@@ -1,0 +1,74 @@
+# Architecture Decision Records
+
+Short, numbered documents that capture a significant technical decision: its
+context, the decision itself, and the consequences. One file per decision, and
+the file says the decision **as it stands**: when a decision moves, edit the ADR
+in place and say where it moved with a dated note that names the pull request
+(`**Amended (2026-09-06, #73):** …`, as ADR-0046 does — at the point of the change,
+or in the header when the whole decision shifted). Git keeps the history; the reader
+should not have to. A NEW ADR supersedes an old one only when the decision is
+reversed, not refined. (House style settled 2026-09-07, after two shapes had grown
+side by side: an "Amended by" header with the body untouched — ADR-0032, which
+predates the rule and keeps that header until ADR-0047's refinement is folded into
+its text — and a body edited with no note, which was ADR-0046 until it got one.)
+
+| # | Title | Status |
+|---|---|---|
+| [0001](0001-foundational-conceptual-model.md) | Foundational conceptual model of the platform | Accepted |
+| [0002](0002-task-sizing-and-execution-budget.md) | Task-sizing gate & execution budget | Accepted |
+| [0003](0003-autonomous-merge-on-current-base.md) | Autonomous merge on the current base | Accepted |
+| [0004](0004-ci-aware-autonomous-repair.md) | CI-aware autonomous repair | Accepted |
+| [0005](0005-post-merge-deploy-watch.md) | Post-merge deploy watch | Accepted |
+| [0006](0006-review-repair-loop.md) | Bounded review-repair loop (1 attempt) | Accepted |
+| [0007](0007-floor-frees-at-merge.md) | The floor frees at merge, not agent-done | Accepted |
+| [0008](0008-on-demand-e2e-ticket.md) | On-demand e2e via a labelled ticket | Accepted |
+| [0009](0009-durability-and-resilience-hardening.md) | Durability & resilience hardening (post-audit) | Accepted; shipped |
+| [0010](0010-single-line-strict-park-on-impediment.md) | Single-line strict: park on any impediment (revises 0007) | Accepted; shipped |
+| [0011](0011-suppression-repair-and-reviewer-vetted-pragmas.md) | Suppression-repair in the sandbox + reviewer-vetted coverage pragmas | Accepted; shipped |
+| [0012](0012-perfect-resume-after-pause.md) | Perfect resume after a rate-limit pause (token visibility + honoured backoff + session resume) | Accepted; shipped |
+| [0013](0013-preflight-sizing-effort-budget-recovery.md) | Pre-flight sizing gate, autonomous split, ticket effort budget, stuck-recovery | Accepted; shipped (P1–4) |
+| [0014](0014-single-agent-execution-and-advisory-review.md) | Single-agent execution + advisory review (frontier-default, still agnostic) | Accepted; shipped |
+| [0015](0015-tech-lead-diagnosis-and-slack.md) | The tech-lead: impediment diagnosis + Slack (one brain, two triggers) | Accepted; v1 shipped |
+| [0016](0016-slack-actions-authorization.md) | Acting from Slack: read for all, write behind an allowlist | Accepted; v3 shipped |
+| [0017](0017-knowledge-layer.md) | The Knowledge Layer: a derived, verifiable map the agent may not trust blindly | Accepted; Phase 1+2a shipped, off by default |
+| [0018](0018-harness-roles.md) | Three harness roles: executor, reviewer, techlead | Accepted; shipped |
+| [0019](0019-product-role-and-requirements-repo.md) | The product role: requirements are authored documents, in their own repo | Accepted; core implemented |
+| [0020](0020-techlead-on-call.md) | The tech-lead is on call: classify by remedy, resolve what it can | Accepted; shipped |
+| [0021](0021-agents-that-follow-through.md) | Agents that follow through: the open loop as the unit of memory | Accepted; shipped |
+| [0022](0022-provider-seams.md) | Provider seams: an axis is agnostic when it is BORN with two | Accepted; shipped |
+| [0023](0023-derive-dont-cache.md) | The map is derived, not learned: generate it where the checkout is (revises 0017) | Accepted |
+| [0024](0024-conversational-memory.md) | Conversational memory: the thread is the unit, the raw log is sacred | Proposed (§1 amended 2026-09-24 by ADR-0051: the raw log is partitioned by product; §4 and §5 amended 2026-09-24 by ADR-0053: retrieval, lexical first, with time as data) |
+| [0025](0025-delivery-closes-with-the-client.md) | Delivery closes with the client, not with the board | Accepted (implemented 2026-07-29) |
+| [0026](0026-shared-vocabulary-beats-an-invented-word.md) | A word the reader already has beats one you invent | Accepted (implemented 2026-07-29) |
+| [0027](0027-the-clients-board-is-not-our-test-bench.md) | The client's board is not our test bench | Accepted (2026-07-29) |
+| [0028](0028-a-yes-is-read-a-done-is-not-asserted.md) | A "yes" is read; a "done" is not asserted | Accepted (2026-07-30) |
+| [0029](0029-a-click-is-not-interpreted.md) | A click is not interpreted | Accepted (2026-07-30) |
+| [0030](0030-what-the-parallel-audit-found.md) | What the parallel audit found, and the inversion it exposed | Accepted (2026-07-30) |
+| [0031](0031-observing-is-not-correcting.md) | Observing is not correcting: when the safety net becomes the damage | Accepted (2026-07-30) |
+| [0032](0032-the-requirement-cycle-happens-in-the-channel.md) | The requirement cycle happens in the channel; merging is not agreeing | Accepted (2026-07-30) |
+| [0033](0033-decision-kernel.md) | The lifecycle decides in pure code; the engine only executes | Proposed (design only — no code changes with this ADR) |
+| [0034](0034-extension-model.md) | Providers stay in-process for now, and the door stays open by a test | Accepted; the in-process step is decided (addendum 2026-08-26: entry points on every axis and on the role axis are the extension mechanism; the out-of-process door stays open by the guard, its trigger unchanged) |
+| [0035](0035-knowledge-layer-on-by-default.md) | The knowledge layer becomes the behaviour, not an experiment | Accepted (2026-08-02) |
+| [0036](0036-cross-repo-ordering.md) | Ordering across repositories: the product declares it, the floor enforces it | Proposed (design only) |
+| [0037](0037-the-box.md) | The box: the client's image, an injected toolbox, and a proof before any pickup | Accepted |
+| [0038](0038-the-platform-is-complete-channels-are-add-ons.md) | The platform is complete on its own; channels are add-ons | Accepted |
+| [0039](0039-the-action-layer.md) | The action layer: what a human can ask the factory to do, written once | Accepted |
+| [0040](0040-the-core-runs-on-the-clients-own-machines.md) | The core runs on the client's own machines; a cloud is an add-on | Accepted |
+| [0041](0041-facts-are-files-not-a-protocol.md) | The roles read facts as files, not through a tool protocol | Accepted |
+| [0042](0042-the-backfill-has-four-inputs.md) | The backfill has four inputs, and a legacy system is the product | Accepted for the thesis and input 2 (the code's history, shipped); inputs 3 and 4 proposed |
+| [0043](0043-the-distribution-is-a-published-image.md) | The distribution is a published image, and one compose file both installs and builds | **Accepted** for the shape (published images on GHCR, one compose file carrying both `image:` and `build:`, the tracked default `main` against a pinned install) (addendum 2026-08-31: the base layer is a FOURTH published image — the v0.1.0 run proved that the release itself pulls it, so "nothing pulls it" was false) |
+| [0044](0044-a-project-declares-what-it-is.md) | A project declares what it is: profiles as a cascade layer | Accepted; shipped (`gates:` consumer added) |
+| [0045](0045-a-fingerprint-nothing-reads-is-a-promise.md) | A fingerprint nothing reads is a promise, not a mechanism: the OKF's stance, and the checker that has no reader | Proposed |
+| [0046](0046-a-file-nothing-describes-is-the-least-safe-to-change.md) | A file nothing describes is the least safe to change: the knowledge gate, its verdicts, and what a stance does | Accepted |
+| [0047](0047-a-requirement-is-agreed-twice-and-never-through-a-pull-request.md) | A requirement is agreed twice, in the conversation, and never through a pull request: the draft, the ticket, and the acceptance on the card | Accepted |
+| [0048](0048-the-factory-asks-before-it-spends.md) | The factory asks before it spends, and the question goes to the person who asked: the gather step between sizing and planning | Accepted |
+| [0049](0049-the-whole-cycle-on-one-machine.md) | The whole cycle runs on one machine: `local` is a kind, not a mode | Accepted (design; slice 0 shipped) |
+| [0050](0050-a-preview-before-the-merge.md) | A preview before the merge, because nothing after it can be taken back | Accepted |
+| [0051](0051-one-door-parallel-conversations-one-semaphore-on-work.md) | One door, parallel conversations, one semaphore on work: `receive(Message)`, a serial queue per conversation, and one lock per product where checking and writing are one step | Accepted (design only; 2026-09-24); D18 proposed 2026-10-10 (#563): a requirement is broken down once, and every door asks what it already has |
+| [0052](0052-the-owners-view.md) | The owner's view: what the product is doing, and the whole map of it — one read model for the panel and the role, minus an exclusion list that starts with spend, a briefing with source and age in every turn, events through the door; every declared source mounted, a system layer derived without a model, the code checked at turn time | Proposed (design only; D16 amended 2026-10-18 by #369: what bounds a turn at N sources) |
+| [0053](0053-the-guardians-memory.md) | The guardian's memory: raw, evidence and curated truth — documents read deterministically first behind a replaceable interface, time and supersession as data, a local hybrid index the engine searches and the role reads as files, memory keyed by product, and nothing from a document true until a person confirms it | Proposed (design only) |
+| [0054](0054-a-card-is-judged-before-the-yes.md) | A card the product role opens is drafted from the conversation, checked by a floor no rubric can switch off, judged against a rubric the product owns in its context repository with the verdict computed in code, and shown whole before the yes | Accepted (implemented with #383) |
+| [0055](0055-a-card-has-one-lifecycle.md) | A card has one lifecycle: one door for every change of its state (`card_transition`), a pure table of which events are allowed and one of what follows each, one ordered record of what happened, one transition at a time per card, changes made outside the platform entering as observed events, and a guard that fails on a card write outside the door | Proposed (design only; milestone 0.5.0) |
+| [0056](0056-a-prompt-has-one-budget-and-names-what-it-leaves-out.md) | A job's prompt has one budget, and every document it leaves out is named in it | Accepted (implemented with #364) |
+| [0057](0057-who-may-act-is-one-decision-and-a-production-approval-is-a-person.md) | Who may act is one decision the core's policy makes, and a production approval is a person, not a password: `policy.may` asked once by `perform`, the areas `floor` and `product`, six roles granted per project or deployment, the approver the signed-in person with a step-up, and the approver store retired in three releases (amends ADR-0016 and ADR-0038's production gate, completes ADR-0039 §2) | Proposed (design only — no code changes with this ADR; a maintainer accepts it in review) |
+| [0058](0058-a-product-owns-its-requirement-template.md) | A product owns its requirement template: `template.yaml` beside its requirements declares the company's header fields and sections, the core's own never change, one the file cannot use is a finding, and the reader, the writer and the role's index share it | Accepted (implemented with #1001) |

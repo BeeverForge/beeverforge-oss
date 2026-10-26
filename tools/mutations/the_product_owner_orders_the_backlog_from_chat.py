@@ -1,0 +1,52 @@
+"""The product owner orders the backlog from chat — the cuts that lose the order or start work.
+
+ROW 1 IS THE ORDER SORTED WHERE IT IS READ. ROW 2 IS THE MARKER READ AND NOT DECLARED. ROW 3 IS
+THE CHANNEL STAGING A QUEUE, so the yes STARTS the cards instead of ordering them. ROW 4 IS THE
+EXECUTOR REACHING THE WRONG VERB. ROW 5 IS THE REPLY SORTED. ROW 6 IS THE EXECUTOR UNREGISTERED.
+ROW 7 IS THE ASK NOT SAYING THAT NOTHING STARTS.
+"""
+
+TEST = "tests/test_the_product_owner_orders_the_backlog_from_chat.py"
+
+MUTATIONS = [
+    ("the order is sorted where it is read",
+     "beeverforge/product/role.py",
+     # re-pinned 2026-09-07: the expression wrapped when the "never sorted" comment went in
+     # re-pinned 2026-10-05: the marker reads each card as its tracker spells it (#515)
+     # re-pinned 2026-10-10: the parser moved into `read_answer`, four spaces shallower (#565)
+     '    order = refs_written(ordered.group("numbers")) if ordered else []',
+     '    order = sorted(set(refs_written(ordered.group("numbers")))) if ordered else []'),
+
+    ("the marker is read and never declared",
+     "beeverforge/product/role.py",
+     # RE-PINNED 2026-10-10 (#565): the parser moved into `read_answer`, four spaces shallower
+     "                         is_reorder=bool(order), order=order,",
+     "                         is_reorder=False, order=order,"),
+
+    # RE-PINNED 2026-09-24: moved to engine.py
+    ("the channel stages a QUEUE, so the yes starts the cards instead of ordering them",
+     "beeverforge/product/engine.py",
+     '        replaced = remember(thread, {"kind": "reorder", "numbers": order, "channel": channel},',
+     '        replaced = remember(thread, {"kind": "queue", "numbers": order, "channel": channel},'),
+
+    ("the executor reaches the wrong verb",
+     "beeverforge/product/confirm.py",
+     "    results = module.reorder(numbers, actor=user)",
+     "    results = module.promote(numbers, actor=user)"),
+
+    ("the reply is sorted",
+     "beeverforge/product/confirm.py",
+     '    placed = [str(r.ref).lstrip("#") for r in results if r.ok and r.ref]',
+     '    placed = sorted(str(r.ref).lstrip("#") for r in results if r.ok and r.ref)'),
+
+    ("the executor is not registered",
+     "beeverforge/product/confirm.py",
+     '    "reorder": _confirm_reorder,\n',
+     ''),
+
+    ("the ask does not say that nothing starts",
+     "beeverforge/product/voice.py",
+     '''    "pt-BR": "Coloco o backlog nesta ordem, de cima para baixo: {order}. Isso só grava a ordem — "
+             "nada começa agora; a próxima leva segue ela. Confirma?",''',
+     '''    "pt-BR": "Coloco o backlog nesta ordem, de cima para baixo: {order}. Confirma?",'''),
+]

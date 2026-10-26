@@ -1,0 +1,19 @@
+{
+  "name": "beeverforge",
+  "networks": {
+    "default": {
+      "name": "beeverforge_default"
+    }
+  },
+  "services": {
+    "orders": {
+      "build": {
+        "context": "/pv/base/app",
+        "dockerfile": "Dockerfile"
+      },
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

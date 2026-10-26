@@ -1,0 +1,607 @@
+# BeeverForge — the whole factory on one machine (C-13).
+#
+#   cp .env.compose.example .env.compose && $EDITOR .env.compose
+#   docker compose --env-file .env.compose up -d                # pull the published images
+#   open http://localhost:8787          # or $PANEL_PORT
+#
+# …or, to run the code in THIS checkout rather than the published images (`make build`):
+#
+#   docker compose --env-file .env.compose --profile build up -d --build
+#
+# `--env-file .env.compose`, AND NOT `.env`, AND IT IS NOT A STYLE CHOICE. Docker Compose reads
+# `.env` from this directory automatically, for every `${VAR}` below. This repository's `.env` is
+# the one the CLI uses against a LIVE deployment — a client's Slack bot token, a GitHub App
+# installation with write access to their repositories. The instruction here used to be
+# `cp .env.compose.example .env`, which on any machine that had already run the platform meant handing
+# the local worker a client's credentials and pointing it at the registry baked into the image.
+# `--env-file` replaces `.env` outright, so the local stack can only see what this file names.
+#
+# WHAT THIS REPLACES. The previous file here declared a Postgres and a Redis that nothing used —
+# its own comment said the queue seam existed "from day one, not because we run parallel jobs yet",
+# and neither was ever wired. Temporal is the queue and always was.
+#
+# WHAT THIS IS FOR. Two jobs at once, which is why it comes early rather than last: it IS the OSS
+# distribution, and it IS the development loop. Every hazard in the extraction programme lives at
+# the deploy boundary, so a loop that needs a deploy maximises the frequency of its own riskiest
+# operation. Here a change is a container restart.
+#
+# It is the SAME CODE the cloud runs, with different providers selected:
+#
+#     durable engine   Temporal OSS      instead of Temporal Cloud   (already the default)
+#     box              ContainerSandbox  instead of Fargate          (already exists)
+#     telemetry        SQLite            instead of DynamoDB         (C-11)
+#     events           file journal      instead of CloudWatch       (already the first choice)
+#     secrets          .env              instead of Secrets Manager
+#
+# WHAT IT STILL NEEDS FROM YOU. Two things, both irreducible: a forge credential and an
+# authenticated harness. `beeverforge doctor <project>` names either if it is missing.
+#
+# ONE FILE INSTALLS AND BUILDS, and that is why every service below carries BOTH `image:` and
+# `build:` (ADR-0043). The two readers of this file want opposite things and used to be served by
+# opposite files:
+#
+#     docker compose up -d                          PULLS the published image — the installer's path
+#     docker compose --profile build up -d --build  BUILDS it and tags it as that same `image:`
+#
+# A SECOND "release" compose file WAS THE OBVIOUS ALTERNATIVE AND IS THE WORSE ONE. Two guards read
+# the literal path `docker-compose.yml` (`test_two_projects_do_not_share_a_box.py` and
+# `test_the_docs_do_not_drift.py`), and a second file would split the truth about this stack across
+# two places — the defect this codebase names most often. The tracked file IS the release asset,
+# verbatim.
+#
+# `BEEVERFORGE_VERSION` DEFAULTS TO `main` HERE AND IS NEVER FLOATING FOR A USER. `main` is built on
+# every push to main, so a contributor who runs `up` gets the branch they are working on. The
+# installer WRITES an explicit `BEEVERFORGE_VERSION=vX.Y.Z` into `.env.compose`, so nobody who
+# arrives through the one-liner is ever pointed at a moving tag.
+#
+# MEASURED 2026-08-30, and it is why `worker` no longer declares `depends_on: sandbox-image`:
+# Compose REFUSES a project in which a profile-less service depends on a profiled one —
+#     service "app" depends on undefined service "builder": invalid compose project
+# — so `docker compose up -d`, the whole point of the line above, exits non-zero before it starts
+# anything. What that dependency used to buy (a missing box image is a build error at `up`, not a
+# job that parks an hour later) is now bought by `beeverforge preflight`, which asks the HOST's
+# daemon whether the box image is there and names `docker pull …` as the remedy — a check that
+# covers the pull path as well as the build path, which the build-time dependency never could.
+
+# THE COMPOSE PROJECT NAME, and it prefixes every container, network and volume this stack
+# creates — including `BEEVERFORGE_TOOLBOX_VOLUME` below, which is literally `<this name>_beeverforge_toolbox`.
+# The two move together or the worker mounts a volume that does not exist. Renaming it orphans
+# the volumes of a stack that is already running locally: `docker compose down -v` first.
+name: beeverforge
+
+services:
+  # ── the durable engine ──────────────────────────────────────────────────────────────────────
+  # The worker and the panel below are TOLD where this is (`TEMPORAL_ADDRESS: temporal:7233`) —
+  # `connection.py` stopped assuming a local engine in #163. Temporal Cloud is the special case;
+  # this is the default.
+  temporal-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes: [temporal_db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      temporal-db: {condition: service_healthy}
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: temporal-db
+      # HOW LONG THE ENGINE REMEMBERS A FINISHED JOB. The image's own default is 24 HOURS, and it
+      # cost the pilot his first real look at a shipped floor (2026-08-17): two tickets ran on the
+      # 16th, he opened the panel ~26h later, and "Recent runs" said *nothing shipped yet* — a
+      # claim, and a false one, about a factory that had shipped both.
+      #
+      # A DAY IS THE WRONG DEFAULT FOR THIS PRODUCT. The question a floor exists to answer is
+      # "what did we ship, and what did it cost" — an answer that evaporates overnight is not one.
+      # 30 days is a month of standups; the journals on disk keep the detail for longer and are
+      # what the Logs page reads (docs/rotation-and-retention.md §4).
+      #
+      # THIS ONLY APPLIES WHEN THE NAMESPACE IS CREATED. auto-setup will not change one that
+      # already exists, which is why the worker RECONCILES it at boot
+      # (`runtime/temporal/schedule.ensure_retention`) — a value a deployment declares and the
+      # platform makes true, the same shape the schedules use.
+      DEFAULT_NAMESPACE_RETENTION: ${BEEVERFORGE_ENGINE_RETENTION_DAYS:-30}d
+    # LOOPBACK ONLY, AND NOT CONFIGURABLE. The engine has no authentication of its own: anybody
+    # who reaches this port can read every job's history, cancel or terminate any run, and send
+    # any workflow signal. Neither the worker nor the panel needs it on the host — they dial
+    # `temporal:7233` on the compose network — so it is published only for tooling on this
+    # machine. A port with no host IP is bound on 0.0.0.0 AND ahead of most host firewalls
+    # (Docker's rules come before ufw's), which is how every release up to 0.4.1 exposed it.
+    # `tests/test_nothing_is_published_beyond_this_machine.py` holds this.
+    ports: ["127.0.0.1:${TEMPORAL_PORT:-7233}:7233"]
+    healthcheck:
+      # Exits non-zero until the namespace exists, which is what "ready" means here. A port that
+      # accepts connections is not the same as a server that can hold a workflow, and starting the
+      # worker against the first is how you get a crash loop that looks like a config error.
+      test: ["CMD", "temporal", "operator", "namespace", "describe", "--address", "temporal:7233",
+             "default"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${TEMPORAL_UI_PORT:-8080}
+    # EVERY PUBLISHED PORT IS CONFIGURABLE, and 8080 is the reason. It is the single most
+    # contended port on a developer machine — on the machine this stack was first run on it was
+    # already held by a client's own web app — and a hard-coded one turns "run the factory
+    # locally" into "stop whatever else you were doing first". The defaults stay familiar; the
+    # override costs one line in the env file.
+    #
+    # LOOPBACK ONLY, for the engine's reason above: the UI is the engine's own write surface
+    # (cancel, terminate, signal) with no sign-in in front of it. Reach it from elsewhere through
+    # an SSH tunnel or an authenticating proxy, never by publishing it.
+    ports: ["127.0.0.1:${TEMPORAL_UI_PORT:-8080}:8080"]
+
+  # ── the box the agent's code runs in ────────────────────────────────────────────────────────
+  # NOT A RUNNING SERVICE. It exists so `docker compose up` BUILDS the sandbox image, then exits.
+  #
+  # The worker referred to `beeverforge-python:sandbox` and nothing here produced it: the only builder was
+  # `infra/deploy.sh`, which tags for ECR and passes `--platform arm64` for Fargate. So the stack
+  # came up looking healthy and every job died on "image not found" — the failure arriving one
+  # layer away from its cause, at the first ticket rather than at `up`.
+  # The toolchain layer `sandbox.Dockerfile` builds `FROM`. Same trick, one level down: it was
+  # also produced only by `infra/deploy.sh`, so the chain had two missing links, not one.
+  base-image:
+    # THE FOURTH PUBLISHED IMAGE, AND IT DID NOT USED TO BE ONE. This carried the purely local tag
+    # `beeverforge-python:latest`, on the argument — written into ADR-0043 — that nothing pulls it
+    # and a fourth image on the registry is a fourth thing to keep current for no reader.
+    #
+    # THE v0.1.0 RELEASE RUN DISPROVED THAT ARGUMENT (2026-08-31, run 33396474816). Something does
+    # pull it: the release's own sandbox build. `docker/setup-buildx-action` uses a
+    # docker-container driver, whose BuildKit has its own content store and cannot see the runner
+    # daemon's images, so `FROM beeverforge-python:latest` resolved as `docker.io/library/…` and
+    # the job died on `pull access denied`. A registry is the only place two builders can agree
+    # about an image, so the base has to be in one.
+    #
+    # THE LOCAL BUILD IS UNAFFECTED. Compose builds on the daemon (the `docker` driver), where a
+    # registry-qualified tag that exists only in the local store is used as-is with no pull —
+    # measured the same day. So a contributor still builds base-then-sandbox offline, and the
+    # name they build under is now the name everybody else pulls.
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: docker/base-python.Dockerfile
+      args:
+        # Passed from `.env.compose`, like everything else a deployment declares. Empty = Debian's
+        # own mirror over http. `sandbox-image` needs no row: it builds FROM the base and inherits
+        # the sources file the base rewrote.
+        DEBIAN_MIRROR: "${DEBIAN_MIRROR:-}"
+    image: ghcr.io/beeverforge/beeverforge-base:${BEEVERFORGE_VERSION:-main}
+    init: true  # one of our images, so an init as PID 1 (#532), as on the worker
+    command: ["true"]
+    restart: "no"
+
+  sandbox-image:
+    # BUILD-ONLY AS A SERVICE, PUBLISHED AS AN IMAGE, and the two are not in tension. The worker
+    # does not `docker run` this through Compose — it launches the box itself, on the HOST's
+    # daemon, by the name in `BEEVERFORGE_SANDBOX_IMAGE` below. So there is nothing for
+    # `docker compose up` to start, and the profile keeps it out of the installer's path; the
+    # `image:` is what `--profile build up --build` tags, and what the release publishes for
+    # everyone who never builds at all.
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: docker/sandbox.Dockerfile
+      # A REAL BUILD-ORDER EDGE, WHICH `depends_on` IS NOT. `docker compose build` compiles this
+      # file into a single bake plan and builds every target in it CONCURRENTLY — `depends_on`
+      # orders container startup and says nothing about builds. So `sandbox-image` was resolving
+      # its `FROM` while `base-image` was still building, and only succeeded when the base tag
+      # happened to be left in the local store by an earlier run. Measured 2026-08-31 on a clean
+      # daemon: the build reached out to the registry for a base that was being built three
+      # seconds away, and died on `403 Forbidden` fetching an anonymous pull token.
+      #
+      # `service:base-image` becomes `target:base-image` in the bake plan, which is a dependency
+      # bake understands: the base is built first and handed to this build directly, with no tag,
+      # no registry and no daemon store in between. Measured: `docker compose --profile build
+      # build base-image sandbox-image` on a machine holding neither image exits 0 and produces
+      # both.
+      #
+      # THE `FROM` READS A NAMED CONTEXT HERE AND A REGISTRY REFERENCE IN THE RELEASE, and one
+      # `ARG` serves both because BuildKit resolves a named context ahead of an image reference of
+      # the same name. That is what keeps ONE Dockerfile working for the contributor building
+      # offline and for a workflow whose builder cannot see any local image at all.
+      additional_contexts:
+        beeverforge-base: "service:base-image"
+      args:
+        BEEVERFORGE_BASE_IMAGE: beeverforge-base
+    image: ghcr.io/beeverforge/beeverforge-sandbox:${BEEVERFORGE_VERSION:-main}
+    init: true  # one of our images, so an init as PID 1 (#532), as on the worker
+    command: ["true"]
+    restart: "no"
+    depends_on:
+      base-image: {condition: service_completed_successfully}
+
+  cli:
+    # THE IMAGE THE INSTALLER RUNS, and it is here so that ONE file still names every image this
+    # project publishes. Compose never starts it as part of the stack — `install.sh` runs it with
+    # `docker run --rm -u "$(id -u):$(id -g)"` before there is a stack at all, to run `preflight`
+    # and `init` while the multi-GB worker image downloads behind the interview. Keeping it out of
+    # this file would mean the release published an image no tracked file mentions, which is
+    # exactly half of what `test_every_image_the_compose_file_names_is_one_the_release_builds`
+    # refuses.
+    #
+    # `--help` AND EXIT, under `--profile build`: the contributor's build gets a free smoke test
+    # that the wheel installed and the console script resolves, which is the entire contract this
+    # image has.
+    profiles: ["build"]
+    build:
+      context: .
+      dockerfile: docker/cli.Dockerfile
+    image: ghcr.io/beeverforge/beeverforge-cli:${BEEVERFORGE_VERSION:-main}
+    init: true  # one of our images, so an init as PID 1 (#532), as on the worker
+    restart: "no"
+
+  # ── the factory ─────────────────────────────────────────────────────────────────────────────
+  worker:
+    # AN INIT AS PID 1 (#532), on every service that runs one of our images — a guard reads this
+    # file and fails on one that does not
+    # (`tests/test_every_container_whose_pid_1_is_ours_has_an_init.py`).
+    # Without it PID 1 is our Python process, which waits only for the children it started: every
+    # orphan in the container — git's detached auto-maintenance after each commit, fetch or merge,
+    # measured at about 7 a minute — stays a zombie for the container's life. A panel held 17,420
+    # after 39 hours, against a `pids.max` of 17,435, and could no longer start a thread. The image
+    # carries `tini -s` as well, for a runtime that starts it with no init at all.
+    init: true
+    image: ghcr.io/beeverforge/beeverforge-worker:${BEEVERFORGE_VERSION:-main}
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+      args:
+        # Passed from `.env.compose`, like everything else a deployment declares. Empty = Debian's
+        # own mirror over http. `sandbox-image` needs no row: it builds FROM the base and inherits
+        # the sources file the base rewrote.
+        DEBIAN_MIRROR: "${DEBIAN_MIRROR:-}"
+    depends_on:
+      temporal: {condition: service_healthy}
+      # NO `sandbox-image` ROW HERE ANY MORE, and its absence is load-bearing rather than an
+      # oversight. It used to read "built before the worker can want it, so a missing box is a
+      # build error at `up` rather than a job that parks an hour later" — and that was right for a
+      # file that could only build. Once `sandbox-image` moved behind `profiles: ["build"]` so the
+      # installer's `up` would stop building a multi-GB image it can pull, this dependency made
+      # the default project INVALID: Compose refuses a profile-less service that depends on a
+      # profiled one, by name, before it starts anything (measured 2026-08-30 — `service "app"
+      # depends on undefined service "builder": invalid compose project`).
+      #
+      # The guarantee did not go away, it moved and got wider: `beeverforge preflight` asks the
+      # host daemon whether `BEEVERFORGE_SANDBOX_IMAGE` is present and answers with `docker pull
+      # …`. The old row could only ever protect somebody who typed `--build`; the check protects
+      # the pull path too, which is now the path almost everybody takes.
+    # READY, NOT MERELY RUNNING (#681). A worker that cannot reach the engine, read the registry or
+    # build the identity provider used to stay "running" with nothing waiting on it any the wiser.
+    # It serves no HTTP of its own, so BEEVERFORGE_HEALTH_PORT below makes it answer /readyz, and
+    # the probe asks it there, from inside the container; a 503 names the check that failed, in
+    # `docker inspect`. FIVE MINUTES TO START: the port opens once the boot's own steps are done,
+    # and a first boot copies the harness toolbox (~800 MB) into its volume before that.
+    healthcheck:
+      test: ["CMD", "python", "-m", "beeverforge.observability.health", "--port", "8788"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+    # EVERY ROW OF .env.compose REACHES THE WORKER. The `environment:` list below cannot do that
+    # job alone and it is structural, not an omission to patch: the registry NAMES per-project
+    # credentials (`token_env: ACME_ADO_PAT`), so the variable a client invents can never appear
+    # in a list written here — the funnel review (2026-08-09) found AZURE_DEVOPS_PAT, the
+    # FORGE/TRACKER overrides and every custom `token_env` documented in .env.compose.example and
+    # reaching nothing. Same trust boundary as `--env-file`: the container sees what that ONE
+    # file names, never the ambient `.env`. `required: false` because the stack must BOOT for
+    # somebody who has not created the file yet. `environment:` still wins on conflicts, which is
+    # right — those rows are platform facts, not preferences.
+    env_file:
+      - path: .env.compose
+        required: false
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      # Where jobs run. `container` is the real isolation path — `SandboxAdapter`'s own docstring
+      # calls Docker "the real, production path"; Fargate is the extra, not the reference.
+      BEEVERFORGE_SANDBOX: container
+      # THE SAME STRING `sandbox-image` ABOVE IS TAGGED WITH, and it has to be: the worker issues
+      # `docker run <this>` against the HOST's daemon, so this names an image that must exist
+      # THERE — not one that exists in some build cache here. Before the images were published
+      # this was `beeverforge-python:sandbox`, a purely local tag, which meant the only way to
+      # have the box was to have built it. Pinning it to the published reference is what lets
+      # `docker pull` be a remedy at all.
+      BEEVERFORGE_SANDBOX_IMAGE: ghcr.io/beeverforge/beeverforge-sandbox:${BEEVERFORGE_VERSION:-main}
+      # Telemetry with no AWS (C-11). Stated out loud rather than inferred: with
+      # BEEVERFORGE_METRICS_TABLE absent the inference gives `null`, and a distribution that silently
+      # recorded nothing would lose the cost dashboard with nothing reporting it.
+      BEEVERFORGE_METRICS_SINK: sqlite
+      BEEVERFORGE_METRICS_DB: /var/lib/beeverforge/metrics.db
+      # A paused job continues instead of starting over, with no object store to buy (#118). Stated
+      # out loud for the same reason as the sink above: the inference is right today and a silent
+      # default is a decision nobody can find. The directory lives on the state volume, so a
+      # session survives a restart exactly as the registry and the proofs do.
+      BEEVERFORGE_SESSION_STORE: ${BEEVERFORGE_SESSION_STORE:-file}
+      BEEVERFORGE_RESUME_DIR: /var/lib/beeverforge/resume
+      BEEVERFORGE_REGISTRY: /var/lib/beeverforge/registry.yaml
+      # What `beeverforge doctor` calls this container on its own line (#532).
+      BEEVERFORGE_ROLE: worker
+      # Where the worker answers /healthz and /readyz — the port its healthcheck above asks, on the
+      # container's own loopback (BEEVERFORGE_HEALTH_HOST unset) and published nowhere (#681).
+      BEEVERFORGE_HEALTH_PORT: "8788"
+      # The board this platform can hold itself (ADR-0049 D5). BOTH halves point at it:
+      # the worker polls it and the panel serves it, from the state volume they share.
+      BEEVERFORGE_BOARD_DB: /var/lib/beeverforge/board.db
+      BEEVERFORGE_REPOS_DIR: ${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}
+      BEEVERFORGE_PANEL_URL: ${BEEVERFORGE_PANEL_URL:-http://localhost:${PANEL_PORT:-8787}}
+      # Job journals. A DEPLOYMENT path, not one derived from where the client's code sits — without
+      # this the worker writes beside its checkout while the panel reads the volume below, which is
+      # how that mount stayed empty on every install (#67). It also decides whether a rate-limit
+      # PAUSED job is ever found again: `scheduler.ready_to_resume` globs this directory.
+      BEEVERFORGE_LOG_DIR: /root/.beeverforge-logs
+      # Client checkouts. A project registered by clone URL is fetched here (#65), and this lives
+      # on the volume rather than in /tmp so a restart is not a full re-clone of every client
+      # repository — which on a real codebase is minutes per deploy.
+      BEEVERFORGE_REPO_CACHE: /var/lib/beeverforge/repos
+      # Job workspaces. Bound at the SAME path on both sides below, because `docker run -v` is
+      # resolved by the HOST's daemon: a path this container invents does not exist there, and
+      # Docker mounts an empty directory rather than failing. Every job would run against nothing.
+      #
+      # THE DEFAULT MOVED OUT OF THE OPERATOR'S HANDS, NOT OUT OF `/var/lib`. This was the literal
+      # path, and it cost every Linux install one `sudo` before `up`:
+      #
+      #     sudo mkdir -p /var/lib/beeverforge-work && sudo chown $(whoami) /var/lib/beeverforge-work
+      #
+      # Skip it and Docker auto-creates the directory owned by ROOT — the stack still starts and
+      # the ownership surprises you later — and rootless Docker cannot create it at all. `beeverforge
+      # init` now WRITES this row, pointing at
+      # `${XDG_DATA_HOME:-$HOME/.local/share}/beeverforge/work`, which the invoking user already
+      # owns. It fixes a macOS failure as well as the Linux sudo line: `$HOME` is inside Docker
+      # Desktop's default file sharing and `/var/lib` is not.
+      #
+      # THE `:-` DEFAULT IS THE COMPATIBILITY GUARANTEE AND IT IS NOT DECORATION. An `.env.compose`
+      # written before this change carries no `BEEVERFORGE_WORK_DIR` row, so it keeps resolving to
+      # `/var/lib/beeverforge-work`, byte for byte — a running stack must not move its workspaces
+      # out from under a job in flight, and DEFAULTING rather than rewriting is what guarantees
+      # that. Only a NEW install, whose `init` writes the row, moves.
+      # `test_an_environment_written_before_this_change_still_resolves_the_old_path` asserts it
+      # rather than believing it.
+      #
+      # THE EXPRESSION IS BYTE-IDENTICAL TO THE ONE IN `volumes:` BELOW, and it has to stay that
+      # way: the two are connected by nothing but agreement, and a source that resolves differently
+      # from its target is the "box saw 0 entries" defect (2026-08-03) with an interpolation in
+      # front of it.
+      BEEVERFORGE_WORK_DIR: ${BEEVERFORGE_WORK_DIR:-/var/lib/beeverforge-work}
+      # WHERE THE OPERATOR'S OWN GUIDELINES ARE (#318) — the same absolute path on the host, in
+      # this worker and in every box it launches. Empty: no operator tier, and nothing is said.
+      BEEVERFORGE_GUIDELINES_DIR: ${BEEVERFORGE_GUIDELINES_DIR:-}
+      # The harness toolbox (ADR-0037 D2). The worker copies the baked toolbox INTO this volume on
+      # boot and then tells each box to mount it read-only. It is named by VOLUME NAME, not path:
+      # the worker is a container issuing `docker run` against the host's daemon, so a path inside
+      # the worker means nothing to the thing that performs the mount.
+      BEEVERFORGE_TOOLBOX: /var/lib/beeverforge-toolbox
+      BEEVERFORGE_TOOLBOX_VOLUME: beeverforge_beeverforge_toolbox
+      # A PREVIEW OF THE PRODUCT (ADR-0050, #265) runs on THIS stack's daemon, through the compose
+      # plugin the worker image carries: the worker brings a unit up, and connects the panel's
+      # container (named below, on the panel service) to that unit's own edge network so the panel
+      # can proxy to it — no network is shared between two units. The pull credentials previews
+      # may use live in their own directory on the state volume (`beeverforge preview login
+      # <registry>` fills it), never in the worker's own docker config. `:-` defaults, so a row in
+      # .env.compose can still say otherwise (`none` turns previews off).
+      BEEVERFORGE_PREVIEW_RUNTIME: ${BEEVERFORGE_PREVIEW_RUNTIME:-compose}
+      BEEVERFORGE_PREVIEW_REACH: ${BEEVERFORGE_PREVIEW_REACH:-network}
+      BEEVERFORGE_PANEL_CONTAINER: ${BEEVERFORGE_PANEL_CONTAINER:-beeverforge-panel}
+      BEEVERFORGE_PREVIEW_DOCKER_CONFIG: ${BEEVERFORGE_PREVIEW_DOCKER_CONFIG:-/var/lib/beeverforge/docker}
+      # The SAME domain the panel serves previews under: the worker writes each exposed service's
+      # address into the others' environment, and the two must agree.
+      BEEVERFORGE_PREVIEW_DOMAIN: ${BEEVERFORGE_PREVIEW_DOMAIN:-preview.localhost}
+      BEEVERFORGE_PLATFORM_NAME: ${BEEVERFORGE_PLATFORM_NAME:-BeeverForge}
+      # The panel's engine deep-links must use the PUBLISHED UI port: every "engine ↗" and
+      # needs-attention link 404'd until this was set (found by the product owner clicking one,
+      # 2026-08-04), because `ui_base()` then guessed a port. It no longer guesses (#183) — with
+      # nothing declared the panel draws no engine link — so THIS LINE IS THE DECLARATION, and
+      # `tests/test_a_deployments_addresses_have_one_owner.py` holds it equal to the port the UI
+      # is published on above, whichever way TEMPORAL_UI_PORT is set. A deployment reached through
+      # a name of its own says so with TEMPORAL_UI_URL, as BEEVERFORGE_PANEL_URL already allows.
+      TEMPORAL_UI_URL: ${TEMPORAL_UI_URL:-http://localhost:${TEMPORAL_UI_PORT:-8080}}
+      # Credentials. All optional so the stack BOOTS for somebody who has not filled them in yet —
+      # `beeverforge doctor` says which is missing, which is a better first experience than a worker that
+      # will not start and does not say why.
+      BEEVERFORGE_BOT_TOKEN: ${BEEVERFORGE_BOT_TOKEN:-}
+      # NO VENDOR'S DEFAULT CREDENTIAL VARIABLE IS LISTED HERE, and this used to name exactly
+      # one of the two. `JIRA_API_TOKEN` sat in this block while `AZURE_DEVOPS_PAT` — the other
+      # shipped tracker's default, the one the funnel review measured — did not, so the file
+      # read as if one vendor were closer to the core than the other. It is not: both are rows
+      # in `adapters/credential/registry.py`, and a stranger's add-on declares a third the same
+      # way, which a list written here could never grow to hold.
+      #
+      # LISTING ONE WAS ALSO WORSE THAN LISTING NONE. `environment:` wins over `env_file:`, and
+      # `${JIRA_API_TOKEN:-}` expands to the EMPTY STRING when interpolation finds nothing — so
+      # on a `docker compose up` without `--env-file .env.compose`, this row overrode the value
+      # .env.compose carried with "". The env_file above forwards every row of that file whole,
+      # which is the path every client-invented `token_env` already takes.
+      BEEVERFORGE_GH_APP_ID: ${BEEVERFORGE_GH_APP_ID:-}
+      BEEVERFORGE_GH_APP_INSTALLATION_ID: ${BEEVERFORGE_GH_APP_INSTALLATION_ID:-}
+      BEEVERFORGE_GH_APP_KEY_CONTENT: ${BEEVERFORGE_GH_APP_KEY_CONTENT:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # NO ADD-ON PACKAGE'S VARIABLE IS LISTED HERE, and the chat channel's two were the last
+      # ones that were (2026-08-26). The core reads neither, so the rows only made this file
+      # claim a capability it does not have; a deployment that installs the package puts its
+      # variables in .env.compose, which the env_file above forwards whole — the same path every
+      # client-invented `token_env` already takes.
+      BEEVERFORGE_BOT_NAME: ${BEEVERFORGE_BOT_NAME:-BeeverForge Bot}
+      BEEVERFORGE_BOT_EMAIL: ${BEEVERFORGE_BOT_EMAIL:-bot@beeverforge.local}
+    volumes:
+      # State that must outlive the image: the project registry (C-12) and the telemetry db.
+      - beeverforge_state:/var/lib/beeverforge
+      # ITS OWN volume, never beeverforge_state: that one holds registry.yaml and metrics.db, and ~800 MB
+      # of harnesses growing beside them is how a full disk turns into "every job raises KeyError".
+      - beeverforge_toolbox:/var/lib/beeverforge-toolbox
+      # THE REPOSITORY CACHE, ITS OWN VOLUME TOO, FOR THE TOOLBOX'S REASON (#369). It holds a
+      # partial clone and a checked-out tree of EVERY source of every product, plus what each turn
+      # of the product role leaves beside them, and the product role runs in THIS process — on the
+      # perennial half of the deployment, not in a box that dies with its job. When that cache
+      # filled it filled the state volume with it, and the registry, the board and the store went
+      # unwritable in the same instant. On this volume a full cache is a cache that must be
+      # cleared; it is no longer every job raising KeyError. Mounted INSIDE the state volume's
+      # path so `BEEVERFORGE_REPO_CACHE` above does not move, and an `.env.compose` that names it
+      # keeps meaning the same directory.
+      #
+      # AFTER AN UPGRADE the old cache stays under the state volume, hidden beneath this mount,
+      # until it is removed once by hand — it is a cache, and the first turn on each product
+      # clones again:  docker run --rm -v beeverforge_beeverforge_state:/s alpine rm -rf /s/repos
+      - beeverforge_repos:/var/lib/beeverforge/repos
+      # Per-job event journals, shared with the panel so it tails the local file instead of
+      # reaching for CloudWatch (C-11c).
+      - beeverforge_logs:/root/.beeverforge-logs
+      # The workspace directory, source and target IDENTICAL — that is the whole point: a path
+      # the worker creates here is a path the daemon can resolve. A named volume would not do,
+      # because the daemon cannot address a volume by the worker's path either.
+      #
+      # THE INTERPOLATION IS REPEATED IN FULL ON BOTH SIDES OF THE COLON RATHER THAN SHORTENED.
+      # Compose has no way to say "the same value twice", and the identity is the property — so
+      # the expression is written out twice and a guard interpolates BOTH with a sample environment
+      # and compares the results, which raw-string equality alone can no longer prove.
+      #
+      # AND COMPOSE DOES NOT EXPAND `~` IN A BIND SOURCE. A `~`-relative work dir would create a
+      # literal `./~` directory on the host and mount an empty box — the same class as the defect
+      # the comment above records. That is why `init` writes an ABSOLUTE, tilde-free path and why
+      # the guard asserts both.
+      - ${BEEVERFORGE_WORK_DIR:-/var/lib/beeverforge-work}:${BEEVERFORGE_WORK_DIR:-/var/lib/beeverforge-work}
+      # THE PERSON'S OWN REPOSITORIES (ADR-0049 D3). On a local forge the repository is a
+      # directory on this machine, and BOTH halves need to see it: the worker clones and pushes
+      # into it, and the panel's pull-request page reads `git diff` there. Source and target are
+      # IDENTICAL for the workspace directory's reason — a path one side names must be a path the
+      # other can resolve, and the daemon resolves the box's `-v` by the host's path.
+      #
+      # TOLERATED ABSENT so an older `.env.compose` still boots: the default is under `$HOME`,
+      # which exists on every machine that runs compose, and a deployment with no local project
+      # never looks inside it.
+      - ${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}:${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}
+      # THE DEPLOYMENT'S OWN GUIDELINES (#318). The worker READS these documents to build a
+      # job's context, and the box MOUNTS the same directory so the agent can open a `reference/`
+      # one the index named — and the daemon resolves that `-v` by the HOST's path, so both sides
+      # are identical here for the workspace directory's reason: a path one side names has to be a
+      # path the other can resolve.
+      #
+      # READ-ONLY, because nothing in a job has any business writing the organisation's standards,
+      # and every box on this deployment is handed the same directory — one job's edit would be
+      # the next job's rules.
+      #
+      # TOLERATED ABSENT, like the repositories above: the default is under `$HOME`, an operator
+      # who sets nothing has no operator tier, and nothing ever looks inside it.
+      - ${BEEVERFORGE_GUIDELINES_DIR:-${HOME}/beeverforge/guidelines}:${BEEVERFORGE_GUIDELINES_DIR:-${HOME}/beeverforge/guidelines}:ro
+      # DOCKER-OUT-OF-DOCKER: the worker launches the box as a SIBLING container on the host's
+      # daemon. `--privileged` docker-in-docker would be the alternative and is both slower and a
+      # far larger blast radius — the box runs an agent's arbitrary code.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  panel:
+    # THE WORKER'S IMAGE, deliberately the same reference and not a fourth published one: the panel
+    # is `python -m beeverforge.cli serve` out of the very same wheel, and `docker/worker.Dockerfile`
+    # has always built both. A second tag over identical bytes would double the registry cost and
+    # give a reader two versions to reconcile where there is only one.
+    image: ghcr.io/beeverforge/beeverforge-worker:${BEEVERFORGE_VERSION:-main}
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+      args:
+        # The panel builds from the WORKER's Dockerfile, so it needs the same row. It was missed
+        # when this was first wired and the build failed on the panel's copy of the toolbox stage
+        # while the worker's was still running — a service list written by hand instead of derived.
+        DEBIAN_MIRROR: "${DEBIAN_MIRROR:-}"
+    command: ["python", "-m", "beeverforge.cli", "serve", "--host", "0.0.0.0", "--port", "8787"]
+    # An init as PID 1, as on the worker (#532): the panel's git work orphans the same children.
+    init: true
+    # A NAME THE WORKER CAN ADDRESS (ADR-0050 D7): a preview's exposed services sit on that unit's
+    # own internal edge network, and the worker — which holds the socket, where the panel holds
+    # none — connects this container to it at start and disconnects it at the end. The worker's
+    # BEEVERFORGE_PANEL_CONTAINER names it.
+    container_name: beeverforge-panel
+    depends_on: [worker]
+    # READY, NOT MERELY RUNNING (#681): the panel's own /readyz, on the port its command serves —
+    # the engine answers, the registry reads and the identity provider can admit.
+    healthcheck:
+      test: ["CMD", "python", "-m", "beeverforge.observability.health", "--port", "8787"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Same rule as the worker: every row of .env.compose reaches the panel — the per-person
+    # token lists (BEEVERFORGE_PANEL_TOKENS / BEEVERFORGE_PRODUCT_TOKENS) were documented and
+    # arrived at nothing, so "who approved that release" could never have an answer on compose.
+    env_file:
+      - path: .env.compose
+        required: false
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      BEEVERFORGE_METRICS_SINK: sqlite
+      BEEVERFORGE_METRICS_DB: /var/lib/beeverforge/metrics.db
+      BEEVERFORGE_REGISTRY: /var/lib/beeverforge/registry.yaml
+      # What `beeverforge doctor` calls this container on its own line (#532).
+      BEEVERFORGE_ROLE: panel
+      # The board this platform can hold itself (ADR-0049 D5). BOTH halves point at it:
+      # the worker polls it and the panel serves it, from the state volume they share.
+      BEEVERFORGE_BOARD_DB: /var/lib/beeverforge/board.db
+      BEEVERFORGE_REPOS_DIR: ${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}
+      BEEVERFORGE_PANEL_URL: ${BEEVERFORGE_PANEL_URL:-http://localhost:${PANEL_PORT:-8787}}
+      # WHERE A PREVIEW OF THE PRODUCT IS SERVED (ADR-0050 D7): each exposed service at
+      # `<service>--<project>--<unit>.<this domain>`, on this same port — NEVER a path under the
+      # panel, because a preview runs agent-written code and the panel's credential is readable by
+      # any script on the panel's own host. `preview.localhost` needs no DNS on one machine
+      # (browsers send every `*.localhost` to the loopback); a server reached by name gives previews
+      # a registrable domain of their own with a wildcard record pointing here. Empty turns them off.
+      BEEVERFORGE_PREVIEW_DOMAIN: ${BEEVERFORGE_PREVIEW_DOMAIN:-preview.localhost}
+      # The key preview tokens are signed with. Empty is safe — the panel makes one per process —
+      # and only means an open preview asks its viewer to come back through the panel after a
+      # restart.
+      BEEVERFORGE_PREVIEW_SECRET: ${BEEVERFORGE_PREVIEW_SECRET:-}
+      # The SAME runtime the worker names: the panel offers a card's start button only where a
+      # runtime is named, and stamps the kind on the preview it starts (#265).
+      BEEVERFORGE_PREVIEW_RUNTIME: ${BEEVERFORGE_PREVIEW_RUNTIME:-compose}
+      # The SAME path the worker writes to — they are connected by nothing but this pair.
+      BEEVERFORGE_LOG_DIR: /root/.beeverforge-logs
+      BEEVERFORGE_PLATFORM_NAME: ${BEEVERFORGE_PLATFORM_NAME:-BeeverForge}
+      # The panel's engine deep-links must use the PUBLISHED UI port: every "engine ↗" and
+      # needs-attention link 404'd until this was set (found by the product owner clicking one,
+      # 2026-08-04), because `ui_base()` then guessed a port. It no longer guesses (#183) — with
+      # nothing declared the panel draws no engine link — so THIS LINE IS THE DECLARATION, and
+      # `tests/test_a_deployments_addresses_have_one_owner.py` holds it equal to the port the UI
+      # is published on above, whichever way TEMPORAL_UI_PORT is set. A deployment reached through
+      # a name of its own says so with TEMPORAL_UI_URL, as BEEVERFORGE_PANEL_URL already allows.
+      TEMPORAL_UI_URL: ${TEMPORAL_UI_URL:-http://localhost:${TEMPORAL_UI_PORT:-8080}}
+      # UNSET MEANS OPEN. Deliberate on a laptop, wrong for anything reachable — the example env
+      # file says so where somebody will actually read it.
+      BEEVERFORGE_PANEL_TOKEN: ${BEEVERFORGE_PANEL_TOKEN:-}
+      # A requirement-writer's credential (#98) — the five product actions and nothing else.
+      BEEVERFORGE_PRODUCT_TOKEN: ${BEEVERFORGE_PRODUCT_TOKEN:-}
+      BEEVERFORGE_BOT_TOKEN: ${BEEVERFORGE_BOT_TOKEN:-}
+      # …and none here either, for the reason spelled out on the worker above: the panel reads
+      # the same boards, so it needs the same per-project credentials and gets them by the same
+      # route — every row of .env.compose, through the env_file directive.
+    volumes:
+      - beeverforge_state:/var/lib/beeverforge
+      - beeverforge_logs:/root/.beeverforge-logs
+      # The same directory the worker mounts, and for the panel's own reason: the pull-request
+      # page reads the diff out of the person's repository (ADR-0049 D3/D4).
+      - ${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}:${BEEVERFORGE_REPOS_DIR:-${HOME}/beeverforge/repos}
+    # LOOPBACK BY DEFAULT. The panel authenticates, but it speaks plain HTTP, so on a network its
+    # sign-in tokens cross in clear text. A deployment that means to serve it to other machines
+    # says so with PANEL_BIND (an address, e.g. 0.0.0.0) and puts TLS in front of it — a reverse
+    # proxy or a VPN. PANEL_BIND and never PANEL_PORT: other rows build URLs out of the port.
+    ports: ["${PANEL_BIND:-127.0.0.1}:${PANEL_PORT:-8787}:8787"]
+
+volumes:
+  temporal_db:
+  beeverforge_state:
+  beeverforge_toolbox:
+  beeverforge_repos:
+  beeverforge_logs:

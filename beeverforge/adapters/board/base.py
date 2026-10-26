@@ -1,0 +1,545 @@
+"""What a BOARD is, independently of who provides it.
+
+The product owner, 2026-07-28, on why the board needed a seam of its own: *"handing them `gh`
+directly strikes me as an architectural error — if it were Jira, for example, it would not be `gh`,
+and that is a premise of BeeverForge."*
+
+That is right, and the debt was worse than the phrasing suggests: the board was not merely reachable
+through a vendor command, it **did not exist as a concept**. `TrackerAdapter` covers tickets —
+create, comment, label, link — and says nothing about columns; `GitHubProjectBoard` was constructed
+directly in six places across the CLI, the poller, the panel, the product module and the Slack bot.
+A Jira deployment would not have had a worse board; it would have had none, and the failure would
+have surfaced as an import error in the poller.
+
+So this protocol is deliberately SMALL and derived from what the code actually calls, not from what
+a board could conceivably do. Every method here has a production caller today:
+
+    columns()          the whole board as {ticket: column} — the read the agents are HANDED
+    column_names()     which columns EXIST, whatever is or is not sitting in them
+    items_in_status()  the pickup queue, the single hottest read in the system
+    add_item()         put a ticket on the board at all
+    set_column()       move a card to a named column
+    set_status()       move a card to the column mapped from a JobState
+
+TWO RULES THAT ARE NOT NEGOTIABLE FOR ANY IMPLEMENTATION:
+
+**`columns()` returns None when it could not read, `{}` only when the board is genuinely empty.**
+Three separate bugs in this codebase came from collapsing those into one value — an unreadable
+board became "nothing is queued", "no findings", "the questions resolved themselves". A provider
+that cannot tell the difference must return None.
+
+**No vendor vocabulary escapes the implementation.** Callers pass ticket REFS and column NAMES,
+never project ids, node ids, field ids or GraphQL. That is what lets the product role be handed a
+board it can reason about without knowing who keeps it.
+
+**A ticket ref is the PROVIDER'S OWN STRING, never a number** (C-05). This protocol was typed with
+`int` throughout, which is the one shape a Jira board cannot produce: `CONT-412`. Azure DevOps
+(`1234`), GitLab and GitHub are all numeric, so the hole was invisible — Jira is the outlier, and
+it is why the backlog's own fixture card is named *the non-numeric-ref fixture*.
+
+The `int` was never buying arithmetic; nothing here adds or averages a ticket ref. It was buying
+ORDERING, and that is now `contracts.refs.ref_sort_key`, which sorts by prefix and then
+numerically. Identity and ordering are different questions, and only one of them needs a number.
+
+Converting at this seam instead — taking the digits out of `CONT-412` — would be worse than the
+bug: a Jira board routinely spans projects, so `CONT-412` and `PROJ-412` would both become `412`
+and the platform would treat two tickets as one. And the ref has to go BACK to the provider; a
+comment on `CONT-412` cannot be addressed with `412`.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+from beeverforge.contracts import JobState
+
+log = logging.getLogger("beeverforge.board")
+
+
+@runtime_checkable
+class Rankable(Protocol):
+    """A board whose backlog ORDER can be written — the product owner's second verb (#33).
+
+    A SECOND PROTOCOL, NOT A METHOD ON `BoardAdapter`, and that is the point of it. Every board
+    can be read and every card can be moved between columns; not every board has a rank a client
+    of this platform is allowed to write, and a capability bolted onto the base protocol would make
+    every double, every conformance fake and every client's own adapter claim it or fail
+    `isinstance`. The four boards shipped here all rank (Azure Boards by `StackRank`, GitHub
+    Projects by item position, Jira by the Agile rank endpoint, the local board by a position in
+    the column, #512); a board that does not is told so by `ProductModule.reorder` in one
+    sentence, never by an `AttributeError` in a chat — and `promote` says, for that board only,
+    that the factory takes the queue in the board's own order.
+    """
+
+    def place_after(self, *, issue: str, issue_url: str, after: str | None, column: str) -> bool:
+        """Put `issue` immediately after `after` in the backlog's rank order — `after=None` is the
+        top. `column` names where the neighbours are looked up on a provider whose rank is read per
+        column (Azure Boards); a provider whose rank is global ignores it. False when the provider
+        could not, with a reason logged — never a raise, for the same reason `set_column` never
+        raises: a False must always leave a why behind it."""
+        ...
+
+
+@runtime_checkable
+class Watchable(Protocol):
+    """A board a person can WATCH — one whose re-read costs so little that a surface may repeat it
+    while somebody is looking (ADR-0049 D6).
+
+    A THIRD PROTOCOL, FOR `Rankable`'S EXACT REASON, and the reason is worth stating because the
+    alternative is the one this platform keeps refusing: the panel comparing a provider's name.
+    Watching a board means asking it again every few seconds, which is free against a file on the
+    same machine and is a rate-limit incident against somebody's hosted API. The panel must not
+    decide which is which — a new row would be decided about by a surface that has never met it —
+    and putting the question on `BoardAdapter` would make every board, every double and every
+    client's own adapter claim an answer or fail `isinstance`.
+
+    So a board that is cheap to re-read says so, and one that is silent is simply not watched. The
+    panel reads a NUMBER and never a kind."""
+
+    def poll_seconds(self) -> int:
+        """How often a surface may re-read this board while a person is looking at it, in seconds.
+
+        THE ROW CHOOSES, because only the row knows what it costs. A file on this machine can
+        answer every few seconds; nothing that crosses a network should claim one at all — it
+        should not implement this protocol."""
+        ...
+
+
+@runtime_checkable
+class Staged(Protocol):
+    """A board that can say which neutral STAGE one of its own columns is (#231).
+
+    A FOURTH PROTOCOL, FOR `Rankable`'S EXACT REASON — and this one was learned rather than
+    designed. The stage gate on `card_edit`/`card_close` resolved the key itself, out of one option
+    name it hoped every tracker spelled alike:
+
+        key_for(column, renamed=proj.tracker.options.get("columns"))
+
+    `ProviderRef.options` is `dict[str, str]`, so that value is a string or absent, and `key_for`
+    wants a mapping. Absent mapped nothing — on Jira, whose columns ARE the site's workflow
+    statuses, that refused every edit and every close on every card; present raised `TypeError:
+    'str' object is not a mapping` in front of an operator. The deployment had declared its names
+    all along, in the Jira row's OWN option (`status_map`), which generic code had no way to know
+    about.
+
+    WHICH IS THE WHOLE POINT: *what does this board call `done`* is the row's question, the same
+    way `pickup_column()` is. Each row already holds the answer — the hosted two merge the client's
+    `columns` over their defaults, Jira reads the tracker's `status_map`, the local board reads the
+    key off its own rows — and there was simply no way to ask for it. A constant standing in for a
+    question only the provider can answer is the defect `pickup_column` already paid for once.
+
+    OPTIONAL, AND A SILENT ROW STILL WORKS. `stage_key` is reached through the module function
+    below, never by `isinstance` (a mock satisfies a `runtime_checkable` protocol by having
+    attributes), and a row that does not implement it is read by the platform's own seven names —
+    which is exactly right for a board this platform created and honestly degraded for one that
+    renamed its columns.
+    """
+
+    #: The registry option, on this project's tracker row, that declares this board's column
+    #: names — `columns` for the rows that take the platform's map, `status_map` on Jira. A plain
+    #: class attribute rather than a method because it is a LITERAL each row knows about itself,
+    #: and it exists so the refusal for a column nobody maps can name the option a person should
+    #: actually go and edit. Telling a Jira operator to set `columns` is a remedy that changes
+    #: nothing.
+    stage_option: str
+
+    def stage_key(self, column: str) -> str:
+        """The neutral key this board's column `column` means, or `""` when nothing maps it.
+
+        `""` IS A REAL ANSWER and must stay one: a column this platform does not know is a
+        legitimate thing for a client's board to have, and the gate that decides what may be done
+        to a card has to tell *I know this column* from *I do not* (`columns.key_for`). What was
+        wrong was meeting that answer on every card."""
+        ...
+
+    def stage_column(self, key: str) -> str:
+        """What this board calls the column for the neutral stage `key` — the other direction of
+        `stage_key`, or `""` for a key nobody knows (#496).
+
+        THE PRODUCT ROLE MOVED CARDS BY THE PLATFORM'S OWN NAMES, `TO-DO` and `Backlog`, and only
+        a board this platform created says those. A Jira project whose deployment declared
+        `status_map: {"todo": "A Fazer"}` offered no transition called `TO-DO`, so every promotion
+        answered *"o quadro recusou a movimentação"* and every filed card was left wherever the
+        site created it; an Azure Boards board says `To Do` out of the box and refused the same
+        promotion with nobody having renamed anything. The poller had asked the row all along
+        (`pickup_column`); the product role was the caller that still spelled a name.
+
+        THE SAME MAP `stage_key` READS, so the two directions cannot come to disagree about which
+        column a stage is, and with the platform's own names answering under it for the keys a
+        deployment did not rename — `columns.name_for` merges them exactly as `key_for` does.
+
+        THE FIRST OF THREE ANSWERS, NEVER THE ONLY ONE: generic code asks through the module's
+        `stage_column`, which reads this, then a real column of the board, then the platform's
+        literal — so a row that does not implement it is still named by its own columns."""
+        ...
+
+
+@runtime_checkable
+class BoardAdapter(Protocol):
+    """A column-based view of tickets. Optional per deployment: a project with no board configured
+    has no adapter at all, and every caller already handles that."""
+
+    def url(self) -> str:
+        """Where a PERSON goes to look at this board, or `""` when there is nowhere to send them.
+
+        THE PANEL WAS BUILDING THIS BY HAND, from GitHub Projects v2 vocabulary
+        (`board_owner`/`board_number`) and a literal `github.com`, on the reference surface of a
+        product sold as vendor-agnostic. An Azure or Jira deployment got a link to a github.com
+        page that does not exist — and the panel had ALREADY paid for this class once: the same
+        line shipped an `/orgs/` URL for a user-owned board and 404ed on somebody's own account.
+
+        A board URL is provider knowledge, exactly like `clone_url` and `ticket_url`: the host, the
+        path shape, and the org-vs-user asymmetry GitHub has and the others do not. It belongs to
+        the adapter that already holds the coordinates.
+
+        `""` RATHER THAN A GUESS, because the caller's alternative is to show no button — which is
+        honest — while a wrong link is a person clicking through to a 404 and concluding the
+        platform has lost their board.
+        """
+        ...
+
+    def columns(self) -> dict[str, str] | None:
+        """`{ticket ref: column name}` for the whole board.
+
+        `None` = COULD NOT READ. `{}` = read fine, nothing on it. Callers depend on the
+        distinction; see the module docstring.
+
+        IN BOARD ORDER, where the board keeps one: within a column, the cards come in the order
+        `items_in_status` serves them — Jira's rank, a Projects item's position, Azure's
+        `StackRank`, the local board's position (#512). The panel draws each column in it, so the
+        queue a person sees is the queue the factory picks up from."""
+        ...
+
+    def column_names(self) -> list[str] | None:
+        """Which columns the board HAS, in board order.
+
+        A DIFFERENT QUESTION FROM `columns()`, and conflating the two is what this method exists to
+        make impossible. `columns()` answers *where are the cards*; on an empty board that is `{}`,
+        and on a busy one its keys are ticket refs. Neither tells you whether a column named
+        `TO-DO` exists — which is the only thing `beeverforge doctor` wants to know, and the one
+        setup
+        mistake whose symptom is total silence.
+
+        Same `None` rule as `columns()`: `None` = could not read, `[]` = read fine and the board
+        genuinely defines none. A provider that cannot distinguish them must return None, because
+        reporting an unreadable board as a column-naming problem sends somebody to rename columns
+        they are looking straight at."""
+        ...
+
+    def pickup_column(self) -> str:
+        """What THIS board calls the column the poller picks work up from.
+
+        THE ONE QUESTION NOBODY COULD ASK, AND THE POLLER GUESSED IT. The queue was resolved as
+        *explicit `pickup_status`* → *the client's `columns.todo`* → the literal `"TO-DO"`, with a
+        comment claiming a Portuguese board therefore needs zero extra config. It was true for
+        exactly one provider: GitHub's canonical board really does say `TO-DO`. Azure Boards says
+        `To Do`, so an ADO deployment that configured nothing wrong asked for a column that does
+        not exist and read an empty queue — the silent stall this platform exists to end, arriving
+        through the front door of its own default.
+
+        Each adapter already HELD the answer (`DEFAULT_COLUMNS` merged with the client's override,
+        C-14); there was simply no way to ask for it. So the platform kept a literal instead, which
+        is the same defect as a hardcoded vendor name wearing a different hat: a constant standing
+        in for a question only the provider can answer.
+
+        Implementations return the client's override when there is one and their own default
+        otherwise. Never empty — a caller has to be able to name the column it looked for."""
+        ...
+
+    def items_in_status(self, status: str) -> list[str]:
+        """Ticket refs sitting in one column, in board order — the pickup queue.
+
+        IN BOARD ORDER, which the provider decides — this does not re-sort. A caller that needs a
+        different order uses `refs.ref_sort_key`; a caller that re-sorted these as plain strings
+        would put `CONT-10` before `CONT-2`."""
+        ...
+
+    def add_item(self, *, issue_url: str) -> None:
+        """Put a ticket on the board. Idempotent."""
+        ...
+
+    def set_column(self, *, issue: str, issue_url: str, name: str) -> bool:
+        """Move a card to a column BY NAME. False when the column does not exist.
+
+        `issue` rather than `issue_number`: the parameter carries the provider's ref, and a name
+        promising a number is how the type came to be `int` in the first place."""
+        ...
+
+    def set_status(self, *, issue: str, issue_url: str, state: JobState,
+                   needs_person: bool | None = None) -> bool:
+        """Move a card to whichever column this provider maps `state` to."""
+        ...
+
+
+# ── asking an optional capability, the way `tracker/base.py::close_ticket` does ─────────────────
+# A module function rather than a call at each site: the degrade for a row that does not answer has
+# to be decided ONCE, or the gate and the product role come to read the same board differently.
+
+
+def stage_key(board, column: str) -> str:
+    """Which neutral stage `column` is on `board` — the ONE place generic code asks (#231).
+
+    THROUGH THE ROW, NEVER THROUGH AN OPTION NAME. See `Staged` for what reading one option name
+    out of generic code cost. The fallback is the platform's own seven names and nothing else: a
+    board that says nothing is a board this platform created, or an add-on written before the verb
+    existed, and the canonical vocabulary reads both correctly.
+
+    ONLY A REAL ANSWER IS BELIEVED. A `MagicMock` answers every call with another mock, and a
+    stage key that is not a string travels into `has_started`/`has_finished` and compares equal to
+    nothing — a gate that silently refuses every card, which is this very defect wearing a test
+    double's clothes. A row that claims the verb and answers otherwise is named in the log, because
+    a silent degrade here stays invisible until somebody's card cannot be closed."""
+    from beeverforge.adapters.board.columns import CANONICAL_COLUMNS, key_for
+
+    name = (column or "").strip()
+    if not name:
+        return ""
+    # NO BOARD IS NOT "NO ANSWER". A project can run on tickets alone and still have a caller
+    # holding a column name (`ProductModule.correct_card` reads one off the card); the platform's
+    # own vocabulary is the honest read there, and it is what that caller had before this seam.
+    if board is not None and callable(getattr(board, "stage_key", None)):
+        try:
+            said = board.stage_key(name)
+        except Exception as exc:  # noqa: BLE001 — a board that cannot say is not a traceback
+            log.warning("BEEVERFORGE_BOARD_STAGE_UNANSWERED column=%r: %s raised when asked which "
+                        "stage it is (%s) — reading it by the platform's own column names, which "
+                        "is right only for a board this platform created",
+                        name, type(board).__name__, str(exc)[:200])
+        else:
+            # A KEY, OR NOTHING. `""` is the row saying *I do not map this one*, which is a real
+            # answer the gate needs. Anything else has to be one of the platform's seven, because
+            # `has_started`/`has_finished` compare against exactly those: a row answering with its
+            # own private key (a board may carry columns this platform knows nothing about) would
+            # be read as "the factory has taken it up" and refuse a card nobody is working on.
+            key = said.strip() if isinstance(said, str) else None
+            if key == "" or (key and key in CANONICAL_COLUMNS):
+                return key
+            log.warning("BEEVERFORGE_BOARD_STAGE_UNANSWERED column=%r: %s answered %r, which is "
+                        "not one of this platform's stage keys (%s) — the answer is ignored in "
+                        "favour of the platform's own column names",
+                        name, type(board).__name__, said, ", ".join(CANONICAL_COLUMNS))
+    return key_for(name)
+
+
+def stage_column(board, key: str, *, existing: bool = False,
+                 names: list[str] | None = None) -> str:
+    """What `board` calls the column for the neutral stage `key` — the ONE place generic code asks
+    (#496), and the ONE inverse of `stage_key` above.
+
+    A CALLER PASSES A KEY AND THE ROW NAMES IT. That is the whole change: the product role's money
+    gate is the CHOICE of key (`ProductModule.QUEUE_KEY`, `FILING_KEY`) and stays closed there,
+    while the name — the half only the deployment knows — comes from the board, never from the
+    platform's vocabulary handed to somebody else's board.
+
+    THREE ANSWERS, ASKED IN ORDER, and the first real one wins:
+
+      1. THE ROW'S MAP (`Staged.stage_column`) — the name the deployment declared, the one
+         `set_column` matches. Only a non-empty string is believed: a `MagicMock` answers every
+         call with another mock, and a mock passed to `set_column` as a column name is a placement
+         refused for a reason nobody can read.
+      2. A REAL COLUMN OF THE BOARD — when the board can list its columns (`column_names()`), the
+         first one, in board order, whose `stage_key` is `key`. A board whose row declares no map
+         still knows which stage each of its own columns is; `pickup_column` is the same question
+         for `todo`, from before this seam existed.
+      3. THE PLATFORM'S LITERAL (`columns.name_for`) — what every caller asked for until the board
+         could be asked, and right for a board this platform created.
+
+    ONE FUNCTION, BECAUSE TWO WERE WRITTEN (review of #505/#506). The product role's moves (#496)
+    and the panel's Done (#500) each grew an inverse of `stage_key` in this file, one walking the
+    row's map and one walking the board's columns — two answers to one question, free to come apart
+    on the first board that disagreed with itself. They are the layers above, in that order.
+
+    `existing=True` IS FOR A CALLER THAT DRAWS, NOT ONE THAT MOVES. `/api/board` places a delivered
+    card in Done, and a column the board does not have is a card the page never draws: so the
+    map's name is believed only when it is among `column_names()`, the walk answers next, and the
+    literal never does — `""` is the answer for a board with no such column, and the card is placed
+    nowhere, which is what `columns()` already says of a card a board does not place. A move needs
+    no such guard: `set_column` answers False for a column that does not exist, and says so.
+
+    `names` is the caller's when it has already read `column_names()`, so one request is not two;
+    left out, the board is asked — and only when the map has not already answered a move.
+
+    THE DEGRADE IS `stage_key`'S, decided once. A row that does not implement the verb is a board
+    this platform created or an add-on written before the verb existed; a row that raises, or
+    answers something that is not a name, is named in the log; each is read by the next layer."""
+    from beeverforge.adapters.board.columns import name_for
+
+    wanted = (key or "").strip().lower()
+    if not wanted:
+        return ""
+    # 1. THE ROW'S MAP — the answer for a move; for a caller that draws, only if the board has it.
+    mapped = ""
+    if board is not None and callable(getattr(board, "stage_column", None)):
+        try:
+            said = board.stage_column(wanted)
+        except Exception as exc:  # noqa: BLE001 — a board that cannot say is not a traceback
+            log.warning("BEEVERFORGE_BOARD_STAGE_UNANSWERED key=%r: %s raised when asked what it "
+                        "calls that stage (%s) — naming it by the board's own columns, else by the "
+                        "platform's own name for it, which is right only for a board this "
+                        "platform created", wanted, type(board).__name__, str(exc)[:200])
+        else:
+            if isinstance(said, str) and said.strip():
+                mapped = said.strip()
+            elif not isinstance(said, str):
+                log.warning("BEEVERFORGE_BOARD_STAGE_UNANSWERED key=%r: %s answered %r, which is "
+                            "not a column name — naming it by the board's own columns, else by "
+                            "the platform's own name for it", wanted, type(board).__name__, said)
+    if mapped and not existing:
+        return mapped
+
+    # 2. A REAL COLUMN. A board that cannot list its columns (or answers something that is not a
+    # list — a mock again) has none to offer, and the walk is simply empty.
+    if names is None:
+        names = _column_names(board, wanted)
+    real = list(names) if isinstance(names, list | tuple) else []
+    if mapped and mapped in real:
+        return mapped
+    walked = next((name for name in real if stage_key(board, name) == wanted), "")
+    if walked or existing:
+        return walked
+    return name_for(wanted)
+
+
+def _column_names(board, key: str) -> list[str] | None:
+    """The board's `column_names()`, or None when it has no such verb or could not say."""
+    if board is None or not callable(getattr(board, "column_names", None)):
+        return None
+    try:
+        return board.column_names()
+    except Exception:  # noqa: BLE001 — a board that cannot say has no column to name
+        log.warning("could not read which columns %s has, so none of them is named for %r",
+                    type(board).__name__, key, exc_info=True)
+        return None
+
+
+def stage_option(board) -> str:
+    """The tracker option that declares THIS board's column names, or `""` when it declares none.
+
+    What a refusal offers as the repair, and it has to come from the row: `columns` is right for
+    the rows that take the platform's map and wrong for Jira, whose map is `status_map`. A
+    non-empty string is the only thing accepted as a declaration — a mock's attribute is not one,
+    and a refusal naming an option the deployment does not have is worse than one naming none."""
+    named = getattr(board, "stage_option", "")
+    return named.strip() if isinstance(named, str) else ""
+
+
+@dataclass(frozen=True)
+class Intake:
+    """Where a card the tracker creates is born on its board, before anybody places it (#536).
+
+    `column` is the board's column; `""` when no column shows the state it is created in, and
+    `None` when the board could not be read — never collapsed into "not the queue", because the
+    question this answers is whether filing a card now starts spending. `queue` is the column the
+    poller reads, and `queued` is whether the two are one. `remedy` is the row's own line for
+    taking a filed card out of the queue, `""` when the row has none to offer."""
+
+    column: str | None
+    queue: str
+    queued: bool
+    remedy: str = ""
+    #: Why a board that WAS read cannot say where a new card is born — a declaration missing, or
+    #: one naming a state the vendor does not have (`IntakeUnknown`). `""` when it can say, or when
+    #: it could not be read at all. Set only with `column` None: unknown is held like unread.
+    unknown: str = ""
+
+
+class IntakeUnknown(Exception):
+    """A row read its board and cannot say where a card it creates is born from what the deployment
+    declared — raised by `intake_state` or `intake_column`, never for an unread board (#543).
+
+    A RAISE, NOT `""`, because `""` already means "born on no column of the board", which files the
+    card. A declaration naming a state the vendor does not have answered `""`, and the doctor
+    passed a board on which every create was refused (review of #547); a Jira workflow with two
+    statuses a new issue could start in was answered by the order the site happened to list them
+    (review of #552). `reason` says which, for the team; `remedy` is the declaration that would
+    answer it, as the registry takes it."""
+
+    def __init__(self, reason: str, *, remedy: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.remedy = remedy
+
+
+def intake(tracker, board) -> Intake | None:
+    """Where a card filed now is born on `board` — asked of the ROW, because only the vendor knows
+    (#536). `None` when the question does not arise: no board, or a row whose created card sits on
+    no column until it is placed (a GitHub issue is on a board only once added) or is filed by the
+    row itself in its backlog (the local board).
+
+    THE DEFECT IT ANSWERS. An Azure DevOps work item is on its team's board by existing, in the
+    column its type's first state maps to — `To Do` on the Basic process, which is the pickup
+    column. The product role filed there and asked the door to place the card in a backlog the
+    board did not have; the placement failed, the card stayed, and the poller started work nobody
+    had queued — the one gesture that spends was nobody's (ADR-0019 §5).
+
+    TWO HALVES, TWO ROWS: the TRACKER says which state it creates a card in (`intake_state`, `""`
+    for the vendor's own first state) and the BOARD says which of its columns shows that state
+    (`intake_column`). The queue is `pickup_column()`, the board's own answer, which carries the
+    deployment's `pickup_status` (#502) — the column `beeverforge poll` and the scan read.
+
+    A ROW THAT CANNOT SAY FROM WHAT WAS DECLARED raises `IntakeUnknown`, and the answer is an
+    `Intake` with no column, the reason and the declaration that would answer it: held like an
+    unread board, and a FAIL in the doctor rather than a pass it did not earn (#543)."""
+    lands = getattr(board, "intake_column", None)
+    if board is None or not callable(lands):
+        return None
+    said = getattr(tracker, "intake_state", None)
+    try:
+        state = said() if callable(said) else ""
+        column = lands(state if isinstance(state, str) else "")
+    except IntakeUnknown as unknown:
+        return Intake(column=None, queue=str(board.pickup_column() or ""), queued=False,
+                      remedy=unknown.remedy, unknown=unknown.reason)
+    queue = str(board.pickup_column() or "")
+    queued = bool(column) and column.strip().casefold() == queue.strip().casefold()
+    offer = getattr(board, "intake_remedy", None)
+    remedy = offer(column) if queued and callable(offer) else ""
+    return Intake(column=column, queue=queue, queued=queued,
+                  remedy=remedy if isinstance(remedy, str) else "")
+
+
+def intake_held(tracker, board) -> Intake | None:
+    """Why a card must NOT be created now — the `Intake` that says it would be born in the queue,
+    or one whose `column` is `None` because the board could not say — and `None` when it may be
+    (#543). The one decision every writer that creates a card asks before it writes.
+
+    SEVEN WRITERS CREATE A CARD, AND ONE ASKED. #536 taught the product role's three filing
+    writers to ask `intake` before they write; the panel's `card_create`, a split's children, the
+    factory's own impediment card and the card onboarding proposes still created theirs where the
+    vendor puts a new one — the pickup column, on a board with no backlog of its own — and the
+    poller took them with nobody queueing them (ADR-0019 §5). Each now asks this, so the rule is
+    said once: two copies of "is this safe to file" are how one of them would come to differ.
+
+    UNSURE IS NOT "SAFE TO SPEND": a question that raised, a board that could not be read, or one
+    read that cannot say from what was declared (`unknown`), holds the card too — whether filing
+    now starts spending is unknown, and filing is asked for again in a moment. A row whose new card
+    sits on no column until it is placed (`intake` answers `None`), or one born out of the queue,
+    files as before."""
+    try:
+        born = intake(tracker, board)
+    except Exception as exc:  # noqa: BLE001 — unsure is not "safe to spend"
+        log.info("could not tell where a card created now would start (%s)", exc)
+        return Intake(column=None, queue="", queued=False)
+    if born is None or (born.column is not None and not born.queued):
+        return None
+    return born
+
+
+def option_line(option: str, mapping: dict[str, str]) -> str:
+    """The line a person writes under the project's tracker `options` to declare `mapping` by
+    `option` — `columns: '{"backlog": "New"}'` (#521). The ONE place a sentence gets it from.
+
+    A STRING OF JSON, QUOTED FOR YAML — NEVER A MAPPING. `ProviderRef.options` is `dict[str,
+    str]`, and the line the refusal and the doctor first printed, `columns: {"backlog": "New"}`, is
+    a mapping once it is pasted into the registry: the registry refuses the project for it, so the
+    repair a person was handed broke the project instead of mapping its column. The setup guide
+    always showed the quoted form; the sentences now say what the guide says.
+
+    `json.dumps` writes the JSON, so a column whose name carries a quote is still one string, and
+    a single quote inside YAML's single quotes is doubled, which is how YAML escapes it there."""
+    import json
+
+    value = json.dumps({str(k): str(v) for k, v in mapping.items()}, ensure_ascii=False)
+    return f"{option}: '{value.replace(chr(39), chr(39) * 2)}'"

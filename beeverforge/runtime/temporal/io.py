@@ -1,0 +1,1042 @@
+"""Serializable inputs for the Temporal workflow and its activities.
+
+Everything crossing the workflow/activity boundary must be data (Temporal
+persists it in history). These are plain Pydantic models; the worker uses
+Temporal's Pydantic data converter, so they pass through directly.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+from beeverforge.adapters.sandbox.registry import DEFAULT_BOX_IMAGE, BoxTraits, box_traits
+from beeverforge.contracts.project import ADJUST_PASSES
+from beeverforge.preview.plan import Layout, PreviewPlan
+
+#: The box a deployment gets when it says nothing: the local container, the reference path.
+DEFAULT_SANDBOX = "container"
+
+
+#: Which box this DEPLOYMENT runs jobs in: `BEEVERFORGE_SANDBOX`, else the local container.
+#:
+#: IT USED TO INFER A VENDOR'S BOX FROM A VENDOR'S VARIABLE — `fargate` whenever
+#: `BEEVERFORGE_FARGATE_CLUSTER` was set — on the reasoning that a knob nobody has to turn cannot be
+#: wrong. The reasoning was fine and the knob was not: the core answering the name of a box it does
+#: not implement, from a variable only that box's add-on reads, is the core knowing one connector
+#: by heart. A deployment that runs its boxes remotely says so in the one variable every other
+#: box already uses (`BEEVERFORGE_SANDBOX=fargate`), and a deployment that says nothing gets the
+#: box the open distribution ships (ADR-0040 D2). The same answer `api/app.py::_boxes_are_remote`
+#: now reads off the box's TRAITS rather than off a cluster name.
+#:
+#: UNTIL C-13 NONE OF THIS WAS CONFIGURABLE AT ALL. The compose file set `BEEVERFORGE_SANDBOX:
+#: container` and nothing read it; the models split three ways — `JobParams` and `RunJobInput`
+#: defaulted to `container`, `PollInput` and friends to `fargate`, and the cloud worked only
+#: because `api/app.py` passed `sandbox="fargate"` by hand. A configuration that looks configured
+#: and is ignored is this repository's signature defect.
+def default_sandbox() -> str:
+    import os
+
+    explicit = (os.environ.get("BEEVERFORGE_SANDBOX") or "").strip().lower()
+    return explicit or DEFAULT_SANDBOX
+
+
+#: The preview runtime a deployment gets when it says nothing: none. A deployment runs agent-
+#: written code on its daemon for a preview only when it said so (ADR-0050 D11).
+DEFAULT_PREVIEW_RUNTIME = "none"
+
+
+def default_preview_runtime() -> str:
+    """Which runtime runs this DEPLOYMENT's previews: `BEEVERFORGE_PREVIEW_RUNTIME`, else `none`.
+
+    Deployment-shaped like the box, and for the box's reason: the runtime decides which daemon
+    agent-written code runs on, so it is the operator's to name and never a file's. Read on the
+    activity side and carried to a workflow as data; the row itself is built by an activity
+    (`adapters/preview/registry.py`)."""
+    import os
+
+    explicit = (os.environ.get("BEEVERFORGE_PREVIEW_RUNTIME") or "").strip().lower()
+    return explicit or DEFAULT_PREVIEW_RUNTIME
+
+
+class RatePauseInput(BaseModel):
+    """Why the poller is standing still, said to a human.
+
+    A SEPARATE INPUT rather than the budget dict: a workflow's activity arguments are part of
+    its history, so a loose dict here would be replayed forever with whatever keys the probe
+    happened to carry that day."""
+
+    resource: str
+    remaining: int
+    reset_epoch: int
+    #: WHOSE budget, as the adapter names itself (`"GitHub"`) — the announcement used to spell
+    #: the vendor as a literal in the activity, which was right for exactly one tracker.
+    vendor: str = ""
+    #: The tracker KIND the budget belongs to (`github`, a stranger's `gitlab`) — the registry's
+    #: key, distinct from the display name above. The once-per-window marker is keyed by it: two
+    #: vendors exhausted in one reset window are two announcements, not one. Empty is the
+    #: pre-per-vendor shape and keeps the marker name that shape had.
+    kind: str = ""
+    #: The projects on the exhausted vendor — the only ones the pause is ABOUT. Empty means every
+    #: project (the shape before budgets were read per tracker), so an in-flight history replays
+    #: with the meaning it had.
+    projects: list[str] = Field(default_factory=list)
+
+
+class JobParams(BaseModel):
+    """The workflow input: one ticket, plus how to run it."""
+
+    project: str
+    issue: str
+    sandbox: str = Field(default_factory=default_sandbox)
+    image: str = Field(default_factory=lambda: DEFAULT_BOX_IMAGE)
+    review: bool = True
+    # Run the post-merge staging→prod path after the PR (only where a live
+    # pipeline exists; a production client's prod is OFF in dev). Default: stop at the PR.
+    promote: bool = False
+    approval_deadline_days: int = 3
+    merge_deadline_days: int = 14  # how long to durably wait for the PR merge (A2)
+    # Single-line strict (ADR-0010): a job that hits an impediment PARKS holding the floor
+    # until the operator resumes/skips. This bounds a forgotten block — after it, the floor
+    # auto-frees (skip) so the queue can't be jammed forever by an unattended ticket.
+    impediment_deadline_days: int = 3
+    #: The language this project's UNPROMPTED messages are written in (#124).
+    #:
+    #: A FIELD, NOT A LOOKUP, and the distinction is a replay one. The park announcement is
+    #: composed inside the workflow, which may not do IO — and fetching the language would be a
+    #: NEW COMMAND in the sequence, so every job in flight would diverge (TMPRL1100). A field with
+    #: a default deserialises fine on a history that predates it: an old job renders English,
+    #: which is the same answer it would have given if nobody had configured anything.
+    #:
+    #: Filled by `start_jobs`, which is an activity and may read the registry.
+    language: str = ""
+    #: The box's TRAITS, stamped by the activity that starts the job — the same replay argument as
+    #: `language`, one field up, applied to the box axis being open to add-ons. The workflow asks
+    #: `remote` (must a stop be sent when the job ends abnormally?) and `idempotent` (may a failed
+    #: attempt be retried?), and `box_traits` answers from the BUILT-IN table alone because it
+    #: runs in the workflow body: an add-on's traits come from `importlib.metadata`, which is
+    #: I/O, and from a package that may not be installed on the worker doing the replay. So the
+    #: activity that starts the job looks the box up with the add-ons in view and writes the
+    #: answer here, as data.
+    #:
+    #: `None` MEANS "NOT STAMPED" AND NOTHING ELSE: a history that predates this field, or a caller
+    #: that built the params by hand. Then the built-in table answers, which for every box the
+    #: platform ships is the same answer — and for an add-on's box it RAISES, naming the built-ins,
+    #: rather than guessing whether a job it cannot see must be stopped.
+    box: BoxTraits | None = None
+    #: HOW MANY MORE PASSES this job may be sent back for at its merge gate — the project's
+    #: `adjust_passes` (#448), stamped by whoever starts the job, for `language`'s reason one field
+    #: up: the workflow may not read the registry. A history that predates the field deserialises
+    #: it as today's hard-coded 2, so a job in flight replays and refuses exactly as it did.
+    adjust_passes: int = ADJUST_PASSES
+    #: THE CARD'S NEXT CHANGE, ASKED FOR AT THE LAST GATE (#448 slice 4). A job parked before the
+    #: product's users, its change merged, is told "not yet" by the person who asked for the card
+    #: (`JobWorkflow.not_yet`), and continues as new with these three: what is still wrong — the
+    #: words its brief carries beside the card, whose criteria were corrected first; how many
+    #: passes the job had spent by then, so the project's one budget (`adjust_passes`) is counted
+    #: across both runs and never starts again; and which change of the card this run builds,
+    #: which names its branch (`namespace.job_branch`) so it never pushes over the merged one.
+    #: Defaults are a first run, so a history that predates them reads exactly what it did.
+    another_pass: str = ""
+    passes_spent: int = 0
+    change: int = 0
+
+    def traits(self) -> BoxTraits:
+        """What the WORKFLOW may ask about this job's box, with no I/O: the stamped traits, else the
+        built-in table. Read the field's comment for why the two are not the same lookup."""
+        if self.box is not None:
+            return self.box
+        return box_traits(self.sandbox)
+
+
+class RunJobInput(BaseModel):
+    project: str
+    issue: str
+    sandbox: str = Field(default_factory=default_sandbox)
+    image: str = Field(default_factory=lambda: DEFAULT_BOX_IMAGE)
+    review: bool = True
+    # C2 (perfect resume): an OPAQUE token from a prior PAUSED attempt. When set, the run
+    # RESUMES that attempt (restore the partial worktree from its pushed branch + hand the
+    # handle to the agent so it continues its session) instead of starting fresh — so a
+    # rate-limit pause doesn't replan/re-implement. The core never interprets it. None → fresh.
+    resume_handle: str | None = None
+    # Which lifecycle-loop iteration this is (0-based). Folded into the launcher's idempotency
+    # scope so an operator "Resume" after an impediment launches a FRESH task instead of
+    # reconciling the PREVIOUS iteration's stale (still-STOPPED, ≤1h in ECS) pr_open result —
+    # same fix shape as CiRepairInput.attempt (audit MED).
+    attempt: int = 0
+    # Cumulative agent turns already spent on this ticket (prior attempts) — feeds the
+    # ticket-wide effort budget (ADR-0013 D4).
+    spent_turns: int = 0
+    # A human's answer to a DecisionRequest this ticket parked on, already resolved to injectable
+    # text ("DECISION A — Trust only configured proxies"). Carried into the box so the agent
+    # proceeds with the chosen option instead of re-asking. Empty on a normal run.
+    decision: str = ""
+    #: What the card's requester said is still wrong with its last change, which merged — and
+    #: which change of the card this run builds (#448 slice 4, `JobParams`). Empty and 0 on every
+    #: first run.
+    another_pass: str = ""
+    change: int = 0
+
+
+class PreflightInput(BaseModel):
+    """The pre-Fargate sizing gate's input (ADR-0013 D2) — runs on the WORKER."""
+
+    project: str
+    issue: str
+
+
+class PreflightVerdict(BaseModel):
+    """The sizer's parsed verdict. Degrade-safe by construction: anything that goes wrong
+    (cache, agent, parsing) yields verdict='fit' with `degraded` set — the job then runs
+    exactly as it would have without preflight; the gate can only ever help, never block."""
+
+    verdict: str = "fit"  # fit | split | unclear
+    estimated_files: int | None = None
+    reasons: str = ""
+    children: list[dict] = []  # [{title, objective, criteria:[...]}] — only for split
+    questions: list[str] = []  # only for unclear
+    #: the files or directories the sizer expects the change to touch — [] when it could not
+    #: tell. Not a sizing input: it is what lets the plan ask how much the bundle already knows
+    #: about that area before anything is spent (issue #33, decision 2).
+    touches: list[str] = []
+    degraded: str | None = None  # why the gate fell back to fit (None = clean judgment)
+
+
+class GatherInput(BaseModel):
+    """The gather after the sizing (ADR-0048 §1) — runs on the WORKER, in its own activity, with
+    the sizer's `touches` as the only thing it knows about the change."""
+
+    project: str
+    issue: str
+    touches: list[str] = []
+
+
+class GatherVerdict(BaseModel):
+    """What the gather did. `proceed` is every path that ends in the job running as before — the
+    gather was off, nothing was dark, everything was established, nobody the tracker knows could
+    be asked, or the gather itself failed (`degraded` says why, never silently). `asked` means the
+    question is on the card, the card is parked and a loop is open: the job ends `skipped`."""
+
+    verdict: str = "proceed"  # proceed | asked
+    note: str = ""            # one line for the journal and the operator
+    authored: int = 0         # concepts written and published before the plan
+    established: int = 0      # questions the product role settled from the context
+    asked: int = 0            # questions left for the requester
+    degraded: str | None = None
+
+
+class SplitInput(BaseModel):
+    """Create the .a/.b children for an oversized parent (ADR-0013 D3)."""
+
+    project: str
+    issue: str
+    children: list[dict]  # the sizer's proposed decomposition
+    reasons: str = ""
+
+
+class MergeCheckInput(BaseModel):
+    project: str
+    pr_url: str
+
+
+class CiRepairInput(BaseModel):
+    """One CI-repair pass on an open PR (ADR-0004): the durable loop calls it when CI is red."""
+
+    project: str
+    issue: str
+    pr_url: str
+    sandbox: str = Field(default_factory=default_sandbox)
+    # Which repair attempt this is (0-based). Folded into the launcher's idempotency scope so
+    # a SECOND attempt launches a fresh task instead of reconciling the FIRST attempt's stale
+    # (still-STOPPED, ≤1h in ECS) result — otherwise the repair cap of 2 collapses to 1.
+    attempt: int = 0
+    #: which change of the card the pull request is (#448 slice 4) — it names the branch
+    change: int = 0
+
+
+class AdjustedInput(BaseModel):
+    """A person's adjust pass rewrote the pull request (#413, #448): the card's door records
+    `adjusted`, the live preview is rebuilt from the new head, and the requester is told the pass
+    is ready — once per pass, keyed by its number, never folded into the first pass's telling."""
+
+    project: str
+    issue: str
+    pr_url: str = ""
+    pass_number: int = 1
+    by: str = ""
+    instruction: str = ""
+
+
+class AdjustInput(BaseModel):
+    """One repair pass on an open PR driven by a HUMAN's own words (#68, C-32).
+
+    The same shape as `CiRepairInput` plus the instruction, and it reaches the same machinery —
+    `machine.repair_ci` checks out the EXISTING branch, runs one agent pass, and pushes to the
+    same PR. The only difference is what fills the prose slot: a CI log when the build is red, a
+    person's sentence when they read the diff and want something changed. Keeping the branch and
+    the PR means the review history and the ticket's thread stay in one place, which is what the
+    card asks for.
+    """
+
+    project: str
+    issue: str
+    pr_url: str
+    sandbox: str = Field(default_factory=default_sandbox)
+    #: which adjust pass this is (1-based), folded into the launcher's idempotency scope for the
+    #: same reason `CiRepairInput.attempt` is — otherwise a second pass reconciles the first's
+    #: stale result and the cap of 2 collapses to 1.
+    attempt: int = 1
+    #: what the human asked for, verbatim and already bounded by the caller.
+    instruction: str = ""
+    #: where the pass's words come from (#330): `""`, a person's own instruction above; or
+    #: `REVIEW_THREAD`, the comments people left on the pull request, read by the worker when
+    #: the pass starts. A history from before this field carries `""` and means what it meant.
+    source: str = ""
+    #: who asked for the pass, for the note the pull request carries about it.
+    by: str = ""
+    #: which change of the card the pull request is (#448 slice 4) — it names the branch
+    change: int = 0
+
+
+#: `AdjustInput.source` for a pass whose words are the pull request's review comments (#330).
+REVIEW_THREAD = "review_thread"
+
+
+class ReviewPassInput(BaseModel):
+    """One re-read of an open PR by the independent reviewer, asked for by a person (#181).
+
+    NEITHER `CiRepairInput` NOR `AdjustInput`, and the difference is the point: this pass writes
+    nothing. It checks the branch out, reads the diff and publishes a verdict — so it carries no
+    prose slot, and the `attempt` below exists for the same idempotency reason theirs do rather
+    than to bound a repair.
+    """
+
+    project: str
+    issue: str
+    pr_url: str
+    sandbox: str = Field(default_factory=default_sandbox)
+    #: which re-review this is (1-based), folded into the launcher's idempotency scope — without
+    #: it a second ask would reconcile the first one's stale STOPPED task and return its verdict.
+    attempt: int = 1
+    #: which change of the card the pull request is (#448 slice 4) — it names the branch
+    change: int = 0
+
+
+class PromoteInput(BaseModel):
+    project: str
+    issue: str
+    #: WHICH BOX RUNS THE PROMOTION. Neither promotion input carried one, and the activity behind
+    #: them launched a vendor's task unconditionally — so a deployment on any other box reached the
+    #: promotion tail and died on that vendor's missing environment. A field with a default
+    #: deserialises on the histories in flight.
+    #:
+    #: `""` AND NOT `default_factory=default_sandbox`, unlike its siblings above, because THESE TWO
+    #: ARE CONSTRUCTED INSIDE THE WORKFLOW BODY, where a factory that reads the environment runs
+    #: under replay — measured: the promotion tests hung at the first
+    #: `execute_activity(promote_staging, …)` when the factory was tried. The workflow names the
+    #: JOB'S box here (`JobWorkflow._promotion_box`, behind `patched("promotion-box-kind")`);
+    #: `""` is what a history from before that marker sends, and means "the deployment's box",
+    #: which the ACTIVITY resolves (`_run_promotion`) — where the worker's environment was being
+    #: read implicitly all along.
+    sandbox: str = ""
+
+
+class ReleaseInput(BaseModel):
+    project: str
+    issue: str
+    version: str
+    approver: str
+    comment: str = ""
+    #: see `PromoteInput.sandbox`
+    sandbox: str = ""
+
+
+class GateSealInput(BaseModel):
+    """One human gate's answer, as the worker must check it before acting on it (`gate_seal`).
+    The workflow id is NOT a field: the activity reads it from its own context, so an answer
+    sealed for one job can never be presented as another's."""
+
+    kind: str
+    fields: list[str]
+    seal: str = ""
+
+
+class TicketRef(BaseModel):
+    """A project + issue reference — for cheap read-only lookups (e.g. the ticket title
+    the workflow stamps into its memo so the panel can show it next to the number)."""
+
+    project: str
+    issue: str
+
+
+class AskInput(BaseModel):
+    """A human's free-text question for the tech-lead, dispatched to the WORKER.
+
+    Exists because `ask` used to execute in whichever process served the request — and the
+    panel's process has (correctly) no harness credential, so the tech-lead's "answer" was the
+    CLI's own "Not logged in · Please run /login". The agent runs where agents run."""
+
+    project: str
+    question: str
+    #: The catalogue rows the ASKER may perform, decided at the door by `actions.proposable(by)`
+    #: and carried as data (#121). The worker has no actor and must not build one: a tech-lead that
+    #: resolved authority for itself would be granting it.
+    #:
+    #: DEFAULTS TO EMPTY, which `conversation.answer` reads as resume/skip — the pair that was
+    #: hardcoded before this field existed. An AskWorkflow already in flight therefore deserialises
+    #: into exactly the behaviour it was started with.
+    can: list[str] = []
+    #: THE CONVERSATION SO FAR, rendered at the door (#168). Every question used to be turn one:
+    #: `_remember` wrote both halves of the thread on every turn and nothing under `techlead/` ever
+    #: read them, so the tech-lead could not know what it had said two hours earlier — which is
+    #: half of #159 (it re-dictated a command it had already been told was unexecutable) and the
+    #: reason it read as a stranger each time.
+    #:
+    #: RENDERED AT THE DOOR AND CARRIED AS DATA, exactly like `can` one field up: the store lives
+    #: where the question arrived and the worker must not acquire a second way to reach it.
+    #: BOUNDED at the door too — token-efficiency is one of the three promises, so this is a
+    #: character budget, not a turn count.
+    thread: str = ""
+
+
+class ProductAskInput(BaseModel):
+    """A human's request for the PRODUCT role to draft, dispatched to the WORKER.
+
+    KEPT FOR THE WORKFLOWS ALREADY IN FLIGHT, and for nothing else (#266 slice 2). `product_ask`
+    is gone — the panel's box and the conversation are one row, `product_say`, on the one turn
+    engine — but a `ProductAskWorkflow` started before a deploy still replays with this payload,
+    and its activity answers "ask again" (`activities.product_role_ask`). Remove both after one
+    release.
+
+    THE SAME DEFECT AS `AskInput` ONE CLASS UP, and it was already live here — the row shipped
+    drafting in whichever process served the request, behind a check that the harness BINARY was
+    on this process's PATH.
+
+    THAT CHECK PASSES ON THE PANEL. Measured in the running container rather than read off the
+    docstring: `docker-compose.yml` builds the panel from `docker/worker.Dockerfile`, which ends
+    in `npm install -g @anthropic-ai/claude-code`, so `claude` is at `/usr/local/bin/claude` on
+    exactly the process the guard was written to stop. What the panel has not got is the
+    CREDENTIAL (`CLAUDE_CODE_OAUTH_TOKEN` is unset there, by design) and the docker socket —
+    neither of which was being measured. So the guard would have waved the request through to an
+    unauthenticated agent and returned its "Not logged in · Please run /login" as the product
+    role's own answer, which is the LATEST-48 defect verbatim, in a new capability.
+
+    Dispatching makes it impossible rather than detected: the agent runs where agents authenticate.
+
+    `asked_by` TRAVELS because the role records who asked in the requirement it drafts, and an
+    activity that inferred it from the worker's own identity would attribute every client's
+    requirement to the bot."""
+
+    project: str
+    question: str
+    asked_by: str = ""
+    #: Which conversation this turn belongs to (#33) — `person:<id>` or `visitor:<cookie>` from
+    #: the panel, a chat thread from a channel, "" for the project-wide one. The row's answer is
+    #: recorded under it and its earlier turns are handed to the role, so the web's free-text box
+    #: is a conversation and not a sequence of first questions.
+    thread: str = ""
+
+
+class ProductBreakdownInput(BaseModel):
+    """One accepted requirement, to be turned into units of work ON THE WORKER.
+
+    THE CARD'S OWN ACCEPTANCE TEST RAN THROUGH SLACK AND NOWHERE ELSE. #98 states it as *"a
+    deployment without slack_sdk can propose a requirement, accept it and see the card born on the
+    board"*, and the last third of that was unreachable: `ProductModule.accept` writes the
+    agreement and stops, and the accept→`break_down` chain existed only in
+    `runtime/slack/product_channel.py`. Measured: `break_down` and `file_issues` had no production
+    caller anywhere else in the tree.
+
+    ON THE WORKER because `file_issues` runs an agent — `_role().issues_for(sandbox=…)` — so this
+    is the same constraint `product_ask` has, reached by the same route rather than a second one.
+    """
+
+    project: str
+    number: int
+    actor: str = ""
+    #: whether a PERSON asked for this breakdown (the `product_break_down` row) rather than an
+    #: acceptance chaining into it. FALSE BY DEFAULT, and the direction matters: a payload from an
+    #: older panel carries no field, and reading that as "asked for" would turn every automatic
+    #: chain into an explicit request — the one thing that lets `ProductModule.break_down` file
+    #: work for a requirement that describes what the code already does (#182).
+    asked_for: bool = False
+    #: THE CONVERSATION THAT STARTED IT, when one did (#563 slice 18b, ADR-0051 D18 items 1 and 3).
+    #: A conversation does not wait minutes on a breakdown, so it is told what was filed when the
+    #: breakdown ends, and the delivery loop is announced there too (#267 slice 3). `room` is where
+    #: that conversation is held and `requester` who asked. EMPTY for the panel's and the command
+    #: line's doors, which wait on the result as before; a payload from an older caller carries
+    #: none, and is told to nobody.
+    conversation: str = ""
+    room: str = ""
+    requester: str = ""
+    #: the language that conversation speaks, which the sentence it is told is written in — the
+    #: project's when empty (#432: a conversation is answered in its own language)
+    language: str = ""
+
+
+def breakdown_workflow_id(project: str, number: int) -> str:
+    """The one execution a requirement's breakdown runs as, whichever door starts it (ADR-0051
+    D18, #563). The engine holds one RUNNING execution per id, on every host, and refuses a
+    second start while it runs; after it ends, a new start runs again — a retry is allowed."""
+    return f"beeverforge-product-breakdown-{project}-{number}"
+
+
+class ProductQueueInput(BaseModel):
+    """What should start next, proposed ON THE WORKER.
+
+    `propose_queue` reads the client's board and then runs an agent pass to ORDER it — the
+    readiness is arithmetic and true whatever the model says, the ordering is the judgement — so
+    it carries the same constraint `product_ask` and the breakdown do, and reaches the worker by
+    the same route rather than a third one."""
+
+    project: str
+    limit: int = 5
+
+
+class ProductCardInput(BaseModel):
+    """One card rewritten by the product role, ON THE WORKER.
+
+    ONE MODEL FOR TWO VERBS, and only because they are genuinely the same shape: `refine` and
+    `align_card` both check `may_act`, read the board, run ONE agent pass over a single card and
+    then write the ticket body. Same timeout, same reason not to retry — rewriting a client's
+    ticket twice is not idempotent. A third verb that differed in any of those would get its own
+    model rather than a wider `verb`, because the moment the field stops meaning "which of two
+    identical things" it stops documenting anything.
+
+    `requirement` is only read for `align`; `refine` ignores it. Kept explicit rather than
+    optional-by-convention so a caller that forgot it is refused by name."""
+
+    project: str
+    number: str
+    verb: str
+    requirement: int = 0
+    actor: str = ""
+
+
+class ProductBaselineInput(BaseModel):
+    """The brownfield first pass — the whole codebase read and written up, ON THE WORKER.
+
+    IT WRITES. `ProductModule.baseline` runs one whole-repository agent survey and opens a pull
+    request on the client's documentation repo (branch `product/baseline`). Idempotent by asking
+    the forge first: a second run finds the open proposal and reports `existed`, which is what
+    makes the bounded retry below safe.
+
+    `actor` IS CARRIED BECAUSE THE MODULE CANNOT ASK. `baseline` is one of four verbs documented
+    as writing without checking `may_act` — its gate is "one layer up" — so the row asks, and this
+    field is what the row's answer travels on."""
+
+    project: str
+    actor: str = ""
+    via: str = ""
+    areas: list[str] | None = None
+
+
+class ProductNeedsActionInput(BaseModel):
+    """What is parked and WHOSE PROBLEM IT IS, classified on the worker.
+
+    IT LOOKS LIKE A READ AND SPENDS LIKE A WRITE, which is the whole reason this input exists.
+    `review_needs_action` composes a git worktree of both repositories and then runs ONE MODEL
+    CALL PER PARKED TICKET (`product/module.py`) — up to `limit` of them. Its sibling
+    `triage_board` spends nothing and is answered in-process, so copying that row's shape here
+    would run an agent inside the panel container: a place that has the harness binary and
+    neither its token nor the docker socket. That failure passes every test in this repository
+    and appears only in production.
+
+    `limit` IS THE BUDGET, not a page size. It is what stands between a board with three hundred
+    parked tickets and three hundred model calls."""
+
+    project: str
+    limit: int = 10
+    #: WHERE THE REQUEST CAME FROM, carried rather than defaulted. `ProductModule`'s default was a
+    #: chat vendor's name, and is `"api"` — either one is a false statement the day the
+    #: row is reached from the other surface, in the record that says who asked for a pass that
+    #: spends money.
+    via: str = ""
+
+
+class ProductSayInput(BaseModel):
+    """One message to the product role, as `ProductSayWorkflow` carried it — KEPT FOR THE
+    WORKFLOWS ALREADY IN FLIGHT, and for nothing else (#266 slice 3). Remove after one release.
+
+    The row no longer starts a workflow per message: every message goes through the door
+    (`product/door.py`) onto its conversation's workflow (`Arrival`, `ConversationWorkflow`). A
+    `ProductSayWorkflow` started before the deploy still replays with this payload, and its
+    activity now answers "ask again" (`activities.product_role_say`), as `ProductAskInput`'s did
+    one slice earlier.
+
+    WHAT IT WAS (#266 slice 2). It was the conversational half of two — `product_ask`
+    drafted without settling, this settled without drafting — and both halves are now the engine's
+    one turn: it settles, reads the intents, answers, and stages what the role heard as work, so a
+    typed "sim" confirms what the panel staged.
+
+    `thread` IS THE CONVERSATION'S IDENTITY, and it travels rather than being derived: the Slack
+    package keys history by thread, the panel by project, and a row that invented one would split
+    a single conversation across two memories or merge two clients into one."""
+
+    project: str
+    message: str
+    thread: str = ""
+    asked_by: str = ""
+    #: the transport the message arrived through — provenance for every gate the turn reaches
+    #: (`may_act`), so a "funcionou" typed in the panel is recorded as the panel's and not as the
+    #: channel's. Empty means "the row did not say", and the worker reads that as `api`.
+    via: str = ""
+    #: the message's own id, minted by the row, so each reply names the message it answers and
+    #: the workflow id names one message rather than a hash of its words (ADR-0051 D1). Empty for
+    #: an input written before it existed; the engine mints one then.
+    id: str = ""
+
+
+# ── the one door and the conversations behind it (#266 slice 3, ADR-0051 D1–D6) ────────────────
+
+class Arrival(BaseModel):
+    """One message admitted to a conversation — the payload of the signal the door sends.
+
+    FLAT, AND THE ENGINE'S `Message` IS NOT IMPORTED HERE: this module is read inside the
+    workflow's sandbox, and what crosses into a workflow's history is data a replay reads back,
+    never a class whose import pulls in the product role. The door builds it from the `Message`
+    and the workflow hands it back to the worker as a `TurnInput`.
+
+    `id` IS THE DEDUPLICATION KEY: a transport that sends the same message twice — a retry, a
+    double click — is one turn, answered once (`ConversationWorkflow` keeps the ids it has seen).
+    `fast` is the door's reading that the message only asks to be shown something
+    (`engine.reads_only`): decided at the door, where the word list is, so a replay never re-reads
+    a regex that changed under it. `replies` is non-empty only for an INTERNAL EVENT — the outcome
+    of an asynchronous task, already recorded, published without a turn. `language` and
+    `agent_name` are the project's, for the few sentences the conversation says in its own voice
+    (the hand-off at the bound, the apology when a turn could not be run at all)."""
+
+    id: str
+    project: str
+    conversation: str
+    room: str = ""
+    speaker: str = ""
+    text: str = ""
+    in_reply_to: str = ""
+    source: str = ""
+    fingerprint: str = ""
+    via: str = ""
+    language: str = ""
+    agent_name: str = ""
+    fast: bool = False
+    replies: list[dict] = Field(default_factory=list)
+    #: What the speaker was looking at (#266 slice 5) — the page context the row ADMITTED
+    #: (`product/page.py::admit`), carried to the turn as data, never re-read from a browser.
+    context: dict[str, str] = Field(default_factory=dict)
+    #: The files the message carries (#336) — `{id, name, type, size}`, never their bytes.
+    attachments: list[dict] = Field(default_factory=list)
+    #: WHAT THE DOOR KNOWS OF WHO THE MESSAGE IS FOR (#266 slice 6, ADR-0051 D14): the conversation
+    #: is a `direct` one with the role; the transport detected the role mentioned
+    #: (`mentions_role`); the product's memory holds the role speaking in this conversation before
+    #: (`took_part`, read only for a reply that neither of the others made addressed). The
+    #: conversation adds the one thing only it knows — whether the role has been addressed in it
+    #: since — and asks `product/addressing.py::why_addressed`. `mentions_role` DEFAULTS TO YES for
+    #: one reason only: an arrival admitted before this existed was always turned, and a replay of
+    #: its history must read it the same way; the door always says it.
+    direct: bool = False
+    mentions_role: bool = True
+    took_part: bool = False
+    #: WHAT KIND OF ITEM THIS IS in the conversation's line (#267 slice 3). "" is a message — or,
+    #: with `replies`, the answer to one, published the moment it arrives. `EVENT_KIND` is
+    #: something that HAPPENED, which the role announces (`door.announce`): it carries its replies
+    #: like an answer, answers nobody, and waits its turn behind the turn in progress. Defaults to
+    #: a message, so a history written before this reads every arrival as it always did.
+    kind: str = ""
+    #: WHEN IT WAS SAID (#394) — the door's moment, stamped on the message where it came in
+    #: (`engine.Message.at`) and carried to the worker, which records the person's line under it:
+    #: a turn run again after its worker died writes the same row, never a second one. Empty for
+    #: an arrival admitted before this existed; the worker's clock stands in, as it always did.
+    at: str = ""
+
+
+#: The kind of an arrival that is an event the role announces, not a message (`Arrival.kind`).
+EVENT_KIND = "event"
+
+
+class OverheardInput(BaseModel):
+    """A message NOT addressed to the role, to be kept — and nothing else (#266 slice 6, D14).
+
+    Recorded in the product's memory, marked as overheard, so it can be searched and is never put
+    in a turn's prompt. No model, no ceiling, no reply: `ConversationWorkflow` hands it here
+    instead of to a turn."""
+
+    project: str
+    conversation: str
+    room: str = ""
+    speaker: str = ""
+    text: str
+    id: str
+    in_reply_to: str = ""
+    #: When it was said (#394): the row it is kept under, so a retried keep is one row.
+    at: str = ""
+
+
+class ConversationInput(BaseModel):
+    """What one conversation's workflow starts with — and what it carries across continue-as-new.
+
+    `product` is the PRODUCT's key (`product/key.py`), never a registry project's: two registry
+    projects of one product share one conversation key space, so the same conversation reached
+    from either page is one workflow and one queue (ADR-0051 D2, D3). `debounce_seconds` and
+    `bound_seconds` are the door's configuration at the moment it started the conversation
+    (`door.Settings`), carried rather than read, because a workflow may not read its environment.
+
+    `seen`, `outbox` and `pending` are the state a continue-as-new hands to the next run: the
+    message ids already admitted (so a retry arriving after the new run began is still one
+    message), the replies published recently (so a waiter that asked just before the move still
+    finds its answer), and — only if a message was admitted in the same instant — what was not
+    yet turned. `seq` is the number the last thing heard or published was given, so the panel's
+    socket, which reads the conversation by that number (`ConversationWorkflow.watch`), is never
+    handed a count that started again under its cursor. `joined` is whether the role takes part
+    in the conversation yet — addressed in it, or published in it (#266 slice 6, ADR-0051 D14) —
+    so a reply written after the move is still read as one; `overheard` is what was kept and not
+    yet recorded when the run moved on."""
+
+    product: str
+    conversation: str
+    debounce_seconds: float = 3.0
+    bound_seconds: float = 90.0
+    seen: list[str] = Field(default_factory=list)
+    outbox: list[dict] = Field(default_factory=list)
+    pending: list[Arrival] = Field(default_factory=list)
+    seq: int = 0
+    joined: bool = False
+    overheard: list[Arrival] = Field(default_factory=list)
+
+
+class TurnInput(BaseModel):
+    """One turn of a conversation, handed to the worker: the messages ONE speaker sent while the
+    role was busy or still hearing them out, as one message (ADR-0051 D5's coalescing).
+
+    `id` is the last of them — the one the answer answers — and `ids` all of them, so each is
+    marked answered by the one reply. `product` travels for the concurrency cap, which is keyed by
+    product (`product/cap.py`); `project` is the registry project the speaker was on, which is the
+    module the turn answers with."""
+
+    product: str
+    project: str
+    conversation: str
+    room: str = ""
+    speaker: str = ""
+    text: str
+    id: str
+    ids: list[str] = Field(default_factory=list)
+    in_reply_to: str = ""
+    source: str = ""
+    fingerprint: str = ""
+    via: str = ""
+    language: str = ""
+    #: The page the LAST of the turn's messages was written on (#266 slice 5): the one the answer
+    #: answers, and so the one "why did this stop?" was asked beside.
+    context: dict[str, str] = Field(default_factory=dict)
+    #: The files the turn's messages carried (#336), in the order they were sent.
+    attachments: list[dict] = Field(default_factory=list)
+    #: When the LAST of the turn's messages was said (#394) — the one `id` names, and the moment
+    #: the person's line is recorded under, however many attempts the turn takes.
+    at: str = ""
+
+
+class TurnProgress(BaseModel):
+    """WHAT A RUNNING TURN IS DOING NOW, told by the worker to its own conversation (#395).
+
+    `turn` is the turn's id (`TurnInput.id`, the last message it answers); `stage` one of
+    `product.progress.STAGES`; `words` the stage in the person's language, composed on the worker
+    by `voice.stage_text` — so the conversation shows it and names it in the hand-off without
+    composing anything itself. PRESENCE, not a reply: the conversation keeps the latest one per
+    working turn, shows it to the transports watching, and forgets it when that turn is answered —
+    it is never published, recorded or read back to the model."""
+
+    turn: str
+    stage: str
+    words: str = ""
+
+
+class ReportInput(BaseModel):
+    """A result coming BACK through the door: the answer of a turn that outlived its bound
+    (ADR-0051 D6), sent as an internal event onto the conversation it belongs to.
+
+    `id` is the event's own, derived from the turn's (`<turn id>:late`), so a retried report is the
+    same event and is published once."""
+
+    project: str
+    conversation: str
+    room: str = ""
+    id: str
+    in_reply_to: str
+    replies: list[dict] = Field(default_factory=list)
+
+
+class ProductAnswerInput(BaseModel):
+    """A staged proposal ANSWERED by token, resolved ON THE WORKER (#105).
+
+    IT IS ON THE WORKER BECAUSE OF WHAT A YES CAN BE. Most confirmations are cheap — a fact, a
+    decision, a drop — but two of the nine kinds spend an agent: `accept` chains into
+    `break_down` (`file_issues` runs a pass) and `align` ends in `_role().ask_json`. Which one a
+    token names is not knowable until the staged entry is read, and the entry may only be read
+    once, by the compare-and-swap that performs it. So the process is chosen by the WORST case,
+    not the common one — a CLI on somebody's laptop or the panel's container would otherwise run
+    an agent with no credential for it, which passes every test here and breaks only in
+    production.
+
+    `via` TRAVELS because it is the provenance of a write in a client's documentation: an answer
+    given on the panel recorded as a Slack one is a lie in the one record that says who
+    authorised the change."""
+
+    project: str
+    token: str
+    approved: bool
+    actor: str = ""
+    via: str = ""
+    #: The click's own id, minted by the page that drew its answer (#402) — the person's line is
+    #: recorded under it and the answer as the reply to it, so the page finds that answer in the
+    #: transcript by identity. Empty from a caller with none: the gate mints one.
+    message_id: str = ""
+
+
+class HoldSyncInput(BaseModel):
+    """The WORKFLOW reconciling the board to a parked state. Normally the in-job orchestrator
+    sets the tracker status, but a crashed/timed-out job dies before it can — leaving the ticket
+    reading 'In progress' while it actually needs a human. The workflow calls this so the board
+    tells the truth. `state` is a JobState value; every impediment state maps to Needs Action."""
+
+    project: str
+    issue: str
+    state: str = "on_hold"
+    note: str = ""
+    #: THE PARK THE WORKER ALREADY APPLIED, when the box handed it back (ADR-0055 D7, #414): the
+    #: id of its transition in the card's record, so this reconcile is answered from that row and
+    #: the card is not parked a second time. `""` — a park the workflow made itself (a crash, a
+    #: timeout, the merge watch), or an input recorded before this field — decides afresh.
+    event_id: str = ""
+
+
+class ReadyForYouInput(BaseModel):
+    """A pull request a PERSON must decide just entered the merge watch (#401): the product role
+    tells the card's requester, in the conversation they asked in. `verdict` is the reviewer's
+    reading as the workflow holds it (`JobWorkflow._verdict`), or None when there was none."""
+
+    project: str
+    issue: str
+    pr_url: str
+    verdict: dict | None = None
+
+
+class MergedInput(BaseModel):
+    """A card's pull request merged, whoever merged it (#448 slice 3): the product role tells the
+    card's requester, once per card and pull request. `stages_follow` is whether the job promotes
+    the change through declared stages next — the delivery is then announced only after them, so
+    the requester hears this now; with none, the delivery says it at the job's end instead."""
+
+    project: str
+    issue: str
+    pr_url: str
+    stages_follow: bool = False
+
+
+class DeployWatchInput(BaseModel):
+    """The abandoned post-merge deploy-watch child workflow's input (ADR-0005). Carries the
+    merged PR so the watcher resolves the merge commit SHA itself, plus the deploy workflow to
+    observe and a label for the notification. Watching only NOTIFIES; it never gates."""
+
+    project: str
+    issue: str
+    pr_url: str
+    workflow: str  # the deploy workflow to observe (`gh run list --workflow`)
+    env: str = "dev"
+    timeout_minutes: int = 30
+    #: Where a person looks once it is green (`post_merge_deploy.url`). Defaulted so an in-flight
+    #: watch started before #122 keeps deserialising.
+    url: str = ""
+    #: WHETHER THIS DEPLOY IS THE CARD'S LAST STAGE (#448 slice 5): the project declares the watch
+    #: and no `environments:`, so the job left the card In review at the merge and the watch is
+    #: what settles it — Done and announced when green, held for a person when not. False for a
+    #: watch that only informs, and for every watch started before this field.
+    delivers: bool = False
+
+
+class DeployStatusInput(BaseModel):
+    """One deploy-status probe: read the deploy workflow's run on a merge commit (ADR-0005)."""
+
+    project: str
+    pr_url: str
+    workflow: str
+
+
+class DeployNotifyInput(BaseModel):
+    """Emit the deploy-watch's outcome via the project's notifier (ADR-0005)."""
+
+    project: str
+    issue: str
+    status: str  # "success" | "failure" | "timeout"
+    env: str = "dev"
+    run_url: str | None = None
+    #: Where a PERSON looks, from the manifest's `post_merge_deploy.url` (#122). Carried on the
+    #: input rather than read inside the activity so the WORKFLOW's history records the address
+    #: that was actually announced — a manifest edited mid-watch cannot rewrite what was said.
+    url: str = ""
+
+
+class PollInput(BaseModel):
+    """One poller tick: which sandbox new jobs run on."""
+
+    sandbox: str = Field(default_factory=default_sandbox)
+
+
+class ScanInput(BaseModel):
+    project: str
+    board_owner: str
+    board_number: str
+    pickup_status: str = "TO-DO"
+
+
+class StartJobsInput(BaseModel):
+    project: str
+    issues: list[str]
+    sandbox: str = Field(default_factory=default_sandbox)
+
+
+class CoordinatorItem(BaseModel):
+    """A parked decision handed to the project's tech-lead coordinator for a humanized take.
+    Carries the JobWorkflow id so the coordinator can signal its advice back to that job."""
+
+    project: str
+    issue: str
+    job_id: str
+    kind: str = ""  # plan | merge | impediment | rate_limit …
+    question: str = ""
+    context: str = ""
+    options: list[dict] = []  # [{key,label,consequence,recommended}]
+    note: str = ""
+
+
+class CoordinatorSayInput(BaseModel):
+    """A one-line update the coordinator narrates (a ticket picked up, a merge, a deploy). Shown
+    as a panel toast now; the SAME data is what a Slack/PO bot will post later (API-first)."""
+
+    project: str
+    text: str
+    kind: str = ""  # pickup | merge | deploy | ...
+
+
+class CoordinatorInput(BaseModel):
+    """The always-alive coordinator's input — one per project. `seq0`/`recent` carry the message
+    log across continue-as-new so ids stay monotonic and the panel doesn't lose recent toasts."""
+
+    project: str
+    seq0: int = 0
+    recent: list[dict] = []
+
+
+class JobMetricsInput(BaseModel):
+    """Cost/effort telemetry the workflow persists on completion (observability.metrics → the
+    cost dashboard). Carries the per-invocation breakdown (agent_runs, from the RunResult) plus
+    the job summary — final state, wall-clock seconds, total cost, PR. `ts` is the ISO completion
+    time the workflow stamps (deterministic: workflow.now()), reused as each record's sort key."""
+
+    project: str
+    issue: str
+    ts: str
+    state: str = ""
+    title: str = ""
+    wall_s: float | None = None
+    total_cost_usd: float | None = None
+    pr_url: str = ""
+    # which A/B arm the run was in (off | injected | unavailable) — ADR-0017's gate dimension
+    knowledge: str = ""
+    # each: {role, model, harness, cost_usd, num_turns, input_tokens, output_tokens}
+    agent_runs: list[dict] = []
+
+
+class KnowledgeRefreshInput(BaseModel):
+    """The post-merge Knowledge Pipeline run for one project (§11 / §22). `issue` is carried for
+    the log line only — the refresh is about the BASE BRANCH's new state, not about one ticket."""
+
+    project: str
+    issue: str = ""
+
+
+class ReviewLoopInput(BaseModel):
+    """A merged ticket whose independent review rejected it or raised something critical.
+
+    Carried as its own input rather than the whole ReviewResult: the workflow already decided this
+    is worth following up, and shipping the full review through an activity boundary would move a
+    lot of text to re-derive a judgement that has been made."""
+
+    project: str
+    #: `str`, like every other `issue` in this file (#69). It was the ONE `int` among eighteen,
+    #: and it is constructed from `JobParams.issue`, which is a `str` — so on a Jira/ADO
+    #: deployment pydantic REFUSED to build this input, the workflow's `except Exception` around
+    #: the call swallowed it, and the review finding was announced once and never chased. The
+    #: whole open-loop mechanism (ADR-0021) could not start on those deployments, and the log line
+    #: said only "could not record the review finding for follow-up".
+    issue: str
+    decision: str
+    score: int = 0
+    detail: str = ""
+    pr_url: str = ""
+
+
+# ── a preview of the product, on demand (ADR-0050 D6; the design on #265, §5.5) ─────────────────
+
+
+class PreviewWatching(BaseModel):
+    """A unit that is UP and being watched, carried across the workflow's own continue-as-new: a
+    preview lives up to a week, and a history that grew by a watch every minute for a week would
+    outgrow what the engine keeps. The new run picks up the watch; it does not start anything."""
+
+    expires_at: int
+
+
+class PreviewParams(BaseModel):
+    """The input of `PreviewWorkflow` — one unit of one project (`preview--<project>--<unit>`).
+
+    `runtime` IS STAMPED, NOT LOOKED UP, for the box's reason (`JobParams.sandbox`): the kind
+    decides which daemon agent-written code runs on, so it is the deployment's, read where the
+    params are built and carried to the workflow as data; the row itself is built by an activity
+    (`adapters/preview/registry.py`'s two-lookup rule). `start_timeout_minutes` is the operator's
+    (`PreviewPolicy`), read by the row that starts the workflow, because the workflow sets its
+    activities' timeouts and may not read a registry."""
+
+    project: str
+    unit: str
+    started_by: str = ""
+    runtime: str = Field(default_factory=default_preview_runtime)
+    start_timeout_minutes: int = 30
+    #: How often a live unit is looked at. A crashed exposed service is `failed` within this.
+    watch_seconds: int = 60
+    watching: PreviewWatching | None = None
+
+
+class PreviewStepInput(BaseModel):
+    """What every preview activity is told: which unit, on which runtime, on whose behalf — and,
+    for the ends, why."""
+
+    project: str
+    unit: str
+    runtime: str
+    started_by: str = ""
+    start_timeout_minutes: int = 30
+    why: str = ""
+    #: False on a rebuild's down: the unit is about to start again, and an `ended` record in
+    #: between would be a card that says it is over while it is being rebuilt.
+    record: bool = True
+
+
+class PreviewPlanInput(BaseModel):
+    step: PreviewStepInput
+    layout: Layout
+
+
+class PreviewUpInput(BaseModel):
+    step: PreviewStepInput
+    plan: PreviewPlan
+
+
+class PreviewStepResult(BaseModel):
+    """What a bring-up step answered. `ok` False has already been recorded, with every reason, by
+    the step itself; the workflow only needs to know it is over."""
+
+    ok: bool
+    why: str = ""
+    layout: Layout | None = None
+    plan: PreviewPlan | None = None
+    expires_at: int = 0

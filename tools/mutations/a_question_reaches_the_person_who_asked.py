@@ -1,0 +1,65 @@
+"""The question reaches the person who asked (ADR-0048 §5-§7) — the cuts that would answer the
+bot's own question, record nobody's word as somebody's, or leave a card waiting for ever."""
+
+TEST = "tests/test_a_question_reaches_the_person_who_asked.py"
+# 162j proved the same reach when the question was the tracker's; its claims are the rows below.
+# Named on both ends (2026-09-08): a retirement one plan declares and the other confirms.
+SUPERSEDES = ("162j_a_person_is_asked_of_their_tracker.py",)
+
+MUTATIONS = [
+    ("with no requester recorded, an anonymous comment answers",
+     "beeverforge/knowledge/gather.py",
+     "    if not who:\n        return None\n    for c in comments or ():\n",
+     "    if False:\n        return None\n    for c in comments or ():\n"),
+
+    ("the sweep accepts the platform's own comment as the answer",
+     "beeverforge/knowledge/gather.py",
+     "        if author != who or (own and author == own):\n",
+     "        if author != who:\n"),
+
+    ("a comment older than the question counts as its answer",
+     "beeverforge/knowledge/gather.py",
+     "        if asked_at and when and when <= asked_at:\n",
+     "        if False:\n"),
+
+    ("the answer is recorded in the bot's name",
+     "beeverforge/runtime/temporal/activities.py",
+     "            answer=hit.body, said_by=hit.author, where=f\"card #{ref}\")\n",
+     "            answer=hit.body, said_by=ctx.get(\"poster\", \"\"), where=f\"card #{ref}\")\n"),
+
+    ("a term the context already holds is a failure",
+     "beeverforge/runtime/temporal/activities.py",
+     "        recorded = bool(result.ok or result.existed)\n",
+     "        recorded = bool(result.ok)\n"),
+
+    # RETIRED 2026-10-01 (#413): "the loop closes on a card that could not be returned" — the
+    # answer goes through the card's door now, which records it and closes the question whatever
+    # the tracker did with the move; the move that did not land is a failed effect the hourly round
+    # applies again (`test_a_card_that_could_not_be_returned_is_returned_by_the_next_round`,
+    # and `412_…`'s "the sweep never applies what failed again").
+
+    ("the question is chased every round",
+     "beeverforge/runtime/temporal/activities.py",
+     "                                after_hours=CARD_QUESTION_CHASE_AFTER_HOURS, ts=now)\n",
+     "                                after_hours=0.0, ts=now)\n"),
+
+    ("the people map is guessed between two logins",
+     "beeverforge/product/requester.py",
+     '    return hits[0] if len(hits) == 1 else ""\n',
+     '    return hits[0] if hits else ""\n'),
+
+    ("the forge identity is written bare, and @login is not YAML",
+     "beeverforge/product/authoring.py",
+     '        [f"requester_forge: {json.dumps(forge, ensure_ascii=False)}"] if forge else []) + (\n',
+     '        [f"requester_forge: {forge}"] if forge else []) + (\n'),
+
+    ("the prose line loses its parenthesis",
+     "beeverforge/product/authoring.py",
+     '    return f"{who} ({forge})" if forge and forge != who else who\n',
+     '    return who\n'),
+
+    ("a person's answer is filed as a machine's",
+     "beeverforge/knowledge/gather.py",
+     "        generated_by=f\"human:{(by or '').strip() or 'unknown'}\", generated_at=at,\n",
+     "        generated_by=\"machine:card-question\", generated_at=at,\n"),
+]

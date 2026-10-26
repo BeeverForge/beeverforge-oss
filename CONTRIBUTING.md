@@ -1,0 +1,270 @@
+# Contributing
+
+Contributions are welcome, and the bar is the one the codebase already holds itself to.
+
+## Setting up: from a clone to a green suite
+
+On a clean machine, in this order:
+
+```bash
+git clone https://github.com/BeeverForge/beeverforge-oss.git
+cd beeverforge-oss
+python3.12 -m venv .venv     # any Python >= 3.12 (pyproject.toml's requires-python); CI runs 3.12
+source .venv/bin/activate    # make calls whichever pip, python and ruff come first on PATH
+make install                 # pip install -e '.[dev]', plus each package under addons/ where there is one
+make lint                    # ruff check beeverforge/ tests/, then shellcheck over the scripts that ship
+make test                    # python -m pytest -q
+```
+
+**The `[dev]` extra is not optional.** It carries the test tools (pytest, pytest-asyncio,
+pytest-randomly, pytest-xdist, ruff) *and* `temporalio`, because the suite covers the durable
+runtime. The suite does not skip what it cannot import: after a plain `pip install -e .`,
+collection stops with `ModuleNotFoundError: No module named 'temporalio'` and pytest reports
+`Interrupted: N errors during collection`. That is an install without the extra, not a broken
+repository.
+
+**What the suite uses besides Python.** None of these comes from pip:
+
+| tool | what uses it | without it |
+|---|---|---|
+| `git` | the tests build real repositories (`git init -b main`, so git 2.28 or later) and the guards read `git ls-files` | needed |
+| `make` | the three targets above, and the guards that run the Makefile to read what it does | needed |
+| Docker CLI with Compose plugin | two tests run `docker compose config` over the deployment file; these do not need a daemon | those two tests skip without the CLI |
+| Docker daemon running | the installer's end-to-end container and the container box streaming across `docker exec`; the latter also needs the box image built. The live preview tests also BUILD the S1 sample product, so they need `node:20-slim`, `python:3.12-slim` and `postgres:16` from a reachable registry. One test builds the CLI image with a throwaway root certificate in a copy of its context, so it needs `python:3.12-slim`, `docker:28-cli` and `docker/compose-bin:v2.32.4` from a reachable registry, PyPI, and `openssl` on the host | those tests skip when the daemon does not answer; the live preview tests skip when S1 cannot be built, each naming the image it could not get (CI sets `TEST_REQUIRE_DOCKER=1`, under which the live preview tests fail instead, on a missing daemon too, and so does the preview test that a unit network reaches nothing of the host, which shares their guard; the other daemon tests still skip). The CLI image build skips naming the image it could not pull, or `openssl`; under `TEST_REQUIRE_DOCKER=1` a missing daemon or an image it cannot pull fails it instead. One test builds the worker image's `toolbox` stage to read the pinned codex's own `--help`, so it needs `node:20-slim` and the npm registry; without a daemon it skips, naming docker and `CODEX_PINNED_BIN` (a codex-cli of the pinned version it reads instead); under `TEST_REQUIRE_DOCKER=1` it fails instead, and a build or a run that fails fails it |
+| `shellcheck` | `make lint` checks `install.sh`, `docker/install-addons.sh` and `scripts/*.sh` with a local shellcheck if there is one, else with `koalaman/shellcheck:stable` in Docker | with neither, `make lint` refuses by name and exits non-zero — it does not skip |
+| `sha256sum` | the tests that drive `install.sh` and assemble a release | those tests skip, naming the missing tool |
+| Node.js (`node`) | the tests that execute the panel's JavaScript | they skip, each saying `node is not on PATH` |
+| the network, once | the durable-runtime tests start a throwaway Temporal server of their own, and the first run per `temporalio` version downloads its binary (about 65 MB) into the temp directory | setup errors until the binary can be downloaded; this is a hard prerequisite, not a skip |
+
+**Your shell's environment.** The suite deletes the variables that would let a test act on
+something real — forge, chat, engine, harness and cloud credentials such as `GITHUB_TOKEN`,
+`GH_TOKEN`, `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN`, and the harness, model and endpoint
+overrides — before collection and again before every test (`LIVE_CREDENTIALS` and
+`_axis_overrides()` in `tests/conftest.py`). It refuses any connection to a Temporal server a test
+did not start itself, so a local compose stack being up does no harm, and it commits under its own
+git identity, so a machine with none, or with `commit.gpgsign` on, runs it the same. It also
+names a temporary registry before collection and a separate one for every test, so the suite
+never reads or writes the registry named by your `BEEVERFORGE_REGISTRY` or the default file in
+your home directory. You do not need to unset it. A regression guard runs a known registry writer
+and an import-time writer with a sentinel registry and verifies that the sentinel is unchanged.
+
+**Running it.** `make test` is `python -m pytest -q`: the whole suite (`tests/`, and
+`addons/*/tests` where the tree has them) in one process, in a random order — pytest-randomly
+shuffles every run. The same suite across every core is `python -m pytest -q -n auto`; the fixed
+order the house rules below also ask for is `python -m pytest -q -n auto -p no:randomly`; one file
+is `python -m pytest -q tests/<the file>.py`. Each xdist worker holds the parsed package once it
+runs a guard that reads it (`tests/the_tree_read_once.py`: ~260 MB, and ~450 MB more in a worker
+that runs a guard reading `tests/` too), so a box running `-n 12` should budget that per worker.
+
+**What green looks like.** pytest's last line reads `N passed, M skipped` and some warnings — no
+`failed`, no `error` — and `make test` exits 0. Skips are normal and each says why: in this public
+tree the tests of the add-on packages skip naming `beeverforge-aws`, the checks held to the
+private tree's export list skip saying this is the public tree, and the Docker and Node rows above
+skip where those are absent. No failure is known to depend on the machine: on a setup made this
+way, a `failed` or an `error` is a finding.
+
+## Reading the system first
+
+The user-facing path (`docs/README.md`) deliberately calls everything else "internal". For a
+contributor that is the wrong filter — those pages are your map:
+
+| | |
+|---|---|
+| [README.md](README.md) §The shape | the package tree in one screen: contracts, adapters, orchestrator, runtime |
+| [docs/architecture.md](docs/architecture.md) | how the pieces fit, and the vocabulary the code uses |
+| the `beeverforge-aws` add-on package | the durable engine realised on one cloud — poller, workflow, activities, replay — is drawn in that package's own documents, outside this tree |
+| [docs/adr/](docs/adr/) | **why** — 58 decision records. Read the one nearest your change before arguing with it |
+| [docs/engineering-lessons.md](docs/engineering-lessons.md) | the defects this codebase has actually paid for, with their measurements |
+| [docs/STATUS.md](docs/STATUS.md) | what is proven end to end and what is not |
+| [docs/developer-guide.md](docs/developer-guide.md) | why an agent is given the instructions it is given — `beeverforge explain` and the cascade it prints — and where a developer or an AI engineer may change them |
+
+The single most useful habit: before changing behaviour, find the test whose NAME states the
+property you are about to change. Tests here are named as sentences (`test_a_named_check_is_not_
+dropped.py`) precisely so that this search works.
+
+## The house rules, short
+
+- **Run `make lint` before the suite** — `ruff check beeverforge/ tests/`, then shellcheck. A
+  lint error here is often a reachability defect (an undefined name is code no test ever ran).
+- **Run the suite in both orders**: `python -m pytest -q -n auto` and
+  `python -m pytest -q -n auto -p no:randomly` (`make test` is the first, without `-n auto`).
+  A failure that depends on ordering is a state leak, not flake — find it, don't reroll.
+  `-n auto` is pytest-xdist, which `make install` installed: the suite is large (the count lives
+  in [`docs/STATUS.md`](docs/STATUS.md)) and drops from
+  minutes to seconds. If a test passes alone and fails under `-n auto`, that is the same state
+  leak, found earlier.
+- **A new guard is proven by mutation, and there is a runner for it.** If you add a test that
+  asserts a property, break the property on purpose and watch the test go red — a guard that
+  never failed is a guard nobody has checked. Do not do it by hand:
+
+  ```bash
+  python tools/mutate.py tools/mutations/<your-plan>.py
+  ```
+
+  A plan is a `TEST` path and a list of `(label, file, old, new)` cuts (an optional 5th element
+  targets a different test file). The runner checks every anchor matches **exactly once** before
+  it touches anything, restores from a backup outside the tree, and leaves a `.mutate-in-flight`
+  note naming the wound if it is killed mid-cut — `finally` does not survive SIGKILL, and a
+  mutant once sat in a working tree through a full green suite. A surviving cut means one of
+  three things: the guard is weak, the cut is aimed wrong, or **the code is dead** — that last
+  one has been the answer twice.
+- **When you move code a plan names, re-pin its anchor in the same PR.** Anchors rot, and a rotted
+  one is invisible: the plans are not run in CI, so a plan that can no longer run looks exactly
+  like a plan that ran. `git grep -l <the file you moved> tools/mutations/` names the plans to
+  re-run. `tests/test_every_mutation_plan_can_run.py` is the backstop — it applies the runner's own
+  rule to every plan in the directory and fails with the list; it was written the day that rule was
+  first pointed at all of them, and 46 of 154 plans were refused. When a plan's claims move
+  WHOLESALE into another plan, declare `SUPERSEDED_BY = "<plan>.py"` rather than leaving it to be
+  refused — and name it back in the successor's `SUPERSEDES`, so the retirement is written on
+  both ends: a one-ended declaration is skipped by every check on nothing but the author's word,
+  and the runner and the guard refuse it by name. When a single row's code is gone, delete the
+  row with a `# RETIRED <date>: <why>` comment in its place.
+- **Failures speak by name.** Anything a user can hit must refuse with one sentence naming the
+  cause and the remedy — never a raw traceback, never a silent no-op. `beeverforge doctor` is
+  the bar.
+- **Comments say WHY, with the measurement.** The codebase's comments carry dates, exit codes
+  and the incident that earned them. Keep that: a claim without its measurement is a claim the
+  next person has to re-earn.
+- **A guard reads the THING, not text about the thing.** This rule is the price of the one above.
+  Because our comments explain a defect at length beside its fix, a guard that greps a file is
+  satisfied by the *explanation* of the very thing it forbids — and passes while measuring
+  nothing. Six times between 2026-08-29 and 2026-09-03: a sandbox guard kept passing after the
+  real `FROM` changed, because the new comment quoted the old line; `test_the_release_attaches_
+  what_a_pinned_install_downloads` passed over a release attaching nothing, because the comment
+  describing the 404 contained the asset name; two e2e assertions matched `8787` and `remedy` in
+  prose; four guards kept reading a workflow step after its logic moved to a script, two of them
+  then comparing against an empty set; and one was walked through by a comment written in the
+  same session, by the same author, as the guard.
+
+  So: **execute what you are checking, or parse it** — run the script and read its argv, load the
+  YAML and read the key. Where you must search text, strip comments first, and prefer asserting
+  against a value the code exports over a string you hope is unique. A guard that cannot fail is
+  worse than no guard, because it also stops anyone looking.
+
+## Card ids in comments — `#137`, `C-22`, `#106 item 4`
+
+You will meet these everywhere: about 900 in the package and 1,300 in the tests. They are the
+ids of cards on the tracker this repository had before it was public (`C-NN` is the older
+scheme, `#NNN` the later one), and they are kept as **provenance**, not as links: the sentence
+around the id carries the reasoning and the measurement, the id says which incident earned it.
+There is nothing to open, and nothing to update — do not strip them (a purge measured on
+2026-08-24 would also have eaten `#189` and `#412` where they are FORMAT EXAMPLES inside prompts),
+and do not add new ones from a tracker a contributor cannot see. What a user READS is a different
+matter: `--help` screens, conformance findings and log lines carry no card id, and
+`tests/test_no_card_id_reaches_a_stranger.py` holds that line.
+
+## Extending a provider axis
+
+**The walkthrough is [docs/writing-an-addon.md](docs/writing-an-addon.md)** — the two files, the
+four commands, the per-axis builder signature and the traps. What follows is the summary.
+
+Every axis is an adapter behind a registry, and an add-on plugs in through the
+`beeverforge.adapters` entry-point group without editing this repository: a package declares
+`<axis>.<kind> = package:builder` (the role axis as `role.<name>`), its rows join the registry's
+table at lookup time, a built-in row wins a collision, and an unknown kind still refuses by
+name. The axis names an entry point may use are `beeverforge/plugins.py::AXES` (board,
+board_setup, box, box_runner, channel, ci, credential, credential_store, embed, event, extract,
+forge, harness, identity, metrics, notifier, preview, role, session_store, token_pool, tracker), and
+`tests/test_a_stranger_can_add_an_adapter.py` holds that list equal to what the registries ask
+for — see [docs/core/07-extensibility.md](docs/core/07-extensibility.md), including §10's
+ledger of what is core and what is vendor-owned. The core ships GitHub, Azure DevOps and Jira;
+the maintainers' own cloud box and chat channel are add-on packages of exactly this shape
+(`beeverforge-aws`, `beeverforge-slack`), and [docs/STATUS.md](docs/STATUS.md) says which paths
+of this tree leave with them. Run your adapter against the
+conformance suite: `beeverforge conformance-adapter <kind> <pkg.module:attr>`, where `<kind>`
+is any row of `beeverforge/conformance/adapters.py::CHECKS` (every port has one — the
+`--help` text lists them) and the target may be an instance, a class, or a zero-argument
+factory function. An instance that does not satisfy its port is refused by name, listing the
+methods it lacks — it is never called.
+
+## Four ways to break a seam, none of which look wrong at the time
+
+Each of these is a real failure mode this codebase is exposed to, and each has been proposed
+here at least once.
+
+**Stub adapters, written to "prove" agnosticism.** ADR-0022 refused to create an empty
+`gitlab.py` precisely because *"an empty module nothing exercises is this repository's
+signature defect."* The pressure is real — a shelf of half-adapters reads well in a README —
+and two working providers beat eight stubs. The conformance suite is what makes the refusal
+legible: no green run, no listing.
+
+**Widening a port because a provider has a feature.** The channel port has three methods
+because the core calls three things. When someone asks for reactions or message editing, the
+question is not *does that provider support it* but *does the core call it*. A capability that
+grows because a provider has a feature is a leak with a Protocol on it.
+
+**Freezing a port's shape before its second implementation.** A port with one implementation is
+that implementation's shape wearing a general name. An axis is agnostic when it is born with
+two, which is the ADR-0022 bar — and it is why `beeverforge conformance-adapter` exists before
+any interface here is called settled.
+
+**Splitting a change across repositories so the split can be announced.** Two repositories
+multiply the cost of every cross-cutting change. The add-on packages are separate because their
+code belongs to one provider and the entry-point group already carries them, not because a
+second URL reads as more modular.
+
+## Pull requests
+
+Small and focused beats large and mixed. State what you measured, not just what you changed.
+CI runs the same ruff + pytest you ran locally.
+
+**Every pull request targets `main`**, even a fix a released version needs: the release manager
+copies it to the release branch afterwards (`backport-X.Y`). The milestone on a pull request says
+which version it may ship in. [docs/RELEASING.md](docs/RELEASING.md) is the whole process.
+
+**A pull request that changes behaviour carries its release note**: the line a person installing
+the release will read about it, in a file of its own, `changes/<issue>.<type>.md`. The reviewer
+reads the line with the change, and the release assembles the lines into `CHANGELOG.md` and the
+release page; nobody rewrites them later. For example, `changes/531.fix.md`:
+
+```markdown
+**A release candidate's page installs the candidate.** It printed the one-line install, which installs the latest final release, so its testers installed the previous version.
+```
+
+- `<issue>` is the issue the pull request closes, or the pull request's own number when it closes
+  none.
+- `<type>` is where a reader looks for it: `highlight`, `behaviour` (new or changed behaviour),
+  `fix`, `security`, `upgrade` (what an existing installation must do or will notice) or
+  `limitation` (what does not work yet, and the workaround).
+- **One sentence or paragraph per line, however long**: the release page shows a line break inside
+  a paragraph as a break. A `- ` line under it is a sub-item.
+- **No number in the text**: the assembly adds `(#531)` from the file name, and the check refuses
+  a line that ends with its own, which would read twice.
+- **A pull request that changes only documents or tests carries no fragment**: ask for the label
+  `no-release-note` instead.
+
+The check `release-note` says which pull request carries neither, and names a fragment it cannot
+read. `python3 scripts/release_notes.py preview <version>` shows the notes as they stand.
+[docs/RELEASING.md](docs/RELEASING.md), "The release notes", has the whole of it.
+
+**Your machine is not the reference.** Anything optional that lives outside the clone — a
+directory of sample projects, a credential, a running daemon — must make a test SKIP at run
+time, never change what is collected. A module that resolves such a thing at import can raise
+during collection, and one module raising takes the whole suite with it: that happened here on
+2026-08-06 and CI executed zero tests for fifteen days while every laptop stayed green.
+`tests/test_ci_runs_what_we_run.py` is the guard, and `tests/demo_projects.py` is the pattern.
+The identity guards follow it: they scan for synthetic shapes on every machine and union a
+gitignored real list (`tests/.identity-forbidden.txt`) when a maintainer's machine has one — the
+list is optional on every run, a fork never holds it, and writing it in CI from a repository
+secret is a later, optional convenience rather than a gate.
+
+## Licensing, and why there is no CLA to sign
+
+This project is Apache-2.0 (`LICENSE`), and **Apache-2.0 §5 already settles what happens to your
+contribution**: unless you say otherwise in the pull request, anything you submit for inclusion is
+under those same terms. That is the whole agreement — there is no contributor licence agreement to
+sign here, and none is planned.
+
+**You keep the copyright on what you write.** The line in `LICENSE` and `NOTICE` reads
+*"Copyright 2026 The BeeverForge Authors"*, which is a collective label for everyone who has
+written part of this — not a transfer to anybody. Nothing is assigned to a company, and there is
+no company holding it.
+
+Two things travel with the code and may not be dropped from a fork (§4(c) and §4(d)): the
+copyright notices, and the `NOTICE` file. `NOTICE` is also where the name is reserved — the code
+is free, the mark is not — and that split is deliberate rather than an oversight. A restrictive
+licence would buy protection against a hyperscaler reselling this, which is a problem the
+project does not have, at the cost of the adoption it is trying to buy. What is worth defending
+is the mark, and the mark is only worth defending because the conformance suite gives it
+meaning. So anyone may fork; only a build that passes the published suite
+(`beeverforge conformance`, `beeverforge conformance-adapter`) may be called BeeverForge.

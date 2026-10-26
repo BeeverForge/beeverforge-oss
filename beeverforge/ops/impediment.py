@@ -1,0 +1,420 @@
+"""When the platform promises something and cannot deliver it, somebody is told — with a name.
+
+THE CONVERSATION THAT CAUSED THIS. The product role spent a morning telling a client, in message
+after message, that it could not open the documents or the code — and asking THE CLIENT to restore
+its access. The product owner read it and named three things at once:
+
+    *"a PO saying that to the client makes no sense… stuck in a loop with the client, nobody
+    resolves anything, nobody knows what is going on… right here and now I am watching, but if this
+    were a client, she should be asking the FACTORY for help."*
+
+All three were right. The honesty was correct and the ADDRESSEE was wrong: the person who bought
+"no dev needed" was handed a support ticket he could not work. And the degradation existed nowhere
+else — no log a human reads, no owner, no state — so the only reason anybody noticed is that he
+happened to be watching.
+
+WHY A TICKET, AND NOT A LINE IN THE OPERATORS' CHANNEL. A chat message has no owner, no state and
+no history; it scrolls away and the stall is silent again, which is the single failure this
+platform exists to make impossible. A ticket closes.
+
+WHY NOT THE CLIENT'S BOARD. A client's board carries the client's product (ADR-0027) — eleven
+smoke-test tickets already shipped eleven dead endpoints into one, and a platform failure is not
+product work. So: the factory's own board, declared per deployment.
+
+WHAT CLOSES ONE. Observation, never self-report (ADR-0021), and the same rule the platform applies
+to every other loop it keeps. Nobody marks an impediment resolved: the next time the capability
+WORKS, the ticket closes itself, with the evidence in the comment. An operator who fixed it
+silently and a fix that never happened must not look alike.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from beeverforge.util.bounded import BoundedDict
+
+log = logging.getLogger("beeverforge.ops")
+
+#: What we last OBSERVED about each `(project, cause)` — True = working, False = broken.
+#:
+#: THIS RUNS ON THE PATH OF EVERY CLIENT MESSAGE, and both entry points below start with a
+#: `find_ticket` lookup. Without this the healthy case — which is almost every case — would spend
+#: one forge API call per capability per message, against the SAME App quota the poller and the
+#: jobs draw on. A board read once cost 303 GraphQL points per call in this codebase and took the
+#: whole factory over its hourly ceiling; the reflex to avoid is paying per message for a fact that
+#: changes once a week.
+#:
+#: So the network is touched only on a TRANSITION. An unknown state (a fresh worker) counts as a
+#: transition on purpose: an impediment opened before the restart still has to be able to close.
+#:
+#: AN ENTRY IS WRITTEN ONLY AFTER THE FORGE CALL IT STANDS FOR HAS RETURNED. This records what the
+#: board was OBSERVED to hold, never what was attempted against it — the two look identical here and
+#: the cost of confusing them is total. A create that raised and was remembered as "known broken"
+#: suppresses that impediment for the LIFE of the worker: nothing is ever filed, nothing says so
+#: again, and the client keeps being told the team was warned. A close that raised and was
+#: remembered as "working" leaves the ticket open with nothing left to close it. A forge that keeps
+#: refusing therefore costs one attempt per message until it lands, which is the price of the only
+#: alternative on offer: an impediment nobody ever hears about.
+_LAST: BoundedDict[str, bool] = BoundedDict(256)
+
+#: Known causes. A CLOSED SET on purpose: the title is derived from the cause, dedup is by title,
+#: and a free-form string would file a new ticket for every wording of the same trouble — the
+#: opposite of a history somebody can count.
+PRODUCT_NO_CODE = "product-no-code"
+PRODUCT_MOUNT_EMPTY = "product-mount-empty"
+PRODUCT_CORPUS_UNREADABLE = "product-corpus-unreadable"
+PRODUCT_BOARD_UNREADABLE = "product-board-unreadable"
+PRODUCT_CANNOT_WRITE = "product-cannot-write"
+#: A gate the project declares cannot RUN where the factory runs it — the command is not in the
+#: box, or is not executable. NOT a gate that ran and failed: that is the client's code, it is the
+#: repair loop's business, and it belongs on the client's own ticket. This one is the platform
+#: failing to deliver something it promised, which is what every cause above has in common — and
+#: it holds every ticket that touches the same component, once each, until somebody fixes the
+#: image, which is precisely the shape that must not live only in a hold nobody counts.
+GATE_CANNOT_RUN = "gate-cannot-run"
+
+#: cause → what the ticket is called. Written for a person opening a board, not for a grep: the
+#: title is what a supervisor scans, and "product-mount-empty" tells them nothing they can act on.
+#:
+#: AND IT IS AN IDENTITY, WHICH IS WHY IT IS NOT TRANSLATED (#124). `title_for` is the DEDUP KEY —
+#: `find_ticket(title=…)` matches EXACTLY, by contract, and that exactness is the whole mechanism:
+#: the platform derives the string from a closed set of causes so the second occurrence finds the
+#: first. Put this table in a phrasebook and a deployment that changes its language stops
+#: recognising its own open tickets and files a fresh duplicate on every occurrence, for ever —
+#: silently, because a create that succeeds looks exactly like a create that was needed.
+#:
+#: So the split is deliberate: the TITLE is identity and stays in one language, and the BODY —
+#: `_body` below — is where the explanation lives and where a language may be chosen. A supervisor
+#: still reads a sentence rather than a slug; they just read it in the identity's language.
+#:
+#: These were Portuguese until 2026-08-16 and are English now, which re-files any impediment
+#: ticket open at that moment ONCE. Measured before changing: no deployment has a factory board
+#: configured today, so the cost is zero and would not have stayed that way.
+#:
+#: ON THE PERSON'S OWN BOARD THE TITLE IS SAID IN THEIR LANGUAGE (#671). The split above was argued
+#: for a factory board of its own, read by a supervisor. The local row has one board, the person's,
+#: and journey 0 filed "the product's requirements cannot be read" there, in English, beside a
+#: pt-BR team's own cards. There the title follows the project's language (`title_on`), and the
+#: identity stays whole the other way round: an impediment is found under ANY of its spellings
+#: (`_open`), so a deployment that changes its language neither re-files it nor leaves it open.
+#: The `en` spelling of each cause IS the identity.
+_TITLES_SAID = {
+    PRODUCT_NO_CODE: {"en": "the product agent cannot open the product's code",
+                      "pt-BR": "a agente de produto não consegue abrir o código do produto"},
+    PRODUCT_MOUNT_EMPTY: {"en": "what is mounted for the product agent is empty",
+                          "pt-BR": "o que foi montado para a agente de produto está vazio"},
+    PRODUCT_CORPUS_UNREADABLE: {"en": "the product's requirements cannot be read",
+                                "pt-BR": "os requisitos do produto não podem ser lidos"},
+    PRODUCT_BOARD_UNREADABLE: {"en": "the work board cannot be read",
+                               "pt-BR": "o quadro de trabalho não pode ser lido"},
+    PRODUCT_CANNOT_WRITE: {"en": "a write by the product agent failed",
+                           "pt-BR": "uma escrita da agente de produto falhou"},
+    GATE_CANNOT_RUN: {"en": "a gate this project declares cannot run in the box",
+                      "pt-BR": "uma verificação que este projeto declara não consegue rodar no "
+                               "box"},
+}
+_TITLES = {cause: said["en"] for cause, said in _TITLES_SAID.items()}
+
+#: What every impediment says about itself, so a supervisor opening it cold knows what it costs and
+#: how it ends without reading this module — IN THE DEPLOYMENT'S OWN LANGUAGE (#160). The split
+#: this module argues for above is exactly this: the title is identity and never moves, the body is
+#: the explanation and follows the language. It was welded Portuguese until this card.
+def _preamble(language: str | None) -> str:
+    from beeverforge.techlead import voice as tl_voice
+
+    return tl_voice.say(tl_voice.NARRATION, "ops.impediment.preamble", language)
+
+
+def title_for(project: str, cause: str) -> str:
+    """The ticket's title — DETERMINISTIC, because it is also the dedup key.
+
+    Exact-title matching is the wrong tool when a model writes the title (two wordings of one idea
+    become two cards, which is how #511 duplicated #288). It is exactly the right tool here: the
+    platform derives this from a closed set of causes, so the same trouble always produces the same
+    string and the second occurrence finds the first.
+
+    WHICH ALSO MEANS IT IS NOT PROSE (#124). Nothing in this string may follow a project's
+    configured language — see `_TITLES`. The human explanation belongs in `_body`."""
+    return f"[beeverforge] {project}: {_TITLES.get(cause, cause)}"
+
+
+def title_on(project, cause: str) -> str:
+    """The title the impediment is FILED under: in the project's language on the person's own
+    board (#671), the identity (`title_for`) on a factory board of its own."""
+    name = getattr(project, "name", "?")
+    if not _the_persons_own_board(project):
+        return title_for(name, cause)
+    lang = (getattr(project, "language", None) or "").strip()
+    said = _TITLES_SAID.get(cause, {}).get(lang)
+    return f"[beeverforge] {name}: {said}" if said else title_for(name, cause)
+
+
+def _spellings(name: str, cause: str) -> list[str]:
+    """Every title the impediment for `cause` can be open under: the identity, then each
+    language's."""
+    said = [f"[beeverforge] {name}: {title}"
+            for lang, title in _TITLES_SAID.get(cause, {}).items() if lang != "en"]
+    return [title_for(name, cause), *said]
+
+
+def _open(trk, name: str, cause: str):
+    """The open impediment for `cause`, under whichever spelling it was filed — or None."""
+    for title in _spellings(name, cause):
+        found = trk.find_ticket(title=title)
+        if found:
+            return found
+    return None
+
+
+def _the_persons_own_board(project) -> bool:
+    """True when the factory's card lands on the product's own board — the one the local row
+    derives, or a declared factory board on the product's own tracker — the same test
+    `_door_view` makes."""
+    declared = getattr(project, "factory_board", None)
+    if declared is not None:
+        return getattr(declared, "tracker", None) == getattr(project, "tracker", None)
+    tracker = getattr(project, "tracker", None)
+    return (getattr(tracker, "kind", "") or "").strip().lower() == "local"
+
+
+def _board(project):
+    """Where the factory files its own impediments — declared, or derived on one machine.
+
+    ADR-0027 PUTS THEM ON A SEPARATE BOARD, and it is right about why: a client's board carries the
+    client's product, and eleven smoke-test tickets taught that once. But the reasoning has a
+    premise — that there are two boards — and on a one-machine deployment there is one. The
+    alternative there is not a cleaner separation; it is the line this module exists to end,
+    `BEEVERFORGE_OPS_NO_BOARD`, with the impediment recorded nowhere but a log nobody reads
+    (measured 2026-09-10, driving the one-machine proof: a gate that could not run reported itself
+    to a log line and the operator's board said nothing).
+
+    SO THE LOCAL ROW DERIVES ONE, and the `fabrica` label is what keeps the promise the separate
+    board was making: the card is on the same board, marked as the factory's own, and a person
+    reading their Board can tell in one glance which cards are theirs. A deployment that DOES
+    declare a factory board is untouched, on every row (ADR-0049 D-slice 7).
+    """
+    declared = getattr(project, "factory_board", None)
+    if declared is not None:
+        return declared
+    tracker = getattr(project, "tracker", None)
+    if (getattr(tracker, "kind", "") or "").strip().lower() != "local":
+        return None
+    from beeverforge.contracts.project import FactoryBoard
+
+    return FactoryBoard(tracker=tracker)
+
+
+def _tracker_for(project, tracker):
+    """The factory's tracker, or None when this deployment has not declared a board.
+
+    None is a configuration, not a failure — but it is SAID, once per cause, because a deployment
+    silently discarding its own impediments is the state this module exists to end."""
+    if tracker is not None:
+        return tracker
+    board = _board(project)
+    if board is None or board.tracker is None:
+        return None
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.credentials import tracker_token_for
+    from beeverforge.factory import bot_token_provider_for
+
+    # THE SAME SEAM, POINTED SOMEWHERE ELSE — a project whose `tracker` is the factory's board.
+    # Building it this way rather than by hand is what keeps the vendor-agnosticism literal: a
+    # deployment that keeps its tickets in Jira files its impediments in Jira, through the
+    # dispatch that already exists, without a line of code here knowing that.
+    #
+    # ITS CREDENTIAL IS RESOLVED LIKE ANY TRACKER'S (#822): the board's own reference, its vendor's
+    # default, the deployment's pair, then the mint — and nothing after a refusal.
+    on_the_board = project.model_copy(update={"tracker": board.tracker})
+    tok = tracker_token_for(on_the_board)
+    return build_tracker(on_the_board, token=tok,
+                         token_provider=None if tok else bot_token_provider_for(on_the_board,
+                                                                                "tracker"))
+
+
+def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
+    """Open (or leave open) the impediment for `cause`. Returns its ref, or "".
+
+    NEVER RAISES AND NEVER BLOCKS THE REPLY. This runs on the path of a client's message: an
+    impediment that cost somebody their answer would be a worse bug than the one it reports.
+
+    Idempotent by title, so a capability broken for an hour produces ONE ticket and not one per
+    message — the difference between a history and a flood. A second occurrence adds nothing: the
+    ticket is already open and already says the same thing.
+    """
+    name = getattr(project, "name", "?")
+    if _LAST.get(f"{name}|{cause}") is False:
+        return ""          # already known broken; the ticket is open and already says this
+    try:
+        trk = _tracker_for(project, tracker)
+        if trk is None:
+            log.warning("BEEVERFORGE_OPS_NO_BOARD project=%s cause=%s — this deployment "
+                        "declares no "
+                        ""
+                        ""
+                        "factory board, so the impediment has nowhere to go and only this line "
+                        "records it: %s", name, cause, detail[:200])
+            return ""
+        existing = _open(trk, name, cause)
+        if existing:
+            _LAST[f"{name}|{cause}"] = False      # the board HAS it; a repeat adds nothing
+            log.info("BEEVERFORGE_OPS_STILL_OPEN project=%s cause=%s ref=%s", name, cause, existing)
+            return str(existing)
+        held = _born_in_the_queue(project, trk)
+        if held:
+            log.error("BEEVERFORGE_OPS_IMPEDIMENT_HELD project=%s cause=%s — %s, so the impediment "
+                      "was not filed and only this line records it: %s", name, cause, held,
+                      detail[:200])
+            return ""          # nothing remembered: asked again on the next occurrence
+        board = _board(project)
+        ref = trk.create_ticket(
+            title=title_on(project, cause),
+            body=_body(name, cause, detail, board, getattr(project, "language", None)))
+        _LAST[f"{name}|{cause}"] = False          # after the create, so a refused one is retried
+        _label_and_assign(trk, ref, board, project)
+        log.error("BEEVERFORGE_OPS_IMPEDIMENT_FILED project=%s cause=%s ref=%s — %s",
+                  name, cause, ref, detail[:200])
+        return str(ref)
+    except Exception as exc:  # noqa: BLE001 — reporting trouble must never become trouble
+        log.warning("BEEVERFORGE_OPS_REPORT_FAILED project=%s cause=%s (%s) — the impediment is in "
+                    "this "
+                    "log line and nowhere else", name, cause, str(exc)[:160])
+        return ""
+
+
+def resolved(project, cause: str, evidence: str = "", *, tracker=None) -> bool:
+    """Close the impediment for `cause` because the capability WORKED. True when one was closed.
+
+    The evidence goes in as a comment before the close, so the record says what made it better
+    rather than only that somebody thought it was.
+
+    Costs NOTHING on the ordinary path: a capability already observed working is skipped without
+    touching the network. Only the first observation after a restart, and every real transition,
+    reaches the forge.
+    """
+    name = getattr(project, "name", "?")
+    if _LAST.get(f"{name}|{cause}") is True:
+        return False       # already observed working; nothing is open, so nothing to close
+    try:
+        trk = _tracker_for(project, tracker)
+        if trk is None:
+            return False
+        existing = _open(trk, name, cause)
+        if not existing:
+            _LAST[f"{name}|{cause}"] = True       # nothing open — the ordinary path, and it is free
+            return False
+        note = "completed"
+        if evidence:
+            from beeverforge.techlead import voice as tl_voice
+
+            note = tl_voice.say(tl_voice.NARRATION, "ops.impediment.closed",
+                                getattr(project, "language", None), evidence=evidence[:400])
+        # DELIVERED, SAID OUT LOUD AND THROUGH THE CARD'S DOOR (#414) — the port's seam behind it
+        # (2026-09-19). The card tracked a capability that was broken; it works again, which is
+        # this card's work done — "not delivered" would say somebody gave up on it. It was the
+        # port's default by omission, in a direct call to the row, which is how the split's parent
+        # came to be closed with a word nobody chose. THE EVIDENCE IS THE CLOSE'S ONE COMMENT, on
+        # every row (ADR-0055 D6): it was a comment of its own and then the bare word beside it.
+        from beeverforge.lifecycle import CardEvent, transition
+
+        moved = transition(_door_view(project), str(existing), CardEvent.CLOSED, by="the factory",
+                           why="the capability worked again",
+                           facts={"delivered": True, "note": note}, tracker=trk, board=None,
+                           columns={})
+        if moved.refused or moved.outcome("close").startswith("failed"):
+            log.warning("BEEVERFORGE_OPS_CLOSE_FAILED project=%s cause=%s (%s)", name, cause,
+                        (moved.refused or moved.outcome("close"))[:160])
+            return False
+        _LAST[f"{name}|{cause}"] = True           # after the close, so a refused one is retried
+        log.warning("BEEVERFORGE_OPS_IMPEDIMENT_CLOSED project=%s cause=%s ref=%s — the capability "
+                    "worked again", name, cause, existing)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("BEEVERFORGE_OPS_CLOSE_FAILED project=%s cause=%s "
+                    "(%s)", name, cause, str(exc)[:160])
+        return False
+
+
+def _born_in_the_queue(project, trk) -> str:
+    """Why the impediment must not be created now — `""` when it may (#543).
+
+    THE FACTORY'S OWN CARD WOULD BE BUILT. On the product's own board — the one a local deployment
+    derives, or a declared `factory_board` that IS the product's tracker — an impediment is one of
+    the product's cards, and on a board where a new card is born in the pickup column the poller
+    takes it: an agent sent to fix "the product role cannot read the code" in the client's
+    repository, paid for, with nobody queueing it (ADR-0019 §5). So it is asked there, as every
+    writer of a new card asks (`board.base.intake_held`), and a board that could not say holds it
+    too.
+
+    A BOARD OF ITS OWN IS NOT ASKED: the factory's board on another tracker (ADR-0027) is no
+    project's queue — the poller reads the boards of registered projects, and the factory's is
+    declared beside one, not as one — and holding an impediment there would leave the trouble in
+    a log line for a column nobody reads. The same test `_door_view` makes."""
+    declared = getattr(project, "factory_board", None)
+    if declared is not None and getattr(declared, "tracker", None) != getattr(project, "tracker",
+                                                                               None):
+        return ""
+    from beeverforge.adapters.board.base import intake_held
+    from beeverforge.lifecycle.ports import Ports
+
+    born = intake_held(trk, Ports(project, tracker=trk).board)
+    if born is None:
+        return ""
+    if born.queued:
+        return f"a card created now on this board is born in {born.column!r}, the pickup column"
+    return born.unknown or "the board could not say where a card created now would be born"
+
+
+def _door_view(project):
+    """The project the factory's own card goes through its door as (ADR-0055, #414).
+
+    ON A BOARD OF ITS OWN — a declared `factory_board` (ADR-0027) on another tracker than the
+    product's — the factory's cards are numbered apart from the product's, so their record is kept
+    under the factory's own name and with no product role: a product card with the same number
+    must never read the impediment's close as its own (the board sweep would take the product
+    card, open, for a reopen), and the factory's trouble is no requester's delivery. On the one
+    board a local deployment derives (`_board`), or a declared one that IS the product's tracker,
+    the card is one of the product's cards, and goes through the door as one.
+
+    `board=None, columns={}` at the call: the door reads no board for a card it may not be on —
+    the product's board does not hold the factory's cards."""
+    declared = getattr(project, "factory_board", None)
+    if declared is None or getattr(declared, "tracker", None) == getattr(project, "tracker", None):
+        return project
+    copy = getattr(project, "model_copy", None)
+    if not callable(copy):
+        return project
+    return copy(update={"name": f"{getattr(project, 'name', '')}:factory", "product": None})
+
+
+def _body(project: str, cause: str, detail: str, board, language: str | None = None) -> str:
+    from beeverforge.techlead import voice as tl_voice
+
+    supervisor = getattr(board, "supervisor", "") if board else ""
+    owner = (f"@{supervisor}" if supervisor
+             else tl_voice.say(tl_voice.NARRATION, "ops.impediment.no-owner", language))
+    return tl_voice.say(
+        tl_voice.NARRATION, "ops.impediment.body", language,
+        preamble=_preamble(language), project=project, cause=cause, owner=owner,
+        detail=detail or tl_voice.say(tl_voice.NARRATION, "ops.impediment.no-detail", language))
+
+
+def _label_and_assign(trk, ref: str, board, project) -> None:
+    """Best-effort decoration. A ticket that exists without its label is findable and useful; one
+    that failed to be created is not — so neither of these may undo the filing."""
+    label = getattr(board, "label", "") if board else ""
+    if label:
+        try:
+            trk.add_label(str(ref), label)
+        except Exception as exc:  # noqa: BLE001
+            log.info("could not label the impediment %s (%s)", ref, exc)
+    supervisor = getattr(board, "supervisor", "") if board else ""
+    if supervisor:
+        try:
+            trk.set_assignees(str(ref), [supervisor])
+        except Exception as exc:  # noqa: BLE001
+            # SAID, not swallowed: an unassigned impediment is one nobody is accountable for, and
+            # that is the exact state this module was written to end.
+            log.warning("BEEVERFORGE_OPS_UNASSIGNED ref=%s supervisor=%s (%s) — nobody is named on "
+                        "it",
+                        ref, supervisor, exc)

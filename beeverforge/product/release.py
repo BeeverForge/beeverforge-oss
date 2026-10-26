@@ -1,0 +1,268 @@
+"""The client's "funcionou" is what releases production (ADR-0025, board #6).
+
+WHAT IT REPLACED. The pipeline parked at `AWAITING_PROD_APPROVAL` for days waiting for a signal
+FROM THE PANEL, with a password, given by an operator. The person who knows whether the change is
+right is the client — and they were the only one not asked. Nothing on this board contradicted "no
+dev needed" harder: a factory that needs an operator to cut a release is not the factory being
+sold.
+
+THE PIECES ALL EXISTED, and that is why this module is small. The workflow already parks durably
+on a signal (days, no compute burned). `temporal_view.approve_job` already queries the gate BEFORE
+signalling, so an approval is never silently dropped. The acceptance loop already asks a client
+whether something worked and reads the answer with a model judge (ADR-0029). What was missing was
+the wire between them.
+
+WHY IT IS NOT `bot.act_job`. That function carries a deliberate hard guardrail — Slack may only
+ever `resume`/`skip`/`ack`, so a prod release "can never be driven from here even if a caller
+asks". That guardrail is about the TECH-LEAD surface, which is an operator's, and it stays exactly
+as it is. This is the other surface (ADR-0026): a different channel, a different gate
+(`may_act` over the deployment's declared product admins), and a staged confirmation the person
+either types or clicks. Punching a hole in the operator path to reach the client's decision would
+have merged the two surfaces the platform keeps apart on purpose.
+
+NOTHING HERE DECIDES ANYTHING. This module observes what is parked and delivers a decision somebody
+already made in the channel. The authorisation happened before it was called, and the observation
+is the workflow's own answer — never this module's belief about it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+
+# WHAT THE RELEASE ANSWERS WHEN NOTHING WENT OUT IS THE VOICE'S (#513), imported with the module and
+# not inside `release`'s guard: its failure branch says it, so the sentence must already be here
+# when everything else has gone wrong — and the voice imports nothing that could fail at a call
+from beeverforge.product.voice import release_said
+
+log = logging.getLogger("beeverforge.product")
+
+#: How the version is derived when the client releases. The panel lets an operator type one; a
+#: client has no reason to know what a version string is, and asking them for one would be the
+#: operator's vocabulary reappearing at the last step of the flow it was removed from.
+_VERSION_PREFIX = "req"
+
+
+def version_for(issue: str) -> str:
+    """A deterministic version for a client-approved release.
+
+    Deterministic, so a retried approval tags the SAME release rather than minting a second one:
+    the tag is what `release_prod` creates, and two tags for one approval is a history nobody can
+    read backwards."""
+    return f"{_VERSION_PREFIX}-{str(issue).lstrip('#')}"
+
+
+def _job_id(project_name: str, issue: str) -> str:
+    return f"beeverforge-{project_name}-{str(issue).lstrip('#')}"
+
+
+async def _awaiting(client, project_name: str, issue: str) -> bool:
+    handle = client.get_workflow_handle(_job_id(project_name, issue))
+    return bool(await handle.query("awaiting_approval"))
+
+
+async def parked_for_release(client, project_name: str) -> list[tuple[str, str, str]]:
+    """`(issue, where a person looks, run)` for every job parked waiting for a production approval.
+
+    THE ADDRESS COMES FROM THE JOB, not from the deployment (#122). `ProductConfig.staging_url` —
+    one string, on the deployment's own registry, with no command that writes it — cannot express
+    `dev` + `qa` + `producao`, which is exactly the shape a declared promotion chain has. The
+    manifest declares it per stage; the promotion reads that manifest inside the box it runs in
+    and hands the answer back, and `where_to_look` is how a parked job is asked for it here.
+
+    `""` for a job that declares no address, and the caller must NOT invent one — that is the
+    acceptance criterion this card was opened with. A message telling somebody to go and try
+    something, with nowhere to go, is worse than one that admits the project never said where.
+
+    ASKED OF THE WORKFLOWS, never of a stored snapshot — the question is what is true NOW, and a
+    park nobody answered fires no event a listener could have cached. A job that cannot answer is
+    left out rather than guessed at: the cost of missing one is that the next round asks, and the
+    cost of inventing one is telling a client something is ready to try when nothing is.
+
+    THE SECOND COPY OF THE DIGITS-ONLY MATCHER (#69). This carried the same
+    `^beeverforge-{project}-(\\d+)$` the tech-lead's rounds did, and it is reached FROM those
+    rounds —
+    so on a Jira/ADO deployment
+    the client-facing staging bridge was blind too: a job parked waiting for the client's "pode
+    subir" was never found, and they were never asked. Now on the shared parser, which also brings
+    the sibling-project guard (`beeverforge-acme-web-478` is not project `acme`) that the
+    hand-rolled
+    regex's own comment cited as its reason to exist.
+
+    THE RUN RIDES ALONG (#448 slice 4), as a third element rather than a sibling listing: the one
+    caller already holds each parked job here, and the listing that names the job names the run it
+    is in — so the requester's telling is keyed once per run (`events.staged_for_you`) for the
+    price of a field, where a second function would have been a second sweep of the engine every
+    hour to learn the same thing. `""` when the engine's listing does not carry one.
+    """
+    from beeverforge.runtime.temporal.view import parse_job_id
+
+    out: list[tuple[str, str, str]] = []
+    async for wf in client.list_workflows(
+            'WorkflowType = "JobWorkflow" AND ExecutionStatus = "Running"'):
+        project_of, issue = parse_job_id(str(wf.id), known_projects=[project_name])
+        if project_of != project_name or not issue:
+            continue
+        try:
+            handle = client.get_workflow_handle(wf.id)
+            if not await handle.query("awaiting_approval"):
+                continue
+            where = ""
+            try:
+                look = await handle.query("where_to_look")
+                where = str((look or {}).get("url") or "")
+            except Exception as exc:  # noqa: BLE001 — a job started before this query existed
+                # NOT a reason to skip the job. The client still needs asking; they just get the
+                # sentence that admits no address rather than one carrying a wrong guess.
+                log.info("release watch: %s could not say where to look (%s)", wf.id, exc)
+            out.append((issue, where, str(getattr(wf, "run_id", "") or "")))
+        except Exception as exc:  # noqa: BLE001 — one that cannot answer is not one that is ready
+            log.info("release watch: %s did not answer (%s) — not offered", wf.id, exc)
+    return sorted(out)
+
+
+@dataclass
+class _Kept:
+    """The ONE engine client this process approves with: the target it was opened for, the loop it
+    was opened on, and the lock that stops two first approvals each opening one."""
+
+    target: tuple[str, str, str]
+    loop: asyncio.AbstractEventLoop
+    lock: asyncio.Lock
+    client: object | None = None
+
+
+_KEPT: _Kept | None = None
+
+
+def forget_the_client() -> None:
+    """Drop the kept client, so the next approval opens one. The seam `tests/conftest.py` clears
+    before every test, beside `view.reset_clients` and for its reason: a module global holding one
+    test's fake engine is the next test's engine."""
+    global _KEPT
+    _KEPT = None
+
+
+async def _client():
+    """The engine client the release path delivers on — one per process, not one per approval
+    (#201), and since #681 the process's one client, which `connection.connect()` hands to every
+    caller; this module keeps it with a lock of its own.
+
+    IT WAS `connection.connect()` UNDER AN `asyncio.run`, ONCE PER CALL, and the installed
+    `temporalio` (1.32.0) has nothing to close a client with. Measured on a throwaway dev server on
+    2026-09-19, six real jobs parked at the gate, this process's established connections to the
+    engine's port after each delivered approval:
+
+        before:  1, 2, 3, 4, 5, 6   — and 12 once the same six were approved again and REFUSED:
+                                      an approval that lands on nothing opened a client too
+        after:   1, 1, 1, 1, 1, 1
+
+    (What did release them, measured in the same run: a pass of the cyclic collector — `gc.collect`
+    took the 12 to 0. So "for the life of the process" overstates it and "until a collection nobody
+    schedules reaches the generation the client was promoted into" is the honest length.)
+
+    NOT THE POOL'S CLIENT, AND NOT BECAUSE A SIGNAL MAY NOT TRAVEL ON ONE — the operator's
+    `approve_prod` row sends this same signal on the pooled client, on the panel's own loop. It is
+    because of WHERE `release()` RUNS. `view.connect()` holds one entry in total, keyed by the
+    running loop, and `release()` is synchronous: it runs on the process's standing loop
+    (`standing.py`), which is never the loop the panel reads on. Taken from the pool there, the
+    approval's client evicts the panel's, and the panel's next read evicts the approval's.
+    Measured, same dev server, a process whose own loop re-reads the job list after each of six
+    approvals — clients opened: 7 before any fix, **13** through the pool, 2 with this. The pool
+    also refuses at once while a READ is remembered as having run out of time (#159): right for a
+    page that asks again in two seconds, wrong for a person's yes, which would be answered "nothing
+    went up" without the engine having been asked. (Since #681 the pool's entries and this one
+    wrap the same client, which `connection.connect()` holds for every loop, so neither evicts the
+    other's any more; the refusal while a read is remembered as silent is why this stays apart.)
+
+    KEPT ONLY WHILE IT IS STILL THE RIGHT ONE, by the pool's own two tests. `fingerprint()` is how
+    this tree says "the same engine, as the same caller", so a rotated key or a certificate
+    rewritten in place is approved with a new client, never the old credential. And the loop: the
+    entry's lock belongs to the loop that made it, and the standing loop is replaced if it ever
+    ends, so a new loop makes a new entry — around the same client since #681, because a client
+    answers from any loop (temporalio 1.29 and later). A client per ROTATION, not per approval.
+
+    A FAILED CONNECT IS NOT KEPT — the entry stays empty and the next approval tries again — and A
+    CLIENT IS NOT DROPPED ON A FAILED CALL, which is the pool's rule ("the Temporal SDK reconnects
+    underneath us") and was measured here rather than trusted: approval 1 delivered, the engine
+    stopped, approval 2 refused honestly, the engine started again on the same port — approvals 2
+    to 6 delivered on the SAME client, one connect in all. Dropping it on failure would be one
+    client per failed approval: this defect again, on exactly the day the engine is unwell.
+
+    WHAT THAT COSTS, MEASURED: with the engine down the honest sentence took 9.7 s (6.3 s in a
+    second run) — the SDK giving up on its own retries of the gate's query — where a fresh connect
+    was refused at once. It is the wait `approve_prod` already has on the pooled client. NOT
+    BOUNDED HERE with the reads' three seconds (#159), on purpose: that query is answered by a
+    WORKER, which may have to replay a job parked for days, and a deadline that fires too early
+    on a read repaints a page two seconds later — here it drops a person's yes.
+
+    SINGLE FLIGHT, because a cold process races itself: two people's yes arriving together are two
+    threads, and both would find no client. The lock is made with the entry, on that entry's loop.
+    NO SHARING OF A FAILED ATTEMPT among those who queued behind it, which the pool needs and this
+    does not: the pool is asked on every engine frame, this at the rate people approve releases.
+    """
+    global _KEPT
+
+    from beeverforge.runtime.temporal.connection import connect, fingerprint
+
+    target, loop = fingerprint(), asyncio.get_running_loop()
+    kept = _KEPT
+    if kept is None or kept.target != target or kept.loop is not loop:
+        kept = _KEPT = _Kept(target=target, loop=loop, lock=asyncio.Lock())
+    async with kept.lock:
+        if kept.client is None:
+            kept.client = await connect()
+        return kept.client
+
+
+def release(project, issue: str, *, approver: str, comment: str = "") -> tuple[bool, str]:
+    """Deliver the client's approval to the parked job. `(ok, what to say)` — NEVER raises.
+
+    THE GATE IS RE-ASKED HERE, and that is the whole safety of this call. Between the message that
+    asked the client and the answer that arrives, the job may have timed out of its approval window
+    or been released by somebody else. `approve_job` queries before signalling, so a stale yes
+    lands on nothing — and this returns the honest sentence rather than the reassuring one. A
+    client told "subiu" over a signal that reached no workflow is the single worst outcome
+    available on this path.
+
+    The caller has ALREADY authorised the person (`may_act`) and consumed a staged confirmation.
+    Nothing here re-decides that; this is the pen, not the judgement.
+
+    CALLED FROM A THREAD, by both callers: the action row hops to one (`asyncio.to_thread`) and the
+    chat path is already on one. It runs on the process's standing loop with the client this
+    module keeps (`_client`, #201) — it was a loop and a client of its own per approval. A caller
+    that IS running a loop is refused by `from_a_thread`, by name, and reads the same honest
+    sentence as any other approval that could not be delivered.
+    """
+    name = getattr(project, "name", "") or ""
+    lang = getattr(project, "language", None)
+
+    async def _run() -> tuple[bool, str]:
+        from beeverforge.runtime.temporal.view import approve_job
+
+        client = await _client()
+        if not await _awaiting(client, name, issue):
+            # Not a failure of ours and not something to hide: the client answered honestly and the
+            # world moved. Saying so is what keeps "I released it" a sentence that means something
+            # — in the conversation's language, the card named as its tracker names it (#513)
+            return False, release_said("not_waiting", ref=issue, language=lang)
+        await approve_job(client, name, str(issue).lstrip("#"),
+                          version=version_for(issue), approver=approver, comment=comment)
+        return True, ""
+
+    try:
+        # IMPORTED INSIDE THE GUARD, with everything else this call does, so "NEVER raises" is true
+        # by construction rather than by this import staying as harmless as it is today.
+        from beeverforge.runtime.temporal.standing import from_a_thread
+
+        # `_run`, NOT `_run()`: a caller that is refused has then made no coroutine for nobody to
+        # await — `asyncio.run(_run())` made it first and left it to the collector to warn about.
+        return from_a_thread(_run)
+    except Exception as exc:  # noqa: BLE001 — a chat listener must never see a traceback
+        # ERROR, not warning: a client said yes to a production release and the platform could not
+        # deliver it. Nobody is watching a log for this, so it also has to be greppable.
+        log.error("BEEVERFORGE_RELEASE_SIGNAL_FAILED project=%s issue=%s approver=%s (%s) — the "
+                  "client "
+                  "approved and the job was not told", name, issue, approver, str(exc)[:200])
+        return False, release_said("failed", language=lang)

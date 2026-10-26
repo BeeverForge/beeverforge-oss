@@ -1,0 +1,56 @@
+"""The third reading and its bound — the cuts that make a guess look like a measurement.
+
+ROW 1 IS THE TEACHING READ AS A DEFECT (the marker parsed, the kind wrong). ROW 2 IS THE EVIDENCE
+NOT PARSED (a reading with nothing to check). ROW 3 IS A STALE CONCEPT READ AS FRESH. ROW 4 IS A
+MISSING CONCEPT READ AS PRESENT. ROW 5 IS NO BUNDLE READ AS ALTA. ROW 6 IS A MISSING REQUIREMENT
+IGNORED. ROW 7 IS THE CAVEAT DROPPED from a "works like this" the bundle could not back. ROW 8 IS
+THE CASE NEVER CLASSIFIED.
+"""
+
+TEST = "tests/test_the_product_owner_reads_an_intake_and_teaches.py"
+
+MUTATIONS = [
+    ("a teaching reply is read as a defect",
+     "beeverforge/product/role.py",
+     '    kind = "misuse" if teach else "defect" if defect else "request" if request else "question"',
+     '    kind = "defect" if teach else "defect" if defect else "request" if request else "question"'),
+
+    # RE-PINNED 2026-09-24 (#268 slice 3): the evidence carries the code files the reply opened
+    # too, so the tokens come back as three lists
+    ("the evidence is not parsed — a reading with nothing to check",
+     "beeverforge/product/role.py",
+     "    concepts, requirements, code = _evidence_tokens(teach, evidence)",
+     "    concepts, requirements, code = [], [], []"),
+
+    ("a stale concept is read as fresh",
+     "beeverforge/product/reading.py",
+     "            elif _is_stale(found, stale):",
+     "            elif False:"),
+
+    ("a missing concept is read as present",
+     "beeverforge/product/reading.py",
+     "            if found is None:\n                verified[\"concepts\"][cited] = \"missing\"",
+     "            if False:\n                verified[\"concepts\"][cited] = \"missing\""),
+
+    # RE-PINNED 2026-09-24 (#268): the bound reads every source's bundle, so "no bundle" is an
+    # empty list of them
+    ("no bundle is read as alta",
+     "beeverforge/product/reading.py",
+     "    if not bundles:\n        level = BAIXA",
+     "    if not bundles:\n        level = ALTA"),
+
+    ("a missing requirement is ignored",
+     "beeverforge/product/reading.py",
+     "        if not exists:\n            if level == ALTA:\n                level = MEDIA",
+     "        if False:\n            if level == ALTA:\n                level = MEDIA"),
+
+    ("the caveat is dropped from a 'works like this' the bundle could not back",
+     "beeverforge/product/module.py",
+     '    if getattr(answer, "is_misuse", False) and bounded.confidence == BAIXA:',
+     '    if False:'),
+
+    ("the case is never classified",
+     "beeverforge/product/case.py",
+     "        state = CLASSIFIED if (case.state == COLLECTING and kind) else case.state",
+     "        state = case.state"),
+]

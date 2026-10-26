@@ -1,0 +1,271 @@
+"""#150 slices 1 and 2, proven by breaking them — a card can be corrected, closed and reopened.
+
+WHAT WAS MEASURED, on `main` at `506317a`, driving the real parser, the real spec gate and the
+queue's own readiness check over five card bodies: the panel's new-card button makes a card the
+gate is certain to refuse, a Gherkin scenario under a correctly-named heading parses as zero
+criteria while the queue calls it ready, and a card the product role files is refused too. None of
+that could be fixed where it sat: `beeverforge actions` had `card_create`, `card_move` and
+`card_comment`, and no row changed a card's title or body, closed it or reopened it. On
+`tracker: local` the board IS the tracker, so the panel was the only surface and it could not.
+
+SIX CLAIMS:
+
+  1. **A card is corrected only before the factory takes it up.** An agent works from the text it
+     read at pickup, so an edit afterwards moves the target with nobody seeing. `todo` and
+     `backlog` are the operator's columns; the other four are where `set_state` put the card.
+  2. **Every edit leaves a record**, in the platform's voice, naming what changed.
+  3. **A close is not a delete and not a delivery.** The card, its thread and its number stay, and
+     it is recorded as NOT delivered — `triage.Ticket.delivered` reads that word.
+  4. **A row that cannot rename or reopen is refused by name.** Those two writes are off the port
+     on purpose: adding them to `TrackerAdapter` made the faithful double answer
+     `isinstance=False` and `check_tracker` report the missing method INSTEAD of the read-side
+     findings it exists for.
+
+  5. **A card the product role opened is the product owner's** (decided on #150, 2026-09-16). From
+     a requirement, a request or a defect, it is not edited or reopened from the board in any
+     column, and the drawer offers no button that would be refused. (Its CLOSE goes through the
+     product role since #384 — `384_a_card_nobody_started_can_be_closed_and_removed.py`.) Read from a whole line
+     each writer composes, never from a word a person might type.
+  6. **The note says which part moved** (the issue's own words: "naming who changed which
+     section"). Only what changed is written, by section and by meaning, and a save that changes
+     nothing writes nothing — the form sends everything on every save.
+
+The guard is `tests/test_the_board_is_a_page_on_the_panel.py`.
+
+WHAT IS DELIBERATELY NOT CUT: the three hosted rows' `update_title` / `reopen_ticket`. Their bodies
+are one vendor call each and no test in this tree reaches a live GitHub, Azure DevOps or Jira — a
+row cut there would be a plan row that cannot go red, which is noise.
+"""
+
+TEST = "tests/test_the_board_is_a_page_on_the_panel.py"
+
+CATALOG = "beeverforge/actions/catalog.py"
+COLUMNS = "beeverforge/adapters/board/columns.py"
+LOCAL = "beeverforge/adapters/tracker/local.py"
+AUTHORING = "beeverforge/product/authoring.py"
+APP = "beeverforge/api/app.py"
+PANEL = "beeverforge/api/panel.html"
+PARSE = "beeverforge/adapters/tracker/parse.py"
+VOICE = "beeverforge/product/voice.py"
+
+MUTATIONS = [
+    # ── 1. the edit gate ───────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-10-02 (#414): the stage is read once, and handed to the gate and the door.
+    # The door's table refuses the edit too (`edited` only before pickup), in its own words — the
+    # guard asserts the gate's, which names the column and says what to do instead.
+    ("THE RULE ITSELF: a card the factory has taken up is edited anyway, so an agent's target "
+     "moves under it with nobody seeing", CATALOG,
+     "               or _stage_refusal(proj, board, issue, stage=stage))",
+     "               or \"\")"),
+
+    ("every column reads as the operator's, so `in_progress` and `in_review` are editable too",
+     COLUMNS,
+     '    return bool(key) and key not in BEFORE_THE_FACTORY',
+     "    return False"),
+
+    ("a board that could not be read is treated as a card nobody has moved", CATALOG,
+     '    where = board.columns()\n    if where is None:',
+     "    where = board.columns()\n    if False:"),
+
+    # RE-PINNED 2026-09-19 (#162): the board read moved out of `_stage_refusal` into `_stage`, so
+    # the close can learn the column's KEY from the same read the refusal judged.
+    # RE-PINNED 2026-09-20 (#231): the key comes from the BOARD ROW now, not from `key_for` with a
+    # tracker option as its map, so the anchor moved onto the line that asks it.
+    ("a column this platform does not map is judged anyway, as if it were the operator's", CATALOG,
+     "    key = stage_key(board, column)\n    if not key:",
+     "    key = stage_key(board, column)\n    if False:"),
+
+    # ── 2. the record ──────────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-10-02 (#414): the note is the card's door's comment, one row of its table
+    ("an edit leaves no record, so somebody else's text is rewritten with nothing in the thread",
+     "beeverforge/lifecycle/table.py",
+     "        # the note says which parts moved (`card_edit_note`), on every row — the door's comment\n"
+     "        return (Comment(), Forget())\n",
+     "        # the note says which parts moved (`card_edit_note`), on every row — the door's comment\n"
+     "        return (Forget(),)\n"),
+
+    # ── 3. closing ─────────────────────────────────────────────────────────────────────────────
+    ("a card an operator withdrew is recorded as delivered work, which is what eleven cards closed "
+     "as duplicates once looked like downstream", CATALOG,
+     # RE-PINNED 2026-09-19 (#162): the word is decided by the card's column now, so the cut is
+     # "every close is a delivery" rather than a flipped literal.
+     "    delivered = has_finished(stage.key)\n",
+     "    delivered = True\n"),
+
+    # The `required` tuple protects a MISSING reason. The in-function check below protects a reason
+    # of only spaces, which `perform`'s `in (None, "")` lets through. It was once removed here as
+    # dead on a surviving row; the row survived because nothing drove a whitespace-only reason —
+    # a weak guard, found by the review of #153.
+    # RE-PINNED 2026-09-28 (#384): `card_remove` requires the same three, so the anchor carries
+    # the row it means. RE-PINNED 2026-10-18 (#678, part 3): the row declares its refusals
+    # between the two. RE-PINNED 2026-10-20 (#908): the row declares DENIED, which the
+    # module's "not yours" now answers.
+    ("a close needs no reason, so the next reader of the card has nothing", CATALOG,
+     '            run=_card_close,\n'
+     '            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),\n'
+     '            required=("project", "issue", "reason"),',
+     '            run=_card_close,\n'
+     '            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),\n'
+     '            required=("project", "issue"),'),
+
+    ("reopening leaves the closing reason on the card, so an open card still says why it was "
+     "closed", LOCAL,
+     '                "UPDATE cards SET state = \'open\', closed_reason = \'\', column_key = ?, "',
+     '                "UPDATE cards SET state = \'open\', column_key = ?, "'),
+
+    # ── 4. a row that cannot do it ─────────────────────────────────────────────────────────────
+    ("a tracker that cannot rename is called anyway, so the panel offers a button that raises",
+     CATALOG,
+     "    if wanted_title and rename is None:",
+     "    if False:"),
+
+    # ── 5. the product owner's cards ───────────────────────────────────────────────────────────
+    # RE-PINNED 2026-10-02 (#414): the stage is read once, and handed to the gate and the door
+    ("THE DECISION ITSELF: a card the product role opened is edited from the board like any other",
+     CATALOG,
+     '    refusal = (await asyncio.to_thread(_product_owned_refusal, tracker, issue, '
+     'act="changes")\n'
+     "               or _stage_refusal(proj, board, issue, stage=stage))",
+     "    refusal = _stage_refusal(proj, board, issue, stage=stage)"),
+
+    # RETIRED 2026-09-28 (#384): "a card the product role opened is closed from the board" was a
+    # claim #384 reversed on purpose — the board's close of such a card now goes THROUGH the
+    # product role instead of being refused. What stands in its place is proven by
+    # `384_a_card_nobody_started_can_be_closed_and_removed.py`.
+
+    ("a card the product owner closed is reopened from the board", CATALOG,
+     '    owned = await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="reopens")\n'
+     "    if owned:",
+     '    owned = await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="reopens")\n'
+     "    if False:"),
+
+    # RE-PINNED 2026-09-28 (#384): the read moved into `_opened_by`, which the close and the
+    # removal ask too, and answers `(kind, why nobody can tell)`.
+    ("a card nobody could read is changed blind, though it may be somebody's promise", CATALOG,
+     "        return \"\", (f\"{issue} could not be read, so there is no way to tell whether the "
+     "product \"",
+     "        return \"\", \"\"\n"
+     "        return \"\", (f\"{issue} could not be read, so there is no way to tell whether "
+     "the product \""),
+
+    ("a requirement card's refusal no longer says the requirement changes first", CATALOG,
+     '                    " It changes the requirement first, and then realigns this card to '
+     'it."),',
+     '                    ""),'),
+
+    ("a card opened from a request is not recognised, so it is rewritten from the board", AUTHORING,
+     "    if any(line.startswith(tuple(_FROM_A_REQUEST.values())) for line in lines):",
+     "    if False:"),
+
+    ("a card opened from a defect is not recognised", AUTHORING,
+     "    if any(line.startswith(tuple(_FROM_A_DEFECT.values())) for line in lines):",
+     "    if False:"),
+
+    ("a requirement card is not recognised", AUTHORING,
+     "    if any(line.startswith(_FROM_A_REQUIREMENT) for line in lines):",
+     "    if False:"),
+
+    ("the marker is searched anywhere in the text, so a person quoting it loses their own card",
+     AUTHORING,
+     "    if any(line.startswith(_FROM_A_REQUIREMENT) for line in lines):",
+     "    if any(_FROM_A_REQUIREMENT in line for line in lines):"),
+
+    ("the writer's line drifts from the reader's constant, and every new requirement card is the "
+     "board's", AUTHORING,
+     '        f"{_FROM_A_REQUIREMENT} If the work needs a decision that is not written there, '
+     'the "',
+     '        "Nothing in this card may go beyond that requirement. If the work needs a decision '
+     'that is not written there, the "'),
+
+    ("the drawer is not told who opened the card", APP,
+     '        "opened_by_product": _opened_by_product(getattr(ticket, "raw", "") or ""),',
+     '        "opened_by_product": "",'),
+
+    # RE-PINNED 2026-09-28 (#384): the drawer's controls are one drawing for both surfaces, and
+    # only EDIT is behind who opened the card — its close and removal go through the product role.
+    ("the drawer offers edit on a card the row will refuse", PANEL,
+     '  const edit = where === "board" && !c.opened_by_product\n',
+     '  const edit = where === "board"\n'),
+
+    # ── 6. the note says which part moved ──────────────────────────────────────────────────────
+    # RE-PINNED 2026-10-02 (#414): what moved is read before the door (`_plan`), and written
+    # inside it (`write`), so a save that changes nothing goes through no door at all
+    ("THE NOTE AGAIN: every save is recorded as a rewrite of the whole description", CATALOG,
+     "                    changed.extend(sections)\n",
+     '                    changed.append("description")\n'),
+
+    ("a title sent unchanged is renamed and recorded as edited", CATALOG,
+     '        renamed = bool(wanted_title and wanted_title != (current.title or "").strip())',
+     "        renamed = bool(wanted_title)"),
+
+    ("a save that changes nothing still leaves a note claiming it did", CATALOG,
+     "    if not renamed and not sections:\n        line = (",
+     "    if False:\n        line = ("),
+
+    ("a blank line counts as a change, so a reformatted body is recorded as rewritten", PARSE,
+     '    return "\\n".join(line.rstrip() for line in (text or "").strip().splitlines() '
+     'if line.strip())',
+     '    return text or ""'),
+
+    ("a heading renamed to its canonical spelling is recorded as a change", PARSE,
+     '            found.setdefault(key or norm, (written if not key else key, text))',
+     '            found.setdefault(norm, (written if not key else key, text))'),
+
+    ("a section somebody deleted is not reported", PARSE,
+     "                (key in old) != (key in new)):",
+     "                False):"),
+
+    ("the front matter is not compared", PARSE,
+     '    if fm_before != fm_after:\n        changed.append("front matter")',
+     '    if False:\n        changed.append("front matter")'),
+
+    # ── 7. the review of #153: each write its own outcome, a running card not closed ────────────
+    ("a reason of only spaces closes the card with a note ending in a space", CATALOG,
+     "    if not said:\n"
+     '        return refused(INVALID, "say why the card is being closed',
+     "    if False:\n"
+     '        return refused(INVALID, "say why the card is being closed'),
+
+    ("a card the factory has taken up is closed from under its running job", CATALOG,
+     # RE-PINNED 2026-09-19 (#162): the stage is read once and handed to the refusal.
+     '    refusal = _stage_refusal(proj, board, issue, act="close", stage=stage)',
+     "    refusal = None"),
+
+    # RE-PINNED 2026-10-02 (#414): the writes run inside the door, and the note is its effect
+    ("a body that failed after the rename answers \"nothing was changed\" over a renamed card",
+     CATALOG,
+     "            except Exception as exc:  # noqa: BLE001 — what landed before it is still reported\n"
+     "                return changed, str(exc) or type(exc).__name__",
+     "            except Exception:\n"
+     "                raise"),
+
+    ("an edit whose note failed is reported as an edit that did not happen", CATALOG,
+     '    unnoted = "" if noted else ", but the note recording it could not be left on the card"\n',
+     "    if not noted:\n"
+     '        return refused(UNAVAILABLE, f"nothing was changed on {issue}")\n'
+     '    unnoted = ""\n'),
+
+    # RE-PINNED 2026-10-01 (#412): the reopen and its note are two effects of the card's door, and
+    # the row reads their outcomes — the cut makes ANY failed effect read as a card still closed
+    ("a reopen whose note failed is reported as a card still closed", CATALOG,
+     '    if moved.outcome("reopen").startswith("failed") and not moved.recorded:\n'
+     '        return refused(UNAVAILABLE, f"{issue} is still closed:',
+     '    if moved.failed and not moved.recorded:\n'
+     '        return refused(UNAVAILABLE, f"{issue} is still closed:'),
+
+    ("the reopen and its note share one `AttributeError` branch again, so a failed note reads as "
+     "a tracker that cannot reopen", CATALOG,
+     "    try:\n"
+     "        tracker.reopen_ticket  # noqa: B018 — asked before the door records a reopen it "
+     "cannot do\n"
+     "    except AttributeError:",
+     "    try:\n"
+     "        tracker.reopen_ticket  # noqa: B018 — asked before the door records a reopen it "
+     "cannot do\n"
+     "        tracker.comment(issue, 'reopened')\n"
+     "    except AttributeError:"),
+
+    ("the note lists the parts as one run-on phrase joined by `and`", VOICE,
+     '    return ", ".join(named[:-1]) + _pick(_AND, language) + named[-1]',
+     '    return _pick(_AND, language).join(named)'),
+]

@@ -1,0 +1,449 @@
+"""CodexAdapter — the OpenAI Codex CLI as a coding harness.
+
+Built against the REAL `codex exec --help` surface (verified 2026-07-26), not from memory:
+
+    codex exec [OPTIONS] [PROMPT]        prompt as an argument, or on stdin
+    codex exec resume <SESSION_ID> …     continue a previous session
+    -m, --model <MODEL>                  model selection
+    -C, --cd <DIR>                       working root
+    -s, --sandbox <read-only|workspace-write|danger-full-access>
+                                         `exec` only, not global: `exec resume` refuses it (0.146.0)
+        --dangerously-bypass-approvals-and-sandbox   (for externally-sandboxed environments)
+        --json                           JSONL event stream on stdout
+    -o, --output-last-message <FILE>     the agent's final message, written to a file
+        --skip-git-repo-check            allow running outside a git repo
+    -c, --config <key=value>             TOML config override (global, so `exec resume` takes it)
+        --ignore-user-config             do not load `$CODEX_HOME/config.toml`; auth still uses
+                                         `CODEX_HOME` (global, so `exec resume` takes it too)
+
+It implements the MINIMUM contract (`execute` + `repair`) plus `plan`, and deliberately not
+`continue_execute` / `recover`: those resume a live session across containers, which for Claude
+needs a whole S3 snapshot/restore machinery this adapter has no equivalent of yet. The
+orchestrator probes for them with `hasattr` and degrades — a turn-capped Codex run parks for a
+human instead of self-healing. That is a real capability gap, stated rather than faked.
+
+WHAT IS AND ISN'T PROVEN HERE
+- The command construction is exact — every flag above came from `--help`, and
+  `tests/test_a_resumed_codex_job_is_handed_only_flags_exec_resume_takes.py` holds each command
+  to the options its subcommand takes in the pinned version. Those tables are checked against
+  the `exec --help` and `exec resume --help` of the codex the worker image installs, built from
+  `docker/worker.Dockerfile`'s `toolbox` stage, in CI's integration job, where that check fails
+  rather than skips (#805).
+- A RESUMED session is handed its sandbox as `-c sandbox_mode="<mode>"`, never `-s` (#636).
+  It is not left to "the sandbox the session stored": a resume re-derives its sandbox from the
+  invocation (`thread_resume_params_from_config`, read at rust-v0.146.0 and rust-v0.157.1), and
+  measured on both versions on 2026-10-17 with no credential, a resume with no sandbox option
+  recorded `read-only` in the session's rollout where the first run had `workspace-write`; with
+  the `-c` it recorded `workspace-write`. `codex exec resume … -s workspace-write` exits 2.
+- The final message comes from `--output-last-message`, a file whose contract is "the last
+  message", so `summary` does not depend on any event schema.
+- The `--json` event schema was OBSERVED from real runs against codex-cli 0.145.0, not guessed:
+      {"type":"thread.started","thread_id":"…"}                       ← the id `exec resume` takes
+      {"type":"turn.started"} / {"type":"turn.completed","usage":{…}}
+      {"type":"item.completed","item":{"type":"command_execution","command":…,"exit_code":…}}
+      {"type":"item.completed","item":{"type":"file_change","changes":[{"path":…,"kind":…}]}}
+      {"type":"item.completed","item":{"type":"agent_message","text":…}}
+  Parsing is still defensive (unknown shapes degrade rather than raise), because one CLI version
+  is not a contract.
+- There is NO cost and NO turn count in that stream. `cost_usd` therefore stays None and turns are
+  DERIVED by counting `turn.completed`. Inventing a cost would poison the very A/B this harness
+  exists to be compared in.
+- Rate-limit / auth pause detection is TEXT-MATCHED and unverified against a real Codex rate
+  limit. Until one is observed, a limit most likely surfaces as a plain failure (the job parks for
+  a human) rather than as a resumable PAUSE. Do not read the pause path here as working.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+
+from beeverforge.adapters.agent.base import (
+    PLANNER_FALLBACK,
+    REPAIR_INSTRUCTION,
+    AgentContext,
+    PromptTooLarge,
+    prompt_too_large_result,
+    prose_only,
+    stage_prompt,
+    ticket_brief,
+    wall_result,
+)
+from beeverforge.adapters.agent.roles import role_prompt
+from beeverforge.adapters.sandbox.base import SandboxAdapter, Workspace
+from beeverforge.adapters.sandbox.timeouts import AGENT_TIMEOUT, timed_out
+from beeverforge.contracts import AgentRunResult
+
+# The agent's final message is written here (inside the workspace's container/worktree) and read
+# back THROUGH the sandbox — on a container sandbox the host cannot see the file at all.
+_LAST_MESSAGE_FILE = ".beeverforge-codex-last-message"
+
+#: The MCP servers a role is started with: none. The account running the CLI declares its own MCP
+#: servers and plugins in `$CODEX_HOME/config.toml`, and none of them is a role's tool. A `-c
+#: mcp_servers={}` override does not clear them (it merges), so the file is not read at all; the
+#: login still is. In 0.146.0, the pinned `HARNESS_CODEX`, and measured on 0.157.1.
+IGNORE_USER_CONFIG = "--ignore-user-config"
+
+# Markers that suggest a usage/auth stop rather than a code failure. Unverified against a real
+# Codex limit — see the module docstring.
+_RATE_RE = re.compile(r"rate.?limit|quota|too many requests|429", re.IGNORECASE)
+_AUTH_RE = re.compile(r"unauthor|forbidden|invalid api key|not logged in|401|403", re.IGNORECASE)
+
+
+class CodexAdapter:
+    """The Codex CLI, driven non-interactively through the sandbox (never on the host)."""
+
+    name = "codex"
+
+    def __init__(
+        self, *, model: str | None = None, log_dir=None,
+        full_access: bool | None = None, language: str | None = None,
+    ) -> None:
+        self.model = model or os.environ.get("BEEVERFORGE_EXECUTOR_MODEL") or None
+        self.planner_model = os.environ.get("BEEVERFORGE_PLANNER_MODEL") or self.model
+        self.log_dir = log_dir
+        #: the project's language for anything a human reads (agent/roles.py)
+        self.language = language
+        # `workspace-write` is the default, and it is VERIFIED sufficient: a probe run against
+        # codex-cli 0.145.0 executed a shell command AND edited a file non-interactively with no
+        # approval prompt. That matters because this codebase learned the opposite lesson the hard
+        # way with Claude — a headless policy that gates shell commands silently DENIES every
+        # `pytest` the agent runs, killing its own TDD loop while it reports that commands are
+        # blocked. Codex does not have that failure mode under `workspace-write`.
+        #
+        # The escape hatch stays only for a case we have not tested: a project whose agent needs
+        # to write OUTSIDE its workspace or reach the network. The job box is an ephemeral,
+        # credential-less, isolated Fargate task — the "externally sandboxed" case the flag's own
+        # help text names — so it is legitimate there. It is never the default.
+        # The default reaches a RESUMED session too, as a `-c sandbox_mode` override (see `_cli`).
+        self.full_access = (
+            full_access if full_access is not None
+            else os.environ.get("BEEVERFORGE_CODEX_FULL_ACCESS", "").lower() in ("1", "true", "yes")
+        )
+
+    # ---- the coding contract -----------------------------------------------------------------
+
+    def plan(
+        self, *, sandbox: SandboxAdapter, workspace: Workspace, context: AgentContext
+    ) -> AgentRunResult:
+        """Read-only investigation → a plan. `-s read-only` IS the permission envelope here:
+        Codex has no per-tool allowlist, so the sandbox policy is what makes this stage
+        genuinely incapable of editing, rather than merely instructed not to.
+
+        `role_prompt("planner")` is the same primitive `claude_code.py` reads, so
+        `org_defaults/roles/planner.md` — a deployment's or project's own house doctrine —
+        reaches this harness too, rather than the fixed sentence below (kept only for an
+        install that could not read its own role file)."""
+        role = role_prompt("planner")
+        prompt = f"{role}\n\n{ticket_brief(context)}" if role else (
+            f"{PLANNER_FALLBACK}\n\n{ticket_brief(context)}")
+        return self._run(sandbox, workspace, prompt, "planner",
+                         model=self.planner_model, sandbox_mode="read-only",
+                         project=context.ticket.repo)
+
+    def ask(
+        self, *, sandbox: SandboxAdapter, workspace: Workspace, prompt: str, phase: str = "ask"
+    ) -> AgentRunResult:
+        """Run a READ-ONLY prompt against the checkout and return the text (see roles.py).
+
+        `-s read-only` is a sandbox POLICY, so a judging role here is genuinely incapable of
+        editing rather than merely instructed not to — a stronger guarantee than a prompt."""
+        return self._run(sandbox, workspace, prompt, phase,
+                         model=self.planner_model, sandbox_mode="read-only")
+
+    def execute(
+        self, *, sandbox: SandboxAdapter, workspace: Workspace, context: AgentContext
+    ) -> AgentRunResult:
+        """`role_prompt("executor")` prepended, same as `claude_code.py`'s `_executor_prompt` —
+        so `org_defaults/roles/executor.md` (TDD discipline, scope limits) reaches this harness
+        rather than a role-neutral ticket brief."""
+        role = role_prompt("executor")
+        prompt = f"{role}\n\n{ticket_brief(context)}" if role else ticket_brief(context)
+        if context.plan:
+            prompt += f"\n\n## The plan to follow\n{context.plan}"
+        return self._run(sandbox, workspace, prompt, "executor", model=self.model,
+                         resume_session=context.resume_handle, project=context.ticket.repo)
+
+    def repair(
+        self, *, sandbox: SandboxAdapter, workspace: Workspace, context: AgentContext,
+        failure_log: str, instruction: str = "",
+    ) -> AgentRunResult:
+        """Repair is the executor role continuing, same as `claude_code.py`'s `repair()` reusing
+        `_executor_prompt` — the role identity leads when available, then the repair instruction
+        (always present — it says what THIS pass is, which the role prompt does not), then the
+        failures and the ticket."""
+        role = role_prompt("executor")
+        lead = f"{role}\n\n" if role else ""
+        # WHAT THIS PASS IS, IN THE CALLER'S WORDS (`instruction`): the orchestrator knows
+        # whether it holds a gate's output or a person's comment, and this row does not —
+        # so it renders that sentence where its own used to stand and adds none.
+        # THE FAILURE LOG IS THE CLIENT'S SUITE TALKING, so it goes where every other value
+        # nobody here wrote goes: inside the brief, under a DATA heading, below the rule. It used
+        # to sit ABOVE `ticket_brief`, which put a stranger's text before the only sentence that
+        # says how to read a stranger's text (review of #108).
+        prompt = (
+            lead + f"{instruction or REPAIR_INSTRUCTION}\n\n"
+            + ticket_brief(context, failures=failure_log[:12000])
+        )
+        return self._run(sandbox, workspace, prompt, "repair", model=self.model,
+                         project=context.ticket.repo)
+
+    # ---- command construction (exact, from `codex exec --help` and `codex exec resume --help`) ---
+
+    def smoke_command(self, *, harness: str, prompt: str) -> str:
+        """The smallest real call this harness can be asked to make (#129).
+
+        BUILT BY THE SAME `_cli` A TICKET GOES THROUGH, so what it exercises is the invocation
+        that actually runs — the harness binary at the path the box chose, its own flags, its own
+        credential. A probe assembled by hand here would prove a command nothing issues, which is
+        how #122 survived every check: `curl` reached the endpoint while the harness could not."""
+        return self._cli(prompt, harness=harness, model=self.planner_model,
+                         sandbox_mode="read-only")
+
+    def smoke_reply(self, out: str) -> str:
+        """What the model said to `smoke_command`: the LAST `agent_message` on the `--json`
+        stream, the item schema this module's docstring records as observed. NOT the
+        `--output-last-message` file a ticket reads — that file is inside the box, and the check
+        holds only what the command printed. `""` when there is none."""
+        return _last_agent_message(_parse_jsonl(out))
+
+    def _cli(
+        self, prompt: str, *, harness: str, model: str | None, sandbox_mode: str,
+        resume_session: str = "", prompt_path: str | None = None,
+    ) -> str:
+        # `harness` is the ABSOLUTE path the box chose — never a bare name,
+        # which `PATH` inside the client's image would resolve (ADR-0037 D2).
+        #
+        # THE PROMPT TRAVELS OFF ARGV WHEN THE BOX STAGED IT (#5). `codex exec` reads its prompt
+        # from stdin as well as from an argument (the module docstring records it from `--help`), so
+        # `cat <path> | codex exec …` keeps the command line short whatever the corpus is — past the
+        # single-argument ceiling a prompt no longer raises `OSError: Argument list too long`.
+        # `exec resume <id>` TOO, which its `--help` does not say — it documents only `-` — and
+        # which is the form a paused job comes back through: read in `codex-rs/exec/src/lib.rs` at
+        # rust-v0.146.0 (the pinned `HARNESS_CODEX`) and rust-v0.157.1, a resume with no positional
+        # prompt goes through the same `resolve_prompt(None)` as `exec` and reads a piped stdin
+        # (#326, 2026-10-01).
+        # `prompt_path` is None for the smoke probe and a box with no channel and a small prompt.
+        cmd = ([f"cat {shlex.quote(prompt_path)} |", harness, "exec"] if prompt_path
+               else [harness, "exec"])
+        if resume_session:
+            cmd += ["resume", shlex.quote(resume_session)]
+        cmd += [
+            "--json",                       # JSONL events on stdout (parsed best-effort)
+            "-o", _LAST_MESSAGE_FILE,       # the final message, schema-free
+            "--skip-git-repo-check",        # the workspace is a checkout, not always a repo root
+            # NO MCP SERVER IS A ROLE'S: the account's own configuration declares its servers and
+            # plugins, and every role was started with them. Not read; the login still is.
+            IGNORE_USER_CONFIG,
+        ]
+        # A RESUMED SESSION IS HANDED ITS SANDBOX BY `-c`, NOT `-s` (#636). `-s/--sandbox` is an
+        # option of `exec` alone — `mark_exec_global_args` makes only the model and the two bypass
+        # flags global — so `codex exec resume … -s workspace-write` exited 2 with "unexpected
+        # argument '-s' found", and every paused job died at the CLI. `-c` is global on the root,
+        # so `exec resume` takes it. Leaving the sandbox out is not "the one the session stored":
+        # a resume re-derives it from the invocation (`thread_resume_params_from_config`), which
+        # with no flag and `--ignore-user-config` is the bare default, so it is said again. Read in
+        # `codex-rs/exec/src/{cli,lib}.rs` at rust-v0.146.0 (the pinned `HARNESS_CODEX`) and
+        # rust-v0.157.1, and measured on both 2026-10-17: the old resume exits 2; this one parses,
+        # and the session's rollout records `workspace-write` for it — `read-only` for a resume
+        # of the same session with no sandbox option at all.
+        if self.full_access:
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+        elif resume_session:
+            cmd += ["-c", shlex.quote(f'sandbox_mode="{sandbox_mode}"')]
+        else:
+            cmd += ["-s", sandbox_mode]
+        if model:
+            cmd += [shlex.quote(f"--model={model}")]  # flag and value as one token
+        if not prompt_path:
+            cmd += ["--", shlex.quote(prompt)]  # `--` so a prompt starting with '-' is not a flag
+        return " ".join(cmd)
+
+    def _localised(self, prompt: str, phase: str) -> str:
+        """The project's language, when a PERSON reads the answer (`roles.needs_language_directive`:
+        not the coding path, not a verdict code parses, everything else — an unknown phase too)."""
+        from beeverforge.adapters.agent.roles import language_directive, needs_language_directive
+
+        if not needs_language_directive(phase):
+            return prompt
+        return f"{language_directive(self.language)}\n\n{prompt}"
+
+    def _run(
+        self, sandbox: SandboxAdapter, workspace: Workspace, prompt: str, role: str, *,
+        model: str | None, sandbox_mode: str = "workspace-write", resume_session: str = "",
+        project: str = "",
+    ) -> AgentRunResult:
+        prompt = self._localised(prompt, role)
+        # OFF THE COMMAND LINE (#5): stage the prompt so a corpus past the argv ceiling reaches the
+        # CLI over stdin rather than raising `OSError: Argument list too long`, and a box that
+        # cannot stage refuses BY NAME instead of crashing.
+        try:
+            prompt_path = stage_prompt(sandbox, workspace, prompt, phase=role, project=project)
+        except PromptTooLarge as exc:
+            return prompt_too_large_result(exc, model=model, harness=self.name)
+        command = self._cli(prompt, harness=sandbox.harness_path("codex"),
+                            model=model, sandbox_mode=sandbox_mode,
+                            resume_session=resume_session, prompt_path=prompt_path)
+        code, out = sandbox.run(workspace=workspace, command=command, timeout=_TIMEOUT)
+        if timed_out(code, out):
+            # Codex has NO turn cap, so this wall is its only effort bound — see the module
+            # docstring. Reported as an impediment with the cause named, never a bare failure.
+            return wall_result(role, model, self.name, out)
+
+        # The final message comes from the FILE, not the event stream — that contract is
+        # documented, the event schema is not. Read it back through the sandbox: on a container
+        # sandbox the host cannot see this path.
+        _, last = sandbox.run(
+            workspace=workspace,
+            command=f"cat {_LAST_MESSAGE_FILE} 2>/dev/null; rm -f {_LAST_MESSAGE_FILE}",
+            timeout=60,
+        )
+        summary = (last or "").strip()
+
+        events = _parse_jsonl(out)
+        pause, retry_at = _pause_from(out)
+        res = AgentRunResult(
+            ok=code == 0 and pause is None,
+            summary=summary or (out or "")[-2000:],
+            actions=_actions(events),
+            model=model or "default",
+            harness=self.name,
+            pause_reason=pause,
+            retry_at=retry_at,
+            raw_output=(out or "")[-20000:],
+        )
+        _apply_usage(res, events)
+        res.resume_handle = _session_id(events) or None
+        return res
+
+
+# the shared wall-clock wall — see beeverforge/adapters/sandbox/timeouts.py
+_TIMEOUT = AGENT_TIMEOUT
+
+
+def _parse_jsonl(out: str) -> list[dict]:
+    """Every JSON object on its own line. Non-JSON lines (the CLI also prints human text) are
+    skipped rather than fought — this stream is a bonus, not the contract."""
+    events: list[dict] = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events
+
+
+def _last_agent_message(events: list[dict]) -> str:
+    """The text of the last `item.completed` whose item is an `agent_message` — and nothing else
+    in the stream, where `turn.completed` carries the token counts."""
+    said = ""
+    for ev in events:
+        item = ev.get("item")
+        if (ev.get("type") == "item.completed" and isinstance(item, dict)
+                and item.get("type") == "agent_message" and isinstance(item.get("text"), str)):
+            said = item["text"]
+    return said
+
+
+def _walk(obj, key: str):
+    """First value for `key` anywhere in a nested structure. The event schema is unknown, so we
+    look for well-known NAMES rather than assume a shape."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            found = _walk(v, key)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _walk(v, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _session_id(events: list[dict]) -> str:
+    """Codex emits `{"type":"thread.started","thread_id":"…"}` first — that id is what
+    `codex exec resume <ID>` takes. The extra key names are tolerated fallbacks in case the
+    stream is renamed; the observed one is `thread_id`."""
+    for ev in events:
+        if ev.get("type") == "thread.started" and isinstance(ev.get("thread_id"), str):
+            return ev["thread_id"]
+    for ev in events:
+        for key in ("thread_id", "session_id", "sessionId", "conversation_id"):
+            val = _walk(ev, key)
+            if isinstance(val, str) and val:
+                return val
+    return ""
+
+
+def _actions(events: list[dict]) -> list[str]:
+    """A human-readable trace for the job journal, in the same shape the other harness produces
+    ("Bash: pytest", "Edit app/health.py").
+
+    Built from the OBSERVED item schema: `item.completed` carries an `item` whose `type` is
+    `command_execution` (with `command`), `file_change` (with `changes[].path`) or `agent_message`
+    (prose, which is not an action). Capped so a chatty run cannot flood the journal."""
+    out: list[str] = []
+    for ev in events:
+        if ev.get("type") != "item.completed":
+            continue
+        item = ev.get("item")
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "command_execution":
+            cmd = str(item.get("command") or "").strip()
+            if cmd:
+                out.append(f"Bash: {cmd[:200]}")
+        elif kind == "file_change":
+            for change in item.get("changes") or []:
+                if isinstance(change, dict) and change.get("path"):
+                    verb = str(change.get("kind") or "edit").capitalize()
+                    out.append(f"{verb} {change['path']}"[:200])
+        if len(out) >= 200:
+            break
+    return out
+
+
+def _apply_usage(res: AgentRunResult, events: list[dict]) -> None:
+    """Token + turn telemetry from the observed stream.
+
+    `turn.completed` carries `usage.input_tokens` / `usage.output_tokens`; there is NO cost and no
+    turn count in the stream, so `cost_usd` stays None (the dashboard renders unknown) and turns
+    are DERIVED by counting completed turns — a real number, not an invented one. Reporting a
+    fabricated cost would poison the very A/B this harness exists to be compared in."""
+    turns = 0
+    for ev in events:
+        if ev.get("type") != "turn.completed":
+            continue
+        turns += 1
+        usage = ev.get("usage")
+        if isinstance(usage, dict):
+            for key, field in (("input_tokens", "input_tokens"),
+                               ("output_tokens", "output_tokens")):
+                val = usage.get(key)
+                if isinstance(val, int):
+                    setattr(res, field, (getattr(res, field) or 0) + val)
+    if turns:
+        res.num_turns = turns
+
+
+def _pause_from(out: str) -> tuple[str | None, str | None]:
+    """Classify a usage/auth stop. UNVERIFIED against a real Codex rate limit (see the module
+    docstring): the patterns are the generic ones, so treat a `None` here as "we have not seen
+    Codex rate-limit yet", not as proof it cannot."""
+    tail = prose_only(out)[-4000:]
+    if _RATE_RE.search(tail):
+        return "rate_limit", None
+    if _AUTH_RE.search(tail):
+        return "auth", None
+    return None, None

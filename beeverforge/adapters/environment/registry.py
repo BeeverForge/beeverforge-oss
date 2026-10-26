@@ -1,0 +1,210 @@
+"""Which CI a project's deployments are observed through — from config, never from an import.
+
+Paired with the forge registry on purpose: a client is not "on GitLab for code and GitHub for CI",
+so the CI kind DEFAULTS TO THE FORGE'S. One value configures both, and a deployment that genuinely
+splits them can still say so explicitly.
+
+GitLab CI is not implemented yet (the product owner's call: later, but prepared). The seam is being
+delivered here — see `forge/registry.py` for why a stub would be worse than an honest error.
+
+Azure Pipelines is the second vendor on this axis, and it cost one module plus the row below. What
+it did NOT cost is the interesting part: the port stayed three methods, because a CI observer is
+asked what the platform needs to know (is this ref green, did it reach that environment, is it
+alive) rather than what a vendor happens to expose.
+
+THE THIRD COMES FROM OUTSIDE (2026-08-26). An add-on registers `ci.<kind>` in the
+`beeverforge.adapters` entry-point group and its row joins the table at lookup time, the shape
+every other registry has. It matters twice on this axis: the CI kind DEFAULTS TO THE FORGE'S, so a
+stranger's `forge.gitea` was built and then refused one call later — `build_promotion_runner`
+asked this registry for `gitea` and it knew only the built-ins (measured: "unknown CI 'gitea'"
+with the add-on's `ci.gitea` loaded and never consulted). And the refusal now says which of the
+two ways out applies: install the `ci.<kind>` add-on, or name a different CI in `forge.options.ci`.
+
+AN ADD-ON RESOLVES ITS OWN CREDENTIAL. Both call sites hand this axis the deployment's FORGE
+credential (`build_observer(project, token=forge_token_for(project) or app_tok)`), which is a
+GitHub token on a GitHub deployment. The two built-in Azure rows already refuse it (`token=None`
+below, with the measurement); an add-on's builder is handed `token=None` for the same reason — a
+credential only goes to the host that issued it (#162), and the platform cannot know which host a
+stranger's CI is. The add-on reads the variable its project's `options.token_env` names.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from beeverforge import plugins
+
+#: The entry-point axis name: `ci.<kind>`.
+AXIS = "ci"
+
+
+#: forge/CI kind → the observer it implies.
+def _github_actions(project, **kw):
+    from beeverforge.adapters.environment.github_actions import GitHubActionsObserver
+    from beeverforge.credentials import github_refusal
+
+    return GitHubActionsObserver(
+        (project.forge.repo if getattr(project, "forge", None) else None) or "",
+        token=kw.get("token"),
+        # the FORGE's refusal, whose CI this is: handed no token after one, the observer runs no
+        # `gh` on the machine's own login (#742), as the forge's own row does
+        refused="" if kw.get("token") else github_refusal(project, "forge"),
+    )
+
+
+#: WHAT A READER IS TOLD THIS ROW IS — declared on the row, where the row is declared, and read
+#: through `plugins.display_name`. One builder serves `github` and `github_actions`, so both are
+#: called what the observer is; an add-on says the same thing the same way
+#: (`build_observer.display_name = "Acme CI"`), and one that says nothing is shown by its kind.
+_github_actions.display_name = "GitHub Actions"
+
+
+def _azure_pipelines(project, **kw):
+    from beeverforge.adapters.azure_devops import coordinates
+    from beeverforge.adapters.environment.azure_pipelines import AzurePipelinesObserver
+
+    forge = getattr(project, "forge", None)
+    options = dict(getattr(forge, "options", None) or {})
+    organization, ado_project = coordinates(project, ref=forge)
+    return AzurePipelinesObserver(
+        # ONE HOME FOR THIS SPELLING (`adapters/azure_devops.py::coordinates`). Four registries
+        # each carried a copy promising the other three would move with it; two had already
+        # drifted, and a drift here means the axes resolve to DIFFERENT ADO projects.
+        # It is not a startup nicety: `factory.py` builds this observer for every PromotionRunner,
+        # so a disagreement here killed the promotion at construction, before a pipeline was read.
+        organization=organization,
+        project=ado_project,
+        # NOT `repo_of(project)` — the forge's fallback — on purpose. That falls back to the
+        # tracker's `repo`, which here names the ADO PROJECT rather than a git repository, and this
+        # project really does contain a repo whose name equals the project's: the observer would
+        # have quietly reported another repository's builds. A missing repo raises in the
+        # constructor instead.
+        repo=(getattr(forge, "repo", None) or ""),
+        # NOT `kw["token"]`. Both call sites hand this axis a GITHUB credential — `build_observer(
+        # project, token=forge_token() or app_tok)` in the factory, a GitHub App token in the
+        # action catalog — because until now every observer was GitHub's. Passing it on would
+        # authenticate against dev.azure.com with a github.com token and surface as 401 on a
+        # perfectly good configuration. The Azure credential is read from the environment variable
+        # this project's options name, which is where it has always lived.
+        token=None,
+        options=options,
+    )
+
+
+_azure_pipelines.display_name = "Azure Pipelines"
+
+
+def _none(project, *, token=None):
+    """Nothing watches this project's code, and that is an answer rather than a gap (ADR-0049 D1).
+
+    ANY FORGE MAY NAME IT through `forge.options.ci`: a GitHub repository with no workflows is
+    entitled to say so instead of being told its checks are pending for ever."""
+    from beeverforge.adapters.environment.none import NoObserver
+
+    return NoObserver(project, token=token)
+
+
+#: NOTHING IS WATCHED, and the panel says that rather than a dash: a dash is a value that could
+#: not be read, and this one was read (ADR-0049 D1). The sentence is this row's own name.
+_none.display_name = "nothing is watched"
+#: AND IT READS NO DEPLOY (#518), declared on the row for the reason the name is: a stranger's CI
+#: that cannot read one says so the same way. `deploy_status` answers "none" for every ref, so on
+#: this project a stage is observed by its `health_url` or by nothing — `reads_deploys` below is
+#: what `loader.load_manifest` asks, and a chain stage with no `health_url` is refused there.
+_none.reads_deploys = False
+
+
+OBSERVERS: dict[str, Callable[..., object]] = {
+    # `local` maps to the same observer as `none`, by the same "one value configures both" rule
+    # that turns `azure_devops` into `azure_pipelines`: a project whose forge is the repository on
+    # this machine names one kind and is observed by nothing, without having to say so twice.
+    "none": _none,
+    "local": _none,
+    "github": _github_actions,
+    # `github_actions` accepted as an alias so a deployment can be explicit about the CI when it
+    # differs from the forge — the two names mean the same observer today.
+    "github_actions": _github_actions,
+    # Azure Repos ⇒ Azure Pipelines, by the same "one value configures both" rule: `azure_devops`
+    # is the kind the forge and tracker rows use, so a project that names it once is observed by
+    # the right CI without saying so twice.
+    "azure_devops": _azure_pipelines,
+    "azure_pipelines": _azure_pipelines,
+}
+
+
+def declared_ci(project) -> str:
+    """The `ci` option a project names explicitly, lower-cased, or "" when it inherits."""
+    forge = getattr(project, "forge", None)
+    options = (getattr(forge, "options", None) or {})
+    return str(options.get("ci", "")).strip().lower()
+
+
+def observer_kind(project) -> str:
+    """The CI kind: an explicit `ci` option, else the forge's kind.
+
+    Defaulting to the forge is the honest reading of how these deployments are actually shaped —
+    and it means adding GitLab CI arrives automatically for a project that moved its forge, rather
+    than silently observing the wrong system until somebody notices deployments never confirm."""
+    explicit = declared_ci(project)
+    if explicit:
+        return explicit
+    from beeverforge.adapters.forge.registry import forge_kind
+
+    return forge_kind(project)
+
+
+def observer_name(project) -> str:
+    """What the CI that watches `project` is called to a reader: its row's own `display_name`.
+
+    THE ROW IS ASKED, NOT BUILT. A heading must not construct an observer to learn its name — the
+    Azure row raises on a missing repository and a stranger's may open a connection — so the name
+    hangs off the builder, which is what this registry holds for a built-in and what the entry
+    point hands over for an add-on. A row that declares nothing, and a kind with no row at all,
+    is shown by the kind: no name is invented for it."""
+    kind = observer_kind(project)
+    row = OBSERVERS.get(kind) or plugins.builder(AXIS, kind, builtin=OBSERVERS)
+    return plugins.display_name(row, kind)
+
+
+def reads_deploys(project) -> bool:
+    """Whether the CI that watches `project` can read a deploy at all (#518).
+
+    ASKED OF THE ROW, NOT OF A LIST OF NAMES, like `observer_name`: `none` and `local` share one
+    row, and an add-on whose CI cannot see deployments says so by declaring
+    `reads_deploys = False` on its builder. ONLY `False` IS A DECLARATION — a row that says
+    nothing, a kind with no row (refused by `build_observer`, with its own sentence) and a test
+    double that answers every attribute all read deploys as far as this is concerned, so nothing
+    is refused on a guess."""
+    kind = observer_kind(project)
+    declared = getattr(OBSERVERS.get(kind) or plugins.builder(AXIS, kind, builtin=OBSERVERS),
+                       "reads_deploys", True)
+    return declared is not False
+
+
+def build_observer(project, *, token=None):
+    """The project's CI observer. Raises on an unknown kind — a deployment whose pipelines are
+    never observed would report every release as "still verifying", for ever.
+
+    A built-in row wins; an add-on's row (`ci.<kind>` entry point) fills the rest and is built
+    WITHOUT the caller's credential — see the module docstring."""
+    kind = observer_kind(project)
+    builder = OBSERVERS.get(kind)
+    if builder is not None:
+        return builder(project, token=token)
+    added = plugins.builder(AXIS, kind, builtin=OBSERVERS)
+    if added is not None:
+        return added(project, token=None)
+    known = ", ".join(plugins.known(AXIS, OBSERVERS))
+    # WHICH DOOR. The kind was either named in `forge.options.ci` or inherited from the forge, and
+    # the operator's remedy differs: a forge add-on with no CI of its own needs `forge.options.ci`
+    # to name one this deployment implements, and a typo'd explicit `ci` needs the option fixed.
+    # Saying "unknown CI" alone sent an operator to the forge registry, where everything was fine.
+    origin = ("named by `forge.options.ci`" if declared_ci(project)
+              else "inherited from the forge kind, because the project names no `forge.options.ci`")
+    raise ValueError(
+        f"unknown CI {kind!r} ({origin}) — known: {known}. Either install the add-on that "
+        f"declares the `{AXIS}.{kind}` entry point, or set `forge.options.ci` to one of the known "
+        f"kinds. Refusing to fall back: an observer pointed at the wrong system never confirms a "
+        f"deployment, and the symptom is a release that hangs in 'verifying' rather than an error "
+        f"anybody can act on."
+    )

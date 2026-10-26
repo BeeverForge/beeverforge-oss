@@ -1,0 +1,98 @@
+"""#135: a stack rebuilt by halves must say so — and a healthy one must stay quiet.
+
+Half these cuts restore the original blindness (nobody announces, nobody compares, the banner is
+never painted). The other half go the OTHER way: they make the banner fire when it must not. Both
+directions matter here — a warning that says "this screen is unreliable" is worthless the day it
+starts crying wolf, and this one would cry on every deployment that has not rebuilt yet.
+"""
+
+TEST = "tests/test_the_two_halves_agree_on_which_code_they_run.py"
+NS = "beeverforge/namespace.py"
+APP = "beeverforge/api/app.py"
+PANEL = "beeverforge/api/panel.html"
+WORKER = "beeverforge/runtime/temporal/worker.py"
+CLI = "beeverforge/cli.py"
+
+MUTATIONS = [
+    # ── the blindness this card removes ─────────────────────────────────────────────────────────
+    ("the worker stops announcing its build at boot", WORKER,
+     '    log.info("this worker runs build %s", _ns.announce_build(WORKER_ROLE) or '
+     '"(not a built image)")\n', ""),
+
+    ("the PANEL stops announcing, so a stale panel is invisible to the worker", CLI,
+     "    namespace.announce_build(PANEL_ROLE)\n", ""),
+
+    ("doctor stops naming a half that runs different code", CLI,
+     "        for role, (stamp, when) in sorted("
+     "namespace.build_disagreement(WORKER_ROLE).items()):",
+     "        for role, (stamp, when) in sorted({}.items()):"),
+
+    ("a half-written announcement is read as somebody's build", NS,
+     "        except (OSError, ValueError):\n            continue",
+     "        except (OSError, ValueError):\n            data = {}"),
+
+    ("a process compares itself against its own announcement and always agrees", NS,
+     "    return {r: v for r, v in announced_builds(where=where).items()\n"
+     "            if r != role and v[0] and v[0] != mine}",
+     "    return {r: v for r, v in announced_builds(where=where).items()\n"
+     "            if v[0] and v[0] != mine}"),
+
+    # RE-PINNED 2026-09-24 (#298): that frame's job list is `None` now — nobody could ask for one.
+    # The cut is the same: `build` leaves the frame of an engine nobody can reach.
+    ("the report is dropped when the engine is unreachable", APP,
+     '        return {"connected": False, "error": str(exc), "jobs": None, "build": build}',
+     '        return {"connected": False, "error": str(exc), "jobs": None}'),
+
+    # RE-PINNED 2026-09-19 (#183): the frame's `ui_base` now arrives with its `ui_hint` through
+    # `_engine_ui(tv)`; the cut is the same one — `build` leaves the working frame.
+    ("the report is dropped when the engine is UP — the working case", APP,
+     '            "connected": True, "address": addr, **_engine_ui(tv), "build": build,',
+     '            "connected": True, "address": addr, **_engine_ui(tv),'),
+
+    ("the banner is never painted from the engine frame", PANEL,
+     "  paintBuildSplit();  // before anything else reads this page: it may not be the page it "
+     "thinks\n", ""),
+
+    ("the banner names no build, so nobody can tell which half is old", PANEL,
+     '    +`served by <code>${esc(b.stamp||"?")}</code>${when(b.built_at)}; '
+     '${others.join("; ")}. Whatever `',
+     "    +`served by an older build. Whatever `"),
+
+    ("the banner stops naming WHICH half disagrees", PANEL,
+     "    .map(([r,o])=>`the <b>${esc(r)}</b> runs "
+     "<code>${esc(o.stamp)}</code>${when(o.built_at)}`);",
+     "    .map(([r,o])=>`another half runs different code`);"),
+
+    ("the remedy stops warning against the narrowed rebuild that caused this", PANEL,
+     "    +`no service name after it — then reload.`;",
+     "    +`the service name of your choice — then reload.`;"),
+
+    ("the banner is moved out of the header, so some screens cannot show it", PANEL,
+     '  <div class="buildsplit" id="buildsplit" style="display:none"></div>\n</header>',
+     "</header>"),
+
+    # ── the other direction: it must not cry wolf ───────────────────────────────────────────────
+    # three rows re-pinned 2026-09-07: the comparison moved to `namespace.build_agreement` (#144)
+    ("a half that has not announced is reported as DISAGREEING", NS,
+     "    others = {r: v for r, v in announced_builds().items() if r != role and v[0]}\n"
+     "    if not mine or not others:",
+     "    others = {r: v for r, v in announced_builds().items() if r != role and v[0]}\n"
+     "    if not mine:"),
+
+    ("a checkout is reported as disagreeing with whatever it can see", NS,
+     "    others = {r: v for r, v in announced_builds().items() if r != role and v[0]}\n"
+     "    if not mine or not others:",
+     "    others = {r: v for r, v in announced_builds().items() if r != role and v[0]}\n"
+     "    if not others:"),
+
+    ("a role that announced an EMPTY stamp is compared as if it were a build", NS,
+     "    others = {r: v for r, v in announced_builds().items() if r != role and v[0]}",
+     "    others = {r: v for r, v in announced_builds().items() if r != role}"),
+
+    ("the banner fires on anything that is not a proven agreement", PANEL,
+     "  if(b.agree!==false){el.style.display=\"none\";return}",
+     "  if(b.agree===true){el.style.display=\"none\";return}"),
+
+    ("a checkout writes a build file to say it is nothing in particular", NS,
+     "    if not stamp:\n", "    if False:\n"),
+]

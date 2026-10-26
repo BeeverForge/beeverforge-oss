@@ -1,0 +1,25 @@
+{
+ "beeverforge/product/domain.py": [
+  "confirmado"
+ ],
+ "beeverforge/product/module.py": [
+  "cartao-"
+ ],
+ "beeverforge/product/reading.py": [
+  "média"
+ ],
+ "beeverforge/product/role.py": [
+  "PEDIDO"
+ ],
+ "beeverforge/product/voice.py": [
+  "#321 e #135 fechados em #136",
+  "A minha proposta é fechar #321 e #135 em #136",
+  "Assim que você confirmar, isto vira requisito",
+  "Confirma e eu registro",
+  "Registrado o Requisito 1",
+  "confirme e eu registro o pedido",
+  "os 11 cards que estão na coluna Review",
+  "os 11 pontos de diagnóstico",
+  "os 11 pontos de diagnóstico em revisão"
+ ]
+}

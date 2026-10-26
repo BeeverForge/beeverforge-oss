@@ -1,0 +1,456 @@
+"""Results of running the platform's own steps.
+
+Key ADR-0001 principle (D-11): the *platform* runs the validation commands and
+reads their exit codes. It does not believe the agent that claims it ran them.
+"""
+
+from __future__ import annotations
+
+import re
+
+from pydantic import BaseModel, Field, field_validator
+
+from beeverforge.contracts.decision import DecisionRequest
+from beeverforge.contracts.manifest import PostMergeDeploy
+from beeverforge.contracts.review import ReviewResult
+from beeverforge.contracts.state import JobState
+
+
+class AgentRunResult(BaseModel):
+    """What a CodingAgentAdapter reports back after an execution/repair pass."""
+
+    ok: bool
+    #: THE JOURNAL'S SHORT FORM of the agent's final message, not the message: Claude's adapter
+    #: caps it at ~1000 characters with no marker. Whatever must carry the WHOLE message — the pull
+    #: request's `AGENT_ACCOUNT_HEADING` section (#627) — reads `agent.base.final_text(res)`.
+    summary: str = ""
+    cost_usd: float | None = None  # from `claude -p --output-format json`
+    # Human-readable trace of what the agent did (e.g. "Edit app/health.py",
+    # "Bash: pytest") — parsed from the stream so the orchestrator can journal it
+    # without knowing which agent produced it.
+    actions: list[str] = Field(default_factory=list)
+    # an infra pause (not a code failure): the agent hit a usage limit or an auth
+    # problem. reason ∈ {"rate_limit", "auth"}; retry_at set only for rate limits.
+    pause_reason: str | None = None
+    retry_at: str | None = None
+    # How many agent turns this invocation consumed — the agnostic effort currency feeding the
+    # ticket-wide budget (ADR-0013 D4). None when the adapter doesn't report turns.
+    num_turns: int | None = None
+    # Cost-telemetry dimensions (observability.metrics): which model tier + harness produced this
+    # result, and the token usage. Agnostic strings/ints any adapter can fill; None when unknown.
+    model: str | None = None          # opus | sonnet | haiku | …
+    harness: str | None = None        # the adapter identity, e.g. "claude_code"
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    # Which credential of the pool produced this result — AGNOSTIC telemetry any adapter with
+    # a credential pool can fill ({index, total, id, rotated}). The core just surfaces it (panel
+    # token visibility + proof that failover happens); it never reads the actual token. None for
+    # a keyless/single adapter. (Claude fills it from its token pool — the detail stays there.)
+    credential: dict | None = None
+    # OPAQUE resume token an adapter emits on a resumable pause and consumes on resume (C2):
+    # the core round-trips it without interpreting it, so a Claude session id or a Codex handle
+    # both work. None → nothing to resume (fresh run). Adapter-private meaning; core-agnostic.
+    resume_handle: str | None = None
+    raw_output: str = ""
+    # THE BOX STOPPED THIS PASS AT ITS WALL (#980). Set only by `agent.base.wall_result`. The box
+    # kills only the shell it started, so the harness and whatever it spawned may still be running
+    # and writing. Read here rather than from `TIMEOUT_MARKER` in `raw_output`, which keeps only
+    # the tail.
+    walled: bool = False
+
+
+class AgentRunMetric(BaseModel):
+    """The cost/effort of ONE agent invocation within a job — the per-model / per-harness detail
+    the orchestrator collects so the telemetry sink can persist spend by dimension. Kept in the
+    contract layer (no observability dependency) so machine.py can fill it as it runs each pass."""
+
+    role: str  # planner | executor | repair | recovery | review | diagnose | chat
+    model: str = ""
+    harness: str = ""
+    cost_usd: float | None = None
+    num_turns: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    # -- what the pass DID, not only what it cost (observability.trajectory) ---------------------
+    # Cost and turns say how much was spent; these say on what. They are the instruments for the
+    # two questions an operator asks about a factory and that nothing here could answer — is it
+    # fast, is it cheap — and their raw material was already being parsed on every pass and thrown
+    # away.
+    #
+    # NONE IS "NOT MEASURED", NEVER "ZERO". A harness with no stream reader, and a pass whose
+    # output was not captured, both leave these None — because a recorded 0 would say the agent
+    # called no tools, which is a measurement nobody took and the exact failure the trajectory
+    # module exists to avoid.
+    tool_calls: int | None = None
+    #: calls whose key had already been seen. NOT automatically waste — re-reading a file after
+    #: editing it is correct — but a run whose repeats dominate its calls is one to look at.
+    repeated_calls: int | None = None
+    #: calls for a tool this invocation never granted; the CLI denied them, so they are pass spent
+    #: asking for something that was never going to arrive
+    refused_calls: int | None = None
+    #: model steps before the first edit — the exploration tax. None also when the pass edited
+    #: nothing, which is why it is never summed across passes: it is a per-pass shape.
+    turns_to_first_edit: int | None = None
+
+
+class ValidationResult(BaseModel):
+    """One declared validation command, run by the platform (not the agent)."""
+
+    name: str  # e.g. "test", "lint", "security"
+    command: str
+    exit_code: int
+    passed: bool
+    output_tail: str = ""  # last N lines, for the PR/report
+    #: Reported, never blocking (C-37). The field is on the RESULT and not only on the manifest
+    #: because everything downstream — the merge decision, the repair loop, the PR body, the panel
+    #: — reads results, and a consumer that had to re-derive the policy from the manifest is a
+    #: consumer that will forget one branch. Default False: a gate that quietly stopped blocking
+    #: is the dangerous direction of this change.
+    advisory: bool = False
+    #: The shell's own line when the command never RAN — the tool is not in the box, or is there
+    #: and not executable. Empty for every gate that ran, whatever it then said about the code.
+    #:
+    #: `passed` STAYS FALSE, and that is deliberate: an unrun gate has proven nothing, and reading
+    #: "could not run" as "fine" is the one direction this codebase never takes. What changes is
+    #: who is asked to act. A failing gate is a diff to repair; a gate that could not run is a box
+    #: to fix, and no agent can install `ruff` — three paid attempts later the job parked as
+    #: "validations failed after 3 repair attempt(s)", a sentence about code, for a missing tool.
+    unrunnable: str = ""
+
+
+class Suppression(BaseModel):
+    """A gate-suppression the diff ADDED (pragma: no cover, noqa, type: ignore, nosec) —
+    with where it lives, so the panel can show the human exactly what to review instead of a
+    bare "forcing human review" (engineering #12). Populated for jobs run after this shipped."""
+
+    kind: str  # normalized type, e.g. "pragma: no cover"
+    file: str = ""  # path the '+' line landed in, from the diff's `+++ b/…` header
+    snippet: str = ""  # the added line's text (trimmed), e.g. the function it exempts
+
+
+class KnowledgeVerdict(BaseModel):
+    """One file of the change as the knowledge gate judged it (ADR-0046)."""
+
+    path: str
+    verdict: str
+    reason: str = ""
+
+
+class HandedBack(BaseModel):
+    """An OUTCOME the box reached on the card and did not write: the worker applies it through
+    the card's door (ADR-0055 D7, #414).
+
+    THE BOX'S OWN VOCABULARY, NOT THE DOOR'S. It says which state it reached and what only it
+    knew about it — whether a person is the blocker (#166), and why — and the worker reads that as
+    the card's event (`lifecycle/handed_back.py`). So the box needs no lifecycle of its own, and
+    the contract layer names no card event.
+
+    `event_id` IS THE WORKER'S, written once the door recorded the transition: a later activity
+    applying the same outcome — the workflow reconciling a park (`mark_needs_action`) — hands it
+    to the door and is answered from the card's record, never parked a second time (D5)."""
+
+    state: JobState
+    needs_person: bool | None = None
+    reason: str = ""
+    event_id: str = ""
+
+
+#: WHAT THE IMPLEMENTING AGENT SAYS IT DID, ON THE PULL REQUEST (#627). Each of these has ONE
+#: spelling, for `_REVIEW_HEADING`'s reason (`orchestrator/machine.py`): the body's writer and the
+#: reader that amends it on every later pass must agree, and a copy that drifts fails silently —
+#: the amendment never lands. The heading is never translated: it is parsed.
+AGENT_ACCOUNT_HEADING = "## What the agent says it did"
+#: The executor's quoted block, counted AS WRITTEN IN THE BODY — after neutralising, escapes
+#: included, with every `> ` prefix — because a message of short lines would otherwise roughly
+#: double in size. The cut line counts differently, as the reader sees the quote.
+AGENT_ACCOUNT_MAX = 2000
+#: One later pass's own words, flattened to one line: the cut the `agent finished:` note uses.
+AGENT_PASS_WORDS_MAX = 200
+#: Later passes listed; the older ones are counted, and the count accumulates across republishes.
+AGENT_PASSES_SHOWN = 10
+#: Every kind of later pass a line can name. A label is followed by its ordinal where a run can
+#: hold several (`gate repair 2`); any other kind is refused — an unknown kind raises.
+PASS_KINDS = ("recovery", "gate repair", "suppression repair", "review repair", "adjust",
+              "CI repair", "adjust gate repair")
+
+
+class PassAccount(BaseModel):
+    """One later pass's line under `AGENT_ACCOUNT_HEADING`: what kind it was, its own words (already
+    one line and cut), and the head commit it pushed — "" for a pass that committed nothing of its
+    own (a recovery). A pass is identified by `(kind, head)`, so the same pass republished twice
+    adds its line once."""
+
+    kind: str
+    words: str
+    head: str = ""
+
+    @field_validator("kind")
+    @classmethod
+    def _a_known_kind(cls, kind: str) -> str:
+        if re.sub(r" \d+$", "", kind) not in PASS_KINDS:
+            raise ValueError(f"{kind!r} is not a pass kind this platform writes ({PASS_KINDS})")
+        return kind
+
+
+class RunResult(BaseModel):
+    """The full outcome of one job attempt, assembled by the orchestrator."""
+
+    ticket_id: str
+    state: JobState  # the terminal state this attempt reached
+    branch: str = ""
+    note: str | None = None  # e.g. the NEEDS_REFINEMENT reason
+    #: How many automatic attempts were ALREADY spent before this park — 0 when none were.
+    #:
+    #: A NUMBER, BECAUSE IT WAS ONE (#124). The pause ladder knew `rate_resumes` exactly and threw
+    #: it away into prose — `note="still rate-limited after 3 auto-resumes"` — which
+    #: `techlead/classify.py` then recovered with a REGEX OVER OUR OWN SENTENCE. So the escalation
+    #: that stops the platform proposing the very thing whose failure the note describes was
+    #: wired to the wording, in two languages, one of which matched a sentence `remedy_for`
+    #: itself emits. Translating either would have disarmed it silently, and #124 is a
+    #: translation card.
+    attempts_spent: int = 0
+    # When state is PAUSED (rate-limited): the reset time the agent reported, if any — surfaced
+    # on the panel ("resumes after …") and used to pace the resume. Often absent (a vague/absent
+    # limit message) → the workflow falls back to a growing backoff. Agnostic string telemetry.
+    retry_at: str | None = None
+    # OPAQUE resume token carried from the agent through to the resumed run (C2) — the workflow
+    # round-trips it without interpreting it (Claude session id / Codex handle both fit).
+    resume_handle: str | None = None
+    # Cumulative agent turns this ticket has consumed across ALL attempts (executor + repairs +
+    # recoveries + resumes) — the workflow carries it into each resume so the effort budget
+    # (ADR-0013 D4) governs the TICKET, not one invocation.
+    spent_turns: int = 0
+    # Source of truth for which components were touched is the DIFF, not any label
+    # (ADR-0001 D-6). Resolved after execution by mapping the diff to component paths.
+    touched_components: list[str] = Field(default_factory=list)
+    # THE OTHER HALF OF THE SAME QUESTION, and the half nothing recorded. `touched_components` holds
+    # the components the diff MATCHED; these are the diff paths that matched none of them. Without
+    # them the merge gate loops over an empty list, finds no high-risk component and permits a
+    # change to a part of the repository the manifest never described — "no concept, no objection",
+    # inverted, in the gate that decides whether a person sees the merge at all. Capped for the
+    # pull request body a human reads; `undeclared_count` carries the true number.
+    undeclared_paths: list[str] = Field(default_factory=list)
+    undeclared_count: int = 0
+    # THE VERIFIER'S OWN INPUTS, if this change edited any (`policy/protected.py`). Resolved from
+    # the same diff, at the same moment, for the same reason the field above exists: the gate holds
+    # a RunResult and not a diff, so a question nobody recorded is a question the gate cannot ask.
+    #
+    # An attempt from before this field existed carries `[]`, which reads as "nothing protected was
+    # touched" — and that IS what the platform used to believe. It is not silently upgraded to
+    # "unknown": an old result cannot answer a question nobody asked it, and inventing a gate for
+    # it would refuse merges on evidence that does not exist.
+    protected_hits: list[str] = Field(default_factory=list)
+    #: the TRUE number of them. `protected_hits` is truncated for a person reading a pull request
+    #: body; this is not. Split for the same reason `undeclared_paths`/`undeclared_count` above is
+    #: split, and learned the same way: a change touching forty protected files reported twelve
+    #: and the real number was gone, because a count taken from a truncated list is not a count.
+    protected_count: int = 0
+    #: THIS DEPLOYMENT COULD NOT READ ITS OWN FLOOR — a different fact from a violation, and the
+    #: gate reads both. Kept apart because the sentence a human is shown differs: a violation names
+    #: the client's own change, and this names OUR install. The first revision answered an
+    #: unreadable floor with an arbitrary sample of changed paths, which gated correctly and told
+    #: the durable record a falsehood about which files were touched.
+    #:
+    #: An attempt from before this field existed carries `False`, which reads as "the floor was
+    #: readable" — the same rule as the fields above: an old result cannot answer a question nobody
+    #: asked it, and inventing a gate for it would refuse merges on evidence that does not exist.
+    floor_unreadable: bool = False
+    #: THE SANDBOX COULD NOT READ THIS CHANGE'S DIFF (#251) — and that is a third fact again,
+    #: beside a violation and an unreadable floor. `sandbox.diff_paths` answered `[]` for a `git`
+    #: that failed, a missing base ref, a `docker exec` that did not run and a timeout, and three
+    #: questions read that as "nothing changed": the risk assessment, the protected-path check and
+    #: the per-component gate selection. All three then reported nothing to find, so an attempt
+    #: nobody could measure arrived at the merge gate looking exactly like a clean one.
+    #:
+    #: An attempt from before this field existed carries `False`, by the rule the fields above
+    #: state: an old result cannot answer a question nobody asked it.
+    diff_unreadable: bool = False
+    # THE TEST CENSUS (`policy/census.py`), taken on the clean workspace after `setup:` and again
+    # after the agent's edits. `None` is NOT zero and the distinction is the whole gate: None means
+    # no census was taken — the project declares no inventory command, or it could not be read —
+    # and 0 means the command ran and collected nothing. Collapsing them would read a project with
+    # no census as a project whose suite just emptied.
+    test_census_before: int | None = None
+    test_census_after: int | None = None
+    #: identifiers present before and absent after — the reason, capped for a human to read
+    test_census_gone: list[str] = Field(default_factory=list)
+    #: how many there really were. The cap above is for a reader; this is the measurement, and it
+    #: is NOT recoverable from the count drop — a rename is minus-one-plus-one by this design's own
+    #: argument, so the two numbers answer different questions. Same split as `undeclared_count`.
+    test_census_gone_count: int = 0
+    validations: list[ValidationResult] = Field(default_factory=list)
+    repair_attempts: int = 0
+    total_cost_usd: float | None = None
+    # per-invocation cost telemetry (observability.metrics): one entry per agent pass this attempt
+    # ran, each tagged with model/harness/role/cost/turns/tokens. The workflow persists these on
+    # completion so the cost dashboard can slice by model and harness. Empty for pre-telemetry jobs.
+    agent_runs: list[AgentRunMetric] = Field(default_factory=list)
+    # WHICH A/B ARM this attempt ran in (ADR-0017's gate). Deliberately records what the agent
+    # actually SAW, not what was configured:
+    #   ""            — pre-instrumentation run (unknown; excluded from the comparison)
+    #   "off"         — the project has not opted in
+    #   "injected"    — the module map was in the agent's context
+    #   "unavailable" — opted in, but nothing was injected (no bundle, or it was stale/orphaned)
+    # The third value is why this isn't a boolean: a flag-on job whose map was stale belongs in
+    # the CONTROL arm, and a high "unavailable" rate means the pipeline isn't keeping up and the
+    # experiment is measuring noise rather than the map.
+    knowledge: str = ""
+    #: ADR-0046 — the knowledge gate's stance on this change (`green`/`amber`/`dark`, "" when it
+    #: did not run), the question a dark stance asks, one line for the body, and the verdicts.
+    knowledge_stance: str = ""
+    knowledge_question: str = ""
+    #: ADR-0050 D9 — the operator requires a person to look at a preview of this project before a
+    #: merge (`preview.required` in the registry), so the factory never merges it on its own.
+    preview_required: bool = False
+    #: THE LOOK IS THE ONLY THING HOLDING THIS MERGE (#448 slice 3). `merge_policy: auto`, every
+    #: other hold of `merge_policy.should_auto_merge` passed, and `preview_required` alone sent it
+    #: to a person — judged by the machine, which holds the manifest and the profile, with the one
+    #: hold taken out. The workflow publishes it on its merge wait, and the requester's recorded
+    #: acceptance of the head they tried is then what lets the factory merge (ADR-0055 D1,
+    #: `accepted`): the look ADR-0050 D9 requires, given by the person who asked for the change.
+    #: False on every result written before it, which reads as today's hard block.
+    auto_but_for_the_look: bool = False
+    #: ADR-0050 §8 — when this change edits the product's SHAPE (a compose file, `.beeverforge/
+    #: preview/**`, the manifest's `preview:`), every file a preview would read after it merges, as
+    #: `<path> <sha256 prefix>` (or `<path> absent`), so the person merging sees what the lines
+    #: point at, not only that they changed.
+    preview_shape: list[str] = Field(default_factory=list)
+    knowledge_note: str = ""
+    knowledge_verdicts: list[KnowledgeVerdict] = Field(default_factory=list)
+    #: how many concepts the factory authored for this change's undescribed files before judging
+    #: it again (ADR-0046, decided 2026-09-06) — 0 when it did not, or did not need to
+    knowledge_authored: int = 0
+    review: ReviewResult | None = None  # independent reviewer's verdict (D-5)
+    #: WHAT THE IMPLEMENTING AGENT SAYS IT DID (#627) — A CLAIM, and only a claim. The executor's
+    #: whole final message (`final_text`), raw, kept to 4 × `AGENT_ACCOUNT_MAX` so the activity
+    #: payload stays bounded (the rendered bound is applied when the body is written); its true
+    #: length; and one line per later pass. They reach the pull request under
+    #: `AGENT_ACCOUNT_HEADING` for the person deciding, and nothing else: `merge_policy` never
+    #: reads them, no gate does, and the reviewer is never handed them (ADR-0001 D-5, D-11).
+    #: Empty on a result from before them, which the body says as "wrote nothing" — nothing was
+    #: carried. RAW HERE, credentials and all: a credential in them is withheld when they are
+    #: quoted into the body (`_quoted`, `_pass_words`, #885), not on this payload.
+    agent_account: str = ""
+    agent_account_chars: int = 0
+    agent_passes: list[PassAccount] = Field(default_factory=list)
+    #: Did THIS PASS change the pull request? Measured, on the checkout the pass had in hand: the
+    #: diff against the base before the agent ran, against the diff after it committed and pushed.
+    #:
+    #: THE VERDICT'S STALENESS IS A STATEMENT ABOUT CODE, so it has to be answered by code (#179).
+    #: A repair pass that could not act, a formatter that reformatted nothing, an amend, a rebase
+    #: that replays identically — each of those used to demote the platform's own review to "out of
+    #: date, go read the diff yourself" and take the finding a person was standing there to read
+    #: off the screen. What moved was a commit sha; what the reviewer read did not move at all.
+    #:
+    #: `None` IS THE CONSERVATIVE ANSWER, not a missing one: git could not be asked, so the marker
+    #: stays up. The expensive direction is the other one — presenting a rejected review as current
+    #: about code it never saw — which is why an unknown never clears it.
+    #:
+    #: SCOPE, SO THE FIELD IS NOT READ FOR MORE THAN IT MEASURES: this is about the pass, not about
+    #: the world. Somebody else pushing to the branch between the review and this pass is not
+    #: detected here — it never was anywhere, since only our own passes ever raised the marker.
+    code_changed: bool | None = None
+    pr_url: str | None = None
+    # True when the PR was opened under merge_policy=auto and auto-merge was ARMED but the
+    # PR is not yet merged (waiting on required CI). The durable workflow then owns the
+    # CI-watch/repair/merge loop (ADR-0004): react to a red CI instead of leaving it armed
+    # forever. False when the machine already merged (CI green / no required checks) or on
+    # the human-review path.
+    auto_merge: bool = False
+    #: THE FORGE REFUSED THIS MERGE, and the pull request is still open (ADR-0049 D4). Set in the
+    #: one place the refusal happens — a person answered the merge gate and the forge said no —
+    #: and read in one place: the resume path, which re-enters the MERGE rather than the agent
+    #: when it is True.
+    #:
+    #: A FIELD, NOT A READING OF `note`. The note is prose for a person, it carries the forge's
+    #: own sentence verbatim, and a translation card is exactly the change that rewrites it — the
+    #: `attempts_spent` lesson above (#124), where an escalation was wired to a regex over our own
+    #: wording in two languages. Whether a resume costs a full agent pass must not depend on which
+    #: words the forge chose.
+    #:
+    #: An attempt from before this field existed carries `False`, which reads as "no merge was
+    #: refused" — the rule `floor_unreadable` states above: an old result cannot answer a question
+    #: nobody asked it, and re-running the agent is what those jobs already replay.
+    merge_refused: bool = False
+    #: WHAT KIND OF FAILURE THIS HOLD IS, in the classifier's own vocabulary
+    #: (`techlead/classify.py`) — set only where the code that parked KNOWS the class, "" where it
+    #: does not.
+    #:
+    #: A FIELD, FOR THE REASON `attempts_spent` AND `merge_refused` ARE ONES, and it was measured:
+    #: the merge watch's holds carry a forge CHECK'S NAME and a vendor's remedy inside their note,
+    #: and the classifier reads that note as prose. A check a team called "rate-limit tests" was
+    #: read as throttling, and the job auto-resumed three times at a full agent pass each — the
+    #: loop that burns passes on something no retry can settle (measured 2026-09-19 on the real
+    #: workflow). What a hold IS cannot depend on the words a vendor or a team chose.
+    #:
+    #: "" ON AN OLD RESULT, which reads as "this hold did not say", and the note is classified as
+    #: it always was. The same rule as every field above: an old result cannot answer a question
+    #: nobody asked it.
+    hold_cause: str = ""
+    # the manifest's declared environments (e.g. ["staging","prod"]) — lets the workflow
+    # decide POST-PR promotion from the project's CONFIG, not a start-time flag (A2)
+    environments: list[str] = Field(default_factory=list)
+    #: The stage a PERSON is asked to confirm, and the address they open to do it (#122). Filled
+    #: by `PromotionRunner` — which runs in a box with the manifest checked out — so the answer
+    #: travels back to the worker, which has no checkout and would otherwise have to guess.
+    #:
+    #: `look_stage` set with `look_at` EMPTY is a real and different state: the project declares a
+    #: stage worth confirming and no address for it. The messages say exactly that rather than
+    #: sending somebody to a place nobody named.
+    look_stage: str = ""
+    look_at: str = ""
+    # the manifest's post-merge deploy-watch config (ADR-0005), carried so the durable
+    # workflow can spawn an abandoned watcher AFTER merge without re-reading config. None
+    # when the project doesn't opt in — then no watch is started.
+    post_merge_deploy: PostMergeDeploy | None = None
+    # gate-suppression comments the diff ADDED (pragma: no cover, noqa, type: ignore,
+    # nosec). An agent must not pass a quality gate by silencing it; detected
+    # deterministically from the diff and always forced to human review (never
+    # auto-merged), independent of the LLM reviewer. (engineering.md #12)
+    added_suppressions: list[str] = Field(default_factory=list)
+    # the same suppressions WITH their location (file + line text) — for the panel's
+    # "why is this waiting for me" briefing. added_suppressions stays the type-list the
+    # merge guard keys off; this is the display detail. Empty for pre-existing jobs.
+    suppression_details: list[Suppression] = Field(default_factory=list)
+    # When a stage parks needing a HUMAN CHOICE (a planner blocker, an unclear ticket), the
+    # question + concrete options travel here so the workflow can surface them (panel/API) and
+    # inject the picked option back on resume. None on a normal outcome. "No park without
+    # options" (owner) — a bare state is never enough. See beeverforge/contracts/decision.py.
+    decision: DecisionRequest | None = None
+    #: THE OUTCOMES THE BOX REACHED ON THE CARD, IN ORDER, AND DID NOT WRITE (ADR-0055 D7, #414):
+    #: a pull request opened, a merge, a delivery, a refusal, a park. The worker that receives this
+    #: result applies each through the card's door, so the board, the record, the promise and the
+    #: requester hear an outcome however far from them the box ran. What the box still writes
+    #: itself is only its progress marks (`contracts/state.py::PROGRESS_MARKS`).
+    #:
+    #: `None` IS A BOX FROM BEFORE THIS FIELD, and it means something: that box wrote its outcomes
+    #: on the card itself, so the worker applies NOTHING and does what it did — a result in a job's
+    #: history, or from a box image older than the worker, parses and is answered as it always
+    #: was. `[]` is a box that reached no outcome (a re-review with no reviewer to run).
+    handed_back: list[HandedBack] | None = None
+
+    @property
+    def all_passed(self) -> bool:
+        """Every BLOCKING gate passed, and there was at least one.
+
+        TWO DEFECTS LIVED IN `all(v.passed for v in self.validations)`, and both were about
+        claiming a green nobody earned.
+
+        ADVISORY WAS COUNTED. `machine._all_passed` learned to exclude advisory gates (C-37) and
+        this property — the one `merge_policy.should_auto_merge` actually reads — did not, so an
+        advisory security scan reporting a finding blocked the merge and parked the job with
+        "validations failed". That is the exact opposite of what advisory means, and it would have
+        made the free security preset the first thing a client turned off.
+
+        `all([])` IS TRUE. A project registered with an empty `validate:` block ran the agent,
+        passed every gate vacuously, and was eligible for auto-merge — its entire quality floor
+        being `all([]) == True`. The floor (`policy/floor.py`) names `test` and `security` as
+        non-negotiable, and its only reader was a CLI command nothing in the job path calls.
+
+        Requiring at least one blocking gate is the safety net, not the fix: a project with no
+        gates is refused before pickup, where refusing costs nothing (`policy/conformance.py`).
+        This is what stops a green being reported if that ever fails to hold.
+        """
+        blocking = [v for v in self.validations if not v.advisory]
+        return bool(blocking) and all(v.passed for v in blocking)

@@ -1,0 +1,2686 @@
+"""The product role's ONE turn engine: a message in, the replies it earns out (#266 slice 2).
+
+THREE DOORS DRIFTED APART, AND THIS IS WHAT THEY BECAME (ADR-0051 D12). Until 2026-09-24 the
+product conversation had four partial copies. `product/channel.py::handle` held the whole of it —
+settle, fourteen typed intents, the intake, the gestures, the staged draft — and was called only
+by the external Slack add-on. The panel reached `activities._product_draft` through `product_ask`,
+which answered and drafted and never settled, so a typed "sim" there confirmed nothing.
+`activities._product_conversation`, behind `product_say`, settled and answered and never drafted,
+and nothing called it. And `catalog._say_as_an_intent` routed four read-only intents a third way.
+Everything those held is here now, in one place, and every surface reaches it the same way:
+through the one door (`product/door.py`, #266 slice 3) onto its conversation, whose turns the
+worker takes one at a time (`runtime/temporal/conversation.py`) — the panel's row, the CLI and the
+chat adapter that `channel.handle` still is alike.
+
+A RELOCATION, NOT A REDESIGN (ADR-0038's word). The judgement is kept line for line, and every
+incident comment travelled with the line it explains. `tests/test_the_conversation_is_pinned.py`
+pinned it flow by flow against `channel.handle` before any of it moved, and drives THIS module now,
+through the neutral `Message`. What changed is the structure the judgement runs in:
+
+    settle  →  intents  →  converse (the answer)  →  gestures  →  staging
+
+— five stages, each a function that takes the one message being answered (`Exchange`) and can be
+called on its own. `turn` runs them in that order and nothing else.
+
+ONE WAY OUT (ADR-0051 D13). The engine never calls a channel, and the one callback it takes is not
+a way out: `turn(..., progress=)` hears WHAT the turn is doing while it works ("lendo o quadro"),
+never anything it says (#395, `product/progress.py`) — presence for a surface that can show it in
+place, not a reply, never recorded, never read back to the model. A receipt —
+"I am on it" — is a `Reply` of its own kind; a question with buttons is a `Reply` carrying a
+`Confirmation`, which each transport renders its own way (ADR-0038 D2): buttons where it has them,
+the sentence alone where it has not. What a person says is recorded in the transcript on arrival,
+and what the role says is recorded before it is returned — a reply memory has, whatever becomes of
+it on the way out (the lesson of ADR-0024's audit).
+
+THE CONVERSATION HAS EXACTLY ONE CONFIRMATION, and where it sits is the design:
+
+    someone describes a need    →  the role answers, and if it heard a REQUEST it drafts
+    the draft is shown          →  in the client's words, with any conflict stated FIRST
+    the person says yes         →  it is written up for the team
+
+That single "yes" is the PROVENANCE — the record of who wanted this and when. It is asked for in
+the conversation with the person who wanted it, rather than on an artefact they would never open.
+Anything more is a form; anything less and a requirement enters the corpus that nobody agreed to.
+
+READ IS OPEN, WRITE IS GATED (ADR-0016's model). Asking what the product already promises is not a
+privileged operation. Recording a new promise is: only a listed approver's "yes" counts, and an
+unauthorised one is answered rather than swallowed — a request that vanishes is indistinguishable
+from a broken bot, so the person simply repeats it.
+
+EVERY MESSAGE HAS A PERSON BEHIND IT, AND EACH PERSON THEIR OWN (#266 slice 4). The speaker is a
+person of the product with a role in it — client, product admin or engineer (`product/speaker.py`)
+— and the role's answer is told which. What a turn stages is staged for that person in that
+conversation (`staging.key_for`), so a second person's request in a room no longer displaces the
+first's draft; a yes confirms only the speaker's own proposal unless the product lets an admin
+accept on the requester's behalf (`confirm.not_theirs`); and a decision the role asked of one
+person is closed only by that person, where it was asked. `in_reply_to` is kept in the transcript:
+the person's turn records what it replies to, and the role's turn the message it answers.
+
+NOTHING OUTSIDE THIS MODULE CALLS `ProductModule.answer` OR `ProductRole.answer`, and
+`tests/test_one_turn_engine.py` walks the package to say so: a second caller of the model's answer
+is a second conversation starting over. The factory's own question about a card (`consult`) comes
+through here too, for that reason.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from beeverforge.contracts.refs import canonical_ref, ref_label
+from beeverforge.product import progress as _progress
+from beeverforge.product.confirm import _is_requester, receipt
+from beeverforge.product.confirm import confirm as confirm_staged
+from beeverforge.product.staging import (
+    _expired_recently,
+    _proposal_summary,
+    consume,
+    find_waiting,
+    is_no,
+    is_yes,
+    key_for,
+    pending_for,
+    proposal_token,
+    remember,
+)
+from beeverforge.product.voice import admins_must_confirm, engine_said
+
+log = logging.getLogger("beeverforge.product.engine")
+
+
+# ── the contract: a message in, replies out ─────────────────────────────────────────────────────
+
+class Confirmation(BaseModel):
+    """The two answers a staged proposal can be given, as options a transport may render.
+
+    `token` names what was SHOWN — the proposal's key and fingerprint (`staging.proposal_token`) —
+    so a click answers that proposal and never its replacement. `typed` is the sentence that says
+    a typed answer works too: a click only reaches the worker where the transport's buttons are
+    wired, and a proposal that waits for a click that cannot arrive waits for ever
+    (`channel.deliver` puts it beside the buttons)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    token: str
+    approve: str
+    reject: str
+    typed: str
+
+
+class Reply(BaseModel):
+    """One thing the role says back (ADR-0051 D13).
+
+    `kind="receipt"` is the acknowledgement before the slow part — NOT recorded in the transcript
+    (`confirm.receipt` says why) and carrying no information but that somebody is on it.
+    `kind="handoff"` is the conversation's own word when a turn outlived its bound (ADR-0051 D6):
+    presence, like a receipt and likewise unrecorded — the work goes on, and its answer comes back
+    through the door when it is done (`product/door.py`). Every other reply is `answer`. `options`
+    is present when the reply asks for a yes or a no on something staged; a transport without
+    buttons shows `text`, which always asks in words."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    kind: Literal["receipt", "answer", "handoff"] = "answer"
+    options: Confirmation | None = None
+    addressed_to: str = ""
+    in_reply_to: str = ""
+    conversation: str = ""
+
+
+class Message(BaseModel):
+    """One message to the product role, in no transport's shape (ADR-0051 D1).
+
+    WHAT EVERY TRANSPORT HANDS OVER, and nothing a vendor decided. The fields are the ones the
+    conversation already needed — `channel.handle` took all of them as loose keywords — named for
+    what they are rather than for where the first transport kept them:
+
+    - `conversation` is the key the conversation is remembered and staged under: a thread, a
+      room, a person's private key (`product/conversation.py`). Which conversation a message
+      belongs to is the TRANSPORT's to say (a chat thread, the panel's scope); the engine never
+      parses an event to find out.
+    - `room` is the conversation a thread lives inside, when it lives inside one: a bare "sim"
+      typed there still finds a proposal staged in the thread, and the thread's history carries
+      the room's rolling exchange. Empty where there is no such room (the panel).
+    - `speaker` is who said it: a PERSON OF THE PLATFORM, never a vendor's user id (#266 slice
+      6, ADR-0051 D16) — the panel names them from the credential, the CLI from the shell, and a
+      chat add-on maps its own users to people through its port before the message is built
+      (`product/channel.py::handle`, `adapters/channel/base.py::PeopleOfAChannel`). Their ROLE in
+      this product — client, product admin or engineer, client by default — is the registry's to
+      say, never the message's: the engine resolves it (`product/speaker.py`, #266 slice 4) from
+      the product's configuration.
+    - `mentions_role` and `direct` are what the TRANSPORT knows about who the message is for
+      (#266 slice 6, ADR-0051 D14): whether it detected the role named in the message, its own
+      way, and whether the conversation is a direct one with the role. The core decides from them
+      — and from whether the role takes part in the conversation — whether the message is
+      addressed to the role at all (`product/addressing.py`); one that is not is kept and
+      searchable, and starts no turn. BOTH DEFAULT TO NO, the direction a transport that forgot
+      them fails in: a room message nobody marked is kept, never put in front of the role.
+    - `source` is where the message can be found again (a permalink), carried onto what it stages.
+    - `fingerprint` is what a CLICK already verified, carried to the compare-and-swap that
+      performs the proposal: empty for a typed message, which has verified nothing yet.
+    - `via` is the transport it came through — PROVENANCE for every gate and write record, never
+      permission. `api` when a caller did not say, the core's own name for a caller of its
+      interface; the chat adapter says its own.
+    - `context` is what the speaker was looking at when they wrote (#266 slice 5): the panel's
+      page and, on a card's page, the card — ADMITTED where the message came in
+      (`product/page.py::admit`), never as the browser said it, and read into the role's current
+      state by `converse`. Empty for a transport with no pages.
+
+    `id` names this message, so a reply can say which one it answers (`Reply.in_reply_to`); the
+    door deduplicates on it (`product/door.py`). `in_reply_to` is the message this one replies to,
+    and both are kept in the transcript (#266 slice 4): the person's turn under its own id and what
+    it replies to, the role's turn as the reply to this id. FROZEN: a message is what was said, and
+    no stage may rewrite it — the verdict of the confirmation judge is carried beside the text,
+    never written over it (see `settle`).
+
+    `replies` is empty for everything a PERSON says. It is how an INTERNAL EVENT comes through the
+    same door (ADR-0051 D1, D6): the outcome of an asynchronous task the role started — the first
+    pass over a codebase, an answer that outlived its turn — carried as the replies to publish,
+    already recorded by whoever produced them. An event starts no turn and reaches no stage."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    project: str
+    conversation: str
+    room: str = ""
+    speaker: str = ""
+    text: str
+    in_reply_to: str = ""
+    source: str = ""
+    fingerprint: str = ""
+    via: str = "api"
+    replies: tuple[Reply, ...] = ()
+    context: dict[str, str] = Field(default_factory=dict)
+    mentions_role: bool = False
+    direct: bool = False
+    #: THE FILES THE MESSAGE CARRIES (#336), in no transport's shape: `{id, name, type, size}` of
+    #: each — the bytes are the product's to keep (`product/attachments.py`), and a turn reads them
+    #: only in the conversation they were sent in.
+    attachments: tuple[dict, ...] = ()
+    #: WHEN IT WAS SAID (#394): the moment the message was built where it came in — the door's
+    #: moment for every transport — in UTC ISO. The person's line in the transcript is written
+    #: under it, so a turn run again after its worker died writes the SAME row and not a second
+    #: one; a worker rebuilding the message from the conversation's input hands it back as it was
+    #: stamped, never its own clock.
+    at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+class Exchange:
+    """ONE MESSAGE BEING ANSWERED — what every stage reads, and what the turn has said so far.
+
+    Built fresh per message, like the module it holds: one conversation must not carry
+    another's state. The stages take it rather than eleven loose keywords, which is what lets
+    each of them be called on its own."""
+
+    def __init__(self, project, message: Message, module=None) -> None:
+        from beeverforge.product.module import ProductModule
+
+        #: THE PRODUCT'S WRITE SEQUENCE AS THIS TURN'S CHECK SAW IT (ADR-0051 D8), noted FIRST —
+        #: before the module reads a corpus, a board or a ledger — so whatever the turn's search
+        #: could not have seen arrived after it. What this turn stages carries it, and the
+        #: confirmation re-checks only what came after. None when it could not be read: the
+        #: staging then notes the sequence it finds, the confirmation's own check stands.
+        self.seen = _sequence_now(project)
+        self.project = project
+        self.message = message
+        self.text = message.text
+        self.user = message.speaker
+        self.thread = message.conversation
+        self.channel = message.room
+        self.source = message.source
+        self.fingerprint = message.fingerprint
+        self.via = message.via
+        self.lang = getattr(project, "language", None)
+        self._person = None
+        #: WHERE WHAT THIS TURN STAGES WAITS: this person's own place in this conversation
+        #: (`staging.key_for`), so their draft and another person's in the same room never
+        #: displace one another
+        self.key = key_for(message.conversation, message.speaker)
+        self.module = module or ProductModule(project, via=message.via)
+        #: the receipts said so far, in order; the answer is appended by `turn`
+        self.replies: list[Reply] = []
+        #: THIS CONVERSATION AS THE ROLE READ IT, and the typed intake beside it — kept for the
+        #: gestures, which run after the answer (#383). The card a person asks for is drafted from
+        #: what the conversation established, and the conversation was built for the answer and
+        #: then dropped: the gesture had only the last message, and filed it. Only THIS
+        #: conversation — never what `_with_elsewhere` adds from others, which must not reach a card
+        #: on the board.
+        self.conversation = ""
+        self.intake = ""
+        #: THE DRAFT THIS TURN MAY REPLACE (#661): the proposal still waiting for this person's
+        #: yes, or the one this message's "no" just took off the table. A draft written after it
+        #: is written FROM it — the request alone redrafted "o filtro também por situação" into a
+        #: filter on the list, and the CSV export the person had asked for was dropped.
+        self.replacing: dict | None = None
+        # ONE RECEIPT PER MESSAGE, and the factory is in the core so the click path gets the same
+        # one: seeded by the message, so consecutive questions differ while the same message
+        # always produces the same acknowledgement (deterministic tests, answerable support).
+        # Said INTO THIS TURN'S REPLIES, never to a channel — the engine has none to call.
+        self.on_it = receipt(project, self._receipt, seed=message.text)
+        self._closed_decisions = False
+
+    def _receipt(self, said: str) -> None:
+        self.replies.append(Reply(text=said, kind="receipt"))
+
+    def progress(self, stage: str, **counts: int) -> None:
+        """THE TURN IS NOW DOING `stage` (#395) — told to whatever surface installed a sink for
+        this turn (`turn(..., progress=)`), and to nothing otherwise. NOT the receipt: a receipt
+        is one `Reply` per message, said once, "at most once, ever"; a stage is presence, said as
+        often as the turn moves on, and never becomes a reply. Stages deeper in the turn — the
+        module, and the card loop of #390 (`cards.compose`) — call `product.progress.stage` itself,
+        which is the same hook."""
+        _progress.stage(stage, **counts)
+
+    @property
+    def person(self):
+        """WHO IS SPEAKING, as a person of this product with a role in it (#266 slice 4) — read
+        from the registry, never from the message. Resolved when a stage first needs it: the
+        answer does; a yes performed by `settle` asks the allowlist itself, at its own gate, and a
+        turn that never reaches the answer never asks twice."""
+        if self._person is None:
+            from beeverforge.product.speaker import person
+
+            self._person = person(self.project, self.message.speaker, via=self.message.via)
+        return self._person
+
+    def close_decisions_if_she_reads_this(self) -> None:
+        """A HUMAN SPOKE, SO THE DECISIONS SHE ASKED FOR WERE ANSWERED — once per message.
+
+        BEFORE anything else she says, and before her new reply can open fresh ones: this very
+        message is the person responding to what she asked last round. Closing after would either
+        close the ones she just opened, or leave last round's open for ever.
+
+        ONLY WHEN THE MESSAGE WILL ACTUALLY REACH HER. The first version closed every open
+        decision on ANY inbound message, resting on "a partial answer is safe because she re-asks
+        what is still undecided". That holds only if she READS the message — and the intent
+        shortcuts (`status`, `triage`, a bare confirmation) answer from data already in hand and
+        never reach the model. So a bare "status" silently closed three chased decisions as
+        `answered` and nothing would ever ask again: precisely the silent loss the decision ledger
+        exists to prevent.
+
+        Deferred to the conversational stage, which is the only one she reads. A message that only
+        says "status" leaves the decisions open — one more reminder, which is the cheap
+        direction.
+
+        ONLY THE ONES SHE ASKED OF THIS PERSON, HERE (#266 slice 4, ADR-0051 D11). This closed
+        every open decision of the project, so one person's "bom dia" answered a decision asked of
+        somebody else in another conversation, and nobody was ever chased about it again."""
+        if self._closed_decisions:
+            return
+        self._closed_decisions = True
+        try:
+            self.module.close_decisions_answered(
+                channel=self.channel,
+                **_scoped(self.module.close_decisions_answered, self.thread, self.user))
+        except Exception:  # noqa: BLE001 — bookkeeping must never cost the reply
+            log.warning("[%s] could not close answered decisions",
+                        getattr(self.project, "name", "?"), exc_info=True)
+
+
+def turn(project, message: Message, *, module=None, again: bool = False,
+         progress=None) -> list[Reply]:
+    """One message to the product role. Returns every reply it earned, receipts first.
+
+    `again` says this message was being answered before, by an attempt that did not finish — the
+    worker's retry after a worker loss (#394). The person's line is written under the moment it
+    was said (`Message.at`), so the second attempt lands on the first's row whatever it is told;
+    what `again` changes is the answer: whatever an earlier attempt recorded as its answer to this
+    message is withdrawn before this attempt's is recorded (`transcript.supersede`), because the
+    conversation publishes this attempt's answer and memory must hold the one the person saw.
+
+    `project` is the registry project the message is for, and `message.project` must name it: the
+    door resolves one from the other (slice 3), and a mismatch here is a caller's bug, raised
+    rather than answered in the wrong project's voice. `module` is the product module to answer
+    with — built fresh for this message when none is handed in — and its per-turn view of the
+    product is released when the turn ends, whoever built it.
+
+    NEVER RAISES otherwise: a chat caller runs this inside its listener (Socket Mode, for one), and
+    the worker inside an activity with one attempt, where an exception takes the answer down with
+    it. An empty list means the role stays quiet.
+
+    `progress` is the sink the turn's stages are told to while it works (#395): `(stage, counts)`,
+    one of `product.progress.STAGES`. The worker's turn hands its conversation one, so the panel
+    can say "lendo o quadro…" in place of minutes of nothing; a caller that hands none (a chat
+    add-on calling directly, a test) gets exactly the turn it always got."""
+    from beeverforge.memory import transcript
+
+    name = getattr(project, "name", "?")
+    if message.project != name:
+        raise ValueError(f"a message for {message.project!r} was handed the project {name!r}")
+    text, user, thread, channel = message.text, message.speaker, message.conversation, message.room
+    reply: Reply | str | None = None
+    ex: Exchange | None = None
+    # ADR-0024 layer 0, the PERSON's turn: recorded on ARRIVAL, not after the reply. An answer here
+    # can take minutes (a model call, a checkout), and a follow-up message that lands meanwhile
+    # used to find no trace of this one — the handler answered the second message with amnesia
+    # about the first. The GSI may or may not surface this row to a concurrent read; late is the
+    # eventual-consistency cost either way, and absent-by-design was strictly worse.
+    # Recorded in the PRODUCT's memory (ADR-0051 D2): handed the registry project, the transcript
+    # keeps it under the product that project belongs to.
+    # AND WHICH MESSAGE IT IS, AND WHAT IT REPLIES TO (#266 slice 4): the role's turn below is
+    # recorded as the reply to this id, so the record says which answer answers which message.
+    arrival_ts = ""
+    try:
+        # UNDER THE MOMENT IT WAS SAID (#394), so a retried turn writes this row again rather
+        # than a second one — and `arrival_ts` is that moment, so the retry's own prompt leaves
+        # the message out of its history as the first attempt's did
+        arrival_ts = transcript.record(project, thread=thread, role="person", text=text,
+                                       actor=user, channel=channel, message_id=message.id,
+                                       in_reply_to=message.in_reply_to, at=message.at,
+                                       **_files_of(message)) or ""
+    except Exception:  # noqa: BLE001 — the record must never cost the person their answer
+        log.warning("[%s] could not record the incoming turn", name, exc_info=True)
+    try:
+        ex = Exchange(project, message, module)
+        # THE STAGES ARE TOLD FOR AS LONG AS THE STAGES RUN, and not a moment after (#395)
+        with _progress.reporting(progress):
+            reply = _answer(ex, arrival_ts=arrival_ts)
+    except Exception:  # noqa: BLE001 — a bad message must never kill the socket
+        # SILENCE IS THE WORST ANSWER. Returning None here meant the person wrote to their PO and
+        # got nothing — indistinguishable from being ignored, and invisible to us until they
+        # complained. It also broke the platform's own standing invariant: every stall either
+        # self-heals or asks a human; none of them is a quiet nothing.
+        log.exception("[%s] product channel handler failed", name)
+        # a distinct marker so ONE occurrence pages, rather than blending into the generic error
+        # burst threshold — a client hearing nothing is not a transient
+        log.error("BEEVERFORGE_PRODUCT_MUTE project=%s thread=%s — the client got no "
+                  "answer", name, thread)
+        from beeverforge.product.voice import broke
+
+        reply = broke(language=getattr(project, "language", None))
+    finally:
+        # the AGENT's turn still lands after: what she said only exists once the stages return
+        if reply:
+            # recorded from the TEXT even when it carries options — her memory must hold the
+            # proposal she made, whichever way it reaches the person
+            _answered(project, message, reply, again=again)
+        release(ex.module if ex is not None else module)
+    said = list(ex.replies) if ex is not None else []
+    if reply:
+        said.append(reply if isinstance(reply, Reply) else Reply(text=str(reply)))
+    return [r.model_copy(update={"addressed_to": user, "in_reply_to": message.id,
+                                 "conversation": thread}) for r in said]
+
+
+def _answered(project, message: Message, reply: Reply | str, *, again: bool) -> None:
+    """Record the role's answer to `message` — ONE answer per message (#394).
+
+    A turn run again answers again, and the conversation publishes only this attempt's answer; an
+    earlier attempt's, recorded before its worker died, is withdrawn first so it is not kept as
+    something the person was told. Only on a retry: a first attempt has nothing to withdraw, and
+    the read it would cost is paid by the rare turn that needs it."""
+    from beeverforge.memory import transcript
+
+    if again:
+        transcript.supersede(project, thread=message.conversation, answering=message.id)
+    transcript.record(project, thread=message.conversation, role="agent",
+                      text=_text_of(reply), channel=message.room, in_reply_to=message.id,
+                      kind=_reply_kind(reply))
+
+
+def _text_of(reply: Reply | str) -> str:
+    return reply.text if isinstance(reply, Reply) else str(reply)
+
+
+def _reply_kind(reply: Reply | str) -> str:
+    """WHAT KIND OF REPLY the role's line was, for the transcript (#457): a `Reply` that already
+    names a kind other than the model's answer carries it (a hand-off); otherwise the platform's
+    own sentences are recognised by their text (`voice.own_voice_kind`) — a crash reply, an
+    unavailable — and everything else is the role's answer (`""`, which `transcript.record` leaves
+    unmarked, so it reads as an answer like every row written before this)."""
+    from beeverforge.product import voice
+
+    if isinstance(reply, Reply) and reply.kind not in ("", "answer", "receipt"):
+        return reply.kind
+    return voice.own_voice_kind(_text_of(reply))
+
+
+def _files_of(message) -> dict:
+    """The keyword that records a message's files (#336) — none for a message without any, so a
+    store written before files existed records it as it always did."""
+    files = list(getattr(message, "attachments", ()) or ())
+    return {"attachments": files} if files else {}
+
+
+def _accepts(fn, name: str) -> bool:
+    """Whether `fn` declares the keyword `name` — by name, or through `**kwargs`. Read from the
+    signature, like `_accepts_intake` and for its reason: a double or an add-on's module written
+    before the keyword existed is called exactly as before, and a `TypeError` raised INSIDE a real
+    call is never mistaken for a missing keyword."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                 for p in params.values())
+
+
+def _scoped(verb, conversation: str, person: str) -> dict:
+    """The conversation and the person a decision verb is scoped to (#266 slice 4) — `{}` for a
+    module whose verb predates the scope, which keeps the rule it always had."""
+    return ({"conversation": conversation, "person": person}
+            if _accepts(verb, "person") and _accepts(verb, "conversation") else {})
+
+
+def _sequence_now(project) -> int | None:
+    """The product's write sequence, or None when it could not be read — never a raise: a turn is
+    never refused for its bookkeeping (`product/semaphore.py`)."""
+    try:
+        from beeverforge.product import semaphore
+
+        return semaphore.sequence(project)
+    except Exception:  # noqa: BLE001 — the confirmation's own check still stands
+        log.warning("[%s] could not read the product's write sequence",
+                    getattr(project, "name", "?"), exc_info=True)
+        return None
+
+
+def release(module) -> None:
+    """The module's per-turn view of the product, removed (ADR-0051 D11) — when it has one.
+
+    A module a caller built without one, or a stand-in that knows nothing of views, is left as it
+    is: the view is the module's own to remove, and only what it composed itself is ever
+    deleted."""
+    done = getattr(module, "release", None)
+    if not callable(done):
+        return
+    try:
+        done()
+    except Exception:  # noqa: BLE001 — a view that could not be removed costs disk, never a reply
+        log.warning("could not release the turn's view of the product", exc_info=True)
+
+
+def _answer(ex: Exchange, *, arrival_ts: str = "") -> Reply | str | None:
+    """The stages, in their order — and the order is the judgement."""
+    # ---- what she asked last is answered first --------------------------------------------------
+    # A staged proposal, an open delivery, an expired proposal. What is left below is what the
+    # conversation does with a message that answered nothing — typed intents, then the
+    # conversation with its staged drafts.
+    settled = settle(ex.project, text=ex.text, user=ex.user, thread=ex.thread, module=ex.module,
+                     channel=ex.channel, fingerprint=ex.fingerprint, on_it=ex.on_it, via=ex.via)
+    if settled.not_yet:
+        # "NOT YET" AT THE LAST GATE IS ANOTHER PASS, NEVER A PROMISE (#448 slice 4) — staged here,
+        # where the conversation it is drafted from can be read
+        offered = _offer_another_pass(ex, settled.not_yet, arrival_ts=arrival_ts)
+        if offered is not None:
+            return offered
+    if settled.reply is not None:
+        return settled.reply
+    waiting = settled.waiting
+    ex.replacing = waiting or settled.rejected
+
+    # ---- the answer to the question a card was held on (#383) ----------------------------------
+    # BEFORE the intents and the conversation: the person was just asked one thing, and this
+    # message is their answer — it goes straight to the card's redraft, never into a whole new
+    # turn of the role (see `cards.hold_question`)
+    if not waiting:
+        resumed = resume_card(ex, arrival_ts=arrival_ts)
+        if resumed is not None:
+            return resumed
+
+    # ---- an explicit ASK for one of the things this role does on its own -----------------------
+    done = intents(ex)
+    if done:
+        return done
+
+    # ---- everything else is a conversation ----------------------------------------------------
+    answer = converse(ex, waiting, arrival_ts=arrival_ts)
+    if isinstance(answer, str):
+        return answer
+
+    # A QUESTION ends here. A REQUEST becomes a draft, shown back for the one confirmation — this
+    # is the only route from a conversation to something written down, and without it the whole
+    # write path is unreachable from the conversation: every message would get a polite answer and
+    # nothing would ever be recorded. A GESTURE the role read comes first, in its own order.
+    offered = gestures(ex, answer) or staging(ex, answer)
+    if offered:
+        # returned WHOLE and untouched, so the confirmation it carries survives: interpolating a
+        # proposal into a sentence here is exactly what once posted it twice
+        return offered
+    return answer.text
+
+
+# ── stage 1: settle — the message read as an ANSWER to what the role asked last ─────────────────
+
+@dataclass(frozen=True)
+class Settled:
+    """What one message settled BEFORE it is read as conversation.
+
+    `reply` is the sentence to say when the message answered something the role had asked — a
+    staged proposal (a yes, or a no), an open delivery ("did it work?"), or a proposal that
+    expired while the person was away — or the proposal its answer staged, with its options: a
+    delivery that did not work is a defect for their yes (#448 slice 5). `None` means the message
+    settled nothing and the turn goes
+    on to intents and conversation, carrying `waiting`: the proposal still staged, or None once a
+    rejection destroyed it. ONE fact per value: `reply=None` never means "stay quiet" — a branch
+    with nothing to say answers "" and the caller stays quiet on that, exactly as it always did.
+
+    ONLY WHAT A CALLER READS. The key the proposal is staged under travelled here for one day and
+    was read by nobody — every consume happens inside this stage — so it went; a field nothing
+    reads is a promise the next reader keeps for it.
+    """
+
+    reply: Reply | str | None
+    waiting: dict | None
+    #: THE CARD WHOSE CHANGE, AT THE LAST GATE, A PERSON SAID IS NOT RIGHT YET (#448 slice 4) —
+    #: `_answer`, which holds the whole exchange, stages another pass on it from the conversation
+    #: (`_offer_another_pass`), and `reply` is what is said where none can be staged. "" otherwise.
+    not_yet: str = ""
+    #: THE PROPOSAL THIS MESSAGE'S "NO" TOOK OFF THE TABLE (#661) — a conditional yes is a
+    #: rejection, and it is usually a correction of that proposal: the draft that follows is
+    #: written from it. None when nothing was rejected.
+    rejected: dict | None = None
+
+
+def settle(project, *, text: str, user: str, thread: str, module, channel: str = "",
+           fingerprint: str = "", on_it=None, via: str = "api") -> Settled:
+    """The message read as an ANSWER to what the role asked last — before it is read as anything.
+
+    THE ONE STAGE EVERY SURFACE SHARES, and until 2026-08-25 it was reached from exactly one:
+    these branches lived inside the Slack handler, so `ProductModule.settle_acceptance` — the
+    client's "worked / did not work" that closes the acceptance loop (ADR-0025), with the client's
+    release behind it — had ONE production caller, in `runtime/slack/`, while the panel's turn
+    went straight to `module.answer`. On a deployment without Slack the sweep opened acceptance
+    loops that no client could ever close. The turn engine is its one caller now, and every
+    surface reaches it through the engine.
+
+    THE GAP IT ONCE HAD ON THE PANEL IS CLOSED (#266 slice 2). For a year the typed yes and the
+    expiry notice ran on the panel's path and found nothing, because nothing STAGED a proposal
+    under the panel's key: the producers (`offer_draft`, the typed intents) lived in the chat
+    handler alone, and the panel proposed through its own button. The panel's turn is this engine
+    now, the producers with it, so a draft staged there is confirmed by a yes typed there — by the
+    executor the click uses, not by a second copy of it.
+
+    `via` IS PROVENANCE, NOT PERMISSION — the transport this message arrived through, handed to
+    every gate this stage reaches (`confirm`, the rejection, `_maybe_release`) so the record of who
+    authorised a write says where they were speaking from. Defaulted like `may_act` is; the
+    engine hands down what the message says.
+
+    RENDERED SENTENCES, ON PURPOSE. Every branch answers in the client's voice (`product/voice`),
+    which is core and takes the project's language; nothing here knows how a transport shows a
+    reply, and no confirmation options come out of it — offering one belongs to the stages after.
+
+    The order is load-bearing and each line of it was paid for:
+      the staged proposal first — a pending proposal is a question just asked, and it wins;
+      the acceptance second — "sim, resolveu" would otherwise be swallowed by the conversational
+      model: a polite reply, and a delivery still recorded as unconfirmed;
+      the expiry last — with a delivery loop open, a bare "sim" answers "did it work?".
+    """
+    from beeverforge.product.module import may_act, unauthorized_message
+
+    lang = getattr(project, "language", None)
+    # A person confirms wherever they happen to be typing: inside the thread Nina replied in, or
+    # back at channel level. The proposal must be findable from both, and consumed from wherever
+    # it was staged — an approval that misses the draft falls through to the conversational model,
+    # which answers politely and writes NOTHING (the audit's worst simulated conversation).
+    # THEIR OWN FIRST (#266 slice 4): in a room each person's proposal waits under a key of its
+    # own, and somebody else's is found after it — to be refused out loud, or confirmed on the
+    # requester's behalf where the product allows it (`confirm.not_theirs`).
+    waiting_key, waiting = find_waiting(thread, channel, project=project, person=user)
+
+    # A REPLY THE WORD LIST CANNOT READ IS NOT A "NO". `is_yes` is deliberately narrow (it accepts
+    # "sim", "pode registrar", and nothing needing interpretation); everything else used to fall
+    # straight through to conversation, so "Sim — registre." wrote nothing while the reply said it
+    # had. When a proposal is pending and neither gate fires, a model reads the sentence — the only
+    # thing that can tell an affirmation from a word that appears inside one (ADR-0028).
+    # initialised BEFORE the gate: the branches below read them unconditionally, and they are only
+    # assigned when the model is consulted at all
+    judged_yes = judged_no = False
+    rejected = None
+    if waiting and not is_yes(text, project=project) and not is_no(text, project=project):
+        verdict = "neither"
+        try:
+            verdict = module.confirmed(text, proposal=_proposal_summary(waiting))
+        except Exception:  # noqa: BLE001 — an unreadable judgment leaves the proposal pending
+            log.warning("[%s] could not judge the confirmation", getattr(project, "name", "?"),
+                        exc_info=True)
+        # THE VERDICT IS CARRIED, NOT WRITTEN OVER THE MESSAGE. Replacing `text` with "sim"/"não"
+        # was destructive in the reject direction: a rejection falls THROUGH to the conversation, so
+        # she received the bare word "não" instead of what the person wrote. It happened on the
+        # first real one — the product owner answered her open question, confirmed the #288 origin
+        # and agreed which number is authoritative, all in one message; the judge correctly read it
+        # as "revise before recording", and every word of it was then thrown away. She got "não"
+        # with three things on the table and rightly refused to guess which one it meant.
+        #
+        # A conditional yes IS a rejection of what is staged — and it is also the most informative
+        # message in the exchange. Both are true, and only one of them used to survive.
+        judged_yes = verdict == "approve"
+        judged_no = verdict == "reject"
+
+    # THE CONFIRMATION IS ONE CALL NOW (#105). Ten branches lived here — eight typed kinds, a
+    # generic yes on a draft, and the rejection below — and the eight opened with an IDENTICAL
+    # preamble: `may_act`, then a compare-and-swap pop, then "somebody answered first". That
+    # preamble and every body moved to `beeverforge/product/confirm.py`, which the panel and the
+    # `product_answer` row now call as well: one implementation, three transports (ADR-0039).
+    #
+    # The receipt goes with it. A confirmed write is always the slow path — every branch reaches a
+    # checkout, the client's board or an agent — and `confirm` fires `on_it` before the
+    # authorisation, so nobody approves something irreversible and then waits in silence.
+    if waiting and (is_yes(text, project=project) or judged_yes):
+        return Settled(confirm_staged(project, key=waiting_key, entry=waiting,
+                                      fingerprint=fingerprint, module=module, user=user,
+                                      lang=lang, on_it=on_it, via=via),
+                       waiting)
+
+    # THE REJECTION STAYS HERE, and it is not the executor's tenth branch. It performs nothing: it
+    # destroys the proposal and FALLS THROUGH, so whatever the person wrote is answered as the
+    # correction it usually is. `confirm` returns a sentence; this one has to keep going.
+    if waiting and (is_no(text, project=project) or judged_no):
+        # REFUSING IS AN ACT, so it is gated — but NOT by the approval rule, which would be wrong.
+        # Two different people can say "não" here and they are not the same case: the person whose
+        # request this is, saying "não, não é isso" to CORRECT their own wording, and a third party
+        # who would simply be destroying a proposal an admin was about to approve. The first is the
+        # point of the draft loop; the second is vandalism. So: an admin, or the requester.
+        if not may_act(project, user, via=via) and not _is_requester(waiting, user):
+            return Settled(unauthorized_message(project), waiting)
+        # the same compare-and-swap the approvals use, and the return is deliberately unread: a
+        # refusal that lost its race destroyed nothing, which is the outcome we wanted anyway. What
+        # replaced it announced itself when it was staged (`remember` returns that notice).
+        # A NO IS RECORDED AS A NO (#272). This passed `approved=True` — the approval's
+        # compare-and-swap reused with the approval's flag — so the durable store said the person
+        # who refused a draft had approved it, and their intake case sat in `confirmed` with
+        # nothing ever filed: shown as in progress, and handed to the model as confirmed. The flag
+        # is the record of who agreed to what; a refusal says `reject` and drops the case, which
+        # is what the same "não" given by click always recorded (`confirm.answer_staged`).
+        consume(waiting_key, waiting, fingerprint=fingerprint, project=project, by=user,
+                approved=False)
+        # the discarded proposal must not survive in this turn's PROMPT either: `waiting` fed the
+        # "still pending" section of the conversation, so after a rejection she was told the thing
+        # the person had just thrown away was still on the table — and said so. It is CARRIED, as
+        # what a redraft is written from (#661), never as what is pending.
+        rejected, waiting_key, waiting = waiting, None, None
+        # fall through: whatever they said next is the correction, and it deserves an answer
+
+    # ---- an answer to "did it work?" — the loop that makes this a product role ----------------
+    # AFTER the staging block on purpose: a pending proposal is a question just asked, and it wins.
+    # BEFORE intents and conversation, because "sim, resolveu" would otherwise be swallowed by the
+    # conversational model — a polite reply, and a delivery still recorded as unconfirmed.
+    if not waiting:
+        # WHERE IT IS WRITTEN (#267 slice 3): a delivery announced in somebody's own conversation
+        # is answered there, and a "funcionou" in the room neither closes it nor learns of it
+        answered = module.settle_acceptance(
+            text, **({"conversation": thread}
+                     if _accepts(module.settle_acceptance, "conversation") else {}))
+        if answered:
+            from beeverforge.product.followup import accepted_text, rejected_text
+
+            verdict, loop, ambiguous = answered
+            cfg = getattr(project, "product", None)
+            agent = getattr(cfg, "agent_name", "") or ""
+            # THE ONE ANSWER THAT SPENDS SOMETHING (board #6). A release loop's "funcionou" does
+            # not merely record an opinion: it puts software in front of the client's own users.
+            # So it leaves this shared path immediately and is handled where its extra rules live.
+            released = _maybe_release(project, module, loop, verdict, user, agent, lang,
+                                      ambiguous=ambiguous, via=via, said=text)
+            if released is not None:
+                from beeverforge.product.followup import is_release
+
+                # A "NÃO FUNCIONOU" THAT NAMED ONE RELEASE goes on to another pass (#448 slice 4)
+                return Settled(released, waiting,
+                               not_yet=(is_release(loop) or "")
+                               if verdict != "worked" and not ambiguous else "")
+            if verdict == "did-not-work":
+                # WHAT THEY SAID IS THE REPORT (#448 slice 5): a defect linked to what was
+                # delivered, staged for their yes — never a request to say it all again
+                staged = _a_defect_for_what_did_not_work(
+                    project, loop, text=text, user=user, thread=thread, channel=channel,
+                    agent=agent, lang=lang)
+                if staged is not None:
+                    return Settled(staged, waiting)
+            say = accepted_text if verdict == "worked" else rejected_text
+            # `ambiguous` NAMES what was settled when more than one delivery was waiting. The
+            # comment here used to promise exactly that and the code never did it — a silent
+            # choice quietly marked the wrong delivery accepted.
+            return Settled(say(loop, agent_name=agent, ambiguous=ambiguous, language=lang),
+                           waiting)
+
+    # A LATE CONFIRMATION OF AN EXPIRED PROPOSAL HEARS SO. Without this, the "sim" of somebody who
+    # stepped away past the TTL found nothing staged and fell through to the conversational model —
+    # a polite answer to a confirmation of nothing, with the person left believing they confirmed.
+    # After the acceptance check on purpose: with a delivery loop open, a bare "sim" answers "did
+    # it work?", and the ledger read first.
+    # THE NOTICE IS READ FROM THE STORE TOO (#452): the expiry may have been found before a restart,
+    # or by another worker, and a late yes reaching this process is owed it all the same
+    if (not waiting and (is_yes(text, project=project) or is_no(text, project=project))
+            and _expired_recently(thread, channel, project=project)):
+        from beeverforge.product.voice import proposal_expired
+
+        return Settled(proposal_expired(language=lang), waiting)
+
+    return Settled(None, waiting, rejected=rejected)
+
+
+def _a_defect_for_what_did_not_work(project, loop, *, text: str, user: str, thread: str,
+                                    channel: str, agent: str, lang) -> Reply | str | None:
+    """A "did not work" about a delivery, staged as the defect it is — linked to the cards the
+    delivery was about, with what the person said, for their yes (#448 slice 5). None when the
+    acceptance names no card — one asked before it carried them — and the reply is as it was.
+
+    MEASURED BEFORE IT WAS ADDED. The acceptance closed as `did-not-work` — the record that
+    matters — and the reply (`followup.rejected_text`, Portuguese whatever the project spoke) asked
+    the person to describe it all again "so I register it as a defect". Nothing was staged: the
+    next message went to the conversation like any other, a defect was filed only if the model
+    happened to read one there, it named no card, and its yes needed an approver even when the
+    person was the one the delivery was for.
+
+    THE CARD AND THE WORDS ARE ALREADY KNOWN. The acceptance carries the cards it delivered
+    (`followup.acceptance_of`), and the message that said it did not work is the report. The
+    defect is titled from the card, so two cards' reports never share a title; it cites the
+    requirement a requirement's delivery was owed against; and the yes files it through
+    `file_defect`, which writes the link both ways.
+
+    WHOSE YES. The acceptance names its requester when the delivery knew one; when that is the
+    person speaking, it is THEIR delivery, and their yes files it (`confirm._their_delivery_did_
+    not_work`). Anybody else's is staged like any other report, and the approvers are named."""
+    from beeverforge.product.module import may_act
+    from beeverforge.product.speaker import sealed
+    from beeverforge.product.voice import defect_after_delivery_title, delivery_did_not_work
+
+    ctx = loop.context or {}
+    cards = [canonical_ref(n) for n in str(ctx.get("issues") or "").split(",") if n.strip()]
+    said = str(text or "").strip()
+    if not cards or not said:
+        return None
+    title = str(ctx.get("title") or "") if ctx.get("ticket") else ""
+    owed = str(loop.subject or "")
+    violates = (int(owed) if owed.isdigit() and not ctx.get("defect") and not ctx.get("ticket")
+                else None)
+    theirs = bool(ctx.get("requester")) and sealed(user) == str(ctx.get("requester"))
+    key = key_for(thread, user)
+    replaced = remember(key, {"kind": "defect",
+                              "title": defect_after_delivery_title(ref=cards[0], title=title,
+                                                                   language=lang),
+                              "restated": said[:400], "reported": said[:1500],
+                              "reported_by": user or "", "violates": violates,
+                              "linked": ",".join(cards),
+                              **({"their_delivery": "1"} if theirs else {}),
+                              "source": "", "channel": channel},
+                        lang=lang, project=project, person=user)
+    ask = delivery_did_not_work(cards=cards, title=title, language=lang, agent_name=agent)
+    if not theirs and not may_act(project, user):
+        admins = _admin_mentions(project)
+        if admins:
+            ask += admins_must_confirm(admins, "record", language=lang)
+    return offer(project, key, replaced + ask)
+
+
+# ── stage 2: intents — an explicit ASK for one of the things this role does on its own ──────────
+
+def intents(ex: Exchange) -> Reply | str | None:
+    """The typed intent this message names, carried out — or None, and the turn goes on.
+
+    Matched before the corpus is consulted: "who are you" and "how are we doing" must answer even
+    when the requirements cannot be read, which is exactly when someone asks."""
+    from beeverforge.product.intents import match_intent
+
+    matched = match_intent(ex.text)
+    if not matched:
+        return None
+    intent, captures = matched
+    return _run_intent(ex.project, intent, captures, module=ex.module, lang=ex.lang,
+                       user=ex.user, on_it=ex.on_it, thread=ex.thread, channel=ex.channel,
+                       asked=ex.message.id, key=ex.key)
+
+
+# ── the read-only fast path — answered without a turn ───────────────────────────────────────────
+
+#: THE INTENTS THAT ONLY SHOW SOMETHING, AND SPEND NO MODEL CALL TO DO IT (ADR-0051 D6, decision
+#: 5). A conversation takes one turn at a time and nobody jumps its queue — except for these: a
+#: person who asks where things stand while the role is busy answering someone else in the same
+#: room is shown it at once, because the answer is a read of the corpus, the board and the ledger,
+#: and holding it behind a model turn would buy nothing.
+#:
+#: `needs_action` IS NOT HERE, though it only reads: it spends one model call per parked card
+#: (`ProductModule.review_needs_action`), which is a turn's cost and waits like one. Every other
+#: intent writes or stages, and stages go through the turn so the conversation's one staged
+#: proposal is never displaced from beside it.
+FAST = frozenset({"announce", "status", "triage"})
+
+
+def reads_only(text: str) -> bool:
+    """Whether a message asks only for one of the `FAST` intents — decided by the word list, with
+    no model, so the door can decide it (`product/door.py`)."""
+    from beeverforge.product.intents import match_intent
+
+    matched = match_intent(text or "")
+    return bool(matched) and matched[0] in FAST
+
+
+def fast(project, message: Message, *, module=None, again: bool = False) -> list[Reply]:
+    """A message that only asks to be SHOWN something, answered without a turn (ADR-0051 D6).
+
+    `again` is `turn`'s: the read run a second time after its first attempt failed (#394).
+
+    Only the intents stage runs: nothing is settled, nothing conversed, nothing staged — so no
+    model is called and no proposal is touched, which is what lets this run beside a turn in the
+    same conversation rather than behind it. The person's words and the answer are recorded in the
+    product's memory like any turn's; the replies come back addressed like `turn`'s.
+
+    Handed a message that is not read-only, it answers that something broke rather than taking a
+    turn out of order: the door and the worker decide `reads_only` with the same word list, so the
+    only way here is a door and a worker that disagree about it."""
+    from beeverforge.memory import transcript
+    from beeverforge.product.voice import broke
+
+    name = getattr(project, "name", "?")
+    if message.project != name:
+        raise ValueError(f"a message for {message.project!r} was handed the project {name!r}")
+    thread, channel = message.conversation, message.room
+    reply: Reply | str | None = None
+    ex: Exchange | None = None
+    try:
+        transcript.record(project, thread=thread, role="person", text=message.text,
+                          actor=message.speaker, channel=channel, message_id=message.id,
+                          in_reply_to=message.in_reply_to, at=message.at, **_files_of(message))
+    except Exception:  # noqa: BLE001 — the record must never cost the person their answer
+        log.warning("[%s] could not record the incoming turn", name, exc_info=True)
+    try:
+        if not reads_only(message.text):
+            log.error("BEEVERFORGE_PRODUCT_NOT_READ_ONLY project=%s thread=%s — a message the "
+                      "fast path was handed asks for more than a read", name, thread)
+            reply = broke(language=getattr(project, "language", None))
+        else:
+            ex = Exchange(project, message, module)
+            reply = intents(ex)
+    except Exception:  # noqa: BLE001 — a read that broke is said, never swallowed
+        log.exception("[%s] the read-only answer failed", name)
+        reply = broke(language=getattr(project, "language", None))
+    finally:
+        if reply:
+            _answered(project, message, reply, again=again)
+        release(ex.module if ex is not None else module)
+    said = list(ex.replies) if ex is not None else []
+    if reply:
+        said.append(reply if isinstance(reply, Reply) else Reply(text=str(reply)))
+    return [r.model_copy(update={"addressed_to": message.speaker, "in_reply_to": message.id,
+                                 "conversation": thread}) for r in said]
+
+
+# ── stage 3: converse — the answer ──────────────────────────────────────────────────────────────
+
+def _accepts_intake(module) -> bool:
+    """Whether this module's `answer` declares `intake` — by name, or through `**kwargs`. Read from
+    the signature, not by trying and catching: a `TypeError` raised INSIDE a real `answer` would
+    otherwise be mistaken for a module that does not take the keyword, and answered without it. A
+    callable with no readable signature is treated as taking it, because the shipped module does."""
+    import inspect
+
+    try:
+        params = inspect.signature(module.answer).parameters
+    except (TypeError, ValueError):
+        return True
+    return "intake" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                     for p in params.values())
+
+
+def _looking_at(ex: Exchange, module) -> dict:
+    """WHERE THE PERSON WROTE FROM, as the role's current state (#266 slice 5, ADR-0051 D1) — the
+    keyword to hand `answer`, or none.
+
+    "Why did this stop?" typed on card #42's page is a question about #42, and until the message
+    carried its page the role was handed the words alone. The context was admitted where the
+    message came in (`product/page.py::admit`); this reads it — the card through the project's
+    own tracker — into the section of the prompt `answer` already has for it. Handed only when
+    there is something to say and only to a module whose `answer` takes it, for the reason
+    `_accepts_intake` gives: a double that predates the keyword must keep answering."""
+    if not ex.message.context:
+        return {}
+    from beeverforge.product.page import looking_at
+
+    state = looking_at(ex.project, ex.message.context)
+    if not state:
+        return {}
+    import inspect
+
+    try:
+        params = inspect.signature(module.answer).parameters
+    except (TypeError, ValueError):
+        return {"context": state}
+    takes = "context" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                       for p in params.values())
+    return {"context": state} if takes else {}
+
+
+def _this_conversation(ex: Exchange, *, arrival_ts: str = "") -> tuple[str, list]:
+    """This conversation as the role reads it — the rendered block and the turns it came from.
+
+    ONE RENDERING FOR THE ANSWER AND FOR THE CARD LOOP'S RESUMPTION (#383), which skips the answer
+    and still drafts from the conversation."""
+    from beeverforge.memory import transcript
+    from beeverforge.product import clock
+
+    project = ex.project
+    agent_name = getattr(getattr(project, "product", None), "agent_name", "")
+    # the CURRENT message is excluded by the ts it was recorded under: it is already the
+    # "## Question" of this prompt, and history is strictly what came before it
+    before = [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)
+              if not (arrival_ts and t.ts == arrival_ts)]
+    # WHEN EACH LINE WAS SAID, AND WHEN THIS TURN IS (`product/clock.py`): without them five days
+    # of silence read as one sitting, and the role said "ontem" about last week
+    zone, _zone_name = clock.zone_of(project)
+    said = transcript.render(
+        before,
+        agent_name=agent_name,
+        # THE CLIENT'S LANGUAGE, said here rather than welded into the renderer (#168). This block
+        # is read by a model that is answering a pt-BR client; the tech-lead's identical block is
+        # read by one whose whole surface is English.
+        heading=engine_said("conversation", language=ex.lang),
+        you=engine_said("you", language=ex.lang),
+        somebody=engine_said("somebody", language=ex.lang),
+        stamp=lambda ts: clock.stamp(ts, zone))
+    return said, before
+
+
+def converse(ex: Exchange, waiting: dict | None, *, arrival_ts: str = ""):
+    """The role's answer to the message — a `ProductAnswer`, or the sentence to say instead when
+    the product cannot be read or the model could not answer.
+
+    ADR-0024 layer 1. Without the conversation handed over, every message was turn 1: no "e o
+    segundo?", no correction, no knowing she had asked something when the answer arrived."""
+    from beeverforge.product.voice import unavailable
+
+    project, module, lang = ex.project, ex.module, ex.lang
+    text, user, thread, channel = ex.text, ex.user, ex.thread, ex.channel
+    ctx = module.context()
+    if not ctx.available:
+        log.warning("[%s] product module unavailable: %s", project.name, ctx.reason)
+        return unavailable(language=lang)
+
+    # THE RECEIPT GOES FIRST — before the transcript query, before the model. Everything below
+    # this line is work the person is waiting through, and the whole point is that they should not
+    # have to guess whether anything is happening.
+    ex.on_it()
+    # AND FROM HERE THE TURN SAYS WHAT IT IS DOING (#395): the receipt is said once, and the
+    # stages go on replacing each other where a surface can show them — the conversation and the
+    # product's memory first, then the model, which is where the minutes go
+    ex.progress("reading")
+
+    agent_name = getattr(getattr(project, "product", None), "agent_name", "")
+    said, before = _this_conversation(ex, arrival_ts=arrival_ts)
+    from beeverforge.product import clock
+
+    zone, zone_name = clock.zone_of(project)
+    now = clock.now_block(clock.current(), last_ts=before[-1].ts if before else "",
+                          zone=zone, zone_name=zone_name)
+    # AND WHAT WAS SAID ABOUT IT ELSEWHERE IN THE PROJECT (#33 hole 3) — the panel's turn carried
+    # this block alone for a year; one engine carries it for every surface.
+    ex.conversation = said
+    said = _with_elsewhere(project, said, text, own=thread, agent_name=agent_name or "")
+    ex.close_decisions_if_she_reads_this()
+
+    # WHAT IS STILL WAITING — the fact whose absence let her announce five registered requirements
+    # she had only proposed. `waiting` is the staged entry, read by the settling stage.
+    # THIS PERSON'S INTAKE IN THIS CONVERSATION, TYPED (#33 hole 7) — beside the transcript, so
+    # the fourth turn of "which screen?" is a continuation and not a re-reading.
+    from beeverforge.product import case as _case
+    intake = _case.block_for(project, thread, user)
+    ex.intake = intake or ""
+    # PASSED ONLY WHEN THERE IS ONE, AND ONLY TO A MODULE THAT TAKES IT. "Only when there is one"
+    # alone deferred the break instead of preventing it: a module whose `answer` predates the
+    # intake answered the FIRST turn, and on the second — `note_turn` having opened a case with
+    # facts — received a keyword it did not declare, raised, and took the mute path, paging on
+    # every turn for a day (review of #66, 2026-09-06). The shipped module declares it; a double
+    # or an add-on that does not is answered as before, every turn.
+    # WHO IS ASKING, AND IN WHICH ROLE (#266 slice 4), to a module that takes it — the shipped
+    # one does; a double or an add-on written before it is answered as it always was. AND WHETHER
+    # THE CONVERSATION IS THEIRS ALONE (#267 slice 2): the briefing quotes the tech-lead's
+    # diagnosis only to an engineer in private (ADR-0052 D10). AND WHERE IT IS ASKED (#267 slice
+    # 3): the role reads the agenda this conversation may see — told to a module that has the
+    # verb; a double or an add-on's module without it is answered as it always was
+    from beeverforge.product.door import is_direct
+
+    answering_in = getattr(module, "answering_in", None)
+    if callable(answering_in):
+        answering_in(thread)
+    ex.progress("answering")
+    answer = module.answer(text, conversation=said,
+                           pending=_proposal_summary(waiting) if waiting else "",
+                           **({"speaker": ex.person} if _accepts(module.answer, "speaker") else {}),
+                           **({"now": now} if _accepts(module.answer, "now") else {}),
+                           **({"attachments": list(ex.message.attachments)}
+                              if ex.message.attachments and _accepts(module.answer, "attachments")
+                              else {}),
+                           **({"private": is_direct(ex.message)}
+                              if _accepts(module.answer, "private") else {}),
+                           **_looking_at(ex, module),
+                           **({"intake": intake} if intake and _accepts_intake(module) else {}))
+    if not answer.ok:
+        return unavailable(language=lang)
+    try:
+        _case.note_turn(project, thread, user, text, answer, message_id=ex.message.id)
+    except Exception:  # noqa: BLE001 — the case is bookkeeping; the reply is the act
+        log.info("[%s] could not note the intake turn", project.name, exc_info=True)
+
+    # WHAT SHE ASKED A HUMAN FOR BECOMES A TRACKED LOOP. The product owner's second real
+    # conversation ended with three decisions requested and NOTHING recorded: loops were only ever
+    # opened by the board sweep, so a request made in conversation lived in a chat message and died
+    # when it scrolled away. Nobody would have been reminded, which is the silent-wait failure this
+    # platform exists to make impossible.
+    # ASKED OF THIS PERSON, IN THIS CONVERSATION (#266 slice 4): only they, there, close it
+    if getattr(answer, "decisions", None):
+        try:
+            module.record_decisions(answer.decisions, channel=channel,
+                                    **_scoped(module.record_decisions, thread, user))
+        except Exception:  # noqa: BLE001
+            log.warning("[%s] could not record the decisions she asked for — "
+                        "BEEVERFORGE_PRODUCT_DECISIONS_UNRECORDED: it asked a human for "
+                        "something and nothing is tracking it", project.name, exc_info=True)
+
+    # SHE CANNOT SEE WHETHER A WRITE HAPPENED, so a reply that says one did is a claim she has no
+    # standing to make. This turn wrote nothing — the write paths are the staged-confirmation
+    # branches of `settle`, which all return before reaching here. Detected rather than edited: a
+    # wrong correction is worse than a flagged sentence, and what shipped was worse than both — a
+    # confirmation went unrecognised, nothing was written, and the reply announced five registered
+    # requirements to somebody who believed it.
+    from beeverforge.product.voice import claims_a_write
+
+    # OBSERVED, NOT ACTED ON — and that is a retreat justified by evidence, not a shrug.
+    #
+    # The append shipped, and in production it fired TWICE, both times on sentences that were
+    # correct. Once on a retraction ("eu disse 'Registrado o Requisito 1' … Não foi") and once on an
+    # accurate history ("o texto foi gravado, o pedido de revisão não abriu"). Zero true positives
+    # in the same window. A word list cannot tell "I recorded it just now" from "it was recorded
+    # last time": that needs tense and temporal reference, which this is not able to read.
+    #
+    # And a WRONG correction is expensive in a way a missed one is not. It contradicts the agent in
+    # front of the client, so the reader learns to distrust both voices — and it lands hardest on
+    # exactly the honest, self-correcting messages the rule exists to produce.
+    #
+    # What actually removed the original harm was the prompt: she is now told, every turn, that this
+    # reply writes nothing and what is still pending, and she says so herself unprompted. This stays
+    # as an OBSERVATION so a real false claim is still visible to us — and if one appears in this
+    # log without a matching write, the append comes back with a model reading the sentence rather
+    # than a regex matching a word.
+    claim = claims_a_write(getattr(answer, "text", "") or "")
+    if claim:
+        # WARNING, not ERROR — recalibrated on the record: four firings in production, four false
+        # positives ("Anotado", "Anotei" — her acknowledging what she UNDERSTOOD, which no word
+        # list can tell from a write claim), zero true ones. An ERROR that is always wrong teaches
+        # whoever watches the log to ignore ERRORs, which is how the real one gets missed. The
+        # marker stays greppable; if a true positive ever shows up here, the promised model-read
+        # correction is what comes back — not the louder level.
+        log.warning("BEEVERFORGE_PRODUCT_FALSE_CLAIM project=%s claim=%r — the reply mentions a "
+                    "completed "
+                    "write and this turn wrote nothing (NOT corrected in the channel; see "
+                    "ADR-0031)", project.name, claim)
+    return answer
+
+
+def _with_elsewhere(project, conversation: str, message: str, *, own: str,
+                    agent_name: str = "") -> str:
+    """The conversation in front of the role, plus what was said about the same thing ELSEWHERE in
+    the project (#33 hole 3) — other conversations, other people, the channel — from the project's
+    memory index. The current conversation is already there and is left out; a private
+    conversation's turns reach only their own person (#46's key, kept). A memory that cannot be
+    read costs the block and never the reply.
+
+    MOVED FROM THE WORKER'S TWO TURNS (#266 slice 2), where it was the one piece of judgement the
+    panel's paths had and the chat handler did not. One engine carries it for every surface.
+
+    THE CONVERSATIONS ARE THE PRODUCT'S (ADR-0051 D2): what is read is every conversation of the
+    product this project belongs to — its other registry projects' included — while the index
+    itself, and the channel's messages it also reads, stay this registry project's."""
+    try:
+        from beeverforge.memory import transcript
+        from beeverforge.memory.recall import recall, render_recall
+        from beeverforge.paths import project_memory_dir
+        hits = recall(getattr(project, "name", "") or "", message,
+                      index_dir=project_memory_dir(project), own=own, exclude_where=own,
+                      partition=transcript.partition(project))
+        # NOBODY IS NAMED ACROSS CONVERSATIONS (ADR-0051 D9): the block informs the answer, and the
+        # model is never handed a name from another conversation that it could repeat here.
+        elsewhere = render_recall(hits, agent_name=agent_name, name_people=False)
+    except Exception:  # noqa: BLE001 — the project's memory is a bonus on top of the thread's
+        log.warning("[%s] could not read the project memory", getattr(project, "name", "?"),
+                    exc_info=True)
+        return conversation
+    if not elsewhere:
+        return conversation
+    return f"{conversation}\n\n{elsewhere}" if conversation else elsewhere
+
+
+# ── stage 4: gestures — what the role read the message as asking FOR ────────────────────────────
+
+def gestures(ex: Exchange, answer) -> Reply | str | None:
+    """A gesture the role read in the message, staged for its one yes — or None.
+
+    THE ORDER IS LOAD-BEARING rather than aesthetic: `remember` holds ONE staged entry per
+    conversation (see its docstring), so two branches staging in the same turn displace each other
+    in silence. A broken promise outranks a request to start — it is about work already owed — and
+    asking to START the agreed work is not asking for something NEW, so it must not fall through
+    into a draft proposal."""
+    from beeverforge.product.module import may_act
+
+    project, module, lang = ex.project, ex.module, ex.lang
+    # `thread` IS THE STAGING KEY in this stage (#266 slice 4): everything below stages for this
+    # person in this conversation (`ex.key`), which is all this stage uses it for
+    text, user, thread, channel, source = ex.text, ex.user, ex.key, ex.channel, ex.source
+    if getattr(answer, "gesture", "") == "adjust" and getattr(answer, "gesture_card", ""):
+        # FIRST, because it names the one card whose change waits on this person: what they
+        # tried is not a broken promise of the product nor a new wish, it is "not yet" (#448)
+        offered = _offer_adjust(ex, answer)
+        if offered is not None:
+            return offered
+    if getattr(answer, "gesture", "") == "accept" and getattr(answer, "gesture_card", ""):
+        # …AND "THAT'S IT" IS ITS OTHER HALF (#448 slice 3): a yes to what they tried, recorded
+        # against the head the preview was built from — never a request, never a requirement
+        offered = _offer_accept(ex, answer)
+        if offered is not None:
+            return offered
+    if getattr(answer, "is_defect", False):
+        # Who can actually unlock the pen. Asking the REPORTER to confirm and then refusing their
+        # confirmation — with a refusal written for the requirement flow ("registrar como
+        # requisito acordado") — was the single worst conversation the audit simulated: the person
+        # confirms their own report and gets turned away in the wrong vocabulary, with no hint of
+        # WHO to ask. The admins are known by id; name them.
+        # SHE decided this breaks an existing promise (the corpus is hers to know); the person
+        # confirms the restatement, an admin's yes files it. No requirement ceremony: the promise
+        # already exists — what is being recorded is that reality disagrees with it.
+        # THE DEFECT IS DRAFTED FROM THE CONVERSATION TOO (#392). It staged the person's message
+        # as its restatement, so the card a coding agent read was "percebi que a caixa de texto…
+        # veja o screenshot" with a title cut mid-word — #383's defect on its sibling path. It now
+        # runs the same loop as a requested card: draft, floor, judge, the whole card before the
+        # yes, and a held question when it is not good enough.
+        compose = getattr(module, "compose_card", None)
+        if callable(compose):
+            composed = compose(request=text, conversation=ex.conversation,
+                               reply=answer.text or "", intake=ex.intake, kind="defect",
+                               language=ex.lang, **_replacing(ex, compose))
+            return _offer_card(ex, composed, request=text,
+                               preamble=(answer.text + "\n\n") if answer.text else "",
+                               kind="defect", extra={"violates": getattr(answer, "violates",
+                                                                         None)})
+        # a module written before the card loop — an add-on's or a double — stages the report as
+        # it always did
+        from beeverforge.product.voice import defect_confirmation
+
+        replaced = remember(thread, {"kind": "defect", "restated": text.strip()[:400],
+                          "reported_by": user or "",
+                          "violates": getattr(answer, "violates", None),
+                          # the sequence this turn's check saw: the yes re-checks what came after
+                          "seq": ex.seen,
+                          # no severity: nobody judged one, and printing "média" as if somebody
+                          # had is a fabricated classification the fix queue would sort by
+                          "source": source or "", "channel": channel},
+                            lang=lang, project=project, person=user)
+        ask = defect_confirmation(violates=getattr(answer, "violates", None), language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "record", language=lang)
+        # the defect proposal, offered with its options. The agent's own words stay in front of
+        # it: the person confirms a RESTATEMENT, so they must read it.
+        body = replaced + ((answer.text + "\n\n") if answer.text else "") + ask
+        return offer(project, thread, body)
+
+    # AN ACT ON A REQUIREMENT THE ROLE PROPOSED (#565): agree, drop, record a decision, note a
+    # fact. Each was reached by a fixed sentence alone, before the model — "pode aceitar o 66"
+    # matched nothing, and the model that understood it had no act to hand it to. Staged by the
+    # branch the sentence reached, so what is checked before the question and what the yes
+    # executes are the same; the role's reply goes in front of the question or of why nothing was
+    # staged.
+    from beeverforge.product.role import GESTURE_INTENT
+    from beeverforge.product.voice import one_act_at_a_time
+
+    intent = GESTURE_INTENT.get(getattr(answer, "gesture", ""))
+    if intent:
+        # A SECOND ACT IN THE SAME REPLY IS NOT STAGED (one entry per conversation), and the
+        # person who asked for both is told so before the one question they get
+        later = (one_act_at_a_time(language=lang) + "\n\n"
+                 if getattr(answer, "acts_not_staged", 0) else "")
+        proposed = _run_intent(project, intent,
+                               {**(getattr(answer, "gesture_args", None) or {}),
+                                "preamble": f"{answer.text}\n\n" if answer.text else "",
+                                "later": later},
+                               module=module, lang=lang, user=user,
+                               on_it=ex.on_it, thread=ex.thread, channel=channel, key=thread)
+        if proposed:
+            return proposed
+
+    # A GESTURE THE MODEL RECOGNISED that the word list did not (role.QUEUE_MARKER). The pattern
+    # in `product_intents` still runs first and still short-circuits — this is the escape for the
+    # phrasings it does not carry, and it costs nothing extra because this call already happened.
+    #
+    # AFTER `is_defect` AND BEFORE `is_request` — see this stage's docstring for why.
+    if getattr(answer, "is_ticket", False):
+        # SHE decided the person asked for a card, as described — not a broken promise and not a
+        # wish to be argued into a requirement. The same gate as a defect, for the same reason: it
+        # puts a card on the client's board.
+        #
+        # THE CARD IS DRAFTED FROM THE CONVERSATION, NOT FROM THIS MESSAGE (#383). In a real
+        # conversation the description comes first and the gesture last, so the message that
+        # read as "open a card" was the whole card. Now the role drafts it from everything the
+        # conversation established, the floor and the judge check it (`product/cards.py`), and
+        # the person reads the WHOLE card before the yes. Twice not good enough: nothing is
+        # staged, the question that would make it possible is asked instead, and the person's
+        # answer goes straight to one redraft (`resume_card`), never into a whole new turn.
+        compose = getattr(module, "compose_card", None)
+        preamble = (answer.text + "\n\n") if answer.text else ""
+        if not callable(compose):
+            # a module written before the card was drafted — an add-on's or a double — is staged
+            # as it always was, rather than refused: it cannot draft, and it said a card was asked
+            return _stage_ticket_as_said(ex, answer)
+        composed = compose(request=text, conversation=ex.conversation, reply=answer.text or "",
+                           intake=ex.intake, title=getattr(answer, "ticket_title", "") or "",
+                           language=ex.lang, **_replacing(ex, compose))
+        return _offer_card(ex, composed, request=text, preamble=preamble)
+    if getattr(answer, "is_reorder", False) and getattr(answer, "order", None):
+        # SHE READ AN ORDER FOR THE BACKLOG (#33 slice 9, the chat half of `reorder`). Staged like
+        # the queue: the person reads the order back and confirms it, an admin's yes writes it.
+        # Not the queue gesture — writing the order starts nothing — but it decides what the next
+        # start spends on, so it waits for the same yes. THE ORDER TRAVELS UNTOUCHED: no sort, no
+        # set, top first as they said it.
+        from beeverforge.product.voice import reorder_confirmation
+
+        order = [str(n) for n in answer.order]
+        replaced = remember(thread, {"kind": "reorder", "numbers": order, "channel": channel},
+                            lang=lang, project=project, person=user)
+        ask = reorder_confirmation(numbers=order, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "order", language=lang)
+        body = replaced + ((answer.text + "\n\n") if answer.text else "") + ask
+        return offer(project, thread, body)
+    if getattr(answer, "gesture", "") == "queue":
+        # HER ANSWER TRAVELS WITH IT. Both sibling branches carry `answer.text` in front of what
+        # they stage — a person confirms a proposal, so they must read what she said about it —
+        # and this one dropped it: she answered the question and the reply was replaced by a bare
+        # queue. The gesture was recognised BY reading the message; throwing away the reading is
+        # the one thing that makes the marker path worse than the pattern it exists to rescue.
+        proposed = _run_intent(project, "queue",
+                               {"preamble": f"{answer.text}\n\n" if answer.text else ""},
+                               module=module, lang=lang, user=user,
+                               on_it=ex.on_it, thread=ex.thread, channel=channel, key=thread)
+        if proposed:
+            # WHOLE AND UNTOUCHED, like `offered` in the staging stage: `_queue_reply` can return a
+            # proposal carrying its confirmation, and interpolating one into an f-string used to
+            # turn it into a plain `str` — the boundary then could not tell it was already posted
+            # and the proposal went out twice.
+            return proposed
+    return None
+
+
+def _offer_adjust(ex: Exchange, answer) -> Reply | str | None:
+    """Another pass on the change that waits on this person, staged for their yes — or what
+    happens instead, said in the conversation (#448). None for a module that cannot prepare one
+    (an add-on's, a double), and the turn goes on as before.
+
+    THE ROLE'S UNDERSTANDING, THEN THE PROPOSAL. Its reply stays in front — the person confirms a
+    restatement of what they said, so they must read it — and the proposal under it names the
+    pass, the bar it is judged against, and that the card is corrected to match. When no pass can
+    be sent (not theirs, nothing waiting, a pass already running, the project's passes spent) the
+    reply says why and what happens next, and nothing is staged: NEVER A BARE REFUSAL."""
+    prepare = getattr(ex.module, "prepare_adjustment", None)
+    if not callable(prepare):
+        return None
+    number = canonical_ref(getattr(answer, "gesture_card", "") or "")
+    preamble = (answer.text + "\n\n") if answer.text else ""
+    ex.on_it()
+    prepared = prepare(number, actor=ex.user, conversation=ex.conversation,
+                       reply=answer.text or "", request=ex.text, language=ex.lang)
+    if not prepared.ok:
+        return preamble + prepared.said
+    return _stage_the_pass(ex, number, prepared, preamble)
+
+
+def _offer_another_pass(ex: Exchange, card: str, *, arrival_ts: str = "") -> Reply | str | None:
+    """"NOT YET" ON A CHANGE AT THE LAST GATE, staged as another pass for the person's yes — or
+    what happens instead, said plainly (#448 slice 4). None for a module that cannot prepare one
+    (an add-on's, a double), and the settling stage's own sentence is said.
+
+    IT WAS A PROMISE NOBODY KEPT. "I will take this back to the team with what you said, and come
+    back when it is fixed" — and nothing took anything to anybody: the job waited out its window at
+    the gate and held, and the requester's words were in no record a pass could read. Now it is
+    slice 1's proposal, drafted from THIS conversation by the same module (`prepare_adjustment`),
+    worded for a change already in (`Gate.merged`): the pass is a new change and what is live
+    stays as it is. When no pass can be sent — not theirs, passes spent, the engine unreachable —
+    the reply says why and what happens next, and nothing is staged: NEVER A PROMISE."""
+    from beeverforge.product.voice import engine_said
+
+    prepare = getattr(ex.module, "prepare_adjustment", None)
+    if not callable(prepare):
+        return None
+    number = canonical_ref(card)
+    agent = getattr(getattr(ex.project, "product", None), "agent_name", "") or ""
+    preamble = (f"{agent}: " if agent else "") + engine_said("nothing_released",
+                                                             language=ex.lang) + "\n\n"
+    ex.on_it()
+    # FROM THE CONVERSATION, NEVER THE MESSAGE ALONE (ADR-0054 D1): read here, as the answer
+    # stage reads it, because the settling stage that heard "não funcionou" never builds it
+    said, _before = _this_conversation(ex, arrival_ts=arrival_ts)
+    ex.conversation = said
+    prepared = prepare(number, actor=ex.user, conversation=said, reply="", request=ex.text,
+                       language=ex.lang)
+    if not prepared.ok:
+        why = prepared.said or ""
+        return preamble + (why[:1].upper() + why[1:])
+    return _stage_the_pass(ex, number, prepared, preamble)
+
+
+def _stage_the_pass(ex: Exchange, number: str, prepared, preamble: str) -> Reply | str:
+    """A prepared pass staged for this person's yes, under the proposal that names it — the one
+    staging of another pass, whether the role read the gesture or a "not yet" at the last gate."""
+    from beeverforge.product.voice import adjust_confirmation
+
+    gate = prepared.gate
+    this = (gate.passes - gate.left + 1
+            if gate is not None and gate.passes is not None and gate.left is not None else None)
+    replaced = remember(ex.key, {"kind": "adjust", "number": number,
+                                 "instruction": prepared.instruction,
+                                 "criteria": list(prepared.criteria),
+                                 "keeps": prepared.keeps,
+                                 "pr_url": getattr(gate, "pr_url", "") or "",
+                                 "seq": ex.seen, "source": ex.source or "",
+                                 "channel": ex.channel},
+                        lang=ex.lang, project=ex.project, person=ex.user)
+    ask = adjust_confirmation(number=number, instruction=prepared.instruction,
+                              criteria=prepared.criteria, keeps=prepared.keeps,
+                              pass_number=this, passes=getattr(gate, "passes", None),
+                              language=ex.lang, merged=bool(getattr(gate, "merged", False)))
+    return offer(ex.project, ex.key, replaced + preamble + ask)
+
+
+def _offer_accept(ex: Exchange, answer) -> Reply | str | None:
+    """The requester's yes to the change that waits on them, staged for their confirmation — or
+    why nothing can be recorded, said in the conversation (#448 slice 3). None for a module that
+    cannot prepare one (an add-on's, a double), and the turn goes on as before.
+
+    THE HEAD IS FIXED HERE, when it is staged: the one the preview was built from, which is what
+    the person tried. The yes records THAT head, and is refused if the preview was rebuilt from
+    another in between (`ProductModule.accept_change`) — a yes never stands for a later push.
+    Nothing is staged when there is nothing to accept (not theirs, nothing waiting, a pass
+    running, nothing tried, the change moved since): NEVER A BARE REFUSAL."""
+    from beeverforge.product.voice import accept_change_confirmation
+
+    prepare = getattr(ex.module, "prepare_acceptance", None)
+    if not callable(prepare):
+        return None
+    number = canonical_ref(getattr(answer, "gesture_card", "") or "")
+    preamble = (answer.text + "\n\n") if answer.text else ""
+    ex.on_it()
+    prepared = prepare(number, actor=ex.user, language=ex.lang)
+    if not prepared.ok:
+        return preamble + prepared.said
+    # WHERE IT WAS SAID travels as every staged entry's `conversation` (`staging.remember`): it
+    # is where "it went in" is told when no delivery of the card names one (`merged_for_you`)
+    replaced = remember(ex.key, {"kind": "accept_change", "number": number,
+                                 "head": prepared.head, "pr_url": prepared.pr_url,
+                                 "seq": ex.seen, "source": ex.source or "",
+                                 "channel": ex.channel},
+                        lang=ex.lang, project=ex.project, person=ex.user)
+    ask = accept_change_confirmation(number=number, merges=prepared.merges, language=ex.lang)
+    return offer(ex.project, ex.key, replaced + preamble + ask)
+
+
+def _offer_accept(ex: Exchange, answer) -> Reply | str | None:
+    """The requester's yes to the change that waits on them, staged for their confirmation — or
+    why nothing can be recorded, said in the conversation (#448 slice 3). None for a module that
+    cannot prepare one (an add-on's, a double), and the turn goes on as before.
+
+    THE HEAD IS FIXED HERE, when it is staged: the one the preview was built from, which is what
+    the person tried. The yes records THAT head, and is refused if the preview was rebuilt from
+    another in between (`ProductModule.accept_change`) — a yes never stands for a later push.
+    Nothing is staged when there is nothing to accept (not theirs, nothing waiting, a pass
+    running, nothing tried, the change moved since): NEVER A BARE REFUSAL."""
+    from beeverforge.product.voice import accept_change_confirmation
+
+    prepare = getattr(ex.module, "prepare_acceptance", None)
+    if not callable(prepare):
+        return None
+    number = canonical_ref(getattr(answer, "gesture_card", "") or "")
+    preamble = (answer.text + "\n\n") if answer.text else ""
+    ex.on_it()
+    prepared = prepare(number, actor=ex.user, language=ex.lang)
+    if not prepared.ok:
+        return preamble + prepared.said
+    # WHERE IT WAS SAID travels as every staged entry's `conversation` (`staging.remember`): it
+    # is where "it went in" is told when no delivery of the card names one (`merged_for_you`)
+    replaced = remember(ex.key, {"kind": "accept_change", "number": number,
+                                 "head": prepared.head, "pr_url": prepared.pr_url,
+                                 "seq": ex.seen, "source": ex.source or "",
+                                 "channel": ex.channel},
+                        lang=ex.lang, project=ex.project, person=ex.user)
+    ask = accept_change_confirmation(number=number, merges=prepared.merges, language=ex.lang)
+    return offer(ex.project, ex.key, replaced + preamble + ask)
+
+
+def _offer_card(ex: Exchange, composed, *, request: str, preamble: str = "",
+                kind: str = "ticket", extra: dict | None = None) -> Reply | str:
+    """What the card loop ended with, said to the person: the whole card staged for their yes, or
+    the one question held for their answer (`cards.hold_question`). `kind` is the card's —
+    `ticket` or `defect` (#392) — and `extra` what its gesture carried beside it (a defect's
+    cited requirement)."""
+    from beeverforge.product import cards
+    from beeverforge.product.module import may_act
+    from beeverforge.product.voice import (
+        card_needs,
+        card_not_drafted,
+        ticket_confirmation,
+    )
+
+    project, lang, user = ex.project, ex.lang, ex.user
+    if not composed.ok:
+        if composed.draft is None and not composed.ask:
+            return preamble + card_not_drafted(language=lang)
+        # HELD IN THE STORE (#452), so the process the answer reaches finds it — not only this one
+        cards.hold_question(ex.key, composed, request, kind=kind, extra=extra,
+                            project=project, conversation=ex.thread)
+        return preamble + card_needs(ask=composed.ask, language=lang)
+    title = composed.draft.title
+    # WHAT THE PERSON IS TOLD THE REVIEW STILL SAYS, in their language (#677) — the findings stay
+    # on the record (`_judged`) for the redraft and the team
+    disputed = (tuple(cards.review_said([], composed.ruling, lang))
+                if composed.disputed and composed.ruling else ())
+    if kind == "defect":
+        return _offer_defect(ex, composed, request=request, preamble=preamble,
+                             violates=(extra or {}).get("violates"), disputed=disputed)
+    replaced = remember(ex.key, {"kind": "ticket", "title": title,
+                                 "card": composed.card,
+                                 # the request that asked for it, kept as the source — never as
+                                 # the card's body
+                                 "described": request.strip()[:1500],
+                                 "judged": _judged(composed),
+                                 "seq": ex.seen,
+                                 "reported_by": user or "",
+                                 "source": ex.source or "", "channel": ex.channel},
+                        lang=lang, project=project, person=user)
+    ask = ticket_confirmation(title=title, card=composed.card, unjudged=composed.unjudged,
+                              disputed=disputed, language=lang)
+    if not may_act(project, user):
+        admins = _admin_mentions(project)
+        if admins:
+            ask += admins_must_confirm(admins, "card", language=lang)
+    return offer(project, ex.key, replaced + preamble + ask)
+
+
+def _offer_defect(ex: Exchange, composed, *, request: str, preamble: str, violates,
+                  disputed) -> Reply | str:
+    """The defect card staged for its yes (#392). `restated` stays on the entry — the semaphore
+    compares it and the pending summary shows it — and is now the card's own description, never
+    the message that reported it."""
+    from beeverforge.product.module import may_act
+    from beeverforge.product.voice import defect_confirmation
+
+    project, lang, user = ex.project, ex.lang, ex.user
+    draft = composed.draft
+    replaced = remember(ex.key, {"kind": "defect", "title": draft.title, "card": composed.card,
+                                 "restated": f"{draft.title}: {draft.description}"[:400],
+                                 "reported": request.strip()[:1500],
+                                 "judged": _judged(composed),
+                                 "reported_by": user or "", "violates": violates,
+                                 "seq": ex.seen, "source": ex.source or "",
+                                 "channel": ex.channel},
+                        lang=lang, project=project, person=user)
+    ask = defect_confirmation(violates=violates, title=draft.title, card=composed.card,
+                              unjudged=composed.unjudged, disputed=disputed, language=lang)
+    if not may_act(project, user):
+        admins = _admin_mentions(project)
+        if admins:
+            ask += admins_must_confirm(admins, "record", language=lang)
+    return offer(project, ex.key, replaced + preamble + ask)
+
+
+def resume_card(ex: Exchange, *, arrival_ts: str = "") -> Reply | str | None:
+    """The person's answer to the question a card was held on, taken straight to its redraft — or
+    None when no question is held for them here, or they declined it ("não", "esquece"), and the
+    message is a conversation like any other."""
+    from beeverforge.product import cards
+    from beeverforge.product import case as _case
+
+    held = cards.held_question(ex.key, project=ex.project)
+    if held is None or is_no(ex.text, project=ex.project):
+        if held is not None:
+            # DECLINED ("não", "esquece"): closed as an answer closes it
+            cards.close_question(ex.key, project=ex.project)
+        return None
+    compose = getattr(ex.module, "compose_card", None)
+    if not callable(compose):
+        return None
+    ex.on_it()
+    said, _before = _this_conversation(ex, arrival_ts=arrival_ts)
+    ex.conversation = said
+    composed = compose(request=held.request, conversation=said,
+                       intake=_case.block_for(ex.project, ex.thread, ex.user) or "",
+                       title=held.draft.title,
+                       answered=cards.Answered(question=held.ask, answer=ex.text,
+                                               draft=held.draft, findings=held.findings),
+                       kind=held.kind, language=ex.lang)
+    # CLOSED NOW, WITH THE REDRAFT IN HAND (#452) — not when it was read: a worker that died in the
+    # redraft's minutes left it for the turn's retry. Before `_offer_card`, which may hold the
+    # question again under the same key, and that new hold must stay open.
+    cards.close_question(ex.key, project=ex.project)
+    return _offer_card(ex, composed, request=held.request, kind=held.kind,
+                       extra=dict(held.extra))
+
+
+def _judged(composed) -> dict:
+    """What the judge said about a staged card, kept on the entry so the yes can be read back
+    against the verdict it followed — or `{}` for a card no judge reviewed."""
+    said = composed.ruling
+    if said is None:
+        return {"unjudged": True, "rubric": composed.rubric} if composed.unjudged else {}
+    return {"rubric": composed.rubric, "average": said.average, "scores": dict(said.scores),
+            "attempts": composed.attempts,
+            **({"disputed": list(said.findings)} if composed.disputed else {})}
+
+
+def _stage_ticket_as_said(ex: Exchange, answer) -> Reply | str:
+    """The card staged from the title alone, for a module that cannot draft one — the path every
+    card took before #383, kept for the modules that predate it."""
+    from beeverforge.product.module import may_act
+    from beeverforge.product.voice import ticket_confirmation
+
+    project, lang, user = ex.project, ex.lang, ex.user
+    title = (getattr(answer, "ticket_title", "") or "").strip() or ex.text.strip()
+    replaced = remember(ex.key, {"kind": "ticket", "title": title,
+                                 "described": ex.text.strip()[:1500], "seq": ex.seen,
+                                 "reported_by": user or "", "source": ex.source or "",
+                                 "channel": ex.channel},
+                        lang=lang, project=project, person=user)
+    ask = ticket_confirmation(title=title, language=lang)
+    if not may_act(project, user):
+        admins = _admin_mentions(project)
+        if admins:
+            ask += admins_must_confirm(admins, "card", language=lang)
+    return offer(project, ex.key, replaced + ((answer.text + "\n\n") if answer.text else "")
+                 + ask)
+
+
+# ── stage 5: staging — a request becomes a draft, staged for one yes ────────────────────────────
+
+def staging(ex: Exchange, answer) -> Reply | str | None:
+    """The draft of what was asked for, staged and shown back — or None when the role heard no
+    request, or heard one and could draft nothing testable (the conversation continues)."""
+    if answer.is_request:
+        user = ex.user
+        offered = offer_draft(ex.project, request=ex.text, user=user, thread=ex.thread,
+                              key=ex.key, module=ex.module, on_it=ex.on_it, channel=ex.channel,
+                              seen=ex.seen,
+                              preamble=f"{answer.text}\n\n" if answer.text else "",
+                              asked_by=user or "", source=ex.source or "",
+                              conversation=ex.conversation, reply=answer.text or "",
+                              replacing=the_draft_it_replaces(ex.replacing))
+        if offered:
+            # returned WHOLE and untouched, so the confirmation survives: interpolating it here is
+            # exactly what posted the proposal twice
+            return offered
+    return None
+
+
+def _not_yet_asked(questions: list[str], reply: str) -> list[str]:
+    """The questions `reply` does not already carry — each read off the drafter's field, never a
+    scan of the prose for a question mark (review of #670): "Posso seguir?" above a hold showed
+    neither of the two questions it waited on, and the person's "sim" settled nothing. Case,
+    spacing and trailing punctuation aside; a question the reply did not ask is always listed."""
+    said = " ".join(str(reply or "").casefold().split())
+    return [q for q in questions
+            if " ".join(q.casefold().split()).rstrip(" ?.!…:;") not in said]
+
+
+def the_draft_it_replaces(entry: dict | None) -> str:
+    """The draft `entry` holds, whole, as a drafter reads what it is replacing — "" when it holds
+    none: an act, a queue, an order (#661).
+
+    WHOLE, NOT THE SUMMARY THE JUDGE READS (`_proposal_summary`): a redraft keeps everything the
+    person did not change, and it can only keep what it is shown — the out-of-scope line and the
+    `why` included."""
+    if not entry:
+        return ""
+    import json
+
+    answer = entry.get("answer")
+    draft = answer.get("draft") if isinstance(answer, dict) else getattr(answer, "draft", None)
+    if draft is not None:
+        fields = draft.model_dump() if hasattr(draft, "model_dump") else dict(draft)
+        kept = {k: v for k, v in fields.items() if k not in ("conflicts", "supersedes") and v}
+        return json.dumps(kept, ensure_ascii=False, indent=1)
+    if entry.get("card"):
+        return f"# {entry.get('title', '')}\n\n{entry['card']}".strip()
+    return ""
+
+
+def _replacing(ex: Exchange, compose) -> dict:
+    """`replacing=` for a card drafter that takes it, when this turn replaces a draft (#661)."""
+    return _drafted_from(compose, replacing=the_draft_it_replaces(ex.replacing))
+
+
+def _drafted_from(drafter, **values: str) -> dict:
+    """What a draft is written from, as keywords `drafter` takes — each only when it holds text, so
+    a drafter written before it took them is called exactly as before (#661)."""
+    return {name: value for name, value in values.items() if value and _accepts(drafter, name)}
+
+
+def offer(project, key: str, text: str) -> Reply | str:
+    """The proposal staged at `key`, offered as a question with options — or the text alone when
+    nothing is staged there to be answered.
+
+    ONE HELPER FOR EVERY STAGING SITE, because four copies of "try buttons, else prose" is how
+    three of them end up without the button and nobody notices — the shape of this repository's
+    signature defect. The engine never posts anything: it says what the options ARE, and each
+    transport renders them its own way (ADR-0038 D2) — `channel.deliver` with buttons where the
+    chat surface has them, the panel with its own, anything else as the sentence, which always
+    asks in words."""
+    entry = pending_for(key)
+    if entry is None:
+        return text
+    from beeverforge.product.voice import confirm_labels, or_just_reply
+
+    lang = getattr(project, "language", None)
+    approve, reject = confirm_labels(language=lang)
+    return Reply(text=text, options=Confirmation(token=proposal_token(key, entry),
+                                                 approve=approve, reject=reject,
+                                                 typed=or_just_reply(language=lang)))
+
+
+def offer_draft(project, *, request: str, user: str, thread: str, module,
+                asked_by: str = "", date: str = "", source: str = "", on_it=None,
+                preamble: str = "", channel: str = "",
+                seen: int | None = None, key: str = "", conversation: str = "",
+                reply: str = "", replacing: str = "") -> Reply | str | None:
+    """Draft what was asked for and show it back for confirmation.
+
+    Separate from the conversation because drafting is a deliberate step: it costs a model call and
+    it is what puts a proposal in front of a person, so the conversation decides when a message
+    deserves one rather than every remark becoming a draft.
+
+    `seen` is the product's write sequence as the turn's check saw it (ADR-0051 D8): the draft
+    keeps it, so its confirmation re-checks only what was saved after the check it came from.
+
+    `key` is where the draft is staged — the turn's `key_for(conversation, person)`, so it waits
+    for `user` beside anybody else's in the same room (#266 slice 4). A caller that gives none
+    stages under `thread` itself, the conversation alone, as every caller did before.
+
+    `conversation`, `reply` and `replacing` are what the draft is written FROM (#661): this
+    conversation as the role read it, the role's reply that proposed the draft, and the draft it
+    replaces — still waiting for the person's yes, or just taken off the table by their "no". The
+    request alone is the conversation's last message, and an adjustment drafted from it alone
+    drops everything the adjustment did not repeat."""
+    thread = key or thread
+    lang = getattr(project, "language", None)
+    if on_it:
+        on_it()
+    _progress.stage("drafting")    # a model call of its own, after the answer's (#395)
+    answer = module.draft(request, asked_by=asked_by or user, **_drafted_from(
+        module.draft, conversation=conversation, reply=reply, replacing=replacing))
+    if not answer.ok or answer.draft is None:
+        return None  # nothing to confirm; the conversation continues
+
+    draft = answer.draft
+    # NOTHING IS PROPOSED WHILE ITS TEXT WAITS ON AN ANSWER (#670). Read off the drafter's field,
+    # never off the role's prose: a draft that names what it cannot write without
+    # (`RequirementDraft.ask_first`) stages nothing — what was on the table stays there — and the
+    # person is asked. Journey 0 had a proposal under "I need two answers before I close the
+    # text" that chose both for them.
+    first = [str(q).strip() for q in (getattr(draft, "ask_first", None) or []) if str(q).strip()]
+    if first:
+        from beeverforge.product.voice import asked_first
+
+        log.info("BEEVERFORGE_PRODUCT_DRAFT_ASKS_FIRST project=%s questions=%d",
+                 getattr(project, "name", "?"), len(first))
+        return preamble + asked_first(questions=_not_yet_asked(first, preamble), language=lang)
+    replaced = remember(thread, {"answer": answer, "asked_by": asked_by or user, "date": date,
+                                 "source": source, "kind": "draft", "channel": channel,
+                                 "seq": seen,
+                                 "number": _next_number(module)}, lang=lang, project=project,
+                        person=user)
+    # THE REASONING GOES ABOVE THE BUTTONS, IN THE SAME MESSAGE. Returned separately it was posted
+    # separately — and after the block it justifies, so the person read "confirm this?" before the
+    # argument for it. Worse, concatenating an already-posted proposal into an f-string produced a
+    # plain `str`, the boundary could no longer tell it had been posted, and the whole proposal
+    # went out TWICE. A sentinel that survives only until somebody interpolates it is not a
+    # sentinel — which is why the preamble is an argument here and never glued on outside.
+    from beeverforge.product.voice import confirmation_request, still_open
+
+    return offer(project, thread, preamble + replaced + confirmation_request(
+        title=draft.title, must_be_true=draft.must_be_true,
+        conflicts=[(c.kind, _conflict_line(c, lang)) for c in draft.conflicts], language=lang)
+        + still_open(questions=list(draft.questions or []), language=lang))
+
+
+def _conflict_line(conflict, lang=None) -> str:
+    ref = (engine_said("conflict_requirement", language=lang, number=conflict.requirement)
+           if conflict.requirement else engine_said("conflict_decided", language=lang))
+    return f"{ref} — {conflict.explanation}"
+
+
+# ── the factory's own question, which is not a turn ────────────────────────────────────────────
+
+def consult(project, question: str, *, context: str = "", module=None):
+    """A question the FACTORY puts to the role about a card — never a person's turn.
+
+    The job's gather asks the role what an undescribed file does before work starts (ADR-0048).
+    Nobody said it, so nothing is recorded in a conversation, nothing is settled and nothing is
+    staged: this is the model's answer and only that. It lives here because `ProductModule.answer`
+    has one caller — this module — and a guard holds it to that (ADR-0051 D12)."""
+    from beeverforge.product.module import ProductModule
+
+    return (module or ProductModule(project, via="api")).answer(question, context=context)
+
+
+# ── the typed intents, carried out ──────────────────────────────────────────────────────────────
+
+def _waiting_line(project) -> str:
+    """What she is still waiting on, appended to the status.
+
+    A DELIVERY, NOT A CALCULATION (C-24). Opening the memory store, filtering loop kinds and
+    writing the Portuguese used to happen right here — the product role's own logic inside one
+    provider's adapter. It now lives in `product/followup.waiting_line`, where the panel and any
+    other channel can ask the same question and get the same sentence."""
+    from beeverforge.product.followup import waiting_line
+
+    line = waiting_line(getattr(project, "name", "") or "",
+                        language=getattr(project, "language", None))
+    return f"\n{line}" if line else ""
+
+
+#: words that carry no identity — a term must not begin or end with one. Portuguese runs on
+#: articles and prepositions, which is why "first six words" produced handles like "a firma usa
+#: Primavera para a": truncated mid-article, unfindable in a glossary, and colliding with every
+#: other sentence that starts the same way.
+_STOPWORDS = frozenset(
+    "a o as os um uma uns umas de do da dos das em no na nos nas para pra por com sem que e ou "
+    "se ao aos à às é são foi ser estar tem têm há aí ai lá la isso isto aquilo the of in on at "
+    "to for and or is are was be".split())
+
+
+def _term_of(fact: str) -> str:
+    """A findable handle for one fact: strip leading/trailing stopwords, keep up to five words.
+
+    Deterministic on purpose (no model call for a dictation), and honest about its limits: the
+    person is shown the term and can re-dictate. What it must never do is what "first six words"
+    did — cut mid-article and index a glossary by sentence fragments."""
+    words = fact.split()
+    while words and words[0].lower().strip(",.;:") in _STOPWORDS:
+        words.pop(0)
+    picked = words[:5]
+    while picked and picked[-1].lower().strip(",.;:") in _STOPWORDS:
+        picked.pop()
+    return " ".join(picked) if picked else " ".join(fact.split()[:4])
+
+
+def _acts_staged_for_a_yes() -> frozenset[str]:
+    """The intent of every act the role proposes, read off `role.ACTS`: each is staged for a yes."""
+    from beeverforge.product.role import GESTURE_INTENT
+
+    return frozenset(GESTURE_INTENT.values())
+
+
+def _admin_mentions(project) -> str:
+    """The people whose yes unlocks the pen, NAMED AS THE PLATFORM KNOWS THEM — the ids the
+    deployment's `product.admins` lists, which are people of the platform (#266 slice 6).
+
+    NO VENDOR'S MENTION SHAPE. This wrapped each id in one chat vendor's mention syntax, which the
+    panel showed as literal punctuation and every other surface as noise; how a transport notifies
+    a person it names is that transport's own (ADR-0038 D2).
+
+    ONLY WHERE THEIR YES CAN COUNT (#266 slice 4). The note these names go into sits under a
+    proposal staged by somebody off the admin list, telling the admins it needs their
+    confirmation. Since the first yes is bound to the requester, an admin's yes on it counts only
+    when the product lets admins accept on the requester's behalf (`accept_on_behalf`); anywhere
+    else the note would send them to a refusal, so there is nobody to name."""
+    cfg = getattr(project, "product", None)
+    if not getattr(cfg, "accept_on_behalf", False):
+        return ""
+    admins = list(cfg.admins or [])[:3]
+    return " ".join(str(a) for a in admins)
+
+
+def _next_number(module) -> int:
+    from beeverforge.product.authoring import next_number
+
+    try:
+        return next_number(module.context().corpus)
+    except Exception as exc:  # noqa: BLE001 — a number is cosmetic in a chat message
+        log.info("could not work out the next requirement number (%s) — showing none", exc)
+        return 0
+
+
+def _run_intent(project, intent: str, captures: dict, *, module, lang: str | None,
+                user: str = "", thread: str = "", on_it=None,
+                channel: str = "", asked: str = "", key: str = "") -> Reply | str | None:
+    """Do the thing that was asked for. `None` falls back to conversation — a recognised intent
+    that cannot be carried out must not swallow the message.
+
+    `key` is where what an intent stages waits — the turn's `key_for(conversation, person)`
+    (#266 slice 4) — and `thread` the conversation it was asked in. A caller that gives no key
+    stages under the conversation itself, as every caller did before."""
+    # IMPORTED ONCE, AT THE TOP. It used to be imported inside the `fact` branch, which makes it a
+    # function-local name for the WHOLE function — so the next branch added above that line raised
+    # UnboundLocalError on its authorisation check and the client got "algo quebrou do meu lado".
+    # A landmine that arms itself for whoever writes the next intent is worth removing, not
+    # documenting. (Its refusal left with the two writes that ran on the match alone, #565.)
+    from beeverforge.product.module import may_act, unauthorized_message
+    from beeverforge.product.voice import triage_report
+
+    name = getattr(getattr(project, "product", None), "agent_name", "") or ""
+    # FROM HERE ON `thread` IS THE STAGING KEY — every proposal below is staged for this person in
+    # this conversation — and `conversation` is where the message was said (the first pass reports
+    # back to it)
+    conversation, thread = thread, (key or thread)
+    # WHAT THE ROLE SAID BEFORE ITS MARKER (#565). An act the role proposed is staged here from
+    # `gestures`, and its reply goes in front of what this branch says — the question, or why
+    # nothing was staged — with no name before the sentence, because the reply is already the
+    # role's own. A proposal it displaced is said first, as `_offer_card` says it.
+    preamble = captures.get("preamble", "")
+    # …AND, IN FRONT OF A QUESTION ONLY, that a second act in the same reply waits for it: where
+    # nothing is staged there is no first act to have prepared
+    asking = preamble + captures.get("later", "")
+
+    def said(sentence: str) -> str:
+        if preamble:
+            return preamble + sentence
+        return f"{name}: {sentence}" if name else sentence
+
+    # NO QUESTION NOBODY CAN ANSWER, FOR EVERY ACT THE ROLE PROPOSES (#634, #638, #667). The
+    # requester's own yes counts only from somebody who may act, and an admin's counts for them
+    # only where the product lets admins accept on their behalf (`_admin_mentions`). Anywhere else
+    # a staged question waits for a yes nobody can give, and the person who asked reads it as if
+    # theirs would do: refused at once, naming who can. ONE RULE, READ OFF THE ACTS' TABLE
+    # (`role.ACTS`): it was written into the breakdown and the refine alone, and the note a person
+    # off the list asked for was staged in their name for a yes that never came (journey 0, C-13).
+    if (intent in _acts_staged_for_a_yes() and not may_act(project, user)
+            and not _admin_mentions(project)):
+        return said(unauthorized_message(project))
+
+    if intent == "announce":
+        return module.introduce()
+
+    if intent == "fact":
+        fact = (captures.get("fact") or "").strip().rstrip(".")
+        # "lembra que semana passada o sistema caiu?" is a rhetorical QUESTION, not a dictation —
+        # staging it produced "Vou anotar assim — *semana passada o sistema caiu?*", which reads
+        # as a bot that cannot tell being asked from being told. A question mark ends the intent.
+        if not fact or fact.endswith("?"):
+            return None
+        term = _term_of(fact)
+        from beeverforge.product.voice import fact_confirmation
+
+        replaced = remember(thread, {"kind": "fact", "term": term, "body": fact,
+                                     "said_by": user or "", "source": "",
+                                     "channel": channel},
+                            lang=lang, project=project, person=user)
+        ask = fact_confirmation(term=term, body=fact, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "note", language=lang)
+        return offer(project, thread, replaced + asking + ask)
+
+    if intent == "status":
+        # COMPOSED HERE, NEVER `status_line()`. That one is `ProductContext.health()` — an operator
+        # line carrying the repository slug, English prose, a warning count and a manifest path,
+        # and it was the answer this channel gave to "como estamos?", the most-asked question on
+        # the surface, every day. The diagnostics still exist and still reach the panel and the log;
+        # what changes is who they are written for (ADR-0026).
+        from beeverforge.product.voice import corpus_state
+
+        ctx = module.context()
+        corpus = getattr(ctx, "corpus", None)
+        if not ctx.available:
+            log.warning("[%s] status asked while the product base is unreadable: %s",
+                        getattr(project, "name", "?"), str(getattr(ctx, "reason", ""))[:200])
+        return corpus_state(
+            available=bool(ctx.available),
+            requirements=len(getattr(corpus, "requirements", []) or []) if corpus else 0,
+            promises=len(corpus.promises()) if corpus else 0,
+            language=lang) + _waiting_line(project)
+
+    if intent == "triage":
+        if on_it:
+            on_it()
+        _progress.stage("board")
+        report, error = module.triage_board()
+        if report is None:
+            # `error` is loader/board prose written for an operator — English, with the repo slug
+            # in it. There is no client-readable version of it: the log keeps the diagnosis whole,
+            # the channel hears that the problem is ours.
+            log.warning("[%s] triage could not read the board: %s",
+                        getattr(project, "name", "?"), str(error)[:400])
+            return engine_said("board_unread", language=lang)
+        return triage_report(report, language=lang, agent_name=name)
+
+    if intent == "needs_action":
+        # the REAL classification, not a proxy: it reads the diagnosis already on each ticket and
+        # decides whose problem it is
+        if on_it:
+            on_it()
+        _progress.stage("board")
+        review, error = module.review_needs_action()
+        if review is None:
+            log.warning("[%s] needs-action could not read the board: %s",
+                        getattr(project, "name", "?"), str(error)[:400])
+            return engine_said("stuck_unread", language=lang)
+        return _needs_action_reply(review, name, language=lang)
+
+    if intent == "breakdown":
+        number = int(captures.get("number") or 0)
+        # STAGED FOR A YES LIKE EVERY OTHER WRITE (#565 slice c). It wrote on the match alone, the
+        # declared exception of `intents.py`, while the person could not know which sentence
+        # reached it: "ok, pode escrever o card e colocar no backlog" matched nothing and filed a
+        # free-standing card beside the breakdown already running (#563). The role proposes it
+        # now (`[[QUEBRAR: REQ-N]]`), what is checked before the question is checked here, and the
+        # yes starts it on the worker (`confirm._confirm_breakdown`, #563 slice 18b).
+        # NO QUESTION NOBODY CAN ANSWER (review of #634): refused above, for every act.
+        req, _corpus, instead = _named_requirement(project, module, number,
+                                                   "" if preamble else name, lang)
+        if instead:
+            return preamble + instead
+        if not req.is_promise:
+            from beeverforge.product.module import _not_a_promise
+
+            return said(_not_a_promise(number, req, language=lang))
+        from beeverforge.product.voice import breakdown_confirmation
+
+        body = remember(thread, {"kind": "breakdown", "number": number, "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = breakdown_confirmation(number=number, title=req.title or req.slug, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "breakdown", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "accept":
+        number = int(captures.get("number") or 0)
+        req, _corpus, instead = _named_requirement(project, module, number,
+                                                   "" if preamble else name, lang)
+        if instead:
+            return preamble + instead
+        if req.is_promise:
+            return said(engine_said("already_agreed", language=lang, number=number))
+        if not req.is_live:
+            # THE MODULE'S OWN QUESTION, ASKED HERE TOO — `drop` reads this same flag one branch
+            # below. This one compared a raw status to "accepted", so a retired requirement bought
+            # a confirmation from a person; and `module.accept` refuses only what is ALREADY
+            # agreed, so that yes would have written a text the client had taken off the table
+            # back into force as a promise the factory defends.
+            return said(engine_said("accept_dropped", language=lang, number=number))
+        from beeverforge.product.voice import accept_confirmation
+
+        body = remember(thread, {"kind": "accept", "number": number, "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = accept_confirmation(number=number, title=req.title or req.slug, language=lang)
+        # NAMED UNDER IT, as under every other act (#667): the one act that said nothing of whose
+        # yes it waits for, where an admin's counts for the person who asked
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "agreement", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "drop":
+        number = int(captures.get("number") or 0)
+        req, _corpus, instead = _named_requirement(project, module, number,
+                                                   "" if preamble else name, lang)
+        if instead:
+            return preamble + instead
+        if not req.is_live:
+            # already off the table — saying "confirm and I'll drop it" would stage a write that
+            # changes nothing, and the person would believe they had decided something
+            return said(engine_said("already_dropped", language=lang, number=number))
+        from beeverforge.product.voice import drop_confirmation
+
+        was_a_promise = req.is_promise
+        reason = (captures.get("reason") or "").strip()[:300]
+        body = remember(thread, {"kind": "drop", "number": number, "channel": channel,
+                                 "reason": reason,
+                                 "was_a_promise": was_a_promise,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = drop_confirmation(number=number, title=req.title or req.slug,
+                                was_a_promise=was_a_promise, reason=reason, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "decision", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "decision":
+        number = int(captures.get("number") or 0)
+        decision = (captures.get("decision") or "").strip().rstrip(".")[:400]
+        req, _corpus, instead = _named_requirement(project, module, number,
+                                                   "" if preamble else name, lang)
+        if instead:
+            return preamble + instead
+        if not req.is_live:
+            # writing into a document nobody is executing records the decision where nobody will
+            # go looking for it — and the person would believe it had landed somewhere useful
+            return said(engine_said("decision_on_dropped", language=lang, number=number))
+        from beeverforge.product.voice import decision_confirmation
+
+        body = remember(thread, {"kind": "decision", "number": number, "channel": channel,
+                                 "decision": decision,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        # THE SENTENCE IS SHOWN BACK VERBATIM, and that is the point of staging this at all: the
+        # whole value of the register is that somebody reads these exact words in three months, so
+        # a paraphrase approved today is a paraphrase found then.
+        ask = decision_confirmation(number=number, decision=decision, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "decision", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "close":
+        # A CARD, NOT A REQUIREMENT (C-05) — the tracker's own ref, whatever shape it takes.
+        # `int(... or 0)` sat on both of these and would have raised on a Jira ref, inside the
+        # chat handler, where the client sees "algo quebrou do meu lado".
+        number = canonical_ref(captures.get("number"))
+        in_favour_of = canonical_ref(captures.get("in_favour_of")) or None
+        reason = (captures.get("reason") or "").strip()[:300]
+        if not number:
+            return None
+        # A SURVIVOR NAMED WITHOUT A `#` cost a question here while a pattern read the sentence: it
+        # could not tell "duplicate of 288" from a number in passing. The role names the survivor
+        # as the board spells it, or names none (#565 slice b), so there is nothing left to ask.
+        # "ALREADY CLOSED" AND "NO SUCH CARD" ARE NOT READ FIRST: `close_card` reports both as a
+        # sentence a client can read, after the yes. What IS read first, for a close in favour of
+        # another card, is what the closed card carries that the survivor does not (#567): the
+        # person's yes is given on it. The role offered to close one card "or" another as equals,
+        # and the one closed was the only card carrying the requirement's first front. The read
+        # is the board snapshot the module keeps, inside the turn — not the listener thread this
+        # branch once avoided reading on, which the turn no longer runs on (ADR-0051).
+        from beeverforge.product.voice import close_confirmation
+
+        carried, unread = None, False
+        compare = getattr(module, "what_only_it_carries", None)
+        if in_favour_of and compare is not None:
+            carried = compare(number, in_favour_of)
+            unread = carried is None
+
+        body = remember(thread, {"kind": "close", "number": number,
+                                 "in_favour_of": in_favour_of, "reason": reason,
+                                 "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = close_confirmation(number=number, in_favour_of=in_favour_of, reason=reason,
+                                 carried=carried, unread=unread, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "closing", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "correct":
+        # A CARD (C-05), and what it should say instead (#156). Nothing is read first, for the
+        # reason `close` gives: the board read belongs behind the confirmation, and `correct_card`
+        # answers "not mine", "already started" and "no such card" as sentences a client can read.
+        number = canonical_ref(captures.get("number"))
+        text = (captures.get("text") or "").strip()[:2000]
+        new_title = (captures.get("title") or "").strip()[:200]
+        if not number or not (text or new_title):
+            return None
+        from beeverforge.product.voice import correct_confirmation
+
+        body = remember(thread, {"kind": "correct", "number": number, "text": text,
+                                 "new_title": new_title, "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = correct_confirmation(number=number, text=text, title=new_title, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "correction", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "align":
+        # THE TWO AXES IN ONE GESTURE, and the reason bare `number` is not a safe name to guard
+        # on: `number` is the CARD (the tracker's ref, any shape) and `requirement` is a REQ
+        # number this platform mints itself, which is genuinely an integer.
+        number = canonical_ref(captures.get("number"))
+        requirement = int(captures.get("requirement") or 0)
+        if not number or not requirement:
+            return None
+        req, corpus, instead = _named_requirement(project, module, requirement,
+                                                  "" if preamble else name, lang)
+        if instead:
+            return preamble + instead
+        if not req.is_promise:
+            return said(_align_refusal(project, corpus, req, number=number,
+                                       requirement=requirement, lang=lang))
+        from beeverforge.product.voice import align_confirmation
+
+        body = remember(thread, {"kind": "align", "number": number, "requirement": requirement,
+                                 "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = align_confirmation(number=number, requirement=requirement,
+                                 title=req.title or req.slug, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "change", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "refine":
+        # A CARD (C-05) — see `close` above.
+        number = canonical_ref(captures.get("number"))
+        if not number:
+            return None
+        # STAGED FOR A YES LIKE EVERY OTHER WRITE (#565 slice c), and `breakdown` beside it: it
+        # edited a client's card on the match alone. The yes writes the criteria
+        # (`confirm._confirm_refine`), which it still writes only where there are none.
+        from beeverforge.product.voice import refine_confirmation
+
+        body = remember(thread, {"kind": "refine", "number": number, "channel": channel,
+                                 "asked_by": user or ""},
+                        lang=lang, project=project, person=user)
+        ask = refine_confirmation(number=number, language=lang)
+        if not may_act(project, user):
+            admins = _admin_mentions(project)
+            if admins:
+                ask += admins_must_confirm(admins, "refine", language=lang)
+        return offer(project, thread, body + asking + ask)
+
+    if intent == "baseline":
+        return _baseline_reply(project, module, name, user, on_it, conversation=conversation,
+                               room=channel, asked=asked)
+
+    if intent == "queue":
+        return _queue_reply(project, module, name, thread, channel=channel,
+                            preamble=captures.get("preamble", ""), user=user)
+
+    return None
+
+
+def _no_such_requirement(number: int, name: str, lang) -> str:
+    """Three gestures name a requirement by number and all three can miss. One sentence, said the
+    same way each time — the third hand-written copy is where the wording drifts."""
+    from beeverforge.product.voice import requirement_not_found
+
+    missing = requirement_not_found(number=number, language=lang)
+    return f"{name}: {missing}" if name else missing
+
+
+def _named_requirement(project, module, number: int, name: str, lang):
+    """What a gesture that names a requirement by number is really asking for:
+    `(requirement, corpus, "")`, or `(None, None, what to say instead)`.
+
+    "I COULD NOT READ THE BASE" IS NOT "THAT REQUIREMENT DOES NOT EXIST", and the second was said
+    for the first. Loading never raises: an unavailable `ProductContext` carries an EMPTY corpus,
+    so `by_number` answers None for every number while the documentation base is unreachable. And
+    the conversation's `ctx.available` gate is reached only when the dispatcher falls through,
+    while each of these three branches returns a sentence — so on a docs outage the product owner
+    told an accounting client, flatly, that a requirement they had written themselves does not
+    exist. It is the same state that once answered "how many requirements are there" with "zero".
+
+    Read once for the three. `requirement_not_found` was written to stop the wording drifting
+    between them, and unified the wrong sentence across all three instead.
+    """
+    ctx = module.context()
+    if not ctx.available:
+        log.warning("[%s] a requirement gesture arrived while the base could not be read: %s",
+                    getattr(project, "name", "?"), ctx.reason)
+        from beeverforge.product.voice import unavailable
+
+        return None, None, unavailable(language=lang)
+    req = ctx.corpus.by_number(number) if number else None
+    if req is None:
+        return None, None, _no_such_requirement(number, name, lang)
+    return req, ctx.corpus, ""
+
+
+def _replacement(corpus, number: int):
+    """The last requirement a supersession chain NAMES, whatever its status — None when it names
+    nothing that can be read.
+
+    NOT A SECOND ANSWER TO `_successor`'S QUESTION, A DIFFERENT ONE. `_successor` says which
+    PROMISE took over, and it is the reading the repair path stands on; it answers None both when
+    the chain dangles and when the text that took over is merely proposed. Those two are not the
+    same fact and the person cannot act on them the same way: one is a text they can read and
+    agree to, the other is an inconsistency of ours. Telling them apart is what this reads, and
+    nothing else — where both answer they must agree, and a test holds them to it.
+    """
+    seen: set[int] = set()
+    current = corpus.by_number(number)
+    while current is not None and current.superseded_by is not None:
+        if current.number in seen:
+            return None
+        seen.add(current.number)
+        current = corpus.by_number(current.superseded_by)
+    return current if current is not None and current.number != number else None
+
+
+def _align_refusal(project, corpus, req, *, number: str, requirement: int, lang) -> str:
+    """Why this card will not be written from this requirement — said HERE, before anybody is asked.
+
+    THE PRE-CHECK IS THE MODULE'S OWN GATE. `align_card` writes only from a PROMISE; this branch
+    admitted anything still `is_live`, so a proposed requirement bought a "this changes what gets
+    built — Confirma?" from a person, displaced whatever else was awaiting confirmation in the
+    thread, and was refused one call deeper by a gate that had never moved. Asking somebody to
+    authorise an act that cannot happen spends the only thing this surface asks of a human.
+
+    THE DAMAGE THIS ACT EXISTS TO UNDO, ARRIVING FROM THE OTHER DIRECTION. Writing a card's
+    criteria out of a retired text is what left thirteen cards executing REQ-0004 under a rule
+    telling whoever works them not to go beyond it. Refused, and the refusal names the sentence
+    that would work — a dead end is how somebody stops asking.
+
+    THE END OF THE CHAIN, NOT THE NEXT LINK, and "unagreed" is not "unreadable". `superseded_by`
+    is a claim about one hop; a replacement written in the same commit that retires its
+    predecessor is `proposed` for as long as nobody has said yes. Reading that as a broken chain
+    told a client our base pointed at a text nobody could open — about a requirement that reads
+    perfectly well — and raised an operator alarm with nothing behind it. What it needs is the
+    fourth answer: the replacement exists, and confirming it is the step that unlocks this one.
+
+    AND "UNAGREED" IS NOT "REFUSED". `_replacement` answers which requirement the chain NAMES,
+    whatever became of it; what this has to know is whether the person can still say yes to it. A
+    replacement the client themselves dropped is neither missing nor pending, and offered as
+    pending it invited them to reinstate the text they had cancelled — which `accept` would have
+    written back into force. The status is read here, once, rather than assumed by the sentence.
+    """
+    from beeverforge.product.module import _not_a_promise, _successor
+    from beeverforge.product.voice import (
+        align_refused,
+        align_to_dropped_replacement,
+        align_to_unagreed,
+    )
+
+    if req.superseded_by is not None:
+        promise = _successor(corpus, requirement)
+        if promise:
+            return align_refused(number=number, requirement=requirement, successor=promise,
+                                 language=lang)
+        replacement = _replacement(corpus, requirement)
+        if replacement is not None:
+            if not replacement.is_live:
+                return align_to_dropped_replacement(number=number, requirement=requirement,
+                                                    successor=replacement.number, language=lang)
+            return align_to_unagreed(number=number, requirement=requirement,
+                                     successor=replacement.number, language=lang)
+        log.warning("BEEVERFORGE_PRODUCT_CHAIN_BROKEN project=%s requirement=%s superseded_by=%s — "
+                    "a "
+                    "retired requirement points at a text the corpus cannot read, so nothing can "
+                    "be re-aimed at it", getattr(project, "name", "?"), requirement,
+                    req.superseded_by)
+        return align_refused(number=number, requirement=requirement, replaced=True, language=lang)
+    if not req.is_live:
+        return align_refused(number=number, requirement=requirement, language=lang)
+    # Live, and still not something the factory may be aimed at. THE MODULE'S OWN SENTENCE, not a
+    # second one written here: `_not_a_promise` is what `align_card` and `break_down` both answer
+    # with, and it separates a proposal from a reading of the code — a person told two different
+    # things about one rule learns the rule is arbitrary.
+    return _not_a_promise(requirement, req, language=lang)
+
+
+def _queue_reply(project, module, name: str, thread: str, *,
+                 channel: str = "", preamble: str = "", user: str = "") -> Reply | str | None:
+    """Propose what to start next, and stage it for one yes.
+
+    The proposal is the argument; the yes is the decision. Staged like a draft because it is the
+    same kind of commitment: approving a specific ordered list, not a direction. Staged for `user`
+    (#266 slice 4): the yes that spends money is the one who asked for the start's, like every
+    other."""
+    from beeverforge.product.voice import queue_proposal
+
+    lang = getattr(project, "language", None)
+    _progress.stage("board")
+    state, proposal, error = module.propose_queue()
+    if state is None:
+        log.warning("[%s] queue proposal could not read the board: %s",
+                    getattr(project, "name", "?"), str(error)[:400])
+        return engine_said("queue_unread", language=getattr(project, "language", None))
+
+    titles = {}
+    try:
+        titles = {t.number: t.title for t in module._board_tickets or []}
+    except Exception as exc:  # noqa: BLE001 — titles are decoration, the numbers still go out
+        log.info("could not read ticket titles (%s) — the message will carry numbers only", exc)
+        titles = {}
+
+    text = queue_proposal(state, proposal, titles=titles, language=lang, agent_name=name)
+    if proposal and proposal.items:
+        replaced = remember(thread, {"kind": "queue", "channel": channel,
+                                     "numbers": [i.ticket for i in proposal.items]},
+                            lang=lang, project=project, person=user)
+        # THE PREAMBLE GOES INSIDE, never around the return: an offered proposal interpolated
+        # into an f-string turned into a plain `str`, and it went out twice. Same reason
+        # `offer_draft` takes its preamble as an argument.
+        return offer(project, thread, preamble + replaced + text)
+    return text
+
+
+def _needs_action_reply(review, name: str, *, language=None) -> str:
+    """The composer moved to `beeverforge/product/voice.py` (#105); this is the engine's call
+    into it.
+
+    It was the only sentence in the product's VOICE that lived in the channel's package, and it was
+    hardcoded pt-BR — so a client on another language read Portuguese and a deployment without
+    Slack could not reach the words at all. `language` is threaded through rather than defaulted
+    here, because defaulting in the transport is how the hardcoding happened the first time."""
+    from beeverforge.product.voice import needs_action_report
+
+    return needs_action_report(review, language=language, agent_name=name)
+
+
+def _waiting_release_refs(project) -> list[str]:
+    """The refs of every release still waiting on the client's word, oldest first — or [].
+
+    Best-effort: this feeds ONE parenthesis in a chat reply, and an unreadable ledger must cost
+    the parenthesis, never the answer."""
+    try:
+        from beeverforge.memory import store as loop_store
+        from beeverforge.memory.ledger import ACCEPTANCE, waiting
+        from beeverforge.product.followup import OWNER, is_release
+
+        loops = [x for x in waiting(loop_store.read(project.name), owner=OWNER)
+                 if x.kind == ACCEPTANCE and is_release(x)]
+        # ONCE EACH (#448 slice 4): a release asked in the room AND of its requester is two loops
+        # and one release — "(#12, #12, #13)" asks the person to choose between a thing and itself
+        return list(dict.fromkeys(is_release(x) for x in sorted(loops, key=lambda x: x.ts)))
+    except Exception as exc:  # noqa: BLE001 — the parenthesis is decoration; the ask is not
+        log.info("could not list the waiting releases for the ambiguity reply (%s)", exc)
+        return []
+
+
+def _at_the_last_gate(project, loop, event, *, user: str, why: str = "",
+                      facts: dict | None = None, act=None):
+    """`event` through the card's door for the release `loop` asks about (#448 slice 6) — the
+    verdict that counts on a change parked at its last gate. What follows is the door's table: the
+    release question closed, every copy of it — the room's and the requester's, one question asked
+    in two places and answered once — with the verdict (`lifecycle/loops.py::release_answered`).
+    It closed beside the door until slice 6 (`_close_release`, #273, #448 slice 4).
+
+    The card's door reads the card where it is and refuses one the factory no longer holds; a
+    refusal is logged, never raised: the reply is already earned. `act` is the engine's half — the
+    sealed approval a release delivers — and its refusal is returned as the transition's answer."""
+    from beeverforge.lifecycle import transition
+    from beeverforge.product.followup import is_release
+
+    context = loop.context or {}
+    known = {"gate": "last", "run": str(context.get("run") or loop.ts or ""),
+             "where": str(context.get("where") or ""), **(facts or {})}
+    moved = transition(project, is_release(loop), event, by=user, why=why, facts=known, act=act)
+    if moved.refused:
+        log.info("[%s] the card's door did not take %s for %s (%s)", getattr(project, "name", "?"),
+                 event, ref_label(is_release(loop)), moved.refused[:160])
+    return moved
+
+
+def _maybe_release(project, module, loop, verdict: str, user: str, agent: str, lang,
+                   *, ambiguous: bool, via: str = "api", said: str = "") -> str | None:
+    """The client's answer to "is it ready to go live?" — or None when this was an ordinary one.
+
+    None rather than a boolean, so the caller's normal path is untouched by a branch that does not
+    apply: every other acceptance still reads exactly as it did.
+
+    THREE THINGS MAKE THIS DIFFERENT FROM ITS SIBLINGS, and each is a rule the ordinary acceptance
+    does not need:
+
+    1. AMBIGUITY IS REFUSED, NOT NAMED. With two deliveries waiting, `settle_acceptance` settles
+       the newest and the reply says which — a wrong guess costs one correction. Here a wrong guess
+       PUTS THE WRONG SOFTWARE IN FRONT OF THE CLIENT'S USERS, so the guess is not offered: they
+       are asked which one, and nothing is released.
+    2. AUTHORISATION IS RE-CHECKED. Reading a message is not an act; releasing is. `may_act` is the
+       deployment's own declared list, so who may do this is a registry line and never "whoever is
+       in the room". ON EVERY SURFACE THAT REACHES THIS STAGE (2026-08-25): a "funcionou o #12"
+       typed in the panel's product box reaches this same gate — by design, the panel is the
+       reference surface (ADR-0038 D1) and the product box is not a second, softer approver — and
+       `via` records which surface the approver was speaking from, never who may approve.
+    3. THE ACT IS OBSERVED BEFORE IT IS CLAIMED. `release()` re-asks the workflow whether it is
+       still parked, and returns the honest sentence when it is not. A client told "subiu" over a
+       signal that reached nothing is the worst outcome available on this path.
+
+    A "não funcionou" releases NOTHING and says so plainly, and closes the loop as
+    `did-not-work`, which is the record that matters. What it does next is another pass, staged
+    by the turn that holds the conversation (`_offer_another_pass`, #448 slice 4) — this says only
+    what is said where none can be staged, and never promises one. An AMBIGUOUS one closes and
+    stages nothing: a pass sent on a guess would rebuild the wrong card.
+
+    WHO MAY SAY "IT WORKED" (#448 slice 4). A product admin (`may_act`), as always — and the
+    card's own requester (`ProductModule.asked_for`), whose word releases it only where the
+    project says so (`Project.release_by_requester`, the operator's, off by default). Where it
+    does not, their yes is RECORDED, not refused: their copy of the question closes as `worked`,
+    the room's stays open, the room is told once that they say it is right, and they hear who puts
+    it in front of everyone (`_the_requesters_yes`).
+
+    THE LOOP IS CLOSED HERE, AND ONLY ONCE THE VERDICT COUNTS (#273). `settle_acceptance` used to
+    close it as `worked` before this asked who was speaking, so a refused "funcionou" released
+    nothing and still took the question away from the admin who could have answered it — and the
+    ledger said the release was accepted. It hands a release loop back open now, and this is the
+    one place that closes it: on a "não funcionou", and on a "funcionou" after `may_act` passes.
+
+    THROUGH THE CARD'S DOOR (#448 slice 6, ADR-0055 amended 2026-10-05): a "not yet" that counts is
+    `stage_rejected`, the release is `released` — its act the sealed approval, so a release the job
+    did not take closes nothing and records nothing — and the requester's yes their word does not
+    release is `accepted` at the last gate. Each closes the question through the door's table.
+    `said` is what the person wrote: a "not yet"'s words travel on its transition.
+    """
+    # IMPORTED AT THE TOP OF THIS FUNCTION, never inside the branch that uses them. `may_act` was
+    # imported inside one branch of `_run_intent` earlier today; the client read "algo quebrou do
+    # meu lado" for an UnboundLocalError. The gate is the last thing that may be reached by luck.
+    from beeverforge.product.followup import is_release
+    from beeverforge.product.module import may_act, unauthorized_message
+
+    issue = is_release(loop)
+    if not issue:
+        return None                      # an ordinary delivery acceptance; the caller handles it
+
+    head = f"{agent}: " if agent else ""
+    if verdict != "worked":
+        if ambiguous:
+            # NOR IS A "NOT YET" GUESSED (#448 slice 4): it closes the question it lands on and
+            # sends that card back for another pass, and the newest of two is a guess — nothing
+            # is closed, and the person is asked which one, in the sentence the parser reads
+            listed = _waiting_release_refs(project)
+            which = f" ({', '.join(ref_label(r) for r in listed)})" if listed else ""
+            return head + engine_said("not_yet_ambiguous", language=lang, which=which)
+        # A "NÃO FUNCIONOU" CLOSES THE LOOP from whoever says it, as it did when the module closed
+        # it: it spends nothing, and a release that did not work is not waiting on anybody's yes.
+        # Through the card's door: `stage_rejected`, the words on its record (#448 slice 6)
+        from beeverforge.lifecycle import CardEvent
+
+        _at_the_last_gate(project, loop, CardEvent.STAGE_REJECTED, user=user,
+                          why=" ".join(str(said or "").split())[:280])
+        return head + engine_said("release_declined", language=lang)
+    if ambiguous:
+        # NOTHING was released AND nothing was closed (module.settle_acceptance hands every release
+        # back open — #24 item 2, #273): the question below is still pending, so the reply that
+        # names the ref settles the right loop and releases it. The instruction gives the exact
+        # sentence the parser understands, because "me diga o número" alone used to instruct a
+        # reply no code path could read — an unfollowable instruction from the platform's own
+        # mouth.
+        listed = _waiting_release_refs(project)
+        which = f" ({', '.join(ref_label(r) for r in listed)})" if listed else ""
+        return head + engine_said("release_ambiguous", language=lang, which=which)
+    admin = may_act(project, user, via=via)
+    theirs = not admin and _asked_for(module, issue, user)
+    if not admin and not (theirs and getattr(project, "release_by_requester", False) is True):
+        if theirs:
+            # THEIR YES IS RECORDED, AND THE ROOM'S QUESTION STAYS FOR AN ADMIN (#448 slice 4)
+            return _the_requesters_yes(project, loop, issue, user, head=head, lang=lang)
+        # THE QUESTION STAYS OPEN FOR SOMEBODY WHO MAY ANSWER IT (#273). Nothing has closed the
+        # loop before this line, so it is still waiting — still chased — and an admin's own
+        # "funcionou" lands on it and releases.
+        return unauthorized_message(project)
+    # WHOSE YES IT WAS, IN THE RECORD THE RELEASE LEAVES (#448 slice 4): the requester's own, where
+    # the project lets it count; an admin's after the requester had said it is right; an admin's.
+    whose = ("released_by_requester" if not admin
+             else "released_after_the_requester" if _the_requester_said_right(project, loop)
+             else "released_by_client")
+    # THROUGH THE CARD'S DOOR (#448 slice 6): `released`, whose act is the release — `release()`
+    # re-asks the workflow whether it is still parked and says, honestly, when it was not. Once the
+    # job took it, every copy of the question closes as worked, by the verdict of somebody who may
+    # act (#273).
+    from beeverforge.lifecycle import CardEvent
+
+    def _release() -> str | None:
+        from beeverforge.product.release import release
+
+        ok, why = release(project, issue, approver=user,
+                          comment=engine_said(whose, language=lang))
+        return None if ok else why
+
+    moved = _at_the_last_gate(project, loop, CardEvent.RELEASED, user=user,
+                              facts={"note": ""}, act=_release)
+    if moved.answer is not None:
+        # THE JOB WAS NO LONGER THERE TO TAKE IT, AND THE VERDICT STILL COUNTS (#273): the question
+        # closes as worked whatever the release answered — left open, it would be chased about a
+        # release nobody can make any more. Nothing was released, so the record says what was
+        # said, `accepted` at the last gate, with why nothing went out — never `released`
+        _at_the_last_gate(project, loop, CardEvent.ACCEPTED, user=user,
+                          facts={"unreleased": str(moved.answer)[:280], "note": ""})
+        return f"{head}{moved.answer}"
+    if moved.refused:
+        return f"{head}{moved.refused}"
+    return head + engine_said("releasing", language=lang)
+
+
+def _asked_for(module, issue: str, user: str) -> bool:
+    """Whether `user` is the person `issue`'s card records as having asked for it — the rule
+    another pass is sent back by (`ProductModule.asked_for`: never a guest, never nobody). False
+    for a module that cannot say (an add-on's, a double), and for one that could not read it."""
+    asks = getattr(module, "asked_for", None)
+    if not callable(asks):
+        return False
+    try:
+        return bool(asks(issue, user))
+    except Exception:  # noqa: BLE001 — "could not tell" authorises nobody
+        log.info("could not tell whether %s asked for %s", user, ref_label(issue), exc_info=True)
+        return False
+
+
+def _the_requesters_yes(project, loop, issue: str, user: str, *, head: str, lang) -> str:
+    """THE CARD'S REQUESTER SAYS IT WORKED, AND THE PROJECT DOES NOT LET THEIR WORD RELEASE IT
+    (#448 slice 4, `Project.release_by_requester` off). Their yes is the input the last gate waits
+    for, so it is RECORDED rather than refused: their copy of the question closes as `worked`, the
+    room's stays open for a product admin, the room is told once (`events.tried_and_right`, per
+    card and run), and they hear that it is recorded and who puts it in front of everyone. Before
+    this they read "you cannot approve this" about their own change. Never raises."""
+    from beeverforge.lifecycle import CardEvent
+    from beeverforge.product.voice import requester_said_right
+
+    # THROUGH THE CARD'S DOOR (#448 slice 6): `accepted` at the last gate — their copy closed as
+    # worked and the room told, by the door's table, once per card and run
+    moved = _at_the_last_gate(project, loop, CardEvent.ACCEPTED, user=user,
+                              facts={"who": _name_of(user), "note": ""})
+    told = any(name == "tell:tried" and outcome in ("told", "told already")
+               for name, outcome in moved.effects)
+    from beeverforge.product.module import approvers_of
+
+    return head + requester_said_right(ref=issue, told=told, language=lang,
+                                       approvers=approvers_of(project))
+
+
+def _the_requester_said_right(project, loop) -> bool:
+    """Whether the card's requester said "it worked" to THIS asking of the release — a copy asked
+    in their conversation, opened with the room's in the same round (the same `ts`), closed as
+    `worked` (#448 slice 4). For the record an admin's release leaves. Never raises."""
+    try:
+        from beeverforge.memory import store as loop_store
+        from beeverforge.memory.ledger import ACCEPTANCE, CLOSED, fold
+        from beeverforge.product.followup import is_release
+
+        issue = is_release(loop)
+        return any(x.kind == ACCEPTANCE and is_release(x) == issue and x.ts == loop.ts
+                   and (x.context or {}).get("conversation") and x.state == CLOSED
+                   and x.outcome == "worked"
+                   for x in fold(loop_store.read(getattr(project, "name", "") or "")))
+    except Exception:  # noqa: BLE001 — a plainer record, never a lost release
+        log.info("could not read whether the requester said it was right", exc_info=True)
+        return False
+
+
+def _name_of(user: str) -> str:
+    """The name the platform's people store knows `user` by, or "" — "the person who asked for
+    it" is said then. Never the id itself: an identity provider's key is not a name a room reads.
+    Never raises."""
+    try:
+        from beeverforge.identity.people import PeopleStore
+
+        person = PeopleStore().snapshot().people.get(str(user or ""))
+    except Exception:  # noqa: BLE001 — a vaguer sentence, never a lost one
+        log.info("could not read the people store for a display name — the room hears \"the "
+                 "person who asked for it\"", exc_info=True)
+        return ""
+    display = str(getattr(person, "display", "") or "").strip()
+    return display if display and display != str(user) else ""
+
+
+# ── `_where_it_came_from`, `_also_broke_it_down` and `_breakdown_reply` moved with the executor ──
+#
+# They are the confirmation's own prose: the provenance cell of a decision row, the acceptance's
+# automatic breakdown, and what the client reads afterwards. A breakdown the role proposed starts,
+# on the person's yes, the same breakdown the acceptance does (#563 slice 18b, #565 slice c), and
+# the sentence about what it filed is `confirm.breakdown_told`'s — one voice, whether it was asked
+# for or followed an acceptance. `_refine_reply` followed them when the refine became a yes (#565).
+
+
+def _baseline_reply(project, module, name: str, user: str, on_it=None, *,
+                    conversation: str = "", room: str = "", asked: str = "") -> str:
+    """Somebody asked for the brownfield first pass — a read of the whole codebase written up as
+    OBSERVATIONS for a person to confirm (`brownfield.py`, ADR-0019).
+
+    ANNOUNCED, THEN RUN, OFF THE LISTENER THREAD. It reads an entire repository through an agent
+    and comes back with a pull request: minutes, not seconds. Blocking here would time out the
+    Socket Mode handler and take the channel down for everyone; saying nothing until it finishes
+    is the "looks broken while working" failure this whole layer exists to remove.
+
+    THE RECEIPT IS SAID BEFORE THE PASS STARTS, not inside it (#266 slice 2): a receipt is a reply
+    of THIS turn, and one said from the thread after the turn returned would reach nobody.
+
+    THE OUTCOME COMES BACK THROUGH THE DOOR (ADR-0051 D6, #266 slice 3). It is an asynchronous
+    task the role started and reports back on, so its result is an INTERNAL EVENT on the
+    conversation it was asked in (`door.tell`): recorded in the product's memory, then published
+    to that conversation — never a bare `say` on a channel from this thread, which reached a room
+    the asker may not have been in and left memory without the answer. `conversation` is where it
+    was asked (the project's room when a caller did not say), `asked` the message the outcome
+    answers.
+
+    For a while this replied that the pass was not wired — an honest admission that was better
+    than pretending, and worse than doing it."""
+    from beeverforge.product.module import may_act, unauthorized_message
+    from beeverforge.product.voice import baseline_done, baseline_started
+
+    if not may_act(project, user):
+        return unauthorized_message(project)
+
+    lang = getattr(project, "language", None)
+    where = conversation or getattr(project, "name", "") or ""
+    if on_it:
+        on_it()
+
+    def _run() -> None:
+        try:
+            result = module.baseline()
+            text = baseline_done(ok=result.ok, url=result.url, detail=result.detail,
+                                 existed=result.existed, language=lang, agent_name=name)
+        except Exception as exc:  # noqa: BLE001 — a thread dying silently is the worst outcome
+            log.exception("the baseline pass crashed for %s", getattr(project, "name", "?"))
+            text = baseline_done(ok=False, detail=str(exc)[:200], language=lang, agent_name=name)
+        finally:
+            # the pass may have composed a view of its own after the turn released its one
+            release(module)
+        try:
+            from beeverforge.product import door
+
+            told = door.tell(project, conversation=where, text=text, room=room,
+                             in_reply_to=asked, addressed_to=user)
+        except Exception as exc:  # noqa: BLE001 — the work happened; only the telling failed
+            told = False
+            log.error("the baseline finished but could not be announced (%s) — the pull request "
+                      "may exist and nobody was told", exc)
+        if not told:
+            # the door reports a refusal by returning False, not only by raising — an engine that
+            # is down, a project that lost its product role — and the error above never fires
+            # for it, which is precisely the silence this marker exists to name
+            log.error("BEEVERFORGE_PRODUCT_BASELINE_UNANNOUNCED project=%s — the baseline outcome "
+                      "never "
+                      "reached the conversation; the client is still waiting on a 'done' that "
+                      "was computed and not delivered", getattr(project, "name", "?"))
+
+    threading.Thread(target=_run, daemon=True, name="product-baseline").start()
+    return baseline_started(language=lang, agent_name=name)

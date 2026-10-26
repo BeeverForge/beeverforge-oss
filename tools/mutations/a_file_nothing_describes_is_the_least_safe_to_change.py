@@ -1,0 +1,120 @@
+"""The knowledge gate — the cuts that would read it as "no concept, no objection".
+
+ROW 1 IS THE INVERSION ITSELF: a file nothing describes called clear. Every other row is a way
+of arriving at the same inversion by a side door.
+
+ROWS 2-6 ARE THE VERDICTS: the exemption ignored (every test file dark, and a gate that is always
+dark is switched off); the checker's answer discarded (a moved citation read as holding); a
+recorded unknown never blocking; a placeholder in an example file blocking like a real secret; a
+file the bundle never saw owed a concept it could not have.
+
+ROWS 7-8 ARE THE STANCE: stale read as green; nothing published read as clear.
+
+ROW 9 IS THE MERGE POLICY letting an enforced dark change merge unattended.
+
+ROWS 10-12 ARE THE MACHINE: the station never runs; a dark change under `enforce` is announced
+as ready instead of parked with the question; the body carries no account of the gate.
+
+ROW 13 IS THE CLI'S CHANGE SET dropping untracked files — the reference gate's own warning.
+"""
+
+TEST = "tests/test_a_file_nothing_describes_is_the_least_safe_to_change.py"
+
+MUTATIONS = [
+    # rows 1-6 re-pinned 2026-09-07: the verdict ladder became `_judge_one`, which RETURNS a
+    # verdict per file instead of appending to a list, and the blocking gaps are matched by prefix
+    # before it is called (#65)
+    ("a file nothing describes is clear — 'no concept, no objection'",
+     "beeverforge/knowledge/gate.py",
+     '    return FileVerdict(path, NO_CONCEPT, f"nothing describes this {kind or \'file\'}")',
+     '    return FileVerdict(path, CLEAR, f"nothing describes this {kind or \'file\'}")'),
+
+    ("the coverage table's exemption is ignored, so every test and document is dark",
+     "beeverforge/knowledge/gate.py",
+     "    if kind in excused:\n        return FileVerdict(path, EXEMPT,",
+     "    if False:\n        return FileVerdict(path, EXEMPT,"),
+
+    ("the checker's answer is discarded — a moved citation reads as holding",
+     "beeverforge/knowledge/gate.py",
+     "        if broken:\n            return FileVerdict(path, STALE,",
+     "        if False:\n            return FileVerdict(path, STALE,"),
+
+    ("a recorded unknown never blocks",
+     "beeverforge/knowledge/gate.py",
+     "        row = _judge_one(path, inventory=inventory, blocking=[g for g in about if _blocks(g)],",
+     "        row = _judge_one(path, inventory=inventory, blocking=[],"),
+
+    ("a placeholder in an example file blocks like a real secret",
+     "beeverforge/knowledge/gate.py",
+     '        return (severity or "high") == "high"',
+     "        return True"),
+
+    ("a file the bundle never saw is owed a concept it could not have",
+     "beeverforge/knowledge/gate.py",
+     "    if inventory is not None and not kind:\n        return FileVerdict(path, NEW_FILE,",
+     "    if False:\n        return FileVerdict(path, NEW_FILE,"),
+
+    ("a stale description reads as green",
+     "beeverforge/knowledge/gate.py",
+     "        if STALE in verdicts:\n            return AMBER",
+     "        if STALE in verdicts:\n            return GREEN"),
+
+    ("nothing published reads as clear",
+     "beeverforge/knowledge/gate.py",
+     "        return GateReport(tuple(FileVerdict(p, NO_BUNDLE, _NO_BUNDLE_REASON) for p in paths))",
+     "        return GateReport(tuple(FileVerdict(p, CLEAR, _NO_BUNDLE_REASON) for p in paths))"),
+
+    ("an enforced dark change merges unattended",
+     "beeverforge/orchestrator/merge_policy.py",
+     '    if manifest.okf_gate == "enforce" and result.knowledge_stance in {"amber", "dark"}:',
+     '    if manifest.okf_gate == "enforce" and False:'),
+
+    ("the station never runs",
+     "beeverforge/orchestrator/machine.py",
+     '        mode = getattr(self.manifest, "okf_gate", "advise")\n        if mode == "off":\n            return',
+     '        mode = getattr(self.manifest, "okf_gate", "advise")\n        if True:\n            return'),
+
+    ("a dark change under `enforce` is announced as ready instead of parked with the question",
+     "beeverforge/orchestrator/machine.py",
+     '                if (getattr(self.manifest, "okf_gate", "advise") == "enforce"\n'
+     '                        and result.knowledge_stance == "dark"):',
+     '                if (getattr(self.manifest, "okf_gate", "advise") == "enforce"\n'
+     '                        and False):'),
+
+    ("the pull request carries no account of the gate",
+     "beeverforge/orchestrator/machine.py",
+     "        if result.knowledge_stance:\n            from beeverforge.knowledge.gate import render_gate_lines",
+     "        if False:\n            from beeverforge.knowledge.gate import render_gate_lines"),
+
+    ("the change set drops untracked files — the file it would have blocked is never seen",
+     "beeverforge/knowledge/gate.py",
+     '        out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],',
+     '        out = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],'),
+
+    # ── rows 14-16: a gate that could not SEE the change is not a green gate (#250) ────────────
+    ("a repository git could not read is answered as a change that touched nothing",
+     "beeverforge/knowledge/gate.py",
+     "    if out.returncode != 0:\n        raise GitCannotSay(\n",
+     "    if False:\n        raise GitCannotSay(\n"),
+
+    ("a `git` that could not be RUN at all is answered the same way",
+     "beeverforge/knowledge/gate.py",
+     "    except (OSError, subprocess.SubprocessError) as exc:\n"
+     '        raise GitCannotSay(f"could not run git in {repo} ({exc}) — so what this change '
+     'touches "\n'
+     '                           f"is unknown, and an unread change is not a judged one") '
+     "from exc\n",
+     "    except (OSError, subprocess.SubprocessError):\n"
+     "        return []\n"),
+
+    ("git's own reason is dropped, so an operator cannot tell a missing `.git` from a refused "
+     "ownership", "beeverforge/knowledge/gate.py",
+     "            f\"git could not say what changed in {repo}: {(out.stderr or '').strip()[:200] "
+     "or\n",
+     "            f\"git could not say what changed in {repo}: {'' or\n"),
+
+    ("the CLI swallows it and exits 0 — the green light a CI job branches on", "beeverforge/cli.py",
+     "        except GitCannotSay as exc:\n            typer.echo(f\"✗ {exc}\")\n"
+     "            raise typer.Exit(2) from exc\n",
+     "        except GitCannotSay as exc:\n            typer.echo(f\"✗ {exc}\")\n"),
+]

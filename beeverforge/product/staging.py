@@ -1,0 +1,992 @@
+"""The staged proposal: one draft waiting for a yes, and the rules that make a yes mean it.
+
+MOVED OUT OF THE SLACK PACKAGE (#98 slice 3), unchanged. It was never Slack-specific — its only
+imports are `beeverforge.memory.messages`, `beeverforge.product.voice` and
+`beeverforge.product.role` — and it was
+already reached from a second surface before this move: `api/app.py` calls `answer_staged`, with
+the reach-into-Slack documented there as an explicit exception. This is that exception being
+retired rather than a new capability.
+
+WHAT IT PROTECTS, and why it is more than a dictionary. A draft is staged per conversation with a
+two-hour expiry-on-read, mirrored durably so another PROCESS can resolve it, and confirmed by
+compare-and-swap on the object's identity plus a fingerprint — so a "sim" cannot land on a draft
+that was replaced while somebody was reading it, and two surfaces cannot both confirm the same
+one. Every one of those rules is a defect that already happened.
+
+`product_channel` re-exports every name from here, so the twenty-two test modules that reach
+`pc.remember`, `pc._PENDING`, `pc.proposal_token` and the rest keep working against the same
+objects — `_PENDING` in particular is re-bound by identity, never copied, because tests mutate it
+in place and a copy would silently stop being the dict the code reads.
+
+ONE PROPOSAL PER PERSON PER CONVERSATION (#266 slice 4, ADR-0051 D11). The key was the
+conversation alone, and the last staging won: in a group room a second person's request displaced
+the first person's draft, and ANY admin's "sim" confirmed whatever happened to be staged. A turn
+now stages under `key_for(conversation, person)` — the conversation, and a digest of whoever asked
+— so two people in one room each keep their own draft, and each is found by its own person first
+(`find_waiting`). What a key cannot say, the entry says: `requester` is who asked and
+`conversation` where, and the confirmation is bound to the first (`confirm.confirm`). A key with
+no person — a caller that named nobody, a row staged before this — is found by anyone in its
+conversation, exactly as before, and its requester is read off the fields it always carried.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import threading
+import time
+
+from beeverforge.util.bounded import BoundedDict
+
+log = logging.getLogger("beeverforge.product.staging")
+
+
+_PENDING: dict[str, dict] = {}
+
+#: How long a staged proposal stays confirmable. It never expired, and two things followed. A "sim"
+#: days later confirmed something nobody remembered reading — the same harm the click fingerprint
+#: prevents, arriving by time instead of by replacement. And while ANY proposal was staged the
+#: acceptance path did not run (it is gated on `not waiting`), so a client answering "funcionou"
+#: about a delivery was ignored for as long as a forgotten draft sat there.
+#:
+#: Two hours: long enough for somebody to step away from a conversation and come back to it, short
+#: enough that "confirm this" always refers to something the person can still recall reading.
+PROPOSAL_TTL_SECONDS = 2 * 60 * 60
+_PENDING_LOCK = threading.Lock()
+
+#: What the durable mirror records when a proposal ages out (#274), by nobody: the factory's own
+#: answer, and never one of the two a person gives (`approve`, `reject`), so no reader of either
+#: can take an expiry for a decision. Answering the row is what retires it from
+#: `messages.pending`, the same way a yes or a no does.
+EXPIRED = "expired"
+
+#: How many drafts we keep. A cap, not a policy — an unbounded dict in a long-lived worker is a
+#: leak, and the oldest unconfirmed draft is the least likely to be confirmed.
+_MAX_PENDING = 200
+
+#: THE APPROVAL VOCABULARY LIVES IN `beeverforge/language/assent.py` (#161). What used to be here
+#: — `_YES_TOKENS`/`_YES_CORE` — is the CORE/FILLER pair there, with the reason this file learned
+#: first: a reply is a yes when the WHOLE message is made of catalogued words and at least one of
+#: them asserts, which is how "sim, pode registrar" (the most Brazilian confirmation there is)
+#: counts while "ok mas e o prazo?" does not — `mas` is in no row. The first version here was an
+#: anchored phrase list, and the owner's natural "sim, pode registrar" fell through to the model:
+#: he believed he had confirmed, and nothing was written.
+#: The English "no" is NOT in the word-start list: it is also the Portuguese preposition "no"
+#: ("No sistema de férias…"), so any pt-BR sentence opening with it read as a rejection — and a
+#: rejection DESTROYS the staged proposal before the judge ever sees the sentence. English "no"
+#: still counts, but only as the whole message, where it cannot be a preposition.
+#: The words a rejection may OPEN with, read by the pattern below and by the test that sweeps them.
+NO_OPENERS = ("não", "nao", "nope", "errado", "not quite", "not right")
+#: …and the one that only counts as the whole message.
+NO_ALONE = "no"
+_NO = re.compile(r"^\s*(" + "|".join(map(re.escape, NO_OPENERS)) + r")\b|^\s*"
+                 + re.escape(NO_ALONE) + r"\s*[.,!…]*\s*$", re.IGNORECASE)
+
+#: Proposals that aged out, so the NEXT yes can be told what happened instead of being silently
+#: swallowed. A person who steps away and comes back to type "sim" deserves "that expired, ask me
+#: again" — falling through to the conversational model answered them politely as if nothing had
+#: ever been staged. A BoundedDict, not a hand-rolled cap: one implementation the caller cannot
+#: forget to bound, in a process that never restarts.
+_EXPIRED_TOMBSTONES: BoundedDict[str, float] = BoundedDict(64)
+
+
+#: What joins a conversation to the person a proposal is staged for (`key_for`). The person
+#: travels as a digest (`speaker.sealed`), which never holds this character, so the key reads as
+#: its conversation plus an opaque tail — and a key, a token or a panel row carries no name.
+_PERSON = "~"
+
+
+def key_for(conversation: str, person: str = "") -> str:
+    """Where one person's proposal is staged in one conversation (#266 slice 4) — the conversation
+    alone when there is no person to key it by, which is where every proposal was staged before.
+
+    A DIGEST OF THE PERSON, NEVER THE PERSON. The key is the first half of the proposal's token,
+    and the token travels: onto a button, into the panel's pending list, into the product's write
+    log. A digest keeps each person's proposal apart without writing who they are into any of it."""
+    from beeverforge.product.speaker import sealed
+
+    conversation = str(conversation or "")
+    person = sealed(person)
+    if not conversation or not person:
+        return conversation
+    return f"{conversation}{_PERSON}{person}"
+
+
+def _bare(who: str) -> str:
+    """A chat mention (`<@id>`) or a plain id, as the id."""
+    return str(who or "").strip().strip("<@>").strip()
+
+
+def requester_of(entry: dict | None) -> str:
+    """Who asked for what is staged here — the id their own yes is compared with — or "".
+
+    `requester` is written by every turn that stages (#266 slice 4). An entry staged before it, or
+    by a caller that names nobody, is read off the fields it always carried — a draft's
+    `asked_by`, a fact's `said_by`, a defect's or a card's `reported_by` — which hold a chat
+    mention, so the id is taken out of it. Compared EXACTLY by every reader: the substring match
+    the rejection used to make let `ana` stand for `<@joana>`."""
+    if not entry:
+        return ""
+    who = str(entry.get("requester") or "").strip()
+    if who:
+        return who
+    for key in ("asked_by", "said_by", "reported_by", "actor"):
+        who = _bare(entry.get(key) or "")
+        if who:
+            return who
+    return ""
+
+
+def conversation_of(key: str, entry: dict | None) -> str:
+    """The conversation a proposal staged at `key` belongs to — the key itself for one staged
+    under its conversation alone."""
+    return str((entry or {}).get("conversation") or key or "")
+
+
+def _stem(key: str, person: str) -> str:
+    """The conversation `key` was made from for `person` — the key itself when it is not theirs.
+
+    VERIFIED, NOT PARSED: the tail is cut only when `key_for` gives back exactly this key for what
+    is left and this person, so a conversation whose own name happens to hold the separator is
+    never cut short."""
+    stem, mark, _tail = str(key or "").rpartition(_PERSON)
+    return stem if mark and key_for(stem, person) == key else str(key or "")
+
+
+def is_yes(text: str, *, project=None) -> bool:
+    """The FAST, high-precision path: every word an approval token, at least one a core yes.
+
+    Kept deliberately narrow. It accepts "sim", "sim, pode registrar", "aprovado" — and nothing
+    that needs interpretation. Widening it was tried and abandoned: a first-sentence rule accepted
+    "Sim — registre." (correct) and also "certo — e quem audita isso?" (a question), because no
+    vocabulary list can tell an affirmation from a word that happens to appear in one.
+
+    Anything this does not recognise is not treated as "no". It goes to `judge_confirmation`, where
+    a model reads it — which is the only thing that can, and is why this function no longer has to
+    grow. See ADR-0028.
+
+    THE VOCABULARY MOVED (#161). This file held one of three hand-rolled yes-lists, and the sweep
+    measured them disagreeing: `certo` was CORE here — asserting approval of a proposal that can
+    promote tickets and spend money — while the operator channel allowed it without letting it
+    assert, and the floor's table had audited it out in as many words. The lists are one table now,
+    in `beeverforge/language/assent.py`, and this is the mapping onto it.
+
+    READ WITHOUT THE ROLE'S ADDRESS (#667): "@po sim" is a yes; "@ana sim" is not one to the role.
+    `project` names the role (`addressing.role_names`); without one, its handles alone do.
+    """
+    from beeverforge.language import assent
+    from beeverforge.product.addressing import without_the_roles_address
+
+    return assent.asserts_assent(without_the_roles_address(text, project))
+
+
+def is_no(text: str, *, project=None) -> bool:
+    """A rejection, read without the role's address — see `is_yes` (#667)."""
+    from beeverforge.product.addressing import without_the_roles_address
+
+    return bool(_NO.match(without_the_roles_address(text, project)))
+
+
+def pending_for(thread: str, *, project=None) -> dict | None:
+    """The proposal staged for this conversation, or None — INCLUDING when it aged out.
+
+    Expiry is enforced on READ rather than by a sweeper: there is no clock to hang one on inside a
+    Socket Mode listener, and a stale entry is only ever harmful at the moment somebody acts on it.
+
+    AND THE READ THAT FINDS IT EXPIRED ANSWERS ITS DURABLE ROW (#274), or the expiry is found
+    again on every read after it. See `_answer_expired`.
+
+    THE STORE DECIDES WHENEVER IT CAN BE READ (#452). `_PENDING` is this process's copy and it was
+    believed first. Measured on `main` with two processes on one SQLite store: a card staged on
+    worker A, a "não" and its correction taken on worker B, then the person's "sim" on A — and A
+    FILED THE CARD THE PERSON HAD REFUSED, from its copy, while the correction they had just read
+    sat unconfirmed (the two cards share one token, so the store's check let the copy through).
+    The copy is believed now only as `_believed` says.
+    """
+    stored = _latest_ask(thread, project)
+    with _PENDING_LOCK:
+        entry = _believed(thread, _PENDING.get(thread), stored)
+        if entry is None:
+            # a copy the store says is decided, or replaced, is not kept to be believed later
+            _PENDING.pop(thread, None)
+            return None
+        _PENDING[thread] = entry
+        staged = entry.get("staged_at")
+        if staged is not None and (time.time() - float(staged)) > PROPOSAL_TTL_SECONDS:
+            _PENDING.pop(thread, None)
+            # the tombstone is what lets a late "sim" (or a late click) hear "that expired"
+            # instead of a polite conversational answer to a confirmation of nothing
+            _EXPIRED_TOMBSTONES[thread] = time.time()
+            # …laid on its CONVERSATION too (#266 slice 4): a click carries the key, but a typed
+            # late "sim" is looked up by where it was typed, and a proposal keyed by its person is
+            # found there by whoever read it expired — the notice is owed to that late yes, as it
+            # was when one proposal filled the conversation
+            where = conversation_of(thread, entry)
+            if where != thread:
+                _EXPIRED_TOMBSTONES[where] = time.time()
+            log.info("a staged proposal aged out of thread %s before anybody confirmed it", thread)
+        else:
+            return entry
+    # outside the lock, like every other write to the store here (`remember`, `consume`)
+    _answer_expired(thread, entry, project)
+    _hold_notice(thread, entry, project)
+    return None
+
+
+#: The store could not be asked: no project names one, or it would not answer.
+_UNREAD = object()
+
+
+def _latest_ask(thread: str, project):
+    """The store's latest ask under `thread` and the answer that settled it (None while open) —
+    None when the store holds no ask there, `_UNREAD` when there is no store to ask."""
+    if project is None:
+        return _UNREAD
+    try:
+        from beeverforge.memory import messages as _panel_store
+
+        for row, settled in _panel_store.asked(getattr(project, "name", "") or ""):
+            if row.token.partition("|")[0] == thread:
+                return row, settled
+        return None
+    except Exception:  # noqa: BLE001 — this process's copy is all there is to go on
+        log.info("could not read the durable staging for %s", thread, exc_info=True)
+        return _UNREAD
+
+
+def _believed(thread: str, local: dict | None, stored) -> dict | None:
+    """Which proposal waits under `thread`: this process's copy, the store's, or none (#452).
+
+    THE COPY IS BELIEVED in three cases only — there is no store to ask; the store has no ask
+    under this key (its mirror never landed: the mirror is best-effort); or the copy was staged
+    AFTER the store's latest ask, so its own row is the one that did not land. Otherwise the store
+    says: the copy, when its latest ask is this very staging still open — the copy and not a
+    thawed twin, so `consume`'s compare-and-swap keeps the identity it compares; nothing, when
+    that ask was answered, here or anywhere; and the store's own entry, thawed, when another
+    process staged something since.
+
+    "THIS VERY STAGING" IS ITS MOMENT, NOT ITS TOKEN. Every card a person asks for in one
+    conversation hashes to the same token — a ticket's summary is its kind alone — so a token
+    said "the same" of the card the other worker had just replaced. The moment `remember` stamped
+    on the entry travels in the row's payload, and two stagings never share one.
+
+    "After" is read off two clocks, the copy's moment and the row's. On one host they are one
+    clock; across hosts the skew must stay under the time between two stagings in one
+    conversation, which is at least a turn of the role."""
+    if stored is _UNREAD or stored is None:
+        return local
+    row, settled = stored
+    if local is not None:
+        staged = local.get("staged_at")
+        if staged is not None and staged == _moment(row) and proposal_token(thread,
+                                                                            local) == row.token:
+            return local if settled is None else None
+        if _newer(local, row):
+            return local
+    if settled is not None:
+        return None
+    return _thaw_row(row)
+
+
+def _moment(row) -> float | None:
+    """When the proposal a stored ask carries was staged: the `staged_at` frozen in its payload,
+    or the row's own stamp for a payload that has none."""
+    import json
+
+    from beeverforge.product.waiting import seconds
+
+    try:
+        staged = json.loads(row.payload or "{}").get("staged_at")
+        if staged is not None:
+            return float(staged)
+    except Exception:  # noqa: BLE001 — an unreadable payload is dated by its row
+        log.info("a staged proposal's payload carries no readable moment; dated by its row",
+                 exc_info=True)
+    return seconds(row.ts)
+
+
+def _newer(local: dict, row) -> bool:
+    """Whether this process staged `local` after the store's `row` was staged."""
+    asked_at = _moment(row)
+    staged = local.get("staged_at")
+    return asked_at is not None and staged is not None and float(staged) > asked_at
+
+
+def _thaw_row(row) -> dict | None:
+    """A stored ask's entry, thawed, dated by its own moment (`_moment`) — or None."""
+    if not row.payload:
+        return None
+    entry = _thaw(row.payload)
+    if entry is None:
+        return None
+    staged = _moment(row)
+    if staged is not None:
+        entry["staged_at"] = staged
+    return entry
+
+
+#: The token prefix of the notice a late yes is owed once its proposal aged out (#452), recorded
+#: as a hold (`messages.HELD`) under the key the proposal was staged at, in its conversation.
+EXPIRY_NOTICE = "expired:"
+
+
+def _hold_notice(thread: str, entry: dict, project) -> None:
+    """The notice a late yes is owed, WRITTEN (#452). Never raises.
+
+    THE TOMBSTONE WAS THIS PROCESS'S MEMORY. A read that found the proposal expired — any message
+    in the conversation, a click on the panel — answered its row `expired` and laid the tombstone
+    here; a restart before the late "sim" forgot the tombstone, and the row, already answered, had
+    nothing left to thaw. Measured on `main`: the "sim" went to the role as an ordinary message,
+    which answered it politely while the person believed they had confirmed. The tombstone stays
+    as this process's copy; the store's hold is what any process reads (`_expired_recently`)."""
+    if project is None:
+        return
+    from beeverforge.memory import messages as _panel_store
+
+    if not _panel_store.hold(getattr(project, "name", "") or "", "",
+                             token=f"{EXPIRY_NOTICE}{thread}",
+                             channel=conversation_of(thread, entry)):
+        log.warning("the expiry of the proposal staged in %s was not written — a late yes after a "
+                    "restart will not hear that it expired", thread)
+
+
+def _spend_notices(project, keys: tuple[str, ...], answer: str) -> bool:
+    """Close the written expiry notices owed under any of `keys` — the key a proposal was staged
+    at, or its conversation — and say whether there was one. Never raises."""
+    if project is None:
+        return False
+    wanted = {k for k in keys if k}
+    try:
+        from beeverforge.memory import messages as _panel_store
+
+        name = getattr(project, "name", "") or ""
+        owed = [m.token for m, closed in _panel_store.held(name)
+                if closed is None and m.token.startswith(EXPIRY_NOTICE)
+                and (m.token[len(EXPIRY_NOTICE):] in wanted or m.channel in wanted)]
+        for token in owed:
+            _panel_store.release(name, token=token, answer=answer)
+        return bool(owed)
+    except Exception:  # noqa: BLE001 — this process's tombstones still answer
+        log.info("could not read the written expiry notices for %s", sorted(wanted),
+                 exc_info=True)
+        return False
+
+
+def _answer_expired(thread: str, entry: dict, project) -> None:
+    """The durable row of a proposal that aged out, answered `EXPIRED`. Never raises.
+
+    WITHOUT THIS THE NOTICE WAS SAID FOR EVER (#274). The expiry forgot the proposal in this
+    process and left its row in the store unanswered, so the next read in the conversation (the
+    fallback above, in this process or any other) thawed the same row, found it expired again and
+    laid a fresh tombstone. The notice `_expired_recently` owes to ONE late confirmation was said
+    to every later yes or no, until something new was staged there. Answered, the row leaves
+    `messages.pending`, and the next read finds nothing to thaw.
+
+    ONLY A ROW STILL PENDING. Another surface may have decided the proposal while this process
+    held its own copy (`consume` asks the store for the same reason), and an `expired` written
+    after that decision would make the factory's word the last one on a proposal a person
+    answered; a mirror that was never written has nothing to answer. With no project there is no
+    store to answer in: the next read that names one thaws the row, finds it expired and answers
+    it then."""
+    if project is None:
+        return
+    try:
+        from beeverforge.memory import messages as _panel_store
+
+        name = getattr(project, "name", "") or ""
+        token = proposal_token(thread, entry)
+        if any(q.token == token for q in _panel_store.pending(name)):
+            _panel_store.answer(name, token=token, answer=EXPIRED)
+    except Exception:  # noqa: BLE001 — the expiry stands; its record is best-effort and loud
+        log.warning("the expiry of the proposal staged in %s was not recorded durably — its "
+                    "notice may be said again", thread, exc_info=True)
+
+
+def waiting_in(project, conversation: str, person: str = "", *,
+               now: float | None = None) -> dict | None:
+    """`{token, approve, reject}` of the proposal waiting for `person` in `conversation`, as the
+    DURABLE STORE says it — or None when nothing is (#443). What a page may draw buttons for.
+
+    THE STORE, NEVER `_PENDING`. This process's dictionary is its own copy: the panel thaws a row
+    into it on a read and keeps it, so a proposal answered in the worker by a typed "sim" is still
+    in it here. The store is the one record every process writes — a yes, a no, a click, an
+    expiry all answer the row (`consume`, `_answer_expired`) — so it is the one that can say what
+    is still waiting. A page that kept its own copy drew "Confirm and record" two hours after the
+    person had confirmed by typing, with no question above it.
+
+    THE PROPOSALS OF THE ONE READER OF WHAT WAITS (#452, `waiting.in_conversation`): this person's
+    own key first, then the conversation's bare key (a proposal staged for nobody in particular),
+    each the latest ask the store holds for it. A row older than `PROPOSAL_TTL_SECONDS` is waiting
+    for nothing — its first read answers it `expired` — and is said as None here. A question held
+    for the person's words is not drawn: it has nothing to press. Never raises: an unreadable store
+    is None, because buttons nobody can confirm are the defect this exists to end."""
+    try:
+        from beeverforge.product.voice import confirm_labels
+        from beeverforge.product.waiting import PROPOSAL, in_conversation
+
+        for wait in in_conversation(project, conversation, person, now=now):
+            if wait.kind != PROPOSAL:
+                continue
+            # THE LABELS IT WAS ASKED WITH (`remember` mirrors them), the language's own when a
+            # row predates them
+            default = confirm_labels(language=getattr(project, "language", None))
+            return {"token": wait.token,
+                    "approve": wait.approve if wait.approve not in ("", "Approve") else default[0],
+                    "reject": wait.reject if wait.reject not in ("", "Reject") else default[1]}
+    except Exception:  # noqa: BLE001 — no buttons is the safe reading of a store nobody can read
+        log.info("could not read what waits in %s", conversation, exc_info=True)
+    return None
+
+
+def _reset_for_tests() -> None:
+    """Forget every staged proposal and every tombstone — the suite's isolation, in one place.
+
+    `_PENDING` is keyed by CONVERSATION and nothing else, which is the design: a person confirms
+    in the thread they are typing in, and `find_waiting` even scans by channel so a bare "sim" at
+    channel level finds a proposal staged inside a thread. In a long-lived worker that is right.
+    In a test process it makes every file that holds its conversation in `C1` — twenty-five of
+    them — a writer of the next file's state.
+
+    MEASURED ON CI (2026-09-21, PR #261 run 502, a change that touches none of this):
+    `test_the_chat_s_own_gesture_IS_an_explicit_request` failed `2 == 1`. A proposal an earlier
+    test had staged under `C1` was still there, so `quebra o requisito 12 em tarefas` was first
+    judged as a CONFIRMATION of it — one model call, answered with the breakdown fixture's JSON,
+    logged as an unparseable verdict — and only then broken down. Green on every laptop and on
+    the file run alone, because which leftovers exist depends on the order the suite ran in.
+    Reproduced by staging one entry under `C1` ahead of that test, which fails it identically.
+
+    ONE FUNCTION, for the reason `case._reset_for_tests` gives next door: two globals here now,
+    and a copy of these lines in a conftest drifts the day a third is added."""
+    with _PENDING_LOCK:
+        _PENDING.clear()
+        _EXPIRED_TOMBSTONES.clear()
+
+
+def _expired_recently(*keys: str, project=None) -> bool:
+    """Whether a proposal aged out under any of these keys — consumed on read: the notice is owed
+    to exactly one late confirmation, not to every message for ever after.
+
+    THIS PROCESS'S TOMBSTONE OR THE STORE'S NOTICE (#452), and both are spent by the one reading:
+    the notice written where the expiry was found (`_hold_notice`) is what a restarted or second
+    worker reads, and closing it is what keeps the next yes, in any process, from hearing it
+    again."""
+    hit = False
+    with _PENDING_LOCK:
+        for key in keys:
+            if key and _EXPIRED_TOMBSTONES.pop(key, None) is not None:
+                hit = True
+    told = _spend_notices(project, keys, "told")
+    return hit or told
+
+
+def _freeze(entry: dict) -> str:
+    """The staged entry as JSON a DIFFERENT process can reconstruct (C-33).
+
+    Pydantic models (today: the draft's `ProductAnswer`) are tagged and dumped; everything else
+    in an entry is JSON-native by construction. The freeze must be FAITHFUL, not merely lossless:
+    the proposal token's fingerprint is computed FROM the entry, and the process that answers
+    recomputes it — an unfaithful round trip would make every cross-process answer read as
+    "replaced"."""
+    import json
+
+    from pydantic import BaseModel
+
+    out = {}
+    for key, value in entry.items():
+        if isinstance(value, BaseModel):
+            out[key] = {"__model__": type(value).__name__,
+                        "data": value.model_dump(mode="json")}
+        else:
+            out[key] = value
+    return json.dumps(out, ensure_ascii=False, default=str)
+
+
+#: The models an entry may carry. A NEW model must be registered or `_thaw` refuses the whole
+#: entry — half-loading a proposal and running the half is worse than "gone".
+_ENTRY_MODELS: dict[str, type] = {}
+
+
+def _entry_models() -> dict[str, type]:
+    if not _ENTRY_MODELS:
+        from beeverforge.product.role import ProductAnswer
+
+        _ENTRY_MODELS["ProductAnswer"] = ProductAnswer
+    return _ENTRY_MODELS
+
+
+def _thaw(payload: str) -> dict | None:
+    """The frozen entry back, or None — never a half-loaded one."""
+    import json
+
+    try:
+        raw = json.loads(payload)
+        out = {}
+        for key, value in raw.items():
+            if isinstance(value, dict) and "__model__" in value:
+                model = _entry_models().get(value["__model__"])
+                if model is None:
+                    log.warning("a staged proposal carries an unregistered model %r — refusing "
+                                "to half-load it", value["__model__"])
+                    return None
+                out[key] = model(**value["data"])
+            else:
+                out[key] = value
+        return out
+    except Exception:  # noqa: BLE001 — an unreadable payload is a gone proposal, not a crash
+        log.warning("could not thaw a staged proposal", exc_info=True)
+        return None
+
+
+def remember(thread: str, entry: dict, *, lang=None, project=None, person: str = "") -> str:
+    """Stage `entry`, and RETURN the line that admits what it displaced ("" when nothing was).
+
+    `thread` is the KEY it is staged under — `key_for(conversation, person)` from a turn, which is
+    what keeps two people's proposals in one room apart (#266 slice 4). `person` is who asked,
+    written onto the entry as `requester` — the key holds them only as a digest, and the
+    confirmation compares the requester's own id — together with the `conversation` the key
+    belongs to.
+
+    THE NOTICE LIVES HERE BECAUSE FOUR CALLERS HAD TO REMEMBER IT AND TWO DID NOT. `_PENDING` holds
+    one entry per key, last wins — that is the design — but only the fact and defect sites
+    announced the eviction. A requirement draft or a queue proposal therefore threw away a pending
+    defect in silence: the client had been told "vou registrar como problema", nobody took it back,
+    and the next "sim" recorded something else entirely. Since the key carries the person, what a
+    staging displaces is only ever that same person's own earlier proposal.
+
+    Two callers learning a lesson and two not is the shape this codebase keeps paying for (see
+    `final_text` and `BoundedDict`). Returning the notice from the one place that can know about the
+    eviction, plus a guard that fails when a caller drops the return value, is what makes it
+    structural instead of a habit.
+
+    THE SECOND NOTICE RIDES THE SAME RETURN (#266 slice 3): when something close to this is staged
+    in ANOTHER conversation, the line that says so without a name (`_sequenced`) — every staging
+    site says it because every staging site already says what this returns.
+    """
+    entry = {**entry, "staged_at": time.time()}
+    if person:
+        entry["requester"] = str(person)
+        entry["conversation"] = _stem(thread, person)
+    where = conversation_of(thread, entry)
+    # THE PRODUCT'S WRITE SEQUENCE (ADR-0051 D8, #266 slice 3). The entry keeps the sequence of the
+    # check it was drafted from — a caller that ran one says so in `seq`; any other is checked now
+    # — so its confirmation, up to two hours later, re-checks only what arrived after that. Staging
+    # bumps the sequence, and finds the same thing staged in another conversation, anonymously.
+    twins = ""
+    if project is not None:
+        twins = _sequenced(project, thread, entry, lang=lang)
+    displaced = None
+    with _PENDING_LOCK:
+        previous = _PENDING.get(thread)
+        if previous is not None and previous.get("kind") != entry.get("kind"):
+            displaced = previous
+        if thread not in _PENDING and len(_PENDING) >= _MAX_PENDING:
+            _PENDING.pop(next(iter(_PENDING)), None)
+        _PENDING[thread] = entry
+        # a fresh proposal supersedes the memory of an expired one: the next "sim" means THIS
+        # text, and must not be answered with "that expired"
+        _EXPIRED_TOMBSTONES.pop(thread, None)
+        _EXPIRED_TOMBSTONES.pop(where, None)
+    # THE CASE MOVES WITH THE STAGING (#33 hole 7): the intake this draft came from is proposed,
+    # and the one it displaced goes back to collecting with its facts kept — the REQUESTER's
+    # intake in the entry's conversation, which the case reads off the entry (#266 slice 4).
+    from beeverforge.product import case as _case
+    _case.hook("proposed", project, thread, entry, displaced=displaced)
+    # THE DURABLE MIRROR (C-33, #70). `_PENDING` is this process's memory, and the panel is a
+    # DIFFERENT service: without this row every panel answer found "gone" — the wiring that
+    # looked done in one process and was reverted for exactly that. Best-effort, keyed by the
+    # same `key|fingerprint` token the click carries; the panel's pending list dedups by key,
+    # so a restaged proposal supersedes its predecessor there too.
+    if project is not None:
+        try:
+            from beeverforge.memory import messages as _panel_store
+            from beeverforge.product.voice import confirm_labels
+
+            approve, reject = confirm_labels(language=lang)
+            _panel_store.ask(getattr(project, "name", "") or "",
+                             _proposal_summary(entry, language=lang)
+                             or _labels(lang)["waiting"],
+                             token=proposal_token(thread, entry), approve=approve, reject=reject,
+                             channel=where, payload=_freeze(entry))
+        except Exception:  # noqa: BLE001 — the mirror is additive; the staging is not
+            log.info("could not mirror the staged proposal onto the panel", exc_info=True)
+        # …AND THE WRITTEN NOTICE WITH THE TOMBSTONE (#452): another process must not tell this
+        # proposal's yes that an older one expired
+        _spend_notices(project, (thread, where), "superseded")
+    if displaced is None:
+        return twins
+    from beeverforge.product.voice import _pick
+    return _pick({
+        "pt-BR": "(Deixei de lado o que estava aguardando confirmação nesta conversa — se ainda "
+                 "quiser aquilo, me peça de novo depois.)\n\n",
+        "en": "(I set aside what was awaiting confirmation in this thread — if you still want "
+              "it, ask me again afterwards.)\n\n",
+    }, lang) + twins
+
+
+def _what(entry: dict) -> str:
+    """What a staged entry IS, in the words a twin of it would share: the draft's title, the
+    card's, the defect as restated, the term — the kinds that become new work. The others act on
+    something that already exists, and their number says what."""
+    answer = entry.get("answer")
+    draft = getattr(answer, "draft", None) if answer is not None else None
+    if draft is not None:
+        return str(getattr(draft, "title", "") or "")
+    for key in ("title", "restated", "term", "decision"):
+        if entry.get(key):
+            return str(entry[key])
+    number = entry.get("number")
+    return f"REQ-{int(number):04d}" if isinstance(number, int) and number else ""
+
+
+def _sequenced(project, thread: str, entry: dict, *, lang=None) -> str:
+    """The staging, into the product's write sequence — and the anonymous notice when the same
+    thing is staged in another conversation ("" when it is not, or when that could not be told).
+
+    AN UNCONFIRMED DRAFT IS NOBODY'S YET (D9): the twin is reported and this one is staged anyway.
+    Which of the two becomes work is settled at the first confirmation, through the semaphore; the
+    second finds it saved and is linked to it. NO NAME AND NO CONTENT of the other conversation's
+    draft reaches this one — only that something close was asked for, and when."""
+    from beeverforge.product import semaphore
+
+    try:
+        if entry.get("seq") is None:
+            entry["seq"] = semaphore.sequence(project)
+        kind = str(entry.get("kind") or ("draft" if "answer" in entry else ""))
+        twins = semaphore.stage(project, kind=kind, text=_what(entry), conversation=thread,
+                                token=proposal_token(thread, entry))
+    except Exception:  # noqa: BLE001 — the staging is not the sequence; the draft stages anyway
+        log.warning("could not put a staged proposal into the product's write sequence",
+                    exc_info=True)
+        return ""
+    if not twins or kind not in semaphore.NEW_WORK:
+        return ""
+    from beeverforge.product.voice import asked_close_to_this
+
+    return asked_close_to_this(language=lang)
+
+
+def forget(thread: str) -> dict | None:
+    """Throw away whatever is staged here, whatever it is. NOT a confirmation path — `consume` is.
+
+    A pop by key alone cannot be part of performing a yes: between reading a proposal and acting on
+    it this handler makes network calls, and by the time the pop runs the key may hold something
+    else entirely. This is the primitive for "drop it regardless" (a test cleaning up, a caller that
+    has nothing to compare against); a guard in test_confirmation_by_click keeps it out of the
+    production paths, because the difference is invisible at the call site and irreversible after.
+    """
+    with _PENDING_LOCK:
+        gone = _PENDING.pop(thread, None)
+    if gone is not None:
+        from beeverforge.product import case as _case
+        _case.hook("forgotten", None, thread, gone)
+    return gone
+
+
+def consume(key: str, verified: dict | None, *, fingerprint: str = "",
+            project=None, by: str = "", approved: bool = True) -> dict | None:
+    """Pop `key` ONLY IF what is staged there is still `verified` — otherwise nothing, and None.
+
+    THE ACT THAT RUNS MUST BE THE ACT THAT WAS CONFIRMED, and until this existed the two were read
+    at different moments with the network in between. `_handle` reads the staged entry once, picks
+    its branch and judges the sentence against THAT entry; then comes the receipt (a
+    chat.postMessage, on every confirmed write) and, for anything but a bare "sim", the judge (a
+    model call, seconds). Socket Mode dispatches with concurrency=10, so a second message in the
+    same conversation runs in parallel and can replace the staged proposal inside that window. The
+    pop then took whatever was under the key: staged "fecha o #511", answered "sim", and #999 —
+    which nobody confirmed — was closed on the client's board, in the client's name.
+
+    A compare-and-swap on the way out is what makes the two atomic. Identity, not equality: every
+    `remember` stores a fresh dict, so the object under the key IS the proposal's identity, and a
+    replacement can never impersonate it.
+
+    THE FINGERPRINT IS FOR THE CLICK PATH, which verifies somewhere this cannot see. A button is
+    checked against `pending_for(key)` and then delegates to `handle`, which re-reads — so if the
+    replacement landed BEFORE that re-read, identity holds against the wrong entry and only the
+    fingerprint the button was posted for still points at the proposal the person actually read.
+    A check two round-trips before the act is not a check unless it travels to the act.
+    """
+    if not key or verified is None:
+        return None
+    # THE OTHER SURFACE MAY HAVE DECIDED FIRST (C-33). The panel resolves through the durable
+    # store and cannot pop THIS process's dict — so before honouring a local hit, ask the store
+    # whether this token was already answered. Without it, a panel approve followed by a Slack
+    # "sim" runs the act TWICE, each surface convinced it decided.
+    if project is not None:
+        try:
+            from beeverforge.memory import messages as _panel_store
+
+            token = proposal_token(key, verified)
+            if _panel_store.answer_of(getattr(project, "name", "") or "", token) is not None:
+                log.warning("BEEVERFORGE_PRODUCT_ALREADY_DECIDED key=%s — this proposal was "
+                            "answered on "
+                            "another surface; nothing was performed", key)
+                with _PENDING_LOCK:
+                    if _PENDING.get(key) is verified:
+                        _PENDING.pop(key, None)
+                return None
+        except Exception:  # noqa: BLE001 — an unreadable store must not block a local decision
+            log.info("could not check the durable store before consuming", exc_info=True)
+    with _PENDING_LOCK:
+        current = _PENDING.get(key)
+        if current is None and project is not None:
+            # THIS process never staged it (the panel's process, or a restarted worker) — OR the
+            # other consumer just popped it. Only the durable store can tell the two apart: a
+            # cross-process staging still has its PENDING row; a lost race has nothing. Trusting
+            # the caller's entry without asking would turn every lost race into the double-write
+            # this function exists to prevent.
+            token = proposal_token(key, verified)
+            try:
+                from beeverforge.memory import messages as _panel_store
+
+                still_staged = any(
+                    p.token == token
+                    for p in _panel_store.pending(getattr(project, "name", "") or ""))
+            except Exception:  # noqa: BLE001 — an unreadable store cannot vouch for the staging
+                log.info("could not check the durable store for the staged row", exc_info=True)
+                still_staged = False
+            if not still_staged:
+                return None
+            current = verified
+        elif current is None:
+            return None
+        if current is not verified or (
+                fingerprint and proposal_token(key, current).split("|", 1)[1] != fingerprint):
+            log.warning("BEEVERFORGE_PRODUCT_CONFIRMATION_RACED key=%s — the staged proposal "
+                        "changed "
+                        "between being read and being written from; nothing was performed", key)
+            return None
+        _PENDING.pop(key, None)
+    # NO LONGER A DRAFT WAITING IN ITS CONVERSATION (#266 slice 3): another conversation asking
+    # for the same thing must stop hearing that something close is staged, and the write this
+    # answer leads to bumps the sequence on its own
+    if project is not None:
+        try:
+            from beeverforge.product import semaphore
+
+            semaphore.close(project, proposal_token(key, verified))
+        except Exception:  # noqa: BLE001 — the answer stands; only the notice may linger to its TTL
+            log.info("could not close the staged proposal in the product's write log",
+                     exc_info=True)
+    # the durable record of the decision — what clears the panel's pending list and what the
+    # cross-process guard above reads
+    # THE CASE MOVES WITH THE ANSWER (#33 hole 7): confirmed on a yes, dropped on a no.
+    from beeverforge.product import case as _case
+    _case.hook("confirmed" if approved else "rejected", project, key, verified)
+    if project is not None:
+        try:
+            from beeverforge.memory import messages as _panel_store
+
+            _panel_store.answer(getattr(project, "name", "") or "",
+                                token=proposal_token(key, verified),
+                                answer="approve" if approved else "reject", by=by)
+        except Exception:  # noqa: BLE001 — the act happened; the record is best-effort and loud
+            log.warning("the decision on %s was performed but not recorded durably", key,
+                        exc_info=True)
+    return verified
+
+
+def find_waiting(thread: str, channel: str = "", *, project=None,
+                 person: str = "") -> tuple[str | None, dict | None]:
+    """The staged proposal this confirmation can mean, WITH the key it is staged under.
+
+    A person confirms wherever they happen to be typing: inside the thread the proposal was shown
+    in, or back at channel level. The first two lookups cover "staged where I am typing"; the scan
+    covers the case they do not — a proposal staged inside a thread, answered with a bare channel
+    message. Entries record their channel precisely so this direction is findable; without it the
+    bare "sim" fell through to the conversational model, which answered politely and wrote NOTHING.
+
+    Returning the KEY is what lets the caller consume exactly what it read. The old shape
+    (`forget(thread) or forget(channel) or waiting`) re-supplied an already-consumed entry from the
+    closure — two concurrent confirmations of one proposal became two writes.
+
+    THE SPEAKER'S OWN FIRST (#266 slice 4). Each person's proposal is staged under a key of their
+    own (`key_for`), so `person`'s "sim" looks for THEIR proposal first — where they are typing,
+    at channel level, then in the room's other threads — then for one staged under the
+    conversation alone, and only then for anybody else's, newest first. Somebody else's is still
+    returned: the gate refuses it OUT LOUD unless the product lets an admin accept on the
+    requester's behalf (`confirm.confirm`), and an admin's "não" may still throw it away. A
+    proposal that is not found cannot be refused, and a "sim" the model answers politely as if
+    nothing were staged is the silence this function exists to remove.
+    """
+    rooms = [k for k in dict.fromkeys((thread, channel)) if k]
+    tried: set[str] = set()
+    if person:
+        for where in rooms:
+            key = key_for(where, person)
+            tried.add(key)
+            entry = pending_for(key, project=project)
+            if entry is not None:
+                return key, entry
+    for where in rooms:
+        tried.add(where)
+        entry = pending_for(where, project=project)
+        if entry is not None:
+            return where, entry
+    # the scan runs for the BARE message too (where thread == channel): that is precisely the
+    # person answering "sim" at channel level about a proposal shown inside a thread — and, in a
+    # room, every other person's proposal staged in this conversation under a key of their own
+    staged = [(k, e) for k, e in _staged_here(thread, channel, project) if k not in tried]
+    own = [kv for kv in staged if person and requester_of(kv[1]) == person]
+    # newest first within each: with several proposals waiting, a bare confirmation means the one
+    # most recently put in front of the person
+    for key, _ in [*own, *[kv for kv in staged if kv not in own]]:
+        entry = pending_for(key, project=project)  # re-read under the TTL check
+        if entry is not None:
+            return key, entry
+    return None, None
+
+
+def _staged_here(thread: str, channel: str, project) -> list[tuple[str, dict]]:
+    """Every proposal staged in this conversation or in its room, under any key, newest first —
+    this process's, and the durable store's, which holds what another process (or this one before
+    a restart) staged."""
+
+    def here(key: str, entry: dict) -> bool:
+        return ((bool(channel) and entry.get("channel") == channel)
+                or conversation_of(key, entry) == thread)
+
+    with _PENDING_LOCK:
+        found = {k: e for k, e in _PENDING.items() if here(k, e)}
+    for key, entry in _stored(project):
+        if key not in found and here(key, entry):
+            found[key] = entry
+    return sorted(found.items(), key=lambda kv: kv[1].get("staged_at") or 0, reverse=True)
+
+
+def _stored(project) -> list[tuple[str, dict]]:
+    """The durable store's staged proposals, as `(key, entry)` — [] for none, and for a store
+    that cannot be read (said): the scan is additive, and a local miss stays a miss."""
+    if project is None:
+        return []
+    try:
+        from beeverforge.memory import messages as _panel_store
+
+        out = []
+        for q in _panel_store.pending(getattr(project, "name", "") or ""):
+            if "|" not in (q.token or "") or not q.payload:
+                continue
+            entry = _thaw(q.payload)
+            if entry is not None:
+                out.append((q.token.partition("|")[0], entry))
+        return out
+    except Exception:  # noqa: BLE001 — the scan is additive; the lookups before it stand
+        log.info("could not read the durable staging to look for proposals here", exc_info=True)
+        return []
+
+
+#: THE LABELS OF A PROPOSAL'S SUMMARY, per language (#429). THE FINGERPRINT READS THE pt-BR ONES,
+#: ALWAYS: `proposal_token` hashes the summary, and a button posted in one language must approve
+#: the same proposal a click reads back in any other — so only the summary a PERSON reads (the
+#: panel's mirror) is asked for in the conversation's language.
+_SUMMARY_LABELS = {
+    "pt-BR": {
+        "kind": "tipo", "requirement_kind": "requisito", "title": "título", "number": "número",
+        "in_favour_of": "em favor de", "requirement": "requisito", "reason": "motivo",
+        "term": "termo", "decision": "decisão", "text": "texto", "new_title": "novo título",
+        "items": "itens", "content": "conteúdo", "criteria": "critérios",
+        "instruction": "instrução", "head": "versão experimentada", "linked": "ligado a",
+        "waiting": "proposta aguardando confirmação",
+    },
+    "en": {
+        "kind": "kind", "requirement_kind": "requirement", "title": "title", "number": "number",
+        "in_favour_of": "in favour of", "requirement": "requirement", "reason": "reason",
+        "term": "term", "decision": "decision", "text": "text", "new_title": "new title",
+        "items": "items", "content": "content", "criteria": "criteria",
+        "instruction": "instruction", "head": "version tried", "linked": "linked to",
+        "waiting": "proposal waiting for confirmation",
+    },
+}
+
+
+def _labels(language: str | None) -> dict:
+    from beeverforge.product.voice import _pick
+
+    return _pick(_SUMMARY_LABELS, language)
+
+
+def _proposal_summary(entry: dict, *, language: str = "pt-BR") -> str:
+    """What is on the table, in one blob for the judge. Only what a staged entry actually holds —
+    a summary that invents fields would have the model approving something nobody drafted."""
+    said = _labels(language)
+    kind = entry.get("kind", said["requirement_kind"])
+    answer = entry.get("answer")
+    draft = getattr(answer, "draft", None) if answer is not None else None
+    parts = [f"{said['kind']}: {kind}"]
+    # `número` is load-bearing for the FINGERPRINT, not just the judge: an accept entry holds
+    # nothing but its kind and number, so without it every staged accept hashed identically and a
+    # stale button for requirement 3 would have approved whatever accept came to be staged later.
+    # A CARD'S ENTRY HOLDS ITS TITLE AND ITS RENDERED CARD AT THE TOP, with no `answer` (#475):
+    # read only from the draft, every card proposal in a conversation summarised to its kind and
+    # shared one fingerprint, so a button posted for one card filed whichever was staged later
+    for label, value in ((said["title"], getattr(draft, "title", "") or entry.get("title", "")),
+                         (said["number"], entry.get("number", "") or ""),
+                         # WHAT THE NUMBER ALONE DOES NOT DISTINGUISH. Two closes of the same card
+                         # in favour of different cards — or two alignments of one card to
+                         # different requirements — are different decisions that hash identically
+                         # without these, so a button posted for one would perform the other. The
+                         # second half of the act is as load-bearing as the first.
+                         (said["in_favour_of"], entry.get("in_favour_of", "") or ""),
+                         (said["requirement"], entry.get("requirement", "") or ""),
+                         # the reason travels onto the client's card in their name, so two closes
+                         # (or two drops) of one number with different reasons are different acts
+                         # and must not share a button
+                         (said["reason"], entry.get("reason", "") or ""),
+                         (said["term"], entry.get("term", "")),
+                         # THE SENTENCE ITSELF, and it is load-bearing for exactly the reason the
+                         # two lines above are: two decisions recorded against one requirement are
+                         # different acts that would hash identically without it, so the button
+                         # posted for the first would write the second — into a register whose
+                         # entire value is that nobody edits it afterwards.
+                         (said["decision"], entry.get("decision", "") or ""),
+                         (said["text"], entry.get("body", "") or entry.get("restated", "")
+                          or entry.get("text", "") or entry.get("described", "")),
+                         # a correction of one card to two different titles is two decisions
+                         (said["new_title"], entry.get("new_title", "") or ""),
+                         (said["items"], ", ".join(str(n) for n in entry.get("numbers", [])
+                                                   or []))):
+        if value:
+            parts.append(f"{label}: {value}")
+    body = getattr(draft, "body", "") or getattr(draft, "statement", "")
+    if body:
+        parts.append(f"{said['content']}: {str(body)[:800]}")
+    elif entry.get("card"):
+        # the card as the person was shown it, criteria included — long enough that two cards
+        # differing only in a criterion near the end still read as two
+        parts.append(f"{said['content']}: {str(entry['card'])[:4000]}")
+    # the criteria distinguish two drafts that share a title — a redraft after a correction must
+    # not be approvable by the button posted for its predecessor
+    criteria = list(getattr(draft, "must_be_true", None) or [])
+    if criteria:
+        parts.append(f"{said['criteria']}: " + "; ".join(str(c) for c in criteria[:8]))
+    # ANOTHER PASS IS ITS WORDS AND ITS BAR (#448): two passes asked of one card with different
+    # instructions, or different criteria, are different acts — the button posted for one must not
+    # send the other. EVERY criterion, not the first eight: the one left out is the one that moved.
+    if entry.get("instruction"):
+        parts.append(f"{said['instruction']}: {entry['instruction']}")
+    if entry.get("criteria"):
+        parts.append(f"{said['criteria']}: " + "; ".join(str(c) for c in entry["criteria"]))
+    # A YES IS TO THE HEAD IT WAS STAGED FOR (#448 slice 3): two acceptances of one card staged
+    # over two builds of its preview are different acts — the button posted for the first must not
+    # record the second
+    if entry.get("head"):
+        parts.append(f"{said['head']}: {entry['head']}")
+    # A DEFECT IS LINKED TO THE CARDS IT WAS REPORTED AGAINST (#448 slice 5): "it did not work"
+    # said of two deliveries is two reports with the same words — the button posted for one must
+    # not file the other
+    if entry.get("linked"):
+        parts.append(f"{said['linked']}: {entry['linked']}")
+    return "\n".join(parts)
+
+
+def proposal_token(key: str, entry: dict) -> str:
+    """What a confirmation button carries back: WHICH conversation and WHICH proposal.
+
+    The fingerprint is the point. Without it a button posted for one proposal would approve whatever
+    is staged under that key at click time — and a proposal CAN be replaced between being shown and
+    being clicked (`remember` returns the notice for it). Somebody would then have approved
+    which is the exact harm the confirmation gate exists to prevent.
+    """
+    from hashlib import blake2b
+
+    fingerprint = blake2b(_proposal_summary(entry).encode(), digest_size=6).hexdigest()
+    return f"{key}|{fingerprint}"

@@ -1,0 +1,779 @@
+"""Reading the deployment, assembling the pack, and the tarball (#356).
+
+THREE STEPS, AND ONLY THE FIRST TOUCHES THE MACHINE. `gather` reads what the platform already knows
+about itself — the registry, the manifests it reads to run a job, the box proofs, the doctor, the
+preflight, the environment and the secrets file's mode — and asks each project's forge row three
+read-only questions (#356): what protects the branch it merges into, what its credential is
+granted, and which releases of the platform are published — into a `controls.Reading`.
+`assemble` turns a reading into the pack's files with every identifier replaced and every
+credential, address and path dropped, and refuses to hand back a pack in which anything survived.
+`write` puts the files in a tarball. A test drives the second and third with no registry, no
+Docker and no network.
+
+WHAT IS NEVER READ: ticket titles and bodies, pull request bodies, commit messages, diffs, and any
+file inside a customer repository other than the manifest the platform already loads. The box
+proof's advisory messages, which can quote a gate's output, are left out of the pack by name.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import logging
+import os
+import secrets as _secrets
+import subprocess
+import tarfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from beeverforge.certify import controls as c
+from beeverforge.certify.redact import CATEGORIES, Redactor, holds_a_credential, what_a_name_carries
+from beeverforge.certify.schema import PACK_SCHEMA, validate
+
+log = logging.getLogger("beeverforge.certify")
+
+#: The window the outcome aggregates cover.
+DEFAULT_WINDOW_DAYS = 90
+
+#: Why `pack.json` says `"signature": null`, in the pack's own words.
+UNSIGNED_BECAUSE = ("minisign signing is not built yet: this pack carries no pack.sig, so nothing "
+                    "in it is attested by the partner's key")
+
+#: Why `outcomes` says `not_measured` when nothing was bound to read them — never zeros, which
+#: would read as a deployment that did nothing.
+OUTCOMES_UNREAD = ("the outcome aggregates were not read for this pack: nothing bound the "
+                   "deployment's journals and metrics store to it")
+
+#: The file that lists the SHA-256 of every other file in the pack, in `sha256sum`'s own format.
+SUMS_FILE = "SHA256SUMS"
+
+#: What a reader must not look for in this pack, said in the pack.
+NOT_YET = (
+    "a signature: minisign signing is not built yet, so there is no pack.sig",
+    "every outcome aggregate that could not be read: each is null in `outcomes`, with its "
+    "reason in `outcomes.not_measured`",
+    "the env check and conformance diagnostics",
+)
+
+#: Registry option keys whose values name an organisation, a repository or a person.
+_ORGANISATION_OPTIONS = ("board_owner", "organization", "org", "project", "team")
+_REPOSITORY_OPTIONS = ("project_key",)
+_PERSON_OPTIONS = ("email",)
+
+
+class Unsafe(RuntimeError):
+    """The pack would carry something it must not — a defect in certify, never a deployment's
+    fault. Nothing is written."""
+
+
+# ── 1. reading the deployment ───────────────────────────────────────────────────────────────────
+
+def gather(*, cwd: Path | None = None) -> c.Reading:
+    """Everything the controls and the redactor need, read once, from where certify runs.
+
+    The environment is the process's over the env file's rows (`preflight`'s reading): on the
+    compose host the deployment's settings live in `.env.compose`, inside the worker they are its
+    environment, and on the one-machine deployment the CLI has already loaded
+    `~/.beeverforge/env`."""
+    from beeverforge import __version__, approvals, namespace, preflight
+    from beeverforge.identity.registry import identity_kind
+    from beeverforge.policy import protected
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.temporal.io import DEFAULT_SANDBOX
+
+    here = cwd or Path.cwd()
+    env = {**preflight._env_file_rows(str(here / ".env.compose")), **os.environ}
+    build = namespace.build_stamp()
+    rows = [p for p in ProjectRegistry().list() if p.enabled]
+    sandbox = (env.get("BEEVERFORGE_SANDBOX") or "").strip().lower() or DEFAULT_SANDBOX
+
+    quieted = logging.getLogger("beeverforge")
+    was = quieted.level
+    quieted.setLevel(logging.ERROR)
+    try:
+        forges = [_forge_of(p) for p in rows]
+        projects = [_project(p, build, forge) for p, forge in zip(rows, forges, strict=True)]
+        releases = _releases(forges)
+        try:
+            before = preflight.check(preflight.probes_for_this_machine()).as_document()
+            before_error = ""
+        except Exception as exc:  # noqa: BLE001 — a diagnostic that could not run is stated
+            before, before_error = None, str(exc)
+    finally:
+        quieted.setLevel(was)
+    try:
+        approvers: list[str] | None = approvals.list_approvers()
+    except Exception as exc:  # noqa: BLE001 — an unreadable store is `unknown`, never empty
+        log.info("the approver store could not be read (%s)", str(exc)[:160])
+        approvers = None
+
+    reading = c.Reading(
+        version=__version__, build=build, env=env, env_file=_env_file(here), sandbox=sandbox,
+        identity=identity_kind(env), providers=_providers(rows, env, sandbox), projects=projects,
+        floor_protected=protected.floor_protected_paths(), approvers=approvers,
+        preflight=before, preflight_error=before_error, releases=releases)
+    reading.identifiers = _identifiers(rows, projects, approvers or [], env)
+    reading.secrets = _secret_values(rows, env)
+    reading.variables = _variable_names(rows)
+    reading.outcomes = _outcomes_of([p.name for p in rows])
+    return reading
+
+
+def _outcomes_of(names: list[str]):
+    """The outcome aggregates' reader for these projects, read as one deployment — asked by
+    `assemble` over the pack's window, because the window is the pack's to decide (#356)."""
+    def read(since, until) -> dict:
+        from beeverforge.observability.query import outcomes
+
+        return outcomes(names, since, until)
+    return read
+
+
+def _project(project, build: tuple[str, str], forge=None) -> c.ProjectReading:
+    from beeverforge import box_prove, doctor
+    from beeverforge.adapters.forge.base import ci_write_permissions_of, credential_permissions_of
+
+    box = getattr(project, "box", None)
+    credential, mints = _forge_credential(project)
+    reading = c.ProjectReading(
+        name=project.name, forge_credential=credential, forge_mints=mints,
+        box_env_declared=box is not None and "env" in box.model_fields_set,
+        box_env_names=len(box.env) if box is not None else 0)
+    reading.repositories.append(_repository(project, "", default=True))
+    for repo in _foreign_repositories(project, box_prove._proof_dir()):
+        reading.repositories.append(_repository(project, repo, default=False))
+    if forge is not None:
+        reading.permissions = credential_permissions_of(forge)
+        reading.ci_permissions = ci_write_permissions_of(forge)
+        for repo in reading.repositories:
+            repo.protection = _protection(forge, repo)
+    try:
+        report = doctor.diagnose(doctor.probes_for(project))
+        reading.doctor = doctor.as_document(report, project=project.name, build=build)
+    except Exception as exc:  # noqa: BLE001 — a doctor that could not run is `unknown`
+        reading.doctor_error = str(exc)
+    return reading
+
+
+def _forge_of(project):
+    """The project's forge row, holding the credential a JOB of the project would hold — the
+    worker's resolution: the project's stored value, else the deployment's provider for the
+    vendor (`credentials.deployment_forge_provider`). None when it cannot be built; every read
+    through it is then `unknown`.
+
+    THE READS ARE A JOB'S READS, NOT THE DOCTOR'S. The doctor asks with the static token only,
+    because a diagnostic that mints spends; a certificate is about the credential a job HOLDS, so
+    it asks with that one. The App's permissions are read without a mint (signed with the App's
+    own key); a branch's protection on a private repository needs a token, and one is minted."""
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import deployment_forge_provider, forge_token_for
+
+    try:
+        token = forge_token_for(project)
+        return build_forge(project, token=token,
+                           token_provider=None if token else deployment_forge_provider(project))
+    except Exception as exc:  # noqa: BLE001 — a forge that cannot be built answers `unknown`
+        log.info("the forge of %s could not be built (%s)", project.name, str(exc)[:160])
+        return None
+
+
+def _protection(forge, repo: c.RepositoryReading):
+    """What protects the branch `repo`'s manifest merges into, or None when the manifest is
+    unread (there is no branch to ask about) or the forge could not say."""
+    from beeverforge.adapters.forge.base import branch_protection_of
+
+    branch = getattr(repo.manifest, "base_branch", "") if repo.manifest is not None else ""
+    if not branch:
+        return None
+    return branch_protection_of(forge, branch, repo="" if repo.default else repo.identity)
+
+
+def releases_home() -> str:
+    """Where the platform publishes its releases: the `Repository` URL of the installed
+    package's own metadata (`pyproject.toml`'s `urls`), or `""` when the installation has none.
+    ONE HOME, the one the wheel already carries — never a second copy of the address in code."""
+    from importlib.metadata import PackageNotFoundError, metadata
+
+    try:
+        entries = metadata("beeverforge").get_all("Project-URL") or []
+    except PackageNotFoundError:
+        return ""
+    for entry in entries:
+        label, _, url = str(entry).partition(",")
+        if label.strip().lower() == "repository":
+            return url.strip()
+    return ""
+
+
+def _releases(forges: list) -> list[str] | None:
+    """The platform's published releases, as the first forge row that can list them answers — or
+    None. A row lists only a repository on its own host, so a deployment on another vendor, or
+    one that cannot reach the network, answers None, and C-VERSION says `unknown`."""
+    from beeverforge.adapters.forge.base import published_releases_of
+
+    home = releases_home()
+    if not home:
+        return None
+    for forge in forges:
+        if forge is None:
+            continue
+        got = published_releases_of(forge, home)
+        if got is not None:
+            return got
+    return None
+
+
+#: `credentials.forge_credential_source`'s identities, as the classes C-FORGE-CRED judges.
+_SOURCES = {"deployment": "minted", "identity": "identity", "env": "stored",
+            "generic": "generic", "login": "login", "": "none"}
+
+
+def _forge_credential(project) -> tuple[str, bool]:
+    """WHAT the forge credential a job of `project` holds is — never its value — asked of the one
+    resolution the doctor and the jobs use, and whether the vendor offers a credential to MINT.
+
+    THE PLATFORM'S OWN ANSWER, not a reading of which variables are set: where the generic token
+    and a minted credential are both configured, the generic token is what a job is handed (the
+    value path comes first), so that is what this reports."""
+    from beeverforge import credentials
+
+    row = credentials.forge_credential_row(project)
+    mints = row is not None and getattr(row, "mint", None) is not None
+    try:
+        source = credentials.forge_credential_source(project)
+    except Exception as exc:  # noqa: BLE001 — an unread source is `unknown`, never a pass
+        log.info("the forge credential of %s could not be resolved (%s)", project.name,
+                 str(exc)[:160])
+        return "unread", mints
+    return _SOURCES.get(source.partition(":")[0], "unread"), mints
+
+
+def _coordinate(project) -> str:
+    forge = getattr(project, "forge", None)
+    return ((forge.repo if forge else None) or project.tracker.repo or "").strip()
+
+
+def _foreign_repositories(project, root: Path) -> list[str]:
+    """The project's OTHER repositories this deployment knows about: the ones with a proof
+    recorded (`<project>--<owner>--<repo>.json`, `card_repo._checkout_key`'s shape). The registry
+    names one repository per project; a product's others travel on its cards, and their proofs are
+    where the deployment wrote them down."""
+    prefix = f"{project.name}--"
+    try:
+        keys = sorted(p.stem for p in root.glob(f"{prefix}*.json"))
+    except OSError:
+        return []
+    return [k[len(prefix):].replace("--", "/") for k in keys]
+
+
+def _repository(project, repo: str, *, default: bool) -> c.RepositoryReading:
+    from beeverforge import box_prove
+    from beeverforge.loader import load_manifest
+    from beeverforge.runtime.card_repo import _checkout_key
+
+    identity = repo or _coordinate(project) or f"{project.name}#default"
+    key = project.name if default else _checkout_key(project, repo)
+    out = c.RepositoryReading(project=project.name, identity=identity, default=default, key=key)
+    try:
+        if default:
+            out.manifest = load_manifest(project)
+        else:
+            from beeverforge.factory import resolve_repo_path
+            from beeverforge.runtime.card_repo import _runner_view
+
+            view, _ = _runner_view(project, f"{repo}#0")
+            out.manifest = load_manifest(view, repo_root=resolve_repo_path(view, cache_key=key))
+    except Exception as exc:  # noqa: BLE001 — an unread manifest is `unknown`, never a pass
+        out.manifest_error = str(exc)
+    try:
+        st = box_prove.status(project, repo=repo)
+        out.box = st.as_document()
+        out.box_lines = _withheld(st).lines()
+    except Exception as exc:  # noqa: BLE001 — an unread proof is `unknown`
+        out.box_error = str(exc)
+    return out
+
+
+#: What stands in for an advisory finding's message in the pack.
+WITHHELD = "(message withheld from the pack: a gate's output can quote the repository)"
+
+
+def _withheld(st):
+    """The status with every advisory MESSAGE replaced — a gate's output can quote a file path or
+    a line of the customer's code, and a pack carries neither."""
+    import copy
+
+    if st.proof is None or not st.proof.findings:
+        return st
+    out = copy.deepcopy(st)
+    for finding in out.proof.findings:
+        finding.message = WITHHELD
+    return out
+
+
+def _env_file(here: Path) -> c.EnvFileReading:
+    """The deployment's secrets file as seen from here: `.env.compose` beside the compose file, or
+    the one-machine deployment's `~/.beeverforge/env`. Only its NAME travels, never its path."""
+    for name, path in ((".env.compose", here / ".env.compose"),
+                       ("~/.beeverforge/env", Path("~/.beeverforge/env").expanduser())):
+        if path.is_file():
+            try:
+                mode = path.stat().st_mode & 0o777
+            except OSError:
+                mode = None
+            return c.EnvFileReading(name, True, mode, _tracked(path))
+    return c.EnvFileReading("", False)
+
+
+def _tracked(path: Path) -> bool | None:
+    """Whether git tracks this file — None when git cannot be asked at all."""
+    try:
+        done = subprocess.run(["git", "-C", str(path.parent), "ls-files", "--error-unmatch",
+                               path.name], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return True
+    said = (done.stderr or "").lower()
+    if "did not match" in said or "not a git repository" in said:
+        return False
+    return None
+
+
+def _providers(rows, env: dict[str, str], sandbox: str) -> dict[str, list[str]]:
+    """Which KIND serves each axis — kind names only."""
+    from beeverforge.adapters.agent.registry import harness_kind
+    from beeverforge.identity.registry import identity_kind
+
+    def kinds(values) -> list[str]:
+        return sorted({str(v) for v in values if v})
+
+    return {
+        "tracker": kinds(p.tracker.kind for p in rows),
+        "forge": kinds(p.forge.kind for p in rows if p.forge),
+        "ci": kinds(p.ci.kind for p in rows if p.ci),
+        "channel": kinds((p.channel or "panel") for p in rows),
+        "harness": kinds(harness_kind(p, "executor") for p in rows),
+        "box": [sandbox],
+        "identity": [identity_kind(env)],
+        "metrics": [(env.get("BEEVERFORGE_METRICS_SINK") or "default").strip().lower()],
+        "preview": [(env.get("BEEVERFORGE_PREVIEW_RUNTIME") or "none").strip().lower()],
+    }
+
+
+def _identifiers(rows, projects: list[c.ProjectReading], approvers: list[str],
+                 env: dict[str, str]) -> dict[str, dict[str, set[str]]]:
+    """Every name the deployment carries that a pack must not, by category, with its aliases."""
+    ids: dict[str, dict[str, set[str]]] = {k: defaultdict(set) for k in CATEGORIES}
+
+    def coordinate(value, *aliases: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        ids["repository"][value].update(a for a in aliases if a)
+        if "/" in value:
+            ids["repository"][value].add(value.rsplit("/", 1)[-1])
+            ids["organisation"].setdefault(value.split("/", 1)[0], set())
+
+    def person(*names) -> None:
+        for name in names:
+            if str(name or "").strip():
+                ids["person"].setdefault(str(name).strip(), set())
+
+    for p in rows:
+        ids["project"].setdefault(p.name, set())
+        for axis in (p.tracker, p.forge, p.ci):
+            if axis is None:
+                continue
+            coordinate(axis.repo)
+            options = axis.options or {}
+            for key in _ORGANISATION_OPTIONS:
+                if options.get(key):
+                    ids["organisation"].setdefault(str(options[key]), set())
+            for key in _REPOSITORY_OPTIONS:
+                coordinate(options.get(key))
+            person(*(options.get(k) for k in _PERSON_OPTIONS))
+        board = getattr(p, "factory_board", None)
+        if board is not None:
+            if board.tracker is not None:
+                coordinate(board.tracker.repo)
+            person(board.supervisor)
+        if p.product is not None:
+            coordinate(p.product.docs_repo)
+            person(*p.product.admins)
+        for login, channel_id in (p.people or {}).items():
+            ids["person"][login].add(str(channel_id))
+        person(*p.admins)
+        for key, value in (p.channel_options or {}).items():
+            if not key.endswith("_env") and str(value or "").strip():
+                ids["organisation"].setdefault(str(value), set())
+    for project in projects:
+        for repo in project.repositories:
+            coordinate(repo.identity, *(() if repo.default else (repo.key,)))
+            m = repo.manifest
+            if m is not None:
+                person(*(getattr(m, "reviewers", None) or []),
+                       *(getattr(m, "prod_approvers", None) or []))
+                coordinate(getattr(m, "docs_repo", None))
+    person(*approvers, env.get("BEEVERFORGE_BOT_LOGIN"), env.get("BEEVERFORGE_BOT_NAME"))
+    return {k: dict(v) for k, v in ids.items()}
+
+
+def _secret_values(rows, env: dict[str, str]) -> set[str]:
+    """The VALUE of every credential-shaped variable, and of every variable the registry names as
+    a credential (`token_env`, a channel's `*_env`) — whatever it is called."""
+    named = {k for k, v in env.items() if holds_a_credential(k)}
+    for p in rows:
+        for axis in (p.tracker, p.forge, p.ci):
+            if axis is not None and (axis.options or {}).get("token_env"):
+                named.add(str(axis.options["token_env"]))
+        named.update(str(v) for k, v in (p.channel_options or {}).items() if k.endswith("_env"))
+    return ({env[n].strip() for n in named if (env.get(n) or "").strip()}
+            | _held_values(named))
+
+
+def _held_values(named: set[str]) -> set[str]:
+    """The values the credential stores hold for what the pack must never print (#742): every
+    reference the registry names (`token_env: file:acme-jira`), every entry of a store that lists
+    what it holds, and, for a declared store that cannot list, every credential the core reads by
+    name — the store's own `held_values`, which the product role's facts withhold by too (review
+    of 256c5b0). Never logged; only redacted."""
+    from beeverforge.adapters.credential_store import registry as store
+
+    return store.held_values(named)
+
+
+def _variable_names(rows) -> set[str]:
+    """The NAMES of the variables the registry declares — `token_env`, `box.env`, a channel's
+    `*_env`, a preview's — that are not the platform's own. A name a customer chose for their
+    credential (`CASTELLO_ADO_PAT`) names the customer, and the doctor quotes it."""
+    from beeverforge.certify.redact import credential_names
+
+    names: set[str] = set()
+    for p in rows:
+        for axis in (p.tracker, p.forge, p.ci):
+            if axis is not None and (axis.options or {}).get("token_env"):
+                names.add(str(axis.options["token_env"]))
+        if p.box is not None:
+            names.update(p.box.env)
+        names.update(str(v) for k, v in (p.channel_options or {}).items() if k.endswith("_env"))
+        if p.preview is not None:
+            for mapping in (*p.preview.env.values(), *p.preview.build_args.values()):
+                names.update(mapping)
+                names.update(mapping.values())
+    platform = credential_names()
+    return {n.strip() for n in names if n and n.strip()
+            and not n.startswith("BEEVERFORGE_") and n not in platform}
+
+
+# ── 2. assembling the pack ──────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Pack:
+    files: dict[str, str]
+    document: dict
+    controls: list[c.Control]
+    salt_id: str
+    when: datetime
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def default_name(self) -> str:
+        return f"beeverforge-evidence-{self.salt_id}-{self.when:%Y-%m-%d}.tgz"
+
+
+def parse_consent(consent: str) -> tuple[str, str, str] | None:
+    """`"name, role, date"` as its three parts, or None when it is not that shape."""
+    parts = [p.strip() for p in (consent or "").split(",")]
+    if len(parts) < 3 or not parts[0] or not parts[-1]:
+        return None
+    return parts[0], ", ".join(parts[1:-1]), parts[-1]
+
+
+def _iso(when: datetime) -> str:
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dumps(document) -> str:
+    return json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def assemble(reading: c.Reading, *, profile: str, partner: str, practitioner: str,
+             window_days: int = DEFAULT_WINDOW_DAYS, consent: str = "",
+             when: datetime | None = None, salt: bytes | None = None) -> Pack:
+    """The pack's files, anonymised, validated, and checked for survivors before anything else
+    sees them. Raises `Unsafe` rather than return a pack that carries what it must not."""
+    # THE PACK'S PROMISE IS KEPT WHERE THE PACK IS BUILT (review of #588). The practitioner is the
+    # one string carried past every rule, so the rules are asked of it here, on every door that
+    # builds a pack. `certify deployment` refuses the flag before this, with its remedy; a door
+    # that reaches this line with an address skipped that refusal, and is a defect.
+    carries = what_a_name_carries(practitioner)
+    if carries:
+        raise Unsafe(f"the practitioner carries {' and '.join(carries)}, and a pack keeps a "
+                     f"person's name, never an address")
+    when = when or datetime.now(UTC)
+    consented = parse_consent(consent) if consent else None
+    identifiers = {k: {i: set(a) for i, a in v.items()}
+                   for k, v in (reading.identifiers or {}).items()}
+    if consented:
+        identifiers.setdefault("person", {}).setdefault(consented[0], set())
+    redactor = Redactor(salt=salt or _secrets.token_bytes(32), identifiers=identifiers,
+                        secrets=reading.secrets, variables=reading.variables, keep=practitioner)
+    files: dict[str, str] = {}
+    notes: list[str] = []
+
+    # THE DIAGNOSTICS, each scrubbed under its own file name so redactions.json can say where.
+    if reading.preflight is not None:
+        files[c.PREFLIGHT_FILE] = _dumps(
+            redactor.scrub_document(reading.preflight, where=c.PREFLIGHT_FILE))
+    else:
+        notes.append("preflight could not run here: "
+                     + redactor.scrub(reading.preflight_error, where="summary.md"))
+    proofs = []
+    for p in reading.projects:
+        who = redactor.project(p.name)
+        if p.doctor is not None:
+            where = c.doctor_file(who)
+            doc = dict(p.doctor, project=who)
+            files[where] = _dumps(redactor.scrub_document(doc, where=where))
+        else:
+            notes.append(f"the doctor could not run on {who}: "
+                         + redactor.scrub(p.doctor_error, where="summary.md"))
+        for repo in p.repositories:
+            name = redactor.repository(repo.identity)
+            where = c.box_file(name)
+            if repo.box is not None:
+                files[where] = "\n".join(redactor.scrub(line, where=where)
+                                         for line in repo.box_lines) + "\n"
+                if repo.box.get("advisories"):
+                    redactor.drop_field(where=where, field="advisories[].message",
+                                        why="a gate's output can quote the repository")
+            else:
+                files[where] = ("the proof could not be read: "
+                                + redactor.scrub(repo.box_error, where=where) + "\n")
+            proofs.append({"project": who, "repository": name,
+                           "status": (repo.box or {}).get("state") or "unknown"})
+
+    results = c.evaluate(reading, profile, redactor)
+    for control in results:
+        control.detail = redactor.scrub(control.detail, where="pack.json")
+
+    since, until = when - timedelta(days=window_days), when
+    measured = _measured(reading, since, until)
+
+    code, built = reading.build
+    document = {
+        "schema": PACK_SCHEMA,
+        "generated_at": _iso(when),
+        "platform": {"version": reading.version,
+                     "build": {"code": code, "built": built} if code else None},
+        "partner": partner,
+        "profile": profile,
+        "practitioner": practitioner,
+        "window": {"days": window_days, "since": _iso(since), "until": _iso(until)},
+        "providers": redactor.scrub_document(reading.providers, where="pack.json"),
+        "controls": [r.as_entry() for r in results],
+        "outcomes": measured,
+        "proofs": proofs,
+        "consent": ({"by": redactor.person(consented[0]),
+                     "role": redactor.scrub(consented[1], where="pack.json"),
+                     "date": redactor.scrub(consented[2], where="pack.json")}
+                    if consented else None),
+        "salt_id": redactor.salt_id,
+        "signature": None,
+        "unsigned_because": UNSIGNED_BECAUSE,
+        "not_in_this_pack": list(NOT_YET),
+        "checksums": {},
+    }
+    files["summary.md"] = render_summary(document, notes=notes,
+                                         pseudonyms=redactor.pseudonyms)
+    files["redactions.json"] = _dumps(redactor.log())
+    document["checksums"] = {path: "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+                             for path, text in sorted(files.items())}
+    ordered = {"pack.json": _dumps(document), "summary.md": files.pop("summary.md"),
+               "redactions.json": files.pop("redactions.json"), **dict(sorted(files.items()))}
+
+    errors = validate(document)
+    if errors:
+        raise Unsafe("pack.json does not match its published schema (pack.schema.json): "
+                     + "; ".join(errors))
+    leaked = _survivors(redactor, ordered)
+    if leaked:
+        raise Unsafe("the pack would carry what it must not — " + "; ".join(leaked))
+    # LAST, AND OUTSIDE THE CHECK ABOVE ON PURPOSE: it holds nothing but the digests of the files
+    # just checked and their names — which `pack.json` already carries as its `checksums` keys,
+    # read above — and a 64-character digest is exactly the shape the long-token rule drops.
+    ordered[SUMS_FILE] = sha256sums(ordered)
+    return Pack(files=ordered, document=document, controls=results, salt_id=redactor.salt_id,
+                when=when, notes=notes)
+
+
+def sha256sums(files: dict[str, str]) -> str:
+    """`SHA256SUMS`: every other file's SHA-256 and its name, one per line, in `sha256sum`'s own
+    format — so an extracted pack checks with `sha256sum -c SHA256SUMS` and nothing of ours.
+
+    WHY A SECOND LIST BESIDE `pack.json`'s `checksums`. That one cannot hold `pack.json` itself —
+    a file cannot carry its own digest — so a `pack.json` edited after it was written was invisible
+    to it. This one covers every file in the pack, `pack.json` among them, and it is the one file a
+    signature will sign when signing is built: one signature over it attests every byte of the
+    pack (`certify verify` checks both lists, and that they agree)."""
+    return "".join(f"{hashlib.sha256(text.encode('utf-8')).hexdigest()}  {path}\n"
+                   for path, text in sorted(files.items()) if path != SUMS_FILE)
+
+
+def _measured(reading: c.Reading, since: datetime, until: datetime) -> dict:
+    """The outcome aggregates over the pack's window — read through the reader `gather` bound,
+    or `not_measured` with the reason, never zeros. A read that FAILS is the same `not_measured`:
+    the pack is still worth writing without its outcomes, and the reason says they are missing."""
+    from beeverforge.observability.query import MEASURES
+
+    def unread(reason: str) -> dict:
+        return {"status": "not_measured", "reason": reason, "projects": len(reading.projects),
+                **dict.fromkeys(MEASURES), "not_measured": dict.fromkeys(MEASURES, reason)}
+
+    if reading.outcomes is None:
+        return unread(OUTCOMES_UNREAD)
+    try:
+        return reading.outcomes(since, until)
+    except Exception as exc:  # noqa: BLE001 — the pack says the outcomes are missing, and why
+        log.warning("the outcome aggregates could not be read (%s)", str(exc)[:200])
+        return unread("the outcome aggregates could not be read on this deployment")
+
+
+def _survivors(redactor: Redactor, files: dict[str, str]) -> list[str]:
+    """Every file asked, the way it was scrubbed: a JSON file string by string (its keys too), a
+    text file whole. Answers WHAT survived and where — never the value."""
+    out: list[str] = []
+
+    def strings(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield str(k)
+                yield from strings(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from strings(v)
+        elif isinstance(node, str):
+            yield node
+
+    for path, text in files.items():
+        found = sorted({kind for s in (strings(json.loads(text)) if path.endswith(".json")
+                                       else [text]) for kind in redactor.survivors(s)})
+        if found:
+            out.append(f"{path}: {', '.join(found)}")
+    return out
+
+
+def render_summary(document: dict, *, notes: list[str], pseudonyms: dict[str, str]) -> str:
+    """`summary.md` — the pack, for a person. What it does NOT contain comes before what it does."""
+    def cell(text: str) -> str:
+        return str(text).replace("|", "\\|").replace("\n", " ")
+
+    platform = document["platform"]
+    build = platform["build"]
+    lines = [
+        "# BeeverForge deployment evidence pack",
+        "",
+        f"- Partner: `{document['partner']}`",
+        f"- Profile claimed: **{document['profile']}**",
+        f"- Responsible practitioner: {document['practitioner']}",
+        f"- Platform: {platform['version']}"
+        + (f" (build {build['code']}, built {build['built']})" if build else
+           " (not a built image)"),
+        f"- Generated: {document['generated_at']}",
+        f"- Window: {document['window']['days']} days, {document['window']['since']} to "
+        f"{document['window']['until']}",
+        f"- Salt id: `{document['salt_id']}` (the salt itself is never written)",
+        "",
+        "## What this pack does not contain yet",
+        "",
+        "This pack is not signed, and some of what the partner program asks for is not read yet. "
+        "Every gap is stated here and in `pack.json`; none of it is filled with a guess.",
+        "",
+        *[f"- {item}" for item in document["not_in_this_pack"]],
+        "",
+        f"Signature: none. {UNSIGNED_BECAUSE}.",
+        "",
+        "## Controls",
+        "",
+        "| Control | Required | Result | Evidence |",
+        "|---|---|---|---|",
+    ]
+    for control in document["controls"]:
+        lines.append(f"| {control['id']} | {'yes' if control['required'] else 'no'} | "
+                     f"{control['result']} | {cell(control['evidence']['detail'])} |")
+    required = [x for x in document["controls"] if x["required"]]
+    tally = defaultdict(int)
+    for x in required:
+        tally[x["result"]] += 1
+    lines += ["", f"{len(required)} control(s) required by the {document['profile']} profile: "
+              + ", ".join(f"{n} {result}" for result, n in sorted(tally.items())) + "."]
+    lines += ["", "## Outcomes over the window", "", *_outcome_lines(document["outcomes"])]
+    lines += ["", "## Box proofs", ""]
+    if document["proofs"]:
+        lines += ["| Project | Repository | Status |", "|---|---|---|"]
+        lines += [f"| {p['project']} | {p['repository']} | {p['status']} |"
+                  for p in document["proofs"]]
+    else:
+        lines.append("No repository is registered on this deployment.")
+    lines += ["", "## Provider kinds", ""]
+    lines += [f"- {axis}: {', '.join(kinds) or 'none'}"
+              for axis, kinds in sorted(document["providers"].items())]
+    lines += ["", "## Consent", ""]
+    consent = document["consent"]
+    lines.append(f"Recorded: {consent['by']}, {consent['role']}, {consent['date']}." if consent
+                 else "No consent was recorded (`--consent`).")
+    lines += ["", "## Redactions", ""]
+    by_category = defaultdict(int)
+    for category in pseudonyms.values():
+        by_category[category] += 1
+    lines.append("Pseudonyms: " + (", ".join(f"{n} {k}" for k, n in sorted(by_category.items()))
+                                   or "none") + ". The full log, with every count of what was "
+                 "replaced and dropped, is `redactions.json`; it never holds an original.")
+    if notes:
+        lines += ["", "## Notes", "", *[f"- {cell(n)}" for n in notes]]
+    return "\n".join(lines) + "\n"
+
+
+def _outcome_lines(block: dict) -> list[str]:
+    """The outcome aggregates for a person: every measure, and for each one not measured, why."""
+    from beeverforge.observability.query import MEASURES
+
+    def shown(measure: str) -> str:
+        value = block.get(measure)
+        if value is None:
+            return f"not measured — {block['not_measured'].get(measure, 'no reason given')}"
+        return _shown(value)
+
+    return [f"Status: {block['status']}. {block['reason']}.", "",
+            *[f"- {m.replace('_', ' ')}: {shown(m)}" for m in MEASURES]]
+
+
+def _shown(value) -> str:
+    if isinstance(value, dict):
+        return ", ".join(f"{k.replace('_', ' ')} {_shown(v)}" for k, v in value.items())
+    if isinstance(value, list):
+        return "; ".join(_shown(item) for item in value) or "none"
+    return str(value)
+
+
+# ── 3. the tarball ──────────────────────────────────────────────────────────────────────────────
+
+def write(pack: Pack, out: Path) -> Path:
+    """The pack as a gzipped tarball at `out`. Never replaces a file that is already there."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for path, text in pack.files.items():
+            data = text.encode("utf-8")
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            info.mtime = int(pack.when.timestamp())
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+    with open(out, "xb") as fh:
+        fh.write(buffer.getvalue())
+    return out

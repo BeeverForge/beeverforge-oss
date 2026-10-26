@@ -1,0 +1,213 @@
+"""#182: accepting a reading of the code records the promise and files nothing.
+
+Three layers, each cut on its own: the corpus can TELL (the two provenance lines are parsed and
+the predicate reads them), the acceptance SAYS (`nothing_to_build`, read by both doors), and the
+sink ASKS (`break_down` has no default for `asked_for`, and refuses a reading of the code nobody
+asked it to break down). The explicit door — `product_break_down`, the chat gesture — is cut from
+the other side: it must still file.
+
+And the corpus tells from the HEADER, where either line counts whatever it says: the reader that
+searched the whole file read a request's "- Evidence of payment…" bullet as provenance and filed
+nothing for it, and read a reading whose only line left was `Observed at commit: unrecorded` as a
+request and broke built behaviour down. Those rows are cut against the doors driven whole — the
+catalog row through `actions.perform` with the worker's activity behind the engine, and the
+conversation from the typed gesture to the typed yes.
+"""
+
+TEST = "tests/test_accepting_what_the_code_already_does_files_nothing.py"
+
+CORPUS = "beeverforge/product/corpus.py"
+MODULE = "beeverforge/product/module.py"
+CATALOG = "beeverforge/actions/catalog.py"
+CONFIRM = "beeverforge/product/confirm.py"
+CHANNEL = "beeverforge/product/channel.py"
+ENGINE = "beeverforge/product/engine.py"
+ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
+IO = "beeverforge/runtime/temporal/io.py"
+VOICE = "beeverforge/product/voice.py"
+PANEL = "beeverforge/api/panel.html"
+
+MUTATIONS = [
+    # ── the corpus can tell ─────────────────────────────────────────────────────────────────────
+    ("the Evidence line goes back to being written and never read — the state of `1512d0a`",
+     CORPUS, "        evidence=evidence,\n", '        evidence="",\n'),
+
+    ("the commit the behaviour was read at is not parsed",
+     CORPUS, '        observed_at=_recorded(observed_at.group("value") if observed_at else ""),\n',
+     '        observed_at="",\n'),
+
+    # RE-PINNED (#182, the header): the predicate also reads `provenance_line` now.
+    ("the predicate asks the STATUS, which stops being `observed` at the very moment it matters",
+     CORPUS, "        return bool(self.evidence or self.observed_at or self.provenance_line)",
+     "        return self.status == OBSERVED"),
+
+    ("the commit alone is not enough, so tidying the Evidence line away makes built work unbuilt",
+     CORPUS, "        return bool(self.evidence or self.observed_at or self.provenance_line)",
+     "        return bool(self.evidence)"),
+
+    ("the writers' placeholder is read as a commit called `unrecorded`",
+     CORPUS, '    return "" if text.lower() == UNRECORDED else text',
+     "    return text"),
+
+    ("a tier this build does not know is DROPPED, turning the entry into a request",
+     CORPUS, "    return tier, [Finding(", '    return "", [Finding('),
+
+    # ── …from the header, where either line counts ──────────────────────────────────────────────
+    ("the Evidence line is searched in the whole file again: a request that mentions evidence "
+     "files nothing",
+     CORPUS, "    evidence, evidence_findings = _evidence_of(head, name)",
+     "    evidence, evidence_findings = _evidence_of(text, name)"),
+
+    ("…and the commit line too",
+     CORPUS, "    observed_at = _OBSERVED_AT_RE.search(head)",
+     "    observed_at = _OBSERVED_AT_RE.search(text)"),
+
+    ("the header runs to the end of the file",
+     CORPUS, "    return text[:first.start()] if first else text", "    return text"),
+
+    ("the title is taken for the first section, so no header is ever read",
+     CORPUS, '_FIRST_SECTION_RE = re.compile(r"^#{2,}\\s", re.MULTILINE)',
+     '_FIRST_SECTION_RE = re.compile(r"^#{1,}\\s", re.MULTILINE)'),
+
+    ("a line that holds only the placeholder counts for nothing again",
+     CORPUS, "        provenance_line=bool(observed_at or _EVIDENCE_RE.search(head)),",
+     "        provenance_line=False,"),
+
+    ("…or the line is looked for in the body, where a request's own words live",
+     CORPUS, "        provenance_line=bool(observed_at or _EVIDENCE_RE.search(head)),",
+     "        provenance_line=bool(observed_at or _EVIDENCE_RE.search(text)),"),
+
+    ("the predicate reads the two values and not the line",
+     CORPUS, "        return bool(self.evidence or self.observed_at or self.provenance_line)",
+     "        return bool(self.evidence or self.observed_at)"),
+
+    # ── the acceptance says it ──────────────────────────────────────────────────────────────────
+    ("the acceptance stops saying there is nothing to build",
+     MODULE, "                result.nothing_to_build = req.came_from_the_code",
+     "                result.nothing_to_build = False"),
+
+    ("a SECOND acceptance forgets, and the retry door files what the first rightly did not",
+     MODULE, "                               nothing_to_build=req.came_from_the_code)",
+     "                               nothing_to_build=False)"),
+
+    # ── the panel's door ────────────────────────────────────────────────────────────────────────
+    ("the catalog row ignores the verdict and starts the breakdown workflow anyway",
+     CATALOG, '    if getattr(result, "nothing_to_build", False) is True:', "    if False:"),
+
+    ("the catalog says it in English whatever the project speaks",
+     CATALOG,
+     '    said = nothing_to_build(number=number, language=getattr(project, "language", None))',
+     "    said = nothing_to_build(number=number, language=None)"),
+
+    ("the automatic chain tells the worker a person asked",
+     CATALOG, "by=by,\n                                                 asked_for=False)",
+     "by=by,\n                                                 asked_for=True)"),
+
+    ("the requirements row stops carrying the server's verdict to the page",
+     CATALOG, '             "came_from_the_code": r.came_from_the_code,',
+     '             "came_from_the_code": False,'),
+
+    # ── the conversation's door ─────────────────────────────────────────────────────────────────
+    ("the chat executor ignores the verdict and goes to the breakdown",
+     CONFIRM, '    if getattr(result, "nothing_to_build", False):', "    if False:"),
+
+    # RE-PINNED 2026-09-24 (#267 slice 3): the call carries where the requirement was asked for
+    # on the line after
+    ("the executor's second act claims a person asked, so the sink lets it through",
+     # RE-PINNED 2026-10-11 (#563 slice 18b): the acceptance starts the breakdown on the worker
+     CONFIRM, "        how = breaking.start_now(project, number, actor=user, asked_for=False,\n",
+     "        how = breaking.start_now(project, number, actor=user, asked_for=True,\n"),
+
+    ("the module's refusal is told as a failed breakdown — 'não consegui… tento de novo'",
+     # RE-PINNED 2026-10-11 (#563 slice 18b): what the conversation is told when it ends
+     CONFIRM,
+     # RE-PINNED 2026-10-11 (review of #619): an unfinished breakdown is said first, on its own
+     '    if any(getattr(r, "nothing_to_build", False) for r in results):',
+     "    if False:"),
+
+    # ── the sink ────────────────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-09-24 (#267 slice 3): the signature grew `conversation` and `requester` on
+    # the line after
+    ("`asked_for` gains a default, so the next call site can stay silent on the question",
+     MODULE, "    def break_down(self, number: int, *, actor: str, asked_for: bool, board=_UNSET,\n",
+     "    def break_down(self, number: int, *, actor: str, asked_for: bool = True, "
+     "board=_UNSET,\n"),
+
+    ("the sink stops refusing: a door that forgets the verdict files built behaviour",
+     MODULE, "        if requirement.came_from_the_code and not asked_for:", "        if False:"),
+
+    ("the sink refuses a PERSON too, and an edited reading can never become work",
+     MODULE, "        if requirement.came_from_the_code and not asked_for:",
+     "        if requirement.came_from_the_code:"),
+
+    ("the refusal comes back `ok`, which an older panel counts as a card: 'Work filed: ?'",
+     # re-pinned 2026-10-20 (#908): the refusal names why it is not ok — `refusal=NOT_VALID`
+     MODULE, "            return [WriteResult(ok=False, refusal=NOT_VALID, nothing_to_build=True,",
+     "            return [WriteResult(ok=True, refusal=NOT_VALID, nothing_to_build=True,"),
+
+    # ── the explicit door ───────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-09-24: moved to engine.py
+    ("the chat's own gesture reaches the module as if nobody had asked",
+     # RE-PINNED 2026-10-11 (#563 slice 18b): the gesture starts the breakdown on the worker
+     # RE-PINNED 2026-10-11 (#565 slice c): the role proposes it, and the yes starts it
+     CONFIRM, "        how = breaking.start_now(project, number, actor=user, asked_for=True,",
+     "        how = breaking.start_now(project, number, actor=user, asked_for=False,"),
+
+    ("`product_break_down` reaches the worker as the automatic chain",
+     CATALOG, "by=by,\n                                                 asked_for=True)",
+     "by=by,\n                                                 asked_for=False)"),
+
+    # RE-PINNED 2026-10-10 (#563 slice 18a): the dispatch moved inside the `try` that catches
+    # the engine's refusal of a second start, one indent deeper
+    ("the dispatch drops the flag on its way into the workflow input",
+     CATALOG,
+     # RE-PINNED 2026-10-11 (#563 slice 18e): where the requirement was written rides along
+     "            ProductBreakdownInput(project=project, number=number, actor=by.id,\n"
+     "                                  asked_for=asked_for, conversation=conversation, room=room),",
+     "            ProductBreakdownInput(project=project, number=number, actor=by.id,\n"
+     "                                  conversation=conversation, room=room),"),
+
+    ("the explicit door spends an agent without a yes",
+     CATALOG,
+     "    if not _said_yes(yes):\n        return refused(\n            INVALID,\n"
+     '            f"nothing was filed: breaking requirement',
+     "    if False:\n        return refused(\n            INVALID,\n"
+     '            f"nothing was filed: breaking requirement'),
+
+    ("…or for somebody who may not act, who then hears no from the worker minutes later",
+     CATALOG,
+     "    if not await asyncio.to_thread(lambda: may_act(proj, by.id, via=via)):\n"
+     "        return refused(DENIED, unauthorized_message(proj), project=proj.name, number=num)",
+     "    if False:\n"
+     "        return refused(DENIED, unauthorized_message(proj), project=proj.name, number=num)"),
+
+    ("…or for a requirement nobody confirmed, which is not a promise to build from",
+     CATALOG, "    if not requirement.is_promise:\n        return refused(INVALID, _not_a_promise(",
+     "    if False:\n        return refused(INVALID, _not_a_promise("),
+
+    # ── the process boundary ────────────────────────────────────────────────────────────────────
+    ("the activity forgets what the door said",
+     # RE-PINNED 2026-09-29 (review of #390): the breakdown heartbeats now, through `_break`
+     # RE-PINNED 2026-10-11 (#563 slice 18b): where it was asked rides along on the next line
+     ACTIVITIES, "        return _product_break_down(project, inp.number, inp.actor, inp.asked_for,",
+     "        return _product_break_down(project, inp.number, inp.actor, False,"),
+
+    ("the worker tells the module a person asked, whatever arrived",
+     ACTIVITIES,
+     # RE-PINNED 2026-10-11 (#563 slice 18b): where it was asked rides along on the next line
+     '    return ProductModule(project, via="api").break_down(number, actor=actor, '
+     "asked_for=asked_for,",
+     '    return ProductModule(project, via="api").break_down(number, actor=actor, '
+     "asked_for=True,"),
+
+    ("a payload with no field — an older panel's — reads as an explicit request",
+     IO, "    asked_for: bool = False", "    asked_for: bool = True"),
+
+    # ── what a person reads ─────────────────────────────────────────────────────────────────────
+    ("the sentence exists in one language only",
+     VOICE, '    "pt-BR": ("O *requisito {number}* descreve o que o produto já faz hoje',
+     '    "pt-PT": ("O *requisito {number}* descreve o que o produto já faz hoje'),
+
+    ("the page's dialog promises filed work for every click, as it did",
+     PANEL, "  const then=row.came_from_the_code\n", "  const then=false\n"),
+]

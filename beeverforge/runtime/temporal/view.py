@@ -1,0 +1,1708 @@
+"""The domain's window into Temporal — read live job state, launch, approve, signal.
+
+This is the "our panel is the product surface" half of the runtime document that ships with
+the beeverforge-aws add-on package (docs/architecture.md in the core):
+a caller speaks the domain (project/issue/state) while the durable truth lives in
+Temporal. We READ from the engine and LINK to its UI for deep debug — we don't
+rebuild it. Kept out of any front end's import path so the panel still serves when
+the `runtime` extra (temporalio) isn't installed.
+
+THAT SENTENCE WAS FALSE FOR THE PAGE ITSELF UNTIL #178: the words the page renders on every load
+(`ATTENTION_STATES`, the merge-wait sentences) were defined here and in `workflow.py`, so reading
+them cost `temporalio` and `/` answered 500 without it. They live in `vocabulary.py` now, this
+module only names them, and `tests/test_the_panel_serves_without_the_engines_client.py` asks every
+GET route of the panel in an interpreter where the library cannot be found.
+
+IT LIVED AT `beeverforge/api/temporal_view.py` UNTIL C-23, and the filename was the lie: the Slack
+bot
+(`_gather_jobs`) and the product role (`product/release.py`) had both been importing "the panel's
+module" for months, because it was never the panel's — it is the engine's, and the panel was
+merely its first caller. That mattered the moment the action layer arrived: C-23's guard is *no
+capability lives inside a front end*, and a guard that has to carve out
+`beeverforge/api/temporal_view.py`
+as "a front-end file that is not really a front-end file" is a guard the next person deletes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import functools
+import logging
+import os
+import time
+from dataclasses import dataclass
+
+from temporalio.client import Client, WorkflowExecutionStatus
+
+from beeverforge.contracts.state import JobState
+from beeverforge.listeners import ENGINE, ENGINE_UI
+from beeverforge.runtime.temporal import TASK_QUEUE
+from beeverforge.runtime.temporal.deadlines import read_deadline, unreachable_window
+from beeverforge.runtime.temporal.io import JobParams
+
+# `tv.ATTENTION_STATES` and `tv.MERGE_WAIT` are the names every caller uses, so they are named
+# here — and DEFINED in `vocabulary.py`, which the panel's page can import without `temporalio`.
+from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES, MERGE_WAIT, EngineUnreachable
+from beeverforge.runtime.temporal.workflow import JobWorkflow
+from beeverforge.util.bounded import BoundedDict
+from beeverforge.util.single_flight import _Flight, _OneAtATime
+
+log = logging.getLogger("beeverforge.panel.temporal")
+
+
+# HOW LONG A READ MAY WAIT (`read_deadline`), AND HOW LONG A SILENT ENGINE IS REMEMBERED
+# (`unreachable_window`), live in `deadlines.py`: the same two numbers, read without the engine's
+# client, for the healthcheck that asks them every fifteen seconds (#681). Imported above and
+# named on this module, as every caller and guard reads them.
+
+
+#: How many recent jobs the job list asks the engine about at once when the operator does not say.
+#: Each RUNNING row is a `describe()` plus up to three queries a WORKER answers by replaying the
+#: job's history, so one-at-a-time made the list's cost the sum of every running row's round trips
+#: and a busy floor ran past `read_deadline()` (#754: 48 running jobs at 10 ms an RPC is four round
+#: trips each, ~1.9 s in sequence; on f37aeaa that test's list was refused at its 1 s deadline with
+#: one RPC in flight, and the breaker opened for every reader). Eight is up to eight query replays
+#: at once on the worker for one scan, the same default the product's sources are brought up with
+#: (`BEEVERFORGE_SOURCES_PARALLEL`). On a real dev server (2026-10-19, the measurement beside
+#: `read_deadline`, in `deadlines.py`) 48 running rows took 564 ms one at a time, 362 ms four at a
+#: time, 357 ms at eight and 384 ms at sixteen: past eight this process's own CPU is the bound on
+#: loopback. WHAT IT COSTS THE LOOP: a 10 ms heartbeat on the same loop as a scan saw its longest
+#: gap grow with the batch, from 14 ms one at a time to 27 ms at four, 40 ms at eight and 74 ms at
+#: sixteen (medians of 10 scans; about 5 ms a row asked at once). The merge-gate rows' registry read
+#: (`_lists_review_comments`, 3.6 ms each) is not that gap: stubbed out, it measured 44 ms at eight.
+#: THE OPERATOR'S, NOT A CONSTANT, as `BEEVERFORGE_SOURCES_PARALLEL` is (#369): a Temporal Cloud
+#: namespace across a region answers in tenths of a second and only the deployment knows what its
+#: workers take — `BEEVERFORGE_LIST_CONCURRENCY`, read by `list_concurrency()`. Measured 2026-10-20
+#: on the same dev server and 48 running rows: with 100 ms added to every client RPC, eight at once
+#: took 2.80 s against the 3 s default deadline (one at a time, and f37aeaa: 19.4 s, refused at 3 s;
+#: sixteen: 1.66 s). With every query replay taking 100 ms on the worker instead, eight answered in
+#: 2 of 10 scans at 3 s (3.25 s median under a 60 s deadline; sixteen 2.38 s; one at a time 14.5 s).
+#: THE WORKER'S SIDE: at most `list_concurrency()` query handlers ran at once (peak 8, 16 at
+#: sixteen; 16 once, right after a scan the deadline cut, whose handlers the worker still finished).
+#: Queries take workflow-task slots (the SDK's default 100; `worker.py` sets none), not the eight
+#: activity slots `worker.py` gives `run_job` and the checks.
+DEFAULT_LIST_CONCURRENCY = 8
+#: The unreadable values this process has already said, so a list read on every stream tick does
+#: not repeat the warning. Bounded by the values the environment has held, never by traffic.
+_LIST_CONCURRENCY_SAID: set[str] = set()
+
+
+def list_concurrency() -> int:
+    """`BEEVERFORGE_LIST_CONCURRENCY`, else `DEFAULT_LIST_CONCURRENCY`. READ ON EVERY CALL, never at
+    import (#185). A value that is not a positive number is the default, said once in the log: a
+    bound nobody can read must not become no bound, nor one job at a time."""
+    raw = (os.environ.get("BEEVERFORGE_LIST_CONCURRENCY") or "").strip()
+    if not raw:
+        return DEFAULT_LIST_CONCURRENCY
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        if raw not in _LIST_CONCURRENCY_SAID:
+            _LIST_CONCURRENCY_SAID.add(raw)
+            log.warning("BEEVERFORGE_LIST_CONCURRENCY=%r is not a positive number — %d jobs are "
+                        "asked about at once", raw, DEFAULT_LIST_CONCURRENCY)
+        return DEFAULT_LIST_CONCURRENCY
+    return value
+
+
+#: When the engine is worth asking again — a loop clock, never a wall clock.
+_SILENT_UNTIL = 0.0
+
+
+def unreachable_for() -> float:
+    """Seconds until the engine is worth asking again; `0.0` when it is."""
+    return max(0.0, _SILENT_UNTIL - time.monotonic())
+
+
+def _answered() -> None:
+    global _SILENT_UNTIL
+    _SILENT_UNTIL = 0.0
+
+
+def _did_not_answer() -> None:
+    global _SILENT_UNTIL
+    _SILENT_UNTIL = time.monotonic() + unreachable_window()
+
+
+async def _within(what: str, coro, *, seconds: float | None = None):
+    """Await `coro`, bounded — and remember an engine that did not answer.
+
+    ONLY WHAT SOMEBODY IS WAITING FOR. The reads are bounded; the writes in this module are not,
+    because a cancelled write is a request whose outcome nobody knows, and "it did not answer in
+    three seconds" must never be the reason a job is started twice.
+
+    A FAILURE THAT IS FAST IS NOT A SILENT ENGINE. An engine that refuses at once is answering, and
+    the next read asks it again — only a read that ran out of time is remembered."""
+    left = unreachable_for()
+    if left:
+        coro.close()
+        raise _still_silent(what, left)
+    try:
+        answer = await asyncio.wait_for(coro, read_deadline() if seconds is None else seconds)
+    except TimeoutError:
+        _did_not_answer()
+        raise EngineUnreachable(
+            f"the engine did not answer {what} within {read_deadline():.0f}s "
+            f"(BEEVERFORGE_ENGINE_DEADLINE)") from None
+    # NOTHING TO CLEAR ON SUCCESS, and that is measured rather than assumed: while the window is
+    # open no read runs at all, so by the time one answers the window has already passed and
+    # `unreachable_for()` is 0. A `_answered()` here was dead — the mutation row that removed it
+    # survived, which in this repository means the code was not doing anything.
+    return answer
+
+
+def _still_silent(what: str, left: float) -> EngineUnreachable:
+    """The refusal of a read while the engine is remembered as silent — one sentence, said by
+    `_within` and by `list_jobs`, which consults the same memory before its shared answer."""
+    return EngineUnreachable(
+        f"the engine did not answer {what} a moment ago, so this read did not wait for it "
+        f"again ({left:.1f}s left before it is asked again)")
+
+
+def _bounded_read(what: str):
+    """Bound one of this module's reads — the seam every read-side caller already goes through."""
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def bounded(*args, **kwargs):
+            return await _within(what, fn(*args, **kwargs))
+
+        return bounded
+
+    return wrap
+
+
+def _a_write(fn):
+    """Mark one of this module's writes: whatever it did, the job list remembered before it is
+    dropped when it returns (`forget_jobs`, #754).
+
+    THE PANEL RE-READS 600-800 MS AFTER A CLICK, inside the job list's window (`LIST_TTL_S`), so
+    without this an Approve, a Merge or a Resume was followed by the list from before it: a button
+    that looks as if it did nothing. ON EVERY EXIT, NOT ONLY A RETURN: a write that raised after
+    the engine took it (a transport that gave up on the reply) changed the list as surely as one
+    that answered, and dropping a list nothing changed costs one scan. A write made by another
+    process (the worker, the CLI) is not seen here; the window is its cost. The panel's Stop and
+    Scan TO-DO now write from this process outside this module (`actions.catalog._stop`, `_scan`)
+    and call `forget_jobs` there, on every exit too. One decorator rather
+    than a line in each write, so a write added later is one line to mark, and
+    `tests/test_a_job_list_read_a_moment_ago_is_shared_and_never_across_loops.py` finds the writes
+    by walking this file, not from a list."""
+
+    @functools.wraps(fn)
+    async def wrote(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            forget_jobs()
+
+    return wrote
+
+
+_WF_ID_PREFIX = "beeverforge-"
+
+
+def temporal_config() -> tuple[str, str]:
+    """(address, namespace) — ASKED OF `connection`, not re-derived here (#163).
+
+    This read the same two variables in the OPPOSITE precedence, with its own localhost default:
+    two answers to "where is the engine", and a deployment that set both would have the panel
+    linking to one while the worker connected to the other. It raises when nobody declared,
+    exactly as `connection.address()` does — every caller here already degrades honestly.
+    """
+    from beeverforge.runtime.temporal import connection
+
+    return connection.address(), connection.namespace()
+
+
+#: Temporal Cloud's gRPC endpoints, both forms. `*.tmprl.cloud` is the original and the only one
+#: this recognised; `<region>.<cloud>.api.temporal.io` is the current one — documented in
+#: `connection.py`'s own header, one module over, while this inferred "not the cloud" from it and
+#: deep-linked a production panel at the local dev server's UI (#163).
+_CLOUD_HOSTS = ("tmprl.cloud", "api.temporal.io")
+
+
+def ui_base() -> str:
+    """Where the engine's web UI lives, or `""` when nobody said. A declared `TEMPORAL_UI_URL`
+    wins; otherwise a Temporal Cloud endpoint maps to the Cloud console. This is what makes the
+    panel's 'Engine ↗' deep-links land on the real console.
+
+    IT GUESSED `http://localhost:8233` FOR EVERYTHING ELSE (#183), under a docstring that called
+    an undeclared UI "not worth an exception" because *this decides a LINK*. A link is exactly
+    what a person clicks: `beeverforge up` started the UI on another port, so **Engine ↗** on a
+    running card answered `ERR_CONNECTION_REFUSED` beside a healthy engine, and the compose file
+    had already worked around the same guess by hand. It is the rule `connection.address()` has
+    followed since #163, one module over — with an empty answer in place of the exception,
+    because the caller that renders a link has no gate to fail: `temporal_url` answers `""`, and
+    the panel draws a greyed button that says which variable to set.
+
+    WHO SAYS IT: `beeverforge up` hands the address of the UI it started to the panel it started
+    (`listeners.started_by_up`), and the compose file declares its own. Only a panel started by
+    hand, beside an engine started by hand, has nobody to tell it — and that is the case this
+    answers honestly.
+
+    THE ENGINE IS ASKED OF THE DEFINITION, in `connection.address()`'s precedence — this read the
+    two names in the opposite order, which is #163's defect surviving in the cloud inference.
+    """
+    if explicit := ENGINE_UI.declared():
+        return explicit
+    if any(host in ENGINE.declared() for host in _CLOUD_HOSTS):
+        return "https://cloud.temporal.io"
+    return ""
+
+
+#: What `address_kind` answers — the KIND of address the engine is reached at, never the address.
+ADDRESS_KINDS = ("undeclared", "unreadable", "cloud", "local", "remote")
+
+
+def address_kind() -> str:
+    """Which kind of address this deployment reaches its engine at (#681): `cloud` for a Temporal
+    Cloud endpoint (`_CLOUD_HOSTS`, the rule `ui_base` reads), `local` for this machine, `remote`
+    for any other host, `undeclared` when nobody said and `unreadable` for a value that names no
+    host. The address itself is the deployment's; the kind is what a supervisor compares."""
+    declared = ENGINE.declared()
+    if not declared:
+        return "undeclared"
+    if any(host in declared for host in _CLOUD_HOSTS):
+        return "cloud"
+    try:
+        ENGINE.where(declared)
+    except ValueError:
+        return "unreadable"
+    return "remote" if ENGINE.elsewhere(declared) else "local"
+
+
+@_bounded_read("a health check")
+async def check_health(client: Client) -> bool:
+    """Whether the engine answers right now: its own health check, the cheapest call it serves,
+    bounded like every read (#681). A pooled client says nothing about the engine — it outlives
+    the engine going away — so readiness asks this, never `connect()` alone."""
+    return await client.service_client.check_health()
+
+
+def job_id(project: str, issue: str) -> str:
+    return f"{_WF_ID_PREFIX}{project}-{issue}"
+
+
+def _registered_projects() -> list[str]:
+    from beeverforge.registry import ProjectRegistry
+
+    return [p.name for p in ProjectRegistry().list()]
+
+
+def parse_job_id(wf_id: str, *, known_projects: list[str] | None = None
+                 ) -> tuple[str | None, str | None]:
+    """`beeverforge-acme-189` → `('acme', '189')`. `(None, None)` for ids of another shape.
+
+    A ref is the PROVIDER's string, and a Jira one contains a hyphen — so the old
+    `rpartition("-")` turned `beeverforge-demo-CONT-412` into project `demo-CONT`, ref `412`.
+    Silently:
+    the panel files the job under a project that does not exist, the tech-lead never finds it, and
+    nothing raises. It worked only because every ref so far has been numeric, and it worked for a
+    hyphenated PROJECT NAME by luck — `rpartition` splits at the last hyphen, so a hyphenated
+    project is fine and a hyphenated ref is not.
+
+    So the split is anchored on the one part we can actually know: the registered project names,
+    longest first (`demo` and `demo-api` can both exist, and matching the shorter one would file
+    every `demo-api` job under `demo`). The remainder is the ref, verbatim.
+
+    DEGRADES, NEVER REFUSES. An unregistered project — one since removed, or a registry that will
+    not read — falls back to the old split. A job that vanished from the panel because its project
+    was deleted would be a worse answer than an imperfectly parsed one.
+    """
+    if not wf_id.startswith(_WF_ID_PREFIX):
+        return None, None
+    rest = wf_id[len(_WF_ID_PREFIX):]
+    if known_projects is None:
+        try:
+            known_projects = _registered_projects()
+        except Exception as exc:  # noqa: BLE001 — a convenience here, not a dependency
+            # Degrade to the old split rather than fail a job listing, but never in silence: with
+            # the registry unreadable, a hyphenated ref parses wrongly and the panel would file
+            # the job under a project that does not exist, looking merely empty.
+            log.warning("could not read the project registry (%s) — parsing %r by its last "
+                        "hyphen, which is wrong for a ref that contains one", exc, wf_id)
+            known_projects = []
+    for name in sorted(known_projects, key=len, reverse=True):
+        if rest.startswith(f"{name}-"):
+            return name, (rest[len(name) + 1:] or None)
+    project, _, issue = rest.rpartition("-")
+    return (project or None), (issue or None)
+
+
+_STATUS = {
+    WorkflowExecutionStatus.RUNNING: "running",
+    WorkflowExecutionStatus.COMPLETED: "completed",
+    WorkflowExecutionStatus.FAILED: "failed",
+    WorkflowExecutionStatus.CANCELED: "canceled",
+    WorkflowExecutionStatus.TERMINATED: "terminated",
+    WorkflowExecutionStatus.CONTINUED_AS_NEW: "continued",
+    WorkflowExecutionStatus.TIMED_OUT: "timed_out",
+}
+
+
+def status_label(status: WorkflowExecutionStatus | None) -> str:
+    return _STATUS.get(status, "unknown")
+
+
+def temporal_url(wf_id: str, run_id: str, namespace: str) -> str:
+    """The workflow's page on the engine's UI, or `""` where nobody said where that UI is (#183):
+    a path appended to a guess is a link to somewhere the person is not."""
+    base = ui_base().rstrip("/")
+    return f"{base}/namespaces/{namespace}/workflows/{wf_id}/{run_id}/history" if base else ""
+
+
+def _row(wf, namespace: str) -> dict:
+    project, issue = parse_job_id(wf.id)
+    return {
+        "workflow_id": wf.id,
+        "run_id": wf.run_id,
+        "project": project,
+        "issue": issue,
+        "status": status_label(wf.status),
+        "start_time": wf.start_time.isoformat() if wf.start_time else None,
+        "close_time": wf.close_time.isoformat() if wf.close_time else None,
+        "temporal_url": temporal_url(wf.id, wf.run_id, namespace),
+    }
+
+
+# The DOMAIN outcome (merged / needs_refinement / on_hold / paused / awaiting_approval /
+# failed) is what an operator actually needs — the raw Temporal status can't tell a clean
+# merge from a needs-refinement (both "completed"). A closed workflow's result is
+# immutable, so cache it forever and fetch each one at most once. (engineering.md #8.)
+#
+# WHICH OF THOSE STATES NEED A PERSON (`ATTENTION_STATES`), and the `action.kind` of a standing
+# pull-request wait (`MERGE_WAIT`), LEFT THIS FILE IN #178 and are imported at the top. This module
+# imports `temporalio`, and the panel's page reads both words on every render — so while they were
+# defined here, an install without the `runtime` extra had a page that answered 500.
+
+
+def _wedged_after() -> float:
+    """How long a job may run, at no gate, before the platform calls it stuck.
+
+    READ FROM THE TECH-LEAD'S OWN CONSTANT so the button and the alarm cannot disagree — the
+    rounds raise `LONG_RUNNING_HOURS` and this decides whether a `Stop` appears; two numbers would
+    mean an operator being told a job is wedged on a screen that offers them nothing (#127).
+
+    Imported lazily and with a floor of its own: `techlead` is an application layer and this module
+    is read by the panel, which must keep working if that import ever grows a dependency it does
+    not have."""
+    try:
+        from beeverforge.techlead.watch import LONG_RUNNING_HOURS
+
+        return float(LONG_RUNNING_HOURS)
+    except Exception as exc:  # noqa: BLE001 — a missing constant must not blank the floor
+        log.warning("could not read LONG_RUNNING_HOURS (%s) — the Stop button uses 8h", exc)
+        return 8.0
+
+
+_WEDGED = _wedged_after()
+
+
+def is_wedged(row: dict, *, live: bool) -> bool:
+    """Is this job running, at no gate, for longer than any real pass takes? (#127)
+
+    A FUNCTION RATHER THAN AN EXPRESSION INSIDE `list_jobs`, because it is a rule and rules get
+    tested. Inline, the only thing a guard could assert was that the assignment existed — and a
+    mutation replacing it with `False` passed every one of them while the Stop button vanished
+    from a floor nobody could clear.
+
+    THREE CONDITIONS, ALL LOAD-BEARING. `live` keeps a closed workflow from being offered a
+    terminate. `action is None` is what separates wedged from WAITING: a job at a gate or in a
+    park is the platform working, and it has its own verbs. The hours are the tech-lead's own
+    constant, so the alarm and the button cannot disagree about what stuck means."""
+    return (bool(live)
+            and (row.get("action") or None) is None
+            and _hours_since(row.get("start_time")) > _WEDGED)
+
+
+def _hours_since(when: str | None) -> float:
+    """Hours since an ISO timestamp, or 0 when there is none to measure from.
+
+    ZERO, NOT INFINITY. A job whose start time we cannot read is not a job that has been running
+    for ever — and offering to terminate one on the strength of an unparseable string is the
+    expensive direction of this whole feature."""
+    if not when:
+        return 0.0
+    try:
+        from datetime import UTC, datetime
+
+        started = datetime.fromisoformat(str(when))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - started).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        return 0.0
+
+#: The workflow queries that mean "a PERSON, not the factory, is what this job is waiting for" —
+#: mapped to the name the readers use for that gate.
+#:
+#: ONE LIST, BECAUSE THE PARK QUERY IS NOT THE WHOLE ANSWER. `awaiting_action` covers impediments
+#: only; a job at the merge gate or the production gate answers it falsy and is otherwise
+#: indistinguishable from a job that is genuinely working. The hourly rounds asked the park query
+#: alone, so a pull request waiting overnight for its author was reported as *"rodando há 10h …
+#: não consegui identificar a causa"* (pilot, 2026-08-16) — an alarm about a healthy job, sent to
+#: the person it was waiting for.
+#:
+#: A gate added to `JobWorkflow` and not added here would recreate that silence exactly, so a
+#: guard derives this mapping from the workflow's own `awaiting_*` queries.
+HUMAN_GATES = {"awaiting_merge": "merge", "awaiting_approval": "prod_approval"}
+#: One entry per job that ever reached a terminal state. Terminal states never change, so
+#: memoising is right — but the panel process never restarts, so the memo needs a floor.
+_state_cache: BoundedDict[tuple[str, str], str] = BoundedDict(2000)
+
+
+async def _true_status(client: Client, wf) -> WorkflowExecutionStatus | None:
+    """The workflow's REAL status. The visibility store `list_workflows` reads from LAGS —
+    it reports a just-terminated/completed workflow as RUNNING for up to minutes, which the
+    panel then paints as a ghost 'in production' card that never clears (the operator sees a
+    finished run frozen at its last station). `describe()` hits the mutable state directly, so
+    it is authoritative. Only paid for running-LOOKING jobs (≤1 on the single line), never for
+    the cached closed history. None → the workflow is gone entirely (aged out)."""
+    if wf.status != WorkflowExecutionStatus.RUNNING:
+        return wf.status
+    try:
+        desc = await client.get_workflow_handle(wf.id, run_id=wf.run_id).describe()
+        return desc.status
+    except Exception as exc:  # noqa: BLE001
+        # never assert 'running' from a read we could not make: the panel would show a job holding
+        # the floor that is not there, and nobody would go looking for the real state
+        log.info("could not confirm %s is still running (%s) — treating it as gone", wf.id, exc)
+        return None
+
+
+@_a_write
+async def gate_key_refusal(client: Client, *, within: float = 20.0) -> str:
+    """Whether the worker accepts a seal made with THIS process's gate key: "" when it does,
+    otherwise its refusal. Raises when no worker answers within `within` seconds — which is not
+    a disagreement, and must not be reported as one."""
+    import uuid
+    from datetime import timedelta
+
+    from beeverforge import gate_seal
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.workflow import GateKeyProbeWorkflow
+
+    wf_id = f"beeverforge-gate-probe-{uuid.uuid4().hex[:12]}"
+    seal = gate_seal.seal(gate_seal.PROBE, wf_id, "probe")
+    return str(await client.execute_workflow(
+        GateKeyProbeWorkflow.run, seal, id=wf_id, task_queue=TASK_QUEUE,
+        execution_timeout=timedelta(seconds=within)) or "")
+
+
+async def _gate_refusal(client: Client, wf_id: str, run_id: str | None = None) -> str:
+    """Why this job's last answer to its approval gate was not acted on, or "" (`gate_seal`).
+
+    THE PANEL SAID "APPROVED", and the worker may have refused it — most likely because the two
+    hold different gate keys. Without this the gate simply keeps waiting and nothing a person
+    reads says why. A worker too old to answer the query has refused nothing: ""."""
+    try:
+        return str(await client.get_workflow_handle(wf_id, run_id=run_id).query(
+            JobWorkflow.gate_refused) or "")
+    except Exception as exc:  # noqa: BLE001 — the card degrades, it never 500s
+        log.info("could not ask %s whether it refused an answer (%s)", wf_id, str(exc)[:120])
+        return ""
+
+
+async def _domain_state(client: Client, wf) -> tuple[str, dict | None, bool]:
+    """The job's domain state, any operator ACTION it's parked on, and whether the workflow is
+    genuinely LIVE. Running: a single-line park (impediment/rate-limit) surfaces its real state
+    ('on_hold'/'needs_refinement'/'paused') plus the action payload {kind,state,note} so the
+    panel can offer Resume/Skip; else the prod-approval gate, else 'running'. Closed: the
+    RunResult's state (cached), or 'failed'. A visibility-lagged 'running' that describe()
+    reveals as closed/gone is corrected here (live=False) — never the stale 'in production'
+    ghost. live distinguishes a truly-running park from a COMPLETED-with-that-result run (both
+    read e.g. 'on_hold'), so the caller can trust it for the live-card decision."""
+    true = await _true_status(client, wf)
+    if true == WorkflowExecutionStatus.RUNNING:
+        try:
+            handle = client.get_workflow_handle(wf.id, run_id=wf.run_id)
+            act = await handle.query(JobWorkflow.awaiting_action)  # parked (impediment/pause)?
+            if act:
+                return (act.get("state") or "on_hold"), act, True
+            mw = await handle.query(JobWorkflow.awaiting_merge)  # PR open, in the merge watch?
+            if mw:
+                # A PASS IS RUNNING ON IT (#151) — the operator already answered and the machine
+                # is acting on that answer, so nobody is being asked anything. Reading this as a
+                # gate is how "Needs you" appeared over a job an agent was actively rewriting,
+                # with Merge and Discard live beside it.
+                if mw.get("working"):
+                    return JobState.REPAIRING.value, {"kind": MERGE_WAIT, **mw}, True
+                # human path (auto=False) NEEDS the operator: review + merge the PR. The auto
+                # path is just CI/auto-merge pending — informative, not attention.
+                state = "merging" if mw.get("auto") else "awaiting_your_merge"
+                return state, {"kind": MERGE_WAIT, **mw}, True
+            if await handle.query(JobWorkflow.awaiting_approval):
+                return "awaiting_prod_approval", None, True
+        except Exception as exc:  # noqa: BLE001 — the panel degrades, never 500s
+            # The panel now shows a state derived without asking the job. A workflow that cannot be
+            # queried is usually one whose worker is gone, which is worth seeing.
+            # `wf.id`, NOT `job_id` — that name is the module-level FUNCTION at the top of this
+            # file, so the one log line whose entire purpose is to name the workflow that will not
+            # answer printed `<function job_id at 0x…>`. Same class as the `namespace()` call that
+            # swallowed the pilot's merge, and invisible for the same reason: it is a plausible
+            # value in a message nobody diffs.
+            log.warning("could not query %s for its state (%s)", wf.id, str(exc)[:120])
+        return "running", None, True
+    if true is None:
+        return "gone", None, False  # aged out of retention — not a live card
+    key = (wf.id, wf.run_id)
+    if key not in _state_cache:
+        state = "failed"
+        if true == WorkflowExecutionStatus.COMPLETED:
+            try:
+                result = await client.get_workflow_handle(wf.id, run_id=wf.run_id).result()
+                state = (result.get("state") if isinstance(result, dict) else None) or "done"
+            except Exception as exc:  # noqa: BLE001 — the panel degrades, it never blanks
+                # "failed" is what the panel shows either way, but a workflow we cannot READ and a
+                # workflow that failed are different problems and only the log tells them apart.
+                log.info("could not read the result of %s (%s) — showing it as failed", wf.id, exc)
+                state = "failed"
+        _state_cache[key] = state
+    return _state_cache[key], None, False
+
+
+# The post-merge deploy-watch (ADR-0005) runs as a SEPARATE abandoned child workflow
+# (beeverforge-deploy-<project>-<issue>) that only notifies. Its outcome is invisible on the
+# JobWorkflow card (the job is "merged" the moment it merges), so the panel reads the child
+# directly and shows the deploy status too. A terminal deploy result is immutable → cache it.
+_DEPLOY_LABEL = {"success": "deployed", "failure": "deploy_failed", "timeout": "deploy_timeout"}
+_deploy_cache: BoundedDict[str, str] = BoundedDict(2000)
+
+
+async def _deploy_state(client: Client, project: str, issue: str) -> str | None:
+    """The deploy-watch outcome for a merged job: 'deploying' (watch still observing),
+    'deployed' / 'deploy_failed' / 'deploy_timeout' (terminal), or None when the job has no
+    watch (not opted in, or older than ADR-0005). Reads the child workflow directly; terminal
+    outcomes are cached so a shipped job is described at most once."""
+    wf_id = f"beeverforge-deploy-{project}-{issue}"
+    if wf_id in _deploy_cache:
+        return _deploy_cache[wf_id]
+    try:
+        desc = await client.get_workflow_handle(wf_id).describe()
+    except Exception as exc:  # noqa: BLE001 — usually genuinely absent (not opted in)
+        log.debug("no deploy-watch for %s (%s)", wf_id, exc)
+        return None
+    if desc.status == WorkflowExecutionStatus.RUNNING:
+        return "deploying"  # not cached — re-checked until it settles
+    label = "deploy_failed"  # a failed/terminated/timed-out child reads as a deploy failure
+    if desc.status == WorkflowExecutionStatus.COMPLETED:
+        try:
+            result = await client.get_workflow_handle(wf_id).result()
+            label = _DEPLOY_LABEL.get(str(result), "deploy_failed")
+        except Exception as exc:  # noqa: BLE001 — same degrade as above
+            log.info("could not read deploy %s (%s) — showing it as failed", wf_id, exc)
+            label = "deploy_failed"
+    _deploy_cache[wf_id] = label
+    return label
+
+
+async def _memo_title(wf) -> str:
+    """The ticket title the workflow stamped into its memo (ADR-0005 companion) — decoded from
+    the raw memo the list response already carried, so no extra RPC. '' when absent (older jobs
+    started before titles were stamped, or a title lookup that failed)."""
+    try:
+        return str((await wf.memo()).get("title") or "")
+    except Exception as exc:  # noqa: BLE001 — a title is decoration; the number identifies the job
+        log.debug("no memo title (%s)", exc)
+        return ""
+
+
+def _why(state: str, result: dict) -> str:
+    """A plain-but-technical explanation of WHY the job is in this state — so the panel's
+    card modal answers "why didn't this merge / why does it need me", instead of a bare
+    `pr_open`. Derived deterministically from the RunResult (no LLM call per open)."""
+    supp = result.get("added_suppressions") or []
+    review = result.get("review") or {}
+    note = result.get("note")
+    if state == "merged":
+        return ("Merged — every gate passed, the review didn't reject it, and the merge "
+                "policy allowed it.")
+    if state == "pr_open":
+        if supp:
+            kinds = ", ".join(sorted(set(supp)))
+            return (f"Not auto-merged: the diff ADDS gate-suppression(s) [{kinds}]. A suppression "
+                    f"tells a quality gate to ignore some code (e.g. `pragma: no cover` exempts it "
+                    f"from the coverage requirement). You can't pass a gate by silencing it, "
+                    f"so any added suppression is always sent to a human — confirm it's "
+                    f"legitimate (test/"
+                    f"defensive code) and not hiding untested production code, then merge.")
+        if review.get("decision") == "rejected":
+            return (f"The independent review REJECTED it (score {review.get('score')}). "
+                    f"{review.get('summary') or ''}").strip()
+        return ("Handed to human review — the project's merge policy requires a human, or a "
+                "high-risk component was touched.")
+    if state == "on_hold":
+        return note or "On hold for a human (gates unfixable, a merge conflict, or a deadline)."
+    if state == "needs_refinement":
+        return note or "Sent back for refinement — the spec was unclear or the plan was too large."
+    if state == "paused":
+        return note or "Paused on a usage/rate limit — resumes on its own (durable timer)."
+    return note or state
+
+
+@_bounded_read("the job's detail")
+async def job_detail(client: Client, project: str, issue: str, namespace: str) -> dict:
+    """The card-click briefing: runtime, cost, PR, WHY it's in this state, the review verdict
+    + findings, the added suppressions (with location), and the gate results. Reads the
+    JobWorkflow's result once; running/older jobs return what's available."""
+    wf_id = job_id(project, issue)
+    handle = client.get_workflow_handle(wf_id)
+    out: dict = {"project": project, "issue": issue, "workflow_id": wf_id}
+    try:
+        desc = await handle.describe()
+    except Exception as exc:
+        return {**out, "error": f"job not found: {str(exc)[:120]}"}
+    out["status"] = status_label(desc.status)
+    out["title"] = await _memo_title(desc)
+    out["temporal_url"] = temporal_url(wf_id, desc.run_id, namespace)
+    start, close = getattr(desc, "start_time", None), getattr(desc, "close_time", None)
+    out["runtime_ms"] = int((close - start).total_seconds() * 1000) if start and close else None
+    if desc.status == WorkflowExecutionStatus.RUNNING:
+        # ASK THE JOB, DO NOT READ ITS TEMPORAL STATUS (#174, measured on the pilot).
+        #
+        # A job parked at a gate IS still RUNNING as a workflow — that is the design: single-line
+        # strict holds the floor until the merge lands (ADR-0007). So this branch returned
+        # `running` / "Still running." for EVERY parked job — the merge gate, the production
+        # approval, an impediment, a decision — on the one screen where a person is deciding.
+        #
+        # Measured at one instant, three readers of one job:
+        #     /api/temporal/jobs   awaiting_your_merge   action merge_wait
+        #     /api/inbox           awaiting_your_merge   "Review rejected it"
+        #     this                 running               "Still running."
+        #
+        # The queries were there the whole time — `list_jobs` asks them through `_domain_state`,
+        # and `verdict` was published for exactly this (#149: a rejected pull request must not
+        # look like an approved one). This is the same one-question-two-answers class as the floor
+        # and the inbox (#164), and the poorer answer was on the deciding surface.
+        state, action, _live = await _domain_state(client, desc)
+        out["state"] = state
+        out["action"] = action
+        out["refused"] = (await _gate_refusal(client, wf_id)
+                          if state == "awaiting_prod_approval" else "")
+        if action and action.get("pr_url"):
+            out["pr_url"] = action["pr_url"]
+        try:  # THE VERDICT IS A QUERY, so it exists long before the workflow completes
+            out["review"] = await handle.query(JobWorkflow.verdict)
+        except Exception as exc:  # noqa: BLE001 — the card degrades, it never 500s
+            log.info("could not read %s's review verdict (%s)", wf_id, str(exc)[:120])
+            out["review"] = None
+        # `pr_open` IS THE PHRASE THE EXPLANATION IS WRITTEN FOR — it is what a merge gate is, and
+        # `_why` says which of its three causes this one is (a suppression, a rejected review, or
+        # the policy). The domain state a live gate reports is the narrower `awaiting_your_merge`.
+        out["why"] = _why("pr_open" if state == "awaiting_your_merge" else state,
+                          {"note": (action or {}).get("note") or "",
+                           "review": out["review"] or {}})
+        out["ci_checks"] = await _pr_checks(project, out.get("pr_url")) if out.get("pr_url") else []
+        out["ci_provider"] = _ci_provider(project)
+        return out
+    if desc.status != WorkflowExecutionStatus.COMPLETED:
+        out["state"] = "failed"
+        out["why"] = "The workflow itself failed."
+        return out
+    try:
+        r = await handle.result()
+    except Exception as exc:  # noqa: BLE001
+        log.info("could not read the result of %s (%s) — reporting it as failed", handle.id, exc)
+        return {**out, "state": "failed", "why": "The workflow failed before producing a result."}
+    r = r if isinstance(r, dict) else {}
+    state = r.get("state") or "done"
+    out.update({
+        "state": state,
+        "cost_usd": r.get("total_cost_usd"),
+        "pr_url": r.get("pr_url"),
+        "note": r.get("note"),
+        "repair_attempts": r.get("repair_attempts"),
+        "review": r.get("review"),
+        "suppressions": r.get("suppression_details") or [],
+        "added_suppressions": r.get("added_suppressions") or [],
+        "gates": [{"name": v.get("name"), "passed": v.get("passed")}
+                  for v in (r.get("validations") or [])],
+        "why": _why(state, r),
+    })
+    out["deploy"] = await _deploy_state(client, project, issue) if state == "merged" else None
+    out["ci_checks"] = await _pr_checks(project, r.get("pr_url")) if r.get("pr_url") else []
+    out["ci_provider"] = _ci_provider(project)
+    return out
+
+
+def _lists_review_comments(project: str) -> bool:
+    """Whether `project`'s forge can list a pull request's review comments (#330); False when the
+    project cannot be read, because a button nobody can use is worse than none."""
+    try:
+        from beeverforge.adapters.forge.registry import lists_review_comments
+        from beeverforge.registry import ProjectRegistry
+
+        return lists_review_comments(ProjectRegistry().get(project))
+    except Exception as exc:  # noqa: BLE001 — unknown is not able
+        log.info("could not ask whether %s's forge lists review comments (%s)", project,
+                 str(exc)[:120])
+        return False
+
+
+def _ci_provider(project: str) -> str:
+    """Whose CI these checks came from, for the panel's own heading.
+
+    THE PANEL SAID "CI checks (GitHub)" TO EVERY READER. It is a hardcoded vendor name on the
+    surface ADR-0038 calls the REFERENCE one, in the same class the product owner flagged when the
+    cockpit told an OpenCode-on-Bedrock project it was running Claude Code: *"this is a
+    multi-harness product — hardcoded things at this point are not acceptable."* An Azure Repos
+    project fills this list from Azure Pipelines and was labelled GitHub, which is not a cosmetic
+    error — it is the panel asserting a fact about a client's infrastructure that is false, and an
+    operator debugging a red check would have gone looking on github.com.
+
+    THE NAME IS THE ROW'S OWN. A table of labels lived here, keyed by kind, under a comment that
+    said what was wrong with it — "a new provider must not need this table to be displayed
+    HONESTLY, only to be displayed prettily" — so a CI add-on was shown by its registry key and
+    showing it properly meant editing the core. The observer's row is asked instead
+    (`observer_name`); one that declares no name is still shown by its kind, as it was.
+
+    "" when it cannot be resolved, and the panel then writes a bare "CI checks" — no name is
+    strictly better than the wrong name."""
+    try:
+        from beeverforge.adapters.environment.registry import observer_name
+        from beeverforge.registry import ProjectRegistry
+
+        # THE OBSERVER, NOT THE FORGE, AND THE TWO DISAGREED (ADR-0049 D6). `build_observer`
+        # dispatches on `observer_kind`, which reads `forge.options.ci` first; this heading read
+        # `forge_kind`, which does not. So a GitHub repository whose checks come from a declared
+        # non-GitHub CI was labelled "GitHub" over checks fetched from somewhere else — the
+        # heading and the fetcher naming different systems about the same list.
+        return observer_name(ProjectRegistry().get(project))
+    except Exception as exc:  # noqa: BLE001 — a heading must never take the cockpit down
+        log.info("could not resolve the CI provider label for %s (%s)", project, exc)
+        return ""
+
+
+async def _pr_checks(project: str, pr_url: str) -> list[dict]:
+    """The PR's CI checks (e2e / vitest / pg_integration / …) — the other half of the picture the
+    sandbox gates don't show. Best-effort: [] on any error (no creds, gh missing)."""
+    import asyncio
+
+    def _fetch() -> list[dict]:
+        try:
+            from beeverforge.adapters.forge.registry import build_forge
+            from beeverforge.credentials import forge_token_for
+            from beeverforge.factory import bot_token_provider_for
+            from beeverforge.registry import ProjectRegistry
+
+            # PER PROJECT. `forge_token()` is one process-wide value, so this handed an Azure Repos
+            # project the deployment's GitHub credential — presented as HTTP Basic to
+            # dev.azure.com, read back as a 401, and swallowed into "no checks shown".
+            proj = ProjectRegistry().get(project)
+            tok = forge_token_for(proj)
+            forge = build_forge(proj, token=tok,
+                                token_provider=(None if tok
+                                                else bot_token_provider_for(proj, "forge")))
+            # WHAT EACH CHECK IS, the way the merge watch reads it (#184): a row that cannot stop
+            # the merge arrives `advisory`, so the panel stops drawing an optional policy as a red
+            # gate. The rows only — never `checks.read`, which also fetches the failing log, and
+            # this runs every time somebody opens a job.
+            from beeverforge.contracts import checks
+
+            rows = forge.pr_checks(pr=pr_url) or []
+            return checks.as_rows([c for c in map(checks.from_row, rows) if c is not None])
+        except Exception as exc:  # noqa: BLE001 — the panel degrades to "no checks shown"
+            log.info("could not read PR checks for %s (%s)", pr_url, exc)
+            return []
+
+    return await asyncio.to_thread(_fetch)
+
+
+@dataclass
+class _Pooled:
+    """One live client, the loop it belongs to, the lock that stops a cold process racing — and
+    what the last connect attempt on it RAISED, so the callers queued behind a failure share it
+    instead of each retrying in turn. See `connect()`'s "A FAILED CONNECT IS SHARED" paragraph."""
+
+    loop: asyncio.AbstractEventLoop
+    lock: asyncio.Lock
+    client: Client | None = None
+    failures: int = 0
+    error: Exception | None = None
+
+
+#: `(address, namespace, auth-digest)` → the ONE client this process holds for that target — and
+#: ONE ENTRY IN TOTAL, because a process has one engine target at a time and a target that changes
+#: is a new key, not a second deployment (see `connect()`).
+#:
+#: A CONNECTION IS A RESOURCE, NOT A DERIVED VALUE, and that is why this is not the caching
+#: ADR-0023 refused ("the map is derived, not learned"): there, recomputing is cheap and a stale
+#: copy is a wrong ANSWER. Here reusing a client asserts nothing about the world — the thing being
+#: avoided is not 0.3 s of CPU but an unbounded socket count.
+_CLIENTS: dict[tuple[str, str, str], _Pooled] = {}
+
+#: How much longer than the attempt's own bound a read waits for a connect, in seconds. The attempt
+#: ends itself at `read_deadline()` (`connection.connect`) and, with JSON lines, leaves its target
+#: resting, so the next reads build nothing; this wait is the backstop for a read queued behind a
+#: longer attempt (a worker's birth connect). EQUAL TO THE ATTEMPT'S BOUND, this timer — started
+#: first — fired first, and an engine that never answered ended each attempt as a cancellation,
+#: which is nobody's failure and leaves no rest (review on 3cd816ac).
+CONNECT_BACKSTOP_S = 1.0
+
+
+def reset_clients() -> None:
+    """Drop every pooled client. The seam `tests/conftest.py` clears between tests, so a fake
+    client a patched `connection.connect` handed this pool cannot become the next test's engine."""
+    _CLIENTS.clear()
+    _answered()
+
+
+async def connect() -> Client:
+    """The READ side's client for this engine — the one this process already holds, when it has
+    one (GitHub issue #134).
+
+    IT OPENED A FRESH gRPC CLIENT ON EVERY CALL AND RELEASED NONE. Every read-side caller resolves
+    through here — `/api/floor` and `/api/floor/{project}` (the page asks for ONE of the two on
+    every engine frame, so as often as the SSE stream's 2 s tick emits one, plus a 20 s safety
+    refresh — `panel.html::applyEngine`), `/api/inbox`, `/api/coordinator/messages`,
+    `/api/temporal/jobs`, `/api/decisions`, the action catalog's `_connected()` — so a panel
+    process accumulated one client per request for as long as a tab was open. Measured by the
+    reporter on 2026-09-15, on a freshly restarted panel with NO browser attached: six sequential
+    `/api/floor` requests took it from 20 to 32 open gRPC connections; overnight, 41 connections,
+    7-13 % idle CPU and 20-27 s per request — against
+    0.18 s for the same `gather(EVERYTHING)` called in-process. A restart returned it to ~2 s.
+    `reading.py::gather`'s own docstring already stated the rule this broke: *"Reuse matters."*
+
+    HERE, ON TOP OF `connection.connect()`. That door made a client per call when this pool was
+    born, and its callers — `worker.py`, `starter.py`, `schedule.py` — each wanted one of their
+    own; since #681 it holds the process's ONE client and hands it to every caller, on any loop
+    (`connection.connect`). This is the read side's door on top of it: the read side's bound
+    (`_within`), a failure shared among the callers on one loop, and the seam ~40 tests patch, so
+    the pool is bypassed exactly where connecting already is. (Activities never come here: an
+    activity uses the client its worker holds — `activities.engine_client`, #217.)
+
+    KEYED BY THE RUNNING LOOP, FOR THE LOCK'S SAKE. An entry's `asyncio.Lock` belongs to the loop
+    that made it, so an entry serves only that loop, and a caller on another loop makes an entry of
+    its own. It costs a dict entry, never a client: the client under every entry is the process's
+    one. (This paragraph used to say a client made on a loop that has since closed is a broken read
+    on the next one. Measured since, on temporalio 1.29 and later, it is not — #681,
+    `connection.connect` — and the package requires that version.) The comparison is identity
+    against the RUNNING loop and nothing else: an `is_closed()` term here could only ever be
+    evaluated on the running loop, which cannot be closed — a mutation deleting it survived the
+    guard whole (`10 passed`, 2026-09-15), which in this repository means the code was dead.
+
+    AND THE POOL HOLDS AT MOST ONE ENTRY, TOTAL — not one per key. `fingerprint()` reads
+    process-wide environment and the TLS files it names, so a process has exactly one engine target
+    at a time; a target that CHANGES (a moved address, a rotated API key, a cert rewritten in
+    place) yields a different key, and keeping the old entry beside the new one would retain its
+    client for the life of the process. That is #134's leak again, on a deployment's clock instead
+    of a request's — and it would arrive by exactly the path the cert-content digest opens. So a
+    new entry EMPTIES the pool rather than joining it. Nothing is evicted from under a coroutine:
+    a holder mid-`async with` keeps its own reference.
+
+    SINGLE FLIGHT, because this is the normal case rather than an edge: the panel issues several
+    requests on load and then re-reads the floor on every engine frame, so a cold process races
+    itself immediately. N concurrent first calls open one client, not N. The lock is made with
+    the entry, on that entry's loop, and never shared across loops.
+
+    A FAILED CONNECT IS SHARED, NOT CACHED, AND THE DIFFERENCE IS BOTH HALVES. The lock gave
+    single flight on success only: a caller queued behind a FAILING attempt took the lock, found
+    no client and connected again, so N concurrent callers made N attempts in series. Measured by
+    the reviewer of #145 on 2026-09-15 — six concurrent calls against a `connection.connect` that
+    takes 0.5 s to refuse:
+
+        da669de (no pool): 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 s   — six attempts, in parallel
+        the lock alone:    0.5, 1.0, 1.5, 2.0, 2.5, 3.0 s   — six attempts, one after another
+
+    That is a regression the pool introduced, and an outage is when it bites: a connect to an
+    unreachable address was STILL HANGING AFTER 40 s when the probe measuring it gave up — that
+    40 s was the probe's own `asyncio.wait_for`, not a bound the SDK declares, and what the SDK
+    does past it is unmeasured — no read-side caller puts a timeout around this, and the
+    floor re-read on every engine frame plus `/api/inbox`, `/api/decisions` and the stream all
+    arrive faster than such a queue drains. So a caller that queued behind a failed attempt takes
+    THAT attempt's failure (one attempt, one refusal's worth of elapsed time, for all six), while a
+    caller arriving AFTERWARDS tries again — which is what lets a recovered engine be picked up
+    without a restart. Nothing is cached: freezing a panel in "the engine did not answer" until
+    somebody restarts it is the same class of defect as the one this fixes.
+
+    WHAT THIS DELIBERATELY DOES NOT DO:
+
+      - NO TTL. The issue offers "a pool with a bounded lifetime"; a lifetime is a number nobody
+        has measured, and expiring a healthy client is a reconnect this exists to stop. The
+        Temporal SDK reconnects underneath us.
+      - NO INVALIDATION ON RPC ERROR. An engine blip already reaches every caller as a degraded
+        read; dropping the pooled client on each one would reopen the leak on exactly the path that
+        is already unhappy.
+      - NOTHING IS CLOSED, because there is nothing to call. Checked against the INSTALLED
+        temporalio 1.33.0 on 2026-09-15 (`pyproject.toml` pins `>=1.7`): neither `Client` nor
+        `ServiceClient` nor the bridge client under it exposes `close`, `shutdown`, `__aexit__` or
+        `__del__`. Dropping the reference is all a caller can do — which is precisely why the fix
+        is "stop opening them" rather than "close them".
+    """
+    from beeverforge.runtime.temporal.connection import connect as _connect
+    from beeverforge.runtime.temporal.connection import fingerprint
+
+    key = fingerprint()
+    loop = asyncio.get_running_loop()
+    entry = _CLIENTS.get(key)
+    if entry is not None and entry.loop is not loop:
+        entry = None
+    if entry is None:
+        # EMPTIED, NOT ADDED TO — this is the "at most one entry, total" line. A stale entry under
+        # a DIFFERENT key (a moved address, a rotated key, a cert rewritten in place) would
+        # otherwise sit beside the live one for ever, holding its client: #134's leak again, on
+        # the slow clock of a deployment's re-keying. Dropping it from the dict is enough and is
+        # all that is safe — a coroutine mid-`async with` on it holds its own reference and
+        # finishes on the client it already has.
+        _CLIENTS.clear()
+        entry = _CLIENTS[key] = _Pooled(loop=loop, lock=asyncio.Lock())
+    # READ BEFORE THE AWAIT, which is the whole mechanism: it says which attempts this caller was
+    # not present for. Read after acquiring the lock it would always equal `entry.failures`, and
+    # every waiter would retry — the defect below.
+    seen = entry.failures
+    async with entry.lock:
+        if entry.client is None and entry.failures != seen:
+            # The attempt this caller queued behind has just failed; take its failure rather than
+            # making the same one again. `.with_traceback(None)` because this ONE object is
+            # retained by the pool for the length of an outage and each bare `raise` of it appends
+            # a frame. Measured through THIS pool on 2026-09-15 — N callers queued behind one
+            # 0.05 s refusal, counting `traceback.extract_tb(entry.error.__traceback__)` after
+            # 1 / 10 / 1000 re-raises: a bare `raise entry.error` gives 5 / 23 / 2003 frames and
+            # keeps going; `.with_traceback(None)` gives 2 / 2 / 2, message unchanged. Unbounded
+            # growth in a module-level object is what `tests/test_no_unbounded_growth.py` exists
+            # for, and an outage is exactly when this object is re-raised most.
+            raise entry.error.with_traceback(None)
+        if entry.client is None:
+            # THE LAST FAILURE IS LET GO OF BEFORE THE NEXT ATTEMPT: nobody behind this attempt can
+            # be handed it (they take this attempt's own outcome), and its traceback holds the
+            # runtime the failed attempt was made on, so kept, it outlived the collection a client
+            # that lands runs to free that runtime (`connection.connect`, review on 3cd816ac).
+            entry.error = None
+            try:
+                # BOUNDED LIKE EVERY READ (#159). A connect to an unreachable
+                # address "was STILL HANGING AFTER 40 s" — the docstring above
+                # says so and no caller put a bound around it.
+                entry.client = await _within("a connection", _connect(),
+                                             seconds=read_deadline() + CONNECT_BACKSTOP_S)
+            except Exception as exc:
+                # `CancelledError` IS NOT AN `Exception` and deliberately does not land here: a
+                # holder whose request was cancelled proves nothing about the engine, so it counts
+                # as no attempt at all and the next waiter tries for itself.
+                entry.error, entry.failures = exc, entry.failures + 1
+                raise
+            # AND RELEASED THE MOMENT THE ENGINE ANSWERS. `entry.error` holds the last failure and
+            # its traceback, and a recovered engine has no use for either: measured by #145's
+            # reviewer on 2026-09-15, one failed connect followed by a successful one left the
+            # entry still holding the exception and its 3 traceback frames until the process
+            # restarted. One object, so not a leak — but a retained one nothing can read, since
+            # the branch above is reachable only while `client is None`.
+            entry.error = None
+        return entry.client
+
+
+@_bounded_read("the poller's schedules")
+async def intake(client: Client) -> dict:
+    """Whether the thing that PICKS UP work is switched on: `{on, note, known}`.
+
+    THE PANEL COULD NOT ANSWER THIS, and its header implied it could. "engine live" means the
+    platform can reach Temporal — a different fact entirely from "the poller is running". A
+    PAUSED poller with a reachable engine renders exactly like a healthy factory, under a line
+    that reads "a new card in TO-DO goes into production on its own (scanned every 3 min)". That
+    sentence is then false, on screen, with nothing contradicting it: cards sit in TO-DO, the
+    floor stays idle, and the only way to find out was to run a script from a laptop with the
+    cloud credentials sourced — which is not an answer a product can rely on somebody having.
+
+    Not hypothetical: pausing this schedule is the ONLY real way to hold the queue (emptying
+    TO-DO does not, because auto-split refills it), so it is a lever an operator genuinely pulls,
+    and the live schedule still carries the note from the last time it was pulled.
+
+    `known=False` when the schedule cannot be read. Never guessed as ON: a header claiming intake
+    is running when we could not ask is the same lie one layer down.
+
+    AND WHETHER IT IS ACTUALLY TICKING, not merely switched on (#140). "Not paused" is a setting;
+    a poller that fires every three minutes is a fact, and only the second one lets a screen
+    promise that the next card in TO-DO gets picked up. `describe()` already returns all of it —
+    this function read `.schedule.state` and threw the rest away, so the panel hard-coded
+    "scanned every 3 min" and had no way to notice a schedule that had stopped firing.
+
+    THE HONESTY CEILING, and it is written here because the copy downstream depends on it:
+    `recent_actions` proves a tick FIRED — that the poll workflow was STARTED. It does not prove
+    a scan COMPLETED. A dead worker leaves the schedule firing happily into an empty task queue.
+    So a reader of these fields may say "the poller last fired X ago" and must never say "the
+    last scan completed X ago".
+
+    SECONDS, COMPUTED HERE. The browser's clock is not this deployment's clock: a laptop four
+    minutes fast would read a healthy three-minute poller as stalled, and a slow one would read a
+    dead poller as fresh — the reassuring direction, which is the expensive one. ISO strings ride
+    along for display only, never for arithmetic.
+    """
+    from beeverforge.runtime.temporal.schedule import SCHEDULE_ID
+
+    #: The shape every branch returns, so a caller never has to ask whether a key is present.
+    #: `None` is the answer for "this deployment's engine did not tell us", which is a different
+    #: thing from zero and must stay tellable apart from it.
+    unread = {"fired_ago_s": None, "next_in_s": None, "every_s": None,
+              "num_actions": None, "running_now": None, "created_ago_s": None,
+              "fired_at": None, "next_at": None}
+
+    async def _one(schedule_id: str) -> dict:
+        try:
+            desc = await client.get_schedule_handle(schedule_id).describe()
+            state = desc.schedule.state
+        except Exception as exc:  # noqa: BLE001 — the panel degrades, it never 500s
+            log.warning("could not read the schedule %s (%s)", schedule_id, str(exc)[:120])
+            return {"known": False, "on": None, "note": "", **unread}
+        # THE SWITCH IS THE PART THAT MUST NEVER FAIL; the cadence is the part that is allowed to
+        # be unknown. An older Temporal server, and every test double in this suite, exposes
+        # `.schedule.state` and nothing else — and `getattr(desc, "info", None)` is NOT enough on
+        # its own, because it only swallows AttributeError: a property that raises anything else
+        # takes the whole intake answer down with it, turning every floor Unknown on a server
+        # version difference. Caught here, so an enrichment can never cost the answer.
+        try:
+            cadence = _cadence(getattr(desc, "info", None), getattr(desc.schedule, "spec", None),
+                               unread)
+        except Exception as exc:  # noqa: BLE001 — an unreadable cadence is reported, not raised
+            log.warning("could not read the cadence of %s (%s) — the switch still answers",
+                        schedule_id, str(exc)[:120])
+            cadence = dict(unread)
+        return {"known": True, "on": not state.paused, "note": str(state.note or ""), **cadence}
+
+    out = await _one(SCHEDULE_ID)
+    # THE OTHER TWO STANDING LOOPS (#24 item 6). Only the poller was proven alive; the product
+    # sweep and the tech-lead's rounds — the loop that carries the release bridge — could stop
+    # (or never be scheduled) and nothing anywhere would say so, because both are SILENT when
+    # they have nothing to report: a dead watcher and a quiet week render identically. Carried
+    # on the same payload the header already reads, keyed by schedule id, so the panel can name
+    # exactly which loop is dark.
+    out["watchers"] = {sid: await _one(sid) for sid in _watcher_schedule_ids()}
+    return out
+
+
+def _cadence(info, spec, unread: dict) -> dict:
+    """What the schedule's own history says about whether it is ticking (#140).
+
+    Its own function so it can be tested against the shapes a Temporal server really returns,
+    without standing up a client — and so the "not told" answer has exactly one definition.
+    """
+    from datetime import UTC, datetime
+
+    if info is None and spec is None:
+        return dict(unread)
+    now = datetime.now(UTC)
+
+    def _ago(when) -> float | None:
+        """Seconds since `when`, clamped at zero. A negative age means the two clocks disagree,
+        and reporting one would make a caller compute a poller that fired in the future."""
+        return None if when is None else max(0.0, (now - when).total_seconds())
+
+    recent = list(getattr(info, "recent_actions", None) or [])
+    # `scheduled_at` is the tick this action BELONGS to; `started_at` is when the worker picked
+    # it up. Prefer the first — it is the cadence question — and fall back to the second.
+    fired = max((r.scheduled_at or r.started_at for r in recent
+                 if (r.scheduled_at or r.started_at)), default=None)
+    nxt = next(iter(getattr(info, "next_action_times", None) or []), None)
+    every = next((i.every for i in (getattr(spec, "intervals", None) or [])), None)
+    created = getattr(info, "created_at", None)
+    return {
+        "fired_ago_s": _ago(fired),
+        # NOT clamped: a next tick already in the past is exactly the signal that the schedule
+        # has stopped being serviced, and clamping it to zero would hide that.
+        "next_in_s": None if nxt is None else (nxt - now).total_seconds(),
+        "every_s": None if every is None else every.total_seconds(),
+        "num_actions": getattr(info, "num_actions", None),
+        "running_now": len(getattr(info, "running_actions", None) or []),
+        "created_ago_s": _ago(created),
+        "fired_at": fired.isoformat() if fired else None,   # display only
+        "next_at": nxt.isoformat() if nxt else None,        # display only
+    }
+
+
+def _watcher_schedule_ids() -> list[str]:
+    """The per-project standing loops this deployment SHOULD have running."""
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.temporal.schedule import PRODUCT_SCHEDULE_PREFIX, WATCH_SCHEDULE_PREFIX
+
+    ids: list[str] = []
+    try:
+        for p in ProjectRegistry().list():
+            if not p.enabled:
+                continue
+            ids.append(f"{WATCH_SCHEDULE_PREFIX}-{p.name}")
+            if getattr(p, "product", None) is not None:
+                ids.append(f"{PRODUCT_SCHEDULE_PREFIX}-{p.name}")
+    except Exception as exc:  # noqa: BLE001 — an unreadable registry must not take the panel down
+        log.warning("could not list the projects for the watcher check (%s)", exc)
+    return ids
+
+
+async def _enriched(client: Client, wf, namespace: str) -> dict | None:
+    """One listed workflow as the job list's row, every engine question it needs asked; `None`
+    when visibility still lists a workflow that aged out (`gone`), which is not a card."""
+    row = _row(wf, namespace)
+    row["state"], row["action"], live = await _domain_state(client, wf)
+    if row["state"] == "gone":
+        return None  # visibility still lists it but the workflow aged out — not a real card
+    # The merge gate carries its refusal in `action`; the approval gate has no action, so
+    # its refusal travels on the row.
+    row["refused"] = (await _gate_refusal(client, wf.id, wf.run_id)
+                      if row["state"] == "awaiting_prod_approval" else "")
+    # WHETHER `address` IS REAL AT THIS GATE (#330) is the forge's to say, and the job cannot:
+    # a workflow does not know its project's forge row. Asked only of a job at a merge gate,
+    # and asking builds the row without a call.
+    if row["state"] == "awaiting_your_merge" and isinstance(row["action"], dict):
+        row["action"] = {**row["action"],
+                         "can_address": _lists_review_comments(row.get("project") or "")}
+    # Reconcile the visibility status (which LAGS) with the truth: the panel paints an
+    # 'in production' machine card for any job whose status=='running', so a lagged
+    # 'running' on an already-closed workflow was the frozen ghost. Only a genuinely live
+    # workflow keeps 'running'; a closed one is stamped 'closed' so the card clears.
+    if not live and row["status"] == "running":
+        row["status"] = "closed"
+    # ATTENTION means "a human must act on a LIVE job". A closed workflow (completed/
+    # terminated/gone) can still carry a cached parked-ish state (e.g. a run that was
+    # on_hold then terminated, or needs_refinement then completed) — gate on `live` so a
+    # finished job never shows a phantom "needs attention" in the panel/Slack count.
+    row["attention"] = live and row["state"] in ATTENTION_STATES
+    row["title"] = await _memo_title(wf)  # panel shows it beside the #number
+    # WEDGED: running, at no gate, for longer than any real pass takes (#127). A job in this
+    # state holds the single-slot floor and no verb could reach it — `resume`/`skip` answer a
+    # park and the engine refuses them, the merge verbs answer a gate — so the honest exit was
+    # "open Temporal and terminate", a raw-engine operation on the one surface this product
+    # promises an operator will never need.
+    #
+    # DECIDED HERE, not in the browser, and against the SAME constant the tech-lead's rounds
+    # use to raise the alarm. Two readings of "stuck" would disagree by next month, and the
+    # one on the button is the one that matters.
+    row["wedged"] = is_wedged(row, live=live)
+    # surface the post-merge deploy outcome (ADR-0005) so the watch isn't invisible when
+    # no external notifier is configured — only merged jobs can have a deploy running.
+    row["deploy"] = await _deploy_state(client, row["project"], row["issue"]) \
+        if row["state"] == "merged" and row["project"] and row["issue"] else None
+    return row
+
+
+async def _enriched_in_order(client: Client, batch: list, namespace: str,
+                             room: asyncio.Semaphore) -> list[dict | None]:
+    """`batch`'s rows, asked about side by side and handed back IN THE BATCH'S ORDER.
+
+    A TaskGroup, so a deadline or a caller that went away cancels every question still asked
+    (nothing outlives the read: a query a silent worker never answers waits until the SDK gives
+    up). The first row that failed is raised as itself, and the group cancels the others: callers
+    catch the SDK's errors, not an `ExceptionGroup`. Not necessarily the first in list order: a
+    later row that fails first cancels an earlier one before it raises (row 1 raising after 50 ms,
+    row 2 after 1 ms → row 2's error, measured 2026-10-20), where the sequential walk raised row
+    1's. Callers catch broadly, so which row's error it is changes nothing they do."""
+
+    async def one(wf):
+        async with room:
+            return await _enriched(client, wf, namespace)
+
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(one(wf)) for wf in batch]
+    except BaseExceptionGroup as failed:
+        raise failed.exceptions[0] from None
+    return [t.result() for t in tasks]
+
+
+#: How long a job list just read is handed to the next reader who asks the same question (#754).
+#: THE STREAM'S TICK (`api/app.py::temporal_stream`, 2 s): each connected browser then costs at most
+#: one scan a tick between them, and the panel's re-read 600-800 ms after a click is answered by
+#: the scan before it only when no write went through this process in between (`forget_jobs`). A
+#: write made by ANOTHER process (the worker, the CLI) is seen when the window ends, at most this
+#: long after: the stated cost of the window. A constant, not a variable: the issue names only the
+#: concurrency as the operator's.
+LIST_TTL_S = 2.0
+
+#: The ONE job list this process remembers: `(loop, client, (namespace, limit, query), stamp,
+#: rows)`, or `None`. One slot, replaced, never added to: a reader asking another question reads
+#: for itself and takes it.
+_jobs_memo: tuple[asyncio.AbstractEventLoop, Client, tuple, float, list[dict]] | None = None
+
+#: The one job-list scan in flight, shared by every reader asking the same question on its loop.
+_jobs_read = _OneAtATime()
+
+
+def forget_jobs() -> None:
+    """Drop the remembered job list and give up the scan in flight, so the next reader scans afresh.
+
+    THE STREAM'S BLIP (#139) AND THIS PROCESS'S WRITES are why: a list read before the engine
+    failed, or before Approve/Merge/Resume went through, is not the list after it. A scan still in
+    flight is detached, not cancelled, as `floor.reading.forget_intake` detaches its read: its
+    waiters asked before the forget and keep their answer, and it stores nothing once the slot is
+    no longer its own. Synchronous, so it may be called from any loop."""
+    global _jobs_memo
+
+    _jobs_memo = None
+    _jobs_read.forget()
+
+
+async def list_jobs(
+    client: Client, namespace: str, *, limit: int = 50, query: str | None = None
+) -> list[dict]:
+    """Recent jobs, newest first, each enriched with its domain `state`. `query` is an
+    optional Temporal list filter (e.g. a StartTime range) for searchable history.
+
+    ONE SCAN FOR READERS TOGETHER, ONE ANSWER FOR READERS RIGHT AFTER (#754). The stream asks on
+    every tick of every browser, the floor, inbox and decisions on each request, and the panel
+    re-reads after each click; each paid a whole scan. Now:
+
+      - A READER WITHIN `LIST_TTL_S` OF A SCAN THAT ANSWERED is handed that scan's rows, when the
+        RUNNING LOOP and the CLIENT are the ones it was read on, BY IDENTITY, and the question
+        (`namespace`, `limit`, `query`) is the same. The loop because a client belongs to the
+        loop that made it (#134), and the tech-lead and the CLI open an `asyncio.run` per
+        question; holding it strongly is what keeps a dead loop's id from being reused under the
+        memo. The question because what a cache is keyed on has to be what the work it skips
+        would have read (engineering-lessons §11): the tech-lead asks `limit=50`, a history read
+        passes a `query`. The clock is `time.monotonic()`, as the breaker's is, never the wall.
+      - READERS ARRIVING WHILE A SCAN IS IN FLIGHT wait on that one scan (`_OneAtATime`, a task
+        and not a lock, #166): a failure reaches every waiter at once and is NEVER STORED, so a
+        recovered engine is asked again by the next reader; one reader going away takes only
+        itself.
+      - EVERY READER IS HANDED A COPY OF ITS OWN (#165): callers annotate rows before rendering.
+      - THE BREAKER IS STILL ASKED FIRST, with `_within`'s own sentence: an engine remembered as
+        silent refuses this read for `BEEVERFORGE_ENGINE_UNREACHABLE_FOR` even when a list is
+        remembered, as before #754.
+      - THE BOUND IS ON THE SCAN, NOT AROUND ITS READERS. It was `@_bounded_read`, a `wait_for`
+        around the whole read; around a shared task that is a wait that gives up while the task
+        it gave up on keeps asking. Measured 2026-10-19 with both bounds: a list that ran out of
+        its 0.3 s still had 8 worker queries in flight when it raised (the job-list test "ran out
+        of time leaves no question running"). So `_scan` runs under `_within` (`read_deadline()`,
+        the breaker, the same sentence), its deadline cancels every question still asked before
+        anyone is told, and a reader waits no longer than the scan it joined (#147's standing
+        loop must not be left with queries running until the SDK gives up).
+      - `forget_jobs()` drops the answer: the stream's blip (#139), every write this module
+        makes, and the panel's Stop and Scan in `actions.catalog`.
+      - A RATE LIMIT ON A NETWORK READ, NOT A DERIVED VALUE, so ADR-0023 ("the map is derived,
+        not learned") does not reach it, as it does not reach `floor.reading.intake_cached`
+        (engineering-lessons §11): what is held is how often the engine is asked, for a stated
+        window.
+
+    ASKED SIDE BY SIDE, `list_concurrency()` at a time (#754). One after another, the list cost
+    the sum of every running row's round trips (a describe and up to three worker queries each)
+    and a busy floor ran past `read_deadline()`, which then refused every reader in the process.
+    The workflows are taken from the listing in batches of `k`; each batch is asked about at once
+    and kept IN LIST ORDER, so the order the engine answers in never reaches the rows: the same
+    rows are chosen, and the newest-first sort below breaks ties as the listing does. THE COST:
+    the last batch may ask about up to `k-1` jobs past `limit` that are then dropped."""
+    if left := unreachable_for():
+        raise _still_silent("the job list", left)
+    loop = asyncio.get_running_loop()
+    question = (namespace, limit, query)
+    stamp = time.monotonic()
+    memo = _jobs_memo
+    if (memo is not None and memo[0] is loop and memo[1] is client and memo[2] == question
+            and stamp - memo[3] < LIST_TTL_S):
+        return copy.deepcopy(memo[4])
+    return copy.deepcopy(await _jobs_read.shared(
+        lambda flight: _scan(flight, client, namespace, limit, query, stamp),
+        key=(id(client), *question)))
+
+
+async def _scan(flight: _Flight, client: Client, namespace: str, limit: int, query: str | None,
+                stamp: float) -> list[dict]:
+    """The scan every waiter shares, BOUNDED ON ITS OWN by `_within`, so a deadline cancels its
+    questions when nobody is waiting any more, and says so in the same sentence as every read. It
+    is remembered only when it answered and only while the slot is still its own: `forget_jobs`
+    and a reader asking from another loop or another question take the slot from under it."""
+    global _jobs_memo
+
+    rows = await _within("the job list", _listed(client, namespace, limit, query))
+    if _jobs_read.holds(flight):
+        _jobs_memo = (flight.loop, client, (namespace, limit, query), stamp, rows)
+    return rows
+
+
+async def _listed(client: Client, namespace: str, limit: int, query: str | None) -> list[dict]:
+    """The job list as the engine answers it now, read side by side (see `list_jobs`)."""
+    base = 'WorkflowType = "JobWorkflow"'
+    full = f"{base} AND ({query})" if query else base
+    k = list_concurrency()
+    # Made per call, never at module level: a semaphore belongs to the loop it was first awaited on.
+    room = asyncio.Semaphore(k)
+    rows: list[dict] = []
+    batch: list = []
+
+    async def keep(asked: list) -> None:
+        for row in await _enriched_in_order(client, asked, namespace, room):
+            if row is not None and len(rows) < limit:
+                rows.append(row)
+
+    async for wf in client.list_workflows(full):
+        batch.append(wf)
+        if len(batch) < k:
+            continue
+        await keep(batch)
+        batch = []
+        if len(rows) >= limit:
+            break
+    if batch and len(rows) < limit:
+        await keep(batch)
+    # stable order (newest first) so the SSE frame doesn't churn on list reordering — an
+    # unstable order made the panel re-render (and reset) a running job's card each tick.
+    rows.sort(key=lambda r: r.get("start_time") or "", reverse=True)
+    return rows
+
+
+@_bounded_read("the coordinator's messages")
+async def coordinator_messages(client: Client) -> list[dict]:
+    """The recent updates the project tech-lead coordinators have NARRATED (pickup / merge /
+    deploy), across projects — the panel toasts what's new; a Slack/PO bot reads the same feed.
+    Each: {project, id, text, kind}. Best-effort per coordinator (a query miss is skipped)."""
+    out: list[dict] = []
+    try:
+        wfs = client.list_workflows(
+            "WorkflowType = 'CoordinatorWorkflow' AND ExecutionStatus = 'Running'")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list the coordinators (%s) — no narration will reach the panel "
+                    "or a chat add-on this round", exc)
+        return out
+    pfx = "beeverforge-coordinator-"
+    async for wf in wfs:
+        project = wf.id[len(pfx):] if wf.id.startswith(pfx) else wf.id
+        try:
+            msgs = await client.get_workflow_handle(wf.id, run_id=wf.run_id).query("recent")
+        except Exception as exc:  # noqa: BLE001 — one coordinator missing is not all of them
+            log.info("coordinator %s did not answer (%s) — its updates are missing this round",
+                     wf.id, exc)
+            continue
+        for m in (msgs or []):
+            out.append({"project": project, **m})
+    out.sort(key=lambda m: (m.get("project", ""), m.get("id", 0)))
+    return out
+
+
+async def review_verdicts(client: Client, jobs: list[dict]) -> dict[str, dict | None]:
+    """`workflow_id → what that job's own review found`, for ALL of `jobs` inside ONE read
+    deadline — and `None` for a job that could not be asked, which every caller renders as
+    UNREADABLE and never as "no review".
+
+    A QUERY IS ANSWERED BY A WORKER, NOT BY THE ENGINE, so it is the one read that can go
+    unanswered while the engine is perfectly well. Made raw, it waits the SDK's own default.
+    Measured 2026-09-19 on a dev server (`temporalio` 1.32.0), three workflows on a task queue
+    nobody polls, asked together: each `RPCError: Timeout expired` at **30.0 s**. The two readers
+    of this query both made it raw. The tech-lead's gatherer asked its jobs together, so it paid
+    that once (29.0 s for four jobs, all four unread). `/api/inbox` asked EVERY listed job — not
+    only the ones that became an item — one after another: four completed jobs and no worker took
+    **116.0 s** to answer "nothing needs you", and the list's limit is fifty.
+
+    THE BOUND IS ON THE WHOLE READ, not on each query: N jobs at three seconds apiece, one after
+    another, is its own half-minute page. They are asked together and waited for once.
+
+    WHY NOT `_within`, WHOSE DEADLINE THIS SHARES. `_within` is all or nothing — it raises, and
+    the answers that DID arrive go with it. Here three jobs answering and one silent is three
+    verdicts and one UNREADABLE, which is what both surfaces already have the words for.
+
+    AND A QUERY NOBODY ANSWERED IS NOT REMEMBERED AS A SILENT ENGINE. The engine listed these
+    jobs a moment ago; it is a worker that is missing. `_did_not_answer()` here would refuse the
+    floor, the job list and the card for `unreachable_window()` each time the inbox met one job
+    whose worker is gone — a second outage made out of the first. The memory is still honoured
+    in the other direction: while the engine IS remembered as silent nothing is asked at all.
+    """
+    asked = {str(j["workflow_id"]): j for j in jobs if j.get("workflow_id")}
+    out: dict[str, dict | None] = dict.fromkeys(asked)
+    if not asked:
+        return out
+    left = unreachable_for()
+    if left:
+        log.info("the engine did not answer a moment ago, so %d review verdict(s) were not asked "
+                 "for (%.1fs left before it is asked again)", len(asked), left)
+        return out
+
+    async def one(wf_id: str, job: dict) -> dict:
+        handle = client.get_workflow_handle(wf_id, run_id=job.get("run_id") or None)
+        got = await handle.query(JobWorkflow.verdict)
+        return got if isinstance(got, dict) else {}
+
+    reads = {asyncio.ensure_future(one(wf_id, job)): wf_id for wf_id, job in asked.items()}
+    try:
+        answered, _late = await asyncio.wait(reads, timeout=read_deadline())
+    finally:
+        # WHATEVER IS STILL ASKING IS STOPPED, on every way out — past the deadline, and when the
+        # caller itself was cancelled (a browser that went away). `asyncio.wait` cancels nothing,
+        # and the tech-lead's reads run on a loop that outlives the question (#147): a query left
+        # running there is a task that loop carries until the SDK gives up, per silent job, per
+        # question.
+        for read in reads:
+            if not read.done():
+                read.cancel()
+    for read, wf_id in reads.items():
+        if read not in answered:
+            log.info("%s did not say what its review found within %.0fs — usually a job whose "
+                     "worker is gone (BEEVERFORGE_ENGINE_DEADLINE)", wf_id, read_deadline())
+        elif read.cancelled() or read.exception() is not None:
+            # A workflow started before this query existed answers "query not registered", which
+            # is genuinely "could not read". It resolves itself the moment that job runs on a
+            # worker carrying this code.
+            log.info("could not read the review verdict of %s (%s)", wf_id,
+                     "cancelled" if read.cancelled() else str(read.exception())[:120])
+        else:
+            out[wf_id] = read.result()
+    return out
+
+
+@_a_write
+async def start_job(client: Client, params: JobParams) -> str:
+    wf_id = job_id(params.project, params.issue)
+    await client.start_workflow(JobWorkflow.run, params, id=wf_id, task_queue=TASK_QUEUE)
+    return wf_id
+
+
+class PreviewAlreadyStarted(RuntimeError):
+    """The unit's preview workflow is already running — a second start of the same unit is the
+    engine refusing a duplicate, and the answer a person gets is that it is starting."""
+
+
+@_a_write
+async def start_preview(client: Client, params) -> str:
+    """Start one unit's `PreviewWorkflow` through the same client and queue a job uses, under the
+    unit's one id. `PreviewAlreadyStarted` when it is already running."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from beeverforge import preview
+    from beeverforge.runtime.temporal.workflow import PreviewWorkflow
+
+    wf_id = preview.workflow_id(params.project, params.unit)
+    try:
+        await client.start_workflow(PreviewWorkflow.run, params, id=wf_id, task_queue=TASK_QUEUE)
+    except WorkflowAlreadyStartedError as exc:
+        raise PreviewAlreadyStarted(wf_id) from exc
+    return wf_id
+
+
+@_a_write
+async def signal_preview(client: Client, project: str, unit: str, signal: str, by: str) -> bool:
+    """Deliver `stop` or `rebuild` to a unit's RUNNING preview workflow. False when none is
+    running — asked first, because a signal is fire-and-forget and one sent to a finished
+    workflow would be reported as done."""
+    from temporalio.client import WorkflowExecutionStatus as _Status
+    from temporalio.service import RPCError
+
+    from beeverforge import preview
+    from beeverforge.runtime.temporal.workflow import PreviewWorkflow
+
+    if signal not in ("stop", "rebuild"):
+        raise ValueError("a preview is only ever stopped or rebuilt")
+    handle = client.get_workflow_handle(preview.workflow_id(project, unit))
+    try:
+        described = await handle.describe()
+    except RPCError:
+        return False
+    if described.status != _Status.RUNNING:
+        return False
+    await handle.signal(getattr(PreviewWorkflow, signal), by)
+    return True
+
+
+@_a_write
+async def approve_job(
+    client: Client, project: str, issue: str, *, version: str, approver: str, comment: str = ""
+) -> None:
+    """Deliver the prod approval as a durable signal to the parked workflow (D-12). Checks
+    the workflow is actually at the gate first, so an approval is never silently lost."""
+    from beeverforge import gate_seal
+
+    wf_id = job_id(project, issue)
+    handle = client.get_workflow_handle(wf_id)
+    if not await handle.query(JobWorkflow.awaiting_approval):
+        raise RuntimeError("job is not awaiting prod approval")
+    # SEALED, because the workflow acts on nothing else: the signal alone could have come from
+    # anybody who reaches the engine (`gate_seal`). Every caller of this function has checked the
+    # person already; the seal is how the worker knows that it was one of them.
+    seal = gate_seal.seal(gate_seal.APPROVE_PROD, wf_id, version, approver, comment)
+    await handle.signal(JobWorkflow.approve_prod, args=[version, approver, comment, seal])
+
+
+@_a_write
+async def answer_merge_gate(client: Client, project: str, issue: str, *, answer: str,
+                            instruction: str = "", by: str = "") -> dict:
+    """Deliver a human's answer to a PR waiting on them (#68). Returns the merge-wait dict.
+
+    QUERY BEFORE SIGNAL, exactly as `approve_job` does above and for the same reason: a signal is
+    fire-and-forget, so without the query a stale answer — to a PR that already merged, or to a
+    job that never opened one — would be accepted and reported as done. Telling somebody the
+    factory acted when it did not is worse than refusing.
+
+    THE MERGE GATE IS NOT A PARK, which is why this exists at all rather than reusing `act_job`.
+    During the merge watch `_paused` is never set, so `awaiting_action` is None and every existing
+    answer path refuses. `awaiting_merge` is the gate's own query and this is its own signal."""
+    if answer not in ("merge", "adjust", "address", "discard", "review"):
+        raise ValueError("answer must be 'merge', 'adjust', 'address', 'discard' or 'review'")
+    from beeverforge import gate_seal
+
+    wf_id = job_id(project, issue)
+    handle = client.get_workflow_handle(wf_id)
+    gate = await handle.query(JobWorkflow.awaiting_merge)
+    if not gate:
+        raise RuntimeError("this job is not waiting on a merge")
+    deaf = gate_cannot_hear(gate)
+    if deaf:
+        raise GateDeaf(deaf)
+    # `address` (#330) is the same pass with its words from the pull request: the same budget
+    if answer in ("adjust", "address") and gate.get("adjusts_left") == 0:
+        # THE JOB WOULD REFUSE IT, SO THE SEAM DOES (#448). Delivered, the answer was consumed by
+        # the workflow's own cap and the caller had already been told "sent back for one pass" —
+        # the requester's "not yet" confirmed, then dropped. `adjusts_left` absent is a job whose
+        # binary predates the number: delivered, as before, and its own branch decides.
+        raise AdjustsSpent(int(gate.get("adjust_passes") or 0))
+    # Sealed for `approve_job`'s reason above.
+    seal = gate_seal.seal(gate_seal.MERGE_GATE, wf_id, answer, instruction, by)
+    await handle.signal(JobWorkflow.human_merge_gate, args=[answer, instruction, by, seal])
+    return dict(gate)
+
+
+async def merge_gate(client: Client, project: str, issue: str) -> dict | None:
+    """What the job on this card publishes at its merge gate — None when no job is RUNNING on it
+    (#448).
+
+    THE STATUS FIRST, because a query is answered by a closed workflow too: a job that merged and
+    completed still holds the last `_merge_wait` it set, and reading that as a gate would offer a
+    person another pass on a change already in the product. A workflow that never ran raises, as
+    the engine says it; the caller decides what that means to the person it answers."""
+    handle = client.get_workflow_handle(job_id(project, issue))
+    described = await handle.describe()
+    if described.status != WorkflowExecutionStatus.RUNNING:
+        return None
+    return await handle.query(JobWorkflow.awaiting_merge) or None
+
+
+async def release_gate(client: Client, project: str, issue: str) -> dict | None:
+    """What the job on this card publishes while it waits at the LAST gate, before the product's
+    users — `{adjust_passes, adjusts_left, hears}` — or None when no job is RUNNING there (#448
+    slice 4). `merge_gate`'s sibling, read the same way and for its reason: the status first, so a
+    job that finished is never read as one still waiting.
+
+    THE CHANGE IS ALREADY MERGED THERE, which is what makes it a gate of its own: "not yet" at the
+    merge gate rewrites the open pull request; here it is answered with a NEW change of the card
+    (`another_change`). A job whose binary predates the query raises, as the engine says it."""
+    handle = client.get_workflow_handle(job_id(project, issue))
+    described = await handle.describe()
+    if described.status != WorkflowExecutionStatus.RUNNING:
+        return None
+    if not await handle.query(JobWorkflow.awaiting_approval):
+        return None
+    return dict(await handle.query(JobWorkflow.release_wait) or {"hears": False})
+
+
+@_a_write
+async def another_change(client: Client, project: str, issue: str, *, instruction: str,
+                         by: str) -> dict:
+    """Deliver "not yet" to the job parked at the last gate, sending its card back for another
+    pass as a new change (#448 slice 4). Returns what the gate published.
+
+    THE SEAM'S THREE REFUSALS, as `answer_merge_gate` makes them and for its reasons: QUERY BEFORE
+    SIGNAL, so an answer to a job no longer waiting is refused, never swallowed (RuntimeError);
+    a job that cannot hear it — a run parked there before it could (`hears` False) — is
+    `GateDeaf`; and a pass the job would refuse, the project's passes spent, is `AdjustsSpent`
+    before any signal. SEALED like every answer a gate acts on (`gate_seal.NOT_YET`), over exactly
+    the two fields the job acts on."""
+    from beeverforge import gate_seal
+
+    wf_id = job_id(project, issue)
+    handle = client.get_workflow_handle(wf_id)
+    if not await handle.query(JobWorkflow.awaiting_approval):
+        raise RuntimeError("this job is not waiting at its last gate")
+    gate = dict(await handle.query(JobWorkflow.release_wait) or {"hears": False})
+    if gate.get("hears") is not True:
+        raise GateDeaf("this job reached its last gate before it could hear a \"not yet\" — it "
+                       "can be released as it is, or a person starts the card again")
+    if gate.get("adjusts_left") == 0:
+        raise AdjustsSpent(int(gate.get("adjust_passes") or 0))
+    seal = gate_seal.seal(gate_seal.NOT_YET, wf_id, instruction, by)
+    await handle.signal(JobWorkflow.not_yet, args=[instruction, by, seal])
+    return gate
+
+
+async def merge_gate_of(client: Client, project: str, issue: str) -> dict | None:
+    """The merge-wait a job is holding, or None when it is not at the merge gate — asked, never
+    answered. For a row that must read the pull request before it decides to answer (#330)."""
+    gate = await client.get_workflow_handle(job_id(project, issue)).query(
+        JobWorkflow.awaiting_merge)
+    return dict(gate) if gate else None
+
+
+class GateDeaf(RuntimeError):
+    """The job IS waiting on a merge — but its run can never consume an answer. A distinct type
+    because the generic RuntimeError above means the opposite ('not waiting on a merge'), and a
+    caller folding the two into one sentence tells the operator the PR may have merged when the
+    truth is the gate is deaf."""
+
+
+class AdjustsSpent(RuntimeError):
+    """The job IS waiting on a person, and every pass its project allows has been spent (#448).
+
+    A TYPE AND A NUMBER, NOT A SENTENCE: the floor answers an operator in the catalog's words and
+    the product role answers the requester in the project's language (`product/voice.py`), and
+    both must say what happens next — a person decides — never only what was refused. A subclass
+    of `RuntimeError` like `GateDeaf`, so a caller that knows neither still refuses; one that
+    folds it into "not waiting on a merge" is wrong in the same way, and catches it first."""
+
+    def __init__(self, passes: int) -> None:
+        self.passes = passes
+        super().__init__(f"the {passes} extra passes this project allows for one change are spent")
+
+
+def gate_cannot_hear(gate: dict) -> str:
+    """Why this merge-wait can never consume an answer, or "" when it can (or when the workflow
+    is too old to say).
+
+    THE ANSWER MUST NOT OUTRUN THE EAR. A job whose history predates the `human-merge-gate`
+    patch replays with `patched()` memoized off — it polls the PR forever and no code in that
+    run ever reads the signal. Before this check, such a job's gate still LOOKED answerable:
+    the panel showed the buttons, the API accepted the click and said "sent back for one pass",
+    and the answer sat unread in workflow state until the 14-day deadline. Found live on
+    fx-mono#1 after a deploy replaced the gate-holder mid-wait. Refusing here — at the one seam
+    every surface goes through — turns the lie into a sentence with the two real ways out.
+
+    `gate_live` absent means the workflow's binary predates the flag: assume answerable rather
+    than refuse work the gate may well consume (absence reads as the OLD behavior, not as
+    evidence of deafness)."""
+    if gate.get("gate_live") is False:
+        return ("this job started before the merge gate existed, so no answer can reach it — "
+                "merge or close the PR on the forge itself, or reset the job's workflow to a "
+                "point before the merge watch so it re-arms with the gate on")
+    said = gate.get("cannot_hear")
+    if isinstance(said, str) and said.strip():
+        # THE JOB SAYS IT ITSELF (#184): on this path of its watch nothing reads an answer — a job
+        # that was in the loop before answers were heard while the checks are red. Its sentence,
+        # not one composed here, because only the workflow knows which path it is on.
+        return said
+    if gate.get("working"):
+        # A PASS IS REWRITING THE BRANCH RIGHT NOW, because a human already answered `adjust`
+        # (#151). The gate is still open — the run consumes an answer the moment the pass ends —
+        # so this is not deafness; it is an answer that would land on a diff nobody has seen. A
+        # merge here lands whatever the agent has pushed so far; a discard throws away a pass the
+        # operator is paying for. Both surfaces used to offer the buttons anyway, and an API call
+        # or a stale page still would: the refusal has to live at the seam every surface crosses.
+        return ("a repair pass is rewriting this pull request right now — the answer you give "
+                "would land on a diff nobody has read. It will ask again when the pass ends, and "
+                "the panel shows what it is doing meanwhile")
+    return ""
+
+
+@_a_write
+async def act_job(client: Client, project: str, issue: str, *, action: str,
+                  choice: str = "") -> None:
+    """Single-line strict (ADR-0010): deliver the operator's (or a bot's) decision on a PARKED
+    job as a durable signal — 'resume' (re-run / retry a rate-limit now / proceed with a chosen
+    option) or 'skip' (free the floor). `choice` is the DecisionRequest option key when the park
+    carried options. Checks the job is actually parked first, so the action is never silently
+    lost."""
+    if action not in ("resume", "skip"):
+        raise ValueError("action must be 'resume' or 'skip'")
+    handle = client.get_workflow_handle(job_id(project, issue))
+    parked = await handle.query(JobWorkflow.awaiting_action)
+    if not parked:
+        raise RuntimeError("job is not parked (no impediment/pause awaiting an action)")
+    # A PARK THAT ASKS A QUESTION IS NOT RESUMED BLINDLY (#24 item 1). The workflow only injects
+    # the picked option when one arrives; a bare resume on a decision park used to be ACCEPTED,
+    # run a whole agent pass, and re-park on the same question — the platform reporting it acted
+    # while the wait continued. Refused here, at the one seam every front end goes through, with
+    # the keys a person can actually answer with. A wrong key is refused for the same reason: an
+    # answer to a question that was not asked must not be recorded as if it were.
+    decision = (parked.get("decision") or {}) if isinstance(parked, dict) else {}
+    options = [str(o.get("key") or "") for o in (decision.get("options") or [])]
+    if action == "resume" and options:
+        if not choice:
+            raise RuntimeError(
+                "this park asks a question — resuming without an answer would re-park on the "
+                f"same question after a full agent pass. Answer with one of: {', '.join(options)} "
+                f"(in chat: `decision: <option>`; on the panel: the option's button)")
+        if choice not in options:
+            raise RuntimeError(
+                f"{choice!r} is not one of this park's options ({', '.join(options)}) — "
+                f"the question on the ticket names what each one means")
+    await handle.signal(JobWorkflow.act_on_impediment, args=[action, choice])

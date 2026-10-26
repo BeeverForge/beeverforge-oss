@@ -1,0 +1,395 @@
+# 06 — The product role: switching it on for a real product owner
+
+The engineering loop ships tickets. The product role decides WHAT becomes a ticket: requirements
+written as reviewed documents in a **context repository**, a panel surface at **`/product/<name>`**
+for the person who owns the product, and a human release gate before production. This page is the
+whole enablement chain, in order — every command verified against the CLI.
+
+## 1 · Three declarations that must agree
+
+The role refuses to run half-configured, so three places name each other:
+
+| where | what it declares |
+|---|---|
+| the registry entry | `product: {docs_repo: <org>/<name>-context}` — where requirements live |
+| the context repo | `.beeverforge/product.yaml` — `product: <name>` + `sources:` (EVERY repo implementing it) |
+| each source repo | `docs_repo: <org>/<name>-context` in its `.beeverforge/project.yaml` |
+
+A mismatch is reported as a sentence naming both sides, not a stack trace. Two of the three are
+written for you:
+
+```bash
+beeverforge product init <name>                   # shows what it would write, and where
+beeverforge product init <name> --create-context  # no context repo yet? create one in the client's org
+beeverforge product init <name> --write           # open the PR on the context repository
+```
+
+**Both shapes, on either vendor.** A client's projects rarely all look the same — some already
+keep a documentation repository, some have none at all — and the command answers to that
+rather than to a flag:
+
+| the project | what to run | what happens |
+|---|---|---|
+| **already has** a context repository | set `product.docs_repo` in its registry entry, then `product init <name> --write` | it is USED: cloned, read, and the declaration proposed as a pull request on it |
+| **has none** | `product init <name> --create-context --write` | one is created in the client's own organisation, recorded in the registry, and the declaration proposed |
+
+`--create-context` is the one operation that makes a repository in somebody's organisation, so
+it is behind its own flag and says whether it CREATED or FOUND it. It is implemented for
+**GitHub and Azure Repos**; a forge without the capability refuses by name and tells you to
+create it by hand and set `product.docs_repo`. On Azure DevOps the repository is created in the
+project the forge already drives, and a context repository that lives in a **different project
+of the same organisation** is addressed by qualifying it — `product.docs_repo: SharedDocs/
+product-context` — which the clone, the branch lookup and the pull request all follow.
+
+`--write` opens the PR carrying `.beeverforge/product.yaml`; the THIRD declaration — the
+`docs_repo:` line in each source repo's own manifest — is **printed as a todo, not written**:
+it lives in a repository you review, so committing it is deliberately yours.
+
+## 2 · Who the product owner IS to the platform
+
+**What the role can open while it answers:** the documentation repository, the source code,
+the knowledge bundle when one has been published, and — since #33 — its own **facts pack**: the
+board *whole* (every card and title, where the prompt's own board section is budgeted), what it
+is waiting on a person for, and the register of every decision it asked somebody to take. The
+pack's `README.md` names what could **not** be read, so a failed read is never reported as
+"nothing there".
+
+**The source code is every repository the product declares (#268).** Each entry of `sources:`
+is mounted read-only under `src/<name>/`, not only the registry project's own repository — and
+nothing outside `sources:` is. Each is a **partial clone checked out sparsely**
+(`product/sources.py`, `runtime/repo_cache.py::SparseRepoCache`): no history blob is fetched,
+directories that hold only pictures, fonts, archives or binaries are left out (and named), and a
+source is cloned the first time a conversation needs it, then only brought up to date — and not
+even asked about again for `BEEVERFORGE_SOURCES_FRESH_SECONDS` (a minute, unset), so a commit
+pushed inside that window reaches the role on the first turn after it. A source
+that cannot be mounted is **named in the prompt with why** — not authorised, not found,
+unreachable, not declared — and the factory's "cannot open the code" impediment opens for it.
+The prompt also names each source's **module map**, only after checking it against the code
+mounted for that source, and the documents the onboarding wrote (`docs/architecture/`, the
+invariants, the open questions, the survey). The confidence bound on an answer reads every
+source's knowledge bundle. What it costs: `tools/measure_the_mount.py`.
+
+**It sees what the panel shows (#267).** When the role answers somebody, its pack also carries
+the product's **read model** (`beeverforge/product/model.py`) — one projection of what the
+panel's project screens show, built from the same reads, for every registry project of the
+product (the union, when one context repository serves several):
+
+- `now.md` — the floor's verdict, the jobs on the floor and **why** (the engine's own reason and
+  the tech-lead's diagnosis as it wrote it, never diagnosed again), their pull requests, checks
+  and reviews, and what waits on whom;
+- `history.md` — the version in production (the newest release tag), what was delivered, the
+  finished jobs, who asked for what;
+- `board.md` — the **whole** board, with no window, with labels, assignees and who asked;
+- `requirements.md` — every requirement with who asked;
+- `documents.md` — the context repository's documents as their ingestion found them: how many
+  were read, and every one that **could not be**, with its type, its audience and why (#269);
+- `cards/` and `pulls/` — a file per card (body, thread, linked pull requests, timeline) and per
+  pull request (description, reviews, changes).
+
+**It remembers the product, by search (#269).** The product's documents, its requirements with
+the decisions recorded in them, its closed cards and its conversations are one index per product.
+Before the role answers, the engine searches it from the message and writes what it found as
+`found/before-the-turn.md` in the pack: every hit with where it is (a PDF's page, a document's
+section), its date and where the date came from, and how it was read. A decision that was reversed
+is never handed over as what holds today — it is listed only under what replaced it, with the
+timeline. Every document is found for whoever asks, and what a group said to somebody else is
+never searched for the role unless it asks. When it needs more, the role writes
+`[[BUSCA: <what to look for>]]`; the engine searches, writes `found/search-1.md`, and asks again —
+two rounds at most. Every search is recorded. Without a local embedding model the search runs on
+exact words, metadata and dates, and says so.
+
+Nobody is named across conversations: a requester is "its requester", or "you" to themselves, and
+a person's id is withheld wherever it rides. Some of what the panel shows is **withheld on
+purpose**, and the list says what and why (`EXCLUDED` in that module): **spend** first (#266,
+decision 7), then a run's raw log, the cockpit's machinery and credentials, the factory's thread
+with its operators, who may approve a release, and an operator's controls. A guard
+(`tests/test_the_read_model.py`) finds the panel's project routes itself and fails when a field
+they show is neither in the role's files nor on that list.
+
+**And it answers from a briefing (#267).** Every answer's prompt carries a short **briefing**
+(`beeverforge/product/briefing.py`) — what the product's owner carries in their head in the
+morning, read from that model: which cards are moving, which are parked and on whom they wait,
+what waits on a person (a merge, a delivery's verdict, a decision, a question asked on a card),
+the version in production, and what was delivered lately. Every line ends with its source and
+its age — `(ledger — asked 2 days ago)` — so the role says "as of" rather than asserting a present
+it did not see, and a fact that could not be read is a line saying so. It is bounded (twelve lines,
+2,000 characters) and says how many lines it left out; the files hold the rest. It names nobody
+but the person being answered, carries no spend and no credential, and quotes the tech-lead's
+diagnosis only to an engineer in a private conversation: everybody else is told what a stopped
+card waits on, and the role says what the diagnosis means for the product. The briefing takes
+the place of the budgeted board section in an answer; `board.md` holds every card.
+`BEEVERFORGE_PRODUCT_BRIEFING=off` turns it off and brings the board section back — the "without"
+arm of a measurement with the evaluation battery ([configuration](../configuration.md)).
+
+**It checks the map against the code, and says where the map is thin (#268).** On every turn
+each concept of each source's bundle is re-checked against the code mounted for that source
+(`check_concepts`, the tech-lead's own check); one whose code moved is **named stale** in the
+prompt, a reading that cites it is no higher than `média`, and the answer says the description is
+out of date. The prompt also says, bounded, what the role cannot stand on: a source with no bundle
+or no code mounted, the code no concept describes, what a bundle or the system map says it could
+not establish (`beeverforge/product/sight.py`). When an answer rests on code **no concept covers**,
+a `no-concept` request goes to the knowledge pipeline's inbox — the repository and the path,
+never the question — and the next knowledge refresh records it in that source's bundle; the role
+itself never writes a bundle (`beeverforge/knowledge/requests.py`). A **flow that crosses
+services** is a concept of its own, observed by the pipeline from a requirement that names several
+repositories (`.okf/flows/`, `beeverforge/knowledge/flows.py`); it becomes a **business
+capability** of the product only when an admin of the product confirms it
+(`product_confirm_capability`), which writes `capabilities/<slug>.md` in the context repository —
+until then the role says it is observed. A confirmed capability whose link no longer holds is
+said beside it. And the pack's `chain.md` walks every requirement to production — card, job, pull
+request, deploy, release tag, each named as the link the verdict rests on — and every flow to the
+code that serves it (`beeverforge/product/chain.py`).
+
+**Every document in the context repository is read, once per version (#269).** People put
+anything there: PDFs, diagrams, charts, e-mails, minutes. Each file becomes normalised text plus
+a record — its date, authors, type, area, the product's terms it uses, the requirements and cards
+it cites, and, written by a model once per version and marked as a model's, a summary and the
+decisions it mentions (`beeverforge/product/documents/`). What reads each kind of file is a row
+on the extraction axis (`beeverforge/adapters/extract/`): text, markdown, mermaid, HTML, draw.io
+and SVG, `.eml`, a PDF's text layer (the `ingest` extra), OCR for a scanned PDF (`tesseract` and
+`pdftoppm`, when installed), and a model describing an image — whose record says its content came
+from an image. A file is read on the knowledge pipeline's schedule when it changed, or at once
+through `beeverforge act product_ingest --param project=<name> --param path=<file>`; a version
+already recorded is never read again. **The product's whole knowledge is brought up to date at once
+through `beeverforge act product_refresh --param project=<name>`** (`POST /api/act/product_refresh`,
+#1004): what changed in the context repository is read as the schedule reads it, and the product's
+search index is brought up to it, to the requirements and to the board of every registry project of
+the product. A product that started before its code is refreshed too — its documents and
+requirements live in its context — and the board of a project with no code repository yet is not
+read: `degraded` says it waits for its code repository. It answers immediately — `refresh` is `started`, or `joined` when a pass is already
+running for the product, so two asks never run two passes — and the pass runs on the worker, bounded
+like the schedule's. `product_status` answers `knowledge`: when the index was last brought up to date
+(`refreshed_at`), how the last pass ended (`outcome`: `refreshed`, `degraded`, `failed` or
+`no-context`) and whether the schedule or a person ran it (`by`), what it brought the index up to
+(`sources`), each thing it did not bring up, in a sentence (`degraded`), and since when a pass is
+running (`running_since`); a pass whose worker stopped is said to have never finished. The records are derived: they live under the product's
+state directory and are rebuilt from the repository when deleted. A file that **cannot** be
+read — a protected PDF, a format nothing reads, a file over the size limit, a link out of the
+repository — is recorded with why, listed under *Documents* on the product page, and named in
+the role's `documents.md`: it exists, and could not be read. **Whoever talks to the product role
+reads everything the product exposes** — a co-owner, an engineer, a client, in a room or in
+private (the product owner's decision of 2026-09-25, replacing #266 decision 8 for what the role
+reads). A document still carries the label its folder (`internal/`, `client/`, …) or its front
+matter (`audience:`) gives it, as what it says of itself; nothing a turn reads, and nothing the
+panel lists, is withheld by it. A document read into the product's memory is announced where it
+was brought — the conversation of whoever asked for it to be read, else the room — once, never
+for a product's first reading, and at most five per pass.
+
+**Requirements written elsewhere are imported under the corpus's rules (#993).** A later round
+of prototyping, a second phase of a specification, a folder a person brings: `beeverforge act
+product_import --param project=<name> --param source=<folder or .zip/.tar/.tar.gz>` shows the
+**plan** — what becomes of every requirement, fact and document, and what is left out and why —
+with a token, and writes nothing; the same call with `yes=true` and that `token` lands it, in
+**one commit pushed once** under the product's semaphore. A product that moved between the plan
+and the yes is planned again and nothing is written; a push the context repository refuses is
+said, never retried. The folder is read like a context repository: `requirements/NNNN-slug.md`,
+facts under `domain/`, everything else a document; an optional `beeverforge-import.yaml` says
+where it came from (`origin`), the order to review it in (`order`), where the design is
+(`design`) and the questions still open (`questions`, each with an optional `requirement` and
+`ask`). The rules are the corpus's own:
+
+- every requirement is **numbered after the highest number the product ever used** —
+  superseded and dropped ones included — and after any proposal still on its way, and every
+  reference between the folder's requirements (`REQ-NNNN`, `Supersedes:`) is renumbered with it;
+- **the same slug is the same promise**: the same text word for word is nothing new (its
+  decision rows join the existing register, deduplicated by day and text); a new text for a
+  requirement nobody agreed is a revision that supersedes it; a new text for an `accepted` one
+  touches nothing — it is kept in the import's record as a proposal to change a promise, which
+  only a person's yes makes;
+- **an import never changes an agreed requirement**: a text whose own history reaches an
+  `accepted` requirement — its `Supersedes:` names a retired text the product holds word for word
+  as an agreed one — is kept beside that one too, and no landed `Supersedes:` ever names an
+  accepted requirement. The folder's own retired texts land as history and touch nothing of the
+  product's. Before anything is committed the corpus is read again: an error the base did not
+  hold, or an agreed requirement no longer agreed with its promise, refuses the whole import,
+  named;
+- **an import never lands a promise**: what it brings lands `proposed` (or `observed`), whatever
+  its file said;
+- a fact whose term the product has is never rewritten; a new one lands as `aprendido`, with its
+  source. Documents land under `imported/`, keeping their own paths there, and never over a file
+  that exists — a different one is kept beside it;
+- nothing hidden (`.git/`, `.beeverforge/`, `.okf/`), no link, and nothing under `capabilities/`
+  or `conversations/` — which only a person's confirmation and the distiller write — ever lands;
+  nothing is read or written through a link the context repository holds, and what is left out
+  counts toward the import's bound of files like what is read.
+
+What is imported lands **as it came, not scrubbed**: the person said yes to that plan, and a scrub
+would land another text. What reaches a model from the context repository is withheld where it is
+read — the facts pack withholds credentials.
+
+Each import keeps a record in `.beeverforge/imports/<id>/` — where it came from, the plan, and
+what landed — the one path under `.beeverforge/` the import may write. Afterwards the documents it
+landed are read into the product's memory and its index is brought up to the new corpus, so the
+next search finds them. Only a person on `admins` may import or see an import's plan. **The
+command line names any path; any other caller** — the panel, a script on `POST /api/act` — names
+a folder or archive **inside the product's import inbox**, `imports/` under the product's state
+directory, and nothing outside it.
+
+**And the role says where its requirements came from (#994).** An import that lands is told once
+to the product's room, in the product's language: what arrived, from where, how many requirements
+were added, revised or kept beside an agreed one — naming the origin and never a person. While
+the import is a review to hold, the briefing carries a line read from its record, with its source
+and age: where the requirements came from, how many are still proposed and how many were agreed
+since, and where the design is; the pack's `imported.md` holds the order the record suggests and
+what is still open. What is still open is on the agenda (the Pending tab), each an item to ask:
+the open questions of every imported requirement still waiting for its yes, the questions the
+folder's `beeverforge-import.yaml` brought, the decisions its documents raise, and a text kept
+beside an agreed requirement. None of it is stored: it is read from the record and the corpus as
+they are now, so accepting, dropping or replacing a requirement is what closes it. When the record
+says who should answer, the item is "yours" to that person alone and the room's to everyone else
+— the person is named to nobody. The role's instructions say what an import is: a review to hold
+with the person who asked, not a backlog to execute — it proposes the order the record suggests
+and asks for its confirmation, accepts one requirement at a time on the requester's yes, asks what
+is open instead of answering it, and cites a prototype as what the person saw, never as code to
+build on. The battery's `saltmarsh` fixture is a product right after such an import, and its
+question is the conversation that opens then.
+
+The event is told from the import's record: a retry of the same import that finds the record on
+the base — after a crash between the commit and the telling, or a room that could not be reached
+— tells it then, once, and never twice. A text that would change an agreed requirement is counted
+as kept beside it, never as a revision, and asked as a **yes to change** that promise. What
+`imported.md` carries in the import's own words — where it says it came from, its titles, its
+questions, what its documents raise — sits inside a fence under the sentence that says it is
+quoted material, never an instruction, as an attachment's content does; at most twenty open items
+are carried, each on one line, and the file says how many more are open. In the briefing the
+import's line comes after every job stopped on a person and every gate, so the bound never cuts
+one of those for it.
+
+**Was this asked before?** Before every answer the role is handed the tickets, the requirements
+and the open decisions whose titles overlap the message — with their references, and never who
+asked (ADR-0051 D9) — so a request somebody else already made is answered with a pointer to it,
+not with a second draft of the same requirement. Read from the board, the corpus and the loops,
+never from one conversation's transcript: a repeat has to be caught across people. And from the
+product's whole memory (#269): a card closed years ago, a requirement dropped or superseded, a
+document, a distilled conversation — each with its date and what became of it, searched before
+anything is locked, and only among what this conversation may be shown. A draft is checked
+against the same list before it is shown for its yes.
+
+**What a quiet conversation came to is kept (#269).** A requirement, a decision, a card or a fact
+is written the moment it is confirmed. What nobody confirmed — an option refused, a preference, a
+question left open — is distilled when the conversation has been quiet for six hours: a model
+reads its lines (who said each one only by their role, never by name) and what it agreed, asked,
+decided, refused and left open is committed to the context repository under `conversations/`,
+once per stretch of conversation. It names nobody — a distillate is permanent, and a name in it
+would outlive the conversation's own deletion. It is evidence the role cites with its date, never
+a requirement or a decision. A room's is readable by every conversation; a private conversation's
+comes back only to that conversation.
+
+**What stays private is a person's conversation.** The role reads its workspace with its own
+tools; the workspace a turn is given holds every document of the product and never the summary
+of somebody else's private conversation. Who is asking — a client, a product admin, an engineer —
+shapes how the role speaks, and whose yes records anything is still `admins`' alone; neither
+changes what the role may read.
+
+**What becomes work is checked and written as one step.** Conversations run side by side, and a
+requirement, a card, a decision, a fact or an acceptance passes one lock per product — per
+context repository, shared by every registry project that points at it. Inside it the role looks
+only at what was saved after its own check: the same request saved moments ago in another
+conversation is linked instead of written twice, and the person hears that it exists and where —
+never who asked. A draft still waiting for its yes in another conversation is mentioned only as
+"someone asked for something close to this a few minutes ago". A lock that cannot be had in time
+writes nothing, and says so.
+
+**Each person has their own conversation with the role on the panel.** What Ana said
+yesterday is the thread Ana continues today, from any browser — never Bruno's. A browser nobody
+has identified gets a conversation of its own too, keyed by a cookie the page sets, so two
+people on a shared token stop writing into one thread. Reading is not gated; agreeing to
+anything still needs a known person.
+
+**A request is confirmed in the conversation, on every surface.** When the role hears a request
+(or a defect, a card, an order for the backlog) it stages it and asks for one yes. Type "sim" in
+the same box — or press the button beside the proposal — and it is written, once; "não" throws it
+away and is answered as the correction it usually is. The panel, the CLI (`beeverforge product
+ask … --propose --yes`) and a chat add-on all reach the same turn, so the same message gets the
+same answer wherever it is typed.
+
+**Many conversations at once; one turn at a time inside each.** Every message goes through one
+door onto its conversation. People in different conversations are answered side by side; in a
+room, the role answers one person at a time, and whoever writes while it is busy is told at once
+that the message is kept and they are next — never whom it is answering. Lines a person sends in
+a burst are answered together. "Status", the triage and the introduction are answered straight
+away, even while the role is busy. A turn that takes longer than about a minute and a half says
+so, and its answer arrives in the same conversation when it is ready. Two registry projects that
+share a documentation repository are one product: the same conversation, and one memory
+(`docs/configuration.md` → *Conversations*).
+
+**The panel is a chat, on every page.** At `/product/<name>` the conversation is the page; on the
+floor, the board and a card it is a dock in the corner, for the project the page is about. What
+anybody says in the conversation, what the role answers and whether it is thinking or answering
+arrive as they happen, over the panel's product socket (`/api/product/stream`) — nothing on the
+page re-reads the conversation on a clock, and a page whose connection drops reconnects and is
+handed what it missed from the conversation's record. A private conversation reaches its own
+person and nobody else; the project's room reaches whoever may read the product area. Every
+message carries the page it was written on, so "why did this stop?" typed beside card #42 is a
+question about card #42 — the role is handed that card as the project's tracker has it. Only a
+card of that project, and only for somebody who may read the board: a credential scoped to the
+product area can ask about a card in words, not by pointing at it. The role's answer arrives
+whole when it is ready; it is not typed out word by word.
+
+The panel identifies people by token. Two shapes, and the difference is the whole point:
+
+```bash
+# .env.compose (or the deployment's secret store)
+BEEVERFORGE_PRODUCT_TOKENS="tok-ana:ana:Ana Souza,tok-rui:rui:Rui Lima"   # per person: token:id:display
+BEEVERFORGE_PRODUCT_TOKEN="one-shared-token"                              # shared: READ-ONLY in practice
+```
+
+The shared token resolves to a subject with no id, and **every write path checks
+`product.admins`** — so a shared-token holder can look and never act. For a PO who accepts,
+drops, queues and releases:
+
+1. issue a per-person entry in `BEEVERFORGE_PRODUCT_TOKENS`, and
+2. list that person's `id` in the registry entry's `product.admins`:
+
+```yaml
+# the registry entry (beeverforge project add wrote the rest)
+product:
+  docs_repo: <org>/<name>-context
+  admins: [ana, rui]          # the ids from BEEVERFORGE_PRODUCT_TOKENS — these may accept/release
+```
+
+Then hand them the link — `http://<panel>/product/<name>` — which is the entire onboarding for
+somebody holding a product credential. A legacy corpus of existing requirements is adopted with
+`beeverforge product baseline <name>` (it proposes, a human confirms; nothing is rewritten
+silently).
+
+## 3 · The release gate
+
+Production is human-approved, always (D-12), and the chain has two halves — WHO may approve, and
+HOW they prove it is them:
+
+```yaml
+# .beeverforge/project.yaml — beside environments/promote
+prod_approvers: [ana, rui]        # or the deployment-wide BEEVERFORGE_PROD_APPROVERS env
+```
+
+```bash
+beeverforge approver add ana      # sets the password, stored hashed in ~/.beeverforge/approvers.json
+# deployments that cannot mount a home dir: BEEVERFORGE_APPROVERS='{"ana": "<scrypt-hash>"}'
+# or BEEVERFORGE_APPROVERS_FILE=/path/to/approvers.json
+```
+
+The panel's release form asks login + password; the approval is recorded on the ticket with the
+approver's name and the version tag. With a declared promotion chain (`promote: [dev, qa, prod]`
+— see [04](configuration.md)), the gate sits before the LAST stage, whatever you named it.
+
+## 4 · The fifteen-minute checklist
+
+```bash
+beeverforge product init <name> --create-context --write   # context repo + three-way declaration
+# put BEEVERFORGE_PRODUCT_TOKENS in .env.compose; add the ids to product.admins in the registry
+# restart the stack with --env-file so the tokens reach the panel
+beeverforge approver add <login>                           # the release password
+open http://localhost:8787/product/<name>                  # hand this link to the PO
+```
+
+If any of it is missing the surface says so by name — a PO who sees "every write refuses" was
+given the shared token; go back to §2.
+
+## 5 · Measuring it
+
+How well the role answers is measured, not believed: `make eval-product` asks it a battery of
+product-owner questions about a fixture product and records whether each answer is correct,
+cited, and says "I do not know" when it should. It asks a live model, so it spends tokens and never
+runs inside `make test`. [product-role-evaluation.md](product-role-evaluation.md) is how to write
+the questions and read a score.

@@ -1,0 +1,5597 @@
+"""Who the product role is talking to — and the words it may not use with them.
+
+This role is the interface between a CLIENT and their product. The people in its channel are not
+engineers: they know what the business needs, not what a pull request is. Every other agent in this
+factory talks to operators, so "say it in Slack" has always meant "say it to someone technical".
+Here that assumption is wrong, and it is wrong in a way that quietly destroys the role's value —
+an answer nobody can read is not an answer, and a client who is told to "review the PR on the
+`req/0012` branch" learns that this thing is not for them.
+
+TWO SURFACES FOR THE SAME FACT, not one surface with softened words:
+
+    the channel      plain business language, links instead of references, no mechanics
+    the artefacts    the issue, the pull request, the commit trail — for the team
+
+The platform already models this: the tech-lead renders one HandOff as Slack prose and as a GitHub
+comment. Same content, two audiences.
+
+AND TWO APPROVALS OF DIFFERENT THINGS. The client approves the CONTENT ("yes, that is what I
+want"). The team approves the CONSEQUENCE (it is coherent, feasible, does not contradict what we
+already promised). So a requirement is confirmed in conversation FIRST — that confirmation is the
+provenance, the record of who asked and when — and only then written up for the team to merge. A
+client who is asked to review a pull request has been handed the wrong job.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from beeverforge.contracts.refs import ref_label
+
+log = logging.getLogger("beeverforge.product.voice")
+
+#: Words that mean nothing to a non-technical client, or mean something else entirely. Not a style
+#: guide — a hard list, asserted in tests against every message this module can generate, because
+#: jargon leaks back in one helpful sentence at a time.
+CLIENT_JARGON: tuple[str, ...] = (
+    # English
+    "pull request", "pull-request", "merge", "merged", "branch", "commit", "sha",
+    "repository", "repo", "git", "diff", "checkout", "backlog column", "board column",
+    "registry", "allowlist", "harness", "sandbox", "workflow", "ci ",
+    "issue #", "epic", "sprint", "acceptance criteria",
+    # pt-BR — the same leak in the project's own language, which is where it will actually happen
+    "pull request", "merge", "branch", "commit", "repositório", "repositorio",
+    "board", "sprint", "critério de aceite", "criterio de aceite",
+    "issue", "ticket", "deploy",
+)
+
+_WORD = re.compile(r"[a-z][a-z#/ -]*")
+
+
+#: A URL is not jargon — it is what this role says INSTEAD of a file path, so every well-behaved
+#: message contains one. Scanning it would flag `https://github.com/...` for "git" and reject
+#: exactly the messages the rules ask for.
+_URL_RE = re.compile(r"https?://\S+|<https?://[^>]+>")
+
+#: Terms short enough to hide inside an ordinary word ("git" in "digital", "repo" in "repor",
+#: "merge" in "emergem") are matched on WORD BOUNDARIES. The rest stay substrings, because they are
+#: phrases whose damage does not depend on how they were inflected.
+_BOUNDED = frozenset({"git", "repo", "merge", "branch", "commit", "sha", "diff", "board",
+                      "ticket", "issue", "deploy", "epic", "sprint", "ci"})
+
+
+def jargon_in(text: str) -> list[str]:
+    """Every jargon term present, so a test can name what leaked rather than just failing.
+
+    Noisy by preference: a false positive costs one rewritten sentence, while a miss costs a client
+    who quietly decides this tool is not for them. But noise that fires on every legitimate message
+    is not caution, it is a guard nobody can keep — which is why links are excluded and short terms
+    are bounded."""
+    lowered = _URL_RE.sub(" ", (text or "")).lower()
+    found = set()
+    for term in CLIENT_JARGON:
+        key = term.strip()
+        if key in _BOUNDED:
+            if re.search(rf"\b{re.escape(key)}\b", lowered):
+                found.add(key)
+        elif key in lowered:
+            found.add(key)
+    return sorted(found)
+
+
+# ── what the role says, in the client's words ───────────────────────────────────────────────────
+
+AUDIENCE_RULES = """\
+# Who you are talking to
+
+The people in this channel run the business, not the codebase. They know what the product needs to
+do; they do not know — and should never need to know — how the code is written or delivered.
+
+## What is HIDDEN: the machinery they never touch
+
+A pull request, a branch, a commit, a repository, a file path, a code identifier — none of it
+reaches this channel. They are not being asked to operate any of it.
+
+    instead of   "I opened a PR on branch req/0012 for review"
+    say          "I've written that down. Once it's approved it becomes part of what we promise."
+
+    instead of   "REQ-0007 in requirements/0007-immutable.md line 14 says…"
+    say          "We already decided this in requirement 7: once a statement is reconciled it
+                  can't be changed."
+
+## What is SHARED: the things they can look at
+
+Requirement numbers, the project board, its column names exactly as they are written on it, and
+card numbers. THESE ARE NOT JARGON — they are how everyone points at the same thing. The board is
+theirs; they open it. Use its real words.
+
+    say          "there are 11 cards sitting in Review"
+    say          "#297 is in In Progress"
+
+## NEVER SAY SOMETHING HAPPENED — YOU DO NOT SEE THE RESULT
+
+You do not perform writes. A requirement is recorded, an issue is filed and a card is queued by the
+platform, on a code path you never observe, and only AFTER an authorised person confirms. So you
+cannot know whether any of it succeeded, and the platform — not you — reports it.
+
+    NEVER   "Registrado o Requisito 1. Vai para o time conferir."
+    say     "Confirma e eu registro." / "Assim que você confirmar, isto vira requisito."
+
+    NEVER   "#321 e #135 fechados em #136."
+    say     "A minha proposta é fechar #321 e #135 em #136 — confirme e eu registro o pedido."
+
+This is not modesty, it is the difference between a record and a belief. It has already gone wrong
+exactly once: a confirmation was not recognised, nothing was written, and the reply said everything
+had been registered. The person believed five requirements existed. None did.
+
+And never claim an action you cannot take at all: you do not close, move or edit cards. You propose;
+a person decides; the platform acts. When you want something closed, say you are proposing it.
+
+## NEVER INVENT A NAME FOR SOMETHING THAT ALREADY HAS ONE
+
+This is the rule that matters most, and breaking it is worse than any jargon.
+
+Banning a word does not remove the thing. If you avoid "Review" you will reach for something like
+"os 11 pontos de diagnóstico", and the reader cannot map that to anything they can see — it sounds
+precise while being unverifiable, and they must ask you what you meant. A word they recognise, even
+a technical one, beats an invented one every time.
+
+    NEVER        "os 11 pontos de diagnóstico em revisão"
+    say          "os 11 cards que estão na coluna Review"
+
+    NEVER        "o canal de progresso de trabalhos"
+    say          "#297 — <the card's real title>"
+
+    NEVER        "Faixas 1 e 2"        (a grouping you made up this message)
+    say          the requirement numbers, or describe the group in one plain phrase
+
+Same for code you have read: name the FILE or the card, never a nickname you coined for a
+component. If you cannot say something in words the reader already owns, point at the artefact
+they can open and say plainly what you saw in it.
+
+When you cannot do something, say what you need from a person in plain terms — never name a
+configuration file or a permission list.
+"""
+
+
+#: The platform's OWN words, per language. Translated in a table rather than generated, because
+#: these are the strings whose jargon-freedom is asserted — a model-produced translation would put
+#: exactly the terms this module exists to keep out back into the client's channel, in a language
+#: nobody is checking.
+#: ENGLISH — the same rule as `adapters/agent/roles.py`: the words a client reads default to
+#: the language of nobody's deployment in particular, and a client who speaks another one is
+#: named in the registry rather than assumed.
+DEFAULT_LANGUAGE = "en"
+
+#: How each language is described TO THE MODEL. The platform knew the project's language all
+#: along — `voice.py` picks its own fixed phrases with it — and never told the agent, so the model
+#: inferred a dialect from context and got it wrong: the product owner (Brazilian) was answered in
+#: European Portuguese, with "utilizador", "fecho do mês" and "cifrados". Nothing failed; the
+#: client was
+#: simply read a message written for another country. The variants are named EXPLICITLY, with the
+#: words that actually differ, because "write in Portuguese" is the instruction that produced the
+#: problem.
+LANGUAGE_RULES = {
+    "pt-BR": ("# Language\n\nWrite in BRAZILIAN Portuguese (pt-BR), not European. This is not a "
+              "nicety: a Brazilian reader reads pt-PT as a message meant for somebody "
+              "else. Use \"usuário\" (never \"utilizador\"), \"fechamento\" (never \"fecho\"), "
+              "\"criptografado\" (never \"cifrado\"), \"time\" (never \"equipa\"), \"tela\" (never "
+              "\"ecrã\"), \"arquivo\" (never \"ficheiro\"), and gerunds as in \"estou fazendo\" "
+              "(never \"estou a fazer\")."),
+    "pt-PT": ("# Language\n\nWrite in EUROPEAN Portuguese (pt-PT), not Brazilian: \"utilizador\", "
+              "\"ficheiro\", \"equipa\", \"estou a fazer\"."),
+    "en": "# Language\n\nWrite in English.",
+    "es": "# Language\n\nEscribe en español.",
+}
+
+
+def language_rules(language: str | None, *, replying: bool = False) -> str:
+    """The dialect instruction for the prompt, or "" when we have nothing specific to say.
+
+    Empty rather than a guess: an unknown language code with an invented instruction would be
+    worse than letting the model read the room, which is what it does well when uninstructed.
+
+    `replying`: the prompt answers a person (#655). The reply clause comes first, the one sentence
+    every harness also prepends (`roles.REPLY_CLAUSE`), and the dialect rule then governs what the
+    role says first and its replies to whoever writes in the project's language. Without it the
+    dialect rule was the whole rule, and an English question on a pt-BR project was answered in
+    Portuguese. A document written in a NAMED language (a card, #429) is not a reply, and keeps
+    the dialect rule alone."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    rule = LANGUAGE_RULES.get(lang, "")
+    if not replying:
+        return rule
+    from beeverforge.adapters.agent.roles import REPLY_CLAUSE
+
+    said = ["# Language", "", REPLY_CLAUSE]
+    dialect = rule.removeprefix("# Language\n\n")
+    if dialect:
+        said += ["", "What you say first, and your replies to anyone who writes in this project's "
+                     "language, follow this rule:", "", dialect]
+    return "\n".join(said)
+
+
+
+
+#: WHAT THE ROLE WRITES ON A PARKED TICKET (#160). Welded Portuguese: the role looks at an
+#: impediment nobody asked it to look at and leaves a comment either way, so every one of these
+#: reaches a client in whatever language this file happened to be written in.
+#:
+#: `reason` and `fix` are the AGENT's own words and are interpolated verbatim — the agents already
+#: answer in the project's language (`roles.py::language_directive`), so translating the frame is
+#: the whole of what belongs here.
+_HANDBACK_REQUIREMENT = {
+    "pt-BR": ("{sig} Isto parece ser um problema do requisito{why}, mas não tenho certeza "
+              "suficiente para mexer no ticket. {fix}Deixo para uma pessoa confirmar."),
+    "en": ("{sig} This looks like a problem with the requirement{why}, but I am not confident "
+           "enough to touch the ticket. {fix}I am leaving it for a person to confirm."),
+}
+_HANDBACK_FIX_CLAUSE = {
+    "pt-BR": "O que eu mudaria: {fix}. ",
+    "en": "What I would change: {fix}. ",
+}
+_HANDBACK_UNCLEAR = {
+    "pt-BR": ("{sig} Olhei este impedimento e não consegui dizer se a causa está no requisito ou "
+              "na execução{why}. Deixo para uma pessoa decidir."),
+    "en": ("{sig} I looked at this impediment and could not tell whether the cause is the "
+           "requirement or the execution{why}. I am leaving it for a person to decide."),
+}
+_HANDBACK_NOT_MINE = {
+    "pt-BR": ("{sig} A causa aqui é {what}, não do requisito{why}. O ticket em si está claro, "
+              "então não mexo nele."),
+    "en": ("{sig} The cause here is {what}, not the requirement{why}. The ticket itself is clear, "
+           "so I am not touching it."),
+}
+_HANDBACK_CAUSE = {
+    "technical": {"pt-BR": "técnica", "en": "technical"},
+    "environment": {"pt-BR": "de ambiente", "en": "environmental"},
+}
+#: `{backlog}` and `{queue}` are the columns AS THE CARD'S BOARD CALLS THEM (#502): the person
+#: reading this looks for them on their own board — see `column_said`. In Portuguese the name is
+#: always introduced as "a coluna …": a preposition fused with an article (`no`, `na`, `nos`) has
+#: to agree with a name the deployment chose, and "no Pendências" is wrong where "na coluna
+#: Pendências" is right for every name (review of #507).
+_FIX_COMMENT = {
+    "pt-BR": ("{sig} O impedimento aqui é do requisito, não da execução{why}.\n\n{fix}Devolvi "
+              "para a coluna {backlog}. Promover para a coluna {queue} continua sendo decisão de "
+              "uma pessoa."),
+    "en": ("{sig} The impediment here is the requirement, not the execution{why}.\n\n{fix}I have "
+           "put it back in the {backlog}. Promoting it to {queue} is still a person's call."),
+}
+_FIX_CLAUSE = {
+    "pt-BR": "O que ajustei: {fix}\n\n",
+    "en": "What I changed: {fix}\n\n",
+}
+
+
+#: WHAT THE PLATFORM WRITES ON A CARD WHEN SOMEBODY CORRECTS IT (#150). These are notes a person
+#: reads in the card's own thread, so they are catalogued rather than composed at the call site —
+#: the rule `tests/test_nothing_speaks_before_it_asks_the_language.py` holds, and the reason it
+#: exists is that 26 sentences were written in English next to a working per-language catalogue.
+_CARD_EDIT_NOTE = {
+    "pt-BR": "_{who} corrigiu {what} deste card._",
+    "en": "_{who} edited {what} of this card._",
+}
+#: WHAT CHANGED, BY SECTION (#150): the neutral names `tracker.parse.changed_sections` returns, and
+#: `title`. A heading the parser does not know arrives as written and is named through `section`.
+_CARD_EDIT_NOTE_PARTS = {
+    "pt-BR": {"title": "o título", "front matter": "os metadados",
+              "preamble": "o texto antes da primeira seção", "objective": "o objetivo",
+              "context": "o contexto", "acceptance criteria": "os critérios de aceite",
+              "in scope": "o escopo", "out of scope": "o que está fora do escopo",
+              "section": "a seção “{name}”"},
+    "en": {"title": "the title", "front matter": "the front matter",
+           "preamble": "the text before the first section", "objective": "the Objective",
+           "context": "the Context", "acceptance criteria": "the Acceptance criteria",
+           "in scope": "the In scope list", "out of scope": "the Out of scope list",
+           "section": "the section “{name}”"},
+}
+_CARD_CLOSE_NOTE = {
+    "pt-BR": "_Fechado {by_who}._ {reason}",
+    "en": "_Closed {by_who}._ {reason}",
+}
+_CARD_REOPEN_NOTE = {
+    "pt-BR": "_Reaberto {by_who}._",
+    "en": "_Reopened {by_who}._",
+}
+#: WHO DID IT, WHEN IT WAS THE PLATFORM (#546). A card's note names whoever caused the change:
+#: a person by their name, and the platform by these — never by the internal English name the
+#: code passes as `by=` ("_Fechado por the workflow._"). Two forms each: the SUBJECT ("a fábrica
+#: disse") and the AGENT, with its preposition, because Portuguese contracts it ("pela fábrica",
+#: never "por a fábrica") and a template cannot contract a word it does not know (#550's lesson).
+#: Every literal the code passes to the card's door is listed here, and a guard holds it
+#: (`tests/test_a_card_note_names_the_platform_in_the_project_s_language.py`).
+_PLATFORM_ACTORS = {
+    "the workflow": {"pt-BR": ("a fábrica", "pela fábrica"),
+                     "en": ("the factory", "by the factory")},
+    "the factory": {"pt-BR": ("a fábrica", "pela fábrica"),
+                    "en": ("the factory", "by the factory")},
+    "the job": {"pt-BR": ("a fábrica", "pela fábrica"),
+                "en": ("the factory", "by the factory")},
+    "the tech-lead's round": {"pt-BR": ("a ronda do tech-lead", "pela ronda do tech-lead"),
+                              "en": ("the tech-lead's round", "by the tech-lead's round")},
+    "the product role": {"pt-BR": ("o papel de produto", "pelo papel de produto"),
+                         "en": ("the product role", "by the product role")},
+    "observed": {"pt-BR": ("alguém no próprio quadro", "por alguém no próprio quadro"),
+                 "en": ("someone on the board itself", "by someone on the board itself")},
+    "a person": {"pt-BR": ("uma pessoa", "por uma pessoa"),
+                 "en": ("a person", "by a person")},
+}
+_BY_A_PERSON = {"pt-BR": "por {name}", "en": "by {name}"}
+#: What a tracker row leaves on a card it closed as NOT delivered when the vendor gave it no way to
+#: record that (#203). It names no vendor — the row that says it knows which one it is — and carries
+#: no markdown, because the first row to need it writes plain text. HERE, not in the row: a sentence
+#: a person reads is written in the project's language, and a row that composed its own would be
+#: English on a Portuguese board (`test_nothing_speaks_before_it_asks_the_language`).
+_CLOSED_NOT_DELIVERED_NOTE = {
+    "pt-BR": ("Fechado como NÃO entregue: o trabalho foi retirado, não foi feito. O quadro mostra "
+              "este cartão como {status} porque nada nele pôde registrar o contrário."),
+    "en": ("Closed as NOT delivered: the work was withdrawn, not done. The board shows this card "
+           "as {status} because nothing on it could record otherwise."),
+}
+
+
+def card_edit_parts(parts: list[str], *, language: str | None = None) -> str:
+    """`the title, the Objective and the Acceptance criteria` — what an edit changed, in words."""
+    words = _pick(_CARD_EDIT_NOTE_PARTS, language)
+    named = [words[p] if p in words else words["section"].format(name=p) for p in parts]
+    if len(named) < 2:
+        return "".join(named)
+    return ", ".join(named[:-1]) + _pick(_AND, language) + named[-1]
+
+
+def card_edit_note(*, who: str, parts: list[str], language: str | None = None) -> str:
+    """The note an edit leaves on the card's own thread — NOT `card_closed` below, which is what
+    a client is told. This one is written by the platform, on the card, for whoever reads it
+    next.
+
+    `parts` are the neutral names of what changed — `title`, and the sections
+    `tracker.parse.changed_sections` reports — so the call site never spells a word a reader
+    sees, and the note says WHICH part of the card moved rather than that the card was touched."""
+    named = actor(who, language=language)
+    if (who or "").strip() in _PLATFORM_ACTORS:   # it opens the sentence; a person's name is as is
+        named = named[:1].upper() + named[1:]
+    return _pick(_CARD_EDIT_NOTE, language).format(
+        who=named, what=card_edit_parts(parts, language=language))
+
+
+def actor(who: str, *, language: str | None = None) -> str:
+    """Who caused a change, as the SUBJECT of a sentence — a person by their name, the platform by
+    its words in the project's language, never by the name the code passes (#546)."""
+    named = _PLATFORM_ACTORS.get((who or "").strip())
+    return _pick(named, language)[0] if named else who
+
+
+def by_actor(who: str, *, language: str | None = None) -> str:
+    """Who caused a change, as the AGENT, with its preposition — "por Ana", "pela fábrica"."""
+    named = _PLATFORM_ACTORS.get((who or "").strip())
+    if named:
+        return _pick(named, language)[1]
+    return _pick(_BY_A_PERSON, language).format(name=who)
+
+
+def card_close_note(*, who: str, reason: str, language: str | None = None) -> str:
+    return _pick(_CARD_CLOSE_NOTE, language).format(
+        by_who=by_actor(who, language=language), reason=reason)
+
+
+def card_reopen_note(*, who: str, language: str | None = None) -> str:
+    return _pick(_CARD_REOPEN_NOTE, language).format(by_who=by_actor(who, language=language))
+
+
+def closed_not_delivered_note(*, status: str, language: str | None = None) -> str:
+    return _pick(_CLOSED_NOT_DELIVERED_NOTE, language).format(status=status)
+
+
+# ── closing or removing a card from the card itself (#384) ───────────────────────────────────
+#
+# THE CARD SAYS WHAT ITS CONTROLS DO, IN THE PROJECT'S LANGUAGE. Until #384 a card the product role
+# opened carried one grey English sentence — "ask for it in the conversation with the product
+# role" — and no control, on the one surface a person looks at when they want a card gone. The
+# words are composed HERE, not in the page, for the reason `_CARD_EDIT_NOTE` gives: the page is
+# one file with no catalogue of its own, and a sentence written into it is English on a
+# Portuguese board. The route hands them to both surfaces with the card.
+#
+# NAMED FOR WHAT HAPPENS, NOT FOR HOW. "Close card" keeps the card and its history, recorded as not
+# done; "Remove from the board" is the row's own removal, and a row that has none CLOSES — which is
+# said in the confirmation, before the person confirms, so nobody believes a card is gone that
+# stays in a tracker's history.
+
+_CARD_CONTROLS = {
+    "pt-BR": {
+        "close": "Fechar cartão", "remove": "Remover do quadro",
+        "confirm": "Confirmar", "cancel": "Cancelar", "reason": "Por quê? (uma linha)",
+        "ask_close": ("Fechar tira o cartão da lista de trabalho e o mantém no histórico, "
+                      "registrado como não feito. Diga por quê — é o que o próximo leitor vai "
+                      "ter."),
+        # a FINISHED card's close is recorded as delivered (#162, #534), so its control says that
+        "ask_close_finished": ("Fechar tira o cartão da lista de trabalho e o mantém no "
+                               "histórico como entregue — ele já está terminado. Diga por quê — é "
+                               "o que o próximo leitor vai ter."),
+        "ask_remove": ("Remover apaga o cartão do quadro. O número dele não volta a ser usado, e "
+                       "fica registrado quem removeu, quando e por quê."),
+        "ask_remove_closes": ("Aqui os cartões só podem ser fechados, não apagados: ele será "
+                              "fechado como não feito e continua no histórico. Diga por quê."),
+    },
+    "en": {
+        "close": "Close card", "remove": "Remove from the board",
+        "confirm": "Confirm", "cancel": "Cancel", "reason": "Why? (one line)",
+        "ask_close": ("Closing takes the card off the list of work and keeps it in the history, "
+                      "recorded as not done. Say why — it is what the next reader will have."),
+        "ask_close_finished": ("Closing takes the card off the list of work and keeps it in the "
+                               "history as delivered — it is already finished. Say why — it is "
+                               "what the next reader will have."),
+        "ask_remove": ("Removing deletes the card from the board. Its number is never used again, "
+                       "and who removed it, when and why is kept."),
+        "ask_remove_closes": ("Cards here can only be closed, not deleted: it will be closed as "
+                              "not done and stay in the history. Say why."),
+    },
+}
+#: The sentence under the card: what its controls do, for WHO opened it and WHERE it is. Keyed by
+#: `(opened by the product role, the factory has taken it up)`.
+_CARD_CONTROLS_NOTE = {
+    "pt-BR": {
+        (True, False): ("O papel de produto abriu este cartão. Fechar ou remover pede isso a ele "
+                        "daqui mesmo: ele mantém o requisito e o cartão dizendo a mesma coisa e "
+                        "avisa a conversa. Mudar o texto continua sendo pedido na conversa."),
+        (True, True): ("O papel de produto abriu este cartão, e a fábrica já o pegou: remover não "
+                       "é mais possível, e fechar pede isso ao papel de produto assim que nenhum "
+                       "trabalho estiver nele. Mudar o texto continua sendo pedido na conversa."),
+        (False, False): ("Fechar tira o cartão da lista com o seu motivo e mantém o histórico. "
+                         "Remover o tira do quadro antes que alguém comece."),
+        (False, True): ("A fábrica já pegou este cartão: remover não é mais possível, e fechar só "
+                        "acontece quando nenhum trabalho estiver nele."),
+    },
+    "en": {
+        (True, False): ("The product role opened this card. Close or remove asks it to, from "
+                        "here: it keeps the requirement and the card saying the same thing and "
+                        "tells the conversation. Changing the text is still asked for in the "
+                        "conversation."),
+        (True, True): ("The product role opened this card, and the factory has taken it up: it "
+                       "can no longer be removed, and closing asks the product role once no job "
+                       "is on it. Changing the text is still asked for in the conversation."),
+        (False, False): ("Close takes the card off the list with your reason and keeps its "
+                         "history. Remove takes it off the board before anybody starts on it."),
+        (False, True): ("The factory has taken this card up: it can no longer be removed, and it "
+                        "closes only once no job is on it."),
+    },
+}
+#: What the person is told once the product role has done it — in place, on the card.
+_CARD_WITHDRAWN_RESULT = {
+    "pt-BR": {
+        "closed": "fechei o {ref} — ele sai da lista de trabalho e fica no histórico como não "
+                  "feito.",
+        # THE SAME WORD THE RECORD WROTE (#534): a card already finished closes as delivered
+        # (#162), and the sentence about it says so — "not done" was the record's opposite
+        "delivered": "fechei o {ref} como entregue — ele já estava terminado, e o que entregou "
+                     "continua registrado.",
+        "removed": "removi o {ref} — ele não está mais no quadro; o número não volta a ser usado, "
+                   "e fica registrado quem removeu, quando e por quê.",
+        "only_closed": "aqui os cartões só podem ser fechados, não apagados, então fechei o {ref} "
+                       "como não feito — ele continua no histórico.",
+        "not_yours": "só quem pediu o {ref}, ou alguém com permissão para aprovar, pode fechá-lo "
+                     "ou removê-lo. Nada mudou — peça a {names}.",
+    },
+    "en": {
+        "closed": "closed {ref} — it leaves the list of work and stays in the history as not "
+                  "done.",
+        "delivered": "closed {ref} as delivered — it was already finished, and what it shipped "
+                     "stays on the record.",
+        "removed": "removed {ref} — it is gone from the list of work; its number is never used "
+                   "again, and who removed it, when and why is kept.",
+        "only_closed": "cards here can only be closed, not deleted, so I closed {ref} as not "
+                       "done — it stays in the history.",
+        "not_yours": "only the person who asked for {ref}, or someone with permission to approve, "
+                     "can close or remove it. Nothing changed — ask {names}.",
+    },
+}
+
+
+def card_controls(*, opened_by_product: bool, started: bool, removes: bool,
+                  finished: bool = False, language: str | None = None) -> dict[str, str]:
+    """The words a card's close and remove controls carry, and the sentence under the card saying
+    what they do — for both surfaces, in the project's language (#384). A `finished` card's close
+    says "delivered", the word its close records (#162, #534)."""
+    words = dict(_pick(_CARD_CONTROLS, language))
+    if not removes:
+        words["ask_remove"] = words["ask_remove_closes"]
+    del words["ask_remove_closes"]
+    if finished:
+        words["ask_close"] = words["ask_close_finished"]
+    del words["ask_close_finished"]
+    words["note"] = _pick(_CARD_CONTROLS_NOTE, language)[(bool(opened_by_product),
+                                                          bool(started))]
+    return words
+
+
+def card_withdrawn_result(*, ref: str, how: str, language: str | None = None,
+                          approvers: list[str] | None = None) -> str:
+    """What the person hears on the card once it is closed (`closed`), removed (`removed`), or
+    closed because this tracker cannot remove (`only_closed`) — or why nothing happened, when they
+    are neither the person who asked for it nor an approver (`not_yours`), naming the approvers."""
+    return _naming(_pick(_CARD_WITHDRAWN_RESULT, language)[how], approvers, language,
+                   ref=ref_label(ref))
+
+
+# ── putting a card in the queue from the card itself (#562) ──────────────────────────────────
+#
+# THE PRODUCT OWNER SAYS WHAT THE FACTORY DOES NEXT. Since #562 they read the board, and a card
+# they open there lands on their own page — where it could be closed or removed, and not started:
+# starting was only a yes to a queue proposal in a conversation. The control is the row that yes
+# already reached (`product_promote`), and what the person confirms is said before they confirm:
+# from the queue the factory picks the card up, and from then on it spends. `{column}` is the
+# board's own name for the queue (#496), never the platform's.
+_CARD_QUEUE = {
+    "pt-BR": {
+        "queue": "Pôr na fila ({column})",
+        "ask": ("Pôr o {ref} em {column} começa o trabalho: a fábrica o pega de lá, e a partir daí "
+                "isso custa dinheiro. Pôr na fila?"),
+        "not_yours": ("Pôr o {ref} em {column} começa o trabalho, e isso custa dinheiro — é um sim "
+                      "de quem aprova: peça a {names}, ou diga na conversa."),
+    },
+    "en": {
+        "queue": "Queue it ({column})",
+        "ask": ("Putting {ref} in {column} starts the work: the factory picks it up from there, "
+                "and from then on it spends money. Queue it?"),
+        "not_yours": ("Putting {ref} in {column} starts the work, and that spends money — it is an "
+                      "approver's yes: ask {names}, or say it in the conversation."),
+    },
+}
+
+
+def card_queue_controls(*, ref: str, column: str, language: str | None = None) -> dict[str, str]:
+    """The words of the card's "queue it" control on the product view: the button and the
+    question it asks before it spends."""
+    said = _pick(_CARD_QUEUE, language)
+    return {key: said[key].format(ref=ref_label(ref), column=column) for key in ("queue", "ask")}
+
+
+def card_queue_not_yours(*, ref: str, column: str, language: str | None = None,
+                         approvers: list[str] | None = None) -> str:
+    """Said on the card, in place of the control, to a person who may not start work — naming who
+    may."""
+    return _naming(_pick(_CARD_QUEUE, language)["not_yours"], approvers, language,
+                   ref=ref_label(ref), column=column)
+
+
+#: WHO CAN APPROVE, BY NAME (#666). Every sentence that sent a person to the product's approvers
+#: said "peça a uma dessas pessoas" and named nobody: journey 0 read it to someone off the list
+#: on a product whose admins the registry lists. A sentence that sends a person to the approvers
+#: carries `{names}`, filled here from `product.admins` as the platform knows them — at most
+#: `APPROVERS_NAMED`, as the note under a proposal names them — or, when nobody is set up, the
+#: person who can set one up.
+_APPROVERS = {
+    "pt-BR": {"or": " ou ", "nobody": "quem configurou o produto"},
+    "en": {"or": " or ", "nobody": "whoever set the product up"},
+}
+APPROVERS_NAMED = 3
+
+
+def approvers_named(approvers: list[str] | None, language: str | None = None) -> str:
+    """The approvers as a sentence names them: "po", "po ou ana", "po, ana ou rui"."""
+    said = _pick(_APPROVERS, language)
+    names = [str(a).strip() for a in (approvers or []) if str(a).strip()][:APPROVERS_NAMED]
+    if not names:
+        return said["nobody"]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + said["or"] + names[-1]
+
+
+def _naming(text: str, approvers: list[str] | None, language: str | None, **fields) -> str:
+    """`text` with its fields, and `{names}` filled with the approvers. A sentence that names them
+    and was handed none is the defect itself, so it is refused rather than said."""
+    if "{names}" in text and approvers is None:
+        raise ValueError("this sentence sends the person to the approvers: pass `approvers`")
+    return text.format(names=approvers_named(approvers, language), **fields)
+
+
+def _pick(catalogue: dict[str, str], language: str | None) -> str:
+    """The message for a language, falling back to the default and then to English. A language
+    nobody has translated for gets understandable English rather than a KeyError in a chat
+    listener."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    return catalogue.get(lang) or catalogue.get(DEFAULT_LANGUAGE) or catalogue["en"]
+
+
+def column_said(named: str, key: str) -> str:
+    """The column a sentence names: `named`, the board's own word for the stage `key`, when the
+    caller asked the board — the platform's word otherwise (#502).
+
+    THE SENTENCES SPELLED THE PLATFORM'S COLUMNS. "Fica no Backlog", "Promover para TO-DO" — said
+    to a person about a card the product role had just placed in their board's `Pendências`, or
+    waiting in its `A Fazer`. They read those words and look for them on their own board. The
+    caller holds the board (`ProductModule.board_words`, the door's `Seen.column`), so it passes
+    the name in; a caller that has none says the platform's word, which is what the board says
+    when nobody renamed it."""
+    from beeverforge.adapters.board.columns import name_for
+
+    return str(named or "").strip() or name_for(key)
+
+
+_CONFIRM = {
+    "pt-BR": ("Foi isto que eu entendi — *{title}*\n\nIsso significaria:\n{items}"
+              "{conflicts}\n\nEntendi certo? Responda *sim* e eu registro para o time conferir."),
+    "en": ("Here's what I understood — *{title}*\n\nThis would mean:\n{items}"
+           "{conflicts}\n\nHave I got it right? Reply *yes* and I'll write it up for the team."),
+}
+_CONFLICT_HEAD = {"pt-BR": "\n\n⚠️ Antes de confirmar: ", "en": "\n\n⚠️ Before you confirm, "}
+#: Each kind of conflict the drafter records (`role.Conflict.kind`), in its own words: what it
+#: does to what was decided, then what that means. THE FRAME SAID "A CHANGE OF MIND" OF EVERY
+#: KIND (#676): a date format that only narrowed a requirement, contradicting nothing, was told
+#: as one right before the yes. Only a contradiction is; the first kind is the fallback, so a kind
+#: nobody wrote words for is told as the strongest.
+_CONFLICT_KINDS = {
+    "pt-BR": {
+        "contradicts": ("isso vai contra algo que já foi decidido:",
+                        "Ou seja, é uma mudança de ideia, não um acréscimo — o que tudo bem, mas "
+                        "vale dizer em voz alta."),
+        "duplicates": ("isso repete algo que já foi decidido:",
+                       "Ou seja, talvez já esteja prometido — vale conferir antes de registrar de "
+                       "novo."),
+        "narrows": ("isso detalha algo que já foi decidido:",
+                    "Ou seja, acrescenta ao que já existe sem desfazer nada."),
+        "depends_on": ("isso depende de algo que já foi decidido:",
+                       "Ou seja, só funciona junto com o que já existe — se aquilo mudar, isto "
+                       "muda também."),
+    },
+    "en": {
+        "contradicts": ("this runs against something we already decided:",
+                        "So it's a change of mind, not an addition — which is fine, but worth "
+                        "saying out loud."),
+        "duplicates": ("this repeats something we already decided:",
+                       "So it may already be promised — worth checking before writing it down "
+                       "again."),
+        "narrows": ("this adds detail to something we already decided:",
+                    "So it adds to what is already there without undoing any of it."),
+        "depends_on": ("this builds on something we already decided:",
+                       "So it only works together with what is already there — if that changes, "
+                       "this changes too."),
+    },
+}
+#: What a person hears when a requirement lands. NO URL, and that is the point: a link to a code
+#: forge is delivery machinery (ADR-0026), and the person who runs an accounting firm cannot judge a
+#: markdown diff. What they can judge is the SENTENCE — which they already approved, in their own
+#: words, before this was written.
+#:
+#: Two versions, because "merged" and "still open" are different facts and one message for both is
+#: the class this codebase keeps paying for. The second is a degradation with a name, not a
+#: hedge: the proposal exists, the team can finish it, and the role itself cannot see it yet.
+#: FIRST PERSON, like its unmerged sibling below, and that is not a style choice.
+#:
+#: This used to read "Pronto — está escrito como *requisito N*". The passive participle is the same
+#: word a product owner uses all day about DOCUMENTS — "é a única promessa escrita", "nenhum outro
+#: assunto está escrito", "continuam sem uma linha escrita" — so the false-claim detector could
+#: either see this sentence and fire on all of those, or spare those and go blind to this one.
+#: A word that means two things cannot be made to mean one by tuning the list that reads it.
+#:
+#: So the SENTENCE became unambiguous instead of the detector. "Escrevi" says who did it and when,
+#: which is what a success line is for, and it costs nothing a client would miss.
+_WRITTEN_UP = {
+    "pt-BR": ("Pronto — **escrevi** o *requisito {number}: {title}* na nossa base.\n\n"
+              "Ainda **não** é um acordo: é um texto proposto. Quando você me disser que está "
+              "acordado, aí sim vira promessa e a fábrica passa a defender isso. "
+              "**Nada está sendo construído ainda**."),
+    "en": ("Done — I **wrote** *requirement {number}: {title}* into our base.\n\n"
+           "It is NOT an agreement yet: it is a proposed text. When you tell me it is agreed it "
+           "becomes a promise and the factory starts defending it. "
+           "**Nothing is being built yet**."),
+}
+_WRITTEN_UP_UNMERGED = {
+    # the reassurance belongs in BOTH versions: whether or not it landed, the thing a person most
+    # needs to know is that nobody has started spending on it. A test caught its absence here.
+    "pt-BR": ("Escrevi o *requisito {number}: {title}* e guardei em segurança, mas ele ainda não "
+              "entrou na base — o time precisa concluir esse passo. Eu mesma ainda não consigo "
+              "lê-lo, então não vou responder sobre ele até entrar. "
+              "**Nada está sendo construído ainda**."),
+    "en": ("I wrote *requirement {number}: {title}* and it is safe, but it has not landed in the "
+           "base yet — the team has to finish that step. I cannot read it myself until it does, so "
+           "I will not answer about it before then. **Nothing is being built yet**."),
+}
+_CANNOT_WRITE_NONE = {
+    "pt-BR": ("Posso conversar sobre isso e preparar uma proposta, mas ainda não há ninguém "
+              "habilitado a aprovar o que eu registro. Peça essa permissão a quem me configurou."),
+    "en": ("I can talk this through and draft it, but nobody has been set up yet to approve what "
+           "I write down. Ask whoever set me up to give you that permission."),
+}
+#: THE ACT, NOT ONE OF THEM, AND NO PROMISE (#666). This said "registrar como requisito acordado …
+#: peça a confirmação a uma dessas pessoas e eu registro" to every refusal of a person off the
+#: list — a breakdown, a refine, a yes, a release — named nobody, and promised a recording nothing
+#: was waiting for.
+_CANNOT_WRITE_SOME = {
+    "pt-BR": ("Posso conversar sobre isso, mas fazer isso precisa do sim de alguém com permissão "
+              "para aprovar. Nada foi feito — peça a {names}."),
+    "en": ("I can talk this through, but doing it needs the yes of someone with permission to "
+           "approve. Nothing was done — ask {names}."),
+}
+_UNAVAILABLE = {
+    "pt-BR": ("Não estou conseguindo enxergar os requisitos do produto agora, então qualquer "
+              "coisa que eu dissesse seria chute, e não algo que eu possa sustentar. Já avisei "
+              "o time."),
+    "en": ("I can't see the product's requirements at the moment, so anything I told you now "
+           "would be guesswork rather than something I can stand behind. I've flagged it to the "
+           "team."),
+}
+#: Sent the INSTANT a slow message arrives, before the model is called. The product owner's first
+#: real message took 2min38s to answer — and during it there is no way to tell "she is thinking"
+#: from "she ignored me" from "she crashed". Slack's typing indicator expires in about five
+#: seconds, so it is not the fix for a two-minute answer; a sentence is.
+#:
+#: SEVERAL of them, because the same string every single time is how a person stops reading it and
+#: starts hearing a machine — the product owner asked for this after seeing the first one land.
+#: Every variant obeys the same two rules: it promises NOTHING about what she will do (nothing has
+#: been thought
+#: yet, so any promise would be invented), and it carries no delivery vocabulary.
+_ON_IT = {
+    "pt-BR": [
+        "deixa eu olhar isso — já te respondo.",
+        "vou dar uma olhada, volto já.",
+        "peguei. me dá um minuto que eu olho direito.",
+        "tô vendo isso agora — já volto.",
+        "anotado, vou conferir e já te digo.",
+    ],
+    "en": [
+        "let me look at that — I'll come back to you shortly.",
+        "on it — give me a minute.",
+        "got it. Let me check properly and I'll get back to you.",
+        "having a look now — back shortly.",
+        "noted, I'll check and tell you.",
+    ],
+}
+
+#: When the handler itself broke. DELIBERATELY DIFFERENT from _UNAVAILABLE: "I can't see the
+#: requirements" is a diagnosis, and saying it after an unrelated crash is a lie that sends the
+#: reader looking at the wrong thing. It also must never be silence — a person who writes to a
+#: colleague and gets nothing back concludes the colleague is ignoring them, and the whole
+#: premise of this role is that it does not do that.
+_BROKE = {
+    "pt-BR": ("Algo quebrou do meu lado ao processar isso — não foi você. O time já foi avisado "
+              "automaticamente. Pode repetir daqui a pouco, ou reformular, que eu tento de novo."),
+    "en": ("Something broke on my side while handling that — it wasn't you. The team has been "
+           "alerted automatically. Try again shortly, or rephrase it, and I'll have another go."),
+}
+#: The door's three words of presence (#266 slice 3). NEUTRAL IN GENDER, like the introduction
+#: below — "você é o próximo" would guess at a person the role cannot see — and naming nobody: the
+#: busy acknowledgement is read by one person about another's turn.
+_HEARD = {
+    "pt-BR": "recebi sua mensagem.",
+    "en": "I have your message.",
+}
+_YOU_ARE_NEXT = {
+    "pt-BR": "recebi sua mensagem — a próxima resposta é a sua.",
+    "en": "I have your message — you are next.",
+}
+_IN_ORDER = {
+    "pt-BR": "recebi sua mensagem — respondo em ordem, e há {ahead} antes da sua.",
+    "en": "I have your message — I answer in order, and there are {ahead} ahead of yours.",
+}
+_OVERHEARD = {
+    "pt-BR": "isto ficou na sala, não veio para mim — me mencione para me perguntar algo.",
+    "en": "that stays with the room; it was not for me — mention me to ask me something.",
+}
+_HANDED_OFF = {
+    "pt-BR": ("isto está levando mais tempo do que uma resposta comporta — continuo trabalhando "
+              "nisso e volto aqui quando terminar."),
+    "en": ("this is taking longer than one reply should — I am still working on it and will come "
+           "back here when it is done."),
+}
+#: THE SAME PROMISE, NAMING WHERE THE TURN WAS AT THE BOUND (#395). A chat add-on has no status it
+#: can edit, so this is the one place it hears what the role is doing — one message, the one it
+#: already got, and never a message per stage.
+_HANDED_OFF_AT = {
+    "pt-BR": ("isto está levando mais tempo do que uma resposta comporta — agora estou {stage}; "
+              "continuo trabalhando nisso e volto aqui quando terminar."),
+    "en": ("this is taking longer than one reply should — right now I am {stage}; I am still "
+           "working on it and will come back here when it is done."),
+}
+#: WHAT A TURN IS DOING, as the person reads it while they wait (#395, `product/progress.py`).
+#: PRESENCE, like the receipt: what the role is doing, never what it found — so no stage can leak
+#: an answer before it is post-processed. Each reads after "agora estou" / "right now I am" (the
+#: hand-off above) and alone as a status line. `{step}`/`{of}` are the card loop's attempt
+#: (#390, `cards.compose`).
+_STAGE = {
+    "pt-BR": {
+        "reading": "lendo a conversa",
+        "answering": "pensando na resposta",
+        "board": "lendo o quadro",
+        "drafting": "escrevendo a proposta",
+        "breaking_down": "quebrando o requisito em cartões",
+        "writing": "registrando",
+        "card_draft": "escrevendo o cartão",
+        "card_review": "revisando o cartão ({step}/{of})",
+    },
+    "en": {
+        "reading": "reading the conversation",
+        "answering": "thinking the answer through",
+        "board": "reading the board",
+        "drafting": "writing the proposal",
+        "breaking_down": "breaking the requirement into cards",
+        "writing": "writing it down",
+        "card_draft": "writing the card",
+        "card_review": "reviewing the card ({step} of {of})",
+    },
+}
+#: How it introduces itself. Named or not, and never with a gendered article — "meu nome é Nina"
+#: reads correctly for any name a client picks, "sou a Nina" does not.
+_INTRO = {
+    "pt-BR": ("Olá, meu nome é {name} e cuido do produto *{product}*.",
+              "Olá — sou o agente de produto do *{product}*."),
+    "en": ("Hello, my name is {name} and I look after *{product}*.",
+           "Hello — I'm the product agent for *{product}*."),
+}
+
+#: The arrival. SHORT, and it earns its length by ending somewhere a person can act.
+#:
+#: The first version opened with three paragraphs describing a process — what a first pass is, what
+#: `observed` means, what would not be touched — and finished by asking where to start. The product
+#: owner's reading of it was the right one: nobody had asked for a methodology, and "tell me where
+#: to begin" hands the work back to the person who was hoping to hand it over. So: who I am, where
+#: things
+#: stand, what I would do first, and what I will not do without you.
+_ANNOUNCE = {
+    "pt-BR": (
+        "{intro}\n\n"
+        "{situation}\n\n"
+        "*O que eu faria primeiro:* {first}\n\n"
+        "Nada disso começa sem vocês: eu proponho, quem decide são vocês. E o que eu escrever "
+        "sobre o produto vem marcado como *observado* até alguém confirmar — porque depois de "
+        "acordado a fábrica passa a defender aquilo, inclusive o que estiver errado."
+    ),
+    "en": (
+        "{intro}\n\n"
+        "{situation}\n\n"
+        "*What I'd do first:* {first}\n\n"
+        "None of it starts without you: I propose, you decide. And anything I write about the "
+        "product is marked *observed* until somebody confirms it — once agreed, the factory "
+        "defends it, including whatever turns out to be wrong."
+    ),
+}
+
+#: What she offers to do first, chosen from what the board actually says. Never a menu: a person
+#: who wanted to choose would not have needed the role.
+_FIRST = {
+    "pt-BR": {
+        "queue": "propor o que entra na fila agora, na ordem — é só me dizer que eu monto.",
+        "refine": ("escrever os critérios dos itens que ainda não dizem quando estariam "
+                   "prontos, para eles poderem entrar na fila."),
+        "document": ("percorrer o que o produto já faz e escrever, para existir algo a que "
+                     "comparar quando alguém pedir uma mudança."),
+    },
+    "en": {
+        "queue": "propose what goes into the queue now, in order — say the word and I'll draft it.",
+        "refine": ("write criteria for the items that do not yet say when they would be done, so "
+                   "they can be queued."),
+        "document": ("go through what the product already does and write it down, so there is "
+                     "something to compare against when somebody asks for a change."),
+    },
+}
+
+
+def confirmation_request(*, title: str, must_be_true: list[str],
+                         conflicts: list[str | tuple[str, str]] | None = None,
+                         language: str | None = None) -> str:
+    """What the client is asked to confirm, before anything is written up for the team.
+
+    This confirmation is the PROVENANCE — the record of who wanted it and when — which is why it
+    happens in the conversation with the person who wanted it, and not on an artefact they would
+    never open.
+
+    A conflict is `(kind, line)`, told under its kind's words (#676); a bare line is a
+    contradiction, as every conflict was told before the kind reached this far."""
+    return _pick(_CONFIRM, language).format(
+        title=title, items="\n".join(f"• {c}" for c in must_be_true),
+        conflicts=_conflict_block(conflicts or [], language))
+
+
+def _conflict_block(conflicts: list[str | tuple[str, str]], language: str | None) -> str:
+    words = _pick(_CONFLICT_KINDS, language)
+    strongest = next(iter(words))
+    grouped: dict[str, list[str]] = {}
+    for c in conflicts:
+        kind, line = c if isinstance(c, tuple) else (strongest, c)
+        grouped.setdefault(kind if kind in words else strongest, []).append(line)
+    parts = []
+    for kind in (k for k in words if k in grouped):
+        lead, coda = words[kind]
+        items = "\n".join(f"• {line}" for line in grouped[kind])
+        parts.append(f"{lead if not parts else lead[:1].upper() + lead[1:]}\n{items}\n\n{coda}")
+    return _pick(_CONFLICT_HEAD, language) + "\n\n".join(parts) if parts else ""
+
+
+#: THE CARD BEFORE THE PROMISE (ADR-0047 §2): what the requester reads right after the first yes.
+#: The second question is asked here, on the thing that will be worked.
+_CARDS_OPENED_AWAITING = {
+    "pt-BR": ("Abri {cards} para esse requisito, na coluna {backlog}, ainda **sem aceite**. Você "
+              "confirma que é isso que o produto promete? Se sim, o aceite fica registrado no "
+              "cartão, em seu nome — e só aí vira promessa. **Nada está sendo construído ainda**."),
+    "en": ("I opened {cards} for this requirement, in the {backlog}, **not yet accepted**. Do you "
+           "confirm this is what the product promises? If so, the acceptance is recorded on the "
+           "card in your name — and only then does it become a promise. "
+           "**Nothing is being built yet**."),
+}
+#: The comment on the card (ADR-0047 §3). `{actor}` is the person who said yes; `{behalf}` names
+#: the requester when somebody else accepted for them.
+_ACCEPTANCE_STAMP = {
+    "pt-BR": "{sig} Aceite dado por {actor} em {day}, {where}{behalf}.",
+    "en": "{sig} Accepted by {actor} on {day}, {where}{behalf}.",
+}
+_ON_BEHALF = {"pt-BR": " (em nome de {requester})", "en": " (on behalf of {requester})"}
+#: ADR-0047 §4: the second yes belongs to whoever asked. Said to the admin who tried to give it
+#: for them — no key name, no jargon: what the rule is and where it would be changed.
+_ONLY_THE_REQUESTER = {
+    "pt-BR": ("O segundo sim é de quem pediu este requisito ({requester}). Aceitar em nome de "
+              "outra pessoa é uma decisão da configuração do produto, e está desligada — peça a "
+              "quem pediu que confirme."),
+    "en": ("The second yes belongs to whoever asked for this requirement ({requester}). "
+           "Accepting on somebody else's behalf is a product configuration decision, and it is "
+           "off — ask the person who asked to confirm."),
+}
+#: The FIRST yes, refused to somebody who did not ask (#266 slice 4, ADR-0051 D11). No name: the
+#: requester may have asked in a thread the refused person is not in, and the refusal is not how
+#: anybody learns who asked for what. What it does say is the way through — asking for it
+#: themselves makes the confirmation theirs.
+_ONLY_THE_REQUESTER_CONFIRMS = {
+    "pt-BR": ("Esta proposta é de quem a pediu, e só essa pessoa pode confirmá-la. Confirmar em "
+              "nome de outra pessoa é uma decisão da configuração do produto, e está desligada — "
+              "se você também quer isso, me peça com as suas palavras e a confirmação fica sendo "
+              "sua."),
+    "en": ("This proposal belongs to whoever asked for it, and only they can confirm it. "
+           "Confirming on somebody else's behalf is a product configuration decision, and it is "
+           "off — if you want this too, ask me for it in your own words and the confirmation is "
+           "yours."),
+}
+_ACCEPTANCE_STAMPED = {
+    "pt-BR": "O aceite ficou registrado {cards}, em seu nome.",
+    "en": "The acceptance is recorded {cards}, in your name.",
+}
+_ACCEPTANCE_NOT_STAMPED = {
+    "pt-BR": ("O acordo vale. Só não consegui registrá-lo no cartão agora — o time foi avisado e "
+              "faz isso."),
+    "en": ("The agreement holds. I only could not record it on the card right now — the team was "
+           "told and will."),
+}
+_CARDS_WORD = {"pt-BR": ("o cartão {one}", "os cartões {many}"),
+               "en": ("card {one}", "cards {many}")}
+#: The same cards after "em", as two entries and never "em" + `_CARDS_WORD`: Portuguese contracts
+#: the preposition with the article ("no cartão", "nos cartões"), and composed it read "registrado
+#: em o cartão #12" (#538, the rule `_AGENDA_WHO` states).
+_ON_CARDS = {"pt-BR": ("no cartão {one}", "nos cartões {many}"),
+             "en": ("on card {one}", "on cards {many}")}
+_AND = {"pt-BR": " e ", "en": " and "}
+
+
+def _named_cards(cards: list[str], language: str | None, words=None) -> str:
+    one, many = _pick(words or _CARDS_WORD, language)
+    refs = [ref_label(c) for c in cards]
+    if len(refs) == 1:
+        return one.format(one=refs[0])
+    joiner = _pick(_AND, language)
+    return many.format(many=", ".join(refs[:-1]) + joiner + refs[-1])
+
+
+def cards_opened_awaiting(*, cards: list[str], number: int, language: str | None = None,
+                          backlog: str = "") -> str:
+    """`backlog` is what the card's board calls it — see `column_said`."""
+    return _pick(_CARDS_OPENED_AWAITING, language).format(
+        cards=_named_cards(cards, language), number=number,
+        backlog=column_said(backlog, "backlog"))
+
+
+def acceptance_stamp(*, number: int, actor: str, day: str, where: str, requester: str = "",
+                     language: str | None = None, agent_name: str = "") -> str:
+    """The comment posted on the card: who accepted, when, from where — and for whom, when the
+    person who said yes is not the one who asked.
+
+    BOTH ARE NAMED AS THE PLATFORM KNOWS THEM (#266 slice 6): no chat vendor's mention syntax. A
+    requester recorded before that wears one on the card it came from, so it is taken off to
+    compare the two and to name them."""
+    bare_actor = actor.strip("<@>")
+    bare_requester = (requester or "").strip("<@>")
+    behalf = ""
+    if bare_requester and bare_requester != bare_actor:
+        behalf = _pick(_ON_BEHALF, language).format(requester=bare_requester)
+    return _pick(_ACCEPTANCE_STAMP, language).format(
+        sig=signature(agent_name, language=language), actor=bare_actor, day=day,
+        where=where or "", behalf=behalf, number=number).replace(" ,", ",").replace("  ", " ")
+
+
+def only_the_requester_accepts(*, requester: str, language: str | None = None) -> str:
+    return _pick(_ONLY_THE_REQUESTER, language).format(requester=requester)
+
+
+def only_the_requester_confirms(*, language: str | None = None) -> str:
+    """The first yes, given on somebody else's proposal — refused, naming nobody."""
+    return _pick(_ONLY_THE_REQUESTER_CONFIRMS, language)
+
+
+def acceptance_stamped(*, cards: list[str], language: str | None = None) -> str:
+    return _pick(_ACCEPTANCE_STAMPED, language).format(
+        cards=_named_cards(cards, language, _ON_CARDS))
+
+
+def acceptance_not_stamped(*, language: str | None = None) -> str:
+    return _pick(_ACCEPTANCE_NOT_STAMPED, language)
+
+
+def written_up(*, title: str, url: str, number: int, language: str | None = None,
+               merged: bool = True) -> str:
+    """What the client reads after a requirement is written.
+
+    `url` is still accepted and DELIBERATELY UNUSED in the text: the caller has it for the log and
+    the team, and passing it here used to put a GitHub link in front of somebody who cannot act on
+    one. Removing the parameter would have made every caller change; ignoring it keeps the seam and
+    kills the leak."""
+    catalogue = _WRITTEN_UP if merged else _WRITTEN_UP_UNMERGED
+    return _pick(catalogue, language).format(title=title, number=number)
+
+
+#: A change is live somewhere a person can look at it. NOT a release announcement: it asks, and
+#: what it asks for is a look, in the client's own terms — no ticket number, no run URL, no branch.
+_DEPLOY_INVITATION = {
+    "pt-BR": ("Já dá para ver funcionando: *{what}* está no ar em {url}.\n\n"
+              "Quando puder, dá uma olhada e me diz se ficou como você esperava."),
+    "en": ("It's up and you can try it: *{what}* is live at {url}.\n\n"
+           "When you get a moment, have a look and tell me whether it turned out the way you "
+           "expected."),
+}
+
+
+#: What to call the change when nothing better is known, per language. A ticket a person dragged
+#: into TO-DO has no requirement behind it and may have no readable title either.
+_SOME_UPDATE = {"pt-BR": "a atualização", "en": "the update"}
+
+
+def deploy_invitation(*, what: str = "", url: str, language: str | None = None) -> str:
+    """The client's invitation to look at a change that just went live (#122).
+
+    THE TICKET NUMBER IS NOT THE SUBJECT. The client-facing delivery loop only opens for work filed
+    FROM a requirement, and a ticket somebody dragged into TO-DO has none — so this names the work
+    by whatever it was called, and falls back to "the update", never to "#87". A number from a
+    board the reader may not be able to open is exactly the mechanics leak this module exists to
+    keep out.
+
+    THE ENVIRONMENT'S NAME IS NOT PRINTED EITHER. "staging" is our word for it; the person being
+    asked to look needs the address and the thing that changed."""
+    subject = (what or "").strip() or _pick(_SOME_UPDATE, language)
+    return _pick(_DEPLOY_INVITATION, language).format(what=subject, url=url.rstrip("/"))
+
+
+def cannot_write(*, approvers: list[str], language: str | None = None) -> str:
+    """A refusal, in terms a client can act on, naming who can (#666). Naming a configuration file
+    would be both useless and slightly insulting to someone who was never meant to edit one."""
+    if approvers is not None and not [a for a in approvers if str(a).strip()]:
+        return _pick(_CANNOT_WRITE_NONE, language)
+    return _naming(_pick(_CANNOT_WRITE_SOME, language), approvers, language)
+
+
+def unavailable(*, reason_for_team: str = "", language: str | None = None) -> str:
+    """The corpus could not be loaded. The client is told the truth — that the role cannot see the
+    product's history right now, so its answers would be guesses — without the diagnosis, which is
+    the team's to read."""
+    return _pick(_UNAVAILABLE, language)
+
+
+def on_it(*, language: str | None = None, agent_name: str = "", seed: str = "") -> str:
+    """The receipt. Says nothing about WHAT it will do — it is sent before any thinking has
+    happened, so any promise here would be invented.
+
+    The variant is chosen from `seed` (the message being answered), NOT at random. Deterministic
+    means the same message always produces the same receipt, so tests are stable and a support
+    question — "why did it say that?" — has an answer; varied means consecutive messages differ,
+    which is the whole point. Random would buy nothing and cost both.
+    """
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    options = _ON_IT.get(lang) or _ON_IT[DEFAULT_LANGUAGE] or _ON_IT["en"]
+    from hashlib import blake2b
+
+    idx = int(blake2b((seed or "").encode(), digest_size=4).hexdigest(), 16) % len(options)
+    return sig + options[idx]
+
+
+def broke(*, language: str | None = None) -> str:
+    """What the person hears when the handler raised. Never the diagnosis, never silence."""
+    return _pick(_BROKE, language)
+
+
+#: THE PLATFORM'S OWN FIXED SENTENCES THAT ARE NOT THE ROLE'S ANSWER (#457), by the kind each
+#: carries where it is recorded as a role line. `broke` and `unavailable` are the two that reach the
+#: transcript — a hand-off and a busy acknowledgement are presence, published and never recorded, so
+#: they need no recognition here. These take no interpolation, so a recorded line IS one of them
+#: when it ends with it: the one thing that can precede it is an agent-name prefix (`on_it` et al.).
+_OWN_VOICE = {"broke": _BROKE, "unavailable": _UNAVAILABLE}
+
+
+def own_voice_kind(text: str) -> str:
+    """The kind a recorded role line is when it is one of the platform's OWN sentences — `""` when
+    it is the model's answer (#457). The engine records it so the distillation hands no platform
+    sentence to a model. Recognised by the whole sentence, matched where `voice.py` composed both
+    sides, never by a substring: these sentences mean one thing and carry no interpolated part."""
+    said = " ".join(str(text or "").split())
+    if not said:
+        return ""
+    for kind, catalogue in _OWN_VOICE.items():
+        for sentence in catalogue.values():
+            flat = " ".join(str(sentence).split())
+            if flat and (said == flat or said.endswith(flat)):
+                return kind
+    return ""
+
+
+def heard(*, language: str | None = None, agent_name: str = "") -> str:
+    """The door's acknowledgement when it could not tell where the message stands — the engine
+    was slow to say — and so promises only what is certain: the message is kept."""
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    return sig + _pick(_HEARD, language)
+
+
+def you_are_next(*, ahead: int = 1, language: str | None = None, agent_name: str = "") -> str:
+    """BUSY IS A PRESENCE, NEVER A REFUSAL (ADR-0051 D5): the acknowledgement a person gets, within
+    two seconds, when the role is answering somebody else in the same conversation.
+
+    IT NAMES NOBODY, and there is no placeholder in any language that could: who the role is
+    answering is not the sender's to know. What it says is that the message is kept and where it
+    stands — next, or with `ahead` turns in front of it."""
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    if ahead <= 1:
+        return sig + _pick(_YOU_ARE_NEXT, language)
+    return sig + _pick(_IN_ORDER, language).format(ahead=ahead)
+
+
+def overheard(*, language: str | None = None, agent_name: str = "") -> str:
+    """The acknowledgement for a message said in a group to somebody else (ADR-0051 D14): kept,
+    and not for the role — and how to make the next one for it. Shown to its sender alone, where
+    a transport can (the panel's note under their own message); never posted into the room."""
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    return sig + _pick(_OVERHEARD, language)
+
+
+def handed_off(*, language: str | None = None, agent_name: str = "", stage: str = "") -> str:
+    """What the person hears when a turn outlived its bound (ADR-0051 D6, about ninety seconds):
+    the work goes on, the conversation moves on, and the answer comes back here when it is done.
+    Presence, like the receipt — it promises only that the answer is coming, never what it is.
+
+    `stage` is what the turn was doing at the bound, as `stage_text` said it (#395): named in the
+    sentence, because a chat add-on has no status line and this is the one message it gets while
+    it waits. "" — a turn that reported no stage — keeps the sentence it always was."""
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    if stage.strip():
+        return sig + _pick(_HANDED_OFF_AT, language).format(stage=stage.strip())
+    return sig + _pick(_HANDED_OFF, language)
+
+
+def stage_text(stage: str, *, language: str | None = None, **counts: int) -> str:
+    """What a turn is doing, in the person's words — "" for a stage no language has words for
+    (#395). A count the sentence needs and was not given reads as "?", never as a KeyError inside
+    a turn: a status is worth less than the answer it sits beside."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    words = (_STAGE.get(lang) or _STAGE.get(DEFAULT_LANGUAGE) or _STAGE["en"]).get(stage) \
+        or _STAGE["en"].get(stage, "")
+    if not words:
+        return ""
+
+    class _Given(dict):
+        def __missing__(self, key):
+            return "?"
+
+    return words.format_map(_Given(counts))
+
+
+def announcement(*, product: str, areas: list[str] | None = None,
+                 language: str | None = None, agent_name: str = "",
+                 readiness=None, requirements: int = 0) -> str:
+    """First contact, for the people who own the product rather than the code."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    named, unnamed = _INTRO.get(lang, _INTRO["en"])
+    template = named if agent_name.strip() else unnamed
+    intro = template.format(name=agent_name.strip(), product=product)
+
+    where = situation(readiness, requirements=requirements, language=language) if readiness else ""
+    first = _first_move(readiness, requirements, lang)
+    return _pick(_ANNOUNCE, language).format(intro=intro, situation=where, first=first)
+
+
+def _first_move(readiness, requirements: int, lang: str) -> str:
+    """The one thing worth doing next, read off the board rather than offered as a menu.
+
+    Ordered by what costs something now: an idle factory beside ready work is losing capacity this
+    hour; a backlog nobody can start is losing it next week; a product nobody wrote down costs on
+    the day somebody argues about what was promised."""
+    options = _FIRST.get(lang, _FIRST["en"])
+    if readiness is None:
+        return options["document"] if not requirements else options["queue"]
+    if readiness.ready:
+        return options["queue"]
+    if readiness.needs_refinement:
+        return options["refine"]
+    return options["document"]
+
+
+#: What she actually ASKS the person, per finding — a question someone can answer, not a status.
+#: The platform's `Observation.detail` is English triage prose ("no acceptance criteria, so nobody
+#: can say when it is done") and shipped VERBATIM to the client channel until a reviewer caught it:
+#: two of the four askable kinds contained words from CLIENT_JARGON, in the wrong language. The
+#: detail stays in the ledger for operators; the CLIENT hears one of these.
+_ASK = {
+    "pt-BR": {
+        "no-criteria": "o que precisa ser verdade para considerarmos isso pronto? Hoje não está "
+                       "escrito, então ninguém consegue dizer quando terminou.",
+        "stalled": "isso começou e está sem movimento há um bom tempo — está esperando algo de "
+                   "vocês, ou perdeu a prioridade?",
+        "waiting-too-long": "isso está esperando uma decisão há tempo demais — o que falta para "
+                            "decidirmos?",
+        "done-but-open": "isso parece pronto do nosso lado — podemos dar por encerrado, ou ainda "
+                         "falta alguma coisa?",
+    },
+    "en": {
+        "no-criteria": "what has to be true for us to call this done? Nothing is written down, so "
+                       "nobody can say when it is finished.",
+        "stalled": "this was started and has not moved in a while — is it waiting on something "
+                   "from you, or did it lose priority?",
+        "waiting-too-long": "this has been waiting on a decision for too long — what is missing "
+                            "to decide?",
+        "done-but-open": "this looks finished on our side — can we call it done, or is something "
+                         "still missing?",
+    },
+}
+
+
+#: A DEFECT'S FRAME CLAIMS NO MORE THAN ITS MARKER CARRIED (#430). `[[DEFEITO:REQ-7]]` names a
+#: written promise and the frame may say it is broken; `[[DEFEITO]]` alone names none — "a defect
+#: needs no written requirement" is the role's own instruction — and a frame that still said "this
+#: breaks something we already promised" contradicted, in the same message, the role that had just
+#: said no requirement covers it. The promise without a number is that the product works.
+_DEFECT_CONFIRM = {
+    "pt-BR": "Isso quebra o que o requisito {violates} prometeu — vou registrar como problema para "
+             "corrigir, não como pedido novo. Confirma que é isso?",
+    "en": "This breaks what requirement {violates} promised — I will register it as a problem to "
+          "fix, not as a new request. Is that right?",
+}
+_DEFECT_CONFIRM_UNWRITTEN = {
+    "pt-BR": "Isso não está funcionando como deveria — vou registrar como problema para corrigir, "
+             "não como pedido novo. Confirma que é isso?",
+    "en": "This is not working as it should — I will register it as a problem to fix, not as a "
+          "new request. Is that right?",
+}
+
+#: HONEST about the gate. The first version said "está na fila de correção" — but a defect lands
+#: in Backlog, and by design (ADR-0019 §5) nothing leaves Backlog without a person promoting it:
+#: starting work spends money. A client who hears "in the fix queue", waits two weeks and sees
+#: nothing has been told a small lie, and a message caught once in a small lie discredits the true
+#: ones. The requirement flow already got this right ("nada está sendo construído ainda").
+_DEFECT_FILED = {
+    "pt-BR": "Registrado{req}. Entra na fila de correção quando o time aprovar a próxima leva — "
+             "e quando o conserto sair, eu aviso aqui.",
+    "en": "Registered{req}. It joins the fix queue when the team approves the next batch — and "
+          "when the fix ships, I will say so here.",
+}
+
+_TICKET_CONFIRM = {
+    "pt-BR": "Vou abrir um cartão no quadro com o título *{title}*, como você descreveu — sem "
+             "transformar isso em requisito. Confirma?",
+    "en": "I will open a card on the board titled *{title}*, as you described it — without "
+          "turning it into a requirement. Is that right?",
+}
+
+#: THE WHOLE CARD, BEFORE THE YES (#383). The confirmation used to show the title alone, and the
+#: body written was the message that asked for the card: the person approved one thing and the board
+#: got another. Now the yes is to the body that will be written, exactly as it reads here.
+_CARD_CONFIRM = {
+    "pt-BR": "Vou abrir este cartão no quadro, como está abaixo — sem transformar isso em "
+             "requisito:\n\n**{title}**\n\n{card}\n\nConfirma?",
+    "en": "I will open this card on the board, exactly as below — without turning it into a "
+          "requirement:\n\n**{title}**\n\n{card}\n\nIs that right?",
+}
+
+#: Said under a card that no judge could review — no judging harness on this deployment, or an
+#: answer that could not be read. The card still passed the deterministic floor; the person is the
+#: last reader, and is told they are the only one.
+_CARD_UNJUDGED = {
+    "pt-BR": "(Não consegui revisar este cartão automaticamente — leia com atenção antes de "
+             "confirmar.)",
+    "en": "(I could not review this card automatically — read it carefully before confirming.)",
+}
+
+#: THE WHOLE DEFECT CARD, BEFORE THE YES (#392) — the sibling of `_CARD_CONFIRM`, honest about what
+#: a defect is: registered to be fixed, against a promise, not a new request.
+_DEFECT_CARD_CONFIRM = {
+    "pt-BR": "Isso quebra o que o requisito {violates} prometeu — vou registrar este problema para "
+             "corrigir, não como pedido novo, como está abaixo:\n\n**{title}**\n\n{card}\n\n"
+             "Confirma?",
+    "en": "This breaks what requirement {violates} promised — I will register this problem to "
+          "fix, not as a new request, exactly as below:\n\n**{title}**\n\n{card}\n\n"
+          "Is that right?",
+}
+#: The same card when the marker named no requirement (#430): not working, never "promised".
+_DEFECT_CARD_CONFIRM_UNWRITTEN = {
+    "pt-BR": "Isso não está funcionando como deveria — vou registrar este problema para corrigir, "
+             "não como pedido novo, como está abaixo:\n\n**{title}**\n\n{card}\n\nConfirma?",
+    "en": "This is not working as it should — I will register this problem to fix, not as a new "
+          "request, exactly as below:\n\n**{title}**\n\n{card}\n\nIs that right?",
+}
+
+#: The person answered the judge's question and the judge still blocks: the card is shown for their
+#: yes with what the review still says, rather than asking a second time (#383).
+_CARD_DISPUTED = {
+    "pt-BR": "(A revisão automática ainda aponta: {findings} — leia com atenção antes de "
+             "confirmar.)",
+    "en": "(The automatic review still points out: {findings} — read it carefully before "
+          "confirming.)",
+}
+
+#: Twice drafted, twice not good enough: nothing is staged, and the one thing that would make the
+#: card possible is asked. A card the factory cannot build from is worse than a question.
+_CARD_NEEDS = {
+    "pt-BR": "Antes de abrir o cartão, preciso de mais uma coisa: {ask}",
+    "en": "Before I open the card, I need one more thing: {ask}",
+}
+_CARD_NEEDS_DONE = {
+    "pt-BR": "Antes de abrir o cartão, me diga o que precisa acontecer para considerarmos isso "
+             "pronto — sem isso, quem pegar o cartão não tem como saber quando terminou.",
+    "en": "Before I open the card, tell me what must happen for this to count as done — without "
+          "it, whoever picks the card up cannot know when they have finished.",
+}
+
+#: The drafting call itself failed — no card to show and nothing staged.
+_CARD_NOT_DRAFTED = {
+    "pt-BR": "Não consegui escrever o cartão agora, então não abri nada. Pode pedir de novo em "
+             "instantes.",
+    "en": "I could not write the card just now, so nothing was opened. Please ask again in a "
+          "moment.",
+}
+
+#: HONEST about the gate, like `_DEFECT_FILED`: a card lands in Backlog, and nothing leaves Backlog
+#: without a person promoting it (ADR-0019 §5) — starting work spends money.
+_TICKET_FILED = {
+    "pt-BR": "Aberto: {where}. Fica na coluna {backlog} até o time aprovar a próxima leva — e "
+             "quando "
+             "sair, eu aviso aqui.",
+    "en": "Opened: {where}. It stays in the {backlog} until the team approves the next batch — "
+          "and when it ships, I will say so here.",
+}
+
+#: The order read back BEFORE it is written, and honest about what it is not: nothing starts.
+_REORDER_CONFIRM = {
+    "pt-BR": "Coloco o backlog nesta ordem, de cima para baixo: {order}. Isso só grava a ordem — "
+             "nada começa agora; a próxima leva segue ela. Confirma?",
+    "en": "I will put the backlog in this order, top first: {order}. This only records the order "
+          "— nothing starts now; the next batch follows it. Is that right?",
+}
+_REORDERED = {
+    "pt-BR": "Ordem gravada no quadro: {order}. A próxima leva segue ela.",
+    "en": "Order recorded on the board: {order}. The next batch follows it.",
+}
+
+#: A "works like this" the bundle could not back. Said in the client's voice, because the person
+#: decides on it: argue, file the defect anyway, or accept — and they must know it is a hypothesis.
+_READING_CAVEAT = {
+    "pt-BR": "(Não consegui confirmar isso no que a fábrica sabe do código — leia como hipótese, "
+             "não como certeza.)",
+    "en": "(I could not confirm this against what the factory knows of the code — read it as a "
+          "hypothesis, not a certainty.)",
+}
+
+#: A concept the answer rested on no longer matches the code mounted for its turn (#268 slice 3,
+#: ADR-0052 D20): named, so a person never takes a description of yesterday's code for today's.
+_STALE_CAVEAT = {
+    "pt-BR": "(Uma descrição em que me apoiei — {titles} — já não corresponde ao código de hoje: "
+             "o código mudou depois que ela foi escrita, então leia o que ela diz como histórico, "
+             "não como o que o produto faz agora.)",
+    "en": "(A description I relied on — {titles} — no longer matches today's code: the code "
+          "changed after it was written, so read what it says as history, not as what the "
+          "product does now.)",
+}
+
+_FACT_CONFIRM = {
+    "pt-BR": "Vou anotar assim — *{term}*: {body}\n\nFica registrado em seu nome, como algo "
+             "aprendido (não como decisão). Confirma?",
+    "en": "I will note it like this — *{term}*: {body}\n\nIt goes on record under your name, as "
+          "something learned (not decided). Confirm?",
+}
+
+_FACT_NOTED = {
+    "pt-BR": "Anotado. Quando alguém perguntar sobre {term}, é isso que vou responder — e vou "
+             "dizer quem me contou.",
+    "en": "Noted. When somebody asks about {term}, that is what I will answer — and I will say "
+          "who told me.",
+}
+
+
+#: WHO CAN SAY YES, SAID UNDER A PROPOSAL SOMEBODY OFF THE ADMIN LIST MADE (#429). Ten copies of
+#: `({admins}: o registro precisa da sua confirmação.)` lived in `engine.py`, outside every
+#: catalogue, so an English conversation got a Portuguese line under its English proposal. One
+#: frame, keyed by what is waiting for the yes.
+_ADMINS_MUST_CONFIRM = {
+    "pt-BR": {
+        "frame": "({admins}: {what} precisa da sua confirmação.)",
+        "record": "o registro", "order": "gravar a ordem", "card": "abrir o cartão",
+        "note": "a anotação", "decision": "a decisão", "closing": "o encerramento",
+        "correction": "a correção", "change": "a mudança", "breakdown": "a quebra",
+        "refine": "escrever o que ele precisa cumprir", "agreement": "o acordo",
+    },
+    "en": {
+        "frame": "({admins}: {what} needs your confirmation.)",
+        "record": "registering this", "order": "saving the order", "card": "opening the card",
+        "note": "the note", "decision": "the decision", "closing": "closing it",
+        "correction": "the correction", "change": "the change", "breakdown": "the breakdown",
+        "refine": "writing what it must meet", "agreement": "the agreement",
+    },
+}
+
+
+def admins_must_confirm(admins: str, act: str, *, language: str | None = None) -> str:
+    """The line naming the people whose yes writes `act`, in the conversation's language."""
+    said = _pick(_ADMINS_MUST_CONFIRM, language)
+    return "\n\n" + said["frame"].format(admins=admins, what=said[act])
+
+
+#: THE ENGINE'S OWN SENTENCES, per language (#429) — the refusals, the release replies and the
+#: conversation header that `engine.py` composed in Portuguese outside every catalogue. Keyed by
+#: what is being said; `engine_said` formats one.
+_ENGINE_SAID = {
+    "pt-BR": {
+        "board_unread": ("Não consegui ler o quadro de trabalho agora — o problema é do meu lado, "
+                         "e o time já tem o detalhe. Tente de novo daqui a pouco."),
+        "stuck_unread": ("Não consegui olhar o que está parado agora — o problema é do meu lado, "
+                         "e o time já tem o detalhe. Tente de novo daqui a pouco."),
+        "queue_unread": ("Não consegui olhar o quadro agora — o problema é do meu lado, e o time "
+                         "já tem o detalhe. Tente de novo daqui a pouco."),
+        "already_agreed": "o requisito {number} já estava acordado.",
+        "already_dropped": "o requisito {number} já não estava valendo.",
+        "decision_on_dropped": ("o requisito {number} já não vale, então uma decisão registrada "
+                                "nele ficaria guardada onde ninguém vai procurar. Em qual "
+                                "requisito isso deve entrar?"),
+        "accept_dropped": ("o requisito {number} já não vale, então acordá-lo agora seria trazer "
+                           "de volta um texto que vocês já tinham tirado da mesa. Se isso voltou "
+                           "a fazer sentido, me digam e eu proponho de novo para vocês "
+                           "confirmarem."),
+        "conflict_requirement": "requisito {number}",
+        "conflict_decided": "algo já decidido",
+        # NO PROMISE NOBODY KEEPS (#448 slice 4). This said "vou devolver isso ao time… e volto
+        # quando estiver corrigido", and nothing took anything to anybody: the job waited out its
+        # window and held. A "não funcionou" now stages another pass (`engine._offer_another_pass`)
+        # and this is only what is said where none can be staged — what the person can do.
+        "release_declined": ("entendi — **não subi nada**. Se você me disser o que ainda está "
+                             "errado, eu posso mandar isso de volta para mais uma passada."),
+        "nothing_released": "entendi — **não subi nada**.",
+        "not_yet_ambiguous": ("tem mais de uma coisa esperando a sua conferida{which}, então **não "
+                              "subi nada** e não mandei nada de volta — prefiro não adivinhar qual "
+                              "delas você testou. Responda «não funcionou o #número» e eu sigo com "
+                              "essa."),
+        "released_by_requester": ("aprovado no canal de produto por quem pediu, que pode liberar "
+                                  "neste projeto"),
+        "released_after_the_requester": ("aprovado pelo cliente no canal de produto, depois que "
+                                         "quem pediu experimentou e disse que estava certo"),
+        "release_ambiguous": ("tem mais de uma coisa esperando a sua conferida{which}, então **não "
+                              "subi nada** — prefiro não adivinhar qual delas você testou. "
+                              "Responda «funcionou o #número» e eu coloco essa no ar."),
+        "releasing": ("perfeito — **estou subindo para produção agora**, com o seu \"funcionou\" "
+                      "como aprovação. Fica registrado que foi você quem liberou e quando. Eu "
+                      "volto aqui quando estiver no ar."),
+        "released_by_client": "aprovado pelo cliente no canal de produto",
+        "conversation": "## Conversa até aqui (mais antigo primeiro)",
+        "you": "você", "somebody": "pessoa",
+    },
+    "en": {
+        "board_unread": ("I could not read the work board just now — the problem is on my side, "
+                         "and the team already has the details. Try again in a little while."),
+        "stuck_unread": ("I could not look at what is stuck just now — the problem is on my side, "
+                         "and the team already has the details. Try again in a little while."),
+        "queue_unread": ("I could not look at the board just now — the problem is on my side, and "
+                         "the team already has the details. Try again in a little while."),
+        "already_agreed": "requirement {number} was already agreed.",
+        "already_dropped": "requirement {number} was already no longer in force.",
+        "decision_on_dropped": ("requirement {number} is no longer in force, so a decision "
+                                "recorded in it would be kept where nobody will look. Which "
+                                "requirement should it go into?"),
+        "accept_dropped": ("requirement {number} is no longer in force, so agreeing to it now "
+                           "would bring back a text you had already taken off the table. If it "
+                           "makes sense again, tell me and I will propose it again for you to "
+                           "confirm."),
+        "conflict_requirement": "requirement {number}",
+        "conflict_decided": "something already decided",
+        "release_declined": ("understood — **I released nothing**. If you tell me what is still "
+                             "wrong, I can send it back for another pass."),
+        "nothing_released": "understood — **I released nothing**.",
+        "not_yet_ambiguous": ("more than one thing is waiting for your check{which}, so **I "
+                              "released nothing** and sent nothing back — I would rather not guess "
+                              "which one you tested. Reply «it did not work #number» and I will go "
+                              "on with that one."),
+        "released_by_requester": ("approved in the product channel by the person who asked for "
+                                  "it, who may release in this project"),
+        "released_after_the_requester": ("approved by the client in the product channel, after "
+                                         "the person who asked for it tried it and said it was "
+                                         "right"),
+        "release_ambiguous": ("more than one thing is waiting for your check{which}, so **I "
+                              "released nothing** — I would rather not guess which one you "
+                              "tested. Reply «it worked #number» and I will put that one live."),
+        "releasing": ("great — **I am releasing to production now**, with your \"it worked\" as "
+                      "the approval. It is recorded that you released it, and when. I will come "
+                      "back here when it is live."),
+        "released_by_client": "approved by the client in the product channel",
+        "conversation": "## The conversation so far (oldest first)",
+        "you": "you", "somebody": "someone",
+    },
+}
+
+
+def engine_said(key: str, *, language: str | None = None, **params: object) -> str:
+    """One of the engine's own sentences, in the conversation's language."""
+    text = _pick(_ENGINE_SAID, language)[key]
+    return text.format(**params) if params else text
+
+
+def defect_confirmation(*, violates: int | None, language: str | None = None, card: str = "",
+                        title: str = "", unjudged: bool = False,
+                        disputed: tuple[str, ...] | list[str] = ()) -> str:
+    if not card:
+        said = _DEFECT_CONFIRM if violates else _DEFECT_CONFIRM_UNWRITTEN
+        return _pick(said, language).format(violates=violates)
+    said = _DEFECT_CARD_CONFIRM if violates else _DEFECT_CARD_CONFIRM_UNWRITTEN
+    text = _pick(said, language).format(violates=violates, title=title, card=card.strip())
+    return _with_review_note(text, language=language, unjudged=unjudged, disputed=disputed)
+
+
+def _with_review_note(text: str, *, language: str | None, unjudged: bool,
+                      disputed: tuple[str, ...] | list[str]) -> str:
+    if unjudged:
+        return f"{_pick(_CARD_UNJUDGED, language)}\n\n{text}"
+    if disputed:
+        said = "; ".join(f.rstrip(".") for f in disputed[:3])
+        return f"{_pick(_CARD_DISPUTED, language).format(findings=said)}\n\n{text}"
+    return text
+
+
+#: The clause `defect_filed` names the promise with — in the conversation's language, like the rest
+#: of the sentence it sits in.
+_AGAINST_REQUIREMENT = {"pt-BR": ", contra o requisito {violates}",
+                        "en": ", against requirement {violates}"}
+
+
+def defect_filed(*, ref: str, violates: int | None, language: str | None = None,
+                 existed: bool = False, just_asked: bool = False, url: str = "") -> str:
+    if just_asked:
+        return just_asked_for_a_card(where=url or ref_label(ref), language=language)
+    req = _pick(_AGAINST_REQUIREMENT, language).format(violates=violates) if violates else ""
+    text = _pick(_DEFECT_FILED, language).format(req=req)
+    if existed:
+        text = _pick({"pt-BR": "Eu já tinha registrado esse problema — segue o mesmo registro. ",
+                      "en": "I had already registered this problem — same record. "},
+                     language) + text
+    return text
+
+
+# ── a delivery that did not work (#448 slice 5) ─────────────────────────────────────────────────
+#
+# "DID IT WORK?" ANSWERED "NO" WAS A DEAD END. The acceptance closed as `did-not-work` and the
+# reply asked the person to say it all again so it could be registered "against the promise" — in
+# Portuguese whatever the project spoke, and against nothing: whatever was filed next named no
+# card. What they said IS the report, and the cards the delivery was about are known, so the
+# defect is staged for their yes with both.
+
+_DELIVERY_DID_NOT_WORK = {
+    "pt-BR": {
+        "one": ("{sig}Entendido — então NÃO está resolvido, e eu não vou dar como entregue. Vou "
+                "registrar um defeito para {cards} com o que você disse, ligado a ele. Confirma?"),
+        "many": ("{sig}Entendido — então NÃO está resolvido, e eu não vou dar como entregue. Vou "
+                 "registrar um defeito para {cards} com o que você disse, ligado a eles. "
+                 "Confirma?"),
+        "and": " e ",
+    },
+    "en": {
+        "one": ("{sig}Understood — so it is NOT solved, and I will not count it as delivered. "
+                "I'll file a defect for {cards} with what you said, linked to it. Confirm?"),
+        "many": ("{sig}Understood — so it is NOT solved, and I will not count it as delivered. "
+                 "I'll file a defect for {cards} with what you said, linked to them. Confirm?"),
+        "and": " and ",
+    },
+}
+
+#: The defect's title on the board: what it is about, and the card — so two cards' reports never
+#: share one title, which is how a filing finds an existing card (`file_defect`'s `find_ticket`).
+_DEFECT_AFTER_DELIVERY_TITLE = {
+    "pt-BR": "Não funcionou depois da entrega: {what}",
+    "en": "Did not work after delivery: {what}",
+}
+
+
+def delivery_did_not_work(*, cards, title: str = "", language: str | None = None,
+                          agent_name: str = "") -> str:
+    """The reply to a "did not work" about a delivery: not counted as delivered, and the defect
+    that will be filed with what they said, linked to the cards it was about — asked, never done."""
+    said = _pick(_DELIVERY_DID_NOT_WORK, language)
+    refs = [str(c).strip().lstrip("#") for c in cards if str(c).strip()]
+    named = said["and"].join(_card(r, title if len(refs) == 1 else "", language) for r in refs)
+    return said["one" if len(refs) == 1 else "many"].format(sig=_sig(agent_name), cards=named)
+
+
+def defect_after_delivery_title(*, ref: str, title: str = "", language: str | None = None,
+                                limit: int = 80) -> str:
+    """The title a defect filed after a delivery is opened under — within the board's `limit`
+    (`cards.TITLE_LIMIT`), its card's ref always whole at the end."""
+    ref = ref_label(str(ref).strip())
+    title = (title or "").strip()
+    suffix = f" ({ref})" if title else ""
+    text = _pick(_DEFECT_AFTER_DELIVERY_TITLE, language).format(what=title or ref)
+    room = limit - len(suffix)
+    if len(text) > room:
+        text = text[:room - 1].rstrip() + "…"
+    return text + suffix
+
+
+def ticket_confirmation(*, title: str, language: str | None = None, card: str = "",
+                        unjudged: bool = False, disputed: tuple[str, ...] | list[str] = ()) -> str:
+    if not card:
+        return _pick(_TICKET_CONFIRM, language).format(title=title)
+    text = _pick(_CARD_CONFIRM, language).format(title=title, card=card.strip())
+    return _with_review_note(text, language=language, unjudged=unjudged, disputed=disputed)
+
+
+def card_needs(*, ask: str, language: str | None = None) -> str:
+    """What the role asks when a card could not be filed yet — the judge's question, or, when it
+    gave none, the one every card needs."""
+    if ask.strip():
+        return _pick(_CARD_NEEDS, language).format(ask=ask.strip())
+    return _pick(_CARD_NEEDS_DONE, language)
+
+
+def card_not_drafted(*, language: str | None = None) -> str:
+    return _pick(_CARD_NOT_DRAFTED, language)
+
+
+def reading_caveat(*, language: str | None = None) -> str:
+    return _pick(_READING_CAVEAT, language)
+
+
+def stale_caveat(titles: list[str], *, language: str | None = None) -> str:
+    """The clause that names every stale description an answer rested on, by its title."""
+    return _pick(_STALE_CAVEAT, language).format(titles=", ".join(f"«{t}»" for t in titles))
+
+
+def reorder_confirmation(*, numbers: list[str], language: str | None = None) -> str:
+    return _pick(_REORDER_CONFIRM, language).format(
+        order=", ".join(ref_label(n) for n in numbers))
+
+
+def reordered(numbers: list[str], *, language: str | None = None, agent_name: str = "") -> str:
+    sig = f"{agent_name.strip()}: " if agent_name.strip() else ""
+    return sig + _pick(_REORDERED, language).format(order=", ".join(ref_label(n) for n in numbers))
+
+
+#: What a sentence names when it has no link or number to name (#429).
+_THE_CARD = {"pt-BR": "o cartão", "en": "the card"}
+_CANNOT_SAY = {"pt-BR": "não sei dizer", "en": "I cannot tell"}
+
+
+def ticket_filed(*, ref: str, url: str = "", language: str | None = None,
+                 existed: bool = False, just_asked: bool = False, backlog: str = "") -> str:
+    """`backlog` is what the card's board calls it — see `column_said`."""
+    where = url or ref_label(ref)
+    if just_asked:
+        return just_asked_for_a_card(where=where, language=language)
+    text = _pick(_TICKET_FILED, language).format(where=where or _pick(_THE_CARD, language),
+                                                 backlog=column_said(backlog, "backlog"))
+    if existed:
+        text = _pick({"pt-BR": "Já existia um cartão com esse título — é este. ",
+                      "en": "A card with that title already existed — this is it. "},
+                     language) + text
+    return text
+
+
+def fact_confirmation(*, term: str, body: str, language: str | None = None) -> str:
+    return _pick(_FACT_CONFIRM, language).format(term=term, body=body)
+
+
+def fact_noted(*, term: str, language: str | None = None) -> str:
+    return _pick(_FACT_NOTED, language).format(term=term)
+
+
+# ── what another conversation asked for, said without anybody's name (ADR-0051 D9) ─────────────
+#
+# THE CITATION IS WHAT IT IS, NEVER WHO ASKED — even where the saved record names its requester,
+# as a requirement's front matter does. A person told "Ana asked for this" learns who else talks to
+# the product, which is not theirs to know. These sentences take no person, so none can reach them.
+
+_JUST_ASKED_REQUIREMENT = {
+    "pt-BR": ("Isso acabou de ser pedido: é o *requisito {number}: {title}*, registrado há "
+              "instantes. Não escrevi de novo — ficaria o mesmo pedido com dois números."),
+    "en": ("This has just been asked for: it is *requirement {number}: {title}*, written moments "
+           "ago. I did not write it again — it would be one request under two numbers."),
+}
+_JUST_ASKED_CARD = {
+    "pt-BR": "Isso acabou de ser pedido — o cartão já existe: {where}. Não abri outro para a mesma "
+             "coisa.",
+    "en": "This has just been asked for — the card already exists: {where}. I did not open another "
+          "for the same thing.",
+}
+_JUST_NOTED = {
+    "pt-BR": "isto acabou de ser anotado sobre {term!r} — não anotei de novo.",
+    "en": "this was just noted about {term!r} — I did not note it again.",
+}
+_ASKED_CLOSE = {
+    "pt-BR": ("(Alguém pediu algo bem parecido com isto há poucos minutos, e ainda não foi "
+              "confirmado. Se for a mesma coisa, não registro duas vezes.)\n\n"),
+    "en": ("(Someone asked for something close to this a few minutes ago, and it is not confirmed "
+           "yet. If it is the same thing, I will not record it twice.)\n\n"),
+}
+#: The semaphore's timeout, in words (`product/semaphore.py`). Nothing was written, and the person
+#: is told so and what to do — a wait that ends in silence is the one outcome this cannot have.
+_SEMAPHORE_BUSY = {
+    "pt-BR": ("Outra coisa estava sendo registrada neste produto e eu esperei a vez sem "
+              "conseguir. Não registrei nada — me peça de novo daqui a um minuto."),
+    "en": ("Something else was being recorded for this product and I waited without getting my "
+           "turn. Nothing was recorded — ask me again in a minute."),
+}
+_TOO_MUCH_AT_ONCE = {
+    "pt-BR": ("Enquanto eu conferia se isto já existia, outras coisas foram registradas neste "
+              "produto sem parar. Não registrei nada, para não ficar duplicado — me peça de novo "
+              "daqui a pouco."),
+    "en": ("While I was checking whether this already existed, other things kept being recorded "
+           "for this product. Nothing was recorded, so nothing is duplicated — ask me again "
+           "shortly."),
+}
+
+
+def just_asked_for_a_requirement(*, number: int, title: str, language: str | None = None) -> str:
+    return _pick(_JUST_ASKED_REQUIREMENT, language).format(number=number, title=title)
+
+
+def just_asked_for_a_card(*, where: str, language: str | None = None) -> str:
+    return _pick(_JUST_ASKED_CARD, language).format(where=where or _pick(_THE_CARD, language))
+
+
+def just_noted(*, term: str, language: str | None = None) -> str:
+    return _pick(_JUST_NOTED, language).format(term=term)
+
+
+def asked_close_to_this(*, language: str | None = None) -> str:
+    return _pick(_ASKED_CLOSE, language)
+
+
+def semaphore_busy(*, language: str | None = None) -> str:
+    return _pick(_SEMAPHORE_BUSY, language)
+
+
+def too_much_at_once(*, language: str | None = None) -> str:
+    return _pick(_TOO_MUCH_AT_ONCE, language)
+
+
+_BASELINE_STARTED = {
+    "pt-BR": "Vou ler o produto inteiro e escrever o que ele faz hoje. Leva alguns minutos — "
+             "aviso aqui quando terminar.\n\nDuas coisas antes: o que eu escrever são "
+             "OBSERVAÇÕES, não promessas. É o que o sistema aparenta fazer, e parte disso pode "
+             "ser acidente ou defeito sem eu conseguir distinguir. Nada vira compromisso até "
+             "alguém confirmar item a item.",
+    "en": "I am going to read the whole product and write down what it does today. It takes a few "
+          "minutes — I will say so here when it is done.\n\nTwo things first: what I write are "
+          "OBSERVATIONS, not promises. Some of it may be an accident or a defect and I usually "
+          "cannot tell which. Nothing becomes a commitment until somebody confirms it.",
+}
+
+#: NO LINK, and it is the same decision `written_up` already made one screen up. This interpolated
+#: `{url}` — a forge pull-request URL, repository slug and all — into a business conversation, on
+#: the HAPPY path, every time. Three statements in this module say it must not: `written_up`'s
+#: docstring ("passing it here used to put a GitHub link in front of somebody who cannot act on
+#: one"), AUDIENCE_RULES ("a pull request, a branch, a commit, a repository, a file path — none of
+#: it reaches this channel"), and `_DIAGNOSTIC`, which classes `https?://` as machinery and is what
+#: sanitises every OTHER detail this surface shows.
+#:
+#: The affordance the link looked like was never real. The entries land on a branch nobody has
+#: merged, so the client cannot act on that page and the role cannot even read it yet — the honest
+#: version of that is what `_WRITTEN_UP_UNMERGED` says, and it is said here too. Confirming an
+#: observation happens in THIS channel, by name and number, which is the one gesture that turns
+#: one into a promise (ADR-0032).
+_BASELINE_DONE = {
+    "pt-BR": "Terminei o levantamento — {n}.\n\nEscrevi tudo de uma vez, para dar para ler junto; "
+             "o time ainda precisa concluir esse passo, e até lá nem eu consigo reler o que "
+             "escrevi. Cada item entrou como observação: quando você me disser que um deles está "
+             "acordado, ele vira promessa e passa a ser defendido. "
+             "**Nada está sendo construído ainda**.",
+    "en": "The first pass is done — {n}.\n\nI wrote it all in one go, so it can be read in one "
+          "sitting; the team still has to finish that step, and until they do I cannot re-read it "
+          "myself either. Every entry landed as an observation: tell me one is agreed and it "
+          "becomes a promise that gets defended. **Nothing is being built yet**.",
+}
+
+_BASELINE_FAILED = {
+    "pt-BR": "Não consegui concluir o levantamento: {detail}\n\nNada foi escrito. Pode pedir de "
+             "novo — ou me diga por onde começar e eu tento só aquela parte.",
+    "en": "I could not finish the first pass: {detail}\n\nNothing was written. Ask again, or "
+          "tell me where to start and I will try just that part.",
+}
+
+
+def baseline_started(*, language: str | None = None, agent_name: str = "") -> str:
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    return sig + _pick(_BASELINE_STARTED, language)
+
+
+def baseline_done(*, ok: bool, url: str = "", detail: str = "", existed: bool = False,
+                  language: str | None = None, agent_name: str = "") -> str:
+    """What the client reads when the brownfield pass finishes.
+
+    `url` is accepted and DELIBERATELY UNUSED in the text, exactly as in `written_up`: the caller
+    holds it for the team, and it is kept as a parameter so the seam survives — removing it would
+    push every caller to change and the next one to pass a link somewhere new. It goes to the log,
+    which is where a pull request address belongs.
+    """
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    if not ok:
+        # through the SAME sanitiser every other client-read detail passes. The baseline failure
+        # arrives as raw machinery (an exception string, git stderr) and this composition site was
+        # the one sibling shipping it verbatim. Sanitised HERE rather than at the call sites: a
+        # caller that has to remember is a caller that forgets.
+        safe, raw = client_safe_detail(detail, language=language)
+        if raw:
+            log.warning("a baseline failure detail the client must not read: %s", raw[:400])
+        return sig + _pick(_BASELINE_FAILED, language).format(
+            detail=safe or _pick(_CANNOT_SAY, language))
+    if url:
+        log.info("the baseline pass is at %s — for the team; the channel is told in its own terms",
+                 url)
+    head = _pick({"pt-BR": "já estava proposto de antes", "en": "it was already proposed"},
+                 language) if existed else _pick(
+        {"pt-BR": "escrevi o que encontrei", "en": "I wrote down what I found"}, language)
+    return sig + _pick(_BASELINE_DONE, language).format(n=head)
+
+
+def question_for(kind: str, language: str | None = None) -> str:
+    """The client-language question for one askable finding. Falls back to the pt-BR catalogue and,
+    for a kind with no entry, to a generic ask — never to the platform's own words."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    table = _ASK.get(lang) or _ASK.get(DEFAULT_LANGUAGE) or _ASK["en"]
+    return table.get(kind) or _pick(
+        {"pt-BR": "pode me dar mais contexto sobre isso? Do jeito que está eu não consigo levar "
+                  "adiante.",
+         "en": "could you give me more context on this? As it stands I cannot take it further."},
+        language)
+
+
+#: How the agent signs what it writes on a ticket — the role's name is prose, in the language of
+#: the card it heads (#538). It was "(produto)" on every project, so an English project's card read
+#: an English note under a Portuguese signature once the notes themselves were translated.
+_SIGNATURE = {
+    "pt-BR": {"named": "**{name} (produto):**", "role": "**Produto:**"},
+    "en": {"named": "**{name} (product):**", "role": "**Product:**"},
+}
+
+
+def signature(agent_name: str = "", *, language: str | None = None) -> str:
+    """How the agent signs what it writes on a ticket.
+
+    Names the ROLE as well as the person: the team reads these, and "Nina" alone tells a new joiner
+    nothing about why the comment exists.
+
+    `language` IS THE CARD'S, which is the project's: every caller writes on a card and hands its
+    own (`tests/test_the_card_notes_speak_the_projects_language.py` holds each one to it). It
+    defaults like every entry here, to English, rather than to the Portuguese it used to be."""
+    name = (agent_name or "").strip()
+    said = _pick(_SIGNATURE, language)
+    return said["named"].format(name=name) if name else said["role"]
+
+
+#: How each triage finding reads to someone who does not run the board. The kinds are the platform's
+#: vocabulary; these are the client's.
+_FINDING = {
+    "pt-BR": {
+        "stalled": "parado há tempo demais em andamento",
+        "waiting-too-long": "esperando uma decisão há tempo demais",
+        "no-criteria": "sem nada escrito que diga quando está pronto",
+        "done-but-open": "aparece como pronto mas nunca foi encerrado",
+        "closed-elsewhere": "já foi encerrado mas continua aparecendo como trabalho em aberto",
+        "container-complete": "tudo dentro dele terminou, mas ele continua aberto",
+    },
+    "en": {
+        "stalled": "stuck in progress for too long",
+        "waiting-too-long": "waiting on a decision for too long",
+        "no-criteria": "nothing written down that says when it is done",
+        "done-but-open": "shows as finished but was never closed",
+        "closed-elsewhere": "already closed but still showing as open work",
+        "container-complete": "everything inside it finished, but it is still open",
+    },
+}
+
+_TRIAGE_HEAD = {
+    "pt-BR": ("Passei o olho no trabalho em andamento. **Não mudei nada** — isto é o que eu vi:",
+              "Passei o olho no trabalho em andamento e **não achei nada fora do lugar**."),
+    "en": ("I went through the work in flight. **I changed nothing** — here is what I saw:",
+           "I went through the work in flight and **found nothing out of place**."),
+}
+
+_TRIAGE_STANDING = {
+    "pt-BR": "Continuam pendentes de antes: {parts}.",
+    "en": "Still outstanding from before: {parts}.",
+}
+
+_TRIAGE_NOTHING_NEW = {
+    "pt-BR": "Nada novo desde a última vez.",
+    "en": "Nothing new since last time.",
+}
+
+_TRIAGE_SKIPPED = {
+    "pt-BR": "Deixei {n} de fora de propósito (alguém cuida deles, ou são guarda-chuva de outros).",
+    "en": "I left {n} alone on purpose (someone owns them, or they are containers for other work).",
+}
+
+
+#: `**bold**` / `*italic*`, never spanning a line. Anchored so a stray asterisk inside a
+#: requirement's title survives — this removes EMPHASIS, it does not sanitise text.
+_EMPHASIS = re.compile(r"\*{1,2}([^*\n]+)\*{1,2}")
+
+
+def strip_markup(text: str) -> str:
+    """The same sentence with its emphasis removed, for a surface that renders none.
+
+    WHY THIS EXISTS RATHER THAN A SECOND SET OF COMPOSERS. Every sentence in this module is
+    written for a person, and a chat client is one of the places a person reads it — `*sim*` and
+    `**não mexi em nada**` are the difference between a report and a wall of numbers there. But
+    `Outcome.message` forbids markup in as many words (`actions/base.py`: "It must not contain
+    mrkdwn, HTML, or a provider's link syntax… a message pre-decorated for Slack renders as
+    literal asterisks in the panel"), and that is not a style rule — it is how the first
+    impediment alert shipped.
+
+    So the PROSE stays one implementation and the RENDERING is what differs, which is the same
+    shape as the rest of this platform: one action, N transports. The action layer strips at its
+    own boundary rather than every composer growing a flag, because the rule belongs to the layer
+    that states it.
+
+    IT IS THE ROW'S CALL, NOT `done()`'S. Folding this into `Outcome` would silently rewrite every
+    message and make the defect invisible; a guard over the composing rows catches a forgotten
+    call instead, and can be seen going red."""
+    return _EMPHASIS.sub(r"\1", text or "")
+
+
+#: What it concluded about each parked ticket. `mine` is where the requirement is at fault; the
+#: other side is somebody else's problem and saying so is the point of the pass.
+_NEEDS_ACTION_NOTHING = {
+    "pt-BR": "Nada parado esperando decisão no momento.",
+    "en": "Nothing parked and waiting on a decision right now.",
+}
+
+_NEEDS_ACTION_HEAD = {
+    "pt-BR": "Olhei o que está parado. **Não mexi em nada** — isto é o que eu vi:",
+    "en": "I went through what is parked. **I changed nothing** — here is what I saw:",
+}
+
+_NEEDS_ACTION_MINE = {
+    "pt-BR": "• **{n}** onde o problema é do requisito (meu): {listed}",
+    "en": "• **{n}** where the requirement is what is wrong (mine): {listed}",
+}
+
+_NEEDS_ACTION_THEIRS = {
+    "pt-BR": "• **{n}** onde a causa não é do requisito: {listed}",
+    "en": "• **{n}** where the cause is not the requirement: {listed}",
+}
+
+
+_WAITING_NONE = {
+    "pt-BR": "Nada esperando por você agora.",
+    "en": "Nothing waiting on you right now.",
+}
+
+_WAITING_SOME = {
+    "pt-BR": "{n} proposta(s) esperando você confirmar.",
+    "en": "{n} proposal(s) waiting for you to confirm.",
+}
+
+
+def waiting_on_you(*, count: int, language: str | None = None) -> str:
+    """What is staged and waiting, in the client's own language.
+
+    NO KINDS IN THE SENTENCE. The first version read "2 proposal(s) waiting on a person (accept,
+    draft)" — English, in a thread whose every other line is the product's Portuguese voice, with
+    two of this platform's INTERNAL entry slugs in brackets. `kind` is a routing key; it is data
+    for a surface to render as it likes, and it was never a word anybody outside this codebase
+    has a meaning for."""
+    if count <= 0:
+        return _pick(_WAITING_NONE, language)
+    return _pick(_WAITING_SOME, language).format(n=count)
+
+
+def needs_action_report(review, *, language: str | None = None, agent_name: str = "") -> str:
+    """What the role concluded about each parked ticket — INCLUDING the ones it left alone.
+
+    A ticket it looked at and did not touch must LOOK like that, or the next reader re-does the
+    pass. The sentence says "I changed nothing" out loud for the same reason.
+
+    LIFTED OUT OF `runtime/slack/product_channel.py` (#105), where it was the only composer in the
+    product's voice that lived in a vendor's package — hardcoded pt-BR, with no `language`
+    parameter, so a client on any other language got Portuguese and a deployment without Slack got
+    nothing at all. Every sibling here takes `language`; this one now does too, which is the
+    difference between moving a file and finishing the job."""
+    head = f"{agent_name}: " if agent_name else ""
+    decisions = list(getattr(review, "decisions", None) or ())
+    if not decisions:
+        return f"{head}{_pick(_NEEDS_ACTION_NOTHING, language)}"
+
+    mine, theirs = review.mine(), review.handed_back()
+    lines = [f"{head}{_pick(_NEEDS_ACTION_HEAD, language)}", ""]
+    if mine:
+        lines.append(_pick(_NEEDS_ACTION_MINE, language).format(
+            n=len(mine), listed=", ".join(ref_label(d.verdict.ticket) for d in mine)))
+    if theirs:
+        lines.append(_pick(_NEEDS_ACTION_THEIRS, language).format(
+            n=len(theirs), listed=", ".join(ref_label(d.verdict.ticket) for d in theirs)))
+    return "\n".join(lines)
+
+
+def triage_report(report, *, language: str | None = None, agent_name: str = "",
+                  limit: int = 12, standing: dict | None = None) -> str:
+    """A triage pass, said to the people who own the product.
+
+    Findings are grouped by KIND rather than listed one by one: "seven tickets have nothing that
+    says when they are done" is a decision someone can make, while seven separate lines are a chore
+    nobody starts."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    words = _FINDING.get(lang, _FINDING["en"])
+    with_findings, clean = _TRIAGE_HEAD.get(lang, _TRIAGE_HEAD["en"])
+    sig = f"{agent_name.strip()}: " if agent_name.strip() else ""
+
+    if not report.observations:
+        # Nothing NEW is not the same as nothing wrong. Saying only "nothing new" would let a
+        # backlog of unfixed rot disappear from view precisely by not changing.
+        out = f"{sig}{_pick(_TRIAGE_NOTHING_NEW, language) if standing else clean}"
+        if standing:
+            out += "\n" + _standing_line(standing, words, language)
+        if report.skipped:
+            out += "\n\n" + _pick(_TRIAGE_SKIPPED, language).format(n=len(report.skipped))
+        return out
+
+    lines = [f"{sig}{with_findings}", ""]
+    by_kind: dict[str, list] = {}
+    for o in report.observations:
+        by_kind.setdefault(o.kind, []).append(o)
+    for kind, found in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+        what = words.get(kind, kind)
+        shown = ", ".join(ref_label(o.ticket) for o in found[:limit])
+        more = f" (+{len(found) - limit})" if len(found) > limit else ""
+        lines.append(f"• **{len(found)}** {what}: {shown}{more}")
+    if standing:
+        lines += ["", _standing_line(standing, words, language)]
+    if report.skipped:
+        lines += ["", _pick(_TRIAGE_SKIPPED, language).format(n=len(report.skipped))]
+    return "\n".join(lines)
+
+
+def _standing_line(standing: dict, words: dict, language: str | None) -> str:
+    """The rot that did NOT change, as one line of counts rather than a re-listing.
+
+    Repeating forty ticket numbers every week is how a report becomes wallpaper; omitting them
+    entirely is how a backlog vanishes by standing still. A count is the honest middle."""
+    parts = ", ".join(f"{n} {words.get(kind, kind)}"
+                      for kind, n in sorted(standing.items(), key=lambda kv: -kv[1]) if n)
+    return _pick(_TRIAGE_STANDING, language).format(parts=parts) if parts else ""
+
+
+_QUEUE_IDLE = {
+    "pt-BR": ("A fábrica está parada e tem trabalho pronto esperando — isso é capacidade indo "
+              "embora. Minha sugestão de por onde seguir, nesta ordem:"),
+    "en": ("The factory is idle with ready work waiting — that is capacity going to waste. Here is "
+           "what I suggest we start, in this order:"),
+}
+_QUEUE_BUSY = {
+    "pt-BR": "Sugestão de ordem para o que vem a seguir:",
+    "en": "Suggested order for what comes next:",
+}
+_QUEUE_BLOCKED = {
+    "pt-BR": ("A fábrica está parada e o backlog tem {n} itens, mas **nenhum deles diz quando "
+              "estaria pronto** — do jeito que estão, seriam recusados na entrada. Isso é comigo: "
+              "posso escrever os critérios e trazer para vocês revisarem."),
+    "en": ("The factory is idle and the backlog has {n} items, but **none of them says when it "
+           "would be done** — as written they would be refused at the gate. That one is mine: I "
+           "can write the criteria and bring them back for review."),
+}
+_QUEUE_EMPTY = {
+    "pt-BR": "A fábrica está parada e não há nada no backlog pronto para começar.",
+    "en": "The factory is idle and there is nothing in the backlog ready to start.",
+}
+_QUEUE_ASK = {
+    "pt-BR": "Aprovo? Responda *sim* e eu coloco na fila nessa ordem.",
+    "en": "Shall I? Reply *yes* and I'll queue them in that order.",
+}
+_QUEUE_HELD = {
+    "pt-BR": "Deixei de fora por enquanto:",
+    "en": "Left out for now:",
+}
+_QUEUE_REFINE = {
+    "pt-BR": "({n} outros no backlog ainda não dizem quando estariam prontos.)",
+    "en": "({n} others in the backlog do not yet say when they would be done.)",
+}
+_QUEUED = {
+    "pt-BR": "Coloquei na fila, nesta ordem: {items}. A fábrica começa pelo primeiro.",
+    "en": "Queued, in this order: {items}. The factory starts with the first.",
+}
+#: A queue whose order did not reach the board (#512), by why. "A fábrica começa pelo primeiro"
+#: is true only where `promote` ranked every card it names (`WriteResult.ranked`): the poller pulls
+#: in board order, and before #512 nothing wrote that order — so the sentence above promised it on
+#: every board. A board that keeps no order this platform can write says so here and only here;
+#: one that ranks and refused a card's place says the order did not land, and the team was told
+#: (the module's watched board reports the refused write).
+_QUEUED_OUT_OF_ORDER = {
+    "unrankable": {
+        "pt-BR": ("Coloquei na fila: {items}. Este quadro não aceita uma ordem gravada daqui, "
+                  "então a fábrica os pega na ordem do próprio quadro."),
+        "en": ("Queued: {items}. This board does not take an order from here, so the factory "
+               "takes them in the board's own order."),
+    },
+    "not_kept": {
+        "pt-BR": ("Coloquei na fila: {items}, mas não consegui gravar essa ordem no quadro — a "
+                  "fábrica os pega na ordem do próprio quadro. O time foi avisado e resolve."),
+        "en": ("Queued: {items}, but I could not write that order on the board — the factory "
+               "takes them in the board's own order. The team has been told and will sort it "
+               "out."),
+    },
+}
+#: Why a card `promote` or `reorder` was asked to move did not (#497). They were Portuguese literals
+#: in the module, so an English conversation read "1 did not go in: o quadro recusou a
+#: movimentação" — and the two that name the card wrote `#{number}`, which on Jira is `#CONT-412`,
+#: a spelling nobody there writes and nobody can paste back. The card is named by `ref_label`. A
+#: queue the board refused is the card's door's to say (`module._FILING`, #414): the promotion is
+#: recorded, and applied again.
+_BOARD_MOVE_SAID = {
+    "unreachable": {"pt-BR": "não consegui acessar o quadro",
+                    "en": "I could not reach the board"},
+    "queue_failed": {"pt-BR": ("não consegui mover o {ref} para a fila agora. O time foi avisado e "
+                               "resolve."),
+                     "en": ("I could not move {ref} into the queue just now. The team has been "
+                            "told and will sort it out.")},
+    "unrankable": {"pt-BR": ("este quadro ainda não aceita reordenação por aqui — a ordem precisa "
+                             "ser mudada no próprio quadro"),
+                   "en": ("this board does not take a new order from here yet — the order has to "
+                          "be changed on the board itself")},
+    "order_refused": {"pt-BR": "o quadro recusou a reordenação",
+                      "en": "the board refused the new order"},
+    "order_failed": {"pt-BR": ("não consegui reposicionar o {ref} agora. O time foi avisado e "
+                               "resolve."),
+                     "en": ("I could not put {ref} in its place just now. The team has been told "
+                            "and will sort it out.")},
+    # ANOTHER PROJECT'S CARD, OR ONE THIS PROJECT FILED THAT ITS SCOPE DOES NOT SELECT (review
+    # round 2 of #752): `promote` read this project's slice of a shared Jira project, and the move
+    # reaches the card by key — queueing web's running card from api put it back in web's queue
+    # (`ok=True`, `POST issue/DAR-2/transitions`, measured on c8320a2). The words are `_stage`'s.
+    "outside_the_slice": {
+        "pt-BR": ("o {ref} não está na fatia do quadro de {project}, então {project} não tem como "
+                  "saber se a fábrica já pegou esse card. Nada foi alterado — se ele é de outro "
+                  "projeto, mova-o por lá; se é do próprio {project}, inclua-o no escopo e tente "
+                  "de novo."),
+        "en": ("{ref} is not in {project}'s slice of its board, so {project} cannot tell whether "
+               "the factory has taken it up. Nothing was changed — if it is another project's, "
+               "act on it from there; if it is {project}'s own, put it in the scope and try "
+               "again.")},
+}
+
+
+def board_move_said(reason: str, *, ref: object = "", project: str = "",
+                    language: str | None = None) -> str:
+    """What `promote` and `reorder` answer for a card that did not move, in the conversation's
+    language and naming the card as its tracker does (#497) — and, for a card outside the
+    project's slice of a shared board, the project whose slice it is not in (#752)."""
+    return _pick(_BOARD_MOVE_SAID[reason], language).format(ref=ref_label(ref), project=project)
+
+
+#: Why the product role filed nothing on a board where a new card is born in the queue (#536). The
+#: person reading it asked for the card and cannot repair the registry, so it says what would have
+#: happened — work started and paid for with nobody queueing it — and who repairs it, and where the
+#: line is: `beeverforge doctor` names it. Said for one card or a whole breakdown alike.
+_FILING_HELD = {
+    "queue": {"pt-BR": ("Não registrei nada: neste quadro um cartão novo nasce em '{column}', a "
+                        "coluna de onde a fábrica pega trabalho, então ele começaria a ser "
+                        "construído — e a custar — sem ninguém colocá-lo na fila. Quem opera esta "
+                        "fábrica define onde os cartões novos esperam; o `beeverforge doctor` diz "
+                        "a linha."),
+              "en": ("I filed nothing: on this board a new card starts in '{column}', the column "
+                     "the factory picks work up from, so it would start being built — and paid "
+                     "for — without anybody queueing it. Whoever runs this factory sets where new "
+                     "cards wait; `beeverforge doctor` names the line.")},
+    "unread": {"pt-BR": ("Não registrei nada: não consegui ler o quadro para saber onde um cartão "
+                         "novo nasce, e um que nasce na coluna de onde a fábrica pega trabalho é "
+                         "construído sem ninguém colocá-lo na fila. Tente de novo daqui a pouco."),
+               "en": ("I filed nothing: I could not read the board to see where a new card starts, "
+                      "and one that starts in the column the factory picks work up from is built "
+                      "without anybody queueing it. Try again in a moment.")},
+    # NOT "TRY AGAIN": the board was read and cannot say from what the deployment declared (#543) —
+    # a declaration missing or wrong, which a retry never mends and only the operator can.
+    "undeclared": {"pt-BR": ("Não registrei nada: onde um cartão novo nasce neste quadro ainda não "
+                             "está definido direito, e um que nasce na coluna de onde a fábrica "
+                             "pega trabalho é construído sem ninguém colocá-lo na fila. Quem opera "
+                             "esta fábrica define isso; o `beeverforge doctor` diz a linha."),
+                   "en": ("I filed nothing: where a new card starts on this board is not set right "
+                          "yet, and one that starts in the column the factory picks work up from "
+                          "is built without anybody queueing it. Whoever runs this factory sets "
+                          "it; `beeverforge doctor` names the line.")},
+}
+
+
+def filing_held(reason: str, *, column: str = "", language: str | None = None) -> str:
+    """Why nothing was filed, in the conversation's language (#536) — `queue` when a card filed
+    now would be born in the pickup column `column`, `unread` when the board could not say, and
+    `undeclared` when it was read and cannot say from what was declared (#543)."""
+    return _pick(_FILING_HELD[reason], language).format(column=column)
+
+
+#: Why the board's own `card_create` opened nothing where a new card is born in the queue (#543).
+#: The person on the board CAN queue a card — opening it in the queue is theirs to choose, the one
+#: gesture that spends (ADR-0019 §5) — so this one says that way too, beside who repairs the board.
+_CARD_OPEN_HELD = {
+    "queue": {"pt-BR": ("Nada foi aberto: neste quadro um cartão novo nasce em '{column}', "
+                        "a coluna de onde a fábrica pega trabalho, então ele começaria a ser "
+                        "construído — e a custar — sem ninguém colocá-lo na fila. Para começar "
+                        "agora, abra-o em '{column}'; para que espere, quem opera esta fábrica "
+                        "define onde os cartões novos esperam — o `beeverforge doctor` diz a "
+                        "linha."),
+              "en": ("Nothing was opened: on this board a new card starts in '{column}', the "
+                     "column the factory picks work up from, so it would start being built — and "
+                     "paid for — without anybody queueing it. To start it now, open it in "
+                     "'{column}'; for it to wait, whoever runs this factory sets where new cards "
+                     "wait — `beeverforge doctor` names the line.")},
+    "unread": {"pt-BR": ("Nada foi aberto: não consegui ler o quadro para saber onde um cartão "
+                         "novo nasce, e um que nasce na coluna de onde a fábrica pega trabalho é "
+                         "construído sem ninguém colocá-lo na fila. Tente de novo daqui a pouco."),
+               "en": ("Nothing was opened: the board could not be read to see where a new card "
+                      "starts, and one that starts in the column the factory picks work up from is "
+                      "built without anybody queueing it. Try again in a moment.")},
+    # `column` is the QUEUE here: where a new card starts is what cannot be said (#543).
+    "undeclared": {"pt-BR": ("Nada foi aberto: onde um cartão novo nasce neste quadro ainda não "
+                             "está definido direito, e um que nasce na coluna de onde a fábrica "
+                             "pega trabalho é construído sem ninguém colocá-lo na fila. Para "
+                             "começar agora, abra-o em '{column}'; para que espere, quem opera "
+                             "esta fábrica define isso — o `beeverforge doctor` diz a linha."),
+                   "en": ("Nothing was opened: where a new card starts on this board is not set "
+                          "right yet, and one that starts in the column the factory picks work up "
+                          "from is built without anybody queueing it. To start it now, open it in "
+                          "'{column}'; for it to wait, whoever runs this factory sets it — "
+                          "`beeverforge doctor` names the line.")},
+}
+
+
+def card_open_held(reason: str, *, column: str = "", language: str | None = None) -> str:
+    """Why the board opened no card, in the project's language (#543) — `queue` when a card opened
+    now would be born in the pickup column `column`, `unread` when the board could not say, and
+    `undeclared` when it was read and cannot say from what was declared, `column` the queue."""
+    return _pick(_CARD_OPEN_HELD[reason], language).format(column=column)
+
+
+# ── what the product role's own writes answer (#513) ────────────────────────────────────────────
+#
+# EVERY DETAIL A WRITE ANSWERS, IN THE CONVERSATION'S LANGUAGE. #497 moved `promote`'s and
+# `reorder`'s here; the rest of `ProductModule` and the release still wrote theirs as Portuguese
+# literals, written when every ref was a number — so an English conversation read "não encontrei o
+# cartão", and a Jira one read `#CONT-412`. A detail is what the person reads in the chat, after the
+# sanitiser (`client_safe_detail`): each table below names the card by `ref_label`, as
+# `board_move_said` does, and the module composes none of its own.
+
+#: The card acts — `refine`, `close_card`, the removal, `align_card` and the re-pointing of an
+#: orphan. The board that cannot be read is said with ONE voice by every act that has to find its
+#: card first, and so is the card that is not on it (`correction_refused` says the same).
+_CARD_SAID = {
+    "board_unreadable": {
+        "pt-BR": ("não consegui abrir o quadro agora para ler esse cartão, então não mexi nele. "
+                  "O time foi avisado."),
+        "en": ("I could not open the board just now to read that card, so I left it alone. The "
+               "team has been told.")},
+    "not_found": {"pt-BR": "não encontrei o cartão {number} no quadro",
+                  "en": "I could not find card {number} on the board"},
+    "already_closed": {"pt-BR": "o {number} já estava fechado — não mexi nele",
+                       "en": "{number} was already closed — I left it alone"},
+    "survivor_missing": {
+        "pt-BR": ("não encontrei o {other} no quadro, então não fechei o {number}: mandar quem ler "
+                  "procurar um cartão que não existe é pior do que deixar os dois abertos."),
+        "en": ("I could not find {other} on the board, so I did not close {number}: sending "
+               "whoever reads it to look for a card that does not exist is worse than leaving both "
+               "open.")},
+    "survivor_closed": {
+        "pt-BR": ("o {other} também já está fechado, então não fechei o {number}: os dois fechados "
+                  "quer dizer que ninguém está olhando esse trabalho. Me digam qual cartão fica "
+                  "com ele."),
+        "en": ("{other} is already closed too, so I did not close {number}: with both closed, "
+               "nobody is looking after that work. Tell me which card keeps it.")},
+    "close_failed": {
+        "pt-BR": "não consegui fechar o {number} agora. Nada mudou — o time foi avisado e resolve.",
+        "en": ("I could not close {number} just now. Nothing changed — the team has been told and "
+               "will sort it out.")},
+    "close_unlinked": {
+        "pt-BR": ("fechei o {number}, mas não consegui deixar o registro disso no {other}. O time "
+                  "foi avisado."),
+        "en": ("I closed {number}, but could not leave a note of it on {other}. The team has been "
+               "told.")},
+    "remove_failed": {
+        "pt-BR": ("não consegui remover o {number} agora. Nada mudou — o time foi avisado e "
+                  "resolve."),
+        "en": ("I could not remove {number} just now. Nothing changed — the team has been told "
+               "and will sort it out.")},
+    "has_criteria": {"pt-BR": "esse já diz quando estaria pronto — não mexi",
+                     "en": "that one already says when it would be done — I left it alone"},
+    "no_criteria": {"pt-BR": "não consegui escrever critérios que se sustentassem",
+                    "en": "I could not write criteria that would hold up"},
+    "refine_failed": {
+        "pt-BR": ("não consegui escrever os critérios no {number} agora. Nada mudou no cartão — o "
+                  "time foi avisado e resolve."),
+        "en": ("I could not write the criteria on {number} just now. Nothing changed on the card "
+               "— the team has been told and will sort it out.")},
+    "refine_unnoted": {
+        "pt-BR": ("escrevi os critérios no {number}, mas não consegui deixar o comentário dizendo "
+                  "que fui eu — isso está escrito no próprio item. O time foi avisado."),
+        "en": ("I wrote the criteria on {number}, but could not leave the comment saying it was "
+               "me — that is written on the item itself. The team has been told.")},
+    "no_criteria_from": {
+        "pt-BR": ("não consegui escrever critérios que se sustentassem a partir do requisito "
+                  "{requirement} — não mexi no cartão"),
+        "en": ("I could not write criteria that would hold up from requirement {requirement} — I "
+               "left the card alone")},
+    "align_failed": {
+        "pt-BR": "não consegui reescrever o {number} agora. O time foi avisado e resolve.",
+        "en": ("I could not rewrite {number} just now. The team has been told and will sort it "
+               "out.")},
+    "align_unnoted": {
+        "pt-BR": ("alinhei o {number}, mas não consegui deixar escrito nele que o texto anterior "
+                  "foi substituído. O time foi avisado."),
+        "en": ("I aligned {number}, but could not write on it that the previous text was "
+               "replaced. The team has been told.")},
+    "repointed": {"pt-BR": "passou a executar o requisito {requirement}",
+                  "en": "now carries out requirement {requirement}"},
+    "repoint_failed": {
+        "pt-BR": ("não consegui atualizar o {number} — ele continua apontando para o texto antigo, "
+                  "e o time foi avisado."),
+        "en": ("I could not update {number} — it still points to the old text, and the team has "
+               "been told.")},
+}
+
+
+def card_said(reason: str, *, number: object = "", other: object = "",
+              requirement: object = "", language: str | None = None) -> str:
+    """What a card act answers for itself (#513), the cards named as their tracker names them."""
+    return _pick(_CARD_SAID[reason], language).format(
+        number=ref_label(number), other=ref_label(other), requirement=requirement)
+
+
+#: What a write that wrote criteria COUNTED — the measure `confirm._A_MEASURE` tells from a residue
+#: (a count and the thing counted, nothing else) and `criteria_written` shows beside the act. It was
+#: "3 critérios" in every language, and "1 critérios" for one.
+_CRITERIA_COUNTED = {
+    "pt-BR": {"one": "{n} critério", "many": "{n} critérios"},
+    "en": {"one": "{n} criterion", "many": "{n} criteria"},
+}
+
+
+def criteria_counted(n: int, *, language: str | None = None) -> str:
+    return _pick(_CRITERIA_COUNTED, language)["one" if n == 1 else "many"].format(n=n)
+
+
+#: The writes into the product's record — a requirement proposed, agreed, dropped or decided on, a
+#: fact or an answer noted, a capability confirmed, a conversation's summary, a document, the survey
+#: of the code. None names a card.
+_RECORD_SAID = {
+    "undrafted": {
+        "pt-BR": ("não consegui transformar isso num texto de requisito que se sustentasse, então "
+                  "não registrei nada. Me diga de outro jeito e eu tento de novo."),
+        "en": ("I could not turn that into a requirement text that would hold up, so I recorded "
+               "nothing. Say it another way and I'll try again.")},
+    "propose_failed": {
+        "pt-BR": ("não consegui registrar esse requisito agora. Nada foi escrito — o time foi "
+                  "avisado e resolve."),
+        "en": ("I could not record that requirement just now. Nothing was written — the team has "
+               "been told and will sort it out.")},
+    "already_agreed": {"pt-BR": "esse já estava acordado", "en": "that one was already agreed"},
+    "accept_failed": {
+        "pt-BR": ("não consegui registrar o acordo do requisito {number} agora. Nada mudou — o "
+                  "time foi avisado e resolve."),
+        "en": ("I could not record the agreement on requirement {number} just now. Nothing "
+               "changed — the team has been told and will sort it out.")},
+    "drop_failed": {
+        "pt-BR": ("não consegui registrar o abandono do requisito {number} agora. Nada mudou — o "
+                  "time foi avisado e resolve."),
+        "en": ("I could not record that requirement {number} is dropped just now. Nothing "
+               "changed — the team has been told and will sort it out.")},
+    "not_a_capability": {"pt-BR": "esse nome não é o de uma capacidade",
+                         "en": "that name is not the name of a capability"},
+    "capability_not_found": {
+        "pt-BR": "não encontrei essa capacidade entre as observadas nem entre as escritas",
+        "en": "I could not find that capability among the observed ones or the written ones"},
+    "capability_failed": {
+        "pt-BR": ("não consegui registrar a confirmação da capacidade {term} agora. Nada mudou — "
+                  "o time foi avisado e resolve."),
+        "en": ("I could not record the confirmation of capability {term} just now. Nothing "
+               "changed — the team has been told and will sort it out.")},
+    # what `capabilities.confirm_in_repository` finds in the file it would write (#538)
+    "capability_is_a_link": {
+        "pt-BR": "o arquivo dessa capacidade é um link — não escrevo através dele",
+        "en": "that capability's file is a link — I do not write through it"},
+    "capability_unreadable": {"pt-BR": "não consegui ler o arquivo dessa capacidade",
+                              "en": "I could not read that capability's file"},
+    "capability_already_confirmed": {"pt-BR": "essa capacidade já estava confirmada",
+                                     "en": "that capability was already confirmed"},
+    "capability_retired": {
+        "pt-BR": ("essa capacidade foi aposentada — confirmar de novo é uma decisão a registrar "
+                  "por escrito, não um sim"),
+        "en": ("that capability was retired — confirming it again is a decision to record in "
+               "writing, not a yes")},
+    "decision_on_retired": {
+        "pt-BR": ("o requisito {number} já não vale, então registrar uma decisão nele guardaria "
+                  "isso onde ninguém vai procurar. Me diga em qual requisito isso deve entrar."),
+        "en": ("requirement {number} no longer stands, so recording a decision on it would keep "
+               "it where nobody will look. Tell me which requirement it belongs in.")},
+    "decision_just_recorded": {"pt-BR": "essa decisão acabou de ser registrada",
+                               "en": "that decision was just recorded"},
+    "decision_failed": {
+        "pt-BR": ("não consegui registrar essa decisão no requisito {number} agora. Nada mudou — o "
+                  "time foi avisado e resolve."),
+        "en": ("I could not record that decision on requirement {number} just now. Nothing "
+               "changed — the team has been told and will sort it out.")},
+    "fact_known": {"pt-BR": "já tenho isto anotado sobre {term!r}: {body}",
+                   "en": "I already have this noted about {term!r}: {body}"},
+    "answer_just_noted": {"pt-BR": "isto acabou de ser anotado sobre {term!r}",
+                          "en": "this was just noted about {term!r}"},
+    "answer_failed": {
+        "pt-BR": ("não consegui registrar a resposta sobre {term!r} agora. Nada foi escrito — o "
+                  "time foi avisado e resolve."),
+        "en": ("I could not record the answer about {term!r} just now. Nothing was written — the "
+               "team has been told and will sort it out.")},
+    "fact_failed": {
+        "pt-BR": ("não consegui anotar o que você me disse sobre {term!r} agora. Nada foi escrito "
+                  "— o time foi avisado e resolve."),
+        "en": ("I could not note what you told me about {term!r} just now. Nothing was written — "
+               "the team has been told and will sort it out.")},
+    "distillate_failed": {"pt-BR": "não consegui guardar o resumo da conversa agora.",
+                          "en": "I could not keep the summary of the conversation just now."},
+    "document_failed": {"pt-BR": "não consegui guardar esse documento agora — nada foi escrito.",
+                        "en": "I could not file that document just now — nothing was written."},
+    "no_code_copy": {"pt-BR": "não consegui obter uma cópia do código para ler",
+                     "en": "I could not get a copy of the code to read"},
+    "unsurveyed": {
+        "pt-BR": ("li o produto e não consegui escrever um levantamento que se sustentasse, então "
+                  "não registrei nada."),
+        "en": ("I read the product and could not write a survey that would hold up, so I "
+               "recorded nothing.")},
+    "survey_failed": {
+        "pt-BR": ("não consegui escrever o levantamento agora. Nada foi registrado — o time foi "
+                  "avisado e resolve."),
+        "en": ("I could not write the survey just now. Nothing was recorded — the team has been "
+               "told and will sort it out.")},
+}
+
+
+def record_said(reason: str, *, number: object = "", term: str = "", body: str = "",
+                language: str | None = None) -> str:
+    """What a write into the product's record answers for itself (#513)."""
+    return _pick(_RECORD_SAID[reason], language).format(number=number, term=term, body=body)
+
+
+#: AN IMPORT, SAID (#993): the plan a person reads before their yes, what landed after it, and
+#: every reason one is refused or a file of the folder is left out — in the product's language.
+#: The plan's lines are composed from these and nothing else (`importing.lines`).
+_IMPORT_SAID = {
+    # the plan, and what landed
+    "plan": {"pt-BR": ("Importar {origin} faria isto no produto — nada é escrito antes do seu "
+                       "sim:"),
+             "en": "Importing {origin} would do this to the product — nothing is written before "
+                   "your yes:"},
+    "landed": {"pt-BR": "Importei {origin}:", "en": "Imported {origin}:"},
+    "commit": {"pt-BR": "importação {id}: {origin}\n\n{counted}\nImportado por {by}.",
+               "en": "import {id}: {origin}\n\n{counted}\nImported by {by}."},
+    "counted": {"pt-BR": ("{new} requisito(s) novo(s), {revision} revisão(ões) de um texto que "
+                          "ninguém tinha acordado, {beside} guardado(s) ao lado de um acordado, "
+                          "{same} já presente(s)."),
+                "en": ("{new} new requirement(s), {revision} revision(s) of a text nobody had "
+                       "agreed, {beside} kept beside an agreed one, {same} already here.")},
+    "say_yes": {"pt-BR": "Responda com `yes` e o token {token} para que eu importe exatamente "
+                         "isto.",
+                "en": "Answer with `yes` and the token {token} to import exactly this."},
+    "new": {"pt-BR": "REQ-{number} — {title}: novo (REQ-{source} na pasta)",
+            "en": "REQ-{number} — {title}: new (REQ-{source} in the folder)"},
+    "revision": {"pt-BR": ("REQ-{number} — {title}: um texto novo para {replaces}, que ninguém "
+                           "tinha acordado — substitui"),
+                 "en": ("REQ-{number} — {title}: a new text for {replaces}, which nobody had "
+                        "agreed — it replaces it")},
+    "same": {"pt-BR": "REQ-{number} — {title}: já está aqui, palavra por palavra{rows}",
+             "en": "REQ-{number} — {title}: already here, word for word{rows}"},
+    "rows": {"pt-BR": " — {rows} decisão(ões) entram no registro dele",
+             "en": " — {rows} decision(s) join its register"},
+    "beside": {"pt-BR": ("REQ-{number} — {title}: já acordado, e a pasta diz outra coisa — o "
+                         "texto fica guardado ao lado, como proposta de mudar uma promessa, que "
+                         "só um sim faz; nada em REQ-{number} muda"),
+               "en": ("REQ-{number} — {title}: agreed already, and the folder says something "
+                      "else — its text is kept beside it as a proposal to change a promise, "
+                      "which only a yes can make; nothing in REQ-{number} changes")},
+    "history": {"pt-BR": "REQ-{number} — {title}: já não vale na pasta ({status}), guardado como "
+                         "histórico",
+                "en": "REQ-{number} — {title}: no longer stands in the folder ({status}), kept as "
+                      "history"},
+    "fact_new": {"pt-BR": "fato “{name}”: novo, em {path}",
+                 "en": "fact “{name}”: new, under {path}"},
+    "fact_known": {"pt-BR": "fato “{name}”: já está escrito — não é reescrito",
+                   "en": "fact “{name}”: already written — not rewritten"},
+    "document_new": {"pt-BR": "documento {name}: entra em {path}",
+                     "en": "document {name}: lands at {path}"},
+    "document_same": {"pt-BR": "documento {name}: já está aqui, o mesmo arquivo",
+                      "en": "document {name}: already here, the same file"},
+    "document_beside": {"pt-BR": ("documento {name}: já há outro arquivo em {beside} — este fica "
+                                  "ao lado, em {path}"),
+                        "en": ("document {name}: a different file is already at {beside} — "
+                               "this one is kept beside it, at {path}")},
+    "left_out": {"pt-BR": "{name}: fica de fora — {why}", "en": "{name}: left out — {why}"},
+    # why a file of the folder is left out
+    "hidden": {"pt-BR": "é oculto (do git, da plataforma ou de uma ferramenta)",
+               "en": "it is hidden (git's, the platform's or a tool's own)"},
+    "a_link": {"pt-BR": "é um link, e não sigo links", "en": "it is a link, and I follow none"},
+    "not_a_file": {"pt-BR": "não é um arquivo", "en": "it is not a file"},
+    "too_large_a_file": {"pt-BR": "é grande demais para ser lido",
+                         "en": "it is too large to be read"},
+    "outside_the_folder": {"pt-BR": "o nome sai da pasta",
+                           "en": "its name leads out of the folder"},
+    "reserved": {"pt-BR": ("só a confirmação de uma pessoa ou o resumo de uma conversa escrevem "
+                           "ali"),
+                 "en": "only a person's confirmation or a conversation's summary writes there"},
+    "not_a_requirement": {"pt-BR": "está na pasta de requisitos e não se chama NNNN-titulo.md",
+                          "en": "it is in the requirements folder and is not named "
+                                "NNNN-title.md"},
+    "the_template": {"pt-BR": "é o modelo, não um requisito",
+                     "en": "it is the template, not a requirement"},
+    "inside_the_requirements": {"pt-BR": "está dentro da pasta de requisitos, numa subpasta",
+                                "en": "it is inside the requirements folder, in a subfolder"},
+    "no_fact": {"pt-BR": "não tem nenhum fato (`### termo`)",
+                "en": "it holds no fact (`### term`)"},
+    "a_retired_fact": {"pt-BR": "é um fato aposentado", "en": "it is a retired fact"},
+    "unreadable_manifest": {"pt-BR": "não consegui ler como YAML",
+                            "en": "it could not be read as YAML"},
+    "no_register": {"pt-BR": ("o requisito não tem registro de decisões, então {rows} decisão(ões) "
+                              "da pasta não foram escritas"),
+                    "en": ("the requirement has no decision register, so {rows} decision(s) "
+                           "from the folder were not written")},
+    "under_a_link": {"pt-BR": ("o caminho dele no produto passa por um link, e não leio nem "
+                               "escrevo através de links"),
+                     "en": ("its way into the product passes through a link there, and I read "
+                            "and write through none")},
+    # why nothing is imported
+    "no_yes": {"pt-BR": ("nada foi importado sem `yes` — e o plano de uma importação só é mostrado "
+                         "a quem pode dar o sim que a faz."),
+               "en": ("nothing was imported without `yes` — and the plan of an import is shown "
+                      "only to a person whose yes would land it.")},
+    "no_source": {"pt-BR": "diga qual pasta ou arquivo importar.",
+                  "en": "name the folder or archive to import."},
+    "not_found": {"pt-BR": "não há pasta nem arquivo chamado {name} para importar.",
+                  "en": "there is no folder or archive called {name} to import."},
+    "not_a_folder": {"pt-BR": ("{name} não é uma pasta nem um arquivo .zip, .tar ou .tar.gz — não "
+                               "sei importá-lo."),
+                     "en": "{name} is neither a folder nor a .zip, .tar or .tar.gz archive — I "
+                           "cannot import it."},
+    "outside_the_inbox": {
+        "pt-BR": ("só a linha de comando, no servidor, pode nomear uma pasta em qualquer lugar; "
+                  "por aqui, nomeie uma que esteja na caixa de importação do produto."),
+        "en": ("only the command line on the host may name a folder anywhere; from here, name "
+               "one inside the product's import inbox.")},
+    "unreadable_archive": {"pt-BR": "não consegui ler {name} como um arquivo compactado.",
+                           "en": "I could not read {name} as an archive."},
+    "too_many": {"pt-BR": "{name} tem mais de {limit} arquivos — demais para importar de uma vez.",
+                 "en": "{name} holds more than {limit} files — too many to import at once."},
+    "too_large": {"pt-BR": "{name} passa de {limit} — demais para importar de uma vez.",
+                  "en": "{name} holds more than {limit} — too much to import at once."},
+    "contradicts_itself": {
+        "pt-BR": "os requisitos da pasta se contradizem, então não planejei nada: {errors}",
+        "en": "the folder's requirements contradict themselves, so nothing was planned: "
+              "{errors}"},
+    "nothing_new": {"pt-BR": "nada em {origin} é novo para o produto — não escrevi nada.",
+                    "en": "nothing in {origin} is new to the product — nothing was written."},
+    "already": {"pt-BR": "{origin} já foi importado ({id}) — não escrevi nada de novo.",
+                "en": "{origin} was already imported ({id}) — nothing was written again."},
+    "moved": {"pt-BR": ("o produto mudou desde que esse plano foi mostrado, então não importei "
+                        "nada. Este é o plano como está agora:"),
+              "en": ("the product changed since that plan was shown, so nothing was imported. "
+                     "This is the plan as it stands now:")},
+    "push_refused": {
+        "pt-BR": ("o repositório de contexto recusou o registro da importação, então nada entrou. "
+                  "Planeje de novo: o plano parte do que está lá agora."),
+        "en": ("the context repository refused the import's commit, so nothing landed. Plan it "
+               "again: it starts from what is there now.")},
+    "supersede_failed": {
+        "pt-BR": ("um requisito que a importação substitui não pôde ser marcado como substituído, "
+                  "então nada entrou — assim não ficam duas versões valendo."),
+        "en": ("a requirement this import replaces could not be marked as replaced, so nothing "
+               "landed — two versions are never left standing.")},
+    "outside": {"pt-BR": ("um arquivo que a importação escreveria é um link no repositório, e não "
+                          "escrevo através de links — nada entrou."),
+                "en": ("a file the import would write is a link in the repository, and I write "
+                       "through none — nothing landed.")},
+    "corpus_broken": {
+        "pt-BR": ("importar isto deixaria os requisitos do produto inconsistentes ({broken}), "
+                  "então nada entrou."),
+        "en": ("importing this would leave the product's requirements inconsistent ({broken}), so "
+               "nothing landed.")},
+    "failed": {"pt-BR": "não consegui importar {origin} agora — nada foi escrito.",
+               "en": "I could not import {origin} just now — nothing was written."},
+}
+
+
+def import_said(reason: str, *, language: str | None = None, **values: object) -> str:
+    """One sentence of an import (#993), in the product's language."""
+    return _pick(_IMPORT_SAID[reason], language).format(**values)
+
+
+#: A requirement broken into cards, and the cards that came of it — the filing, the vetting, where
+#: a card was filed, and the acceptance stamped on it. `{ref}` is a card, named by `ref_label`.
+_BREAKDOWN_SAID = {
+    "unbroken": {
+        "pt-BR": ("não consegui quebrar esse requisito em frentes de trabalho que se "
+                  "sustentassem, então não registrei nada."),
+        "en": ("I could not break that requirement into pieces of work that would hold up, so I "
+               "recorded nothing.")},
+    "out_of_time": {
+        "pt-BR": ("não deu tempo de revisar e abrir a frente “{title}” nesta rodada — nada dela "
+                  "foi escrito; peça a quebra de novo para abrir as que faltam."),
+        "en": ("there was no time this round to review and open “{title}” — nothing of it was "
+               "written; ask for the breakdown again to open the ones still missing.")},
+    "already_carried": {
+        "pt-BR": ("essa frente já está no {ref} — apontei o requisito para lá em vez de abrir um "
+                  "cartão novo"),
+        "en": ("that piece of work is already in {ref} — I pointed the requirement there instead "
+               "of opening a new card")},
+    # NOT "THE OTHERS WENT AHEAD" (review of #580): with two fronts refused it was false for the
+    # second, and the reply's head already says which cards were opened
+    "not_vetted": {
+        "pt-BR": ("a frente “{title}” não passou na revisão automática, então não abri esse "
+                  "cartão. O que falta: {why}"),
+        "en": ("“{title}” did not pass the automatic review, so I did not open that card. What "
+               "is missing: {why}")},
+    "title_exists": {"pt-BR": "já existe um cartão com esse título",
+                     "en": "a card with that title already exists"},
+    # A FRONT HELD WITH THE ONE IT WAITS ON (#576), in one sentence: filed alone, it stood on a
+    # foundation nobody had filed, and the pre-flight parked it a move later. IT PROMISES NOTHING
+    # (review of #586): a base the review refused is refused again by the same review on a second
+    # ask, so "both are opened" was false in the very case this exists for. What makes the base
+    # openable is said by the base's own sentence beside it
+    "held": {
+        "pt-BR": ("“{base}” não foi aberta, então segurei “{title}”, que é construída em cima "
+                  "dela — peça a quebra de novo quando “{base}” puder ser aberta."),
+        "en": ("“{base}” was not opened, so I held “{title}”, which builds on it — ask for the "
+               "breakdown again once “{base}” can be opened.")},
+    # A CARD OF THE REQUIREMENT APPEARED WHILE IT WAS BROKEN DOWN (#563 slice 18d): filed by hand
+    # or by another surface, it may carry what this front would have — so the front is held,
+    # naming the card, and the next breakdown starts from the list that includes it
+    "carried_meanwhile": {
+        "pt-BR": ("segurei a frente “{title}”: enquanto eu quebrava o requisito, o card {ref} foi "
+                  "aberto para ele. Veja o que ele cobre e peça a quebra de novo para registrar o "
+                  "que faltar."),
+        "en": ("I held “{title}”: while I was breaking the requirement down, card {ref} was "
+               "opened for it. See what it covers, and ask for the breakdown again to file what "
+               "is still missing.")},
+    "file_failed": {
+        "pt-BR": "não consegui registrar “{title}” agora. O time foi avisado e resolve.",
+        "en": ("I could not record “{title}” just now. The team has been told and will sort it "
+               "out.")},
+    "unplaced": {
+        "pt-BR": ("criado, mas o quadro recusou a colocação — o cartão está sem coluna e o time "
+                  "foi avisado."),
+        "en": ("created, but the board refused to place it — the card has no column and the team "
+               "has been told.")},
+    "unplaced_no_ref": {
+        "pt-BR": ("criado, mas o quadro não aceitou a colocação — o cartão está sem coluna e o "
+                  "time foi avisado."),
+        "en": ("created, but the board did not take the placement — the card has no column and "
+               "the team has been told.")},
+    # NO "REPOSITORY" IN THE ENGLISH: it is delivery vocabulary the sanitiser hides, and this is
+    # said under a card that WAS filed — swapped for "I couldn't record that", it would be a lie
+    "outside_sources": {
+        "pt-BR": ("o cartão foi aberto em {default}: `{target}` não está entre os repositórios "
+                  "deste produto."),
+        "en": ("the card was opened in {default}: `{target}` is not one of the places this "
+               "product's code lives.")},
+    "one_place": {
+        "pt-BR": ("o cartão foi aberto em {default}: este quadro registra todo cartão num lugar "
+                  "só, e ele é de `{home}`."),
+        "en": ("the card was opened in {default}: this board keeps every card in one place, and "
+               "this one belongs to `{home}`.")},
+    "the_default": {"pt-BR": "o repositório padrão", "en": "the usual place"},
+    "retired": {
+        "pt-BR": "o requisito {number} já não vale — não abri nenhum cartão para ele",
+        "en": "requirement {number} no longer stands — I did not open any card for it"},
+    "unstamped": {"pt-BR": "não consegui registrar o aceite no {ref}",
+                  "en": "I could not record the agreement on {ref}"},
+}
+
+
+def breakdown_said(reason: str, *, ref: object = "", title: str = "", why: str = "",
+                   number: object = "", default: str = "", target: str = "", home: str = "",
+                   base: str = "", language: str | None = None) -> str:
+    """What filing a requirement's cards answers for itself (#513). `default` is the repository a
+    card was filed in, said in backticks — or, when the product names none, in words. `base` is
+    the front a held one builds on (#576)."""
+    where = f"`{default}`" if default else _pick(_BREAKDOWN_SAID["the_default"], language)
+    return _pick(_BREAKDOWN_SAID[reason], language).format(
+        ref=ref_label(ref), title=title, why=why, number=number, default=where, target=target,
+        home=home, base=base)
+
+
+#: What `propose_queue` answers for itself: a proposal the role could not put together, and the
+#: cards a batch boundary left for the next round — NAMED, never a silent truncation.
+_QUEUE_SAID = {
+    "unproposed": {"pt-BR": "não consegui montar a proposta",
+                   "en": "I could not put the proposal together"},
+    "left_for_later": {
+        "pt-BR": "Deixei para a próxima rodada o que não cabia inteiro agora: {cards}.",
+        "en": "I left for the next round what did not fit whole this time: {cards}."},
+}
+
+
+def queue_said(reason: str, *, cards: list | tuple = (), language: str | None = None) -> str:
+    return _pick(_QUEUE_SAID[reason], language).format(
+        cards=", ".join(ref_label(c) for c in cards))
+
+
+#: Why the factory may not be aimed at this text — ONE sentence for the acts that aim it
+#: (`break_down`, `align_card`, and the alignment's own refusal in the engine). Three answers, and
+#: the difference is what the person can do next: a retired text has a replacement to ask about, a
+#: proposal needs a yes, and a reading of the code was never a promise at all.
+_NOT_A_PROMISE = {
+    "retired": {
+        "pt-BR": ("o requisito {number} já não vale, então mandar construir a partir dele seria "
+                  "pedir um texto aposentado. Me diga qual requisito vale hoje e eu sigo com "
+                  "esse."),
+        "en": ("requirement {number} no longer stands, so building from it would mean asking for "
+               "a retired text. Tell me which requirement stands today and I'll go with that "
+               "one.")},
+    "observed": {
+        "pt-BR": ("o {number} é o que eu li que o sistema já faz hoje, não algo que vocês pediram "
+                  "— construir a partir dele seria transformar o comportamento actual em "
+                  "promessa, defeitos inclusive. Se é isso que tem de valer, me digam e eu "
+                  "registro primeiro."),
+        "en": ("requirement {number} is what I read the system already does today, not something "
+               "you asked for — building from it would turn the current behaviour into a "
+               "promise, defects included. If that is what has to stand, tell me and I'll record "
+               "it first.")},
+    "proposed": {
+        "pt-BR": ("o requisito {number} ainda não foi acordado, então não dá para virar trabalho: "
+                  "enquanto ele for só uma proposta, construir a partir dele seria decidir por "
+                  "vocês. Me confirmem esse requisito e eu sigo."),
+        "en": ("requirement {number} has not been agreed yet, so it cannot become work: while it "
+               "is only a proposal, building from it would be deciding for you. Confirm that "
+               "requirement and I'll carry on.")},
+}
+
+
+def not_a_promise(reason: str, *, number: object, language: str | None = None) -> str:
+    return _pick(_NOT_A_PROMISE[reason], language).format(number=number)
+
+
+#: What the client's release answers when it did not go out (`product/release.py`, ADR-0025). The
+#: first names the card, which was `#{…}` on every tracker.
+_RELEASE_SAID = {
+    "not_waiting": {
+        "pt-BR": ("o {ref} não está mais esperando essa liberação — ou já subiu, ou a janela de "
+                  "espera fechou. Não mexi em nada; me diga e eu verifico em que pé está."),
+        "en": ("{ref} is no longer waiting for this release — either it already went out, or the "
+               "time to approve it ran out. I did not touch anything; tell me and I'll check where "
+               "it stands.")},
+    "failed": {
+        "pt-BR": ("não consegui levar a sua liberação até a esteira agora. **Nada subiu** — o "
+                  "time já foi avisado e eu volto a você assim que resolver."),
+        "en": ("I could not get your release through just now. **Nothing was released** — the "
+               "team has been told, and I'll come back to you as soon as it is sorted.")},
+}
+
+
+def release_said(reason: str, *, ref: object = "", language: str | None = None) -> str:
+    return _pick(_RELEASE_SAID[reason], language).format(ref=ref_label(ref))
+
+
+#: The header over a group that only means something whole. Written as WHAT THE CLIENT WILL BE ABLE
+#: TO DO, because that is the decision they are being asked to make — not "these three tickets are
+#: related", which they cannot act on.
+_QUEUE_BATCH = {
+    "pt-BR": "**Juntos, para vocês poderem testar “{what}”:**",
+    "en": "**Together, so you can try “{what}”:**",
+}
+#: Back to items that stand on their own, after a group. Without it the list reads as though the
+#: batch above swallowed everything below it.
+_QUEUE_ALONE = {
+    "pt-BR": "**Independentes entre si:**",
+    "en": "**Independent of each other:**",
+}
+
+
+def queue_proposal(readiness, proposal, *, titles: dict[str, str] | None = None,
+                   language: str | None = None, agent_name: str = "") -> str:
+    """The proposal, led by WHY it matters — an idle floor beside ready work is the one finding
+    here that costs something every hour it stays true."""
+    titles = titles or {}
+    sig = f"{agent_name.strip()}: " if agent_name.strip() else ""
+
+    if not proposal or not proposal.items:
+        if readiness.blocked_by_refinement:
+            return sig + _pick(_QUEUE_BLOCKED, language).format(n=len(readiness.needs_refinement))
+        return sig + _pick(_QUEUE_EMPTY, language)
+
+    head = _QUEUE_IDLE if readiness.wasting_capacity else _QUEUE_BUSY
+    lines = [sig + _pick(head, language), ""]
+    # THE BATCH HAS TO BE VISIBLE OR IT DOES NOT EXIST. Grouping the tickets in the model and then
+    # printing one flat numbered list would leave the client approving a sequence with no way to
+    # see that three of its items are one deliverable — the care would be real in the JSON and
+    # absent everywhere a person looks.
+    shown = ""
+    for i, item in enumerate(proposal.items, 1):
+        batch = item.batch.strip()
+        if batch and batch != shown:
+            lines.append(("" if i == 1 else "") + _pick(_QUEUE_BATCH, language).format(what=batch))
+        if not batch and shown:
+            lines.append(_pick(_QUEUE_ALONE, language))
+        shown = batch
+        title = titles.get(item.ticket, "")
+        lines.append(f"{i}. **{ref_label(item.ticket)}**{f' — {title}' if title else ''}"
+                     + (f"\n   _{item.why}_" if item.why else ""))
+    if proposal.held_back:
+        lines += ["", _pick(_QUEUE_HELD, language)]
+        lines += [f"• {ref_label(h.ticket)} — {h.why}" for h in proposal.held_back[:5]]
+    if proposal.note:
+        lines += ["", proposal.note]
+    if readiness.needs_refinement:
+        lines += ["", _pick(_QUEUE_REFINE, language).format(n=len(readiness.needs_refinement))]
+    lines += ["", _pick(_QUEUE_ASK, language)]
+    return "\n".join(lines)
+
+
+def queued(numbers: list[str], *, language: str | None = None, agent_name: str = "",
+           ranked: str = "kept") -> str:
+    """The cards a confirmed queue moved, named AS THE TRACKER SPELLS THEM (#491).
+
+    `ref_label`, never `f"#{n}"`: `#12` on GitHub, as it always read, and `CONT-412` on Jira —
+    not `#CONT-412`, which nobody there writes and nobody can paste back.
+
+    `ranked` IS WHETHER THE ORDER REACHED THE BOARD (#512, `WriteResult.ranked`): `kept` says the
+    factory starts with the first; `unrankable` and `not_kept` say it takes them in the board's
+    own order, and why."""
+    from beeverforge.contracts.refs import ref_label
+
+    sig = f"{agent_name.strip()}: " if agent_name.strip() else ""
+    said = _QUEUED_OUT_OF_ORDER.get(ranked, _QUEUED)
+    return sig + _pick(said, language).format(items=", ".join(ref_label(n) for n in numbers))
+
+
+_SITUATION = {
+    "pt-BR": {
+        "idle_ready": ("Como está agora: a fábrica está **parada** e há **{ready}** itens prontos "
+                       "para começar — isso é capacidade indo embora."),
+        "idle_blocked": ("Como está agora: a fábrica está **parada**, e dos **{backlog}** itens no "
+                         "backlog **nenhum** diz quando estaria pronto ({items})."),
+        "busy": "Como está agora: **{running}** em andamento, **{todo}** na fila.",
+        "quiet": "Como está agora: nada em andamento e nada esperando.",
+        "refine": (" Outros **{n}** ainda não dizem quando estariam prontos ({items}) — posso "
+                   "escrever os critérios deles."),
+        "corpus": " Sobre o produto em si, **{n}** requisitos escritos.",
+        "corpus_none": " Sobre o produto em si, ainda não há nada escrito — é por onde eu começo.",
+        "trend": " Desde a última vez que olhei, o backlog {dir} **{n}**.",
+    },
+    "en": {
+        "idle_ready": ("Where things stand: the factory is **idle** with **{ready}** items ready "
+                       "to start — that is capacity going to waste."),
+        "idle_blocked": ("Where things stand: the factory is **idle**, and of the **{backlog}** "
+                         "items in the backlog **none** says when it would be done ({items})."),
+        "busy": "Where things stand: **{running}** in flight, **{todo}** queued.",
+        "quiet": "Where things stand: nothing in flight and nothing waiting.",
+        "refine": (" Another **{n}** do not yet say when they would be done ({items}) — I can "
+                   "write their criteria."),
+        "corpus": " On the product itself, **{n}** requirements written down.",
+        "corpus_none": " On the product itself, nothing is written yet — where I start.",
+        "trend": " Since I last looked, the backlog {dir} by **{n}**.",
+    },
+}
+_TREND_WORD = {"pt-BR": ("cresceu", "diminuiu"), "en": ("grew", "shrank")}
+
+
+#: The tail of a list cut short — "#3, #5 e mais 4" — in the conversation's language (#513): it was
+#: a hard-coded "e mais", so an English situation ended "#3, #5 e mais 4".
+_LISTED_MORE = {"pt-BR": "{shown} e mais {rest}", "en": "{shown} and {rest} more"}
+
+
+def _listed(numbers: list[str], *, limit: int = 6, language: str | None = None) -> str:
+    """Ticket numbers a reader can actually go and look at.
+
+    A count is a fact nobody can act on: "another 11 do not say when they would be done" leaves a
+    person scrolling a board of fifty trying to work out WHICH eleven. Naming them costs one line
+    and turns a statistic into a task."""
+    shown = ", ".join(ref_label(n) for n in numbers[:limit])
+    rest = len(numbers) - limit
+    if rest <= 0:
+        return shown
+    return _pick(_LISTED_MORE, language).format(shown=shown, rest=rest)
+
+
+#: What the CLIENT hears about the state of their own requirements. The operator's version
+#: (`ProductContext.health`) says "product module ready on clientorg/client-documentation —
+#: 4 requirements, 1 accepted — 0 errors, 1 warnings · 1 aviso(s) de configuração: the source repo
+#: does not declare docs_repo … in its .sdlc/project.yaml", and for months that string WAS the
+#: answer to "como estamos?" — the most-asked question on this surface. A repository slug, English
+#: prose, a file path and a warning count, every single day, to somebody who bought a product that
+#: needs no developer.
+#:
+#: Two audiences, two surfaces (ADR-0026) — the same split the requirement flow already makes. The
+#: operator's line keeps every diagnostic; this one carries the two facts a person who owns the
+#: product actually asked for: how much is written down, and how much of it is a promise.
+_CORPUS_STATE = {
+    "pt-BR": ("Sobre o produto em si: **{n}** requisito{s} escrito{s}, "
+              "**{promises}** valendo como promessa."),
+    "en": ("On the product itself: **{n}** requirement{s} written down, **{promises}** counting "
+           "as a promise."),
+}
+_CORPUS_EMPTY = {
+    "pt-BR": "Sobre o produto em si, ainda não há nada escrito — é por onde eu começo.",
+    "en": "On the product itself, nothing is written yet — that is where I start.",
+}
+_CORPUS_UNREADABLE = {
+    "pt-BR": ("Não estou conseguindo abrir o que já foi escrito sobre o produto agora, então não "
+              "vou dizer números que eu não conferi. O time já foi avisado."),
+    "en": ("I cannot open what has been written about the product right now, so I will not quote "
+           "numbers I have not checked. The team has been told."),
+}
+
+
+def corpus_state(*, available: bool, requirements: int, promises: int,
+                 language: str | None = None) -> str:
+    """The state of the written product, in the words of somebody who owns it.
+
+    NUMBERS ONLY WHEN THEY WERE READ. An unreadable base answers with the limitation and not with
+    a zero — "nada escrito" and "não consegui abrir" are opposite facts, and one of them would have
+    a client believing their requirements are gone.
+    """
+    if not available:
+        return _pick(_CORPUS_UNREADABLE, language)
+    if not requirements:
+        return _pick(_CORPUS_EMPTY, language)
+    return _pick(_CORPUS_STATE, language).format(
+        n=requirements, s="s" if requirements != 1 else "", promises=promises)
+
+
+def situation(readiness, *, requirements: int = 0, previous_backlog: int | None = None,
+              language: str | None = None) -> str:
+    """Where things stand, in one paragraph, led by whichever fact costs something.
+
+    An idle factory beside ready work is stated first and in those terms, because it is the only
+    line here that is losing money while it is read."""
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    w = _SITUATION.get(lang, _SITUATION["en"])
+    backlog = len(readiness.ready) + len(readiness.needs_refinement)
+
+    if readiness.wasting_capacity:
+        out = w["idle_ready"].format(ready=len(readiness.ready))
+    elif readiness.blocked_by_refinement:
+        out = w["idle_blocked"].format(backlog=backlog,
+                                       items=_listed(readiness.needs_refinement,
+                                                     language=language))
+    elif readiness.idle:
+        out = w["quiet"]
+    else:
+        out = w["busy"].format(running=readiness.in_progress, todo=len(readiness.todo))
+
+    if readiness.needs_refinement and not readiness.blocked_by_refinement:
+        out += w["refine"].format(n=len(readiness.needs_refinement),
+                                  items=_listed(readiness.needs_refinement, language=language))
+    if previous_backlog is not None and previous_backlog != backlog:
+        grew, shrank = _TREND_WORD.get(lang, _TREND_WORD["en"])
+        delta = backlog - previous_backlog
+        out += w["trend"].format(dir=grew if delta > 0 else shrank, n=abs(delta))
+    out += w["corpus"].format(n=requirements) if requirements else w["corpus_none"]
+    return out
+
+
+#: Words that assert a write ALREADY happened. The role has no way to know: the write runs on a
+#: path it never observes, only after an authorised person confirms. When one of these appears in a
+#: reply that wrote nothing, somebody is being told a record exists when it does not.
+#:
+#: DERIVED FROM THIS MODULE'S OWN SUCCESS SENTENCES, not from a list somebody imagined. The first
+#: version was invented and therefore missed "Anotado" — the exact word `fact_noted` uses when a
+#: glossary write really succeeded — along with "Coloquei na fila" (`queued`) and "Filei". An
+#: agent echoing the platform's own confirmation was the likeliest false claim of all, and it was
+#: the one the detector could not see. `test_every_success_sentence_is_detected` now derives the
+#: coverage from the real phrases, so the vocabulary cannot fall behind them again.
+#: `abri`/`abrimos`/`aberto` ARE NOT HERE, and their absence is a measurement rather than an
+#: oversight. They were meant for "I opened an issue" — but in this role's actual vocabulary the
+#: verb overwhelmingly means opening a FILE TO READ, which is the behaviour the prompt asks for on
+#: every turn: *"Abri o requisito 3 e o código que ele cita"* fired this detector on 2026-07-31,
+#: describing a read. No success sentence in this module uses them, so nothing is lost by their
+#: going; keeping them cost a false alarm on the most desirable sentence she writes.
+#:
+#: `escrito`/`escrita` LEFT FOR THE SAME REASON `abri` DID, and it is a measurement rather than a
+#: preference. They were meant for "I wrote it down" — but in THIS role's vocabulary the word
+#: describes whether a REQUIREMENT EXISTS ON PAPER, which is the subject she talks about all day.
+#: Her first substantial reply to the client (2026-08-01) fired the detector three times on
+#: sentences that assert the opposite of a write:
+#:
+#:     "É a única promessa escrita deste produto hoje"
+#:     "nenhum outro assunto está escrito"
+#:     "Faixas 2 a 5 continuam sem uma linha escrita"     ← says nothing is written
+#:
+#: The first-person forms stay: `escrevi`/`escrevemos` ARE claims about this turn, and no sentence
+#: about a document's existence uses them. A detector that fires on the most ordinary noun of the
+#: domain it watches stops being read, which costs more than the true positives it would catch.
+_CLAIMED_DONE = re.compile(
+    r"\b(registrado|registrada|registrei|registramos|gravado|gravada|gravei|"
+    r"anotado|anotada|anotei|anotamos|escrevi|escrevemos|"
+    r"criado|criada|criei|criamos|"
+    r"fechado|fechados|fechada|fechei|fechamos|movido|movi|movemos|arquivado|"
+    r"encerrado|encerrada|encerrei|encerramos|alinhado|alinhada|alinhei|alinhamos|"
+    r"corrigido|corrigida|corrigi|corrigimos|"
+    r"filei|filado|coloquei|colocamos|inclu[ií]|inclu[ií]do|"
+    # `wrote` and not `written`, for the reason the pt-BR side lost `escrito`: the participle is
+    # what an English sentence about a document's existence uses ("nothing else is written"), and
+    # the first person is only ever a claim about this turn.
+    # `registered` and `noted` FROM THE ENGLISH SUCCESS SENTENCES, like the pt-BR side's
+    # `registrado`/`anotado` (#429): `_DEFECT_FILED` says "Registered", `fact_noted` "Noted", and an
+    # English reply echoing them about a write nobody made was the claim nobody caught
+    r"filed|recorded|registered|noted|created|closed|queued|logged|wrote|corrected)\b",
+    re.IGNORECASE)
+
+
+#: An explicit statement, in the same message, that nothing was written. A text that says "I said
+#: it was registered — it was not" does NOT assert a write; it denies one. Detecting the claim word
+#: and ignoring the denial around it is how the platform came to contradict a CORRECT
+#: self-correction: Nina wrote "corrijo o que escrevi: eu disse 'Registrado o Requisito 1'. Não foi.
+#: Eu não vejo o resultado de escrita nenhuma" — and the platform appended "nada foi gravado; o
+#: texto acima diz o contrário, e está errado" underneath. The text did not say the contrary. Being
+#: corrected while right is worse than not being corrected: it teaches the reader to distrust both
+#: voices, and it punishes the exact behaviour the rule exists to produce.
+#:
+#: TWO KINDS OF SENTENCE WERE IN ONE LIST, and that was the defect. A RETRACTION refers BACK — it
+#: exists to stop a reader believing a specific write happened, so it speaks for everything around
+#: it. A statement that she CANNOT OBSERVE something refers to nothing but itself; the role adopted
+#: "não vejo o resultado" as a habitual and correct formula in nearly every message, and treating
+#: it as a retraction switched the detector off for the whole conversation. On 2026-07-31 she wrote
+#: "Registrado o pedido junto ao time" about a request that exists nowhere and nothing said a word,
+#: because the same message carried the formula: a true positive swallowed by the guard against
+#: false ones.
+#:
+#: So they are separated, and they excuse different amounts of text (`claims_a_write`).
+_RETRACTS_WRITE = re.compile(
+    r"(n[ãa]o foi\b|n[ãa]o foram\b|nada foi (gravado|registrado|escrito)|"
+    r"n[ãa]o (existe|existem) (nada|nenhum)|"
+    r"n[ãa]o (est[áa]|estão) registrad|n[ãa]o (foi|foram) registrad|"
+    r"corrijo o que|me corrijo|nada daquela mensagem existe|"
+    r"nothing was (recorded|written)|was not (recorded|written))",
+    re.IGNORECASE)
+
+#: "I cannot see the outcome" — honest, asked for by the prompt, and NOT a denial that anything
+#: happened. It is kept only because the sentence trips the claim detector on its own ("escrita" is
+#: both the noun and the participle), and flagging her for saying it would punish the behaviour the
+#: rule exists to produce. It therefore excuses ITS OWN SENTENCE and nothing further.
+#: IN EVERY LANGUAGE THE ROLE ANSWERS IN (#429): an English reply saying it cannot see the outcome
+#: tripped the detector the Portuguese formula was excused from.
+_CANNOT_OBSERVE = re.compile(r"n[ãa]o (vejo|consigo ver|posso ver) o resultado"
+                             r"|\bI (cannot|can't|can not|do not|don't) see the (result|outcome)",
+                             re.IGNORECASE)
+
+
+def claims_a_write(text: str) -> str:
+    """The claim-of-completion found in `text`, or "".
+
+    A function over TEXT, not a method on the module: what it inspects is a sentence, and putting it
+    on the module made every test double have to know about it.
+
+    Detection, not correction. Rewriting the agent's words would put the platform in the business of
+    editing what it said, and a wrong edit is worse than a flagged sentence. What shipped was worse
+    than both: a confirmation went unrecognised, nothing was written, and the reply announced five
+    registered requirements to somebody who believed it.
+    """
+    body = text or ""
+    if not _CLAIMED_DONE.search(body):
+        return ""
+    # EACH KIND OF DENIAL EXCUSES WHAT IT SPEAKS FOR, AND NOT THE WHOLE MESSAGE.
+    #
+    # A retraction speaks for its PARAGRAPH: "eu disse 'Registrado o Requisito 1'. Não foi." is one
+    # thought, written together, and the claim it retracts is the sentence beside it. Tested
+    # against the whole message it also excused every UNRELATED claim above it — one honest
+    # correction at the bottom licensing anything asserted at the top.
+    #
+    # "Não vejo o resultado" speaks for its SENTENCE only. It refers to nothing before it, and the
+    # single reason it is consulted at all is that the phrase trips the claim detector on itself.
+    #
+    # The paragraph is a boundary the ROLE puts in the text; the sentence split is coarse on
+    # purpose — it only has to keep one clause from vouching for the next.
+    for para in re.split(r"\n\s*\n", body):
+        if not _CLAIMED_DONE.search(para):
+            continue
+        if _RETRACTS_WRITE.search(para):
+            log.info("a claim-of-completion appeared inside an explicit retraction — not "
+                     "correcting: %s", para[:120])
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+|\n", para):
+            m = _CLAIMED_DONE.search(sentence)
+            if m and not _CANNOT_OBSERVE.search(sentence):
+                return m.group(0)
+    return ""
+
+
+#: The platform's correction when a reply claims a write that did not happen. Appended, never a
+#: replacement: editing what the agent said would hide the disagreement, and the disagreement is
+#: exactly what a reader needs to see. Two versions, because "confirm and I record it" is only
+#: useful advice when there is something staged to confirm.
+#: What a click finds when the proposal is no longer there, or is no longer the same one. FOUR
+#: distinct facts, four distinct sentences: a stale button, an EXPIRED proposal, a replaced
+#: proposal and a rejection are different things, and one message for several would leave the
+#: reader unable to tell which happened — the "two facts sharing one value" class this codebase
+#: has paid for four times. And none of them may name machinery: "o worker reiniciou" told a
+#: client about a process they never knew existed.
+_CLICK_GONE = {
+    "pt-BR": ("Esse pedido de confirmação já não está de pé — ou já foi resolvido, ou eu o perdi "
+              "ao recomeçar. Se ainda quiser, me peça de novo que eu preparo outra proposta."),
+    "en": ("That confirmation is no longer open — either it was already dealt with, or I lost it "
+           "on a fresh start. If you still want it, ask me again and I'll prepare another."),
+}
+_PROPOSAL_EXPIRED = {
+    "pt-BR": ("Aquela proposta esperou confirmação por tempo demais e expirou — descartei para "
+              "ninguém confirmar um texto que já não lembra de ter lido. Se ainda quiser, me peça "
+              "de novo que eu preparo outra."),
+    "en": ("That proposal waited too long for a confirmation and expired — I dropped it so nobody "
+           "confirms a text they no longer remember reading. If you still want it, ask me again "
+           "and I'll prepare another."),
+}
+#: A confirmation that finds its proposal ALREADY BEING consumed — the same yes arriving twice
+#: (a click and a typed "sim", or two people at once). The first one is doing the work; this one
+#: must neither write again nor pretend to have.
+_ALREADY_HANDLED = {
+    "pt-BR": "Essa confirmação já está sendo registrada — um instante.",
+    "en": "That confirmation is already being recorded — one moment.",
+}
+_CLICK_REPLACED = {
+    "pt-BR": ("Não confirmei: o que está preparado agora é diferente do que estava neste botão. "
+              "Não vou registrar em seu nome algo que você não leu — me peça a proposta atual."),
+    "en": ("Not confirmed: what is staged now differs from what this button was posted for. I will "
+           "not record something in your name that you did not read — ask me for the current one."),
+}
+_CLICK_REJECTED = {
+    "pt-BR": "Certo, descartei a proposta. Nada foi registrado.",
+    "en": "Right, I've dropped the proposal. Nothing was recorded.",
+}
+
+
+def proposal_gone(*, language: str | None = None) -> str:
+    return _pick(_CLICK_GONE, language)
+
+
+def proposal_expired(*, language: str | None = None) -> str:
+    return _pick(_PROPOSAL_EXPIRED, language)
+
+
+def proposal_already_handled(*, language: str | None = None) -> str:
+    return _pick(_ALREADY_HANDLED, language)
+
+
+def proposal_replaced(*, language: str | None = None) -> str:
+    return _pick(_CLICK_REPLACED, language)
+
+
+def proposal_rejected(*, language: str | None = None) -> str:
+    return _pick(_CLICK_REJECTED, language)
+
+
+#: The button labels. Short, unambiguous, and in the reader's language — a button reading "OK" next
+#: to one reading "Cancel" is where people click the wrong one.
+_CONFIRM_LABELS = {
+    "pt-BR": ("Confirmar e registrar", "Não registrar"),
+    "en": ("Confirm and record", "Do not record"),
+}
+
+
+def confirm_labels(*, language: str | None = None) -> tuple[str, str]:
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    return _CONFIRM_LABELS.get(lang) or _CONFIRM_LABELS[DEFAULT_LANGUAGE]
+
+
+#: Added to a proposal posted WITH buttons. It exists because of a dependency I cannot verify from
+#: here: a click only reaches the worker when the Slack app has Interactivity enabled. If it is off,
+#: the button post still succeeds — so the prose fallback would not be sent and the proposal would
+#: wait for a click that can never arrive. One line keeps the typed path alive regardless, which is
+#: cheaper than a runbook step somebody has to remember.
+_OR_JUST_REPLY = {
+    "pt-BR": "_(ou responda confirmando, se preferir — funciona igual.)_",
+    "en": "_(or just reply confirming, if you prefer — it works the same.)_",
+}
+
+
+def or_just_reply(*, language: str | None = None) -> str:
+    return _pick(_OR_JUST_REPLY, language)
+
+
+#: What a raw failure detail looks like when it is diagnostics rather than an explanation a client
+#: can act on. `WriteResult.detail` serves TWO audiences — the team's log and the client's channel —
+#: which is the "two facts sharing one value" class this codebase has paid for repeatedly. Rather
+#: than split the field everywhere, the CHANNEL decides what a client may read, and anything bearing
+#: these marks is replaced with a sentence and kept in the log.
+#: TWO KINDS OF THING A CLIENT MUST NOT READ, and the first version only knew one. It was built
+#: from EXCEPTION SHAPES (`fatal:`, a traceback, an HTTP code) and therefore sailed past a perfectly
+#: calm English sentence: "the branch req/0001-… was pushed but the pull request could not be
+#: opened; open it by hand against main". No exception in it — just the exact delivery vocabulary
+#: AUDIENCE_RULES forbids, plus an instruction the person cannot carry out.
+#:
+#: The forbidden words were already written down, in the rules the model reads. Two lists of "what
+#: a client must not see" that did not know about each other is the same shape as every other defect
+#: in this file's history; this one is now derived from both.
+_DIAGNOSTIC = re.compile(
+    r"(fatal:|stderr|traceback|https?://|refs/|\.git\b|"
+    r"[\w-]+/[\w./-]+\.(py|ya?ml|md|json|txt)|"      # any path-with-extension, not just absolute
+    r"HTTP \d{3}|exit status|gh: |remote:|error:|Exception|Traceback|"
+    r"[A-Z][a-zA-Z]*Error\b|"
+    # the delivery vocabulary ADR-0026 hides — machinery the client never touches
+    r"\b(branch|pull request|merge request|commit|rebase|checkout|repositor(y|io|y)|"
+    r"stack trace|traceback)\b)",
+    re.IGNORECASE)
+
+_WRITE_FAILED = {
+    "pt-BR": ("Não consegui registrar isso agora — o problema é do meu lado, não do que você "
+              "escreveu. O time já foi avisado com o detalhe técnico. Pode me pedir de novo daqui "
+              "a pouco."),
+    "en": ("I couldn't record that just now — the problem is on my side, not with what you wrote. "
+           "The team has the technical detail. Ask me again shortly."),
+}
+
+
+def client_safe_detail(detail: str, *, language: str | None = None) -> tuple[str, str]:
+    """`(what the client reads, what the log keeps)`.
+
+    Returns the detail unchanged when it is an explanation somebody can act on ("já tenho isto
+    anotado sobre 'erp'"), and swaps it for a plain sentence when it is machinery — a branch name, a
+    repo slug, git stderr, a file path, an exception. The second element is always the original, so
+    the diagnosis is never lost, only relocated to where it belongs.
+    """
+    raw = (detail or "").strip()
+    if not raw or not _DIAGNOSTIC.search(raw):
+        return raw, ""
+    return _pick(_WRITE_FAILED, language), raw
+
+
+#: Accepting is the single most consequential act on this surface: after it the factory ARGUES FROM
+#: the statement. So the confirmation names what changes, in the client's terms, rather than saying
+#: "status updated" — nobody confirms a field.
+_ACCEPT_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: dar o *requisito {number}: {title}* como **acordado** "
+              "significa que ele passa a valer como promessa — a partir daí, se o produto fizer "
+              "diferente disso, eu trato como defeito e não como pedido novo.\n\n"
+              "Confirma?"),
+    "en": ("To confirm first: marking *requirement {number}: {title}* as **agreed** makes it a "
+           "promise — from then on, if the product behaves differently I treat that as a defect "
+           "rather than a new request.\n\nConfirm?"),
+}
+_ACCEPTED = {
+    "pt-BR": ("Acordado. O *requisito {number}* passa a valer como promessa, e fica registrado que "
+              "foi você quem acordou e quando."),
+    "en": ("Agreed. *Requirement {number}* now counts as a promise, recorded with who agreed and "
+           "when."),
+}
+
+
+#: Abandoning. TWO TEXTS, because the two cases are not the same size. Dropping a text nobody agreed
+#: to costs nothing — it was a draft. Dropping an ACCEPTED requirement takes a promise back, and the
+#: person confirming it has to be told exactly that, in the same terms the acceptance used ("a
+#: fábrica passa a defender isso" → "deixa de defender"), or the two acts would read alike while
+#: being opposites.
+_DROP_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: dar o *requisito {number}: {title}* como **abandonado** "
+              "quer dizer que ele sai do que o produto se propõe a fazer. O texto continua "
+              "guardado e legível — fica registrado que foi decidido não fazer, por quem e "
+              "quando — mas eu paro de tratá-lo como algo a cumprir.\n\nConfirma?"),
+    "en": ("To confirm first: marking *requirement {number}: {title}* as **dropped** takes it out "
+           "of what the product sets out to do. The text stays stored and readable — it records "
+           "that this was decided against, by whom and when — but I stop treating it as something "
+           "to deliver.\n\nConfirm?"),
+}
+_DROP_CONFIRM_PROMISE = {
+    "pt-BR": ("Só para confirmar antes, e este é o caso mais sério: o *requisito {number}: "
+              "{title}* está **acordado**, ou seja, hoje ele vale como promessa e a fábrica o "
+              "defende — se o produto fizer diferente, eu trato como defeito.\n\nDar como "
+              "abandonado **desfaz isso**: eu deixo de defendê-lo, e um comportamento que hoje "
+              "seria defeito passa a ser só como o produto é. O texto e o registro de quem "
+              "acordou continuam guardados.\n\nCards já abertos a partir dele não se fecham "
+              "sozinhos — quem encerra card é uma pessoa; posso listar quais são se quiser."
+              "\n\nConfirma?"),
+    "en": ("To confirm first, and this is the serious case: *requirement {number}: {title}* is "
+           "**agreed** — today it counts as a promise and the factory defends it; behaviour that "
+           "differs is treated as a defect.\n\nDropping it **undoes that**: I stop defending it, "
+           "and what would be a defect today becomes simply how the product is. The text and the "
+           "record of who agreed stay stored.\n\nCards already opened from it do not close "
+           "themselves — a person closes cards; I can list them if you want.\n\nConfirm?"),
+}
+_DROPPED = {
+    "pt-BR": ("Registrado: o *requisito {number}* fica como abandonado, com o seu nome e a data. "
+              "Ele sai do que eu cobro e do que eu defendo — o texto continua guardado, e se um "
+              "dia voltar a fazer sentido é só me pedir que eu proponho de novo."),
+    "en": ("Recorded: *requirement {number}* is now dropped, with your name and the date. It "
+           "leaves what I chase and what I defend — the text stays stored, and if it ever makes "
+           "sense again just ask and I'll propose it afresh."),
+}
+_DROPPED_PROMISE = {
+    "pt-BR": ("Registrado: o *requisito {number}* deixa de valer como promessa, com o seu nome e "
+              "a data de quem decidiu. A partir de agora eu não o defendo mais — o que antes eu "
+              "trataria como defeito passa a ser só como o produto é. O texto e o registro de "
+              "quem tinha acordado continuam guardados."),
+    "en": ("Recorded: *requirement {number}* no longer counts as a promise, with your name and "
+           "the date. From now on I do not defend it — what I would have treated as a defect is "
+           "simply how the product is. The text and the record of who had agreed stay stored."),
+}
+
+
+#: THE REASON A DROP IS WRITTEN WITH, SHOWN BEFORE THE YES (#565). It goes on the record in the
+#: person's name and is read back months later, and the role carries it from their words into the
+#: marker — so what they confirm is the sentence that will be written, as a decision's
+#: confirmation shows its own.
+_DROP_REASON = {
+    "pt-BR": "O motivo fica registrado assim, em seu nome:\n\n> {reason}",
+    "en": "The reason is recorded as this, in your name:\n\n> {reason}",
+}
+
+
+def drop_confirmation(*, number: int, title: str, was_a_promise: bool = False,
+                      reason: str = "", language: str | None = None) -> str:
+    catalogue = _DROP_CONFIRM_PROMISE if was_a_promise else _DROP_CONFIRM
+    text = _pick(catalogue, language).format(number=number, title=title)
+    if not reason.strip():
+        return text
+    body, question = text.rsplit("\n\n", 1)
+    return f"{body}\n\n{_pick(_DROP_REASON, language).format(reason=reason.strip())}\n\n{question}"
+
+
+#: TWO ACTS IN ONE REPLY, ONE STAGED (#565): the conversation holds one entry for a yes, and a
+#: person who asked for both would otherwise believe the second was on its way.
+_ONE_ACT_AT_A_TIME = {
+    "pt-BR": ("Um de cada vez: só o primeiro está preparado para a sua resposta abaixo — me peça o "
+              "outro depois de responder."),
+    "en": ("One at a time: only the first is prepared for your answer below — ask me for the "
+           "other once you have answered."),
+}
+
+
+def one_act_at_a_time(*, language: str | None = None) -> str:
+    return _pick(_ONE_ACT_AT_A_TIME, language)
+
+
+#: A REQUIREMENT IS NOT PROPOSED WHILE ITS TEXT WAITS ON AN ANSWER (#670). The drafter names what
+#: must be answered before the text can be written (`RequirementDraft.ask_first`): nothing is
+#: staged, and the person reads that the proposal comes after their answer — with every question
+#: the role's reply above them has not already asked.
+_ASKED_FIRST = {
+    "pt-BR": ("Ainda não escrevi a proposta: ela depende da sua resposta. Quando você responder, "
+              "eu escrevo o texto e mostro para você confirmar."),
+    "en": ("I have not written the proposal yet: it depends on your answer. Once you answer, I "
+           "write the text and show it to you to confirm."),
+}
+_ASKED_FIRST_LISTED = {"pt-BR": "Preciso saber:", "en": "I need to know:"}
+#: …AND WHAT A STAGED PROPOSAL LEAVES OPEN IS SAID TO BE ANSWERABLE AFTER IT (#670). The role
+#: wrote "I need two answers before I close the text" above a proposal that had already chosen
+#: them for the person; what the draft leaves open is now said under it, as open.
+_STILL_OPEN = {
+    "pt-BR": "Fica em aberto, e dá para responder depois de ver o texto:\n{items}",
+    "en": "Still open, and you can answer it after reading the text:\n{items}",
+}
+
+
+def asked_first(*, questions: list[str], language: str | None = None) -> str:
+    """Why no proposal follows the role's reply yet, and what must be answered first that the
+    reply has not asked — `questions`, none when it asked them all (#670)."""
+    said = _pick(_ASKED_FIRST, language)
+    if not questions:
+        return said
+    items = "\n".join(f"{n}. {q}" for n, q in enumerate(questions, 1))
+    return f"{_pick(_ASKED_FIRST_LISTED, language)}\n{items}\n\n{said}"
+
+
+def still_open(*, questions: list[str], language: str | None = None) -> str:
+    """What a staged requirement leaves open, said as answerable after the text — "" for none."""
+    if not questions:
+        return ""
+    return "\n\n" + _pick(_STILL_OPEN, language).format(
+        items="\n".join(f"• {q}" for q in questions))
+
+
+def dropped(*, number: int, was_a_promise: bool = False, language: str | None = None,
+            agent_name: str = "") -> str:
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    catalogue = _DROPPED_PROMISE if was_a_promise else _DROPPED
+    return sig + _pick(catalogue, language).format(number=number)
+
+
+def accept_confirmation(*, number: int, title: str, language: str | None = None) -> str:
+    return _pick(_ACCEPT_CONFIRM, language).format(number=number, title=title)
+
+
+#: Recording a decision taken AFTER the text was written. The confirmation SHOWS THE SENTENCE that
+#: will be written, verbatim, because this act's whole value is that somebody reads the same words
+#: in three months — and a paraphrase approved today is a paraphrase found then. It also says
+#: plainly that this does not change the promise: a person who confirms a decision believing they
+#: amended the requirement has agreed to something they did not mean.
+_DECISION_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: vou gravar isto no *requisito {number}*, no registro de "
+              "decisões do próprio documento — com a data e o seu nome:\n\n> {decision}\n\n"
+              "Isso **não muda o que o requisito promete**; fica registrado como uma decisão "
+              "tomada pelo caminho, para quem abrir o documento daqui a três meses saber de onde "
+              "veio.\n\nConfirma?"),
+    "en": ("To confirm first: I will write this into *requirement {number}*, in the document's own "
+           "decision register — with today's date and your name:\n\n> {decision}\n\nThis **does "
+           "not change what the requirement promises**; it records a decision taken along the way, "
+           "so whoever opens the document in three months knows where it came from.\n\nConfirm?"),
+}
+_DECISION_RECORDED = {
+    "pt-BR": ("Registrado no *requisito {number}*, no documento — data, quem decidiu e de onde "
+              "veio. Quem abrir o requisito vê a decisão junto com o texto que ela ajusta."),
+    "en": ("Recorded in *requirement {number}*, in the document — the date, who decided and where "
+           "it came from. Whoever opens the requirement sees the decision beside the text it "
+           "adjusts."),
+}
+_DECISION_ALREADY = {
+    "pt-BR": ("Essa decisão já estava registrada hoje no *requisito {number}* — não gravei de "
+              "novo, para o registro não fazer um ato parecer dois."),
+    "en": ("That decision was already recorded today on *requirement {number}* — I did not write "
+           "it twice, so the register does not make one act look like two."),
+}
+
+
+def decision_confirmation(*, number: int, decision: str, language: str | None = None) -> str:
+    return _pick(_DECISION_CONFIRM, language).format(number=number, decision=decision.strip())
+
+
+def decision_recorded(*, number: int, existed: bool = False, language: str | None = None,
+                      agent_name: str = "") -> str:
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    catalogue = _DECISION_ALREADY if existed else _DECISION_RECORDED
+    return sig + _pick(catalogue, language).format(number=number)
+
+
+def accepted(*, number: int, language: str | None = None, agent_name: str = "") -> str:
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    return sig + _pick(_ACCEPTED, language).format(number=number)
+
+
+#: An acceptance that files NO work, because what was agreed to is already built (#182). A baseline
+#: pass writes what the product does today as entries awaiting a yes; confirming one used to run
+#: the same second act as any acceptance and ask the role to break built behaviour into tasks.
+#:
+#: THREE THINGS, IN THIS ORDER, and each is there because its absence was a way to misread the
+#: answer. WHY nothing was filed — or "no work" reads as the breakdown having failed, which is the
+#: sentence this one replaces on that path. WHAT the yes did do — or an acceptance that files
+#: nothing reads as an acceptance that did nothing. And the WAY THROUGH for the one case the file
+#: cannot show: a text somebody edited into more than the product does, which only a person knows.
+#:
+#: DOOR-AGNOSTIC ON PURPOSE. The conversation, the product page and the command line all say this
+#: sentence; "ask for it to be broken into tasks" is true of the chat gesture, the page's button
+#: and the CLI verb alike, where "ask me" would be a lie on the two surfaces with nobody to ask.
+_NOTHING_TO_BUILD = {
+    "pt-BR": ("O *requisito {number}* descreve o que o produto já faz hoje — foi lido do código, "
+              "não pedido por alguém — então não há o que construir e nenhuma tarefa foi aberta. "
+              "A partir de agora eu o defendo: se o produto passar a fazer diferente, trato como "
+              "defeito. Se o texto foi mudado para algo que o produto ainda não faz, peça para "
+              "quebrar o requisito {number} em tarefas e esse trabalho é aberto."),
+    "en": ("*Requirement {number}* describes what the product already does — it was read from the "
+           "code, not asked for — so there is nothing to build and no work was filed. From now on "
+           "I defend it: if the product starts doing otherwise, I treat that as a defect. If its "
+           "text was changed into something the product does not do yet, ask for requirement "
+           "{number} to be broken into tasks and that work is filed."),
+}
+
+
+def nothing_to_build(*, number: int, language: str | None = None) -> str:
+    """Why an agreed requirement got no work, what the agreement did instead, and the way through
+    when the text says more than the code — see `_NOTHING_TO_BUILD`."""
+    return _pick(_NOTHING_TO_BUILD, language).format(number=number)
+
+
+#: A PRODUCT THAT STARTED BEFORE ITS CODE (#992): its requirements are written and agreed, and
+#: breaking one into tasks waits for the code repository the cards are worked in. Said by every door
+#: into a breakdown — the conversation, the product page, the command line — so it names no gesture
+#: of one surface: the way through is the operator's (the product's first source) and then the
+#: person's own request, which is the same words on all three.
+_WAITS_FOR_CODE = {
+    "pt-BR": ("Quebrar o *requisito {number}* em tarefas espera o código do produto, que ainda não "
+              "começou. Quando quem opera esta plataforma configurar onde o código vai ficar, peça "
+              "para quebrar o requisito {number} em tarefas."),
+    "en": ("Breaking *requirement {number}* into tasks waits for the product's code, which has not "
+           "started yet. Once whoever runs this platform sets up where the code lives, ask for "
+           "requirement {number} to be broken into tasks."),
+}
+
+#: …and what the conversation says when it has just written one: no card was opened for the second
+#: yes to be given on (ADR-0047 §2), so the yes is asked for on the requirement itself.
+_WRITTEN_BEFORE_CODE = {
+    "pt-BR": ("Ainda não há cartão para ele: o código do produto ainda não começou, então as "
+              "tarefas esperam por ele. O aceite não espera — diga sim e o requisito {number} fica "
+              "combinado agora."),
+    "en": ("There is no card for it yet: the product's code has not started, so its tasks wait "
+           "for it. Its acceptance does not wait — say yes and requirement {number} is agreed "
+           "now."),
+}
+
+
+def breakdown_waits_for_code(*, number: int, language: str | None = None) -> str:
+    """Why an agreed requirement got no cards on a product that started before its code, and the
+    way through — see `_WAITS_FOR_CODE`."""
+    return _pick(_WAITS_FOR_CODE, language).format(number=number)
+
+
+def written_before_code(*, number: int, language: str | None = None) -> str:
+    """What follows a written requirement on a product with no code repository yet — see
+    `_WRITTEN_BEFORE_CODE`."""
+    return _pick(_WRITTEN_BEFORE_CODE, language).format(number=number)
+
+
+#: A BREAKDOWN THE CONVERSATION STARTED, AND DOES NOT WAIT ON (#563 slice 18b, ADR-0051 D18). It
+#: drafts for minutes, so the reply says it began and where its cards will be said; the workflow
+#: tells this conversation what was filed when it ends. One already running is news, never "nothing
+#: was filed" (item 2): its cards are on the board when it ends, said wherever it was started.
+_BREAKDOWN_BEGUN = {
+    "pt-BR": ("Comecei a quebrar o requisito {number} em tarefas. Leva alguns minutos; quando "
+              "terminar, digo aqui o que virou card."),
+    "en": ("I started breaking requirement {number} into tasks. It takes a few minutes; when it "
+           "ends, I will say here what became a card."),
+}
+_BREAKDOWN_ALREADY_RUNNING = {
+    "pt-BR": ("O requisito {number} já está sendo quebrado em tarefas, então não comecei outra "
+              "quebra: os cards aparecem no quadro quando ela terminar."),
+    "en": ("Requirement {number} is already being broken into tasks, so I did not start another "
+           "breakdown: its cards will be on the board when it ends."),
+}
+#: The engine that runs a breakdown did not answer the start: nothing was filed, and asking again
+#: is the way through. Said to a person who asked; an acceptance says its own (`confirm._SAID`).
+_BREAKDOWN_NOT_BEGUN = {
+    "pt-BR": ("Não consegui começar a quebrar o requisito {number} em tarefas: o serviço que faz "
+              "a quebra não respondeu, e nada foi registrado. É só pedir de novo."),
+    "en": ("I could not start breaking requirement {number} into tasks: the service that does it "
+           "did not answer, and nothing was filed. Just ask again."),
+}
+
+
+def breakdown_begun(*, number: int, running: bool = False, language: str | None = None) -> str:
+    """The reply to a breakdown the conversation started — or found already running."""
+    return _pick(_BREAKDOWN_ALREADY_RUNNING if running else _BREAKDOWN_BEGUN,
+                 language).format(number=number)
+
+
+#: THE BREAKDOWN, ASKED BEFORE IT IS STARTED (#565 slice c): it wrote on the match alone, and a
+#: person could not know which words reached it. What a yes does, in their terms.
+_BREAKDOWN_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: quebro o *requisito {number}: {title}* em tarefas? Um "
+              "agente lê o requisito e registra os cards dele onde o trabalho novo espera — o que "
+              "já existe não é registrado duas vezes, e começar qualquer um deles continua sendo "
+              "decisão de uma pessoa.\n\nConfirma?"),
+    "en": ("To confirm first: shall I break *requirement {number}: {title}* into tasks? An agent "
+           "reads it and files its cards where new work waits — what already exists is not filed "
+           "twice, and starting any of them is still a person's decision.\n\nConfirm?"),
+}
+#: REFINE, ASKED BEFORE IT WRITES (#565 slice c) — the one act that edited a client's card with no
+#: yes in between. It writes only where nothing is written, which the question says.
+_REFINE_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: escrevo o que o *{number}* precisa cumprir para estar "
+              "pronto? Eu só escrevo onde ainda não há nada escrito — se já houver, não "
+              "mexo.\n\nConfirma?"),
+    "en": ("To confirm first: shall I write what *{number}* must meet to be done? I only write it "
+           "where nothing is written yet — if something is, I leave it alone.\n\nConfirm?"),
+}
+
+
+def breakdown_confirmation(*, number: int, title: str, language: str | None = None) -> str:
+    return _pick(_BREAKDOWN_CONFIRM, language).format(number=number, title=title)
+
+
+def refine_confirmation(*, number: str, language: str | None = None) -> str:
+    return _pick(_REFINE_CONFIRM, language).format(number=ref_label(number))
+
+
+def breakdown_not_begun(*, number: int, language: str | None = None) -> str:
+    return _pick(_BREAKDOWN_NOT_BEGUN, language).format(number=number)
+
+
+#: A BREAKDOWN THAT DID NOT FINISH (review of #619): it raised, its worker died, or its heartbeat
+#: stopped — and it may have filed some of its cards before that. "Nothing was filed" would be
+#: false then, so this says what is known: some may be on the board, and asking again does not file
+#: twice what is already there. After an acceptance, the agreement stands, and is said to.
+_BREAKDOWN_DID_NOT_FINISH = {
+    "pt-BR": ("A quebra do requisito {number} em tarefas não terminou. Alguns cards podem já estar "
+              "no quadro; se pedir a quebra de novo, o que já está lá não é registrado duas "
+              "vezes.{agreed}"),
+    "en": ("Breaking requirement {number} into tasks did not finish. Some cards may already be on "
+           "the board; if you ask for the breakdown again, what is already there is not filed "
+           "twice.{agreed}"),
+}
+_AGREEMENT_STANDS = {"pt-BR": " O acordo continua registrado.", "en": " The agreement stands."}
+
+
+def breakdown_did_not_finish(*, number: int, agreed: bool = False,
+                             language: str | None = None) -> str:
+    return _pick(_BREAKDOWN_DID_NOT_FINISH, language).format(
+        number=number, agreed=_pick(_AGREEMENT_STANDS, language) if agreed else "")
+
+
+#: A REQUESTED CARD FOR AN ACCEPTED REQUIREMENT, HELD (#563 slice 18c, ADR-0051 D18 item 4). The
+#: work of an accepted requirement is filed by its breakdown alone, so the card is not opened, and
+#: the sentence says what the requirement already has — and offers the breakdown when it has
+#: nothing, which the role proposes from whatever words ask for it (#565 slice c).
+_TICKET_HELD = {
+    "pt-BR": {
+        "head": "Não abri esse card: ele é do *requisito {number}*, que está acordado",
+        "running": ", e o requisito já está sendo quebrado em tarefas agora. Os cards dele "
+                   "aparecem no quadro quando a quebra terminar.",
+        "cards": ", e o trabalho dele já está nos cards {cards}. Se falta alguma coisa neles, me "
+                 "diga o que é.",
+        "offer": ". O trabalho de um requisito acordado entra pela quebra dele em tarefas: me "
+                 "peça para quebrá-lo e eu preparo a quebra para você confirmar.",
+    },
+    "en": {
+        "head": "I did not open that card: it belongs to *requirement {number}*, which is agreed",
+        "running": ", and the requirement is being broken into tasks right now. Its cards will be "
+                   "on the board when that ends.",
+        "cards": ", and its work is already in cards {cards}. If something is missing from them, "
+                 "tell me what.",
+        "offer": ". The work of an agreed requirement comes in through its breakdown: ask me to "
+                 "break it down and I will prepare it for you to confirm.",
+    },
+}
+
+
+def ticket_held_for_its_requirement(*, number: int, running: bool = False,
+                                    cards: list[str] | None = None,
+                                    language: str | None = None) -> str:
+    said = _pick(_TICKET_HELD, language)
+    tail = said["running"] if running else said["cards"] if cards else said["offer"]
+    return (said["head"] + tail).format(number=number, cards=", ".join(cards or []))
+
+
+def accepted_nothing_to_build(*, number: int, language: str | None = None,
+                              agent_name: str = "") -> str:
+    """The whole answer to accepting a reading of the code: the agreement, then why no work."""
+    return (accepted(number=number, language=language, agent_name=agent_name)
+            + "\n\n" + nothing_to_build(number=number, language=language))
+
+
+_REQUIREMENT_NOT_FOUND = {
+    "pt-BR": "não encontrei o requisito {number} escrito na base.",
+    "en": "I could not find requirement {number} written in our base.",
+}
+
+
+def requirement_not_found(*, number: int, language: str | None = None) -> str:
+    """Said by every gesture that names a requirement by number. One sentence rather than one per
+    branch: three hand-written copies is how the fourth one ends up saying something else."""
+    return _pick(_REQUIREMENT_NOT_FOUND, language).format(number=number)
+
+
+# ── the CARD acts: what happens on the board, not to what the product promises ──────────────────
+#
+# CLOSING A CARD IS NOT DROPPING A REQUIREMENT, and these texts exist mostly to keep the two from
+# reading alike. They are one sentence apart in a chat window and opposite in weight: dropping a
+# requirement takes back something the product promised and the factory defended; closing a card
+# takes one item off the list of work, changes no promise, and costs nothing to ask for again. A
+# person who confirms the wrong one of those has not made a small mistake.
+
+#: Closing with nothing surviving it: this will not be done as its own item.
+_CLOSE_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: encerrar o *{number}* tira esse item da lista de "
+              "trabalho — deixa de ser algo a fazer, e ninguém pega ele por engano.\n\n"
+              "Isso não mexe no que o produto promete: o que já foi acordado continua valendo do "
+              "mesmo jeito. E se um dia voltar a fazer sentido, é só me pedir que eu proponho de "
+              "novo.\n\nConfirma?"),
+    "en": ("To confirm first: closing *{number}* takes that item off the list of work — it stops "
+           "being something to do, and nobody picks it up by mistake.\n\nIt does not touch what "
+           "the product promises: whatever was agreed still stands. And if it ever makes sense "
+           "again, just ask and I'll propose it afresh.\n\nConfirm?"),
+}
+#: Closing because another card already carries the work. A DIFFERENT decision from the one above,
+#: and the difference is the whole point: nothing is being given up, the work moved.
+_CLOSE_CONFIRM_DUPLICATE = {
+    "pt-BR": ("Só para confirmar antes: o *{number}* e o *{other}* pedem a mesma coisa. "
+              "Encerrar o *{number}* deixa o *{other}* como o único lugar onde esse trabalho é "
+              "acompanhado — e eu escrevo nos dois qual foi a decisão, para quem procurar o "
+              "*{number}* depois achar para onde ele foi.\n\n"
+              "O trabalho não está sendo cancelado: ele continua no *{other}*. Nada do que o "
+              "produto promete muda com isso, e nada começa por causa disso — começar continua "
+              "sendo decisão de vocês.\n\nConfirma?"),
+    "en": ("To confirm first: *{number}* and *{other}* ask for the same thing. Closing "
+           "*{number}* leaves *{other}* as the only place this work is tracked — and I write the "
+           "decision on both, so whoever looks for *{number}* later finds where it went.\n\nThe "
+           "work is not being cancelled: it carries on in *{other}*. Nothing the product promises "
+           "changes, and nothing starts because of this — starting is still your call."
+           "\n\nConfirm?"),
+}
+#: WHAT THE CLOSING NOTE ACTUALLY HOLDS. `closing_note` writes who asked, and the reason only when
+#: somebody gave one — so the sentence that claimed "quem decidiu **e por quê**" over a note reading
+#: "fechado a pedido de <@U…>." was promising the client a record that did not exist. Whoever opened
+#: the card in six months found half of what they had been told was there.
+_CARD_CLOSED = {
+    "pt-BR": ("Encerrado o *{number}*. Deixei escrito nele quem pediu, para quem abrir depois "
+              "saber a quem perguntar."),
+    "en": ("Closed *{number}*. I wrote on it who asked, so whoever opens it later knows who to "
+           "ask."),
+}
+_CARD_CLOSED_REASONED = {
+    "pt-BR": ("Encerrado o *{number}*. Deixei escrito nele quem pediu e por quê, para quem abrir "
+              "depois não ficar adivinhando."),
+    "en": ("Closed *{number}*. I wrote on it who asked and why, so whoever opens it later is not "
+           "left guessing."),
+}
+_CARD_CLOSED_DUPLICATE = {
+    "pt-BR": ("Encerrado o *{number}* em favor do *{other}*. Escrevi nos dois: no que saiu, "
+              "para onde o assunto foi; no que fica, que ele responde pelos dois agora. Nada "
+              "começou por causa disso."),
+    "en": ("Closed *{number}* in favour of *{other}*. I wrote on both: on the one that went, "
+           "where the subject moved to; on the one that stays, that it now answers for both. "
+           "Nothing started because of this."),
+}
+#: The half-done link. The close landed and the note on the surviving card did not, and the sentence
+#: above would have told the client "escrevi nos dois" about writing that is not there — so whoever
+#: picks up the survivor works from half the conversation while believing it carries the whole. The
+#: module says what is missing; this only stops claiming the opposite.
+_CARD_CLOSED_UNLINKED = {
+    "pt-BR": ("Encerrado o *{number}* em favor do *{other}*. No *{number}* ficou escrito para "
+              "onde o assunto foi. Nada começou por causa disso."),
+    "en": ("Closed *{number}* in favour of *{other}*. *{number}* now says where the subject "
+           "went. Nothing started because of this."),
+}
+#: The reason, shown back BEFORE it is written. It goes onto the client's card in their name, so
+#: the person confirming has to have read it — a proposal is only a proposal for what it shows.
+_CLOSE_REASON_LINE = {
+    "pt-BR": "\n\nVou deixar escrito no cartão o motivo que você deu: «{reason}».",
+    "en": "\n\nI'll write the reason you gave on the card: “{reason}”.",
+}
+
+
+#: A CLOSE IN FAVOUR OF A CARD THAT DOES NOT CARRY EVERYTHING (#567). "They ask for the same
+#: thing" was said over two cards the role had compared by title, and the closed one was the only
+#: card carrying a requirement's first front. When the closed card states what the survivor does
+#: not, the yes is asked on that list, never on the claim that the two are the same.
+_CLOSE_CONFIRM_OVERLAP = {
+    "pt-BR": ("Só para confirmar antes: o *{number}* e o *{other}* se sobrepõem, mas não são "
+              "iguais — o *{number}* pede o que o *{other}* não pede:\n{items}\n\nSe encerrar o "
+              "*{number}*, isso sai da lista de trabalho; o *{other}* continua como está. Eu "
+              "escrevo nos dois qual foi a decisão. Nada do que o produto promete muda com isso."
+              "\n\nConfirma?"),
+    "en": ("To confirm first: *{number}* and *{other}* overlap, but they are not the same — "
+           "*{number}* asks for what *{other}* does not:\n{items}\n\nClosing *{number}* takes "
+           "that off the list of work; *{other}* stays as it is. I write the decision on both. "
+           "Nothing the product promises changes.\n\nConfirm?"),
+}
+_CLOSE_EXECUTES_ITEM = {
+    "pt-BR": "• ele executa o requisito {number}; o *{other}* não",
+    "en": "• it executes requirement {number}; *{other}* does not",
+}
+#: How every close question ends; the unread line goes before it.
+_CONFIRM_TAIL = {"pt-BR": "\n\nConfirma?", "en": "\n\nConfirm?"}
+#: The two cards could not be read to compare — said, so the person looks before the yes.
+_CLOSE_UNREAD_LINE = {
+    "pt-BR": ("\n\n(Não consegui ler os dois cartões agora para comparar o que cada um pede — "
+              "vale abrir os dois antes de confirmar.)"),
+    "en": ("\n\n(I could not read the two cards just now to compare what each asks for — worth "
+           "opening both before you confirm.)"),
+}
+
+
+#: THE CLOSED CARD STATES NOTHING TO COMPARE (review of #602): no criteria, and no requirement it
+#: executes. The comparison found nothing it carries because it could see nothing, and the
+#: sentence above it claims they ask for the same thing — so this says it was not compared.
+_CLOSE_UNSTATED_LINE = {
+    "pt-BR": ("\n\n(O *{number}* não tem critérios nem diz que requisito executa, então não deu "
+              "para comparar o que cada um pede — vale abrir os dois antes de confirmar.)"),
+    "en": ("\n\n(*{number}* has no criteria and names no requirement it executes, so what each "
+           "asks for could not be compared — worth opening both before you confirm.)"),
+}
+
+
+def close_confirmation(*, number: str, in_favour_of: str | None = None, reason: str = "",
+                       carried=None, unread: bool = False,
+                       language: str | None = None) -> str:
+    """The question a close is staged under. `carried` is what the closed card carries and
+    `in_favour_of` does not (`module.Carried`, #567): with anything in it, the yes is asked on that
+    list. `unread` says the two cards could not be compared."""
+    other = ref_label(in_favour_of)
+    if in_favour_of and carried:
+        items = [f"• {c}" for c in carried.criteria]
+        if carried.executes is not None:
+            items.append(_pick(_CLOSE_EXECUTES_ITEM, language).format(
+                number=carried.executes, other=other))
+        text = _pick(_CLOSE_CONFIRM_OVERLAP, language).format(
+            number=ref_label(number), other=other, items="\n".join(items))
+    else:
+        catalogue = _CLOSE_CONFIRM_DUPLICATE if in_favour_of else _CLOSE_CONFIRM
+        text = _pick(catalogue, language).format(number=ref_label(number), other=other)
+        if in_favour_of and unread:
+            text = text.removesuffix(_pick(_CONFIRM_TAIL, language)) \
+                + _pick(_CLOSE_UNREAD_LINE, language) + _pick(_CONFIRM_TAIL, language)
+        elif in_favour_of and carried is not None and not getattr(carried, "stated", True):
+            text = text.removesuffix(_pick(_CONFIRM_TAIL, language)) \
+                + _pick(_CLOSE_UNSTATED_LINE, language).format(number=ref_label(number)) \
+                + _pick(_CONFIRM_TAIL, language)
+    if reason.strip():
+        text += _pick(_CLOSE_REASON_LINE, language).format(reason=reason.strip())
+    return text
+
+
+def card_closed(*, number: str, in_favour_of: str | None = None, linked: bool = True,
+                reasoned: bool = False, language: str | None = None, agent_name: str = "") -> str:
+    """What the client reads after a card was closed — composed from what was actually written.
+
+    `linked` is False when the pointer on the surviving card could not be left, `reasoned` True when
+    a reason went onto the closed one. Both exist because the alternative is a sentence that
+    describes the happy path and is read out over every other one.
+    """
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    if in_favour_of:
+        catalogue = _CARD_CLOSED_DUPLICATE if linked else _CARD_CLOSED_UNLINKED
+    else:
+        catalogue = _CARD_CLOSED_REASONED if reasoned else _CARD_CLOSED
+    return sig + _pick(catalogue, language).format(number=ref_label(number),
+                                                   other=ref_label(in_favour_of))
+
+
+# ── what the role leaves written ON a card (#538) ───────────────────────────────────────────────
+#
+# A CARD BELONGS TO THE PROJECT, NOT TO A CONVERSATION. These are not said in the chat: they stay
+# on the card's own thread, where somebody reads them months later with no idea which conversation
+# asked — so they follow the PROJECT's language (`Project.language`), as `_CORRECTION_NOTE` and
+# `_CHANGE_ACCEPTED_NOTE` do. Until #538 the five of them were composed in `module.py` in
+# Portuguese, #513 having fixed only their `#`: an English project's card said "fechado a pedido
+# de …" about its own closing. `{sig}` is `signature`, `{ref}` a card named by `ref_label`.
+
+#: Who asked, AFTER "a pedido" — the preposition is the entry's, never the template's, because
+#: Portuguese contracts it with the article of what follows (the rule `_AGENDA_WHO` states): a
+#: person is "de U0ADMIN", and nobody named is the team, "do time". Composed as "de {who}" it read
+#: "a pedido de o time" on every close a caller made without an actor.
+_REQUESTED_BY = {
+    "pt-BR": {"person": "de {actor}", "nobody": "do time"},
+    "en": {"person": "of {actor}", "nobody": "of the team"},
+}
+
+
+def _requested_by(actor: str, language: str | None) -> str:
+    said = _pick(_REQUESTED_BY, language)
+    return said["person"].format(actor=actor) if actor else said["nobody"]
+
+
+#: What the closed card is left saying. Written for whoever opens it in six months and asks why the
+#: work disappeared — so it names the decision, the person, and, when it moved, where it went.
+_CLOSING_NOTE = {
+    "pt-BR": "{sig} Fechado a pedido {by}.",
+    "en": "{sig} Closed at the request {by}.",
+}
+_CLOSING_NOTE_IN_FAVOUR = {
+    "pt-BR": ("{sig} Fechado a pedido {by}, em favor do {ref}: o trabalho passa a ser "
+              "acompanhado lá."),
+    "en": ("{sig} Closed at the request {by}, in favour of {ref}: the work is followed there "
+           "now."),
+}
+#: The other half of the link. Without it the surviving card never learns it absorbed something,
+#: and whoever picks it up works from half the conversation.
+_SURVIVOR_NOTE = {
+    "pt-BR": ("{sig} O {ref} foi fechado em favor deste, a pedido {by}. Se havia algo escrito "
+              "lá que não está aqui, vale trazer antes de começar."),
+    "en": ("{sig} {ref} was closed in favour of this one, at the request {by}. If something "
+           "was written there that is not here, bring it over before starting."),
+}
+
+
+def closing_note(*, in_favour_of: str | None, actor: str, reason: str = "",
+                 language: str | None = None, agent_name: str = "") -> str:
+    """What the closed card is left saying: who asked, where the work went when it moved, and the
+    reason in the words it was given — never translated, because it is somebody's."""
+    catalogue = _CLOSING_NOTE_IN_FAVOUR if in_favour_of else _CLOSING_NOTE
+    note = _pick(catalogue, language).format(sig=signature(agent_name, language=language),
+                                             by=_requested_by(actor, language),
+                                             ref=ref_label(in_favour_of))
+    if reason:
+        note += f"\n\n{reason.strip()}"
+    return note
+
+
+def survivor_note(*, closed: str, actor: str, language: str | None = None,
+                  agent_name: str = "") -> str:
+    """What the surviving card is told about the card closed in its favour (`closed`, a ref)."""
+    return _pick(_SURVIVOR_NOTE, language).format(sig=signature(agent_name, language=language),
+                                                  ref=ref_label(closed),
+                                                  by=_requested_by(actor, language))
+
+
+# ── correcting a card this role opened (#156) ───────────────────────────────────────────────────
+#
+# A card opened from a request or a defect is the product owner's (#150): the board refuses to edit
+# it, so this is the one way what it says can change. What it replaces is somebody's words, so the
+# confirmation SHOWS the new text before anything is written, and the card keeps the old one.
+
+_CORRECT_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes: vou corrigir o *{number}*.{changes}\n\n"
+              "O texto anterior fica guardado num comentário no próprio cartão. Se ele já tinha "
+              "critérios de aceite escritos a partir do texto antigo, eles saem, porque "
+              "descreveriam um pedido que não é mais esse.\n\nConfirma?"),
+    "en": ("To confirm first: I'll correct *{number}*.{changes}\n\n"
+           "The previous text stays in a comment on the card itself. If it already had acceptance "
+           "criteria written from the old text, they go, because they would describe a request "
+           "that is no longer this one.\n\nConfirm?"),
+}
+_CORRECT_CONFIRM_TITLE = {
+    "pt-BR": "\n\nNovo título: “{title}”",
+    "en": "\n\nNew title: “{title}”",
+}
+_CORRECT_CONFIRM_TEXT = {
+    "pt-BR": "\n\nO cartão passa a dizer:\n{text}",
+    "en": "\n\nThe card will say:\n{text}",
+}
+
+
+def _quoted(text: str) -> str:
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in text.strip().splitlines())
+
+
+def correct_confirmation(*, number: str, text: str = "", title: str = "",
+                         language: str | None = None) -> str:
+    changes = ""
+    if title.strip():
+        changes += _pick(_CORRECT_CONFIRM_TITLE, language).format(title=title.strip())
+    if text.strip():
+        changes += _pick(_CORRECT_CONFIRM_TEXT, language).format(text=_quoted(text))
+    return _pick(_CORRECT_CONFIRM, language).format(number=ref_label(number), changes=changes)
+
+
+_CARD_CORRECTED = {
+    "pt-BR": "Corrigi o *{number}*. O texto anterior ficou guardado num comentário no cartão.",
+    "en": "Corrected *{number}*. The previous text is kept in a comment on the card.",
+}
+_CARD_CORRECTED_UNNOTED = {
+    "pt-BR": "Corrigi o *{number}*.",
+    "en": "Corrected *{number}*.",
+}
+_CARD_ALREADY_SAID = {
+    "pt-BR": "O *{number}* já dizia isso, então não mexi nele.",
+    "en": "*{number}* already said that, so I left it alone.",
+}
+#: The criteria a refine wrote came from the old text, and they went with it. New ones are one
+#: request away, in whatever words (#565: the role proposes the refine, no sentence is copied).
+_CORRECTED_CRITERIA_WENT = {
+    "pt-BR": (" Os critérios de aceite que ele tinha foram escritos a partir do texto antigo, "
+              "então saíram. Para eu escrever novos para o {number}, é só me pedir."),
+    "en": (" The acceptance criteria it had were written from the old text, so they went. For new "
+           "ones for {number}, just ask me."),
+}
+
+
+def card_corrected(*, number: str, existed: bool = False, noted: bool = True,
+                   criteria_removed: bool = False, language: str | None = None,
+                   agent_name: str = "") -> str:
+    """What the client reads after a correction, composed from what was actually written."""
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    number = ref_label(number)
+    if existed:
+        return sig + _pick(_CARD_ALREADY_SAID, language).format(number=number)
+    text = _pick(_CARD_CORRECTED if noted else _CARD_CORRECTED_UNNOTED, language).format(
+        number=number)
+    if criteria_removed:
+        text += _pick(_CORRECTED_CRITERIA_WENT, language).format(number=number)
+    return sig + text
+
+
+#: Why a correction did not happen, one sentence per reason, in the project's language.
+_CORRECTION_REFUSED = {
+    "not_found": {"pt-BR": "não encontrei o cartão {number} no quadro",
+                  "en": "I could not find card {number} on the board"},
+    "closed": {"pt-BR": "o {number} já está fechado, então não mexi nele",
+               "en": "{number} is already closed, so I left it alone"},
+    "requirement": {
+        "pt-BR": ("o {number} executa um requisito, então não é o texto dele que muda: a mudança "
+                  "começa no requisito, e depois eu alinho o cartão a ele."),
+        "en": ("{number} carries out a requirement, so its text is not what changes: the change "
+               "starts in the requirement, and then I realign the card to it.")},
+    "board": {
+        "pt-BR": ("o {number} foi escrito direto no quadro, não por mim. Quem cuida do quadro "
+                  "corrige ali mesmo, até a execução começar."),
+        "en": ("{number} was written straight on the board, not by me. Whoever looks after the "
+               "board corrects it there, until work on it starts.")},
+    "started": {
+        "pt-BR": ("o {number} já está em “{column}”: a fábrica pegou ele e trabalha com o texto "
+                  "que leu quando começou. Mudar agora mexeria no alvo sem ninguém ver. Se algo "
+                  "mudou, comente no cartão, que é o que o trabalho lê em seguida."),
+        "en": ("{number} is already in “{column}”: the factory has picked it up and works from "
+               "the text it read when it started. Changing it now would move the target with "
+               "nobody seeing. If something changed, comment on the card, which is what the work "
+               "reads next.")},
+    "unmapped": {
+        "pt-BR": ("o {number} está em “{column}”, e eu não sei dizer se essa coluna já é "
+                  "execução, então não corrigi. Se algo mudou, comente no cartão."),
+        "en": ("{number} is in “{column}”, and I cannot tell whether that column means work has "
+               "started, so I did not correct it. If something changed, comment on the card.")},
+    "rename": {
+        "pt-BR": ("não consigo trocar o título de um cartão neste quadro. O texto eu consigo "
+                  "corrigir, se você me pedir sem o título."),
+        "en": ("I cannot change a card's title on this board. I can correct its text, if you ask "
+               "without the title.")},
+    "failed": {
+        "pt-BR": "não consegui corrigir o {number} agora. Nada mudou, e o time foi avisado.",
+        "en": ("I could not correct {number} just now. Nothing changed, and the team was "
+               "told.")},
+    "unrenamed": {
+        "pt-BR": ("corrigi o texto do {number}, mas não consegui trocar o título. O time foi "
+                  "avisado."),
+        "en": ("I corrected the text of {number}, but could not change its title. The team was "
+               "told.")},
+    "unnoted": {
+        "pt-BR": ("corrigi o {number}, mas não consegui deixar no cartão o comentário com o texto "
+                  "anterior. O time foi avisado."),
+        "en": ("I corrected {number}, but could not leave the comment with the previous text on "
+               "the card. The team was told.")},
+}
+
+
+def correction_refused(reason: str, *, number: str, column: str = "",
+                       language: str | None = None) -> str:
+    return _pick(_CORRECTION_REFUSED[reason], language).format(number=ref_label(number),
+                                                               column=column)
+
+
+#: The note a correction leaves on the card: who asked, what changed, and what it said before.
+_CORRECTION_NOTE = {
+    "pt-BR": "{sig} Corrigi {what} deste cartão a pedido de {actor}.",
+    "en": "{sig} I corrected {what} of this card at the request of {actor}.",
+}
+_CORRECTION_WHAT = {
+    "pt-BR": {"title": "o título", "request": "o pedido", "defect": "o relato do problema",
+              "bar": "os critérios de aceite", "and": " e "},
+    "en": {"title": "the title", "request": "the request", "defect": "the description of the "
+           "problem", "bar": "the acceptance criteria", "and": " and "},
+}
+_CORRECTION_BEFORE = {
+    "pt-BR": {"text": "\n\nAntes dizia:\n{text}", "title": "\n\nTítulo anterior: “{title}”",
+              "criteria": ("\n\nOs critérios de aceite escritos a partir do texto anterior foram "
+                           "retirados."),
+              "bar": "\n\nOs critérios de aceite diziam antes:\n{items}",
+              "no_bar": "\n\nAntes ele não tinha critérios de aceite.",
+              # #448: the bar moved at the merge gate, and the pass that builds to it is why
+              "with_a_pass": (" Junto com isso, a mudança dele voltou para mais uma passada no "
+                              "mesmo pull request, que é revisada contra estes critérios.")},
+    "en": {"text": "\n\nIt said before:\n{text}", "title": "\n\nPrevious title: “{title}”",
+           "criteria": ("\n\nThe acceptance criteria written from the previous text were "
+                        "removed."),
+           "bar": "\n\nThe acceptance criteria said before:\n{items}",
+           "no_bar": "\n\nIt had no acceptance criteria before.",
+           "with_a_pass": (" With it, its change went back for another pass on the same pull "
+                           "request, which is reviewed against these criteria.")},
+}
+
+
+def correction_note(*, kind: str, actor: str, old_text: str = "", old_title: str = "",
+                    text_changed: bool = False, title_changed: bool = False,
+                    criteria_removed: bool = False, language: str | None = None,
+                    agent_name: str = "", bar_changed: bool = False,
+                    old_bar: list[str] | tuple[str, ...] = (), with_a_pass: bool = False) -> str:
+    words = _pick(_CORRECTION_WHAT, language)
+    parts = (([words["title"]] if title_changed else []) + ([words[kind]] if text_changed else [])
+             + ([words["bar"]] if bar_changed else []))
+    before = _pick(_CORRECTION_BEFORE, language)
+    note = _pick(_CORRECTION_NOTE, language).format(
+        sig=signature(agent_name, language=language), what=words["and"].join(parts),
+        actor=actor)
+    if bar_changed and with_a_pass:
+        note += before["with_a_pass"]
+    if title_changed and old_title.strip():
+        note += before["title"].format(title=old_title.strip())
+    if text_changed:
+        note += before["text"].format(text=_quoted(old_text) if old_text.strip() else ">")
+    if criteria_removed:
+        note += before["criteria"]
+    if bar_changed:
+        note += (before["bar"].format(items="\n".join(f"- {c}" for c in old_bar)) if old_bar
+                 else before["no_bar"])
+    return note
+
+
+# ── another pass on a change that waits on the person who asked for it (#448) ──────────────────
+#
+# THE REQUESTER'S "NOT YET" IS THE NORMAL CASE, and these are its words: what the role stages for
+# the yes, what it says once the pass is sent, and — never a bare refusal — what happens instead
+# when no pass can be sent. Held to `CLIENT_JARGON` like every sentence here: the change, never the
+# forge's pull request; "put it in", never its verb; what the card must meet, never the template's
+# heading.
+
+_ADJUST_SAID = {
+    "not_yours": {
+        "pt-BR": ("só quem pediu o {ref}, ou alguém com permissão para aprovar, pode mandá-lo de "
+                  "volta para mais uma passada. Nada mudou — peça a {names}."),
+        "en": ("only the person who asked for {ref}, or someone with permission to approve, can "
+               "send it back for another pass. Nothing changed — ask {names}.")},
+    "not_waiting": {
+        "pt-BR": ("nenhuma mudança do {ref} está esperando por você agora — ela pode já ter "
+                  "entrado no produto, ter sido fechada, ou ainda não estar pronta para você "
+                  "conferir — então não há o que mandar de volta. Se algo está errado no que já "
+                  "está no produto, me diga e isso vira um cartão."),
+        "en": ("no change for {ref} is waiting on you right now — it may already be in the "
+               "product, have been closed, or not be ready for you to check yet — so there is "
+               "nothing to send back. If something is wrong with what is already in the product, "
+               "tell me and it becomes a card of its own.")},
+    "working": {
+        "pt-BR": ("o {ref} já está numa passada agora, reescrevendo a mudança. Quando ela "
+                  "terminar, a mudança volta a esperar por você, e aí você diz o que ainda "
+                  "estiver errado."),
+        "en": ("{ref} is in a pass right now, rewriting the change. When it ends the change "
+               "waits on you again, and you can say then what is still wrong.")},
+    "deaf": {
+        "pt-BR": ("o {ref} está esperando uma pessoa, mas o trabalho dele começou antes de "
+                  "conseguir ouvir uma resposta daqui. Quem cuida da fábrica pode colocá-lo no "
+                  "produto como está ou descartá-lo; nada mudou."),
+        "en": ("{ref} is waiting on a person, but its job started before it could hear an "
+               "answer from here. Whoever runs the factory can put it into the product as it is "
+               "or discard it; nothing changed.")},
+    # THE WALL, SAID AS WHAT HAPPENS NEXT (#448, behaviour 3): the number is the project's, and
+    # past it a person decides — the "not yet" is not lost, and nothing more is spent meanwhile
+    "spent": {
+        "pt-BR": ("o {ref} já teve as {passes} passadas a mais que este projeto permite para uma "
+                  "mudança. O que acontece agora é decisão de uma pessoa: quem coloca as mudanças "
+                  "deste projeto no produto olha esta como está e a coloca assim mesmo, ou a "
+                  "descarta, e o cartão volta a esperar que alguém o comece de novo. Nada mais é "
+                  "gasto nele enquanto isso."),
+        "en": ("{ref} has had the {passes} extra passes this project allows for one change. "
+               "What happens next is a person's decision: whoever puts this project's changes "
+               "into the product looks at it as it is and puts it in, or discards it, and the "
+               "card waits for somebody to start it again. Nothing more is spent on it "
+               "meanwhile.")},
+    "unreachable": {
+        "pt-BR": ("não consegui falar com a fábrica agora, então o {ref} não voltou para outra "
+                  "passada. Nada mudou — me peça de novo daqui a pouco."),
+        "en": ("I could not reach the factory just now, so {ref} was not sent back for another "
+               "pass. Nothing changed — ask me again in a moment.")},
+    # A KEY OF THE FACTORY'S OWN CANNOT BE READ (#742): not "it is not waiting", which it may be,
+    # and not "ask again in a moment", which would not help — a person who runs the factory must
+    # read the refusal, and the sentence sends them to `beeverforge doctor`, which names it
+    "key_refused": {
+        "pt-BR": ("não consegui mandar o {ref} de volta: a fábrica não está conseguindo assinar "
+                  "respostas agora, porque uma das chaves dela não pode ser lida. Nada mudou — "
+                  "quem cuida da fábrica vê o motivo com `beeverforge doctor`."),
+        "en": ("I could not send {ref} back: the factory cannot sign answers right now, because "
+               "one of its keys cannot be read. Nothing changed — whoever runs the factory can "
+               "see why with `beeverforge doctor`.")},
+    "empty": {
+        "pt-BR": ("diga o que ainda está errado — a próxima passada trabalha a partir das suas "
+                  "palavras, por exemplo: «o botão deveria ficar à direita»."),
+        "en": ("say what is still wrong — the next pass works from your words, for example: «the "
+               "button should be on the right».")},
+    "too_long": {
+        "pt-BR": ("isso tem {length} caracteres e o limite é {limit} — vira a instrução da "
+                  "passada, então precisa continuar sendo um pedido, não um documento."),
+        "en": ("that is {length} characters and the limit is {limit} — it becomes the pass's "
+               "instruction, so it has to stay a request rather than a document.")},
+    "undrafted": {
+        "pt-BR": ("não consegui transformar o que ainda está errado no {ref} numa passada que eu "
+                  "pudesse mandar. Me diga de novo, numa ou duas frases, o que você quer "
+                  "diferente."),
+        "en": ("I could not turn what is still wrong with {ref} into a pass I could send. Tell "
+               "me again, in a sentence or two, what you want different.")},
+    "corrected_anyway": {
+        "pt-BR": ("O cartão já foi corrigido para dizer o que a passada precisa cumprir — isso "
+                  "continua valendo."),
+        "en": "The card was already corrected to say what the pass must meet — that stands."},
+}
+_ADJUST_SENT = {
+    "pt-BR": "mandei o {ref} de volta para {which}, para mudar:\n{instruction}\n\n{corrected}"
+             "Ela trabalha na mesma mudança, e quando terminar a mudança volta a esperar por você.",
+    "en": "sent {ref} back for {which}, to change:\n{instruction}\n\n{corrected}It works on the "
+          "same change, and when it ends the change waits on you again.",
+}
+#: …AND ONCE IT IS ON ITS WAY, FOR A CHANGE ALREADY IN (#448 slice 4): never "the same change".
+_ADJUST_SENT_MERGED = {
+    "pt-BR": "mandei o {ref} de volta para {which}, para mudar:\n{instruction}\n\n{corrected}"
+             "Ela vira uma mudança nova; o que está no ar continua como está, e quando a mudança "
+             "nova estiver pronta ela espera por você de novo.",
+    "en": "sent {ref} back for {which}, to change:\n{instruction}\n\n{corrected}It becomes a "
+          "new change; what is live stays as it is, and when the new change is ready it waits on "
+          "you again.",
+}
+_ADJUST_WHICH = {
+    "pt-BR": {"counted": "a passada {n} de {of}", "plain": "mais uma passada"},
+    "en": {"counted": "pass {n} of {of}", "plain": "another pass"},
+}
+_ADJUST_CORRECTED = {
+    "pt-BR": ("Corrigi o cartão para dizer o que ela precisa cumprir, e o que ele dizia antes "
+              "ficou num comentário. "),
+    "en": "I corrected the card to say what it must meet, and what it said before is kept in a "
+          "comment. ",
+}
+_ADJUST_CONFIRM = {
+    "pt-BR": ("Vou mandar o *{number}* de volta para mais uma passada{count}, com estes critérios "
+              "como régua:\n{criteria}\n\ne corrigir o cartão para dizer o mesmo. O que a passada "
+              "vai mudar:\n{instruction}\n\nConfirma?"),
+    "en": ("I'll send *{number}* back for another pass{count}, with these criteria as the "
+           "bar:\n{criteria}\n\nand correct the card to match. What the pass will change:\n"
+           "{instruction}\n\nConfirm?"),
+}
+#: THE SAME PROPOSAL FOR A CHANGE ALREADY IN (#448 slice 4): at the last gate, before the
+#: product's users, the pass is a new change of the card — and what is live is not touched by it.
+_ADJUST_CONFIRM_MERGED = {
+    "pt-BR": ("Vou mandar o *{number}* de volta para mais uma passada{count}, com estes critérios "
+              "como régua:\n{criteria}\n\ncomo uma mudança nova — o que está no ar continua como "
+              "está — e corrigir o cartão para dizer o mesmo. O que a passada vai mudar:\n"
+              "{instruction}\n\nConfirma?"),
+    "en": ("I'll send *{number}* back for another pass{count}, with these criteria as the "
+           "bar:\n{criteria}\n\nas a new change — what is live stays as it is — and correct the "
+           "card to match. What the pass will change:\n{instruction}\n\nConfirm?"),
+}
+_ADJUST_CONFIRM_MERGED_KEEPS = {
+    "pt-BR": ("Vou mandar o *{number}* de volta para mais uma passada{count}, como uma mudança "
+              "nova — o que está no ar continua como está. O que a passada vai mudar:\n"
+              "{instruction}\n\n{keeps}\n\nConfirma?"),
+    "en": ("I'll send *{number}* back for another pass{count}, as a new change — what is live "
+           "stays as it is. What the pass will change:\n{instruction}\n\n{keeps}\n\nConfirm?"),
+}
+#: The same proposal on a card whose bar the role may not move — said BEFORE the yes, so nobody
+#: confirms a correction that will not be written.
+_ADJUST_CONFIRM_KEEPS = {
+    "pt-BR": ("Vou mandar o *{number}* de volta para mais uma passada{count}. O que a passada "
+              "vai mudar:\n{instruction}\n\n{keeps}\n\nConfirma?"),
+    "en": ("I'll send *{number}* back for another pass{count}. What the pass will change:\n"
+           "{instruction}\n\n{keeps}\n\nConfirm?"),
+}
+_ADJUST_KEEPS = {
+    "requirement": {
+        "pt-BR": ("O que ele precisa cumprir continua como está: o {number} executa um "
+                  "requisito, e essa régua muda primeiro no requisito."),
+        "en": ("What it must meet stays as it is: {number} carries out a requirement, and that "
+               "bar changes in the requirement first.")},
+    "board": {
+        "pt-BR": ("O que ele precisa cumprir continua como está: o {number} foi escrito por uma "
+                  "pessoa, não por mim, e o texto dele é dela para mudar."),
+        "en": ("What it must meet stays as it is: {number} was written by a person, not by me, "
+               "and what it says is theirs to change.")},
+}
+_ADJUST_COUNT = {
+    "pt-BR": " (a {n}ª das {of} que este projeto permite)",
+    "en": " (pass {n} of the {of} this project allows)",
+}
+#: The card's own control on the product view, and the sentence under it.
+_ADJUST_CONTROLS = {
+    "pt-BR": {"adjust": "Mandar para mais uma passada", "send": "Mandar", "cancel": "Cancelar",
+              "instruction": "O que ainda está errado?",
+              "criteria": "O que precisa ser verdade para estar pronto — um por linha",
+              "ask": ("Diga o que ainda está errado — a passada trabalha a partir das suas "
+                      "palavras. Abaixo está o que o cartão diz que ela precisa cumprir: mude se "
+                      "a régua deve ser outra, e o cartão é corrigido junto com a passada."),
+              "note": ("Esta mudança está esperando por você: experimente e, se algo ainda "
+                       "estiver errado, mande para mais uma passada."),
+              "left": " Restam {left} das {of} que este projeto permite."},
+    "en": {"adjust": "Send back for another pass", "send": "Send", "cancel": "Cancel",
+           "instruction": "What is still wrong?",
+           "criteria": "What must be true for it to be done — one per line",
+           "ask": ("Say what is still wrong — the pass works from your words. Below is what the "
+                   "card says it must meet: change it if the bar should be different, and the "
+                   "card is corrected with the pass."),
+           "note": ("This change is waiting on you: try it, and if something is still wrong, "
+                    "send it back for another pass."),
+           "left": " {left} of the {of} this project allows are left."},
+}
+
+
+def adjust_said(reason: str, *, ref: str, passes: int | None = None, length: int = 0,
+                limit: int = 0, language: str | None = None,
+                approvers: list[str] | None = None) -> str:
+    """Why no pass was sent — or, for `corrected_anyway`, what stands although it was not — in the
+    person's language. Every reason of `product/adjust.py::WHY` has one, and the module's own."""
+    return _naming(_pick(_ADJUST_SAID[reason], language), approvers, language,
+                   ref=ref_label(ref), passes=passes if passes is not None else "", length=length,
+                   limit=limit)
+
+
+def adjust_sent(*, ref: str, instruction: str, number: int | None = None,
+                passes: int | None = None, corrected: bool = False,
+                language: str | None = None, merged: bool = False) -> str:
+    """What the person reads once the pass is on its way — which pass of how many, when the job
+    said, and whether the card was corrected with it. `merged`: a new change of a card whose last
+    one is already in (#448 slice 4)."""
+    which = _pick(_ADJUST_WHICH, language)
+    return _pick(_ADJUST_SENT_MERGED if merged else _ADJUST_SENT, language).format(
+        ref=ref_label(ref), instruction=_quoted(instruction),
+        which=(which["counted"].format(n=number, of=passes)
+               if number is not None and passes is not None else which["plain"]),
+        corrected=_pick(_ADJUST_CORRECTED, language) if corrected else "")
+
+
+def adjust_confirmation(*, number: str, instruction: str, criteria=(), keeps: str = "",
+                        pass_number: int | None = None, passes: int | None = None,
+                        language: str | None = None, merged: bool = False) -> str:
+    """The proposal the yes answers: the bar the pass is judged against and the correction of the
+    card to match — or, where the role may not move the bar (`keeps`), why it stays. `merged`: the
+    change is already in and the pass is a new one (#448 slice 4)."""
+    count = (_pick(_ADJUST_COUNT, language).format(n=pass_number, of=passes)
+             if pass_number is not None and passes is not None else "")
+    number = ref_label(number)
+    if keeps:
+        return _pick(_ADJUST_CONFIRM_MERGED_KEEPS if merged else _ADJUST_CONFIRM_KEEPS,
+                     language).format(
+            number=number, count=count, instruction=_quoted(instruction),
+            keeps=_pick(_ADJUST_KEEPS[keeps], language).format(number=number))
+    return _pick(_ADJUST_CONFIRM_MERGED if merged else _ADJUST_CONFIRM, language).format(
+        number=number, count=count, instruction=_quoted(instruction),
+        criteria="\n".join(f"- {c}" for c in criteria))
+
+
+def adjust_controls(*, left: int | None = None, passes: int | None = None,
+                    language: str | None = None) -> dict[str, str]:
+    """The words of the card's "send back for another pass" control on the product view, and the
+    sentence under it saying how many passes are left, when the job said."""
+    words = dict(_pick(_ADJUST_CONTROLS, language))
+    tail = words.pop("left")
+    if left is not None and passes is not None:
+        words["note"] += tail.format(left=left, of=passes)
+    return words
+
+
+# ── "that's it": the requester accepts the change they tried (#448 slice 3) ─────────────────────
+#
+# THE YES IS RECORDED AGAINST WHAT THEY TRIED, and these are its words: what the role stages, what
+# it says once the yes is recorded, and — never a bare refusal — why nothing was recorded. Held to
+# `CLIENT_JARGON`: "what you tried in its preview", never the commit it was built from; "goes into
+# the product", never the forge's verb. The head is named only where the team reads it: the card's
+# note and the floor (`accept.line`).
+
+_ACCEPT_CHANGE_SAID = {
+    "not_yours": {
+        "pt-BR": ("só quem pediu o {ref}, ou alguém com permissão para aprovar, pode aceitar a "
+                  "mudança dele. Nada foi registrado — peça a {names}."),
+        "en": ("only the person who asked for {ref}, or someone with permission to approve, can "
+               "accept its change. Nothing was recorded — ask {names}.")},
+    "not_waiting": {
+        "pt-BR": ("nenhuma mudança do {ref} está esperando por você agora — ela pode já ter "
+                  "entrado no produto, ter sido fechada, ou ainda não estar pronta para você "
+                  "experimentar — então não há o que aceitar."),
+        "en": ("no change for {ref} is waiting on you right now — it may already be in the "
+               "product, have been closed, or not be ready for you to try yet — so there is "
+               "nothing to accept.")},
+    "working": {
+        "pt-BR": ("o {ref} está numa passada agora, reescrevendo a mudança — o que você "
+                  "experimentou está sendo substituído. Quando ela terminar, experimente de novo "
+                  "e me diga."),
+        "en": ("{ref} is in a pass right now, rewriting the change — what you tried is being "
+               "replaced. When it ends, try it again and tell me then.")},
+    "unreachable": {
+        "pt-BR": ("não consegui falar com a fábrica agora, então nada foi registrado para o "
+                  "{ref}. Me diga de novo daqui a pouco."),
+        "en": ("I could not reach the factory just now, so nothing was recorded for {ref}. Tell "
+               "me again in a moment.")},
+    # THE YES STANDS FOR WHAT WAS TRIED, so with nothing tried there is nothing to record it on
+    "untried": {
+        "pt-BR": ("só consigo registrar o seu «está certo» sobre uma versão que você experimentou "
+                  "na prévia, e não há prévia da mudança do {ref} como ela está. Abra o cartão "
+                  "para experimentá-la e me diga depois."),
+        "en": ("I can only record your yes against a version you tried in its preview, and there "
+               "is no preview of {ref}'s change as it stands. Open the card to try it, and tell "
+               "me then.")},
+    # …AND A YES ON A VERSION THAT MOVED WOULD STAND FOR SOMETHING NOBODY SAW
+    "moved": {
+        "pt-BR": ("a mudança do {ref} mudou desde que a prévia que você experimentou foi montada, "
+                  "então o seu «está certo» valeria para algo que você não viu. Experimente a "
+                  "prévia montada de novo e me diga depois."),
+        "en": ("{ref}'s change moved since the preview you tried was built, so your yes would "
+               "stand for something you did not see. Try the rebuilt preview, and tell me then.")},
+    "unrecorded": {
+        "pt-BR": ("não consegui registrar o seu «está certo» para o {ref} agora, então nada "
+                  "mudou. Me diga de novo daqui a pouco."),
+        "en": ("I could not write your yes down for {ref} just now, so nothing changed. Tell me "
+               "again in a moment.")},
+    # WHAT DID NOT LAND AFTER THE YES WAS RECORDED — said on the success, never instead of it
+    "unnoted": {
+        "pt-BR": ("Não consegui deixar um comentário no cartão do {ref} dizendo isso — o seu "
+                  "«está certo» está registrado mesmo assim."),
+        "en": ("I could not leave a note on {ref}'s card saying so — your yes is recorded all "
+               "the same.")},
+}
+_ACCEPT_CHANGE_CONFIRM = {
+    "pt-BR": ("Vou registrar que o *{number}*, como você o experimentou na prévia, é o que você "
+              "pediu{then}. Confirma?"),
+    "en": ("I'll record that *{number}*, as you tried it in its preview, is what you asked "
+           "for{then}. Confirm?"),
+}
+#: What the yes does next, said BEFORE it: the look is all that holds the change, so the yes puts
+#: it in — or a person puts it in, and sees the yes.
+_ACCEPT_CHANGE_THEN = {
+    "merges": {"pt-BR": ", e com isso ela entra no produto",
+               "en": ", and with that it goes into the product"},
+    "shown": {"pt-BR": ", para quem coloca as mudanças deste projeto no produto ver quando decidir",
+              "en": ", for whoever puts this project's changes into the product to see when they "
+                    "decide"},
+}
+_ACCEPT_CHANGE_DONE = {
+    "merges": {
+        "pt-BR": ("registrado: o {ref}, como você o experimentou, é o que você pediu — e por "
+                  "isso ele entra no produto agora."),
+        "en": ("recorded: {ref}, as you tried it, is what you asked for — so it goes into the "
+               "product now.")},
+    "shown": {
+        "pt-BR": ("registrado: o {ref}, como você o experimentou, é o que você pediu. Quem coloca "
+                  "as mudanças deste projeto no produto vê o seu «está certo» quando decidir."),
+        "en": ("recorded: {ref}, as you tried it, is what you asked for. Whoever puts this "
+               "project's changes into the product sees your yes when they decide.")},
+    "unmerged": {
+        "pt-BR": ("registrado: o {ref}, como você o experimentou, é o que você pediu. Não "
+                  "consegui entregá-lo para entrar no produto agora; quem coloca as mudanças "
+                  "deste projeto no produto vê o seu «está certo»."),
+        "en": ("recorded: {ref}, as you tried it, is what you asked for. I could not hand it "
+               "over to go into the product just now; whoever puts this project's changes into "
+               "the product sees your yes.")},
+}
+#: The card's own control on the product view, and the sentence under it.
+_ACCEPT_CHANGE_CONTROLS = {
+    "pt-BR": {"accept": "Está certo — aceitar", "merges": " Com isso ela entra no produto.",
+              "note": ("Se o que você experimentou na prévia é o que você pediu, aceite — o seu "
+                       "«está certo» fica registrado sobre a versão que você experimentou.")},
+    "en": {"accept": "This is it — accept", "merges": " With that it goes into the product.",
+           "note": ("If what you tried in the preview is what you asked for, accept it — your yes "
+                    "is recorded against the version you tried.")},
+}
+#: The card's note: the TEAM reads it, so the head and the change are named.
+_CHANGE_ACCEPTED_NOTE = {
+    "pt-BR": ("{sig} {by} experimentou a mudança na prévia e a aceitou: o que experimentou — "
+              "{head} de {pr} — é o que pediu.{merging}"),
+    "en": ("{sig} {by} tried the change in its preview and accepted it: what they tried — {head} "
+           "of {pr} — is what they asked for.{merging}"),
+}
+_CHANGE_ACCEPTED_MERGING = {
+    "pt-BR": " A prévia era tudo o que segurava o merge, então a fábrica faz o merge agora.",
+    "en": " The look was all that held the merge, so the factory merges it now.",
+}
+
+
+def accept_change_said(reason: str, *, ref: str, language: str | None = None,
+                       approvers: list[str] | None = None) -> str:
+    """Why nothing was recorded, in the person's language — one sentence per reason the module
+    and `product/accept.py` can give."""
+    from beeverforge.contracts.refs import ref_label
+
+    return _naming(_pick(_ACCEPT_CHANGE_SAID[reason], language), approvers, language,
+                   ref=ref_label(ref))
+
+
+def accept_change_confirmation(*, number: str, merges: bool = False,
+                               language: str | None = None) -> str:
+    """The proposal the yes answers: their yes recorded against what they tried, and what follows
+    — the change goes into the product, or the person who puts it in sees the yes."""
+    from beeverforge.contracts.refs import ref_label
+
+    return _pick(_ACCEPT_CHANGE_CONFIRM, language).format(
+        number=ref_label(number),
+        then=_pick(_ACCEPT_CHANGE_THEN["merges" if merges else "shown"], language))
+
+
+def accept_change_done(*, ref: str, merging: bool = False, unmerged: bool = False,
+                       language: str | None = None) -> str:
+    """What the person reads once their yes is recorded."""
+    which = "merges" if merging else "unmerged" if unmerged else "shown"
+    from beeverforge.contracts.refs import ref_label
+
+    return _pick(_ACCEPT_CHANGE_DONE[which], language).format(ref=ref_label(ref))
+
+
+def accept_change_controls(*, merges: bool = False, language: str | None = None) -> dict[str, str]:
+    """The words of the card's "this is it" control on the product view."""
+    words = dict(_pick(_ACCEPT_CHANGE_CONTROLS, language))
+    tail = words.pop("merges")
+    if merges:
+        words["note"] += tail
+    return words
+
+
+def change_accepted_note(*, by: str, head: str, pr_url: str, merging: bool = False,
+                         language: str | None = None, agent_name: str = "") -> str:
+    """What the card says once its requester accepted the change: who, on which head of which
+    change — and that the factory merges it, when the look was all that held it."""
+    return _pick(_CHANGE_ACCEPTED_NOTE, language).format(
+        sig=signature(agent_name, language=language), by=by, head=f"`{head[:7]}`", pr=pr_url,
+        merging=_pick(_CHANGE_ACCEPTED_MERGING, language) if merging else "")
+
+
+#: Aligning. The confirmation has to say the thing a person would not guess: this is not tidying
+#: wording, it changes WHAT GETS BUILT. Thirteen cards citing a retired requirement is what this
+#: exists for, and each of those already carries criteria somebody may have started working from —
+#: so the message names the replacement AND says plainly that nothing starts because of it.
+_ALIGN_CONFIRM = {
+    "pt-BR": ("Só para confirmar antes, porque isto muda **o que vai ser construído**: alinhar o "
+              "*{number}* ao *requisito {requirement}: {title}* faz duas coisas. O item passa a "
+              "citar o requisito {requirement} como origem, e eu reescrevo o que precisa ser "
+              "verdade para considerá-lo feito a partir desse texto — o que está escrito ali hoje "
+              "sai.\n\n"
+              "Não é acertar a redação: se alguém estava se guiando pelo que estava escrito, o "
+              "alvo muda.\n\n"
+              "Nada começa por causa disso — o item continua onde está, e começar continua sendo "
+              "decisão de vocês.\n\nConfirma?"),
+    "en": ("To confirm first, because this changes **what gets built**: aligning *{number}* to "
+           "*requirement {requirement}: {title}* does two things. The item starts citing "
+           "requirement {requirement} as its source, and I rewrite what has to be true to call it "
+           "done from that text — whatever is written there today goes.\n\nThis is not tidying "
+           "wording: if somebody was working to what was written, the target moves.\n\nNothing "
+           "starts because of it — the item stays where it is, and starting is still your call."
+           "\n\nConfirm?"),
+}
+_CARD_ALIGNED = {
+    "pt-BR": ("Alinhado: o *{number}* passa a citar o *requisito {requirement}*, e o que precisa "
+              "ser verdade para considerá-lo feito veio desse texto. Deixei registrado no item "
+              "que fui eu e a partir de quê. **Nada começou por causa disso.**"),
+    "en": ("Aligned: *{number}* now cites *requirement {requirement}*, and what has to be true to "
+           "call it done came from that text. I recorded on the item that it was me and what from. "
+           "**Nothing started because of it.**"),
+}
+#: The same act with its second half missing — the criteria were replaced and the note explaining
+#: that they were could not be left. TWO TEXTS, like `close`'s: the sentence above promises whoever
+#: opens the card an explanation that is not on it, and that card is the one somebody picks up next.
+#: What went wrong is said by the module, in its own words, straight after this.
+_CARD_ALIGNED_UNEXPLAINED = {
+    "pt-BR": ("Alinhado: o *{number}* passa a citar o *requisito {requirement}*, e o que precisa "
+              "ser verdade para considerá-lo feito veio desse texto. **Nada começou por causa "
+              "disso.**"),
+    "en": ("Aligned: *{number}* now cites *requirement {requirement}*, and what has to be true to "
+           "call it done came from that text. **Nothing started because of it.**"),
+}
+#: Refusing to write a card's criteria from a retired text — the exact damage this act exists to
+#: undo, arriving from the other direction. It NAMES the replacement and the sentence that would
+#: work, because a refusal that leaves somebody at a dead end is how a person stops asking.
+_ALIGN_TO_SUPERSEDED = {
+    "pt-BR": ("o *requisito {requirement}* foi substituído pelo *requisito {successor}* — escrever "
+              "um item a partir de um texto aposentado é justamente o problema que eu estaria "
+              "criando. Se o {successor} é o que vale, me peça para alinhar o {number} a ele e eu "
+              "preparo."),
+    "en": ("*Requirement {requirement}* was replaced by *requirement {successor}* — writing an "
+           "item from a retired text is exactly the problem I would be creating. If {successor} "
+           "is what holds, ask me to align {number} to it and I'll prepare it."),
+}
+_ALIGN_TO_DROPPED = {
+    "pt-BR": ("o *requisito {requirement}* foi abandonado e nada entrou no lugar dele — não dá "
+              "para dizer que o *{number}* está pronto por um texto que ninguém vai cumprir. Se "
+              "houver outro requisito que valha para ele, me diga qual."),
+    "en": ("*Requirement {requirement}* was dropped and nothing replaced it — I cannot judge "
+           "*{number}* done against a text nobody will honour. If another requirement applies to "
+           "it, tell me which."),
+}
+#: Replaced by a text NOBODY HAS AGREED TO YET — the commonest shape of all, and the one the three
+#: sentences around it could not say. `propose_requirement` stamps the predecessor as retired in the
+#: same commit that writes the replacement as a proposal, so between that commit and somebody's yes
+#: every alignment onto the old number lands here. It is not a broken chain (the text is there and
+#: reads fine) and it is not an abandonment (somebody decided the opposite), and being told either
+#: sends a client to look for a problem that does not exist. What it is, is one confirmation away —
+#: so the sentence names both steps, in the order they have to happen. The first is said in plain
+#: words, not quoted (#565): agreeing is an act the role proposes from whatever words the person
+#: uses, so there is no sentence to copy for it — and it is itself staged for a yes, which the
+#: sentence says, or the person would type the second step to a question still open.
+_ALIGN_TO_UNAGREED = {
+    "pt-BR": ("o *requisito {requirement}* foi substituído pelo *requisito {successor}*, e o "
+              "{successor} ainda não foi acordado — escrever o *{number}* a partir de uma "
+              "proposta seria decidir por vocês. Se ele já vale, me diga que o {successor} "
+              "está acordado e confirme quando eu perguntar; depois, me peça para alinhar o "
+              "{number} a ele."),
+    "en": ("*Requirement {requirement}* was replaced by *requirement {successor}*, and "
+           "{successor} has not been agreed yet — writing *{number}* from a proposal would be "
+           "deciding for you. If it holds, tell me {successor} is agreed and confirm when I "
+           "ask; then ask me to align {number} to it."),
+}
+#: Replaced by a text that was ITSELF taken off the table — REQ-0004 `superseded-by 0006` with 0006
+#: `dropped`. None of the sentences around it can say that: the chain is not broken (both texts read
+#: perfectly well), the requirement was not abandoned with nothing in its place, and above all this
+#: is not one confirmation away. Told it was, a client would be sent to agree to the very text they
+#: had decided against — and agreeing writes it back into force. So this one names both numbers,
+#: says neither holds, and asks the only question left.
+_ALIGN_TO_DROPPED_REPLACEMENT = {
+    "pt-BR": ("o *requisito {requirement}* foi substituído pelo *requisito {successor}*, e o "
+              "{successor} também já não vale — escrever o *{number}* a partir de qualquer um "
+              "dos dois seria mandar construir por um texto que ninguém vai cumprir. Se houver "
+              "outro requisito que valha para o *{number}*, me diga qual."),
+    "en": ("*Requirement {requirement}* was replaced by *requirement {successor}*, and "
+           "{successor} no longer holds either — writing *{number}* from either of them would "
+           "mean building from a text nobody will honour. If another requirement applies to "
+           "*{number}*, tell me which."),
+}
+#: Replaced, and the replacement cannot be read. A retired requirement whose successor is not in the
+#: base is an inconsistency on our side, and the two sentences above would each be a lie about it:
+#: one would send the person to a number nobody can open, the other would tell them it was
+#: abandoned. Saying so plainly costs the person one rephrase and costs us the bug report we need.
+_ALIGN_CHAIN_BROKEN = {
+    "pt-BR": ("o *requisito {requirement}* foi substituído, e eu não consegui achar o texto que "
+              "entrou no lugar dele — então não escrevo o *{number}* a partir de nenhum dos "
+              "dois. O time já tem o detalhe. Se você souber qual requisito vale hoje, me diga o "
+              "número."),
+    "en": ("*Requirement {requirement}* was replaced and I could not find the text that took its "
+           "place — so I am writing *{number}* from neither. The team has the detail. If you know "
+           "which requirement holds today, tell me the number."),
+}
+
+
+def align_confirmation(*, number: str, requirement: int, title: str,
+                       language: str | None = None) -> str:
+    return _pick(_ALIGN_CONFIRM, language).format(number=ref_label(number), requirement=requirement,
+                                                  title=title)
+
+
+def card_aligned(*, number: str, requirement: int, noted: bool = True,
+                 language: str | None = None, agent_name: str = "") -> str:
+    """`noted` is False when the note explaining the rewrite could not be left on the card.
+
+    The same split `card_closed` makes, for the same reason: a success line that describes the
+    happy path is read out over every other one, and this one would promise an explanation to
+    whoever opens a card whose criteria have just changed underneath them.
+    """
+    sig = f"{agent_name}: " if agent_name.strip() else ""
+    catalogue = _CARD_ALIGNED if noted else _CARD_ALIGNED_UNEXPLAINED
+    return sig + _pick(catalogue, language).format(number=ref_label(number),
+                                                   requirement=requirement)
+
+
+def align_refused(*, number: str, requirement: int, successor: int | None = None,
+                  replaced: bool = False, language: str | None = None) -> str:
+    """Why a card cannot be written from this requirement — and what to say instead.
+
+    `successor` is the LIVE end of the supersession chain, never one hop along it: pointing at
+    another retired text is the very thing this refusal exists to stop, and a person following the
+    instruction would land on the same refusal one number further on. `replaced` says the chain
+    exists but could not be walked, which is neither of the other two answers.
+    """
+    if successor:
+        catalogue = _ALIGN_TO_SUPERSEDED
+    else:
+        catalogue = _ALIGN_CHAIN_BROKEN if replaced else _ALIGN_TO_DROPPED
+    return _pick(catalogue, language).format(number=ref_label(number), requirement=requirement,
+                                             successor=successor or "")
+
+
+def align_to_unagreed(*, number: str, requirement: int, successor: int,
+                      language: str | None = None) -> str:
+    """The replacement is written and readable, and nobody has said yes to it yet.
+
+    Separate from `align_refused` because it is not a refusal of the same kind: the other three say
+    what cannot be done, this one says what has to happen first — and names it as two sentences a
+    person can type, in order.
+    """
+    return _pick(_ALIGN_TO_UNAGREED, language).format(number=ref_label(number),
+                                                      requirement=requirement,
+                                                      successor=successor)
+
+
+def align_to_dropped_replacement(*, number: str, requirement: int, successor: int,
+                                 language: str | None = None) -> str:
+    """The replacement is readable and was itself taken off the table.
+
+    The sibling of `align_to_unagreed`, and separate for the same reason: "not agreed yet" and "not
+    agreed, ever" send a person to two different places. Only the first has a next step the client
+    can type, and offering it here would be inviting them to reinstate what they cancelled.
+    """
+    return _pick(_ALIGN_TO_DROPPED_REPLACEMENT, language).format(
+        number=ref_label(number), requirement=requirement, successor=successor)
+
+
+#: The note an alignment leaves on the card (#538): what it now carries out, that its criteria were
+#: rewritten from that text, and — under `_COULD_NOT_DETERMINE` — what this pass could not answer,
+#: kept in the comment where nothing orders an executor to meet it.
+_ALIGN_NOTE = {
+    "pt-BR": ("{sig} Este cartão passou a executar o requisito {requirement}, e reescrevi o que "
+              "precisa ser verdade para dá-lo por pronto a partir dele — o texto que ele seguia "
+              "antes foi substituído. Corrijam se eu entendi errado."),
+    "en": ("{sig} This card now carries out requirement {requirement}, and I rewrote what has to "
+           "be true to call it done from that text — the one it followed before was replaced. "
+           "Correct me if I got it wrong."),
+}
+#: The questions a pass of the model could not answer, under the note of `align` and of `refine`.
+_COULD_NOT_DETERMINE = {
+    "pt-BR": "\n\nO que eu não consegui determinar:\n",
+    "en": "\n\nWhat I could not determine:\n",
+}
+#: The note a re-pointed citation leaves (#538). It says what changed AND what deliberately did
+#: not: whoever picks this card up has to know that what it asks for was written against the older
+#: text, or they will read the new citation and assume somebody checked.
+_REPOINT_NOTE = {
+    "pt-BR": ("{sig} Este cartão passou a executar o requisito {successor}{who}: o requisito "
+              "{cited}, que ele citava, foi substituído por aquele.\n\n**O que está escrito aqui "
+              "como \"pronto\" continua igual, e foi escrito a partir do texto antigo.** Não "
+              "revisei nada disso: rever pode mudar o que vai ser construído, e essa é uma "
+              "decisão de vocês, não uma arrumação minha."),
+    "en": ("{sig} This card now carries out requirement {successor}{who}: requirement {cited}, "
+           "which it cited, was replaced by that one.\n\n**What is written here as \"done\" is "
+           "unchanged, and it was written from the older text.** I revised none of it: revising "
+           "it can change what gets built, and that is your decision, not tidying of mine."),
+}
+_REPOINT_WHO = {"pt-BR": ", a pedido de {actor}", "en": ", at the request of {actor}"}
+
+
+def _undetermined(questions, language: str | None) -> str:
+    return (_pick(_COULD_NOT_DETERMINE, language) + "\n".join(f"- {q}" for q in questions)
+            if questions else "")
+
+
+def align_note(*, requirement: int, questions=(), language: str | None = None,
+               agent_name: str = "") -> str:
+    return (_pick(_ALIGN_NOTE, language).format(sig=signature(agent_name, language=language),
+                                                requirement=requirement)
+            + _undetermined(questions, language))
+
+
+def repoint_note(*, cited: int, successor: int, actor: str = "", language: str | None = None,
+                 agent_name: str = "") -> str:
+    """Re-pointed by the platform, nobody is named; at somebody's request, they are."""
+    who = _pick(_REPOINT_WHO, language).format(actor=actor) if actor else ""
+    return _pick(_REPOINT_NOTE, language).format(sig=signature(agent_name, language=language),
+                                                 successor=successor, who=who, cited=cited)
+
+
+#: What `refine` says when the card already states what must be true. THE REFUSAL IS RIGHT — it
+#: exists to unblock cards with nothing written, and rewriting prose nobody complained about is how
+#: an agent churns a board and teaches people to stop reading its comments.
+#:
+#: What it lacked was somewhere to go. In production it fired on #516, correctly, and the client
+#: was left holding a card whose criteria were written from a requirement that has since been
+#: replaced — with no word for the act that would fix it. A refusal that names no alternative is
+#: read as "this cannot be done"; the alternative is a different act, on purpose, because changing
+#: criteria somebody may already be working from is not the same risk as writing where there was
+#: nothing.
+_REFINE_REFUSED = {
+    "pt-BR": ("o *{number}* já dizia quando estaria pronto — não mexi. Reescrever o que ninguém "
+              "reclamou só ensina o time a parar de ler o que eu escrevo.\n\n"
+              "Se o que está escrito ali não é mais o que foi combinado, aí é outro pedido, e ele "
+              "tem nome: *alinhar*. Me diga a qual requisito ele deve se alinhar e eu preparo a "
+              "mudança para vocês confirmarem — nada muda antes disso."),
+    "en": ("*{number}* already said when it would be done — I left it alone. Rewriting what "
+           "nobody complained about only teaches the team to stop reading what I write.\n\nIf what "
+           "is written there is no longer what was agreed, that is a different request and it has "
+           "a name: *align*. Tell me which requirement it should align to and I'll prepare the "
+           "change for you to confirm — nothing changes before that."),
+}
+
+
+def refine_refused(*, number: str, language: str | None = None) -> str:
+    return _pick(_REFINE_REFUSED, language).format(number=ref_label(number))
+
+
+#: What `refine` says when the card HAS a criteria section and nothing in it reads as a criterion.
+#:
+#: WRITING WOULD BE WORSE THAN REFUSING (#150). `refine` appends its criteria under a heading of its
+#: own, and the ticket parser reads the FIRST criteria section a body carries — so the new set would
+#: land below the old section and never be read, the spec gate would refuse the card exactly as
+#: before, and every later refine would add one more ignored set. Until the queue asked the parser,
+#: this card was called "already has criteria" and left alone; now the refusal says what is wrong
+#: and who can fix it, which on the local board is somebody editing the card.
+_REFINE_WOULD_BE_IGNORED = {
+    "pt-BR": ("o *{number}* já tem uma seção de critérios de aceite, mas nada escrito nela é lido "
+              "como critério, então a entrada ainda recusaria o cartão. Não escrevi outra seção: "
+              "ela ficaria abaixo dessa e seria ignorada. Quem cuida do quadro precisa corrigir a "
+              "seção que já existe."),
+    "en": ("*{number}* already has an acceptance criteria section, but nothing written in it "
+           "reads as a criterion, so pickup would still refuse the card. I did not write a second "
+           "section: it would sit below that one and be ignored. Whoever looks after the board "
+           "needs to correct the section that is already there."),
+}
+
+
+def refine_would_be_ignored(*, number: str, language: str | None = None) -> str:
+    return _pick(_REFINE_WOULD_BE_IGNORED, language).format(number=ref_label(number))
+
+
+#: What `refine` says when it wrote criteria onto a card that had none. `refine` writes TWICE — the
+#: criteria, then the comment attributing them — and reports the second one failing as a SUCCESS
+#: carrying a sentence for the client, exactly as `close_card` and `align_card` do.
+#:
+#: SO THE NOTE IS A FLAG, like `linked` and `noted` above it. The line used to announce the comment
+#: unconditionally AND splice the module's "I could not leave the comment" sentence into the slot
+#: meant for the count, so one sentence denied and asserted the same note eight words apart. Three
+#: siblings had already been given this split; this was the fourth and it was left behind.
+_CRITERIA_WRITTEN = {
+    "pt-BR": ("escrevi no {number} o que precisa ser verdade para considerá-lo feito{measure}, e "
+              "deixei um comentário dizendo que fui eu. O texto de quem descreveu o item continua "
+              "lá — só acrescentei."),
+    "en": ("I wrote in {number} what has to be true to call it done{measure}, and left a comment "
+           "saying it was me. What the person who described the item wrote is still there — I only "
+           "added to it."),
+}
+#: The same act with its second half missing. No count either: what the module has to say in place
+#: of one is said straight after this, in its own words.
+_CRITERIA_WRITTEN_UNEXPLAINED = {
+    "pt-BR": ("escrevi no {number} o que precisa ser verdade para considerá-lo feito. O texto de "
+              "quem descreveu o item continua lá — só acrescentei."),
+    "en": ("I wrote in {number} what has to be true to call it done. What the person who "
+           "described the item wrote is still there — I only added to it."),
+}
+
+
+def criteria_written(*, number: str, measure: str = "", noted: bool = True,
+                     language: str | None = None) -> str:
+    """`noted` is False when the comment saying who wrote them could not be left on the card.
+
+    `measure` is what the module counted ("3 critérios") and is shown only alongside a whole act:
+    the field it comes from carries a residue sentence instead whenever the second write failed,
+    and a residue in the slot meant for a count is how the two facts got said in one breath.
+    """
+    catalogue = _CRITERIA_WRITTEN if noted else _CRITERIA_WRITTEN_UNEXPLAINED
+    return _pick(catalogue, language).format(
+        number=ref_label(number), measure=f" ({measure.strip()})" if measure.strip() else "")
+
+
+#: The comment `refine` leaves beside the criteria it wrote (#538): why it wrote them, how many,
+#: from what, and what it could not determine. `{criteria}` is `criteria_counted`, so one is "1
+#: critério" and "1 criterion" rather than the "1 critérios" this said when it was module prose.
+_REFINE_NOTE = {
+    "pt-BR": ("{sig} Este item não dizia quando estaria pronto, então seria recusado na entrada. "
+              "Escrevi {criteria} a partir do que já estava descrito — corrijam se eu entendi "
+              "errado."),
+    "en": ("{sig} This item did not say when it would be done, so pickup would have refused it. "
+           "I wrote {criteria} from what was already described — correct me if I got it wrong."),
+}
+
+
+def refine_note(*, criteria: int, questions=(), language: str | None = None,
+                agent_name: str = "") -> str:
+    return (_pick(_REFINE_NOTE, language).format(
+        sig=signature(agent_name, language=language),
+        criteria=criteria_counted(criteria, language=language))
+        + _undetermined(questions, language))
+
+
+#: What she is still waiting on, said to the person who asked how things are going. Two clauses,
+#: joined only when both apply — "aguardo resposta sobre nada" is worse than saying nothing.
+_STILL_WAITING_QUESTIONS = {
+    "pt-BR": "aguardo resposta sobre {listed}{more}",
+    "en": "waiting on an answer about {listed}{more}",
+}
+_STILL_WAITING_MORE = {"pt-BR": " (+{n})", "en": " (+{n})"}
+_STILL_WAITING_DELIVERIES = {
+    "pt-BR": "acompanho a entrega de {n} pedido{s}",
+    "en": "following the delivery of {n} request{s}",
+}
+
+
+def still_waiting(*, questions: list[str], deliveries: int,
+                  language: str | None = None) -> str:
+    """Her open loops in one line, or "" when there are none.
+
+    THE CONVERSATIONAL HALF OF THE VISIBLE LIST — the panel's `/api/loops` is the other. The chase
+    policy stops at one reminder by design, so anything past it must be findable by ASKING, or a
+    question with a slow answer quietly stops existing.
+
+    Refs are printed as the tracker wrote them (C-05); at most five are named, because a status
+    line that lists twenty is a wall nobody reads and the count already says how many there are."""
+    parts: list[str] = []
+    if questions:
+        listed = ", ".join(ref_label(q) for q in questions[:5])
+        more = (_pick(_STILL_WAITING_MORE, language).format(n=len(questions) - 5)
+                if len(questions) > 5 else "")
+        parts.append(_pick(_STILL_WAITING_QUESTIONS, language).format(listed=listed, more=more))
+    if deliveries:
+        parts.append(_pick(_STILL_WAITING_DELIVERIES, language).format(
+            n=deliveries, s="s" if deliveries != 1 else ""))
+    return " · ".join(parts)
+
+
+# ── what happened, said to the person it concerns (#267 slice 3) ────────────────────────────────
+#
+# THE EVENTS' OWN SENTENCES, composed here and never by a model — they are said without anybody
+# asking, and a sentence nobody asked for is the one that most needs to be in the client's words
+# (`product/events.py`). Each names the card by its number and title, which is how people point
+# at the same thing; none says how the factory works it — no check's name, no pull request, no
+# branch. "Waiting for the team to look" is what a person can do something with.
+
+_CARD = {"pt-BR": "o {ref}{title}", "en": "{ref}{title}"}
+
+_CI_RED = {
+    "pt-BR": ("{sig}{card} não passou nas verificações automáticas. O time já está corrigindo — "
+              "nada disso chega aos seus usuários enquanto isso."),
+    "en": ("{sig}{card} did not pass its automatic checks. It is being fixed now — none of it "
+           "reaches your users meanwhile."),
+}
+_PR_WAITING = {
+    "pt-BR": ("{sig}{card} está pronto para a revisão do time há {days} dias e espera alguém do "
+              "time olhar. Não há nada de errado com ele: só precisa desse olhar para seguir."),
+    "en": ("{sig}{card} has been ready for the team's review for {days} days and is waiting for "
+           "someone on the team to look at it. Nothing is wrong with it: it only needs that look "
+           "to go ahead."),
+}
+_PREVIEW_UP = {
+    "pt-BR": ("{sig}Já dá para experimentar {card} antes de ele entrar no produto: {url}\n\n"
+              "Dá uma olhada e me diga se é o que foi pedido."),
+    "en": ("{sig}You can already try {card} before it goes into the product: {url}\n\n"
+           "Have a look and tell me whether it is what was asked for."),
+}
+_CARD_WITHDRAWN = {
+    "pt-BR": {
+        "closed": ("{sig}{card} foi fechado e saiu da lista de trabalho — não vai ser feito. Se "
+                   "voltar a fazer sentido, é só pedir de novo."),
+        "removed": ("{sig}{card} foi removido antes de alguém começar — não vai ser feito. Se "
+                    "voltar a fazer sentido, é só pedir de novo."),
+    },
+    "en": {
+        "closed": ("{sig}{card} was closed and left the list of work — it will not be built. If "
+                   "it makes sense again, just ask."),
+        "removed": ("{sig}{card} was removed before anybody started on it — it will not be built. "
+                    "If it makes sense again, just ask."),
+    },
+}
+_DOCUMENT_INGESTED = {
+    "pt-BR": ("{sig}Li o novo documento *{name}* — agora ele faz parte do que eu sei sobre o "
+              "produto, e eu digo de onde tirei sempre que usar."),
+    "en": ("{sig}I have read the new document *{name}* — it is now part of what I know about the "
+           "product, and I will say where it came from whenever I use it."),
+}
+
+
+def _card(ref: str, title: str, language: str | None) -> str:
+    title = (title or "").strip()
+    return _pick(_CARD, language).format(ref=ref_label(ref),
+                                         title=f" ({title})" if title else "")
+
+
+def _sig(agent_name: str) -> str:
+    return f"{agent_name}: " if agent_name else ""
+
+
+def ci_went_red(*, ref: str, title: str = "", language: str | None = None,
+                agent_name: str = "") -> str:
+    """A card's work failed the factory's own checks and is being repaired — said once."""
+    return _pick(_CI_RED, language).format(sig=_sig(agent_name),
+                                           card=_card(ref, title, language))
+
+
+def pull_request_waiting(*, ref: str, title: str = "", days: int = 2,
+                         language: str | None = None, agent_name: str = "") -> str:
+    """A card's finished work has waited `days` for a person on the team to look at it."""
+    return _pick(_PR_WAITING, language).format(sig=_sig(agent_name),
+                                               card=_card(ref, title, language),
+                                               days=max(2, int(days)))
+
+
+def preview_up(*, ref: str, title: str = "", url: str, language: str | None = None,
+               agent_name: str = "") -> str:
+    """A card's change can be tried before it goes in (ADR-0050) — the address, and the ask."""
+    return _pick(_PREVIEW_UP, language).format(sig=_sig(agent_name),
+                                               card=_card(ref, title, language),
+                                               url=str(url or "").rstrip("/"))
+
+
+def card_withdrawn(*, ref: str, title: str = "", removed: bool = False,
+                   language: str | None = None, agent_name: str = "") -> str:
+    """A card was closed, or removed before the factory took it up, from the card itself (#384) —
+    said to the conversation it was asked in, so what was asked there is known to be off the
+    table."""
+    return _pick(_CARD_WITHDRAWN, language)["removed" if removed else "closed"].format(
+        sig=_sig(agent_name), card=_card(ref, title, language))
+
+
+# ── what happened to a card, said by the door it went through (ADR-0055) ─────────────────────────
+#
+# ONE COMMENT ON THE CARD, THE SAME ON EVERY ROW (D6). The note a stop, a skip or a discard left
+# travelled as `set_state(reason=…)`, which two trackers write as a comment and the local board
+# drops, and the stop's own sentence was English on a Portuguese board. The door writes these.
+_CARD_NOTE = {
+    "pt-BR": {
+        "discarded": ("_Pull request fechado sem merge {by_who}._{why} Nada foi entregue: o "
+                      "cartão voltou para o backlog, e o branch e os commits dele estão intactos."),
+        "skipped": ("_Pulado {by_who}._{why} A fábrica parou de trabalhar nele e a fila está "
+                    "livre. Nada foi entregue: o cartão voltou para o backlog."),
+        "stopped": ("_Parado {by_who}._{why} O job foi encerrado no motor; nada foi mergeado e "
+                    "nenhum branch foi apagado. O cartão voltou para o backlog e pode ser "
+                    "retomado."),
+        "question_answered": "_Respondido {by_who}._{why}",
+        "parked": "_Parado à espera de uma pessoa._{why}",
+        "delivered": "_Entregue._{why}",
+        "adjusted": "_Mais uma passagem, pedida {by_who}._{why}",
+        "filed": "_Registrado {by_who}._{why}",
+        "promoted": "_Colocado na fila {by_who}._{why}",
+        "reordered": "_Tirado da fila {by_who}: voltou para o backlog._{why}",
+        "edited": "_Editado {by_who}._{why}",
+        "question_asked": "_Perguntado {by_who}: o cartão espera a resposta._{why}",
+        "refused": "_Devolvido para refinamento: a fábrica não o constrói como está escrito._{why}",
+        "pr_opened": "_A mudança está num pull request._{why}",
+        "merged": "_Mergeado._{why}",
+        "promised": "_Faz parte da entrega de um requisito, {by_who}._{why}",
+        "resumed": "_Devolvido para mais uma passagem {by_who}._{why}",
+        "accepted": "_Aceito {by_who}: é o que foi pedido._{why}",
+        "staged": "_Num estágio, esperando ser experimentado antes de chegar a todos._{why}",
+        "stage_rejected": "_Ainda não, disse {who} no estágio._{why}",
+        "released": "_Liberado para produção {by_who}._{why}",
+    },
+    "en": {
+        "discarded": ("_Pull request closed without merging {by_who}._{why} Nothing was "
+                      "delivered: the card is back in the backlog, and its branch and commits are "
+                      "untouched."),
+        "skipped": ("_Skipped {by_who}._{why} The factory stopped working on it and the queue is "
+                    "free. Nothing was delivered: the card is back in the backlog."),
+        "stopped": ("_Stopped {by_who}._{why} The job was terminated in the engine; nothing was "
+                    "merged and no branch was deleted. The card is back in the backlog and can be "
+                    "picked up again."),
+        "question_answered": "_Answered {by_who}._{why}",
+        "parked": "_Parked, waiting on a person._{why}",
+        "delivered": "_Delivered._{why}",
+        "adjusted": "_One more pass, asked for {by_who}._{why}",
+        "filed": "_Filed {by_who}._{why}",
+        "promoted": "_Queued {by_who}._{why}",
+        "reordered": "_Taken out of the queue {by_who}: back in the backlog._{why}",
+        "edited": "_Edited {by_who}._{why}",
+        "question_asked": "_Asked {by_who}: the card waits on the answer._{why}",
+        "refused": "_Sent back to be refined: the factory does not build it as written._{why}",
+        "pr_opened": "_The change is in a pull request._{why}",
+        "merged": "_Merged._{why}",
+        "promised": "_Part of what a requirement delivers, {by_who}._{why}",
+        "resumed": "_Sent back for another pass {by_who}._{why}",
+        "accepted": "_Accepted {by_who}: it is what was asked for._{why}",
+        "staged": "_On a stage, waiting to be tried before it reaches everyone._{why}",
+        "stage_rejected": "_Not yet, said {who} at the stage._{why}",
+        "released": "_Released to production {by_who}._{why}",
+    },
+}
+_CARD_NOTE_WHY = {"pt-BR": " Motivo: {why}", "en": " Reason: {why}"}
+
+
+def card_note(event: str, *, who: str, why: str = "", language: str | None = None) -> str:
+    """The comment the door leaves on a card for `event`, saying who decided and why."""
+    why = (why or "").strip()
+    if event in ("closed", "withdrawn", "removed"):
+        return card_close_note(who=who, reason=why, language=language)
+    if event == "reopened":
+        return card_reopen_note(who=who, language=language)
+    said = _pick(_CARD_NOTE_WHY, language).format(why=why) if why else ""
+    return _pick(_CARD_NOTE, language)[event].format(
+        who=actor(who, language=language), by_who=by_actor(who, language=language), why=said)
+
+
+#: What the requester's conversation is told when the work on their card stopped, and when a card
+#: they were told would not be built is back. A card that is gone is `_CARD_WITHDRAWN`'s.
+_CARD_MOVED = {
+    "pt-BR": {
+        "stopped_work": ("{sig}O trabalho no cartão {ref}{title} parou e nada dele foi entregue: "
+                         "o cartão voltou para o backlog até alguém retomá-lo."),
+        "back": "{sig}O cartão {ref}{title} foi reaberto e voltou para o backlog.",
+        "pass_ready": ("{sig}A passagem {pass_number} do {ref}{title} está pronta para você "
+                       "experimentar: {link}\n\nMe diga se agora é o que você pediu, ou o que "
+                       "ainda falta."),
+    },
+    "en": {
+        "stopped_work": ("{sig}The work on {ref}{title} stopped, and nothing of it was delivered: "
+                         "the card is back in the backlog until somebody picks it up again."),
+        "back": "{sig}{ref}{title} was reopened and is back in the backlog.",
+        "pass_ready": ("{sig}Pass {pass_number} of {ref}{title} is ready for you to try: {link}"
+                       "\n\nTell me whether it is what you asked for now, or what is still "
+                       "missing."),
+    },
+}
+
+
+def card_moved(notice: str, *, ref: str, title: str = "", removed: bool = False,
+               language: str | None = None, agent_name: str = "", pass_number: int = 0,
+               link: str = "") -> str:
+    """What the requester is told, once, when the door moved their card (ADR-0055 D10)."""
+    if notice == "will_not_be_built":
+        return card_withdrawn(ref=ref, title=title, removed=removed, language=language,
+                              agent_name=agent_name)
+    title = (title or "").strip()
+    return _pick(_CARD_MOVED, language)[notice].format(
+        sig=_sig(agent_name), ref=ref_label(ref), title=f" ({title})" if title else "",
+        pass_number=pass_number, link=link)
+
+
+#: Why the door refused: where the card is, and what cannot happen to it from there (D2).
+_CARD_WHERE = {
+    "pt-BR": {"backlog": "no backlog", "todo": "na coluna {queue}, esperando a fábrica",
+              "running": "com a fábrica trabalhando nele", "waiting_on_a_person":
+              "esperando uma pessoa", "merged": "já mergeado", "staged": "em um estágio",
+              "delivered": "entregue", "closed": "fechado", "removed": "fora do quadro",
+              "": "aberto, e o quadro não diz onde"},
+    "en": {"backlog": "in the backlog", "todo": "in {queue}, waiting for the factory",
+           "running": "being worked on by the factory", "waiting_on_a_person":
+           "waiting on a person", "merged": "merged", "staged": "on a stage",
+           "delivered": "delivered", "closed": "closed", "removed": "not on the board",
+           "": "open, and its board does not say where"},
+}
+_CARD_DONE_TO = {
+    "pt-BR": {"discarded": "descartado", "skipped": "pulado", "stopped": "parado",
+              "closed": "fechado", "withdrawn": "retirado", "removed": "removido",
+              "reopened": "reaberto", "filed": "registrado", "promoted": "colocado na fila",
+              "reordered": "tirado da fila", "edited": "editado",
+              "question_asked": "parado à espera de uma resposta",
+              "refused": "devolvido para refinamento", "pr_opened": "posto num pull request",
+              "merged": "mergeado", "promised": "prometido na entrega de um requisito",
+              "resumed": "devolvido para mais uma passagem", "accepted": "aceito",
+              "staged": "posto num estágio", "stage_rejected": "recusado no estágio",
+              "released": "liberado para produção"},
+    "en": {"discarded": "discarded", "skipped": "skipped", "stopped": "stopped",
+           "closed": "closed", "withdrawn": "withdrawn", "removed": "removed",
+           "reopened": "reopened", "filed": "filed", "promoted": "queued",
+           "reordered": "taken out of the queue", "edited": "edited",
+           "question_asked": "parked on a question",
+           "refused": "sent back to be refined", "pr_opened": "put in a pull request",
+           "merged": "merged", "promised": "promised in a requirement's delivery",
+           "resumed": "sent back for another pass", "accepted": "accepted",
+           "staged": "put on a stage", "stage_rejected": "turned down at a stage",
+           "released": "released to production"},
+}
+_CARD_REFUSED = {
+    "pt-BR": "O {ref} está {where} — não pode ser {done} a partir daí. Nada foi alterado.",
+    "en": "{ref} is {where} — it cannot be {done} from there. Nothing was changed.",
+}
+_CARD_RACED = {
+    "pt-BR": ("O {ref} mudou enquanto isso era decidido, mais de uma vez — nada foi alterado. "
+              "Tente de novo."),
+    "en": "{ref} kept changing while this was being decided — nothing was changed. Try again.",
+}
+
+
+def card_refused(event: str, *, state: str, ref: str, language: str | None = None,
+                 column: str = "") -> str:
+    """Why `event` may not happen to card `ref` while it is in `state` — `""` when no board places
+    it. `column` is where the card sits AS ITS BOARD CALLS IT (#502): a card waiting in the queue
+    is in the board's `A Fazer`, and the platform's `TO-DO` names nothing the requester can find."""
+    where = _pick(_CARD_WHERE, language).get(state, state)
+    if state == "todo":
+        where = where.format(queue=column_said(column, "todo"))
+    return _pick(_CARD_REFUSED, language).format(
+        ref=ref_label(ref), where=where,
+        done=_pick(_CARD_DONE_TO, language).get(event, event))
+
+
+def card_raced(*, ref: str, language: str | None = None) -> str:
+    return _pick(_CARD_RACED, language).format(ref=ref_label(ref))
+
+
+#: A CARD WHOSE CHANGE BELONGS TO ANOTHER REPOSITORY OF THE PRODUCT (#665). A board that keeps every
+#: card in one place filed it here, and its job would run in this project's repository, where the
+#: code it changes is not: journey 0's API front ran in the web repository, changed nothing and held
+#: the floor. Queueing it is refused (`queue`); a card that reached the queue anyway is taken out of
+#: it (`pickup`), and a job started on it is not sized (`preflight`). Each names where it belongs.
+_CARD_BELONGS_ELSEWHERE = {
+    "pt-BR": {
+        "queue": ("O {ref} é de `{home}`: a mudança dele está no código de `{home}`, e os cards "
+                  "deste quadro rodam no repositório `{here}`. Ele não foi posto na fila — abra "
+                  "esse trabalho no quadro de `{home}`."),
+        "pickup": ("O {ref} é de `{home}`, e os cards deste quadro rodam no repositório "
+                   "`{here}`, onde o código que ele muda não está. Tirei da fila sem começar — "
+                   "abra esse trabalho no quadro de `{home}`."),
+        "preflight": ("o {ref} é de `{home}`, e este job roda no repositório `{here}`, onde o "
+                      "código que ele muda não está — abra esse trabalho no quadro de `{home}`"),
+    },
+    "en": {
+        "queue": ("{ref} belongs to `{home}`: its change is in `{home}`'s code, and this board's "
+                  "cards run in the `{here}` repository. It was not queued — open this work on "
+                  "`{home}`'s board."),
+        "pickup": ("{ref} belongs to `{home}`, and this board's cards run in the `{here}` "
+                   "repository, where the code it changes is not. It was taken out of the queue "
+                   "without starting — open this work on `{home}`'s board."),
+        "preflight": ("{ref} belongs to `{home}`, and this job runs in the `{here}` repository, "
+                      "where the code it changes is not — open this work on `{home}`'s board"),
+    },
+}
+
+
+def card_belongs_elsewhere(kind: str, *, ref: str, home: str, here: str,
+                           language: str | None = None) -> str:
+    """Why card `ref` is not run in `here`: its change belongs to `home` (#665)."""
+    return _pick(_CARD_BELONGS_ELSEWHERE, language)[kind].format(ref=ref_label(ref), home=home,
+                                                                 here=here)
+
+
+#: A CARD IN A COLUMN NO STAGE IS (#521). The door cannot tell where such a card is in its life, and
+#: it refuses rather than guesses — that stays. What the refusal said about it was *"map it in the
+#: project's tracker options"*, in English to every conversation, naming neither the option nor
+#: the stage: and on an Azure board with a stock process it is the FIRST thing a person meets,
+#: because Azure files every new work item into `New`, which no stage is by default, so the first
+#: queueing of the first card was refused that way. The repair is the deployment's one line, and
+#: the sentence now says it — the option the board's own row reads (`board.base.stage_option`:
+#: `columns`, `status_map` on Jira), and the stage a card a person queues waits in. A column that
+#: is some other stage is the person's to name; the backlog is only the example, said as one.
+_CARD_UNMAPPED = {
+    "pt-BR": ("O {ref} está em {column!r}, que não é uma coluna que esta plataforma mapeia, então "
+              "não há como saber em que ponto da vida o cartão está. Nada foi alterado. {repair}"),
+    "en": ("{ref} is in {column!r}, which is not a column this platform maps, so it cannot tell "
+           "where the card is in its life. Nothing was changed. {repair}"),
+}
+#: `{line}` is `board.base.option_line`'s — a STRING of JSON, quoted for YAML, because the
+#: registry's options are strings and the unquoted form is a mapping it refuses.
+_CARD_UNMAPPED_REPAIR = {
+    "pt-BR": ("Mapeie a coluna com a opção `{option}` do tracker do projeto — se é nela que um "
+              "cartão espera para entrar na fila, `{line}` faz dela o backlog — e tente de novo."),
+    "en": ("Map it with the project's tracker option `{option}` — if cards wait there to be "
+           "queued, `{line}` makes it the backlog — and try again."),
+}
+#: A row that declares no option of its own: naming one it does not read would send the person to
+#: edit something that changes nothing (`board.base.stage_option`).
+_CARD_UNMAPPED_SOMEWHERE = {
+    "pt-BR": ("Mapeie a coluna nas opções do tracker do projeto, do jeito que o fornecedor deste "
+              "quadro documenta os nomes das colunas, e tente de novo."),
+    "en": ("Map it in the project's tracker options, the way this board's provider documents its "
+           "column names, and try again."),
+}
+
+
+def card_unmapped(*, ref: str, column: str, option: str = "", language: str | None = None) -> str:
+    """Why nothing can happen to card `ref` while it sits in `column`, a column no stage is — and
+    the one line of configuration that maps it, under the tracker option `option` that THIS
+    board reads (`""` when its row declares none)."""
+    from beeverforge.adapters.board.base import option_line
+
+    option = (option or "").strip()
+    repair = (_pick(_CARD_UNMAPPED_REPAIR, language).format(
+        option=option, line=option_line(option, {"backlog": column}))
+        if option else _pick(_CARD_UNMAPPED_SOMEWHERE, language))
+    return _pick(_CARD_UNMAPPED, language).format(ref=ref_label(ref), column=column,
+                                                  repair=repair)
+
+
+#: A CARD OUTSIDE THIS PROJECT'S SLICE OF A SHARED BOARD (#752): the edit/close/remove gate's
+#: refusal (`actions/catalog.py::_stage`). It was English only, and the product view's close and
+#: remove show it (`_withdraw_refusal`), so a pt-BR project read it in English while the queueing's
+#: refusal of the same card (`board_move_said("outside_the_slice")`) spoke Portuguese (review of
+#: PR #884, point 4). `{within}` is the board's own naming of its option (`scope_named`), kept as
+#: the row spells it so the person can find the line to edit.
+_CARD_OUTSIDE_THE_SLICE = {
+    "pt-BR": ("O {ref} não está na fatia do quadro de {project}{within}, então {project} não tem "
+              "como saber se a fábrica já pegou esse card. Nada foi alterado — se ele é de outro "
+              "projeto, aja sobre ele por lá; se é do próprio {project}, inclua-o no escopo e "
+              "tente de novo."),
+    "en": ("{ref} is not in {project}'s slice of its board{within}, so {project} cannot tell "
+           "whether the factory has taken it up. Nothing was changed — if it is another "
+           "project's, act on it from there; if it is {project}'s own, put it in the scope and "
+           "try again."),
+}
+
+
+def card_outside_the_slice(*, ref: str, project: str, within: str = "",
+                           language: str | None = None) -> str:
+    """Why card `ref` may not be edited, closed or removed from `project`: it is not in the
+    project's slice of a shared board. `within` is the board's `scope_named()`, `""` when the row
+    names none."""
+    return _pick(_CARD_OUTSIDE_THE_SLICE, language).format(
+        ref=ref_label(ref), project=project, within=f" ({within})" if within else "")
+
+
+#: WHAT THE PRODUCT ROLE OWES, AS ONE LINE ON THE CARD ITSELF (ADR-0055 D11). The person cannot act
+#: on a promise, so it is not on the list of what waits on them; it is on the card it is about.
+_CARD_OWED = {
+    "pt-BR": "{agent} avisa você na conversa quando isto for entregue.",
+    "en": "{agent} will tell you in the conversation when this is delivered.",
+}
+_CARD_OWED_BACKLOG = {
+    "pt-BR": " Até lá o cartão está no backlog: o trabalho nele parou sem entrega.",
+    "en": " Until then the card is in the backlog: the work on it stopped with nothing delivered.",
+}
+
+
+def card_owed(*, agent_name: str = "", in_backlog: bool = False,
+              language: str | None = None) -> str:
+    agent = (agent_name or "").strip() or _pick(_AGENDA_AGENT, language)
+    line = _pick(_CARD_OWED, language).format(agent=agent[:1].upper() + agent[1:])
+    return line + (_pick(_CARD_OWED_BACKLOG, language) if in_backlog else "")
+
+
+#: REQUIREMENTS ARRIVED FROM SOMEWHERE ELSE (#994): what came, from where, and how many — said
+#: once to the product's room, naming the origin and never a person. The counts are the import's
+#: record's (`ProductModule.import_requirements` tells from it), and "a text nobody had agreed" is
+#: what every record says of its revisions: `importing.land` refuses, before the commit, a landing
+#: after which a requirement accepted before is not the same agreed promise, and a text that would
+#: change one is counted `beside` (review of PR #1000).
+_IMPORTED = {
+    "pt-BR": ("{sig}Chegaram requisitos de *{origin}*: {new} novo(s), {revision} revisão(ões) de "
+              "um texto que ninguém tinha acordado e {beside} guardado(s) ao lado de um acordado, "
+              "como proposta de mudar uma promessa. Nenhum está acordado ainda — revisamos juntos, "
+              "um de cada vez."),
+    "en": ("{sig}Requirements arrived from *{origin}*: {new} new, {revision} revising a text "
+           "nobody had agreed and {beside} kept beside an agreed one, as a proposal to change a "
+           "promise. None of them is agreed yet — we review them together, one at a time."),
+}
+
+
+def imported(*, origin: str, new: int, revision: int, beside: int,
+             language: str | None = None, agent_name: str = "") -> str:
+    """An import landed in the product (#994), said once to its room."""
+    return _pick(_IMPORTED, language).format(sig=_sig(agent_name), origin=(origin or "").strip(),
+                                             new=new, revision=revision, beside=beside)
+
+
+def document_ingested(*, name: str, language: str | None = None, agent_name: str = "") -> str:
+    """A document now in the product's memory, said where it was brought (#269)."""
+    return _pick(_DOCUMENT_INGESTED, language).format(sig=_sig(agent_name),
+                                                      name=(name or "").strip())
+
+
+# ── the change is ready for the person who asked for it to try (#401) ───────────────────────────
+#
+# THE ROLE SAID "EU AVISO AQUI" AND THEN WATCHED THE CARD WAIT ON THAT PERSON IN SILENCE. On a
+# deployment where a person decides the merge, the requester's own look is what the change waits
+# on: it is built, reviewed and one click from a preview, and nothing moves until somebody tries it.
+# The card's comment said so in the factory's words; the role — who had promised to tell them —
+# said nothing, and the person found out by opening the board.
+#
+# WHAT THEY CAN DO, NOT HOW THE FACTORY WORKS. The card and its title, where to open it (the
+# tracker's own link, where the preview and the approve/adjust buttons live), what the automatic
+# review said in one line, and the three moves: try it, then approve it into the product or ask
+# for an adjustment. The words are held to `CLIENT_JARGON` like every event here — "approve it into
+# the product", never the forge's verb.
+#
+# THE CARD'S LINK AND THE PREVIEW'S, NEVER THE PULL REQUEST'S (AUDIENCE_RULES,
+# `tests/test_sweep_client_surface.py`). A pull request is a mechanic in front of somebody who may
+# not be able to act on one; the card is where every move above is made, and it links to the
+# change for whoever reviews code. The two links are exempted from that guard BY NAME.
+
+_READY_HEAD = {
+    "pt-BR": "{sig}{card} está pronto para você conferir{review}.",
+    "en": "{sig}{card} is ready for you to check{review}.",
+}
+#: What the automatic review said, as a clause of the head — keyed by `verdict.headline`'s own
+#: `stance`, so this never re-reads a decision. "" (not known) says nothing rather than a guess.
+_READY_REVIEW = {
+    "approved": {"pt-BR": " — a revisão automática aprovou",
+                 "en": " — the automatic review approved it"},
+    "flagged": {"pt-BR": " — a revisão automática aprovou, com pontos para uma pessoa conferir",
+                "en": " — the automatic review approved it, with points for a person to check"},
+    "rejected": {"pt-BR": " — a revisão automática reprovou, então vale olhar com atenção antes "
+                          "de decidir",
+                 "en": " — the automatic review rejected it, so look carefully before deciding"},
+    "unread": {"pt-BR": " — nenhuma revisão automática leu esta versão",
+               "en": " — no automatic review read this version"},
+    # NEVER "APPROVED" WHEN NOTHING EXECUTED WHAT WAS ASKED (#447): the requester was told "the
+    # automatic review approved it" about a fix whose own review said no gate had run its criteria
+    "not_verified": {"pt-BR": " — a revisão automática não conseguiu verificar: nada executou o "
+                              "que o cartão pede, então confira você mesmo antes de aprovar",
+                     "en": " — the automatic review could not verify it: nothing executed what "
+                           "the card asks for, so check it yourself before approving"},
+}
+_READY_CARD_LINK = {"pt-BR": "O cartão: {url}", "en": "The card: {url}"}
+#: The first move, in the one form this deployment can offer it.
+_READY_TRY_LIVE = {
+    "pt-BR": "já dá para experimentar a mudança antes de ela entrar no produto: {url}",
+    "en": "you can already try the change before it goes into the product: {url}",
+}
+_READY_TRY_PREVIEW = {
+    "pt-BR": ("abra o cartão e inicie a prévia — leva alguns minutos — para experimentar a mudança "
+              "antes de ela entrar no produto"),
+    "en": ("open the card and start the preview — it takes a few minutes — to try the change "
+           "before it goes into the product"),
+}
+#: THE PREVIEW STARTS ITSELF (#437): said when the deployment starts it on its own
+#: (`preview.auto_start`, a runtime named) and it is not up yet. The last clause keeps it true when
+#: the cap held the start back — the card then offers the button — and the link follows from
+#: `preview_up`.
+_READY_TRY_STARTING = {
+    "pt-BR": ("aguardar a prévia, que está subindo sozinha — leva alguns minutos, e eu mando o "
+              "link aqui assim que estiver no ar (se ela não subir, dá para iniciá-la pelo "
+              "cartão) — e experimentar a mudança antes de ela entrar no produto"),
+    "en": ("wait for the preview, which is starting on its own — it takes a few minutes, and I "
+           "will send its link here as soon as it is up (if it does not come up, you can start "
+           "it from the card) — and try the change before it goes into the product"),
+}
+_READY_TRY_CARD = {
+    "pt-BR": "abra o cartão e confira a mudança",
+    "en": "open the card and check the change",
+}
+_READY_NEXT = {
+    "pt-BR": ("O que dá para fazer agora: {try_it}. Se estiver certo, é a sua aprovação no cartão "
+              "que coloca no produto; se não estiver, peça um ajuste pelo próprio cartão."),
+    "en": ("What you can do now: {try_it}. If it is right, your approval on the card is what "
+           "puts it into the product; if it is not, ask for an adjustment on the card itself."),
+}
+
+
+def ready_for_you(*, ref: str, title: str = "", card_url: str = "", review: str = "",
+                  preview: bool = False, preview_url: str = "", language: str | None = None,
+                  agent_name: str = "", preview_starts_itself: bool = False) -> str:
+    """A card's change waits on the person who asked for it (#401) — said once, where they asked.
+
+    `review` is `verdict.headline(...)["stance"]`, or "" when the review is not known here (the
+    tech-lead's round, which sees the gate and not the verdict). `preview_url` is a preview that
+    is already up; `preview` says one can be started from the card, and `preview_starts_itself`
+    that the deployment is starting it on its own (#437). Neither → "check the change"."""
+    lines = [_pick(_READY_HEAD, language).format(
+        sig=_sig(agent_name), card=_card(ref, title, language),
+        review=_pick(_READY_REVIEW[review], language) if review in _READY_REVIEW else "")]
+    if str(card_url or "").strip():
+        lines += ["", _pick(_READY_CARD_LINK, language).format(url=str(card_url).strip())]
+    if str(preview_url or "").strip():
+        try_it = _pick(_READY_TRY_LIVE, language).format(url=str(preview_url).strip().rstrip("/"))
+    elif preview and preview_starts_itself:
+        try_it = _pick(_READY_TRY_STARTING, language)
+    else:
+        try_it = _pick(_READY_TRY_PREVIEW if preview else _READY_TRY_CARD, language)
+    lines += ["", _pick(_READY_NEXT, language).format(try_it=try_it)]
+    return "\n".join(lines)
+
+
+# ── the change went in (#448 slice 3) ───────────────────────────────────────────────────────────
+#
+# WHOEVER PUT IT IN, THE PERSON WHO ASKED HEARS IT. A person's merge, the factory's own, or the one
+# a requester's acceptance gave: the change is now part of the product's code. Said only where the
+# delivery does not say it at the same moment (`events.merged_for_you`), and honest about what is
+# left — a project with stages still has them to pass. Never the forge's verb (`CLIENT_JARGON`).
+
+_MERGED_FOR_YOU = {
+    "pt-BR": "{sig}{card}: a mudança que você pediu agora faz parte do código do produto.",
+    "en": "{sig}{card}: the change you asked for is now part of the product's code.",
+}
+_MERGED_STAGES = {
+    "pt-BR": " Ela ainda passa pelas etapas deste projeto antes de chegar a quem usa o produto.",
+    "en": " It still goes through this project's stages before it reaches the people who use it.",
+}
+
+
+def merged_for_you(*, ref: str, title: str = "", stages_follow: bool = False,
+                   language: str | None = None, agent_name: str = "") -> str:
+    """The change a card's requester asked for went in — said once, where they asked."""
+    said = _pick(_MERGED_FOR_YOU, language).format(sig=_sig(agent_name),
+                                                   card=_card(ref, title, language))
+    if stages_follow:
+        said += _pick(_MERGED_STAGES, language)
+    return said[0].upper() + said[1:] if said else said
+
+
+# ── it is theirs to try before it reaches anyone (#448 slice 4) ─────────────────────────────────
+#
+# THE PERSON WHO ASKED HEARS IT IS READY TO TRY, WHERE THEY ASKED. The room's question
+# (`followup.release_question`) is the same news for whoever reads the room; this is the requester's
+# own, in their conversation (`events.staged_for_you`). The same rule as the room's: NO PIPELINE
+# VOCABULARY — never the stage's name, never the verbs that move a change between stages — and an
+# empty address changes the sentence rather than leaving a line out. What their answer does is
+# said without promising which act it is: "it decides what happens next", because who may put it
+# in front of everyone is not this sentence's to say.
+
+_STAGED_HEAD = {
+    "pt-BR": ("{sig}{card}: a mudança que você pediu está pronta para você experimentar — e ainda "
+              "não chegou a quem usa o produto."),
+    "en": ("{sig}{card}: the change you asked for is ready for you to try — and it has not reached "
+           "the people who use the product yet."),
+}
+_STAGED_TRY = {
+    "pt-BR": "Para experimentar: {where}",
+    "en": "To try it: {where}",
+}
+_STAGED_NOWHERE = {
+    "pt-BR": ("Só que eu não tenho o endereço de onde experimentar: o projeto não disse onde fica. "
+              "Se você já sabe onde olhar, confira lá; se não, peça o endereço ao time."),
+    "en": ("Except I do not have the address to try it at: the project has not said where it is. "
+           "If you already know where to look, check there; if not, ask the team for it."),
+}
+_STAGED_ASK = {
+    "pt-BR": ("Depois me diga aqui se ficou certo, ou o que ainda está errado: é a sua resposta "
+              "que decide o que acontece a seguir."),
+    "en": ("Then tell me here whether it is right, or what is still wrong: your answer is what "
+           "decides what happens next."),
+}
+
+
+def staged_for_you(*, ref: str, title: str = "", where: str = "", language: str | None = None,
+                   agent_name: str = "") -> str:
+    """A card's change is ready for the person who asked for it to try, and has reached nobody
+    else yet — said once per run of its job, where they asked."""
+    head = _pick(_STAGED_HEAD, language).format(sig=_sig(agent_name),
+                                                card=_card(ref, title, language))
+    where = str(where or "").strip()
+    middle = (_pick(_STAGED_TRY, language).format(where=where) if where
+              else _pick(_STAGED_NOWHERE, language))
+    said = "\n\n".join([head, middle, _pick(_STAGED_ASK, language)])
+    return said[0].upper() + said[1:]
+
+
+# ── their yes, at the last gate (#448 slice 4) ──────────────────────────────────────────────────
+#
+# THE REQUESTER SAID IT IS RIGHT, AND THE PROJECT DID NOT LET THEIR WORD RELEASE IT
+# (`Project.release_by_requester`, off by default). Their yes is recorded, the room is told once,
+# and both sentences say who puts it in front of everyone — a product admin — rather than leaving
+# a person who said "funcionou" to wonder why nothing happened. NO PIPELINE VOCABULARY, the rule
+# of `staged_for_you` above; "funcionou"/"it worked" is the sentence an admin types, so it is named.
+
+_SAID_RIGHT = {
+    "pt-BR": ("anotado — você experimentou o {ref} e disse que está certo, e isso fica "
+              "registrado. Colocar na frente de todo mundo que usa o produto é com um "
+              "administrador do produto: {room}"),
+    "en": ("noted — you tried {ref} and said it is right, and that is recorded. Putting it in "
+           "front of everyone who uses the product is for a product admin to do: {room}"),
+}
+_SAID_RIGHT_ROOM = {
+    "pt-BR": {"told": "avisei a sala do produto que você disse que está certo.",
+              "untold": ("não consegui avisar a sala do produto agora, então diga a {names} que "
+                         "você já experimentou.")},
+    "en": {"told": "I have told the product's room that you say it is right.",
+           "untold": ("I could not reach the product's room just now, so tell {names} you "
+                      "have tried it.")},
+}
+_TRIED_AND_RIGHT = {
+    "pt-BR": ("{sig}{card}: {who} experimentou{at} e diz que está certo. Um administrador do "
+              "produto coloca na frente de todos dizendo que funcionou."),
+    "en": ("{sig}{card}: {who} tried it{at} and says it is right. A product admin puts it in "
+           "front of everyone by saying it worked."),
+}
+_TRIED_WHO = {"pt-BR": "quem pediu", "en": "the person who asked for it"}
+_TRIED_AT = {"pt-BR": " em {where}", "en": " at {where}"}
+
+
+def requester_said_right(*, ref: str, told: bool, language: str | None = None,
+                         approvers: list[str] | None = None) -> str:
+    """What the card's requester reads when their "it worked" was recorded and did not release it:
+    that it was recorded, who puts it in front of everyone, and whether the room knows — naming,
+    when it does not, whom to tell."""
+    room = _naming(_pick(_SAID_RIGHT_ROOM, language)["told" if told else "untold"], approvers,
+                   language)
+    return _pick(_SAID_RIGHT, language).format(ref=ref_label(ref), room=room)
+
+
+def tried_and_right(*, ref: str, title: str = "", who: str = "", where: str = "",
+                    language: str | None = None, agent_name: str = "") -> str:
+    """The room's line: the person who asked for the card tried it and says it is right, and a
+    product admin's "it worked" puts it in front of everyone — said once per card and run.
+    `who` is a name a person reads, or "" for "the person who asked for it"."""
+    where = str(where or "").strip()
+    said = _pick(_TRIED_AND_RIGHT, language).format(
+        sig=_sig(agent_name), card=_card(ref, title, language),
+        who=str(who or "").strip() or _pick(_TRIED_WHO, language),
+        at=_pick(_TRIED_AT, language).format(where=where) if where else "")
+    return said[0].upper() + said[1:]
+
+
+# ── the agenda, in the person's words (#401) ────────────────────────────────────────────────────
+#
+# EVERY LINE OF THE AGENDA WAS AN ENGLISH F-STRING WRITTEN IN `agenda.py`, so a pt-BR product's
+# person read "tell you when the problem reported is fixed · owed · you" beside a conversation in
+# Portuguese, and said they had no idea what the tab was. The agenda is the product role talking
+# about what it owes them; its words live here with the rest of what it says, in both languages.
+
+#: Whom an item is about, as the object of a verb and after "from" — Portuguese contracts the
+#: preposition with the article ("da sala"), so the two forms are two entries, never composed.
+_AGENDA_WHO = {
+    "pt-BR": {"you": ("você", "de você"), "room": ("a sala", "da sala")},
+    "en": {"you": ("you", "from you"), "room": ("the room", "from the room")},
+}
+_AGENDA_SAID = {
+    "delivery_defect": {"pt-BR": "avisar {who} quando o problema reportado estiver corrigido",
+                        "en": "tell {who} when the problem reported is fixed"},
+    "delivery": {"pt-BR": "avisar {who} quando o requisito {subject} estiver pronto",
+                 "en": "tell {who} when requirement {subject} is ready"},
+    "delivery_ticket": {"pt-BR": "avisar {who} quando o cartão pedido entrar no produto",
+                        "en": "tell {who} when the card asked for is in the product"},
+    "release": {"pt-BR": "saber {from_who} se o {issue} funciona, antes de ir para o ar",
+                "en": "hear {from_who} whether {issue} works, before it goes live"},
+    "acceptance_defect": {"pt-BR": "saber {from_who} se a correção funciona",
+                          "en": "hear {from_who} whether the fix works"},
+    "acceptance_ticket": {"pt-BR": "saber {from_who} se o cartão entregue funciona",
+                          "en": "hear {from_who} whether the card delivered works"},
+    "acceptance": {"pt-BR": "saber {from_who} se o requisito {subject} funciona",
+                   "en": "hear {from_who} whether requirement {subject} works"},
+    "decision": {"pt-BR": "uma decisão {from_who}", "en": "a decision {from_who}"},
+    "question": {"pt-BR": "uma resposta sobre o {card}", "en": "an answer about {card}"},
+    "context": {"pt-BR": "uma resposta sobre como o produto funciona",
+                "en": "an answer about how the product works"},
+    # WHAT AN IMPORT LEFT OPEN (#994): read from its record and the corpus as it is now — the
+    # question itself, the decision and the text kept beside are the item's `what`
+    "import_question": {"pt-BR": "uma resposta {from_who} sobre o que chegou de {origin}",
+                        "en": "an answer {from_who} about what arrived from {origin}"},
+    "import_decision": {"pt-BR": "uma decisão {from_who} que um documento de {origin} levanta",
+                        "en": "a decision {from_who} that a document from {origin} raises"},
+    "import_change": {"pt-BR": ("um sim {from_who} para mudar o requisito {subject} como "
+                                "{origin} propõe"),
+                      "en": "a yes {from_who} to change requirement {subject} as {origin} "
+                            "proposes"},
+}
+#: The chip: whom the item waits on, as one phrase. ONLY WHAT IS AWAITED HAS ONE (ADR-0055 D11):
+#: what the role owes is not on the Pending tab, so its "owed to you" chip is gone with it.
+_AGENDA_CHIP = {
+    ("awaited", "you"): {"pt-BR": "espero de você", "en": "awaited from you"},
+    ("awaited", "room"): {"pt-BR": "espero da sala", "en": "awaited from the room"},
+}
+_AGENDA_WHEN = {"pt-BR": "desde {since}", "en": "since {since}"}
+_AGENDA_REMINDED = {"pt-BR": ", lembrei em {chased}", "en": ", reminded {chased}"}
+_AGENDA_EMPTY = {
+    "pt-BR": "Nada está esperando por você aqui.",
+    "en": "Nothing is waiting on you here.",
+}
+#: WHAT THE TAB IS, IN ONE SENTENCE — the panel draws it above the list. Only what waits on the
+#: person (ADR-0055 D11): what the role owes them is a line on the card it is about.
+_AGENDA_ABOUT = {
+    "pt-BR": ("O que {agent} espera de você: uma decisão, uma resposta, um \"funcionou?\". Cada "
+              "item abre onde ele é respondido — a conversa ou o cartão."),
+    "en": ("What {agent} is waiting for from you: a decision, an answer, a \"did it work?\". "
+           "Each one opens where it is answered — the conversation or the card."),
+}
+_AGENDA_AGENT = {"pt-BR": "o agente de produto", "en": "the product role"}
+
+
+def agenda_said(key: str, *, yours: bool, subject: str = "", issue: str = "",
+                origin: str = "", language: str | None = None) -> str:
+    """One agenda line — `key` is one of `_AGENDA_SAID`'s, chosen by `agenda._said` (or by
+    `agenda.from_the_import` for what an import left open, `origin` naming where it came from)."""
+    who, from_who = _pick(_AGENDA_WHO, language)["you" if yours else "room"]
+    return _pick(_AGENDA_SAID[key], language).format(who=who, from_who=from_who,
+                                                     subject=subject, issue=ref_label(issue),
+                                                     card=ref_label(subject), origin=origin)
+
+
+def agenda_chip(direction: str, *, yours: bool, language: str | None = None) -> str:
+    return _pick(_AGENDA_CHIP[(direction, "you" if yours else "room")], language)
+
+
+def agenda_when(since: str, chased: str = "", *, language: str | None = None) -> str:
+    """"since 2026-09-29, reminded 2026-10-01" — dates as the ledger holds them, day only."""
+    out = _pick(_AGENDA_WHEN, language).format(since=(since or "")[:10] or "?")
+    if chased:
+        out += _pick(_AGENDA_REMINDED, language).format(chased=chased[:10])
+    return out
+
+
+def agenda_empty(language: str | None = None) -> str:
+    return _pick(_AGENDA_EMPTY, language)
+
+
+def agenda_about(*, agent_name: str = "", language: str | None = None) -> str:
+    return _pick(_AGENDA_ABOUT, language).format(
+        agent=(agent_name or "").strip() or _pick(_AGENDA_AGENT, language))

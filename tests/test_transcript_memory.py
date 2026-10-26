@@ -1,0 +1,436 @@
+"""The conversation actually reaches the model — ADR-0024, layers 0 and 1.
+
+THE DEFECT THIS GUARDS IS THE ONE THIS REPOSITORY KEEPS SHIPPING. A transcript module with perfect
+unit tests, called by nothing, is indistinguishable from the amnesia it replaces: every test green,
+every reply polite, and the agent still answering "e o segundo?" as if it were the first message.
+`people.mention` shipped exactly that way and addressed every question to an empty room for weeks.
+
+So the assertions here are about REACH, in order of how easy each is to fake:
+
+  1. production code calls record() and recent() at all;
+  2. a real message through `handle()` lands two rows — what was said AND what was answered;
+  3. the SECOND message carries the first in the text that goes to the model;
+  4. and it sits in the right place in that text, because prompt caching is prefix-based.
+
+The fakes are boundary-only — the telemetry sink and the query. Everything between them is
+production code.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+
+import beeverforge.observability.query as query_mod
+from beeverforge.contracts.product import ProductConfig
+from beeverforge.contracts.project import Project, ProviderRef
+from beeverforge.memory import transcript
+from tests.the_chat_turn import chat_turn
+from tests.the_sink_door import SINK_DOOR
+from tests.the_tree_read_once import parsed
+
+
+class _Sink:
+    def __init__(self):
+        self.rows: list = []
+
+    def record(self, rec):
+        self.rows.append(rec)
+
+
+def _project():
+    return Project(name="books", repo_path="/t", language="pt-BR",
+                   tracker=ProviderRef(kind="github", repo="a/b"),
+                   forge=ProviderRef(kind="github", repo="a/b"),
+                   product=ProductConfig(docs_repo="a/docs", channel_id="C0",
+                                         agent_name="Nina"))
+
+
+@pytest.fixture()
+def store(monkeypatch):
+    """The append-only table as a list, wired at both ends so writes are readable."""
+    import beeverforge.product.authoring as authoring
+
+    sink = _Sink()
+    monkeypatch.setattr(SINK_DOOR, lambda *a, **k: sink)
+    # never a live forge from a unit test — same seam fake as test_acceptance_loop's fixture.
+    # It used to be `authoring._gh`, one layer down; the proposal sweep speaks to the port now
+    # (#95), so `land_open_proposals` is where production and this fake meet.
+    monkeypatch.setattr(authoring, "land_open_proposals", lambda **kw: [])
+
+    def _read(project, kind, *, limit=500, **kw):
+        return [{"ticket": r.ticket, "role": r.role, "ts": r.ts, "extra": r.extra}
+                for r in sink.rows if r.project == project and r.kind == kind][-limit:]
+
+    monkeypatch.setattr(query_mod, "records_of_kind", _read)
+    return sink
+
+
+# ── 1. reach ───────────────────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("fn", ["record", "recent", "render"])
+def test_production_code_calls_it(fn):
+    """Not "a test calls it" — production. The whole module is worthless otherwise."""
+    callers = []
+    for path in Path("beeverforge").rglob("*.py"):
+        if path.name == "transcript.py" or "__pycache__" in path.parts:
+            continue
+        tree = parsed(path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == fn:
+                callers.append(str(path))
+    assert callers, f"transcript.{fn}() is called by no production code — it is decoration"
+
+
+# ── 2. the raw log ─────────────────────────────────────────────────────────────────────────────
+def test_a_message_and_its_reply_are_both_recorded(store, monkeypatch):
+    """Layer 0 is written at the BOUNDARY, so a path that never reaches the model is still in the
+    record. `status` is exactly such a path — it answers from the board without an agent run."""
+
+    class _Module:
+        def settle_acceptance(self, text):
+            return None
+
+        def status_line(self):
+            return "3 em andamento"
+
+    from beeverforge.product import engine
+
+    monkeypatch.setattr(engine, "_waiting_line", lambda project: "")
+    reply = chat_turn(_project(), text="como estamos?", user="U1", thread="T1",
+                      module=_Module(), source="")
+
+    assert reply, "the shortcut answered nothing"
+    kinds = [(r.role, r.extra["text"]) for r in store.rows if r.kind == "message"]
+    assert ("person", "como estamos?") in kinds, kinds
+    assert any(role == "agent" for role, _ in kinds), f"her own words were not recorded: {kinds}"
+
+
+def test_a_crash_answers_honestly_and_still_records(store, monkeypatch, caplog):
+    """The handler swallows exceptions so the socket survives — but SILENCE IS THE WORST ANSWER.
+    Returning None meant the person wrote to their PO and got nothing, indistinguishable from
+    being ignored and invisible until they complained. Three things must happen: an honest reply,
+    a marker one alarm can page on, and the verbatim record of the message that broke her."""
+    from beeverforge.product import engine
+
+    # the turn's stages, since #266 slice 2 moved them out of the channel's `_handle`
+    monkeypatch.setattr(engine, "_answer", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("ERROR"):
+        reply = chat_turn(_project(), text="isto quebra", user="U1", thread="T9", module=None)
+
+    assert reply, "the client was left in silence"
+    assert "quebrou do meu lado" in reply, reply
+    assert "requisitos" not in reply, "a crash must not be reported as an unreadable corpus"
+    assert any("BEEVERFORGE_PRODUCT_MUTE" in r.getMessage() for r in caplog.records), \
+        "nothing an alarm can see"
+
+    said = [r.extra["text"] for r in store.rows if r.kind == "message"]
+    assert "isto quebra" in said, f"the message that broke her was lost: {said}"
+
+
+# ── 3. working memory reaches the model ────────────────────────────────────────────────────────
+def test_a_role_line_carries_the_kind_of_reply_it_was(store, monkeypatch):
+    """The platform's own sentences — a crash reply, an unavailable — are recorded as a role line
+    with a kind that is NOT an answer, so the distillation never reads them as the role's answer
+    (#457). A real answer, and every row written before this change, reads as an answer."""
+    from beeverforge.memory import recall
+    from beeverforge.product import engine, voice
+
+    # a crash: the engine's own `broke` sentence, recorded as `broke`
+    monkeypatch.setattr(engine, "_answer",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    chat_turn(_project(), text="isto quebra", user="U1", thread="K1", module=None)
+    # a real answer carries no mark, so it reads as an answer
+    transcript.record(_project().name, thread="K2", role="agent", text="uma resposta de verdade")
+
+    agent_rows = {r.ticket: (r.extra.get("text", ""), r.extra.get(transcript.KIND_MARK))
+                  for r in store.rows if r.kind == "message" and r.role == "agent"}
+    assert agent_rows["K1"][1] == "broke", agent_rows
+    assert voice.own_voice_kind(agent_rows["K1"][0]) == "broke"
+    assert agent_rows["K2"][1] is None, "a real answer carries no mark — it reads as an answer"
+
+    # `Said`, as the distillation reads the row, carries the kind — a row with no mark is an answer
+    marked = {"ts": "2026-02-01T00:00:00+00:00", "ticket": "K1", "role": "agent",
+              "extra": {"text": "broke", transcript.KIND_MARK: "broke"}}
+    old_row = {"ts": "2026-01-01T00:00:00+00:00", "ticket": "K0", "role": "agent",
+               "extra": {"text": "an answer from before this change"}}
+    assert recall._from_transcript([marked])[0].kind == "broke"
+    assert recall._from_transcript([old_row])[0].kind == transcript.ANSWER
+
+
+def test_the_second_message_carries_the_first_INTO_THE_PROMPT(store, monkeypatch):
+    """The assertion that matters: not that `recent()` returns rows, but that the prior turn is in
+    the string handed to the agent. Everything upstream can be right and this still be empty."""
+    import beeverforge.product.channel as pc
+
+    seen: dict = {}
+
+    class _Module:
+        def settle_acceptance(self, text):
+            return None  # nothing awaiting a "did it work?" in these cases
+
+        def context(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(available=True, reason="")
+
+        def answer(self, question, *, context="", conversation="", **_):
+            seen["question"], seen["conversation"] = question, conversation
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True, text="sim, o requisito 4 cobre isso",
+                                   is_defect=False, asked_for_something=False)
+
+    monkeypatch.setattr(pc, "_reply_of", lambda answer, **kw: answer.text, raising=False)
+
+    project = _project()
+    transcript.record(project.name, thread="T2", role="person",
+                      text="o fechamento contábil já roda sozinho?", actor="U1")
+    transcript.record(project.name, thread="T2", role="agent",
+                      text="hoje não — está no requisito 4, ainda não aceito")
+
+    chat_turn(project, text="e o segundo?", user="U1", thread="T2", module=_Module())
+
+    convo = seen.get("conversation", "")
+    assert "fechamento contábil" in convo, f"the prior question never reached the model: {convo!r}"
+    assert "requisito 4" in convo, f"her own prior answer never reached the model: {convo!r}"
+    assert "e o segundo?" not in convo, "the current message must not be duplicated into history"
+
+
+def test_threads_do_not_bleed_into_each_other(store):
+    """A channel is a room; a thread is an exchange. Keying on the room would answer one person
+    with another person's context, confidently."""
+    transcript.record("books", thread="A", role="person", text="pergunta sobre folha")
+    transcript.record("books", thread="B", role="person", text="pergunta sobre estoque")
+
+    only_a = transcript.render(transcript.recent("books", thread="A"))
+    assert "folha" in only_a and "estoque" not in only_a, only_a
+
+
+def test_the_budget_keeps_the_RECENT_end(store):
+    """Dropping the newest turns to fit would keep the opening of a long conversation and lose what
+    was just said — the half that actually carries the thread."""
+    for i in range(40):
+        transcript.record("books", thread="T3", role="person", text=f"turno {i} " + "x" * 300)
+
+    turns = transcript.recent("books", thread="T3", budget=1000)
+
+    assert turns, "the budget dropped everything"
+    assert "turno 39" in turns[-1].text, f"the newest turn was dropped: {turns[-1].text[:40]}"
+    assert sum(len(t.text) for t in turns) <= 1000 + 400, "the budget was not honoured"
+
+
+def test_an_unreadable_store_answers_like_an_empty_one_but_says_so(monkeypatch, caplog):
+    """Both return []. The caller MUST reply either way — but "could not read" and "nothing said"
+    are opposite facts, and the log is where that difference survives."""
+    def _boom(*a, **k):
+        raise RuntimeError("dynamo down")
+
+    monkeypatch.setattr(query_mod, "records_of_kind", _boom)
+    with caplog.at_level("WARNING"):
+        assert transcript.recent("books", thread="T4") == []
+    assert any("could not read the transcript" in r.getMessage()
+               for r in caplog.records), caplog.text
+
+
+# ── 4. position in the prompt ──────────────────────────────────────────────────────────────────
+def test_the_conversation_sits_after_the_stable_blocks_and_before_the_question():
+    """Prompt caching is prefix-based: whatever changes every turn invalidates everything after it.
+    Today there is no cache to lose; the order has to be right before there is."""
+    from beeverforge.product.role import ProductRole
+
+    captured: dict = {}
+
+    class _Role(ProductRole):
+        def _prompt(self, instruction, body, **kw):
+            captured["body"] = body
+            return body
+
+        def _ask(self, *a, **kw):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=False, raw_output="", summary="")
+
+    _Role(agent=None).answer(  # type: ignore[arg-type]
+        sandbox=None, workspace=None, question="e agora?",
+        context="corpus com 2 problemas", conversation="## Conversa até aqui\npessoa: oi")
+
+    body = captured["body"]
+    assert body.index("Current state") < body.index("Conversa até aqui") < body.index("## Question"), \
+        f"volatile blocks are out of order:\n{body}"
+
+
+# ── 5. the turn is measured ────────────────────────────────────────────────────────────────────
+def test_a_product_turn_writes_an_agent_run_row(store):
+    """ADR-0024 §5. A scan of the live table found `executor` and `repair` and ZERO product rows —
+    so the cost of talking to her was, literally, unknown while the product is sold on token
+    efficiency. Injecting history makes each turn bigger; the claim that it also makes it cheaper
+    is only checkable against rows that exist."""
+    from beeverforge.product.role import ProductRole
+
+    class _Agent:
+        name = "claude_code"
+
+        def ask(self, **kw):
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True, raw_output="", summary="tudo certo",
+                                   cost_usd=0.42, num_turns=3)
+
+    ProductRole(_Agent(), project_name="books").answer(
+        sandbox=None, workspace=None, question="e aí?")
+
+    runs = [r for r in store.rows if r.kind == "agent_run"]
+    assert runs, "a conversation with her still costs nothing measurable"
+    assert runs[0].project == "books", f"a row nobody can attribute: {runs[0].project!r}"
+    assert runs[0].cost_usd == 0.42, runs[0].cost_usd
+    assert runs[0].role == "product_answer", runs[0].role
+
+
+# ── 6. the REAL usage pattern: bare messages in the channel ────────────────────────────────────
+# The first ten tests in this file all passed while the feature was DEAD in production use. They
+# drove handle() with a fixed thread id — and the listener's key for a bare channel message was
+# the message's OWN ts, so real usage produced a fresh "thread" every message and recent() always
+# returned []. Built, tested, reached by nothing: the 14th instance, this time in MY OWN tests.
+# Every test below keys messages the way a chat TRANSPORT does: a bare message is the room's
+# rolling conversation, and a reply inside a thread is that thread's.
+#
+# THE RULE LEFT THE CORE WITH #266 SLICE 6 (ADR-0051 D16). The core's `conversation_key` read one
+# chat vendor's event (`thread_ts or channel`) and the listener was held to calling it; both tests
+# that pinned that pair were about parsing the vendor's shape, which is the add-on's now — the
+# add-on hands the door the conversation's key (`Message.conversation`). The rule itself is pinned
+# below, by the keys the tests use, and the core no longer has anything to call.
+
+
+def test_which_conversation_a_chat_message_belongs_to_is_the_transports_to_say():
+    """The core parses no vendor's event: it keeps a message in whatever conversation the transport
+    names, and a bare message's conversation is its room because the transport says so."""
+    import beeverforge.product.channel as pc
+    from beeverforge.product.engine import Message
+
+    assert not hasattr(pc, "conversation_key")
+    bare = Message(project="books", conversation="C0PROD", room="C0PROD", text="oi")
+    threaded = Message(project="books", conversation="111.222", room="C0PROD", text="oi")
+    assert (bare.conversation, threaded.conversation) == ("C0PROD", "111.222")
+
+
+def test_two_bare_channel_messages_are_ONE_conversation(store, monkeypatch):
+    """The product owner's actual pattern, from the screenshots: bare message, bare follow-up.
+    Keyed the way
+    the listener keys them, the second must carry the first."""
+    import beeverforge.product.channel as pc
+
+    seen: dict = {}
+
+    class _Module:
+        def settle_acceptance(self, text):
+            return None  # nothing awaiting a "did it work?" in these cases
+
+        def context(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(available=True, reason="")
+
+        def answer(self, question, *, context="", conversation="", **_):
+            seen["conversation"] = conversation
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True, text="a conciliação cobre os dois bancos",
+                                   is_defect=False, asked_for_something=False)
+
+    monkeypatch.setattr(pc, "_reply_of", lambda answer, **kw: answer.text, raising=False)
+
+    project, channel = _project(), "C0PROD"
+    # two BARE messages: the transport keys each to its room
+    for text in ("a conciliação já funciona?", "e para dois bancos?"):
+        chat_turn(project, text=text, user="U1", module=_Module(), thread=channel,
+                  channel=channel)
+
+    convo = seen.get("conversation", "")
+    assert "a conciliação já funciona?" in convo, \
+        f"bare message #2 forgot bare message #1 — the exact production failure: {convo!r}"
+
+
+def test_a_reply_in_a_fresh_thread_still_sees_her_channel_level_question(store):
+    """She asks at channel level (the sweep posts bare); the person replies INSIDE the thread of
+    her question — a thread id the transcript has never seen. The union with the channel's rolling
+    exchange is what lets her remember what she asked."""
+    transcript.record("books", thread="C0PROD", role="agent",
+                      text="sobre o Fechamento mensal: qual o prazo-limite?", channel="C0PROD")
+
+    turns = transcript.recent("books", thread="9999.1", channel="C0PROD")
+
+    assert any("prazo-limite" in t.text for t in turns), \
+        "her own question is the one turn she cannot remember"
+
+
+def test_the_delivery_she_announces_is_recorded(store, monkeypatch):
+    """The proactive path: the delivery notice must land in the transcript keyed by the channel.
+    Driven through the production path, not the helper in isolation — since #267 slice 3 through
+    the door, which records what it took (`door.announce`), and since #414 from the card's door's
+    own effect (`Loops("deliver")`), where the weekly sweep announced it before."""
+    import beeverforge.adapters.channel as channel_pkg
+    import beeverforge.memory.store as loop_store
+    from beeverforge.memory.ledger import DELIVERY, open_loop
+    from beeverforge.product.triage import Ticket
+    from tests.the_room_heard import delivered_through_the_door, taken_at_the_door
+
+    taken_at_the_door(monkeypatch)
+
+    class _Channel:
+        def say(self, *, project, channel, text):
+            return True
+
+        def mention(self, person, **kw):
+            return person
+
+        def client(self, project):
+            return None
+
+    rows = [open_loop(DELIVERY, "7", owner="product", ts="2026-07-28T10:00:00+00:00",
+                      context={"issues": "500"})]
+    monkeypatch.setattr(channel_pkg, "build_channel", lambda p=None: _Channel())
+    monkeypatch.setattr(loop_store, "read", lambda project: list(rows))
+    monkeypatch.setattr(loop_store, "write", lambda project, loops: len(loops))
+
+    done = [Ticket(number=500, title="a", state="closed", column="Done", body="")]
+
+    assert delivered_through_the_door(_project(), "500", tickets=done,
+                                      monkeypatch=monkeypatch) == "1 announced"
+
+    room = _project().product.channel_options["channel"]
+    hers = [r for r in store.rows
+            if r.kind == "message" and r.role == "agent" and r.ticket == room]
+    assert hers, "the delivery notice went to the channel and into no memory at all"
+    assert "requisito 7" in hers[0].extra["text"], hers[0].extra["text"]
+
+
+def test_a_bare_sim_finds_a_proposal_staged_two_messages_earlier(store, monkeypatch):
+    """The latent twin of the memory hole: staging used the same key. A proposal made in a bare
+    message was staged under that message's ts; a bare "sim" arrived under ITS ts; they never met,
+    and the confirmation fell through to the conversational model — polite reply, nothing written.
+    With both keyed to the channel, they meet. And an in-thread "sim" must find it too."""
+    import beeverforge.product.channel as pc
+
+    noted: list = []
+
+    class _Module:
+        def settle_acceptance(self, text):
+            return None  # nothing awaiting a "did it work?" in these cases
+
+        def context(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(available=True, reason="")
+
+        def note_fact(self, *, term, body, said_by, where=""):
+            noted.append(term)
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True, existed=False, detail="", ref="")
+
+    project, channel = _project(), "C0PROD"
+    project.product.admins = ["U1"]
+
+    # she staged a fact from a bare message → the transport keys it to the room
+    pc.remember(channel,
+                {"kind": "fact", "term": "erp", "body": "a firma usa Primavera", "said_by": "U1"})
+    # the person confirms INSIDE the thread of her reply → the thread's own key
+    reply = chat_turn(project, text="sim", user="U1", module=_Module(), thread="5.0",
+                      channel=channel)
+
+    assert noted == ["erp"], f"the confirmation missed the staged fact (reply: {reply!r})"
+    assert pc.pending_for(channel) is None, "consumed from the key it was staged under"

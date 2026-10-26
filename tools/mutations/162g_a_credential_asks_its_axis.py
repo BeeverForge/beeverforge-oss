@@ -1,0 +1,75 @@
+"""#162 (doctor.py:832 and its seventeen neighbours): a credential is asked of its own axis."""
+
+TEST = "tests/test_a_credential_is_asked_of_its_own_axis.py"
+CRED = "beeverforge/credentials.py"
+DOCTOR = "beeverforge/doctor.py"
+ACT = "beeverforge/runtime/temporal/activities.py"
+BOX = "beeverforge/runtime/boxed_job.py"
+
+MUTATIONS = [
+    # ── the resolver, both directions ───────────────────────────────────────────────────────────
+    # the four resolver rows re-pinned 2026-09-07: the mint is the vendor's ROW's now
+    # (`adapters/credential/registry.py`), asked through `_deployment_mint` / `_kind_of`
+    ("the tracker axis offers a GitHub mint to every vendor again", CRED,
+     "    row = _row(_kind_of(ref))\n"
+     "    return row.mint() if row is not None and row.mint is not None else None",
+     "    from beeverforge.factory import github_app_token_from_env\n\n"
+     "    return github_app_token_from_env()"),
+
+    ("…and the reverse: it offers NOTHING to anybody, including GitHub", CRED,
+     "    row = _row(_kind_of(ref))\n"
+     "    return row.mint() if row is not None and row.mint is not None else None",
+     "    return None"),
+
+    ("a row that names no vendor at all is refused — a legacy deployment goes dark", CRED,
+     '    return str(getattr(ref, "kind", "") or "").strip().lower() or _REFERENCE_KIND',
+     '    return str(getattr(ref, "kind", "") or "").strip().lower()'),
+
+    ("the tracker resolver reads the FORGE's row", CRED,
+     '    return _deployment_mint(getattr(project, "tracker", None))',
+     '    return _deployment_mint(getattr(project, "forge", None))'),
+
+    # ── the site the card named ─────────────────────────────────────────────────────────────────
+    ("the doctor's board probe falls back to the GitHub mint again", DOCTOR,
+     "        return tracker_token_for(project) or deployment_tracker_token(project)",
+     "        from beeverforge.factory import github_app_token_from_env\n\n"
+     "        return tracker_token_for(project) or github_app_token_from_env()"),
+
+    # ── the axis mix-up ─────────────────────────────────────────────────────────────────────────
+    ("the board is read with the FORGE axis's credential again", ACT,
+     "    token = tracker_token_for(project) or deployment_tracker_token(project) or None\n"
+     "    tickets, error = read_board(project, token=token)",
+     "    from beeverforge.credentials import forge_token_for\n\n"
+     "    token = forge_token_for(project) or None\n"
+     "    tickets, error = read_board(project, token=token)"),
+
+    # ── the box ─────────────────────────────────────────────────────────────────────────────────
+    # re-pinned 2026-10-19 (#822, second round): the pair is asked only after the refusal question
+    ("the box goes back to a process-wide credential", BOX,
+     "        token = (forge_token_for(carried)\n"
+     "                 or (None if axis_refusal(carried, \"forge\")\n"
+     "                     else forge_token())      # honour BEEVERFORGE_BOT_TOKEN for the "
+     "GitHub path\n"
+     "                 or deployment_forge_token(carried))",
+     "        token = forge_token()"),
+
+    # ── the ratchet ─────────────────────────────────────────────────────────────────────────────
+    # The allow-list is gone: an exemption is a `# github-only:` sentence AT THE CALL now, so a
+    # widened list is not a thing that can be mutated. What can, and must go red:
+    ("the ratchet stops walking", TEST,
+     '    out: list[str] = []\n    for path in sorted(root.rglob("*.py")):\n'
+     "        text = path.read_text()\n        lines = text.splitlines()",
+     '    out: list[str] = []\n    for path in sorted(root.rglob("nothing-*.py")):\n'
+     "        text = path.read_text()\n        lines = text.splitlines()"),
+
+    ("a bare call counts as a last resort — every honest site is flagged", TEST,
+     "            for value in node.values[1:]:", "            for value in node.values:"),
+
+    ("…and the reverse: a sentence anywhere in the file exempts every call in it", TEST,
+     '                near = "\\n".join(lines[max(0, value.lineno - 7):value.lineno])',
+     "                near = text"),
+
+    # The crossed-axis check was rewritten from a regex to an AST walk after adversarial review
+    # (the regex could not cross a nested `)` — see 162h). Its cuts live there.
+
+]

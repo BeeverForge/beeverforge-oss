@@ -1,0 +1,81 @@
+"""The one rule every `gh` call this platform makes obeys: it names what it acts on.
+
+`gh issue comment 12 --repo ""` DOES NOT FAIL. `gh` reads an empty `--repo` as no `--repo` at all,
+and then resolves the repository from the git remote of the directory it runs in. A project whose
+GitHub row carries no repository (a registry entry with no `repo`, a test's bare `Project`) was
+therefore acted on in whatever checkout the process happened to start in.
+
+MEASURED, NOT IMAGINED. From 2026-09-29 to 2026-10-01, the suite's two real-daemon preview tests
+registered `Project(name="acme")`, which builds a GitHub tracker with `repo=""`, and the preview's
+"Preview up" comment on card 12 went to `BeeverForge/beeverforge-oss` issue #12, the
+repository the suite runs from, through the operator's own `gh` login: 31 comments in three days.
+"""
+
+from __future__ import annotations
+
+import subprocess
+
+#: The flags this platform passes from configuration whose EMPTY value `gh` fills in by guessing,
+#: each with what it would guess from (review of #489). An empty `--head` on `pr create` is the
+#: branch checked out in the working directory; an empty `--base` its default branch; an empty
+#: `--owner` on a project board the authenticated account, whose projects are not the client's.
+GUESSED = {
+    "--repo": "the repository of the directory it runs in",
+    "-R": "the repository of the directory it runs in",
+    "--owner": "the account it is logged in as",
+    "--head": "the branch checked out in the directory it runs in",
+    "-H": "the branch checked out in the directory it runs in",
+    "--base": "the repository's default branch",
+    "-B": "the repository's default branch",
+}
+
+
+class LoginRefused(RuntimeError):
+    """The credential a GitHub adapter was built to use is REFUSED by the credential store, so it
+    runs nothing (#742): with no token, `gh` would run on whatever login the machine has — the
+    ambient `GH_TOKEN`, a person's `gh auth login` — and a refusal is never answered by a login.
+    A `RuntimeError`, as every other failure of a `gh` call these adapters raise is."""
+
+
+def credential_of(adapter) -> str | None:
+    """`adapter`'s token, read now — its provider's, else its static one — or a `LoginRefused`
+    when there is none and the store refused the one meant (`adapter.refused`). What each GitHub
+    adapter's `token` is, so every `gh` call, every board read and every push asks it."""
+    provider = getattr(adapter, "_token_provider", None)
+    found = provider() if provider else getattr(adapter, "_static_token", None)
+    refused = getattr(adapter, "refused", "")
+    if not found and not refused and provider is not None:
+        # A PROVIDER THAT ANSWERS NOTHING IS ASKED THE KEY'S REFUSAL NOW (review of 256c5b0): the
+        # refusal handed at construction was the store's answer then. The shipped App mint holds
+        # the key it was built with and never answers nothing — it mints or raises — so a key
+        # file changed afterwards changes nothing it mints. A provider that does answer nothing,
+        # an add-on credential row's, is asked the key's refusal again, so a refusal it meets
+        # later is as final as one at construction; with nothing refused, this is the
+        # development path it always was.
+        from beeverforge.credentials import app_key_refusal
+
+        refused = app_key_refusal()
+    if not found and refused:
+        raise LoginRefused(f"the GitHub credential {refused} — `gh` is not run on this machine's "
+                           f"own login in its place")
+    return found
+
+
+def nothing_named(args: list[str]) -> str:
+    """Why this `gh` call must not run, or `""` when it may: it passes one of `GUESSED`'s flags
+    with nothing in it, which `gh` would fill in by guessing rather than refuse."""
+    for i, arg in enumerate(args):
+        flag, inline = (arg.split("=", 1) + [None])[:2] if arg.startswith("--") else (arg, None)
+        if flag not in GUESSED:
+            continue
+        value = inline if inline is not None else (args[i + 1] if i + 1 < len(args) else "")
+        if not str(value or "").strip():
+            return (f"`gh {' '.join(args[:2])}` passes `{flag}` with nothing in it: the setting "
+                    f"behind it is empty, and `gh` would act on {GUESSED[flag]} instead. Set it.")
+    return ""
+
+
+def refused(args: list[str], why: str) -> subprocess.CompletedProcess[str]:
+    """A `gh` call that was never run, answered the way a failed one is: every caller already
+    reads a non-zero exit as "the forge did not do it", and a write raises on it."""
+    return subprocess.CompletedProcess(["gh", *args], 2, "", why)

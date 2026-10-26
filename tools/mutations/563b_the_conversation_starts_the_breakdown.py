@@ -1,0 +1,106 @@
+"""The conversation starts a requirement's breakdown on the worker, as every other door does, and is
+told what it filed when it ends (#563, ADR-0051 D18, slice 18b), proven by breaking it.
+
+Run:  .venv/bin/python tools/mutate.py tools/mutations/563b_the_conversation_starts_the_breakdown.py
+
+The claims, each a row:
+
+  1. one execution per requirement, whichever door: the conversation's start shares the panel's
+     id, and one already running is said as running;
+  2. the breakdown on the worker tells the conversation that started it what it filed, or that it
+     failed, in that conversation's language, and tells nobody when no conversation started it; a
+     failed breakdown still fails, and a telling that failed never costs the cards;
+  3. each conversation door starts it with where it was asked, says so, says one already running
+     as news, and says an engine that did not answer — the acceptance with the agreement first;
+  4. what the conversation is told: an acceptance that filed nothing says the agreement holds.
+"""
+
+TEST = "tests/test_the_conversation_starts_the_breakdown.py"
+BREAKING = "beeverforge/product/breaking.py"
+ENGINE = "beeverforge/product/engine.py"
+CONFIRM = "beeverforge/product/confirm.py"
+ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
+WORKFLOW = "beeverforge/runtime/temporal/workflow.py"
+
+MUTATIONS = [
+    # 1. one execution
+    ("TODAY'S RUN: the conversation's breakdown is a second execution beside the panel's",
+     BREAKING, "            id=breakdown_workflow_id(name, number), task_queue=TASK_QUEUE)",
+     '            id=breakdown_workflow_id(name, number) + "-asked", task_queue=TASK_QUEUE)'),
+    ("a breakdown already running is told as one this door started", BREAKING,
+     "        return RUNNING\n", "        return STARTED\n"),
+
+    # 2. the telling
+    ("the conversation that started it is never told", ACTIVITIES,
+     "    if not inp.conversation:\n        return\n    from beeverforge.product.confirm",
+     "    return\n    from beeverforge.product.confirm"),
+    ("a breakdown no conversation started is told to nobody's conversation", ACTIVITIES,
+     "    if not inp.conversation:\n        return\n    from beeverforge.product.confirm",
+     "    if False:\n        return\n    from beeverforge.product.confirm"),
+    # RE-PINNED 2026-10-11 (review of #616): the workflow tells a breakdown that did not finish
+    ("a breakdown that did not finish is not told", WORKFLOW,
+     "            if inp.conversation:\n                with contextlib.suppress(ActivityError):",
+     "            if False:\n                with contextlib.suppress(ActivityError):"),
+    ("a breakdown no conversation started is told to nobody's conversation", WORKFLOW,
+     "            if inp.conversation:\n                with contextlib.suppress(ActivityError):",
+     "            if True:\n                with contextlib.suppress(ActivityError):"),
+    ("a breakdown that did not finish is told and then reported as done", WORKFLOW,
+     "                        retry_policy=RetryPolicy(maximum_attempts=3),\n"
+     "                    )\n            raise\n",
+     "                        retry_policy=RetryPolicy(maximum_attempts=3),\n"
+     "                    )\n            return []\n"),
+    ("the telling of an unfinished breakdown tells what it filed", ACTIVITIES,
+     "    project = ProjectRegistry().get(inp.project)\n"
+     "    await _tell_the_breakdown(project, inp, None)\n    return True\n",
+     "    project = ProjectRegistry().get(inp.project)\n"
+     "    await _tell_the_breakdown(project, inp, [])\n    return True\n"),
+    ("a telling that failed costs the cards", ACTIVITIES,
+     "    except Exception:  # noqa: BLE001 — the cards stand; only the telling failed, and says so",
+     "    except ArithmeticError:  # noqa: BLE001"),
+    ("the conversation's language is lost on the way to the worker", ACTIVITIES,
+     "asked_for=inp.asked_for, language=inp.language or None)",
+     "asked_for=inp.asked_for, language=None)"),
+    ("the delivery loop is not told where the breakdown was asked", ACTIVITIES,
+     "                                   conversation=inp.conversation, requester=inp.requester)",
+     "                                   )"),
+
+    # 3. the doors
+    # RE-PINNED 2026-10-11 (#565 slice c): the role proposes the breakdown and the person's yes
+    # starts it (`confirm._confirm_breakdown`) — the three rows of the gesture's door follow it
+    ("the gesture starts it without where it was asked", CONFIRM,
+     '                                 conversation=str(entry.get("conversation") or ""),\n'
+     '                                 room=str(entry.get("channel") or ""),\n'
+     '                                 requester=requester_of(entry), language=lang or "")',
+     '                                 conversation="",\n'
+     '                                 room="",\n'
+     '                                 requester="", language=lang or "")'),
+    ("a breakdown already running is said as started", CONFIRM,
+     "    return breakdown_begun(number=number, running=how == breaking.RUNNING, language=lang)",
+     "    return breakdown_begun(number=number, running=False, language=lang)"),
+    ("an engine that does not answer the gesture is a crash", CONFIRM,
+     "    except Exception:  # noqa: BLE001 — an engine that does not answer is a sentence",
+     "    except ArithmeticError:  # noqa: BLE001"),
+    ("the acceptance starts it without where it was asked", CONFIRM,
+     '                                 conversation=conversation, room=str(entry.get("channel") or ""),',
+     '                                 conversation="", room="",'),
+    ("an acceptance whose breakdown could not start says nothing about it", CONFIRM,
+     "        return (f\"{head}\\n\\n{said['no_breakdown']}{said['no_breakdown_now']}\"\n"
+     "                f\"{said['agreement_holds']}\")",
+     "        return head"),
+
+    # 4. what the conversation is told
+    ("an acceptance that filed nothing is told the breakdown sentence", CONFIRM,
+     # RE-PINNED 2026-10-11 (review of #619): an unfinished breakdown is said first, on its own
+     '    if asked_for or any(getattr(r, "ok", False) for r in results):',
+     "    if True:"),
+    ("the conversation is told in the project's language, not its own", CONFIRM,
+     '    lang = language or getattr(project, "language", None)\n'
+     "    if results is None:",
+     '    lang = getattr(project, "language", None)\n'
+     "    if results is None:"),
+    ("a breakdown that did not finish is told that nothing was filed", CONFIRM,
+     "        return breakdown_did_not_finish(number=number, agreed=not asked_for, language=lang)",
+     "        results = []"),
+    ("an unfinished acceptance's breakdown does not say the agreement stands", CONFIRM,
+     "agreed=not asked_for, language=lang)", "agreed=False, language=lang)"),
+]

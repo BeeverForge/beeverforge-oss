@@ -1,0 +1,166 @@
+# One machine, and nothing else
+
+The shortest way to see this platform work: your own repository, your terminal, and the coding
+agent you already pay for. No account at GitHub or Jira, no personal access token, no Docker, no
+server. The factory writes a branch, opens a pull request **in your repository**, reviews it, and
+fast-forwards your base when you say so — all on the machine you are sitting at.
+
+The other door — Docker, a hosted forge, a board at your vendor — is [the GitHub
+guide](github.md), and nothing here forecloses it: the same install runs both, and a project
+registered one way does not disturb a project registered the other.
+
+## What you need
+
+| | |
+|---|---|
+| a git repository with at least one commit | the factory branches from it and merges back into it |
+| Python 3.12+ | the platform itself |
+| a coding agent on your PATH, signed in | `claude`, `codex`, `kimi` or `opencode` — **the one credential you cannot postpone** |
+
+That last row is the whole list of credentials. The harness signs in as **you**, with the login it
+already has on this machine, and nothing else here asks for a token.
+
+## Install
+
+```bash
+git clone https://github.com/BeeverForge/beeverforge-oss.git && cd beeverforge-oss
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e '.[runtime]'
+beeverforge init          # press Enter twice: your code and your tickets live HERE
+```
+
+`init` writes a file for this deployment. Answered with its defaults it asks for no credential at
+all — the two axes read `local`, and the file says in words what that means.
+
+The `runtime` extra is the library the durable engine's worker runs on, and the panel's page needs
+it as well; `run` and `poll` work without it. `beeverforge up` starts the engine and its worker
+only when both the extra and the `temporal` binary are here, and names whichever one is missing.
+
+The file also says where the three things `up` starts are: `TEMPORAL_ADDRESS` (the engine),
+`TEMPORAL_UI_URL` (the engine's UI, what the panel's **Engine ↗** links open) and
+`BEEVERFORGE_PANEL_URL` (the panel, what every card link points at). `up` starts each one on the
+port its line names and hands the same address to everything it starts, so moving one — 8080 is
+the usual collision — is editing that one line. `beeverforge up --panel-port 9000` moves the panel
+for one run. A line `up` cannot start on, such as an engine on another machine, is refused in a
+sentence; `beeverforge doctor` checks that all three answer.
+
+## Register your repository
+
+```bash
+beeverforge project init myapp ~/code/myapp
+```
+
+A filesystem path registers as itself: the forge is your own repository, the board is a file
+beside the registry, and there is no CI to observe. The command scaffolds
+`.beeverforge/project.yaml` — **commit it on your base branch**, because that file is what the
+factory reads to know how to build and check your project.
+
+Then check the machine:
+
+```bash
+beeverforge doctor myapp
+```
+
+On this door a green report is the whole prerequisite list: no container runtime is needed, no
+token is missing, and the agent's credential is the login you already have.
+
+It will name one more step, and it is the last one:
+
+```bash
+beeverforge box prove myapp
+```
+
+Your `setup:` and your `validate:` run in a worktree of your repository, and the coding agent is
+asked one real question to find out whether it can log in at all — a few tokens against a whole
+agent pass that would otherwise be spent discovering the same thing. **Nothing is picked up until
+this is green**, which is why `poll` says *held* rather than running a card when it is not.
+
+## Write a card and run it
+
+```bash
+beeverforge act card_create -p myapp -P title="Add a health endpoint" -P body="## Objective
+Serve 200 at /health
+
+## Acceptance criteria
+- GET /health returns 200
+- a test covers it"
+
+beeverforge act card_move -p myapp -i 1 -P column=TO-DO
+beeverforge poll myapp
+```
+
+`poll` takes what is in TO-DO, one card at a time. The card walks the columns as the job moves —
+In progress while the agent works, In review when the pull request is open, Needs Review while it
+waits for a person to review or merge it, **Done** when the merge lands and nothing follows it.
+
+The panel shows the same thing in a browser, including the Board and the pull request:
+
+```bash
+beeverforge serve        # http://localhost:8787
+```
+
+On the Board, **new card** opens a form with the sections above, and the box under it says what
+pickup would make of the card while you write it — the same gate `poll` runs, asked of the draft.
+A card the gate would refuse can still be saved in Backlog; it just says so. `card_check` asks the
+same question from a shell:
+
+```bash
+beeverforge act card_check -p myapp -P title="Add a health endpoint" -P body="## Objective
+Serve 200 at /health"
+```
+
+## What happens to your working tree
+
+Nothing you did not ask for. The job runs in a git worktree of its own; your checkout is only
+touched by the fast-forward itself, and only when it is safe:
+
+- **an unrelated edit of yours** — the merge lands and your edit stays;
+- **an edit over the same lines** — the merge is refused, in git's own words, on the card. Your
+  file is exactly as you left it and the pull request stays open;
+- **a base you have checked out somewhere else** — refused for the same reason, by name;
+- **a card's branch you have out yourself** — a tree you made to review the pull request, or
+  your own checkout. Git lets a branch be out in one working tree only, so the job that needs it
+  (an adjust, a repair, a resumed attempt, a re-review) waits for you instead, and the card names
+  the path and the command that frees it. `resume` checks again. What you were told to keep stays
+  yours:
+  - when the job continues the pull request, the branch is kept: commit what is there, then
+    `git -C <repo> worktree remove <path>`;
+  - when the job builds the branch again (a fresh start), the card gives
+    `git -C <path> switch -c <a branch of yours>`, which keeps your commits on a branch of your own
+    and frees the card's branch in one command;
+  - a review tree you deleted with `rm -rf` still holds the branch, because git keeps its
+    registration; the card says the directory is not there, and `git -C <repo> worktree remove
+    <path>` frees it. On a fresh start it first gives `git -C <repo> branch <a branch of yours>
+    <branch>`, because what you committed there is on the card's branch, which the job builds
+    again. If the directory is on a disk that is not mounted, mount it and resume instead.
+
+  Nothing the job did not create is removed, and the job never runs `git worktree prune` in your
+  repository. A tree of the job's own that you locked is left as it is, at the start of a job and
+  at its end; on a fresh start the card also gives `git -C <repo> worktree move <path> <a path of
+  yours>`, because the job needs that path back.
+
+  A card that runs again finds what its earlier run left at the job's path. Its own working tree
+  that git has forgotten (a refresh of the deployment's copy of the repository forgets them all)
+  is removed, and so is one its own `git worktree add` left locked when the job was killed while
+  git checked it out: the job marks that add while it runs, so it can tell it from a lock of
+  yours. Anything else at that path is left as it is, a lock you made included, and the card says
+  whose it is and gives the command that moves it (`git -C <owner> worktree move <path> <a path of
+  yours>` for another repository's working tree, `mv` otherwise).
+
+## What this door does not do
+
+- **Nothing is hosted, so nothing is shared.** The board, the pull requests and the journal live in
+  files on this machine. A second person cannot see them without the other door.
+- **No CI is observed**, because there is none to observe: the manifest's `validate:` commands are
+  the gate, and they run in the box before the pull request is opened.
+- **The agent still reaches its own endpoint.** That is the product: the model runs remotely and
+  you pay for it. Everything else stays here.
+- **No preview of a change, unless you opt in.** A preview runs the whole product from your
+  compose file on a Docker daemon, and this door needs no Docker, so `init` leaves previews off and
+  every card says so. With Docker installed, four lines turn them on — and what a preview can then
+  reach on this machine is measured, not promised:
+  [previews on one machine](previews.md#3--one-machine-off-until-you-opt-in) says what opting in
+  means before you do it.
+
+When you outgrow it, [the GitHub guide](github.md) is the same platform with the hosted axes
+switched on — and `docs/ONBOARDING.md` is the long walk through both.

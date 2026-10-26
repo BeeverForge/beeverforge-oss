@@ -1,0 +1,1039 @@
+# Deployment configuration — every knob of a running installation
+
+> **Not the one you want first.** If you are setting up a project, read
+> [`reference/configuration.md`](reference/configuration.md) — it explains the three places
+> configuration lives (the manifest, the registry, the environment) and who owns each. THIS file is
+> the operator's reference for a deployment that already exists: infrastructure, parameters,
+> rotation, and the optional modules.
+
+> **It drives `infra/`, which is not in this tree.** That directory and the deployment it stands
+> up ship with the `beeverforge-aws` **add-on package** — one cloud realisation, never the
+> platform ([STATUS.md](STATUS.md) lists what leaves with it). Every `infra/…` path below is a
+> path inside that package's checkout, and every parameter store, region and console name with
+> it; a deployment on your own machines has none of them and configures itself through
+> `.env.compose` and the registry.
+
+Every knob of the deployed system and how to change it. The examples use `eu-west-2`; use your
+own region. All AWS commands assume your credentials are exported. Nothing here is a console
+click — the durable config is IaC (`infra/terraform/`) + a few SSM parameters. See also
+the `beeverforge-aws` package's own `docs/runbook.md` (incident response on that deployment) and
+[`glossary.md`](glossary.md).
+
+> **`SSM_PREFIX` — the parameter namespace you own.** Every secret below lives at
+> `<SSM_PREFIX>/<name>`. It is terraform's `ssm_prefix` variable and, for `infra/deploy.sh`, the
+> `BEEVERFORGE_SSM_PREFIX` environment variable; both default to `/beeverforge`. Nothing here names a namespace
+> belonging to somebody else — you create these parameters in your own account. Export it once and
+> every command on this page copy-pastes:
+>
+> ```bash
+> export SSM_PREFIX="/beeverforge"   # the default; or whatever namespace your deployment owns
+> ```
+
+---
+
+## 1. Agent credential pool (token failover)
+
+The coding agent's credentials live in **SSM Parameter Store** (SecureString, free) as a
+**JSON array** — so one exhausted or revoked token fails over to the next before the job
+pauses (see [`autonomous-flow.md`](autonomous-flow.md)).
+
+- **Parameter:** `$SSM_PREFIX/agent-tokens`
+- **Format:**
+  ```json
+  [
+    {"id": "primary", "type": "subscription", "token": "sk-ant-oat01-..."},
+    {"id": "backup",  "type": "subscription", "token": "sk-ant-oat01-..."}
+  ]
+  ```
+  - `type`: `subscription` (sets `CLAUDE_CODE_OAUTH_TOKEN`) or `api` (sets `ANTHROPIC_API_KEY`).
+  - Order matters: the agent tries them top-down, rotating on a rate-limit / auth stop.
+    Only when **all** are spent does the job pause (30-min durable backoff).
+- **Set / update the pool:**
+  ```bash
+  POOL='[{"id":"primary","type":"subscription","token":"<TOKEN-A>"},
+         {"id":"backup","type":"subscription","token":"<TOKEN-B>"}]'
+  aws ssm put-parameter --region eu-west-2 --name "$SSM_PREFIX/agent-tokens" \
+      --type SecureString --value "$POOL" --overwrite
+  ```
+  Picked up **per job launch** — no redeploy. A single token is fine (`[{...one...}]`);
+  add more only when you want failover / more throughput.
+- **Get a subscription token:** `claude setup-token` (on a machine logged into the plan).
+- **No pool set?** The agent falls back to the single `$SSM_PREFIX/claude-oauth-token` (§2).
+
+---
+
+## 2. Secrets
+
+All secrets are **SSM Parameter Store SecureString** (free; the platform moved off Secrets
+Manager, which charges $0.40/secret/mo and none of its rotation is used here). ECS injects them
+into the worker / sandbox / panel at task start via the execution role.
+
+| Parameter | What it is | Rotate when |
+|---|---|---|
+| `$SSM_PREFIX/agent-tokens` | the agent token **pool** (§1) | a token is revoked / you add capacity |
+| `$SSM_PREFIX/claude-oauth-token` | single Claude token (fallback) | ~1y, or on revoke |
+| `$SSM_PREFIX/temporal-api-key` | Temporal Cloud API key | **~90 days** (Cloud keys expire) |
+| `$SSM_PREFIX/bot-app-private-key` | GitHub App private key (PEM) | on GitHub App key rotation |
+
+**Set / rotate any of them:**
+```bash
+aws ssm put-parameter --region eu-west-2 --name "$SSM_PREFIX/<name>" \
+    --type SecureString --value "<value>" --overwrite
+# PEM from a file:
+aws ssm put-parameter --region eu-west-2 --name "$SSM_PREFIX/bot-app-private-key" \
+    --type SecureString --value "$(cat key.pem)" --overwrite
+```
+After rotating a secret the **worker/panel materialize it at startup**, so force a fresh
+task to pick it up:
+```bash
+aws ecs update-service --cluster beeverforge-sandbox --service beeverforge-worker --force-new-deployment
+aws ecs update-service --cluster beeverforge-sandbox --service beeverforge-panel  --force-new-deployment
+```
+Sandbox (job) tasks read the current value per launch — no action needed.
+
+---
+
+## 3. The panel (deployed)
+
+The panel runs on **AWS App Runner** (`beeverforge-panel`) — a managed container host that gives
+a **stable HTTPS URL** out of the box, so a link shared with a partner never breaks. It's
+gated by a **token**, not by IP (right for dynamic IPs + sharing). App Runner can't run
+ARM, so the panel uses a dedicated **amd64** build of the worker image (worker/jobs stay
+ARM/Graviton). Defined in `infra/terraform/panel_apprunner.tf`, OFF by default.
+
+- **Build the amd64 panel image + deploy:**
+  ```bash
+  SHA=$(git rev-parse --short HEAD); ECR=<your-aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com
+  aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin "$ECR"
+  docker build --platform linux/amd64 --build-arg BASE_PLATFORM=linux/amd64 --provenance=false \
+      -f docker/worker.Dockerfile -t "$ECR/beeverforge-worker:${SHA}-amd64" .
+  docker push "$ECR/beeverforge-worker:${SHA}-amd64"
+
+  cd infra/terraform
+  export TF_VAR_panel_apprunner_image_tag="${SHA}-amd64"
+  export TF_VAR_panel_token="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+  terraform apply -var image_tag=<current-worker-sha>       # image_tag = the ARM worker tag
+  echo "panel token: $TF_VAR_panel_token"                   # keep it — it's the access key
+  terraform output -raw panel_apprunner_url                 # → https://xxxx.eu-west-2.awsapprunner.com
+  ```
+  - `panel_token` → `BEEVERFORGE_PANEL_TOKEN`. **All `/api/*` routes require it** (reads too); the
+    HTML shell is open but useless without it. Sent as a Bearer header (fetch) or a
+    same-origin cookie / `?token=` (SSE). The live socket (`/api/stream`) reads all three, in
+    that order, and is opened or refused on exactly the answer a `GET` would get — a browser
+    cannot set a header on a WebSocket, a dashboard of your own can. Share the **URL + this
+    token** with viewers. The product chat's socket (`/api/product/stream`) is gated the same
+    way as a read of the product area, so a product credential opens it; the page opens it with
+    the cookie alone and puts no credential in its address.
+  - **`BEEVERFORGE_PANEL_TOKENS` — one secret per person (C-26).** Prefer this: with the shared token
+    alone, everybody holding it is the same person, so *who approved that production release* has
+    no answer. Rows are `token:id[:display]`, comma-separated:
+
+    ```
+    BEEVERFORGE_PANEL_TOKENS="s3cret-a:ana:Ana Lima,s3cret-b:leo:Leo Martins"
+    ```
+
+    Every action's audit line then names the person instead of the word `panel`. The shared token
+    keeps working alongside it (a caller presenting it is recorded as `anonymous`, and one
+    `BEEVERFORGE_IDENTITY_ANONYMOUS` log line says so), so a deployment can migrate without an outage —
+    and **either variable alone closes the panel**. With *neither* set the panel is open, which is
+    the local-development posture and must not be the production one.
+  - **`BEEVERFORGE_PRODUCT_TOKENS` / `BEEVERFORGE_PRODUCT_TOKEN` — a credential that is NOT an operator's.**
+    Same two shapes as above, for somebody who writes requirements and does not run the floor —
+    a business analyst, typically. A caller presenting one may use the five product actions
+    (`product_status`, `product_say`, `product_propose`, `product_accept`, `product_drop`) and is
+    refused every other row **by name**: `merge`, `skip`, the production-release gate.
+
+    ```
+    BEEVERFORGE_PRODUCT_TOKENS="s3cret-c:bia:Bia Rocha"
+    ```
+
+    This is a different question from `admin`, and both answers are needed. The holder *is* an
+    admin of the product area — accepting a requirement is the most consequential act there — and
+    still cannot land a pull request. Before these existed the only way to let a BA propose a
+    requirement was to hand over the panel token, which also handed over the merge button.
+
+    A secret configured in **both** a panel variable and a product one resolves to the **product**
+    credential: a copy-paste mistake must not be able to widen a BA into an operator. And these
+    variables **count as configuration** — a deployment that sets only these is closed, not open.
+
+    **The product owner reads the board too** (#562): a product credential may open
+    `/p/<project>/board` for a project with a product role and read it (`GET /api/board/<project>`),
+    with no second credential, and a card on it (`?card=`) as their own page does. Not a pull
+    request's diff (`?pr=`): code stays on the floor. Moving a card stays an action of the board;
+    what the product owner could already do to a card the role filed — close it, correct it — is
+    still theirs.
+  - **`BEEVERFORGE_BOARD_TOKENS` / `BEEVERFORGE_BOARD_TOKEN` — a credential for the floor and
+    nothing of the product owner's** (#562). Same two shapes, for whoever runs the board and is not
+    the product owner: the
+    holder reaches the floor — the board, the jobs, the actions — and is refused the product
+    owner's area **by name**: its page, its chat, its documents and attachments, the `product_*`
+    rows. The panel token stays what it was, the administrator's, and reaches both.
+
+    ```
+    BEEVERFORGE_BOARD_TOKENS="s3cret-d:leo:Leo Martins"
+    ```
+
+    A secret in both a product and a board variable resolves to the product credential, as above;
+    these variables count as configuration too.
+  - `BEEVERFORGE_IDENTITY` names the identity provider; `local` (the default) is the variables above.
+    A provider that asserts groups grants a scope by naming it (`product`); groups it does not
+    recognise are ignored rather than treated as areas. SAML and the like are add-ons registered
+    as `identity.<kind>` in the `beeverforge.adapters` entry-point group
+    (`beeverforge/identity/registry.py` consults it), not a second gate.
+  - **People by invitation — `beeverforge people invite <id>`.** The token variables are the
+    operator's; the tenth person does not get one changed to be able to say yes to a requirement.
+    An operator (from the worker's shell, or the `people_invite` action on the panel) issues a
+    one-time link; the person opens it, chooses a name and a password (at least 12 characters,
+    stored as scrypt), and is a **known** person `via=local` with **who vouched for them**
+    recorded. From then on the panel has a sign-in form at `/auth/login` and `/auth/logout` ends
+    a session — and what it left open: the panel's live streams ask about the credential they
+    were opened with again every few seconds, whatever the identity provider, and close with a
+    typed `ended` event once it is revoked, expired or no longer allowed their path.
+    `--product` scopes them to the product surface, exactly as a
+    `BEEVERFORGE_PRODUCT_TOKENS` row would, and `--board` to the board, as an
+    `BEEVERFORGE_BOARD_TOKENS` row would (an invitation with neither is the administrator's); `beeverforge people list` shows who is registered and
+    which links are still open (a link lasts 7 days, a session 30). `beeverforge people revoke
+    <id>` (the `people_revoke` action) takes a person off again — their registration, every
+    session they hold and any link still open for them — and refuses the last person registered
+    while no token variable is set, since the panel would then open to whoever arrives; revoking
+    the last person invited to neither area leaves nobody but the shell to invite an
+    administrator. Not open sign-up: a person
+    nobody vouched for would be a name in an audit line nobody stands behind. The people live in
+    the metrics store the worker and the panel share (`BEEVERFORGE_METRICS_SINK=sqlite` on
+    compose); a deployment whose sink keeps nothing is told so at the shell, before a link is
+    minted. **Once anybody is registered the panel is closed** — the same rule as setting a
+    token variable. **And while that store cannot be read the panel is closed too**, answering
+    `503 identity provider unavailable` rather than `401`: it cannot tell who is registered, and
+    that is not the same as nobody being. The panel's log names the cause
+    (`BEEVERFORGE_PEOPLE_UNREADABLE`); a token from the variables above needs no store and still
+    gets in; and it clears by itself, with nothing restarted, when the store answers again.
+  - **`BEEVERFORGE_IDENTITY=oidc` — log in through your own identity provider.** OpenID Connect is
+    a standard, not a vendor, so the row ships in the core: Entra ID, Okta, Keycloak, Google and
+    Auth0 all speak it. Register the panel as a web application at the provider with the
+    callback `https://<panel>/auth/callback`, then:
+
+    ```
+    BEEVERFORGE_IDENTITY=oidc
+    BEEVERFORGE_OIDC_ISSUER=https://login.microsoftonline.com/<tenant-id>/v2.0   # or your Keycloak realm, Okta org, https://accounts.google.com …
+    BEEVERFORGE_OIDC_CLIENT_ID=<the client id the provider issued>
+    BEEVERFORGE_OIDC_CLIENT_SECRET=<its secret — optional; a public client uses PKCE alone>
+    BEEVERFORGE_OIDC_REDIRECT_URL=https://<panel>/auth/callback   # set it behind a TLS-terminating proxy
+    BEEVERFORGE_OIDC_GROUPS="BF-Product=product"                   # <provider group>=<platform group>, comma-separated
+    ```
+
+    The panel sends a browser with no credential to `/auth/login`; the provider's `id_token`
+    comes back as the panel credential and every request is verified against the issuer's
+    published keys — no session store. **Who may log in at all is decided at the provider**
+    (assign the application to the people or groups who may enter: *user assignment required*
+    on Entra, app assignment on Okta, an *Internal* app on Google); the platform decides what
+    they may reach. `BEEVERFORGE_OIDC_GROUPS` maps a provider group to the platform's word for
+    it — `product` scopes its members to the product surface, as `BEEVERFORGE_PRODUCT_TOKENS`
+    does, and `floor` to the board, as `BEEVERFORGE_BOARD_TOKENS` does — and a group not named passes through unchanged, so a project's `admins` may name it
+    directly — **which means a group name the provider emits can match an allowlist entry on its
+    own**: the map is not the only thing that decides, so read `admins` and `product.admins` as
+    lists of *ids or group names* and pick names your directory does not already use by accident.
+    A person's id is their `email` claim (`BEEVERFORGE_OIDC_ID_CLAIM` names another;
+    `BEEVERFORGE_OIDC_GROUPS_CLAIM` names the groups claim, default `groups`;
+    `BEEVERFORGE_OIDC_SCOPES` the scopes asked for, default `openid profile email`). Spell it the
+    same way in `admins` and `product.admins`. **An `email` id must be one the provider marked
+    verified** (`email_verified`): assigning the application gates who may *enter*, not which
+    address an admitted person claims, and on a directory that admits self-asserted addresses —
+    guest identities on Entra, self-registration on Keycloak, a database connection on Auth0 —
+    an unverified address would be an allowlist entry anyone could take. A provider that emits no
+    `email_verified` at all is accepted only when the deployment writes that down:
+    `BEEVERFORGE_OIDC_TRUST_UNVERIFIED_EMAIL=1`. `/auth/logout` ends the panel's session — the
+    provider's own session outlives it, so the next login is usually silent. A misconfigured row
+    refuses every request with a 503 naming the variable, never falls back to open; a token
+    deployment's variables are ignored on an `oidc` one.
+  - The URL is **stable** — it doesn't change on redeploy/restart.
+- **Update the panel after code changes:** rebuild the amd64 image with a new tag and
+  re-apply with the new `TF_VAR_panel_apprunner_image_tag` (auto-deploy is off, so the tag
+  change is what rolls it).
+- **Turn OFF:** `unset TF_VAR_panel_apprunner_image_tag` → `terraform apply` → the service
+  is destroyed.
+- **Cost:** ~$5–8/mo (0.25 vCPU / 0.5 GB; active vCPU billed only while someone's viewing).
+- **Note:** an older Fargate-based panel (`panel_service.tf`, gated by `panel_allowed_cidr`)
+  is kept OFF as a fallback; App Runner is the deployed one.
+
+---
+
+### The default front end, on or off
+
+**`BEEVERFORGE_DEFAULT_FRONT_END`** — `on` (the default) or `off`. The panel's page is BeeverForge's
+default front end, and it uses the same API any other front end would. With `off`, the panel's
+process serves the API (`/api/*`), its two streams (`/api/stream`, `/api/product/stream`), the
+sign-in (`/auth/*`) and the previews, and no page: `/`, `/p/…`, `/product/…` and `/logs/…` answer
+404, saying why. Turn it off when a deployment has screens of its own; a dashboard served from
+another origin is admitted by `BEEVERFORGE_PANEL_ORIGINS`. A value that is neither `on` nor `off`
+keeps the page on, and the log says so. `beeverforge init` writes the line into `.env.compose`.
+
+## 4. Prod-release approvers (panel)
+
+Only relevant when a project promotes to prod. Approvers authenticate the durable
+approval signal.
+```bash
+export TF_VAR_prod_approvers="alice,bob"   # comma-separated logins → BEEVERFORGE_PROD_APPROVERS
+```
+Locally: `beeverforge approver add <login>` (password prompt; salted-KDF stored).
+
+---
+
+## 5. Projects
+
+A project is **data, not code**. Two places, both committed:
+
+1. **`deploy/registry.yaml`** (baked into the worker image) — the platform's list of
+   projects: name, repo, board owner/number, forge/tracker.
+2. **`.beeverforge/project.yaml`** in *that* project's repo — its gates, validation commands,
+   reviewers, environments, and `merge_policy`.
+
+**Add a project:** edit both, then `infra/deploy.sh` (rebuilds the image with the new
+registry). Locally you can also register via the panel's **New project** or
+`beeverforge project add ...`.
+
+Key `.beeverforge/project.yaml` fields. The manifest is **strict** — an unknown key (a typo like
+`max_cost:`) fails the manifest load, it is never silently ignored:
+```yaml
+merge_policy: auto        # auto-merge green + approved PRs; or `human`
+environments: {}          # map of name → target; e.g. {staging: {...}, prod: {...}}. Empty → stop at the PR.
+# NOTE: the durable merge-wait (14d) and prod-approval window (3d) are workflow-level
+# defaults, NOT manifest fields — do not set them here.
+
+# Cost ceiling (ADR-0002). Opt-in (unset → off).
+# max_cost_usd: 8.0       # per-token (API) billing only — see note below
+
+# DEPRECATED — `max_plan_files` and `max_plan_steps` are still ACCEPTED by the manifest and are
+# read by NOTHING (ADR-0013: sizing is INVEST-only — a rename or a legitimately full-stack
+# feature may touch many files and still be one ticket). They were documented here as a live
+# blast-radius gate, so a project could set them, load cleanly, and run with no ceiling at all
+# while believing it had one. The loader now says so out loud when a manifest declares them.
+# Use `max_cost_usd` for a real ceiling.
+
+# Bounded review-repair (ADR-0006). On a REJECTED review with actionable findings, the
+# executor gets this many autonomous fix attempts (+ an independent re-review) before the PR
+# is handed to a human. Default 1 (the review is subjective — more rounds risk ping-pong);
+# 0 disables (straight to human). Tune per project.
+review_repair_max_attempts: 1
+
+# On-demand e2e (ADR-0008). A ticket with the `e2e_label` isn't implemented — the platform
+# DISPATCHES this workflow (a workflow_dispatch GitHub Actions workflow), watches it, and
+# reports pass/fail on the ticket. Lets e2e leave the heavy every-PR CI. Unset workflow → off.
+e2e_workflow: e2e.yml     # the workflow to dispatch (gh workflow run)
+e2e_label: e2e            # the board/issue label that routes a ticket to "just run e2e"
+
+# Post-merge deploy WATCH (ADR-0005). Opt-in; unset → no watch. After the bot merges to
+# main, the repo's OWN CI deploys; the platform observes that run on the merge commit and
+# notifies its outcome. It NEVER blocks — the merge already freed the floor.
+post_merge_deploy:
+  workflow: deploy.yml    # the deploy workflow to observe (gh run list --workflow)
+  env: dev                # label for the notification ("dev deploy ok")
+  timeout_minutes: 30     # give up watching after this → notify a timeout, never hang
+```
+
+> **`review_repair_max_attempts` — react to a rejection, once (ADR-0006).** A rejected review
+> with concrete findings gets one bounded autonomous fix + a fresh re-review before parking for
+> a human, so the common case (a fixable rejection) self-heals and the floor-at-merge queue
+> keeps flowing. The cap is the anti-ping-pong mechanism; raise it only if usage shows it helps.
+>
+> **It requires `review_mode: blocking`, and the default is `advisory`.** Under `advisory` the
+> review is reported and never gates, so a rejection has nothing to react to and this loop never
+> runs — on default settings, no ticket has ever self-healed from a rejected review. Documenting
+> the attempt count without the mode that reaches it described a behaviour no default deployment
+> has.
+
+> **`e2e_workflow` — deliberate e2e, not every-PR (ADR-0008).** e2e is heavy, so it comes off
+> the PR CI and runs when you drop an `e2e`-labelled ticket: the platform dispatches the
+> workflow, watches it, and comments pass/fail on the ticket (DONE / ON_HOLD). Pair it with a
+> `workflow_dispatch` e2e workflow in the repo and dropping e2e from the required checks.
+
+> **Why these matter (ADR-0002 → superseded on sizing by ADR-0013).** Sizing now happens
+> BEFORE any Fargate: the worker's pre-flight gate (`preflight: {enabled, code_check}`)
+> judges the ticket text (INVEST) and the real blast radius over a cached checkout — an
+> oversized ticket is SPLIT autonomously into `Plan Na/Nb` children (Backlog + notify), an
+> unsizable one parks with questions. The in-run plan gate remains as a second net during
+> the transition. Effort is governed by the TICKET-wide `effort_budget_turns` (default
+> **400**, cumulative across executor + repairs + recoveries + resumes); a stop mid-work
+> triggers the autonomous recovery ladder (`recovery_max_attempts`, default **2**:
+> continue-session, then a fresh recovery pass) and ANY stop preserves the partial work
+> (resumable hold). The per-invocation turn cap is only a runaway disjuntor (default
+> **200**, tune with `BEEVERFORGE_MAX_TURNS`) — never a task-size limit.
+>
+> **`max_cost_usd` is opt-in and only meaningful under per-token (API) billing.** On a
+> Claude **subscription** the reported cost is notional, so leave it unset — the sizing gate
+> and the turn cap are the runaway guards. `myapp` (subscription) leaves it unset.
+>
+> **`post_merge_deploy` observes, it never blocks (ADR-0005).** When the repo deploys itself
+> on push to main, the platform spawns an *abandoned* durable child at merge that polls the
+> deploy run on the merge commit and notifies success / failure / timeout. The job itself
+> completes at merge, so the floor is freed for the next ticket immediately — the watch is
+> off the critical path. Leave it unset for repos with no self-deploy (or no dev to watch).
+
+### One deployment, one GitHub organisation
+
+**The rule.** Every GitHub project in one deployment's registry belongs to one GitHub organisation
+(or one personal account). A Jira or Azure DevOps project is not counted; only the axes whose
+kind is `github`, and their `board_owner`.
+
+**The reason.** When the forge credential is the App, the deployment authenticates to GitHub as
+one GitHub App installation, and the installation id is one process-wide variable,
+`BEEVERFORGE_GH_APP_INSTALLATION_ID`, not a field of a project. A GitHub App installation belongs
+to exactly one organisation or personal account, so it reaches only that account's repositories:
+a project in another organisation would answer 404 on every forge read, on a repository you can
+open in your browser. The Slack credential is per project; this one is not.
+
+**How it is held.** `beeverforge project add` refuses a project in a second organisation and
+names both. A registry edited by hand that spans two still loads (the load logs
+`BEEVERFORGE_REGISTRY_SPANS_INSTALLATIONS` rather than stop every project), and
+`beeverforge doctor <project>` fails its `installation_scope` line with the same sentence. With
+one organisation, that line asks the App installation which account it is on (a read signed with
+the App's own key; no installation token is minted) and fails, naming both, when the registry
+names another one. With no App configured, the line begins "not applicable" and verifies
+nothing; with one not fully configured (any of `BEEVERFORGE_GH_APP_ID`, the App's private key or
+`BEEVERFORGE_GH_APP_INSTALLATION_ID` unset), it says so and names the three it needs. The same holds when every GitHub project uses a static token instead
+(`BEEVERFORGE_BOT_TOKEN`, `BEEVERFORGE_FORGE_TOKEN` / `BEEVERFORGE_TRACKER_TOKEN`, or a project's
+`token_env`), which wins over the App: the line names the token and asks the App nothing, since
+its installation is not what reaches those projects. The line reads the whole registry, not
+only the project you named, because the installation is the deployment's.
+
+**Two organisations: run two deployments.** Each gets its own App installation id (install the
+App on the second organisation, or use a second App), its own registry
+(`BEEVERFORGE_REGISTRY`) and its own environment file. Then run
+`beeverforge doctor <project>` in each one: the `installation_scope` line is `ok` when that
+deployment's installation is on the organisation its registry names.
+
+### Project knowledge — what the planner & executor read
+
+Process (plan → TDD) is framework-wide (§10); **the project's own architecture,
+constraints, and conventions live in the project's repo** and are declared under `docs:`
+in `.beeverforge/project.yaml`. `build_context` assembles them into the `AgentContext` that
+**both the planner and the executor** receive — so the planner plans *respecting* the
+architecture and the executor implements *following* it. Three tiers, by hardness/size:
+
+```yaml
+docs:
+  constraints:  docs/adr/**            # the CONSTITUTION — hard rules (ADRs). Each one
+                                       #   inlined up to 8,000 characters, newest first,
+                                       #   under the prompt budget; the rest named by path.
+  guidelines:                          # HOUSE RULES the agent can't guess. Inlined.
+    - .beeverforge/guidelines/execution.md    #   e.g. "100% coverage enforced", "reserve the
+                                       #   migration number", "i18n strings in 4 bundles"
+  architecture: docs/architecture/**   # the BIG docs. Turned into a derived INDEX (path
+                                       #   + summary); the agent reads the full doc ON
+                                       #   DEMAND when a ticket touches that area.
+```
+
+| Tier | For | How it reaches the agent | Example |
+|---|---|---|---|
+| **constraints** | inviolable rules | each record inlined up to 8,000 characters, the deployment's prompt budget (`BEEVERFORGE_PROMPT_BUDGET`, default 160,000 bytes) filled newest first; every record not inlined, or cut, is named by path in the prompt | "money is Decimal", "writes emit an event" |
+| **guidelines** | house rules, small | inlined in the prompt, and the first thing the budget keeps; one that does not fit is named by path | "reads go through the cache layer", "100% coverage" |
+| **architecture** | large design docs | an index; read in full on demand | "docs/architecture/realtime-events.md — the WS push topology" |
+
+Rules of thumb: a rule that must **never** be broken → an **ADR** (constraint). Something
+the agent **can't guess and CI enforces** → a **guideline** (keep it tight — it's in
+every prompt). A subsystem's design the agent should **read when relevant** → an
+**architecture** doc (can be long — it's only pulled when the diff touches that area).
+This keeps prompts small while the full knowledge base stays reachable.
+
+**One budget bounds what a pass inlines** (ADR-0056). The card, the plan, the knowledge map, a
+repair's failure log, the reference index and every document tier share
+`BEEVERFORGE_PROMPT_BUDGET` bytes — 160,000 unless the operator sets another number, or `off` to
+inline everything. The budget is filled in this order: the project's own guidelines (the last
+declared first), then the decision records newest first, then the operator's guidelines, then a
+profile's additions. The framework's baseline is always inlined. What is kept is still handed
+over in the cascade's order, so the project keeps the last word. Every document that does not
+fit, and every one cut at 8,000 characters, is named in the prompt by the path the agent can
+open it at; `beeverforge explain` shows each document's fate, and `beeverforge doctor` says how
+many a blank card's brief keeps.
+
+If your corpus does not fit, the budget is not the only answer: a long record that the agent
+needs only when a change touches its area reads better as an **architecture** document, indexed
+and opened on demand, than as a constraint that crowds out the newer ones.
+
+**A guideline is a path inside the repository** (#329). The manifest lives in the repository
+the agent edits, and each guideline is inlined into the prompt, so an entry is resolved and must
+stay inside the checkout: an absolute path, one that climbs out with `..`, or a link that points
+out of the repository is **refused**. The job's log names each refused entry, and
+`beeverforge doctor` fails the project on its `guidelines` line before the first job: it resolves
+each entry in the project's checkout by the job's own rule, links followed, so a guideline
+committed as a link out of the repository fails there too. Where no checkout can be resolved,
+the line reads the manifest's text and says so, and a link is then left to the job (#350). An
+organisation's central standards belong in `BEEVERFORGE_GUIDELINES_DIR`, the operator's setting
+(see `docs/reference/configuration.md`), not in a path the manifest points out to.
+
+#### `knowledge_map` — the generated module map (opt-in, OFF by default)
+
+The three tiers above are HAND-WRITTEN by the project. A fourth input is GENERATED: a
+deterministic map of "where things live" (ADR-0017, `docs/knowledge-layer.md`).
+
+```yaml
+knowledge_map: true      # default false — nothing is generated, fetched or injected
+```
+
+With it on, the platform regenerates the map after every merge that changes sources and
+publishes it into the project's **context repository**, at `.okf/repos/<owner>--<name>/` —
+never into the project's own repo (that requires `product.docs_repo` to be set; see
+`beeverforge onboard`). Each job then fetches that map and injects it — **but only if the
+checksums prove it still describes the job's own checkout**. A missing, stale, or inconsistent map
+injects nothing and the agent searches the code as before, so turning this on cannot make a job
+worse than not having it.
+
+Leave it off unless you are measuring: the flag exists to be A/B'd on the cost dashboard, and
+the layer does not advance until cost/ticket actually drops. Build a map by hand any time with
+`beeverforge knowledge build <project>` / inspect it with `beeverforge knowledge check <project>`.
+
+---
+
+## 6. The autonomous trigger (poller)
+
+The board scan runs as a **Temporal Schedule**. Create / update it (idempotent):
+```bash
+python -m beeverforge.runtime.temporal.schedule --every-minutes 3 --sandbox fargate
+```
+The same command also creates or refreshes each enabled project's tech-lead watch, knowledge
+refresh and card-question sweep, and the product sweep of each project with the product module;
+the worker reconciles all of these again at boot, along with the retention and the previews' reaper.
+Every tick scans each project's **TO-DO** column and starts a job per card. Overlap
+policy SKIP + a 2-min per-poll timeout, so a stuck poll never blocks the next. Pause it in
+the Temporal Cloud UI (Schedules → `beeverforge-poller`) to halt pickup without stopping in-flight
+jobs.
+
+---
+
+## 7. Temporal Cloud connection
+
+Set on the worker/panel (Terraform vars + task env) and in local `.env`:
+```
+TEMPORAL_ENDPOINT=<namespace>.tmprl.cloud:7233
+TEMPORAL_NAMESPACE=<namespace>
+TEMPORAL_API_KEY=<from $SSM_PREFIX/temporal-api-key>
+```
+The panel's **Engine ↗** deep-links resolve automatically: a `*.tmprl.cloud` endpoint →
+the Cloud console; anything else → the local dev-server UI.
+
+**The gate key.** The panel seals every answer to a human gate (the production approval, the
+merge gate) and the worker acts only on a sealed one, so a signal sent to the engine by anybody
+else approves and merges nothing. The panel and the worker must hold the same key. On one machine,
+and on compose, they share it without configuration (a `gate.key` file beside the registry, made
+on first use). Where they share no disk (a hosted worker), set the same secret on both:
+```
+BEEVERFORGE_GATE_SECRET=<32+ random bytes, e.g. `openssl rand -hex 32`>
+```
+Two halves holding different keys refuse every approval. The refusal is shown on the gate in
+the panel and in the inbox, and `beeverforge doctor` checks agreement directly: run where the panel
+runs, it seals a probe with that key and asks the worker to verify it.
+
+**What the seal proves, and what it does not.** An answer that did not come from a process holding
+the key is refused — so a signal sent straight to the engine approves and merges nothing. It does
+*not* prove the panel sent it: the worker's product role also signs (a client's "it worked" releases
+through the same path), and the key is symmetric. Job code in the **container** box cannot reach it
+(the state directory is not mounted and `box.env` refuses the variable). Code in the **worktree**
+box runs as your user with no filesystem confinement and *can* read the key file — as can the
+judging roles, which run as worktree boxes inside the worker container. On those doors the seal does
+not stand between agent code and a gate; run jobs whose code you do not trust in the container box.
+
+---
+
+## 8. The deployment-wide fallback notifier (optional)
+
+Where the tech-lead's unprompted speech goes when a project's own channel cannot carry it, and
+where a project with no channel at all is spoken to (needs-refinement / on-hold / paused /
+PR-ready / prod-approval). It is a **declared kind** on the notifier axis, never inferred from a
+provider's variables:
+
+```bash
+BEEVERFORGE_NOTIFIER_FALLBACK=telegram     # a row the `beeverforge-slack` package declares
+BEEVERFORGE_TELEGRAM_BOT_TOKEN=<bot token>  # read by that row, not by the core
+BEEVERFORGE_TELEGRAM_CHAT_ID=<chat id>
+```
+
+Unset → the panel is the last resort (its attention inbox shows everything). A declared kind
+nobody installed, or one whose row cannot post, is a warning in the worker's log naming what is
+missing — the package to `pip install`, or the variable — and the speech goes to the panel
+until it is filled in. On the reference cloud deployment the terraform sets the three from
+`telegram_bot_token` / `telegram_chat_id` in `deployment.tfvars`.
+
+---
+
+## 9. Alerting & budget (already on)
+
+`infra/terraform/alerting.tf`: an SNS topic + EventBridge rule (task stopped non-zero) →
+email, a worker-error log alarm, and a `$50/mo` AWS budget at 80%. Point the email at
+yourself:
+```bash
+export TF_VAR_alert_email="you@example.com"
+infra/deploy.sh
+```
+
+---
+
+## 10. Coding agent roles (planner → executor)
+
+The coding agent runs as a **two-stage pipeline**: a **planner** (read-only — investigates
+and drafts a short, testable plan) then an **executor** (implements the plan with TDD).
+Both are **harness-neutral role prompts** in `beeverforge/org_defaults/roles/planner.md` and
+`executor.md` — each adapter renders the *same* roles its own way (`claude -p`, `codex exec`,
+`kimi -p`). That's what keeps the pipeline portable: the roles are the source of truth, the
+adapter is the projection. **Which harness** renders them is §11.
+
+On Kimi Code the planner is read-only by instruction only, so the orchestrator fingerprints the
+job's workspace before and after a Kimi planner pass, and a pass that wrote to it holds the job,
+naming the files it wrote: the job stops before pushing anything, and the executor never builds on
+the edit. A workspace git cannot answer holds the job too, in git's own words, and before the
+planner is run when it cannot be asked first. The planner runs only where `planner_stage` is on
+(ADR-0014; it is off by default).
+
+- **Customize a role:** edit the neutral prompt (`beeverforge/org_defaults/roles/*.md`). It reaches
+  the workers on the next image build/deploy; locally it takes effect immediately.
+- **A model per role** (plan cheap/fast, execute strong) — env vars the adapter reads:
+  ```bash
+  # local (.env or export):
+  BEEVERFORGE_PLANNER_MODEL=claude-opus-5    # investigate + draft the plan
+  BEEVERFORGE_EXECUTOR_MODEL=claude-opus-5   # implement with TDD
+  ```
+  **In prod** they're Terraform vars injected into the sandbox task env, both defaulting to
+  `claude-opus-5`:
+  ```bash
+  export TF_VAR_planner_model="claude-opus-5"; export TF_VAR_executor_model="claude-opus-5"
+  infra/deploy.sh
+  ```
+  Value = anything `claude --model` accepts. **Use an explicit model id, never a family alias
+  like `opus`.** An alias is resolved by whichever Claude Code CLI version the worker image
+  pins, so the factory's real model silently becomes a side effect of an image bump — that is
+  how it sat on Opus 4.8 for a while after Opus 5 shipped. An explicit id makes the model a
+  deliberate decision and an upgrade a reviewable one-line diff. Empty → the CLI default.
+  Verified: the adapter emits `--model <value>` for the planner call and the executor call.
+- **In the panel:** the live feed labels each action **PLANNER** / **EXECUTOR** (the thing
+  that changes line to line); the **harness** (Claude Code) is shown once, in the cockpit.
+- **Independent review is *not* one of these two stages** — it is its own harness role
+  (§11), configurable separately precisely so the reviewer can be a different engine from the
+  one that wrote the code.
+- **Adding roles / harnesses:** neither edits a file of ours. A new role is a `role.<name>`
+  entry point in the `beeverforge.adapters` group whose builder returns a `RoleSpec` — its
+  prompt, its own two env names, whether a person reads its answers, an optional default
+  harness (§11, *Add-on roles*); a new harness is a `harness.<kind>` entry point in the same
+  group, or, inside this repository, one entry in `beeverforge/adapters/agent/registry.py` plus
+  its module. The shipped roles and the rest of the pipeline don't change.
+
+---
+
+## 11. Which harness plays each role (executor · reviewer · techlead)
+
+Three roles, each independently configurable. They are named after what they **do** and after the
+prompt files that shape them (`beeverforge/org_defaults/roles/*.md`), so what you configure and what
+drives its behaviour share a name. Full rationale: **ADR-0018**.
+
+| Role | Does | Stages it serves | Runs in |
+|---|---|---|---|
+| `executor` | **writes the code** | plan · execute · repair · continue · recover | the ephemeral job box |
+| `reviewer` | **reviews the diff** | review | the ephemeral job box |
+| `techlead` | **judges** | pre-flight sizing · parked-decision advice · impediment diagnosis · Slack answers | the long-lived worker |
+
+`techlead` includes the **sizer** — same nature (read-only judgment), same place.
+
+### Setting it
+
+In the project's entry in `deploy/registry.yaml`. **One line** covers the common case, where a
+deployment uses the same harness everywhere:
+
+```yaml
+harness: codex                  # executor, reviewer and techlead
+```
+
+Per role, when they differ:
+
+```yaml
+harness:
+  executor: codex
+  reviewer: claude_code         # a genuinely independent second opinion
+  techlead: claude_code
+```
+
+A key that is not a role is **warned by name** when the registry loads (`harness: {reviewr: …}`
+used to load clean and configure nothing); `default` covers every role not named.
+
+### Add-on roles
+
+The role axis is open the same way the harness axis is (2026-08-24). A package that ships an agent
+around the core — a QA role, a security reviewer — declares it as an entry point and never edits a
+file of ours:
+
+```toml
+[project.entry-points."beeverforge.adapters"]
+"role.qa" = "beeverforge_qa:role"     # a builder returning beeverforge.adapters.agent.RoleSpec
+```
+
+The `RoleSpec` carries what the platform needs to resolve the role: its **prompt**, its **own two
+env names** for the harness and model overrides (never a `BEEVERFORGE_*` name — that namespace,
+its old `SDLC_*` spelling and the variables of the tools the platform drives are reserved, and a
+spec claiming one is refused by name; the foreign names are derived from the code's own reads,
+never listed by hand, so a variable is reserved the day a module reads it), **`human_facing`** —
+whether a person reads its answers
+(`False` for a one-word verdict the add-on's own code parses; the project's language directive is
+withheld for that role's phases, exactly as it is for the product role's approve/reject verdict),
+and an optional default harness. Once installed, `qa` has its own `harness:` / `model:` line,
+`beeverforge project set-model <name> <m> --role qa` accepts it, and the panel cockpit shows it.
+
+What the core does **not** do for an add-on role is invoke it: the package that ships the role
+calls `build_asker(project, role="qa")` itself and does something with the answer. Refused, and
+logged once: a shipped role's or prompt's name (`techlead`, `sizer`), `default`, the name of a
+phase the platform passes (`size`, `chat`), and a second add-on claiming a variable the first
+already reads.
+
+Known values: `claude_code` (default), `codex`, `kimi`. **An unknown value fails the job loudly**
+rather than falling back — a run that silently used an engine nobody chose would report clean
+numbers for the wrong thing.
+
+Resolution order per role: env override → the project's `harness` → the default. The env vars
+`BEEVERFORGE_HARNESS_EXECUTOR`, `BEEVERFORGE_HARNESS_REVIEWER`, `BEEVERFORGE_HARNESS_TECHLEAD` exist **only** as an
+escape hatch for a quick experiment (the registry is baked into the worker image, so trying a
+harness would otherwise cost a rebuild and a roll). Don't configure a deployment with them.
+
+### What to know before switching
+
+- **A Claude deployment is unaffected.** Where a harness ships its own proven implementation of a
+  role, that one is used; the shared implementation serves harnesses that have none (ADR-0018 §3).
+- **Same harness for `executor` and `reviewer` is a real reduction.** The review becomes a fresh
+  context on the same engine — still useful, no longer an independent second opinion.
+- **Codex** has completed real tickets, but its plumbing is not yet at parity: no credential pool,
+  no durable cross-container resume, no transcript writing. The *roles* are at parity.
+- **Kimi is wired but unproven** — no observed stream output yet. Its read-only roles are also
+  weaker: instruction only, with no mode and no policy. A planner pass that writes to the job's
+  workspace holds the job, naming the files (§10); the questions run on the host, in a directory
+  nothing commits from, except `env context --ask`, which asks in the checkout it is pointed at
+  and leaves a write in that working tree, and the independent review, which runs in the job's
+  box on the job's workspace before the push, where its write can reach the pull request (review
+  is on by default). Don't put a client on it until a real run.
+- **Cost from a harness that reports no price reads UNKNOWN, never `$0.00`.** A zero would make it
+  look free and win every comparison.
+
+### The four-hour wall
+
+Every harness is stopped after **4h** of wall-clock in one agent call. Claude normally stops on
+`--max-turns` long before; for a harness with no turn cap (Codex) this wall *is* the bound. A run
+that hits it parks as an impediment with a diagnosis for the tech-lead — not as a rate-limit pause,
+because a stuck run does not get better by waiting. Tunable with `BEEVERFORGE_AGENT_TIMEOUT` (seconds);
+the launcher and Temporal ceilings derive from it automatically, so don't set those by hand.
+
+---
+
+## 12. The product module (PO/BA/PM) — optional per client
+
+The role that turns a conversation into a requirement. **Opt-in**: a project with no `product:`
+section does not have the module, and nothing changes for it. Full design: **ADR-0019**.
+
+### Switching it on
+
+The normal path is the command — it writes to the deployment's LIVE registry (the file below is the
+seed for a NEW deployment; editing the seed does **not** reach a deployment that is already
+running):
+
+```bash
+beeverforge product declare <project> <owner/repo>            # a context repo that ALREADY exists
+beeverforge product init <project> --create-context --write   # create one
+```
+
+In `deploy/registry.yaml` (the seed), inside the project:
+
+```yaml
+product:
+  docs_repo: yourorg/myapp-documentation              # required
+  admins: [ana]                                       # who may make it WRITE — panel identities
+  engineers: [edu]                                    # optional — who BUILDS it: the role speaks
+                                                      # to them as engineers; grants nothing
+  docs_branch: main                                   # optional
+  agent_name: Nina                                    # optional — what the role is called;
+                                                      # Nina unset (`beeverforge product name`)
+  timezone: America/Sao_Paulo                         # optional — the zone the role counts days
+                                                      # in ("ontem" is somebody's yesterday).
+                                                      # Default: UTC, and the role is told so.
+  accept_on_behalf: false                             # optional — ADR-0047 §4: an admin who did
+                                                      # not ask may give EITHER yes (the draft's,
+                                                      # the ticket's) for the requester.
+                                                      # Default: only the requester.
+  enabled: true                                       # optional (the incident switch)
+```
+
+`admins` are **people of the platform** — the ids the deployment's identity provider knows them
+by (the `BEEVERFORGE_PRODUCT_TOKENS` identities on the panel, an invitation, an SSO login) — never
+a chat vendor's user ids. A chat add-on maps its own users to these people before a message
+reaches the role, and a user it cannot map is a guest who confirms nothing (#266 slice 6,
+ADR-0051 D16). **There is no chat coordinate here on a core deployment:** the product's room is
+the panel's, keyed by the project's name. A chat add-on reads where the product's own room is on
+its channel from `product.channel_options` (the room under `channel`, in its own terms); the
+core hands it back and never reads it as which channel this is. The old keys — `channel_id`,
+`slack_channel` and `slack_admins` — are still read as aliases, each named once in a deprecation
+warning, until 0.5.0; where the new spelling is also present the old one is ignored, never merged.
+
+**In a room, the role answers what is addressed to it** (ADR-0051 D14): a mention, a reply
+inside a conversation it takes part in, or a direct conversation. What the people there say to
+each other is kept in the product's memory and found by `product_recall`, and it never starts a
+turn or reaches a prompt. On the panel's room the mention is `@po`, `@product` or the
+`agent_name`; a message sent from the room's composer has `@po` written in for you; in your own
+conversations everything is for the role. The page lists them beside the room — each person has
+as many as they open (#335), and nobody else's is ever listed or readable.
+
+The **presence** of the section is the switch — there is no "on with nowhere to write". To turn it
+off without losing the configuration, `enabled: false`.
+
+The **source** repo declares the other side in its `.beeverforge/project.yaml`:
+
+```yaml
+docs_repo: yourorg/myapp-documentation
+```
+
+And the **documentation** repo declares its members in `.beeverforge/product.yaml`:
+
+```yaml
+product: myapp
+sources:
+  - yourorg/myapp
+requirements_dir: requirements
+```
+
+**All three declarations have to agree.** The registry authorises; the source repo's only confirms
+and **never redirects** (otherwise anybody with write access to a source could point the PO at
+another repository by editing one line). A divergence **switches the module off** with a message
+naming the file to fix, rather than guessing — writing a requirement into the wrong product's
+repository is a break in client isolation, not a typo to work around.
+
+### Who may do what
+
+| action | who |
+|---|---|
+| ask about the product, request a draft | anyone in the channel |
+| rewrite a criterion, clarify scope, break down, relate | the PO, on its own (once authorised) |
+| record a requirement | a PR on the docs repo → **a human merges** |
+| file an issue into **Backlog** | the PO, on its own |
+| promote to **TO-DO** | **a human** — this is where the money starts |
+
+An empty `admins` means nobody writes. Switching the module on never hands out authoring
+rights by itself.
+
+**Whose yes it is.** What the role stages in a conversation — a draft, a card, a fact, a decision,
+a queue — waits for the person who asked for it, in that conversation; in a room two people each
+keep their own. It is confirmed by that person, if they are on `admins`. Another admin's yes on it
+is refused unless `accept_on_behalf: true`, which lets any admin confirm for the requester — both
+the draft and, later, the ticket (ADR-0047 §4, ADR-0051 D11). A requester who is not on `admins`
+confirms nothing either way: with `accept_on_behalf` off, what they ask for is written only once an
+admin asks for it in their own words. One exception, below: another pass on the change of a card
+they asked for is theirs to confirm (#448).
+
+**Who is speaking.** Every person talking to the role has one of three roles in the product:
+`admins` are product admins, `engineers` are engineers, and everybody else is a client — the
+default. The role is told which, and speaks to each accordingly; the roles grant nothing beyond
+what `admins` already does. Both lists hold the ids the deployment identifies people with (panel
+identities on a core deployment), never a chat vendor's.
+
+### Language
+
+Every human-facing role (the tech lead and product) speaks the project's language when it **speaks
+first** — a notice, a diagnosis, a question, a summary. When it **answers**, it follows the language
+of whoever wrote, even if that is a different one: somebody who asks in English wants an answer in
+English.
+
+```yaml
+language: en         # `pt-BR`, `es`, … — the project's own
+```
+
+It is `Project.language`, in the registry — it applies to the tech lead too, not only to product.
+The code phases (plan/execute/repair/review) are **not** affected: touching them would move a path
+that already works in production, with no benefit anybody asked for.
+
+Identifiers are never translated in any of these cases — a file name, a requirement number, a
+command, an error message.
+
+### Conversations: the door, the turn and the ceiling
+
+Every message to the product role — the panel's box, the CLI, a chat add-on — goes through one door
+and onto its **conversation**: a private chat, or a room. Conversations run side by side; inside
+one, the role answers one turn at a time, and a person who writes while it is busy is told at once
+that the message is kept and they are next — without being told whom it is answering. Two
+registry projects that point at the same `docs_repo` are one product: one conversation key space,
+one memory (ADR-0051).
+
+| variable | default | what it sets |
+|---|---|---|
+| `BEEVERFORGE_PRODUCT_DEBOUNCE_SECONDS` | `3` | how long the role waits after someone's last line before it answers — people write in bursts; `0` answers at once |
+| `BEEVERFORGE_PRODUCT_TURN_BOUND_SECONDS` | `90` | the longest a turn holds its conversation; past it the person is told the work goes on, and the answer arrives later in the same conversation |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_PRODUCT` | `2` | how many turns of one product run at once, across all its conversations |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_DEPLOYMENT` | `4` | how many turns run at once on a worker, across every product — half of its eight activity slots, so the factory's own work is never starved |
+| `BEEVERFORGE_PRODUCT_BRIEFING` | `on` | whether every answer carries the **briefing**: a short situation summary (what is moving, parked, waiting on whom, in production), each line with its source and age, in the place of the budgeted board section. `off` (or `0`, `false`, `no`) is the "without" arm of an A/B run with the evaluation battery: no briefing, and the board section is back, as the prompt was before it. The files the role opens are the same either way; each answer logs `BEEVERFORGE_PRODUCT_BRIEFING … state=on\|off` |
+
+The two ceilings limit cost and exposure to a provider's rate limits; they order nothing — a turn
+waiting for a slot is a turn whose conversation shows it busy. They hold **per worker process**:
+a deployment that runs several workers gets each worker's ceiling. The read-only asks — the
+status, the triage, the introduction — are answered beside a busy turn and take no slot, because
+they spend no model call.
+
+### Documents in the context repository
+
+Every document in the product's context repository is read into a record once per version —
+after the module map, on the same schedule, and at once for a file named to
+`beeverforge act product_ingest` (#269). The records live under the product's state directory
+(`$BEEVERFORGE_LOG_DIR/_products/<product>/documents/`) and are rebuilt from the repository when
+deleted. `beeverforge act product_refresh` (#1004) runs the schedule's pass now, on the worker, and
+also brings the product's search index up to its boards; it needs the durable engine, answers
+without waiting for the pass, and runs one pass per product at a time. How the last pass went —
+the schedule's or an asked one — is kept beside the records, in `knowledge-refresh.json`, and
+`product_status` answers it as `knowledge`. The PDF reader is the `ingest` extra (`pip install -e '.[ingest]'` from a checkout; the
+worker image carries it); OCR needs `tesseract` and `pdftoppm` on the worker, and without them a scanned PDF is
+listed as "OCR not available".
+
+| variable | default | what it sets |
+|---|---|---|
+| `BEEVERFORGE_EXTRACT_ROWS` | *(unset)* | which row reads a document type, `type=kind` pairs: `image=ocr` reads images with OCR instead of a model; a kind an add-on registers (`extract.<kind>`) is named the same way. Types: `text`, `markdown`, `mermaid`, `html`, `drawio`, `svg`, `email`, `pdf`, `scanned`, `image` |
+| `BEEVERFORGE_DOCUMENTS_ROLE` | `reviewer` | the role whose harness and model describe images and write each record's summary — a shipped role or an add-on's |
+| `BEEVERFORGE_DOCUMENTS_MAX_BYTES` | `33554432` (32 MB) | the largest file read; a larger one is recorded as too large, never read |
+
+### The product's memory index
+
+The documents' records, the requirements with their decisions, the board's closed cards and the
+product's conversations are one index per product (#269 slice 2), a SQLite file under the
+product's state directory (`$BEEVERFORGE_LOG_DIR/_products/<product>/index/memory.sqlite`),
+rebuilt from its sources when deleted. Before each answer the engine searches it and hands the
+role what it found as `found/before-the-turn.md` in its facts; the role may ask for more with
+`[[BUSCA: …]]`. Every search is recorded in `…/_products/<product>/searches.jsonl`, kept for the
+conversations' retention. Search by meaning needs the `embed` extra
+(`pip install -e '.[embed]'`) and a model in a folder on the machine; without them the index
+answers by exact words, metadata and date, and every search says so.
+
+| variable | default | what it sets |
+|---|---|---|
+| `BEEVERFORGE_EMBED` | `local` | the row that embeds: `local` (a model on this machine), `none` (turn search by meaning off), or a kind an add-on registers (`embed.<kind>`) |
+| `BEEVERFORGE_EMBED_MODEL` | *(unset)* | the absolute path of the folder holding the local model — nothing is ever downloaded; the recommended one is `minishlab/potion-multilingual-128M` at revision `73908c3438cf03b6a01bcb9611d62b23d0726f08` |
+| `BEEVERFORGE_EMBED_MODEL_SHA256` | *(unset)* | the SHA-256 of `model.safetensors` of a model the platform does not pin, to accept it; an unpinned model is refused otherwise |
+| `BEEVERFORGE_PRODUCT_RETRIEVAL` | *(on)* | `off` turns the retrieval step off — no search before the answer and no `[[BUSCA]]` — so the evaluation battery can measure the answer with it and without it; the front end's search of a product (`/api/v1/product/{project}/search`) then searches nothing and says so in `degraded` |
+
+### Harness
+
+`product` is a fourth axis, beside executor/reviewer/techlead:
+
+```yaml
+harness: {executor: claude_code, product: codex}
+```
+
+### The cards it opens: drafted, judged, shown whole (ADR-0054)
+
+When a person asks the role to open a card ("cria um card", "abre um ticket"), the card is not the
+message that asked for it. The role drafts it from the conversation, a deterministic floor checks it,
+a judge scores it against a rubric, and the person reads the **whole card** before the yes. A card
+that fails twice is not filed: the role asks the person the question the judge said is missing.
+
+| step | what | can a product change it? |
+|---|---|---|
+| draft | the role writes the card as JSON (title ≤ 80 characters, objective, description, done when, out of scope, related, the person's own words) | the layout, through `cards/template.md` |
+| floor | title within the bound, a description that is not the request itself, something that says when it is done, a quote that was really said, the pickup gate's own verdict | **no** |
+| judge | a model on the **reviewer** axis scores each criterion 1–5 with evidence, and names critical failures | the criteria and the bar, through `cards/rubric.yaml` |
+| verdict | computed in code: pass when no critical failure, the mean is at least `pass.average`, and no criterion is below `pass.floor` | the two numbers, in the rubric |
+
+**Every card the role creates goes through this door** — the cards a person asks for, the defects,
+and the cards an accepted requirement is broken into (those are judged against the requirement
+instead of a conversation; one the judge still blocks after a redraft is not filed, and the reply
+names the front and what it lacks). A guard in the suite fails when a new way of creating a card
+appears outside it.
+
+The same loop runs when the role reads a message as a **broken promise** (a defect): the card is
+drafted from the conversation, judged against the same rubric and shown whole before the yes, and
+its layout is `defect-template.md`, whose description sits under `## What is happening`.
+
+**A card is written in the conversation's language** (#429). Each layout ships per language —
+`template.md` and `defect-template.md` in English, `template.pt-BR.md` and
+`defect-template.pt-BR.md` beside them — and the one in the conversation's language is used (the
+project's `language`, `beeverforge project set-language`), English when none ships for it. The
+drafter is told the language by name, and a card clearly written in another is redrafted.
+
+The shipped files are `beeverforge/org_defaults/cards/template.md`, `defect-template.md` and
+`rubric.yaml`. **To change
+them for one product, commit your own copy to the product's context repository** (`product.docs_repo`)
+as `cards/template.md`, `cards/defect-template.md` and/or `cards/rubric.yaml` — or per language, as
+`cards/template.<language>.md` (for example `cards/template.pt-BR.md`), which wins over the
+unsuffixed one for that language. A card is product guidance, and a product of
+several source repositories has one context repository. Review that change as you would review code:
+the rubric is runtime behaviour.
+
+- **Template.** The fields you can place are `{objective}`, `{description}`, `{done_when}`,
+  `{out_of_scope}`, `{related}` and `{source_quote}`. A section (`## heading` and what follows it) whose
+  fields are all empty is left out. Your template must keep `{description}` under `## O que foi
+  pedido` (the section a correction rewrites) and `{done_when}` under a heading the parser reads as
+  acceptance criteria. Otherwise it is refused, `BEEVERFORGE_CARD_TEMPLATE_REFUSED` is logged, and the
+  shipped template is used. The lines above the template (who asked, where, the card's kind) are always
+  written by the code.
+- **Rubric.** Keep every criterion's ladder complete, one description per level: a gap is how a
+  well-formed empty card scores high. Change `version` whenever a level's meaning changes, because the
+  version is logged with every verdict. A rubric that cannot be read is refused
+  (`BEEVERFORGE_CARD_RUBRIC_REFUSED`), and the shipped one is used.
+- **The judge's engine.** It is the reviewer's, `harness: {reviewer: …}` / `BEEVERFORGE_REVIEWER_MODEL`.
+  A judge on a different model family from the product role shares fewer of its blind spots. With no
+  harness that can judge, the card is shown with a line saying it was not reviewed.
+- **Calibrating.** Every verdict is one log line, `BEEVERFORGE_CARD_JUDGED`, with the rubric's id,
+  version and source, the attempt, the scores and the verdict. This is what you compare against the
+  cards people later corrected or closed before you move the bar. The judge's cost is metered as
+  `product_card_judge`, and the draft's as `product_card_draft`.
+
+### Another pass on a change that waits on you (#448)
+
+When a card's change is built and waits for a person before it goes into the product, the person
+who asked for the card can try it and say what is still wrong — in the conversation, or with
+**Send back for another pass** on the card in the product view's Board tab. The role drafts, from
+the conversation, what the next pass must change and the card's criteria as they must read now, and
+asks: *"I'll send #N back for another pass, with these criteria as the bar: … and correct the card
+to match. Confirm?"* The yes corrects the card first, then sends one more pass on the same change.
+
+- **Who may:** the card's own requester, a product admin, or an operator (an admin whose credential
+  may enter the floor). The requester needs no `admins` entry for this one act on their own card.
+- **The bar moves only at the gate.** A card's criteria are corrected only while its job waits on a
+  person, by the engine's own answer, and only with the pass; while a job is running on the card
+  they are refused as before. A card that carries out a requirement, or one a person wrote on the
+  board, keeps its bar — the pass is sent and the proposal says the bar stays.
+- **How many passes:** `adjust_passes` in the project's registry entry, `2` when unset, clamped to
+  `0..10`. It is the operator's, never the manifest's, because it bounds what the factory spends. A
+  job keeps the budget it started with. Past it, nothing is refused bare: the requester is told a
+  person decides now — the change goes in as it is, or is discarded and the card waits to be
+  started again — and the floor's gate says the same and stops offering **Adjust**.
+- The draft is metered as `product_adjust_draft`, and every draft logs `BEEVERFORGE_ADJUST_DRAFTED`.
+
+### "That's it": accepting the change you tried (#448)
+
+The other half of the loop. When the person who asked for the card tried its preview and says it is
+right — in the conversation, or with **This is it — accept** on the card — the role asks: *"I'll
+record that #N, as you tried it in its preview, is what you asked for. Confirm?"* The yes is
+recorded against the head the preview was **built** from, never the pull request's head at that
+moment, as one `card_accepted` row in the platform's metrics store, and the card gets a note naming
+who and which head.
+
+- **Who may:** the same three as another pass — the card's requester, a product admin, or an
+  operator.
+- **Nothing tried, nothing to accept.** With no preview of the change, or a pull request that moved
+  past the head the preview was built from, the yes is refused by name and nothing is recorded.
+- **With a human merge**, the person merging sees *"accepted by <requester> on <head>"* on the floor
+  bar, in the inbox, and in what the tech-lead is told.
+- **With `merge_policy: auto` and `preview.required`**, when the look is the only thing holding the
+  merge (every other hold of the auto-merge passes), the yes gives the gate its merge, sealed in the
+  requester's name. A pass the requester asked for since the pull request opened must have been
+  read again, and verified, for that to stand; otherwise a person merges, shown the acceptance.
+- **The requester hears the change went in**, once per card and pull request, whoever merged it —
+  except where, with no stage declared, the delivery's own "it is ready, did it work?" says it at
+  the same moment.
+
+### The last gate: their yes, and their "not yet" (#448)
+
+When the change has merged and waits before the product's users, the person who asked for the card
+is asked to try it in their own conversation, beside the room's question.
+
+- **Their "it worked"** is recorded. With `release_by_requester: true` in the project's registry
+  entry it puts the change in front of everyone, as a product admin's does. Unset (the default),
+  their copy of the question closes as answered, the room is told once that they tried it and say it
+  is right, and a product admin's "it worked" releases it — and the release's record says the
+  requester had said so. The flag is the operator's, never the manifest's: it decides who may put
+  software in front of the client's users. It is only ever the card's own requester, never a guest.
+- **Their "not yet"** is another pass, never a promise: the role drafts it from the conversation as
+  above, worded *"… as a new change — what is live stays as it is"*, and the yes corrects the card
+  and sends the job back. The change already merged, so the job builds a **new change** of the card
+  from the base, on a branch of its own (`beeverforge/<n>-2`, `-3`, …), with the person's words in its
+  brief. It counts against the same `adjust_passes`, across all of the card's changes; past it,
+  nothing is sent and a person decides — release it as it is, or leave it unreleased.
+
+### What it never does
+
+It does not write to a code repo, does not review a diff, does not promote to TO-DO, and does not
+treat a `superseded` requirement as current truth (it is kept as history, and stays quotable).

@@ -1,0 +1,183 @@
+"""The reading of an intake, bounded by what can be checked (#33 slice 7, holes 5 and 6).
+
+TELLING A BUG FROM "WORKING AS DESIGNED" REQUIRES KNOWING WHAT THE CODE DOES — the knowledge bundle
+— and telling a wish from a promise requires the requirements. The model reads the message and
+says which it saw, and names what it relied on (`[[EVIDENCIA]]`, `[[USO]]`). This module is the
+half a model cannot do: it CHECKS that evidence — is the cited concept in the bundle, is it still
+fresh (the renewal records a `stale` gap when its bytes moved), does the cited requirement exist —
+and bounds the confidence a person is shown by the answer. A reading that relied on nothing, or on
+a bundle that does not exist, is `baixa` however sure the model sounded; one that relied on a
+stale concept is `média`; only one whose evidence stands is `alta`.
+
+WHY THE BOUND IS MECHANICAL. The confidence is what a person decides on — whether to argue with
+the role, file the defect anyway, or accept "it works like this". A confidence the model assigned
+itself would be the same guess dressed as a measurement.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Collection
+from pathlib import Path
+
+from beeverforge.product.role import Reading
+
+log = logging.getLogger("beeverforge.product.reading")
+
+ALTA = "alta"
+MEDIA = "média"
+BAIXA = "baixa"
+STALE_GAP = "stale"
+
+
+def _concepts_in(bundle_dirs: list[Path]) -> tuple[list, list]:
+    """Every concept of every bundle, and every stale gap they record — the product's, not one
+    source's (#268, ADR-0052 D20). A concept of the payments service is cited from the payments
+    service's bundle, and a bound that read the project's own alone graded it "not in the
+    bundle"."""
+    from beeverforge.knowledge.okf import read_concepts, read_manifest
+    concepts: list = []
+    stale: list = []
+    for bundle_dir in bundle_dirs:
+        concepts += read_concepts(bundle_dir)
+        manifest = read_manifest(bundle_dir)
+        stale += [g for g in (manifest.gaps if manifest else []) if g.kind == STALE_GAP]
+    return concepts, stale
+
+
+def _bundles(bundle_dir) -> list[Path]:
+    """`bundle_dir` as a list: one directory, several (one per source of the product), or none."""
+    if bundle_dir is None:
+        return []
+    if isinstance(bundle_dir, str | Path):
+        return [Path(bundle_dir)]
+    return [Path(d) for d in bundle_dir if d is not None]
+
+
+def _find(cited: str, concepts: list) -> object | None:
+    """A cited concept by file (any suffix of the path the writer gives it) or by title."""
+    from beeverforge.knowledge.okf import concept_path
+    wanted = cited.strip().strip("`").lower()
+    for concept in concepts:
+        path = concept_path(concept).as_posix().lower()
+        if wanted == path or path.endswith("/" + wanted) or wanted.endswith(path):
+            return concept
+    for concept in concepts:
+        if concept.title.strip().lower() == wanted:
+            return concept
+    return None
+
+
+def _is_stale(concept, stale_gaps: list) -> bool:
+    title = f"'{concept.title}'"
+    paths = {s.path for s in concept.sources}
+    return any(title in g.detail or (g.path and g.path in paths) for g in stale_gaps)
+
+
+def bound(reading: Reading, *, bundle_dir: Path | list[Path] | None, corpus,
+          broken: Collection[str] = (), code_read: int = 0) -> Reading:
+    """The reading with its confidence set by what its evidence checks out against.
+
+    `bundle_dir` is every bundle the reading may stand on — the project's own folder, or one per
+    source the product declares, and the flows across them (`ProductModule._okf_dirs`).
+
+    `broken` is the titles, folded, of every concept THIS TURN'S CHECK found no longer matching the
+    code mounted for it (`sight.Sight.broken_titles`, ADR-0052 D20): the manifest's `stale` gaps
+    say what the renewal could not re-author, and this says what moved since — a concept stale
+    either way is `stale`, never `fresh`. `code_read` is how many code files the reading says it
+    opened that lie in a mounted source: a reading that cites no concept and stands on code read
+    this turn is `média` — "what I say comes from reading the code just now" (D21) — not
+    `baixa`."""
+    verified: dict = {"concepts": {}, "requirements": {}}
+    reasons: list[str] = []
+    level = ALTA
+    bundles = _bundles(bundle_dir)
+    folded = {str(t).strip().lower() for t in broken}
+    if not bundles:
+        level = BAIXA
+        reasons.append("no knowledge bundle is published for this project — nothing the reading "
+                       "says about what the code does can be checked")
+    elif not reading.concepts and code_read:
+        level = MEDIA
+        reasons.append(f"the reading cites no concept and rests on {code_read} code file(s) "
+                       f"opened this turn — medium confidence at best")
+    elif not reading.concepts:
+        level = BAIXA
+        reasons.append("the reading cites no concept — nothing about what the code does was "
+                       "checked")
+    else:
+        try:
+            concepts, stale = _concepts_in(bundles)
+        except Exception as exc:  # noqa: BLE001 — an unreadable bundle bounds the reading, never the reply
+            log.info("could not read the bundles at %s (%s)", bundles, exc)
+            concepts, stale = [], []
+            reasons.append("the knowledge bundle could not be read")
+            level = BAIXA
+        for cited in reading.concepts:
+            found = _find(cited, concepts)
+            if found is None:
+                verified["concepts"][cited] = "missing"
+                level = BAIXA
+                reasons.append(f"`{cited}` is not in the bundle")
+            elif _is_stale(found, stale):
+                verified["concepts"][cited] = "stale"
+                if level == ALTA:
+                    level = MEDIA
+                reasons.append(f"`{cited}` describes bytes that have since moved")
+            elif found.title.strip().lower() in folded:
+                verified["concepts"][cited] = "stale"
+                if level == ALTA:
+                    level = MEDIA
+                reasons.append(f"`{cited}` no longer matches the code mounted for this turn")
+            else:
+                verified["concepts"][cited] = "fresh"
+    for number in reading.requirements:
+        exists = False
+        try:
+            exists = corpus is not None and corpus.by_number(number) is not None
+        except Exception:  # noqa: BLE001 — an unreadable corpus is an absent requirement, said below
+            log.info("could not look up REQ-%s", number, exc_info=True)
+        verified["requirements"][number] = exists
+        if not exists:
+            if level == ALTA:
+                level = MEDIA
+            reasons.append(f"REQ-{number} is not in the requirements")
+    return reading.model_copy(update={"confidence": level, "bounded_by": "; ".join(reasons),
+                                      "verified": verified})
+
+
+#: HOW A READING IS SAID on a case, a row or a log line, per language (#535) — the kind, and the
+#: confidence by the level it was given (`ALTA`, `MEDIA` and `BAIXA` are the reading's own values,
+#: kept as written).
+_SAID = {
+    "pt-BR": {"defect": "problema", "request": "pedido", "misuse": "funciona assim",
+              "question": "pergunta", "reading": "leitura", "confidence": "confiança",
+              ALTA: ALTA, MEDIA: MEDIA, BAIXA: BAIXA},
+    "en": {"defect": "defect", "request": "request", "misuse": "working as designed",
+           "question": "question", "reading": "reading", "confidence": "confidence",
+           ALTA: "high", MEDIA: "medium", BAIXA: "low"},
+}
+
+
+def render_reading(reading: Reading, *, language: str | None = None) -> str:
+    """One line for a case, a row, a log: the kind, the confidence, what it stood on."""
+    from beeverforge.product.voice import _pick
+
+    # any Portuguese reads the Portuguese line, as it always did — `pt-PT` included
+    said = _pick(_SAID, "pt-BR" if str(language or "").lower().startswith("pt") else language)
+    kind = said.get(reading.kind, reading.kind)
+    parts = [f"{said['reading']}: {kind}"]
+    if reading.confidence:
+        parts.append(f"{said['confidence']} {said.get(reading.confidence, reading.confidence)}")
+    stood = [f"{c} ({reading.verified.get('concepts', {}).get(c, '?')})" for c in reading.concepts]
+    stood += [f"REQ-{n}" + ("" if reading.verified.get("requirements", {}).get(n) else " (?)")
+              for n in reading.requirements]
+    if stood:
+        parts.append(", ".join(stood))
+    line = " · ".join(parts)
+    if reading.bounded_by:
+        line += f" — {reading.bounded_by}"
+    return line
+
+
+__all__ = ["ALTA", "BAIXA", "MEDIA", "bound", "render_reading"]

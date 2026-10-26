@@ -1,0 +1,7015 @@
+"""Activities — the side-effecting steps, each a durable, retryable unit.
+
+An activity is where the framework touches the outside world (clone, run the
+agent, tests, open a PR, tag, observe an environment). Temporal records each
+one's result in history, so a crash resumes from the last completed activity
+instead of restarting the job.
+
+Every job runs in a Fargate task (run_job, promote_staging, release_prod), so the
+side-effecting work happens where gh + credentials + the cloned repo live, and the
+launcher's job-tag idempotency (re-attach / reconcile) makes retries safe. The forge
+operations themselves are find-or-create idempotent. Each activity offloads its
+blocking launcher call to a thread so the event loop stays free to heartbeat.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re as _re_module
+import shutil
+import subprocess
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
+
+from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
+from beeverforge.adapters.channel.registry import channel_destination
+from beeverforge.adapters.sandbox.registry import installed_box_traits, remote_box
+from beeverforge.contracts import JobState, RunResult
+from beeverforge.contracts.checks import NOTHING_RAN, CiDecision, decide, declares_no_checks
+from beeverforge.contracts.checks import read as read_checks
+from beeverforge.contracts.refs import SPLIT_CHILD_MARK, canonical_ref, ref_label, ref_sort_key
+from beeverforge.credentials import box_launch_credentials, box_options
+from beeverforge.factory import build_runner, resolve_box_image
+from beeverforge.observability import logs
+from beeverforge.registry import ProjectRegistry
+from beeverforge.runtime.card_repo import _checkout_key, _ref_repo, _runner_view
+from beeverforge.runtime.repairable import changed_paths, log_names_the_change, what_to_repair
+from beeverforge.runtime.temporal.io import (
+    REVIEW_THREAD,
+    AdjustedInput,
+    AdjustInput,
+    AskInput,
+    CiRepairInput,
+    CoordinatorInput,
+    CoordinatorItem,
+    CoordinatorSayInput,
+    DeployNotifyInput,
+    DeployStatusInput,
+    GateSealInput,
+    GatherInput,
+    GatherVerdict,
+    HoldSyncInput,
+    JobMetricsInput,
+    JobParams,
+    KnowledgeRefreshInput,
+    MergeCheckInput,
+    MergedInput,
+    OverheardInput,
+    PreflightInput,
+    PreflightVerdict,
+    PreviewPlanInput,
+    PreviewStepInput,
+    PreviewStepResult,
+    PreviewUpInput,
+    ProductAnswerInput,
+    ProductAskInput,
+    ProductBaselineInput,
+    ProductBreakdownInput,
+    ProductCardInput,
+    ProductNeedsActionInput,
+    ProductQueueInput,
+    ProductSayInput,
+    PromoteInput,
+    RatePauseInput,
+    ReadyForYouInput,
+    ReleaseInput,
+    ReportInput,
+    ReviewLoopInput,
+    ReviewPassInput,
+    RunJobInput,
+    ScanInput,
+    SplitInput,
+    StartJobsInput,
+    TicketRef,
+    TurnInput,
+    TurnProgress,
+)
+
+if TYPE_CHECKING:
+    from beeverforge.runtime.boxed_job import BoxConfig
+
+
+def _resolved_image(project, *, sandbox: str, explicit: str | None = None) -> str:
+    """`resolve_box_image`, made NON-RETRYABLE at the activity boundary (#66).
+
+    `resolve_box_image` raising means a project declares `box.image` for a sandbox that cannot
+    honour it (ADR-0037 D4) — a DECLARATION, not a transient condition. Repeating the identical
+    call cannot change the answer; the fix is a person editing the registry. Left as a plain
+    `ValueError`, the SDK's default retry policy burns the activity's whole budget (3–5 attempts,
+    seconds to low minutes of backoff) re-asking a question that will not change, and only THEN
+    reaches a human — with the retries having bought nothing but delay before the (now correctly
+    diagnosable, thanks to `describe`) park note is written.
+
+    Every OTHER config refusal this function's callers might raise (an unknown project, an
+    unreadable manifest) is a `KeyError`/`FileNotFoundError` from a DIFFERENT layer and is left
+    to retry as before — narrowing this to the one call proven non-retryable rather than wrapping
+    the whole activity body, which would silently swallow genuinely transient failures nearby."""
+    try:
+        return resolve_box_image(project, sandbox=sandbox, explicit=explicit)
+    except ValueError as exc:
+        raise ApplicationError(str(exc), non_retryable=True) from exc
+
+
+class NoEngineClientHere(ApplicationError):
+    """`engine_client()` was asked somewhere no worker is holding a client for it.
+
+    NON-RETRYABLE, for the reason `_resolved_image` is: every cause is a fact about the code that
+    asked — not an activity, or the wrong kind of one — and the SDK's default policy would spend
+    the whole retry budget re-asking a question about a function's signature. ITS OWN TYPE so the
+    engine's history names it and a test can tell it from the engine being down."""
+
+    def __init__(self, why: str) -> None:
+        super().__init__(why, type="NoEngineClientHere", non_retryable=True)
+
+
+def engine_client():
+    """The durable engine's client FOR THE ACTIVITY THAT IS RUNNING: the one its worker holds.
+
+    FIVE ACTIVITIES OPENED THEIR OWN, on every execution (#217) — `available_slots` on every
+    poller tick, `start_jobs`, both coordinator notifications and the tech-lead's hourly round
+    each called `connection.connect()`: a new gRPC channel (on Temporal Cloud a TLS handshake and
+    an API-key exchange too), used for one or two calls and dropped, inside a process that was
+    already holding a connected client built by the same function from the same environment.
+    The installed SDK (1.32.0) has nothing to close a client with, so a dropped one sits in a
+    reference cycle until a collection nobody schedules. MEASURED ON A REAL WORKER over a throwaway
+    dev server, 2026-09-19: 60 executions of `available_slots` made 60 connects, and the process's
+    established connections to the engine climbed `2, 3, … 12`, fell to 1 when the collector
+    happened to run, climbed to 23, fell again — a sawtooth whose height is whatever the worker
+    allocated in between. Asking here instead: 0 connects, 1 connection, all 60.
+
+    THE SDK ALREADY HANDS IT OVER. `activity.client()` is the client `worker.py` gave `Worker(…)`,
+    made once by `connection.connect()` — so the namespace, the `pydantic_data_converter` and the
+    credentials are the deployment's, exactly what each of the five was rebuilding. Nothing to
+    pool, key by loop or release, which is why this is not `view.connect()`, the read side's door.
+    (Since #681 that door, and every other in the process, hands out this same client too:
+    `connection.connect()` holds one per process. An activity still asks the SDK for it, because
+    the SDK says which worker it is running in.)
+
+    EVERY ACTIVITY ASKS HERE, and nothing else in this module spells the SDK call or a `connect`
+    — `tests/test_an_activity_uses_the_client_its_worker_holds.py` parses the package for both, so
+    the next activity that needs the engine finds this and not the old habit.
+
+    OUTSIDE AN ACTIVITY IT REFUSES, AND DOES NOT CONNECT INSTEAD. Nothing in the package calls one
+    of these as a plain function — the poller and the workflows execute them — so a fallback
+    would run in no deployment and be the one door the habit could come back through unseen: a
+    seam that connects "when there is no context" satisfies every structural guard while opening
+    a client per call. The three ways to have no client are told apart because their remedies
+    differ, and the SDK's own words for them are two bare `RuntimeError`s."""
+    if not activity.in_activity():
+        raise NoEngineClientHere(
+            "the engine client was asked for outside a running activity. An activity uses the "
+            "client its worker already holds, and there is no worker here: a command connects "
+            "through `connection.connect()`, the panel through `view.connect()`, and a test runs "
+            "the activity inside `temporalio.testing.ActivityEnvironment(client=<a double>)`.")
+    try:
+        return activity.client()
+    except RuntimeError as exc:
+        name = activity.info().activity_type
+        raise NoEngineClientHere(
+            f"activity `{name}` has no engine client: the worker hands its client to `async def` "
+            "activities only. Declare it `async def` and move the blocking work into "
+            "`asyncio.to_thread`; in a test, build the environment as "
+            "`ActivityEnvironment(client=<a double>)`.") from exc
+
+
+def _project_or_none(project_name: str):
+    """The Project behind a name, or None. The coordinator's queue items carry only the name, and
+    the judging sandbox needs the project to know which harness credentials it declared."""
+    try:
+        return ProjectRegistry().get(project_name)
+    except Exception as exc:  # noqa: BLE001 — advisory path; a miss must degrade, not raise
+        # Said out loud: degrading to None means the judging sandbox declares no harness
+        # credential, so on a Bedrock deployment this is the difference between a tech-lead that
+        # answers and one that cannot reach a model at all.
+        activity.logger.warning("could not resolve project %r for a judging sandbox (%s)",
+                                project_name, str(exc)[:120])
+        return None
+
+
+def _judge_for(project_name: str):
+    """The JUDGMENT harness configured for a project, resolved by name.
+
+    Some tech-lead surfaces only carry the project's name (the coordinator's queue items), so the
+    Project has to be looked up. A registry miss falls back to the default harness — but SAYS SO,
+    because a silent fallback is how an experiment ends up reporting clean numbers for a harness
+    nobody chose. This path is advisory and best-effort by design (ADR-0015), so it must degrade
+    rather than fail; loudly is the compromise."""
+    from beeverforge.adapters.agent import build_techlead
+
+    try:
+        return build_techlead(ProjectRegistry().get(project_name))
+    except ValueError:
+        raise  # an unknown harness KIND is a config error — never paper over it
+    except Exception:  # noqa: BLE001 — a registry miss/hiccup, not a config error
+        activity.logger.warning(
+            "judgment harness: could not resolve project %r — using the default harness",
+            project_name)
+        return build_techlead(None)
+
+
+async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
+    """Run blocking work in a thread while heartbeating every ~30s, so Temporal sees the
+    activity is alive (a dead worker trips heartbeat_timeout instead of the full ceiling).
+    On cancellation/timeout the pending thread-task is cancelled, never leaked (H7).
+
+    `tick` IS THE ONLY MOMENT ANYTHING IS AWAKE DURING A FOUR-HOUR PASS (C-39). `fn` blocks a
+    worker thread for as long as the agent runs; this loop is already up every 30 seconds to
+    heartbeat, and until now it used that to say the WORKER is alive — which is not the same claim
+    as the AGENT is working, and the difference is the whole of #82. A `tick` that returns a
+    sentence has it appended to the heartbeat detail, so the engine's own view of the activity
+    carries it too.
+
+    IT MUST NEVER BE ABLE TO END THE WORK. A watcher raising here would cancel a pass that was
+    perfectly healthy, so it is called defensively — the heartbeat is what keeps the activity
+    alive, and it is issued whether or not the tick succeeded."""
+    work = asyncio.create_task(asyncio.to_thread(fn))
+    try:
+        while not work.done():
+            note = ""
+            if tick is not None:
+                try:
+                    note = tick() or ""
+                except Exception as exc:  # noqa: BLE001 — observing must not kill the observed
+                    activity.logger.warning("the harness watcher raised (%s) — the pass continues "
+                                            "unwatched", str(exc)[:160])
+            activity.heartbeat(f"{detail} — {note}" if note else detail)
+            await asyncio.wait({work}, timeout=30)
+        return work.result()
+    finally:
+        # the underlying Fargate task is stopped by the workflow's cleanup compensation
+        if not work.done():
+            work.cancel()
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# WATCHING THE HARNESS WHILE IT RUNS (C-39, #82)
+#
+# The arithmetic already existed and was reached only from the END: `stream.pulses_of` turns a
+# harness stream into pulses, `watch.read_harness` turns pulses into named stalls, and both were
+# called from the 4h wall and the no-result branch. So the platform's answer to "is the agent
+# stuck?" was correct and four hours late by construction.
+#
+# What was missing was somebody holding the other end of the pipe. `SandboxAdapter.tail()` is that
+# end; this is the thing that pulls on it. Nothing here is new judgment — every decision is made by
+# the same two functions the wall already uses, which is the card's "um cérebro só": a second
+# decision path diverges from the first within three months.
+#
+# IT OBSERVES AND REPORTS. It never signals, throttles, kills or answers the agent — the card's own
+# risk note says an interrupted pass leaves a half-written worktree and a half-pushed branch, and
+# that interrupting is a second step, after thresholds have proven they do not fire on healthy runs.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+#: THE LIVE WATCHER IS WHAT MAKES THE SILENCE SIGNAL EXIST AT ALL, and this line is where.
+#:
+#: Only opencode stamps its events with a wall clock, so post-mortem the other three harnesses
+#: cannot answer "no event for N minutes" and `read_harness` honestly reports itself blind to it.
+#: Reading LIVE removes the question: a pulse that arrives now happened now. The stamp is applied
+#: only where the stream did not carry one, so a harness with a real clock keeps its own.
+def _stamped(pulses: list, now: float) -> list:
+    from dataclasses import replace
+
+    return [p if p.at is not None else replace(p, at=now) for p in pulses]
+
+
+class HarnessWatch:
+    """One job's live reading of its own harness. Not a thread, not a clock — `tick()` is called by
+    whoever already has one (`_heartbeat_while`, every ~30s).
+
+    THE STATE IS PER PASS AND DIES WITH THE ACTIVITY: one pulse list, bounded by the events a
+    single harness invocation emits (turns and tool calls — hundreds, not millions), released when
+    this object is. Nothing module-level, nothing that outlives the job.
+    """
+
+    def __init__(self, *, harness: str, project: str, issue: str) -> None:
+        self.harness = harness
+        self.project = project
+        self.issue = issue
+        self._box = None
+        self._events = None
+        self._pulses: list = []
+        #: when the box last produced ANY line, parseable or not. See `_still_writing`.
+        self._last_line: float | None = None
+        #: stall kinds already reported for this pass. A four-hour silence would otherwise put the
+        #: same line in the panel 480 times, and a feed that repeats itself is one nobody reads on
+        #: the tick that matters (`techlead.watch.worth_saying` makes the same argument for the
+        #: hourly rounds).
+        self._said: set[str] = set()
+
+    def attach(self, runner) -> None:
+        """The box to read and the journal to report into — BOTH from the runner, which is the
+        object that actually holds them. Called from inside the worker thread the moment the runner
+        exists, because that is the earliest anything can be watched; before it, `tick()` says so
+        rather than reporting a quiet agent."""
+        self._box = getattr(runner, "sandbox", None)
+        self._events = getattr(runner, "events", None)
+
+    def read(self, *, now: float):
+        """The reading right now, or `None` when nothing could be read — and the difference is the
+        whole discipline. `None` here means *could not look*: the runner does not exist yet, the
+        box cannot read its own output, or this harness has no reader. `[]` pulses would mean *read
+        it and it was empty*, which is a different sentence and is `read_harness`'s to write."""
+        from beeverforge.adapters.agent.stream import pulses_of
+        from beeverforge.techlead.watch import read_harness
+
+        if self._box is None:
+            return None
+        try:
+            new = self._box.tail()
+        except Exception as exc:  # noqa: BLE001 — advisory; a box that cannot answer is not a job
+            activity.logger.warning("could not read the box for %s#%s (%s)",
+                                    self.project, self.issue, str(exc)[:120])
+            return None
+        if new is None:
+            return None  # the box says it cannot read itself — never "the agent said nothing"
+        if new:
+            self._last_line = now
+        fresh = pulses_of(self.harness, "".join(new))
+        if fresh is None and not self._pulses:
+            return None  # no reader for this harness: nothing may be concluded, ever
+        self._pulses.extend(_stamped(fresh or [], now))
+        # `grant_known=False`: the tool allow-list belongs to the agent adapter's invocation and
+        # does not reach here, so the "reaching for what it was never granted" signal reports
+        # itself unanswerable rather than reading absence as good behaviour.
+        return self._not_the_next_command(read_harness(self._pulses, now=now, grant_known=False),
+                                          now=now)
+
+    def _not_the_next_command(self, reading, *, now: float):
+        """Drop a silence finding while the box is demonstrably still writing.
+
+        ONE BOX RUNS THREE THINGS: `setup:`, then the harness, then `validate:` — and the port's
+        `tail()` says what was written, not which of them wrote it. So the agent's last pulse keeps
+        ageing through a twenty-minute test suite, and a reading taken then says the harness has
+        been quiet for twenty minutes. True about the harness, useless as an alarm, and a false
+        alarm is how a watcher gets turned off before the real one fires.
+
+        THIS IS NOT A SECOND CLASSIFIER, and the distinction matters because a second decision path
+        is what this card explicitly forbids. `read_harness` still decides everything; this declines
+        to REPORT one of its findings when the raw stream contradicts the premise it was computed
+        from — the harness cannot be silent while lines are arriving.
+
+        IT CANNOT HIDE THE STALL IT EXISTS FOR. A harness stuck at a prompt, looping inside its own
+        thinking, or waiting on an approval nobody will give writes NOTHING — no lines at all — so
+        `_last_line` stops moving and the finding stands. What it hides is a box that is busy with
+        something else, which was never the thing being looked for."""
+        from dataclasses import replace
+
+        from beeverforge.techlead.watch import HARNESS_SILENCE_MINUTES, SILENT
+
+        if not reading.stalls or self._last_line is None:
+            return reading
+        if now - self._last_line >= HARNESS_SILENCE_MINUTES * 60:
+            return reading
+        kept = tuple(s for s in reading.stalls if s.kind != SILENT)
+        return reading if len(kept) == len(reading.stalls) else replace(reading, stalls=kept)
+
+    def tick(self) -> str:
+        """Called on the heartbeat. Returns a short line for the heartbeat detail, and puts a
+        stall in the job's own journal — the same sink every other event on this card goes to, so
+        it lands in the panel beside them (ADR-0038: the panel is the reference surface)."""
+        import time
+
+        reading = self.read(now=time.time())
+        if reading is None or not reading.stalled:
+            return ""
+        fresh = [s for s in reading.stalls if s.kind not in self._said]
+        if not fresh:
+            return ""
+        self._said.update(s.kind for s in fresh)
+        # ONE BRAIN. The same classifier that reads a park note reads this one, so a live stall and
+        # a stall found at the wall are described and remedied identically. `reading.note` is
+        # already written to be read by `classify` — see `HarnessReading.note`, which explains why
+        # its wording avoids the TRANSIENT rules on purpose.
+        from beeverforge.techlead.classify import classify, remedy_for
+
+        verdict = classify(reading.note)
+        remedy = remedy_for(verdict)
+        self._say(f"o harness parece travado: {reading.note}",
+                  stalls=[s.kind for s in fresh], cause=verdict.cause,
+                  remedy=remedy.action, say=remedy.say)
+        return "; ".join(s.kind for s in fresh)
+
+    def _say(self, message: str, **data) -> None:
+        """Into the JOB'S OWN journal, under the job's own id — not a parallel feed.
+
+        `_pf_emit` below keys its events `beeverforge-<project>-<issue>` because the pre-flight runs
+        before a job exists. This one runs INSIDE a job, and `machine._emit` keys every event of
+        that job by the ticket ref, so an id of a different shape here would put the one line that
+        says "this pass is stuck" in a stream of its own, next to but not among the events an
+        operator is reading. Best-effort like every journal write: a telemetry hiccup must never
+        end a pass, and losing the line is said out loud because a lost warning reads exactly like
+        a healthy run."""
+        try:
+            from beeverforge.observability.events import JobEvent, now_iso
+
+            ref = canonical_ref(self.issue)
+            self._events.emit(JobEvent(ts=now_iso(), job_id=ref, ticket_id=ref,
+                                       kind="warning", message=message, data=data))
+        except Exception:  # noqa: BLE001 — the journal is additive; never fail a job over it
+            activity.logger.warning(
+                "the harness watcher found a stall on %s#%s and could not journal it: %s",
+                self.project, self.issue, message[:200])
+
+
+def _watch_for(inp: RunJobInput) -> HarnessWatch | None:
+    """A watcher for this job, or `None` WITH A REASON SAID OUT LOUD.
+
+    A box that cannot be read must not get a watcher: it would attach, receive nothing for four
+    hours and report a calm agent — silence read as health, which is the defect this whole card is
+    about. `BoxTraits.streams` is the question, asked before anything starts believing an empty
+    stream, and today `fargate` answers no (the harness's output never leaves the task; only the
+    orchestrator's own `BEEVERFORGE_EVENT:` lines reach CloudWatch). Saying so in the log is
+    the honest
+    half: an unwatched pass should be a known gap, not an assumption."""
+    from beeverforge.adapters.agent.registry import harness_kind
+
+    try:
+        # THE INSTALLED lookup, like every other activity-side question: the built-in table asked
+        # here refused a plugin box before its `streams` was ever read, and the log blamed "an
+        # unknown box" — a stranger's box that streams was never watched, for the wrong reason.
+        if not installed_box_traits(inp.sandbox).streams:
+            activity.logger.info(
+                "the %r box cannot be read while it runs, so %s#%s runs unwatched — a stall in "
+                "this pass stays invisible until the wall", inp.sandbox, inp.project, inp.issue)
+            return None
+        harness = harness_kind(_project_or_none(inp.project), "executor")
+        return HarnessWatch(harness=harness, project=inp.project, issue=inp.issue)
+    except Exception as exc:  # noqa: BLE001 — a watcher is advisory; never fail a job to build one
+        activity.logger.warning("could not build a harness watcher for %s#%s (%s)",
+                                inp.project, inp.issue, str(exc)[:120])
+        return None
+
+
+@activity.defn
+async def run_job(inp: RunJobInput) -> RunResult:
+    """Drive one ticket to a PR: get_ticket → sandbox → execute → validate →
+    review → open PR. The whole existing JobRunner, as one durable step.
+
+    A REMOTE box (`installed_box_traits(kind).remote`) runs the whole job on another machine
+    through the row's own runner; a local one runs the JobRunner here (container/worktree)."""
+    # Discriminates THIS run's tasks (R8) AND this lifecycle-loop iteration: an operator
+    # "Resume" after an impediment must launch a FRESH task, not reconcile the previous
+    # iteration's stale stopped result (same shape as repair_ci's -r{attempt}).
+    run_id = activity.info().workflow_run_id
+    if inp.attempt:
+        run_id = f"{run_id}-a{inp.attempt}"
+    # THE WATCHER IS BUILT HERE BECAUSE THIS IS THE ONLY PLACE THAT IS AWAKE (C-39). `_do_run_job`
+    # blocks a worker thread for the whole pass; the heartbeat loop below is the one thing still
+    # running, so it is what pulls on the box. `watch` is None for a box that cannot be read, and
+    # `_watch_for` says so in the log rather than attaching a watcher that would see nothing.
+    watch = _watch_for(inp)
+    applied = _this_activitys_event("handed-back")
+    result = await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied,
+                                    _do_run_job(inp, run_id, watch=watch)),
+        f"{inp.project}#{inp.issue} via {inp.sandbox}",
+        tick=watch.tick if watch else None,
+    )
+    try:
+        # BOUNDED, BECAUSE NOTHING BEATS FOR IT: the loop above stopped beating when the job
+        # returned, and the engine is still counting (`_A_PREVIEW_STARTS_WITHIN`)
+        await asyncio.wait_for(_a_preview_starts_on_its_own(inp.project, inp.issue, result),
+                               timeout=_A_PREVIEW_STARTS_WITHIN)
+    except TimeoutError:
+        activity.logger.warning(
+            "BEEVERFORGE_PREVIEW_AUTO_START_CUT %s#%s — starting its preview outlived %ss; the "
+            "job's result is returned without it, and the card's button starts one",
+            inp.project, inp.issue, _A_PREVIEW_STARTS_WITHIN)
+    return result
+
+
+def _the_worker_applies(project_name: str, issue: str, event_id: str, result: RunResult
+                        ) -> RunResult:
+    """THE BOX HANDS ITS OUTCOMES BACK, AND THE WORKER APPLIES THEM THROUGH THE CARD'S DOOR
+    (ADR-0055 D7, #414) — a pull request opened, a merge, a delivery, a refusal, a park, in the
+    order the box reached them. The box wrote only its progress marks; this is where the board, the
+    record and the role's snapshot hear the rest. Returns `result`, each outcome stamped with the
+    transition the door recorded (`HandedBack.event_id`), which the workflow hands the park's
+    reconcile so it is answered from the record (`mark_needs_action`).
+
+    INSIDE THE HEARTBEAT, NOT IN THE ACTIVITY'S TAIL: the door reads the card and writes the
+    tracker, and a tail past the last beat is a window the engine is still counting (#408).
+    `event_id` is this activity's own, so a retried activity — a box that re-attaches to the work
+    it already did — is answered from the card's record and applies nothing twice (D5).
+
+    A RESULT WITH NOTHING HANDED BACK is applied as nothing: a box from before #414 wrote its own
+    outcomes, and an older result in a job's history replays as it always did. NEVER RAISES — the
+    job's result is the workflow's to act on whatever the door managed."""
+    if not getattr(result, "handed_back", None):
+        return result
+    try:
+        from beeverforge.lifecycle import handed_back
+
+        project = ProjectRegistry().get(project_name)
+        handed_back.apply(project, issue, result, event_id=event_id,
+                          tracker=_tracker_for(project))
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        activity.logger.warning("BEEVERFORGE_CARD_OUTCOME_UNAPPLIED %s#%s — the outcomes its box "
+                                "handed back did not go through the card's door (%s)",
+                                project_name, issue, str(exc)[:200])
+    return result
+
+
+# ── what an activity does AFTER its work returned is bounded, because nothing beats for it ──────
+#
+# THE TAIL OF AN ACTIVITY IS NOT COVERED BY ITS HEARTBEAT (review of #408). `_heartbeat_while` and
+# `_heartbeating` beat WHILE the work runs and stop the moment it returns; whatever the activity
+# awaits after that runs with nothing beating, against a window the engine is still counting. Two
+# tails were written that way in #405 — the start that follows a job, and the telling that follows
+# a preview coming up — and both swallowed a failure while neither bounded a HANG. What is in
+# them can hang: reading the previews up is a `docker ps -a` that waits sixty seconds on a daemon
+# that does not answer, the engine's start is an RPC made with no timeout, and a tracker is told
+# once per card, each a call to a forge that may be throttling. Measured with the heartbeat
+# instrumented and a tail made to hang for N seconds, the gap from the last beat to the return
+# was N plus the second the job took, with no ceiling: 4.01 s at 3, 41.01 s at 40.
+#
+# WHAT IT COST WAS NEVER THE PREVIEW'S. Past the window the engine fails the activity. For the job
+# that is the most expensive step in the system failed — or RE-RUN, on a box that re-attaches —
+# after its pull request was opened; for the preview it is a stack that came up being taken down
+# as "the start did not finish", while its cards were still being told it was up.
+#
+# THE ARITHMETIC. A beat can be one period old when the work returns (and the preview's step may
+# not have beaten at all: then the window counts from a start under one period ago), so what a
+# tail has is the window LESS one period — 120 − 30 = 90 s for the job, 60 − 10 = 50 s for the
+# step. Each bound keeps the return within HALF its window of the last beat: 30 + 30 of 120,
+# 10 + 20 of 60. The other half is the engine's, to be handed the result in.
+# `tests/test_a_preview_starts_itself_when_the_pull_request_opens.py` holds both sums against the
+# windows the workflows declare, so a window that shrinks or a bound that grows is said.
+#
+# WHAT OUTLIVES ITS BOUND. The job's tail is a coroutine, so it is cancelled where it waits and
+# begins nothing more. A THREAD CANNOT BE CANCELLED (`asyncio.to_thread`): the call in flight —
+# and, for the telling, which is one thread, every card after it — runs on in the background to
+# its own end (the daemon's call and the trackers' each carry a timeout of their own), and its
+# result is dropped. Nothing it writes late can disagree with what is already there:
+#   - a start the engine accepted after the bound is the unit's ONE workflow
+#     (`preview.workflow_id`): the same start the button makes, refused as a duplicate to whoever
+#     asks second, and said `starting` on the card by its own first step;
+#   - the note of a start the cap held back is written on the record AS IT IS WHEN IT IS WRITTEN,
+#     and only while that is still `offered` (`_held_back`);
+#   - a card is commented once, because the step runs once and its answer no longer waits for
+#     the telling; and the product role is told once per start, by key (`<unit>@<started_at>`).
+
+#: How long `run_job` waits for the start that follows the job, in seconds.
+_A_PREVIEW_STARTS_WITHIN = 30.0
+#: How long `preview_up` waits for the telling that follows the stack coming up, in seconds.
+_SAID_UP_WITHIN = 20.0
+
+
+async def _a_preview_starts_on_its_own(project_name: str, issue: str, result) -> str:
+    """Start the card's preview when its job just handed the pull request to a person (ADR-0050
+    D6 as amended 2026-09-29, #405) — the workflow id when one was started, `""` otherwise.
+
+    HERE, AFTER THE JOB RETURNED, AND NOT IN EITHER OF THE TWO OBVIOUS PLACES. Not inside the
+    job's machine: a job never waits on, or fails over, a preview, and the machine also runs
+    outside the engine (`beeverforge run`). Not as a step of `JobWorkflow`: a new command in a
+    workflow with jobs in flight breaks their replay. This activity already holds the engine's
+    client and returns the result the workflow is waiting for; starting a separate workflow from
+    here adds nothing to the job's history.
+
+    WHAT DECIDES IS `preview/live.py::should_start`, from the record the job's offer just wrote —
+    the offer is the one judge of "this change can be previewed" (a declared shape, a named
+    runtime), so the automatic start and the button can never disagree about it. A limit that
+    held it back (the cap) is said on the card as a note; the button still starts it.
+
+    NEVER FAILS THE JOB: the pull request is open and the work is done. Never HOLDS it either —
+    that half of the promise is the caller's, which cuts this where it waits
+    (`_A_PREVIEW_STARTS_WITHIN`)."""
+    if getattr(result, "state", None) != JobState.PR_OPEN or not getattr(result, "pr_url", ""):
+        return ""
+    try:
+        from beeverforge import preview
+        from beeverforge.contracts.project import PreviewPolicy
+        from beeverforge.preview import live
+        from beeverforge.runtime.temporal import view as tv
+        from beeverforge.runtime.temporal.io import PreviewParams, default_preview_runtime
+
+        project = ProjectRegistry().get(project_name)
+        card = preview.card_of(issue)
+        if not card:
+            return ""
+        token = await asyncio.to_thread(preview.unit_of_card, project.name, card)
+        found = await asyncio.to_thread(preview.latest, project.name, token)
+        kind = default_preview_runtime()
+        # THE DAEMON IS ASKED ONLY WHEN EVERYTHING CHEAPER SAID YES: handed over as a value, the
+        # previews up were read on every job that opened a pull request — a project whose
+        # operator turned the start off included (`should_start`, review of #408)
+        start, why = await asyncio.to_thread(
+            live.should_start, project, found, kind=kind,
+            running=lambda: _running_previews(kind))
+        if why and found is not None:
+            await asyncio.to_thread(_held_back, project, token, why)
+            activity.logger.info("BEEVERFORGE_PREVIEW_HELD %s %s — %s", project.name, token, why)
+            return ""
+        if not start:
+            return ""
+        policy = getattr(project, "preview", None) or PreviewPolicy()
+        params = PreviewParams(project=project.name, unit=token, started_by=live.AUTO_STARTER,
+                               runtime=kind, start_timeout_minutes=policy.start_timeout_minutes)
+        try:
+            wf_id = await tv.start_preview(engine_client(), params)
+        except tv.PreviewAlreadyStarted:
+            return ""  # somebody pressed the button first: one workflow per unit, as ever
+        activity.logger.info("BEEVERFORGE_PREVIEW_AUTO_START %s %s (%s)", project.name, token,
+                             wf_id)
+        return wf_id
+    except Exception as exc:  # noqa: BLE001 — the promise above: a preview never fails a job
+        activity.logger.warning("no preview was started on its own for %s#%s (%s)", project_name,
+                                issue, str(exc)[:200])
+        return ""
+
+
+def _held_back(project, token: str, why: str) -> bool:
+    """The cap held an automatic start back: its sentence, as a note on the unit's record —
+    whether it was written.
+
+    ON THE RECORD AS IT IS NOW, READ HERE, AND ONLY WHILE IT IS STILL `offered` (review of #408).
+    The record the decision read is as old as the daemon's answer took, and the store is
+    append-only with the newest row the truth: a note written on that copy relabels `offered` a
+    unit a person started in between, and hides its `starting` — or its failure — from the card
+    until the next step writes. Read and written in ONE thread, so the caller's bound, which
+    cannot cut a thread, cannot fall between the two."""
+    from beeverforge import preview
+    from beeverforge.preview import live
+
+    now = preview.latest(project.name, token)
+    if now is None or now.state != preview.OFFERED:
+        return False
+    said = live.held(why, getattr(project, "language", None))
+    return preview.record(now.model_copy(update={
+        "notes": tuple(dict.fromkeys([*now.notes, said]))}))
+
+
+def _running_previews(kind: str):
+    """The previews up on this deployment's runtime, for the cap — `()` when it cannot be read,
+    which lets the plan step's own cap check be the judge (it refuses by name)."""
+    from beeverforge.adapters.preview.registry import build_runtime
+
+    try:
+        return build_runtime(kind).running()
+    except Exception as exc:  # noqa: BLE001 — an unread count is the plan step's to refuse
+        activity.logger.info("could not count the previews up (%s)", str(exc)[:160])
+        return ()
+
+
+def _do_run_job(inp: RunJobInput, run_id: str | None = None,
+                watch: HarnessWatch | None = None) -> RunResult:
+    # BY TRAIT, NOT BY NAME. `if inp.sandbox == "fargate"` stood here, and it meant a third box
+    # declaring `remote=True` was built as a LOCAL adapter by this line while `stop_job` ignored
+    # it — the two halves of one lifecycle disagreeing about where the job is (measured with an
+    # `ssh` row, 2026-08-24). The row's runner is the only thing that knows how to run it there.
+    if installed_box_traits(inp.sandbox).remote:
+        return _run_remote(inp, run_id)
+    project = ProjectRegistry().get(inp.project)
+    # C-18: the runner works the CARD's repository. The ref stays qualified — it is the platform's
+    # identity for this job (workflow id, journal, ledger) — while every adapter under it is built
+    # against that one repo, where a bare `#1` is unambiguous.
+    view, repo_key = _runner_view(project, inp.issue)
+    runner = build_runner(
+        view, inp.issue, sandbox=inp.sandbox, image=inp.image, review=inp.review,
+        repo_key=repo_key, change=inp.change,
+    )
+    # THE HANDOFF, and it is the whole reason the watcher is reachable at all. The box is built
+    # inside `build_runner`, three layers below this activity, and the agent adapter calls it three
+    # layers further down — so a push callback would have had to be threaded through both. The
+    # runner holds the box and the journal as plain fields, and this line is where the watcher
+    # (which lives one frame up, in the loop that stays awake) is given them.
+    if watch is not None:
+        watch.attach(runner)
+    result = runner.run(inp.issue, resume_handle=inp.resume_handle,
+                        spent_turns=inp.spent_turns, decision=inp.decision,  # C2 + D4 + a choice
+                        another_pass=inp.another_pass)  # #448 slice 4: the card's next change
+    # which A/B arm this run was in (ADR-0017's gate) — see the box path for why it's stamped
+    # at the boundary, and why a dashboard dimension is never allowed to fail a finished run.
+    try:
+        result.knowledge = runner.knowledge_arm()
+    except Exception:  # noqa: BLE001 — a DASHBOARD dimension must never fail a finished run
+        # The ticket lands with no arm and the A/B silently loses a data point. Still must not fail
+        # a run that succeeded — but a comparison quietly missing rows is worse than a visible gap.
+        activity.logger.warning("could not record the knowledge arm for #%s", inp.issue)
+    return result
+
+
+
+
+
+
+def _box_for(inp: RunJobInput, *, references: dict[str, str] | None = None):
+    """The job's `BoxConfig`. `references` is what `box_launch_credentials` answered for the
+    launch (#903): an axis handed as a reference is read from the variable the launcher fills."""
+    from beeverforge.runtime.boxed_job import BoxConfig
+
+    project = ProjectRegistry().get(inp.project)
+    # C-18: the box clones and works THE CARD'S repo; inside it the ref is bare — branch names,
+    # issue ops and board moves all happen against that one repo, where bare is unambiguous.
+    card_repo, bare_issue = _ref_repo(project, inp.issue)
+    return BoxConfig(
+        project=inp.project,
+        issue=bare_issue,
+        repo=card_repo,
+        board_owner=project.tracker.options.get("board_owner"),
+        board_number=project.tracker.options.get("board_number"),
+        # WHICH provider the box talks to. Read off the project rather than assumed: the seam was
+        # honoured here and then abandoned inside the container (ADR-0022 §1).
+        tracker_kind=project.tracker.kind,
+        forge_kind=(project.forge.kind if project.forge else None) or project.tracker.kind,
+        # …AND EACH AXIS'S COORDINATES (#162). Whole, because they are the provider's own
+        # vocabulary: `board_owner`/`board_number` above are two keys of GitHub Projects' that an
+        # earlier fix hand-picked, and a box told only those cannot build an Azure adapter at all.
+        tracker_options=box_options(project, "tracker", references=references),
+        forge_options=box_options(project, "forge", references=references),
+        review=inp.review,
+        resume_handle=inp.resume_handle,  # C2: propagate to the remote box via env
+        spent_turns=inp.spent_turns,  # D4: the effort budget's running total
+        decision=inp.decision,  # a resolved human choice, injected into the box's agent
+        another_pass=inp.another_pass, change=inp.change,  # #448 slice 4: the card's next change
+    )
+
+
+def _the_change_env(change: int, another_pass: str = "") -> dict[str, str]:
+    """WHICH CHANGE OF THE CARD, AND WHAT IS STILL WRONG WITH THE LAST ONE, for a remote box
+    (#448 slice 4) — as variables the box reads itself (`boxed_job.config_from_env`), so they
+    reach it whatever a launcher row does with `BoxConfig`. Empty on a card's first change: a
+    box launched for it is launched exactly as before."""
+    out: dict[str, str] = {}
+    if change:
+        out["BEEVERFORGE_CHANGE"] = str(change)
+    if another_pass:
+        out["BEEVERFORGE_ANOTHER_PASS"] = another_pass
+    return out
+
+
+def _run_remote(inp: RunJobInput, run_id: str | None = None) -> RunResult:
+    """The whole job on the box's own machine, through the row's runner (`RemoteBox.launch`)."""
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.paths import events_file
+
+    project = ProjectRegistry().get(inp.project)
+    # tee the task's streamed events into the host journal the panel reads (dedup: a
+    # retry that re-tails from the head must not duplicate the feed — R7).
+    journal = journal_for(events_file(project, inp.issue), dedup=True)
+    # THE A/B ARM (knowledge/experiment.py) is decided HERE, on the worker, and carried into the
+    # box. The box is credential-less by design, so it cannot read the metrics that say how the
+    # arms are balanced so far — deciding there would degrade to "always inject" every time and the
+    # experiment would never run while looking as though it did. No-op unless a window is open.
+    from beeverforge.knowledge.experiment import arm_env, arm_for
+
+    extra_env = ({} if not getattr(project, "knowledge_experiment", False)
+                 else arm_env(arm_for(project)))
+    return _remote_launch(
+        project, inp.sandbox, lambda references: _box_for(inp, references=references),
+        journal=journal, run_id=run_id,
+        extra_env={**extra_env, **_the_change_env(inp.change, inp.another_pass)},
+    )
+
+
+def _remote_launch(project, kind: str, build_box: Callable[[dict[str, str]], BoxConfig], *,
+                   extra_env: dict[str, str], **launch) -> RunResult:
+    """THE ONE WAY AN ACTIVITY LAUNCHES ON A REMOTE BOX (#903): the job, a promotion phase, a
+    re-review and a CI repair or adjustment all come through here, so what a launcher is handed
+    cannot differ between them.
+
+    The credentials are asked FIRST, before the box is built and before `launch`: a secret the
+    credential store holds is refused for a launcher that does not declare it resolves references,
+    and that refusal must come before anything was started (docs/engineering-lessons.md §12).
+    `build_box(references)` builds the `BoxConfig` with the same answer, so an axis handed as a
+    reference names the variable the launcher fills. `references=` is passed only when it is
+    non-empty, which `box_launch_credentials` answers only for a declaring launcher: a launcher
+    that declares nothing is called with exactly the keywords every launcher was called with
+    before the declaration existed (`AcmeRunner.launch` takes no `references`)."""
+    runner = remote_box(kind)
+    env, references = box_launch_credentials(project, kind, runner)
+    if references:
+        launch["references"] = references
+    return runner.launch(build_box(references), extra_env={**extra_env, **env} or None, **launch)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight sizing gate (ADR-0013 D2) — runs on the WORKER, before any Fargate.
+
+
+def _tracker_for(project):
+    """A tracker bound to `project` — chosen by the REGISTRY, never named here.
+
+    THE single construction point on the worker: every activity that needs a tracker comes through
+    this, so a client on Jira changes one registry value and nothing in this file."""
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.credentials import tracker_token_for
+    from beeverforge.factory import bot_token_provider_for
+
+    tok = tracker_token_for(project)
+    return build_tracker(project, token=tok,
+                         token_provider=None if tok else bot_token_provider_for(project, "tracker"))
+
+
+def _sizer_result_text(res) -> str:
+    """The sizer's FULL final message — the sizer writes its analysis FIRST and the JSON verdict
+    LAST, so the 1000-char cap chops the verdict off (live bug: #37's 3509-char response). One
+    shared reader now; this name stays because the call sites read better with it."""
+    from beeverforge.adapters.agent.base import final_text
+
+    return final_text(res)
+
+def _parse_verdict(text: str) -> PreflightVerdict | None:
+    """Extract the sizer's LAST fenced JSON block. None → caller degrades to fit. Tolerates
+    prose around the block and minor sloppiness; never raises."""
+    import json as _json
+    import re as _re
+
+    try:
+        blocks = _re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL)
+        raw = blocks[-1] if blocks else None
+        if raw is None:  # maybe bare JSON without a fence
+            m = _re.search(r"\{[^{}]*\"verdict\"[\s\S]*\}", text)
+            raw = m.group(0) if m else None
+        if raw is None:
+            return None
+        d = _json.loads(raw)
+        v = str(d.get("verdict", "")).lower()
+        if v not in ("fit", "split", "unclear"):
+            return None
+        return PreflightVerdict(
+            verdict=v,
+            estimated_files=d.get("estimated_files"),
+            reasons=str(d.get("reasons", ""))[:800],
+            children=[c for c in (d.get("children") or []) if isinstance(c, dict)][:4],
+            questions=[str(q)[:300] for q in (d.get("questions") or [])][:6],
+            touches=[str(p).strip().replace("\\", "/").lstrip("./")[:200]
+                     for p in (d.get("touches") or []) if str(p).strip()][:30],
+        )
+    except Exception as exc:  # noqa: BLE001 — a malformed verdict degrades, never crashes
+        # None means "the gate had no opinion", so the job runs. Right as a default, but if the
+        # gate is malformed EVERY time it has silently stopped gating anything.
+        activity.logger.warning("pre-flight verdict unreadable (%s) — the job runs ungated", exc)
+        return None
+
+
+# The marker every auto-split child carries in its title. Single source of truth: the splitter
+# writes it, and pre-flight reads it to recognise its own children and NEVER re-size them. The
+# spelling lives in `contracts/refs.py` since 2026-09-19, because the delivery sweep reads it too.
+_SPLIT_CHILD_MARK = SPLIT_CHILD_MARK
+
+#: THE BODY LIMIT OF A TRACKER ROW THAT DECLARES NONE (#624) — the smallest any shipped row
+#: declares, because a row nobody measured should get the most cautious bound: Jira Cloud's 32,767
+#: characters for a description (`JiraTracker.body_limit`, cited there). A row says its own with a
+#: `body_limit` attribute, asked through `getattr` and never added to the port: a new member of a
+#: `runtime_checkable` Protocol fails every row a stranger shipped (measured in #150,
+#: `catalog.py`). Read only by the split, the one writer whose body grows with a parent's.
+CARD_BODY_LIMIT = 32_767
+
+
+def _pf_emit(sink, project: str, issue: str, kind: str, message: str, **data) -> None:
+    """Stream one pre-flight/split event as an `BEEVERFORGE_EVENT:` line on the worker's stdout
+    (→ /ecs/beeverforge-worker), tagged with this job's id so the panel can tail the sizing LIVE.
+    The step runs on the WORKER (no Fargate task), so without this it is invisible on the
+    board — the operator sees a silent card and assumes 'nothing is happening'. Best-effort:
+    a telemetry hiccup must never break sizing."""
+    try:
+        from beeverforge.observability.events import JobEvent, now_iso
+
+        sink.emit(JobEvent(ts=now_iso(), job_id=f"beeverforge-{project}-{issue}",
+                           ticket_id=str(issue),
+                           kind=kind, message=message, data=data))
+    except Exception:  # noqa: BLE001 — the journal is additive; never fail a job over it
+        # The panel's live feed loses this line, and journalling that fails repeatedly reads to an
+        # operator exactly like a job doing nothing.
+        activity.logger.warning("journal entry lost for %s#%s (%s)", project, issue, kind)
+
+
+def _belongs_elsewhere_said(project, tracker, issue: str) -> str:
+    """The pre-flight's sentence when `issue`'s change belongs to another repository (#665), else
+    `""` — and `""` when the card cannot be read, which the sizing below finds out and says."""
+    from beeverforge.lifecycle.card import _here
+    from beeverforge.product.voice import card_belongs_elsewhere
+    from beeverforge.runtime.card_repo import runs_elsewhere
+
+    try:
+        home = runs_elsewhere(project, getattr(tracker.get_ticket(issue), "belongs_to", None))
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        activity.logger.info("pre-flight could not read #%s for its repository (%s)", issue, exc)
+        return ""
+    return card_belongs_elsewhere("preflight", ref=issue, home=home, here=_here(project),
+                                  language=getattr(project, "language", None)) if home else ""
+
+
+def _do_preflight(inp: PreflightInput) -> PreflightVerdict:
+    """Judge the ticket BEFORE launching any Fargate. Every failure path returns fit+degraded
+    — the gate can only ever help; it must never become a new way to block the pipeline."""
+    import tempfile
+    from pathlib import Path
+
+    from beeverforge.adapters.agent import build_techlead
+    from beeverforge.adapters.forge.registry import clone_url_for
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.registry import judging_worktree
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.orchestrator.context import build_context
+    from beeverforge.runtime.repo_cache import RepoCache, current_branch
+    from beeverforge.techlead import voice as tl_voice
+
+    project = ProjectRegistry().get(inp.project)
+    tracker = _tracker_for(project)
+    # A CARD OF ANOTHER REPOSITORY OF THE PRODUCT IS NOT SIZED HERE (#665): a job started on it
+    # past the queue and the pickup is parked with the sentence naming where it belongs
+    elsewhere = _belongs_elsewhere_said(project, tracker, inp.issue)
+    if elsewhere:
+        return PreflightVerdict(verdict="unclear", questions=[elsewhere], reasons=elsewhere)
+    # THE TICKET IS THE CLIENT'S (#160). Everything this gate writes onto it is unprompted — it
+    # comments before anything runs, to say why — and it went out in English on every project.
+    _lang = str(getattr(project, "language", "") or "")
+    events = journal_for(None, live=True)  # live pre-flight feed → panel (no Fargate task)
+    _pf_emit(events, inp.project, inp.issue, "state", "sizing",
+             note="pre-flight — judging INVEST (one small, testable outcome?)")
+    # Intentional skips (the gate is OFF, or an e2e ticket) are silent; a FAILURE to actually
+    # size (broken gate: no token, clone/sizer error, garbage verdict) must NEVER be silent —
+    # it means the ticket ran UNSIZED and nobody knew (the live #37 bug). Surface those loudly:
+    # a warning comment on the ticket + a log line, so a degraded gate is always visible.
+    _INTENTIONAL = {"disabled", "e2e ticket"}
+
+    def degrade(reason: str) -> PreflightVerdict:
+        _pf_emit(events, inp.project, inp.issue,
+                 "note" if reason in _INTENTIONAL else "warning",
+                 f"pre-flight did not size ({reason}) — proceeding UNSIZED")
+        if reason not in _INTENTIONAL:
+            logs.announce(activity.logger, f"BEEVERFORGE_PREFLIGHT: DEGRADED for "
+                                           f"{inp.project}#{inp.issue} — {reason}",
+                          logging.WARNING)
+            try:
+                tracker.comment(
+                    f"#{inp.issue.lstrip('#')}",
+                    tl_voice.say(tl_voice.NARRATION, "preflight.unsized", _lang, why=reason))
+            except Exception:  # noqa: BLE001 — surfacing is best-effort, never blocks
+                # Nobody is told the ticket went through UNSIZED — the one case this warning exists
+                # for, so a later "why was this so big?" has an answer.
+                activity.logger.warning("could not warn #%s that it proceeded unsized", inp.issue)
+        return PreflightVerdict(degraded=reason)
+
+    # `project.repo_path` is a REGISTRY value — on Fargate it's where the entrypoint clones
+    # to (a real path inside that container); on the WORKER it names no real directory at
+    # all. So the worker must sync its OWN cached checkout FIRST and load the manifest from
+    # THAT — never from `project.repo_path` directly (the bug that made every worker-side
+    # preflight degrade: "no manifest at /work/<project>/.sdlc/project.yaml").
+    #
+    # THE CARD'S repo, not the project's (C-18): each source repo carries its own manifest, and
+    # sizing a `…-web` ticket against `…-api`'s components is sizing the wrong world.
+    repo, _ = _ref_repo(project, inp.issue)
+    cache_key = _checkout_key(project, repo)
+    # PER PROJECT (`forge_token_for`): this clones the CARD'S repository, and on a
+    # deployment hosting two forges the process-wide value is the other vendor's.
+    token = forge_token_for(project) or deployment_forge_token(project)
+    # THE BASE BRANCH IS NOT KNOWN UNTIL THE MANIFEST LOADS, and the manifest lives inside the
+    # checkout — so the first sync asks for the registry's named base if there is one and OTHERWISE
+    # for nothing at all, letting the clone land where the repository points (#162). It used to ask
+    # for the literal `main`, which is not a guess that costs a fetch: on a `master` repository
+    # `--branch main` names nothing, the clone fails, and this function degrades — so EVERY ticket
+    # on such a client proceeded UNSIZED, hourly, with a message blaming reachability. The manifest
+    # itself is expected identical across branches; we re-sync below if it names another.
+    # THE URL RESOLUTION IS INSIDE THE GUARD, not just the clone. `clone_url_for` goes through the
+    # forge registry, which RAISES on a kind it does not know — correctly, because a clone aimed at
+    # the wrong host is the most expensive configuration error there is. But the preflight's entire
+    # contract is that it never stops a ticket: it degrades and says so, loudly, on the card. A
+    # ValueError escaping here would turn a misconfigured registry row into a dead job, which is
+    # worse than the unsized ticket this function exists to avoid. It read as a pure function until
+    # the URL became a provider question, so the old `try` did not need to cover it.
+    try:
+        url = clone_url_for(project, repo, token=token)
+    except Exception as exc:  # noqa: BLE001 — a bad provider row must degrade, never kill the job
+        return degrade(f"clone: {str(exc)[:160]}")
+    from beeverforge.loader import load_manifest_base_branch
+
+    asked = load_manifest_base_branch(project, default="")
+    repo_path = RepoCache().sync(cache_key, url, asked)
+    if repo_path is None:
+        return degrade("clone: could not reach the repo for a worker-side checkout")
+
+    try:
+        from beeverforge.loader import load_manifest  # local: the tests' patch seam
+        manifest = load_manifest(project.model_copy(update={"repo_path": str(repo_path)}))
+    except Exception as exc:  # noqa: BLE001
+        return degrade(f"manifest: {str(exc)[:120]}")
+    if not manifest.preflight.enabled:
+        return degrade("disabled")
+    # RE-SYNC AGAINST WHAT WE ACTUALLY LANDED ON, not against the literal `main`. Comparing to
+    # `main` re-fetched every `master` repository whose manifest says `master` — and, worse, did
+    # NOT re-fetch a `main`-registered project whose manifest names a different base, because the
+    # comparison was about the wrong branch entirely.
+    # `declared_base_branch`, NOT `base_branch` — the field has the schema default `"main"`, so
+    # reading it as a declaration re-clones a `master` client at a branch that does not exist,
+    # one line after resolving the right one. Adversarial review, 2026-08-20.
+    declared = manifest.declared_base_branch
+    if declared and declared != current_branch(repo_path):
+        repo_path = RepoCache().sync(cache_key, url, declared)
+        if repo_path is None:
+            return degrade(f"clone: could not sync branch {declared!r}")
+
+    try:
+        ticket = tracker.get_ticket(inp.issue)
+    except Exception as exc:  # noqa: BLE001
+        return degrade(f"ticket: {str(exc)[:120]}")
+    # A ticket that is ITSELF a split child is already a scoped, sized work unit — NEVER
+    # re-size it. Re-sizing recurses: the sizer splits the child again (and again), a runaway
+    # cascade that spawns ever-smaller Plan 92x… tickets. The auto-split title marker is how we
+    # recognise our own children; they go straight to fit → the pipeline codes them. (A child
+    # that truly is too big is a human call — re-drop it, don't let the gate loop.)
+    if _SPLIT_CHILD_MARK in (ticket.title or ""):
+        _pf_emit(events, inp.project, inp.issue, "note",
+                 "fit — split child (already scoped by an earlier split), going to code",
+                 verdict="fit")
+        return PreflightVerdict(verdict="fit")
+    # e2e tickets aren't implemented at all (ADR-0008) — sizing is meaningless for them
+    if manifest.e2e_workflow and manifest.e2e_label.lower() in ticket.labels:
+        return degrade("e2e ticket")
+
+    if not manifest.preflight.code_check:
+        repo_path = None  # text-only judgment — the sizer gets no checkout to explore
+
+    try:
+        ctx = build_context(manifest, repo_path or Path(project.repo_path), ticket)
+        # Sizing is INVEST-only (owner decision): judge conceptual cohesion — one outcome or
+        # several — NOT a file-count budget. So we give the sizer the repo to understand the
+        # change, but no numeric budget to tally against.
+        ctx.guidelines.append(
+            ("Working directory: a read-only checkout of the repo. "
+             if repo_path else "No code checkout was provided — judge from the ticket text alone. ")
+            + "Judge size by INVEST (one cohesive, independent, testable outcome), "
+              "never by counting files."
+        )
+        agent = build_techlead(project)  # the sizer is JUDGMENT, not coding
+        if not hasattr(agent, "size"):  # a future adapter without a sizer → gate is a no-op
+            return degrade("adapter has no sizer")
+        # code_check=false → no checkout for the sizer to explore; give it the (unused-for-
+        # read) cache root so Workspace has a valid path — the sizer's prompt already says
+        # "no code checkout was provided" and its tools are read-only Read/Grep/Glob anyway.
+        ws = Workspace(path=repo_path or Path(tempfile.gettempdir()), branch=manifest.base_branch,
+                       base_branch=manifest.base_branch)
+        sandbox = judging_worktree(
+            project, root=Path(tempfile.gettempdir()) / "beeverforge-preflight")
+        res = agent.size(sandbox=sandbox, workspace=ws, context=ctx)
+        if not res.ok and res.pause_reason:
+            return degrade(f"agent paused: {res.pause_reason}")
+        sizer_text = _sizer_result_text(res)
+        verdict = _parse_verdict(sizer_text)
+        if verdict is None:
+            # Log the tail so a genuinely malformed verdict is diagnosable without a rerun.
+            logs.announce(activity.logger, f"BEEVERFORGE_PREFLIGHT: unparseable verdict "
+                                           f"({len(sizer_text)} chars) "
+                                           f"tail={sizer_text[-300:]!r}", logging.WARNING)
+            return degrade("unparseable verdict")
+    except Exception as exc:  # noqa: BLE001
+        return degrade(f"sizer: {str(exc)[:120]}")
+
+    # Stream the verdict so the operator SEES the decision land, live, on the card.
+    if verdict.verdict == "split":
+        titles = ", ".join(c.get("title", "?") for c in verdict.children)
+        _pf_emit(events, inp.project, inp.issue, "note",
+                 f"verdict: SPLIT into {len(verdict.children)} — {titles}", verdict="split")
+    elif verdict.verdict == "unclear":
+        _pf_emit(events, inp.project, inp.issue, "note",
+                 "verdict: UNCLEAR — needs the ticket clarified first", verdict="unclear")
+    else:
+        _pf_emit(events, inp.project, inp.issue, "note",
+                 "verdict: FIT — one small change, proceeding into the pipeline", verdict="fit")
+
+    # Surface the judgment on the ticket so the operator sees WHY before anything runs.
+    try:
+        if verdict.verdict == "unclear":
+            qs = ("\n".join(f"- {q}" for q in verdict.questions)
+                  or tl_voice.say(tl_voice.NARRATION, "preflight.no-questions", _lang))
+            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.unclear",
+                                                    _lang, questions=qs))
+        elif verdict.verdict == "split":
+            kids = "\n".join(f"- **{c.get('title', '?')}** — {c.get('objective', '')}"
+                             for c in verdict.children)
+            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.too-large",
+                                                    _lang, why=verdict.reasons, children=kids))
+    except Exception:  # noqa: BLE001 — commentary is cosmetic
+        activity.logger.warning("could not comment the sizing verdict on #%s", inp.issue)
+    return verdict
+
+
+def _clipped(text: str, limit: int) -> str:
+    """`text` cut at a WORD boundary, with an ellipsis when it was cut.
+
+    A hard slice ends mid-word and can leave an unbalanced bracket: the pilot's own split
+    announcement read "…with an unaddressed 1/day quota conflict) to)." — a sentence that stops
+    in the middle of a thought, with a stray `to` and a parenthesis that closes nothing. A reader
+    cannot tell that from a sentence the model wrote badly.
+    """
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    # `rsplit` WITH NO SEPARATOR RETURNS THE WHOLE STRING, so a single word longer than the cap
+    # comes back intact rather than empty — the `or clean[:limit]` this line used to carry was a
+    # branch nothing could reach, found by a mutation that removed it and stayed green.
+    cut = clean[:limit].rsplit(" ", 1)[0].rstrip(" ,;:([{-")
+    return f"{cut}…"
+
+
+def _child_title(parent_title: str, i: int, parent_ref: str) -> str:
+    """The child's issue title — DETERMINISTIC, derived ONLY from the parent, NEVER from the
+    LLM's per-child text. That is what makes the split idempotent: a re-run of the sizer
+    (a re-drop, a workflow retry) produces the SAME titles, so find-or-create REUSES the
+    existing children instead of spawning a fresh duplicate set — the bug that littered the
+    board with 30 near-identical 'Plan 92x' issues. The title also carries the parent→child
+    link and marks the ticket auto-generated:
+        'Plan 92 — Guest hardening'  →  'Plan 92a — Guest hardening [auto-split of #37]'
+    Deliberately independent of the child COUNT (no i/N), so even a re-size that proposes a
+    different number of children still matches a,b,c… by letter. The child's SPECIFIC scope
+    (the LLM's objective + criteria) lives in the body, never the title."""
+    import re as _re
+
+    letters = "abcdefghijklmnopqrstuvwx"
+    # Strip any prior auto-split marker off the parent text so a (defensive) re-split can't
+    # stack '[auto-split of #37] [auto-split of #385]' tails — the title stays clean.
+    clean = (parent_title.split(_SPLIT_CHILD_MARK, 1)[0].strip()
+             if _SPLIT_CHILD_MARK in parent_title else parent_title)
+    m = _re.search(r"(Plan\s+\d+)", clean, _re.IGNORECASE)
+    tag = f"[auto-split of {parent_ref}]"
+    if m:
+        desc = clean.split(" — ", 1)[1].strip() if " — " in clean else ""
+        base = f"{m.group(1)}{letters[i]}" + (f" — {desc}" if desc else "")
+    else:  # no house 'Plan N' — suffix the whole parent title with the letter
+        base = f"{clean.strip()} ({letters[i]})"
+    return f"{base} {tag}"
+
+
+def _child_body(child: dict, parent_ref: str, order: int, total: int, *,
+                carried: tuple[str, list[tuple[str, str]]] = ("", []),
+                limit: int = CARD_BODY_LIMIT, parent_url: str = "", title: str = "") -> str:
+    # The LLM's specific framing moves to the body (the title is deterministic) so the card
+    # still shows WHAT this child covers — as a Focus line, plus the full objective/criteria.
+    #
+    # …AND WHAT THE PARENT'S AUTHOR WROTE BESIDE THEM (#624). The child was built from the sizer's
+    # output alone, and the parent is closed as not planned, so its Scope, its Context and every
+    # other section a person wrote reached neither the job nor the reviewer (field run, card 79 →
+    # 98: the Scope said where each ingredient grows, and no child said it). `carried` is
+    # `parse.carried_sections` of the parent: it goes under `## From the parent card (#N)`, each
+    # section demoted to `### ` so the parser never reads the parent's Scope as this card's own.
+    # Nothing carried → the body is byte-identical to the one written before.
+    #
+    # BOUNDED BY THE TRACKER'S `limit`: only the carried block is cut, at a line boundary, with an
+    # open code fence closed and a line that says where the rest is. The sizer's own part is never
+    # cut: when it leaves no room for the header and the cut line, nothing is carried and the
+    # body is the one written before this change — and if it alone exceeds the limit, the create
+    # fails as it did then.
+    from beeverforge.adapters.tracker.parse import FROM_THE_PARENT
+
+    focus = str(child.get("title", "")).strip()
+    head = f"**Focus:** {focus}\n\n" if focus else ""
+    crits = ("\n".join(f"- {c}" for c in (child.get("criteria") or []))
+             or "- (define before running)")
+    ordering = (f"\n\n## Out of scope\n- Everything covered by the sibling sub-tickets of "
+                f"{parent_ref} (this is part {order}/{total}; run in order).")
+    own = (f"{head}## Objective\n{child.get('objective', '')}\n\n"
+           f"## Acceptance criteria\n{crits}{ordering}")
+    tail = f"\n\n_Auto-split from {parent_ref} by the pre-flight sizer (ADR-0013)._"
+    preamble, sections = carried
+    block = "\n\n".join([*([preamble] if preamble.strip() else []),
+                          *(f"### {heading}\n{text}" for heading, text in sections if text)])
+    if not block:
+        return own + tail
+    lead = (f"\n\n## {FROM_THE_PARENT} ({parent_ref})\n"
+            "_What the parent card said beyond its objective and acceptance criteria, carried as "
+            "its author wrote it. This card delivers only its own criteria above; the rest is its "
+            "sibling cards'._\n\n")
+    if len(own) + len(lead) + len(block) + len(tail) <= limit:
+        return own + lead + block + tail
+    where = f"{parent_ref}: {parent_url}" if parent_url else parent_ref
+    cut_line = (f"\n\n_The parent card's sections are cut here, to keep this card within the "
+                f"tracker's limit of {limit} characters; the rest is on {where}._")
+    budget = limit - len(own) - len(lead) - len(cut_line) - len(tail)
+    if budget <= 0:
+        # NO ROOM FOR EVEN THE HEADER AND THE CUT LINE (~360 characters): writing them pushed a
+        # child main would have created over the limit — 579 characters at a limit of 222 (review
+        # of 83256a1). The child is then what it was before #624, and the cut is still logged.
+        activity.logger.warning(
+            "BEEVERFORGE_SPLIT_CARRIED_CUT %s — kept 0 of %d characters of %s's sections: the "
+            "sizer's own part leaves no room under the tracker's limit of %d characters",
+            title or parent_ref, len(block), parent_ref, limit)
+        return own + tail
+    kept = _markdown_within(block, budget)
+    activity.logger.warning(
+        "BEEVERFORGE_SPLIT_CARRIED_CUT %s — kept %d of %d characters of %s's sections, to stay "
+        "within the tracker's limit of %d characters; the rest is on the parent",
+        title or parent_ref, len(kept), len(block), parent_ref, limit)
+    return own + lead + kept + cut_line + tail
+
+
+def _markdown_within(text: str, budget: int) -> str:
+    """`text` cut to at most `budget` characters at a LINE boundary (a word boundary when one line
+    is longer than the whole budget), with a code fence the kept part opened closed again.
+
+    NOT `_clipped`, which collapses whitespace and would flatten the markdown into one line. A
+    fence left open swallows everything after it — the cut line and the "Auto-split from" line
+    would render as code — so it is closed, and lines are given back until the closed text fits.
+
+    THE OPENER IS TRACKED, NOT THE PARITY OF FENCE LINES. Counting them left a backtick fence
+    holding a `~~~` line open, and closed a four-backtick fence with three (review of 83256a1). As
+    CommonMark reads it: a fence closes on a line of the opener's character, at least as long,
+    with nothing after it; the closer written is the opener's own marker."""
+    lines: list[str] = []
+    used = 0
+    for line in text.splitlines():
+        cost = len(line) + (1 if lines else 0)
+        if used + cost > budget:
+            if not lines and budget > 0:
+                head = line[:budget]
+                lines.append(head.rsplit(" ", 1)[0] if " " in head else head)
+            break
+        lines.append(line)
+        used += cost
+    while lines:
+        kept = "\n".join([*lines, *([opener] if (opener := _open_fence(lines)) else [])]).rstrip()
+        if len(kept) <= budget:
+            return kept
+        lines.pop()
+    return ""
+
+
+def _open_fence(lines: list[str]) -> str:
+    """The marker of the code fence `lines` leave open (`"````"`, `"~~~"`), or `""`."""
+    opener = ""
+    for line in lines:
+        found = _re_module.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
+        if not found:
+            continue
+        marker, rest = found.groups()
+        if not opener:
+            opener = marker
+        elif marker[0] == opener[0] and len(marker) >= len(opener) and not rest.strip():
+            opener = ""
+    return opener
+
+
+def _children_safe(tracker, parent_ref: str) -> list[str]:
+    """Native child refs of `parent_ref`, defensively (a tracker may not implement linkage)."""
+    fn = getattr(tracker, "children_of", None)
+    if not fn:
+        return []
+    try:
+        return fn(parent_ref) or []
+    except Exception as exc:  # noqa: BLE001 — a tracker may not implement linkage
+        activity.logger.info("could not read the children of %s (%s) — treating it as childless",
+                             parent_ref, exc)
+        return []
+
+
+def _link_safe(tracker, parent_ref: str, child_ref: str) -> None:
+    """Best-effort native parent→child link (no-op if the tracker doesn't support it)."""
+    fn = getattr(tracker, "link_child", None)
+    if not fn:
+        return
+    try:
+        fn(parent_ref, child_ref)
+    except Exception as exc:  # noqa: BLE001 — a link is not worth failing a split
+        # The child is orphaned: it exists, but nothing connects it to what it came from, and the
+        # epic that spawned it will never look complete.
+        activity.logger.warning("could not link %s under %s (%s)",
+                                child_ref, parent_ref, str(exc)[:120])
+
+
+def _board_beside(project, tracker):
+    """The board `tracker`'s cards are placed on: the tracker's own when it holds one (the GitHub
+    row keeps its project board), else the project's, built once through the card door's port —
+    which says so in the log when none can be built, and then a card is placed nowhere."""
+    own = getattr(tracker, "board", None)
+    if own is not None:
+        return own
+    from beeverforge.lifecycle.ports import Ports
+
+    return Ports(project, tracker=tracker).board
+
+
+def _file_the_child(project, tracker, board, ref: str, *, column: str) -> bool:
+    """File one split child through its door (ADR-0055, #414): `filed`, placed in `column` — TO-DO,
+    in creation order, when the project sends a split's children straight to the queue (ADR-0013
+    D3), the backlog otherwise — and recorded. Returns whether the placement POSITIVELY happened.
+
+    THE BOARD'S OWN VERDICT, NEVER `set_state`'s SILENCE. A rate-limited `gh project item-edit`
+    once left children column-less — invisible to the poller's exact-match TO-DO scan — while the
+    parent's close comment and the announcement claimed they were queued. The door's `Place` asks
+    the board and FAILS when it did not move the card, so a refused placement is a failed effect of
+    a recorded transition, which the hourly round places again; the card's link is the port's own
+    (`Ports._url`, asked of the tracker, never composed). A deployment with no board has nowhere to
+    place a card and nothing that picks one up: that is an outcome, not a straggler, as a tracker's
+    no-raise was before.
+
+    `columns={}`: the child was written a moment ago, on no column this put it in, so no hosted
+    board is read for an answer this already has — once per child, it would be the split's cost."""
+    from beeverforge.lifecycle import CardEvent, transition
+
+    moved = transition(project, ref, CardEvent.FILED, by="the workflow",
+                       facts={"column": column}, tracker=tracker, board=board, columns={},
+                       event_id=_this_activitys_event("filed"))
+    if moved.refused:
+        activity.logger.warning("split child %s: its door refused the filing (%s)", ref,
+                                moved.refused[:160])
+        return False
+    return not moved.outcome("place").startswith("failed")
+
+
+def _do_split(inp: SplitInput) -> str:
+    """Create the children, LINK them to the parent natively, and close it. IDEMPOTENT on two
+    levels: (1) DECISION — if the tracker already records native children for this parent, the
+    split was already taken, so reuse them and never split twice; (2) per-child — deterministic
+    titles make find-or-create reuse an existing child. Together they killed the '8 re-runs →
+    30 duplicate Plan 92x issues' bug.
+
+    Each child carries the sizer's objective and criteria for it AND the parent's other sections
+    as its author wrote them, under `## From the parent card (#N)`, cut to the tracker's
+    `body_limit` with a link to the parent when they do not fit (#624, `_child_body`). A child
+    `find_ticket` reuses keeps the body it was born with.
+
+    Children go straight to TO-DO in ORDER (ADR-0013 D3, owner decision — keep the flow
+    autonomous). Single-line strict makes this dependency-safe: the poller picks them one at a
+    time in board order (creation order = 92a before 92b), and holds the floor until each MERGES
+    — so 92b only runs once 92a's code is on main. `split_to_todo: false` reverts to Backlog.
+
+    THROUGH THE CARDS' DOOR (ADR-0055, #414): each child is `filed` where the split policy puts it,
+    and the parent is `closed` as split — not delivered, and not gone either: its promise stands
+    until its children are delivered, so nothing is cancelled and nobody is told it will not be
+    built (`table.consequences`)."""
+    from beeverforge.observability.registry import journal_for
+
+    project = ProjectRegistry().get(inp.project)
+    tracker = _tracker_for(project)
+    events = journal_for(None, live=True)  # live split feed → panel (same card as the sizing)
+    try:
+        from beeverforge.loader import load_manifest  # local: the tests' patch seam
+        to_todo = load_manifest(project).split_to_todo
+    except Exception as exc:  # noqa: BLE001 — config trouble → the safe default (autonomous flow)
+        # THIS DEFAULT SPENDS MONEY: the children go straight to TO-DO and the poller picks them
+        # up, on a project that may have asked for Backlog. Autonomy is the right default, and a
+        # config read that failed is exactly when somebody should know which default was taken.
+        activity.logger.warning(
+            "could not read %s's split policy (%s) — sending the children straight to TO-DO",
+            inp.project, str(exc)[:120])
+        to_todo = True
+    parent_ref = f"#{inp.issue.lstrip('#')}"
+    n = len(inp.children)
+
+    # DECISION idempotency: if the parent already carries the WHOLE set of native children, this
+    # ticket was already split — reuse them, don't create a second set (nor a second close
+    # comment).
+    #
+    # AGAINST THE DECISION, NEVER AGAINST ZERO. "Some children exist" and "the split is done" are
+    # different facts, and reading the first as the second turns any interruption mid-loop into a
+    # permanently truncated split reported as success: the forge answers `#a` and `#b`, children
+    # three and four are never created, the parent is never closed, and the workflow returns
+    # `done`. That interruption is now ordinary rather than exotic — `find_ticket` RAISES when the
+    # search is throttled (adapters/tracker/github.py: search carries a much lower limit than
+    # issue creation), which is exactly the shape that leaves half a set behind. The loop below is
+    # find-or-create on deterministic titles, so resuming re-uses what exists and finishes the
+    # rest.
+    existing = _children_safe(tracker, parent_ref)
+    if existing and len(existing) >= n:
+        links = ", ".join(existing)
+        _pf_emit(events, inp.project, inp.issue, "state", "done",
+                 note=f"already split → {links} (reusing, no duplicates)")
+        return f"already split into {links}"
+    if existing:
+        activity.logger.warning(
+            "BEEVERFORGE_SPLIT_RESUMED %s — %d of %d children exist; a previous pass stopped "
+            "mid-split, "
+            "so the rest are created and the parent is closed now", parent_ref, len(existing), n)
+        _pf_emit(events, inp.project, inp.issue, "note",
+                 f"resuming an interrupted split ({len(existing)} of {n} already created)")
+
+    parent = tracker.get_ticket(parent_ref)
+    # WHAT EACH CHILD CARRIES OF ITS PARENT (#624), read once: the sections its author wrote beside
+    # the objective and the criteria the sizer rewrote, the tracker's own body limit, and the link
+    # a cut line points at. `raw == ""` (a double that does not fill it) carries nothing.
+    from beeverforge.adapters.tracker.parse import carried_sections
+
+    carried = carried_sections(getattr(parent, "raw", "") or "")
+    limit = getattr(tracker, "body_limit", None) or CARD_BODY_LIMIT
+    try:
+        parent_url = tracker.ticket_url(parent_ref) or ""
+    except Exception as exc:  # noqa: BLE001 — a missing link is not worth failing a split
+        activity.logger.warning("could not read the link of %s (%s) — a cut line in its children "
+                                "names the card without one", parent_ref, str(exc)[:120])
+        parent_url = ""
+    board = _board_beside(project, tracker)
+    # A CHILD IS NEVER BORN IN A QUEUE NOBODY SENT IT TO (#543). A deployment that keeps a split's
+    # children in the backlog (`split_to_todo: false`) has said a person sequences them — and on a
+    # board where a new card is born in the pickup column, each child would be taken by the poller
+    # the moment it was written, with nobody queueing it (ADR-0019 §5); the door's `filed` into the
+    # backlog then fails on a board that has none, and the child stays. So nothing is created: the
+    # split fails, and the job parks with the proposal for a person to split by hand — the same
+    # outcome as any split that could not finish. A board that could not say holds it too.
+    #
+    # STRAIGHT TO THE QUEUE IS NOT ASKED: those children go where they are born, by the policy the
+    # deployment chose (ADR-0013 D3) — the parent was queued by a person — and each is placed there
+    # the moment it is written, in creation order, exactly as it was before a child could be born
+    # in the queue: being born there moves nothing earlier.
+    if not to_todo:
+        from beeverforge.adapters.board.base import intake_held
+
+        born = intake_held(tracker, board)
+        if born is not None:
+            why = (f"a child created now would be born in {born.column!r}, the pickup column, and "
+                   f"this project keeps a split's children in the backlog" if born.queued else
+                   born.unknown or "the board could not say where a child created now would be "
+                                   "born")
+            activity.logger.error("BEEVERFORGE_SPLIT_HELD %s — nothing was created: %s. "
+                                  "The job parks for a person to split it by hand; `beeverforge "
+                                  "doctor` names the board's line", parent_ref, why)
+            _pf_emit(events, inp.project, inp.issue, "note", f"not split: {why}")
+            raise RuntimeError(f"{parent_ref} was not split: {why}")
+    _pf_emit(events, inp.project, inp.issue, "state", "splitting",
+             note=f"creating {n} children and closing the parent")
+    # WHERE EACH CHILD WENT, AS THIS PROJECT'S BOARD CALLS IT (#502): the note is read by a person
+    # looking at their own board, which may say `A Fazer` where the platform says `TO-DO`
+    named = _named_columns(project, "todo", "backlog")
+    refs: list[str] = []
+    stragglers: list[str] = []  # created but NOT positively queued — every claim below wears this
+    for i, child in enumerate(inp.children):
+        # DETERMINISTIC title → find-or-create reuses an existing child on a re-run instead
+        # of duplicating it (idempotent split). The LLM framing goes in the body.
+        title = _child_title(parent.title, i, parent_ref)
+        ref = tracker.find_ticket(title=title) or tracker.create_ticket(
+            title=title, body=_child_body(child, parent_ref, i + 1, n, carried=carried,
+                                          limit=limit, parent_url=parent_url, title=title))
+        refs.append(ref)
+        _link_safe(tracker, parent_ref, ref)  # native parent→child (traceability + decision idem)
+        queued = False
+        # FILED WHERE THE POLICY PUTS IT — TO-DO in creation order, so the poller picks 92a before
+        # 92b; the backlog otherwise, where on a hosted board an issue is a card only once added
+        try:
+            placed = _file_the_child(project, tracker, board, ref,
+                                     column="todo" if to_todo else "backlog")
+        except Exception as exc:  # noqa: BLE001 — the split happened; the queueing did not
+            activity.logger.warning("split child %s: board move raised (%s)",
+                                    ref, str(exc)[:120])
+            placed = False
+        if to_todo:
+            queued = placed
+            if not queued:
+                # A never-moved child sits column-less, unreachable by the poller's exact-match
+                # TO-DO scan — work that vanishes unless a person hears which card to drag.
+                stragglers.append(ref)
+                activity.logger.error(
+                    "BEEVERFORGE_SPLIT_CHILD_NOT_QUEUED %s — created but not in TO-DO; nothing "
+                    "picks "
+                    "it up until somebody moves it", ref)
+        dest_note = (named["todo"] if queued
+                     else ("NOT QUEUED — move it by hand" if to_todo else named["backlog"]))
+        _pf_emit(events, inp.project, inp.issue, "note", f"created {title} → {dest_note}")
+    links = ", ".join(refs)
+    from beeverforge.lifecycle import CardEvent, transition
+    from beeverforge.techlead import voice as tl_voice
+
+    # IN THE PROJECT'S LANGUAGE (#160), like the announcement below. These sentences were welded
+    # English until 2026-09-19 and the language guard never saw them: they reach the card as
+    # `close_ticket`'s reason, which it did not count among the surfaces that speak to a person.
+    lang = str(getattr(project, "language", "") or "")
+    if not to_todo:
+        where = tl_voice.say(tl_voice.NARRATION, "split.parent.in-backlog", lang)
+    elif stragglers:
+        # The parent still closes (the split DID happen), but its record must never claim a queue
+        # position the board refused — that claim is how work vanishes behind a confirmation.
+        #
+        # THE SAME SENTENCE THE CHANNEL GETS, and it had the same defect: "drag them" about one
+        # refused card. This half lands on the CLIENT'S TICKET, which outlives the channel message
+        # and is where somebody reads the history six months later.
+        where = tl_voice.say(
+            tl_voice.NARRATION,
+            "split.parent.straggler-one" if len(stragglers) == 1 else "split.parent.stragglers",
+            lang, stuck=", ".join(stragglers))
+    else:
+        where = tl_voice.say(tl_voice.NARRATION, "split.parent.in-todo", lang)
+    # CLOSED AS NOT DELIVERED, THROUGH THE CARD'S DOOR (#414) AND THE PORT'S SEAM BEHIND IT. This
+    # card shipped nothing — the cards split from it carry the work — and it was closed with the
+    # port's default word, `delivered`, by a call that never chose one: the sweep then told a
+    # client their requirement was ready with every child still unstarted (measured, 2026-09-19).
+    # `triage.delivered_numbers` counts it again once those cards ship. THE NOTE SAYS `SPLIT INTO`
+    # FIRST, because the vendor's own label for this close is "not planned" and a person must not
+    # read that as "rejected" — and it is the close's one comment, on every row (D6).
+    closed = transition(
+        project, parent_ref, CardEvent.CLOSED, by="the workflow", why=inp.reasons[:300],
+        facts={"delivered": False, "split_into": links,
+               "note": tl_voice.say(tl_voice.NARRATION, "split.parent.closed", lang,
+                                    children=links, why=inp.reasons[:300], where=where)},
+        # `columns={}`: whether the parent is still open is its tracker's word, which is all a
+        # split's close turns on — no hosted board is read for it
+        tracker=tracker, board=board, columns={}, event_id=_this_activitys_event("closed"))
+    if closed.refused or closed.outcome("close").startswith("failed"):
+        # A SPLIT WHOSE PARENT STAYED OPEN IS NOT DONE: the activity fails, as the close raising
+        # made it fail before, and the job parks for a person to finish it by hand. A recorded
+        # close that failed is also the hourly round's to apply again.
+        raise RuntimeError(f"{parent_ref} was split into {links} and could not be closed: "
+                           f"{closed.refused or closed.outcome('close')}")
+    _pf_emit(events, inp.project, inp.issue, "state", "done",
+             note=f"split complete → {links} ({where})")
+    try:  # ADR-0015: announce the split in Slack — a split MODIFIES the planned sequence (new
+        # tickets, new order), so the humans who queued it must hear WHAT changed and how the board
+        # looks now, not discover extra cards silently. Best-effort; never fails the split.
+        from beeverforge.factory import notifier_for_project
+
+        # IN THE PROJECT'S LANGUAGE (#160). This announcement was welded Portuguese and reached
+        # every client of every deployment — the split is unprompted by definition, so nobody
+        # asked for it in any language.
+        # THE STUCK CHILD IS MARKED IN THE LIST. The sentence names its ref and the list under it
+        # repeated three near-identical titles, so a reader had to cross-reference a number
+        # against them to find the one card they had to move (measured on the pilot).
+        stuck_note = tl_voice.say(tl_voice.NARRATION, "split.not-queued", lang)
+        kids = "\n".join(
+            f"  {'⚠' if r in stragglers else '•'} {r} — "
+            f"{_child_title(parent.title, i, parent_ref)}"
+            + (f"  ← {stuck_note}" if r in stragglers else "")
+            for i, r in enumerate(refs))
+        head = tl_voice.say(tl_voice.NARRATION, "split.head", lang, parent=parent_ref,
+                            title=parent.title[:80], n=n, why=_clipped(inp.reasons, 160))
+        if to_todo and stragglers:
+            # ONE OR SEVERAL IS A DIFFERENT SENTENCE — see the note on these rows. English needs
+            # the agreement and Portuguese hid the defect, which is why both rows exist.
+            body = tl_voice.say(
+                tl_voice.NARRATION,
+                "split.straggler-one" if len(stragglers) == 1 else "split.stragglers",
+                lang, n=n, stuck=", ".join(stragglers), children=kids, queue=named["todo"])
+        else:
+            body = tl_voice.say(
+                tl_voice.NARRATION, "split.created", lang, children=kids,
+                where=tl_voice.say(tl_voice.NARRATION,
+                                   "split.to-todo" if to_todo else "split.to-backlog", lang,
+                                   queue=named["todo"], backlog=named["backlog"]))
+        notifier_for_project(project).notify(
+            message=head + body, level="warning" if stragglers else "info")
+    except Exception:  # noqa: BLE001 — the narration is additive; never fail the split
+        activity.logger.warning("could not announce the split of %s", parent_ref)
+    if stragglers:
+        return f"split into {links} (not queued: {', '.join(stragglers)})"
+    return f"split into {links}"
+
+
+@activity.defn
+async def split_ticket(inp: SplitInput) -> str:
+    """ADR-0013 D3 — the autonomous splitter: children created with the .a/.b naming, parent
+    linked + closed. The children land in Backlog; sequencing stays a human decision."""
+    return await _heartbeat_while(
+        lambda: _do_split(inp), f"split {inp.project}#{inp.issue}"
+    )
+
+
+@activity.defn
+async def preflight_check(inp: PreflightInput) -> PreflightVerdict:
+    """ADR-0013 D2: size the ticket on the worker (text INVEST + read-only code estimate)
+    BEFORE any Fargate launch. Degrades to verdict='fit' on ANY trouble."""
+    result = await _heartbeat_while(
+        lambda: _do_preflight(inp), f"preflight {inp.project}#{inp.issue}"
+    )
+    return result
+
+
+# ── ADR-0048: the gather between the sizing and the plan, and the sweep that reads the answers ─
+
+#: Chase once, after this long, in the same voice — then the open question is a visible item on
+#: the ledger, and the answer to continued silence is a person looking at the list.
+CARD_QUESTION_CHASE_AFTER_HOURS = 48.0
+
+
+def _worker_checkout(project, repo: str):
+    """The worker's own synced checkout of `repo` and the manifest read from it — the same three
+    steps `_do_preflight` takes, for the same reasons written there. Returns
+    `(repo_path, manifest, url, token)` or raises; the caller degrades."""
+    from beeverforge.adapters.forge.registry import clone_url_for
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+    from beeverforge.loader import load_manifest, load_manifest_base_branch
+    from beeverforge.runtime.repo_cache import RepoCache, current_branch
+
+    token = forge_token_for(project) or deployment_forge_token(project) or ""
+    url = clone_url_for(project, repo, token=token)
+    key = _checkout_key(project, repo)
+    repo_path = RepoCache().sync(key, url, load_manifest_base_branch(project, default=""))
+    if repo_path is None:
+        raise RuntimeError("could not reach the repository for a worker-side checkout")
+    manifest = load_manifest(project.model_copy(update={"repo_path": str(repo_path)}))
+    declared = manifest.declared_base_branch
+    if declared and declared != current_branch(repo_path):
+        repo_path = RepoCache().sync(key, url, declared) or repo_path
+    return Path(repo_path), manifest, url, token
+
+
+def _head_of(repo_path: Path) -> str:
+    head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=30, check=False)
+    return head.stdout.strip() if head.returncode == 0 else ""
+
+
+def _inventory_paths(bundle: Path) -> list[str] | None:
+    """The paths the bundle's inventory lists — the denominator the gate judges against — or None
+    when the bundle carries no inventory the reader understands."""
+    from beeverforge.knowledge.inventory import read_inventory
+
+    inventory = read_inventory(bundle)
+    if inventory is None:
+        return None
+    rows = getattr(inventory, "rows", None) or getattr(inventory, "files", None) or []
+    return [str(getattr(r, "path", "") or "") for r in rows if getattr(r, "path", "")]
+
+
+def _mention_for(tracker, requester: str) -> str:
+    """How the requester is addressed on THIS tracker — ADR-0048 §5, a mention nobody is notified
+    by is decoration.
+
+    THE ROW ANSWERS, and that is the whole change (ADR-0049 D7/D8). This read the project's
+    provider kind and compared it to `"github"`, which is the one provider-kind comparison the
+    activities carried: every new row on the tracker axis — a client's own, a stranger's add-on,
+    the platform's own board — was rendered as "not GitHub" by a module that had no way to ask.
+
+    Defensive in the shape `children_of` already has: a tracker that implements nothing keeps
+    today's answer, the login unchanged, so no add-on that passed conformance yesterday breaks.
+    An exception is not allowed to cost the question — the comment is about to be posted, and a
+    mention the row could not render is a worse outcome than a plain name."""
+    who = (requester or "").strip()
+    fn = getattr(tracker, "mention", None)
+    if not fn or not who:
+        return who
+    try:
+        return fn(who) or who
+    except Exception as exc:  # noqa: BLE001 — an unrenderable mention must not lose the question
+        activity.logger.info("could not render a mention for %s (%s) — using the plain name",
+                             who, exc)
+        return who
+
+
+def _do_gather(inp: GatherInput) -> GatherVerdict:  # noqa: C901 — one activity, one story
+    """Gather what the bundle does not know about the files the change will touch, BEFORE the
+    plan spends a budget (ADR-0048). Every failure path PROCEEDS — the job runs as it would have
+    without the gather — and says why in `degraded`, never silently.
+
+    THE ORDER IS THE CONTRACT (§5): publish → post what was established → post the ONE question →
+    park the card and read the park back → open the loop → return `asked`. Every fallible step
+    happens before the card is moved, so a gather that dies half-way leaves a card with more
+    knowledge on it and nothing waiting. The last three steps are the card's door's since #414
+    (`question_asked`), in the same order, stopping at the first write that does not land."""
+    from beeverforge.contracts.ticket import tracker_requester_of
+    from beeverforge.knowledge import gather as g
+    from beeverforge.knowledge.gate import NO_CONCEPT, judge
+    from beeverforge.knowledge.okf import read_concepts
+    from beeverforge.knowledge.pipeline import (
+        discard_fetched_bundle,
+        fetch_bundle,
+        okf_subpath,
+        publish_bundle,
+    )
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import CARD_QUESTION, waiting
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.onboarding.cover import cover_paths
+    from beeverforge.techlead import voice as tl_voice
+
+    def proceed(note: str, *, degraded: str | None = None, **counts) -> GatherVerdict:
+        return GatherVerdict(verdict="proceed", note=note[:300], degraded=degraded, **counts)
+
+    touches = [str(t).strip() for t in inp.touches if str(t).strip()]
+    if not touches:
+        return proceed("the sizer named no area")
+    try:
+        project = ProjectRegistry().get(inp.project)
+    except Exception as exc:  # noqa: BLE001
+        return proceed("no such project", degraded=f"registry: {str(exc)[:120]}")
+    lang = str(getattr(project, "language", "") or "")
+    repo, _ = _ref_repo(project, inp.issue)
+    try:
+        repo_path, manifest, _url, token = _worker_checkout(project, repo)
+    except Exception as exc:  # noqa: BLE001 — a checkout that failed is a gather that says so
+        return proceed("could not read the repository", degraded=f"checkout: {str(exc)[:160]}")
+    if not getattr(manifest.preflight, "gather", False):
+        return proceed("gather is off for this project")
+    mode = getattr(manifest, "okf_gate", "advise")
+    if mode != "enforce":
+        return proceed(f"okf_gate is {mode!r} — the gather runs under enforce only")
+    docs_repo = (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+    if not docs_repo:
+        return proceed("no context repository — nothing is published to judge against")
+    from beeverforge.adapters.forge.registry import clone_url_for
+
+    context_url = clone_url_for(project, docs_repo, token=token)
+    subpath = okf_subpath(repo)
+    fetched = fetch_bundle(context_url, subpath=subpath)
+    if fetched.unreadable:
+        activity.logger.warning("gather #%s: %s — nothing judged, the job proceeds", inp.issue,
+                                fetched.unreadable)
+        return proceed("the context repository could not be read — nothing judged",
+                       degraded=f"bundle: {fetched.unreadable[:160]}")
+    if fetched.path is None:
+        return proceed("nothing published for this repository — run the backfill")
+    bundle = fetched.path
+    try:
+        files = g.expand_touches(touches, repo_path, inventory_paths=_inventory_paths(bundle))
+        if not files:
+            return proceed("the named areas hold no files")
+        report = judge(bundle, repo_path, files)
+        dark = [f.path for f in report.files if f.verdict == NO_CONCEPT]
+        if not dark:
+            return proceed(f"the bundle covers what the change touches ({len(files)} file(s))")
+        commit = _head_of(repo_path)
+        now = _now_iso()
+        covered = cover_paths(project, bundle, repo_path, dark, commit=commit, generated_at=now)
+        authored = covered.authored
+        if authored:
+            from beeverforge.credentials import bot_identity
+
+            bot = bot_identity()
+            if not publish_bundle(bundle, context_url, project=project, subpath=subpath,
+                                  source_commit=commit,
+                                  author=(bot.name or "beeverforge-bot",
+                                          bot.email or "beeverforge-bot@local")):
+                activity.logger.warning("gather #%s: authored %s concept(s) and could not publish "
+                                        "them — judged with them anyway; the next refresh "
+                                        "republishes", inp.issue, authored)
+        still = list(covered.left) if authored else list(dark)
+        tracker = _tracker_for(project)
+        ticket = tracker.get_ticket(inp.issue)
+        facts: list[str] = []
+        if authored:
+            by_path = {p for p in dark if p not in still}
+            for concept in read_concepts(bundle):
+                if any(s.path in by_path for s in concept.sources):
+                    # `description` is front matter and reads back; `what_it_does` is prose
+                    gist = " ".join((concept.description or concept.what_it_does).split())[:240]
+                    facts.append(f"- **{concept.title}** — {gist}")
+        questions: list[tuple[str, str]] = []
+        established = 0
+        if still:
+            from beeverforge.product import engine
+            from beeverforge.product.module import ProductModule
+
+            # THROUGH THE ENGINE (#266 slice 2): `ProductModule.answer` has one caller, and the
+            # factory's own question about a card is `engine.consult` — never a person's turn.
+            module = ProductModule(project, via="api")
+            try:
+                for path in still[:g.QUESTIONS_PER_CARD]:
+                    question = tl_voice.say(tl_voice.NARRATION, "gather.question", lang, path=path)
+                    try:
+                        answer = engine.consult(project, question,
+                                                context=f"card {ticket.id}: {ticket.title}",
+                                                module=module)
+                    except Exception as exc:  # noqa: BLE001 — an unavailable role is a question
+                        activity.logger.warning("gather #%s: the product role could not answer "
+                                                "about %s (%s)", inp.issue, path, str(exc)[:120])
+                        answer = None
+                    if g.established(answer):
+                        established += 1
+                        facts.append(f"- `{path}`: {' '.join(answer.text.split())[:400]}")
+                    else:
+                        questions.append((path, question))
+            finally:
+                engine.release(module)
+            if len(still) > g.QUESTIONS_PER_CARD:
+                activity.logger.info("gather #%s: %s more undescribed file(s) not asked about — "
+                                     "%s per card", inp.issue, len(still) - g.QUESTIONS_PER_CARD,
+                                     g.QUESTIONS_PER_CARD)
+        if facts:
+            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.established", lang,
+                                                    facts="\n".join(facts)))
+        counts = {"authored": authored, "established": established, "asked": len(questions)}
+        if not questions:
+            return proceed(f"established before starting: {authored} concept(s) authored, "
+                           f"{established} answer(s) from the context", **counts)
+        # THE BUNDLE'S OWN OPEN QUESTIONS ABOUT THOSE FILES RIDE THE SAME COMMENT (ADR-0048 §7).
+        # An author recorded a caveat about a file nobody had described; this is the one moment a
+        # person is being asked about that file, and the person who can settle the caveat. Their
+        # keys travel with the loop so the answer RETIRES them in the bundle — the retirement path
+        # without which the gather could never terminate (refutation 5). Unanswered ones only,
+        # bounded per file, never a trigger on their own: an open question stays an offer (§3).
+        from beeverforge.knowledge.gaps import about as gaps_about
+        from beeverforge.knowledge.okf import read_manifest as read_okf_manifest
+
+        recorded = read_okf_manifest(bundle)
+        open_qs: list = []
+        for path, _ in questions:
+            seen_keys = {x.key for x in open_qs}
+            open_qs += [gp for gp in gaps_about(recorded.gaps if recorded else [], path)
+                        if gp.kind == "open-question" and not gp.answered
+                        and gp.key not in seen_keys][:g.OPEN_QUESTIONS_PER_FILE]
+        qs_text = "\n".join(f"- {q}" for _, q in questions)
+        if open_qs:
+            qs_text += "\n" + "\n".join(f"- {' '.join(gp.detail.split())[:400]}" for gp in open_qs)
+        requester = tracker_requester_of(ticket)
+        if not requester:
+            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.unaddressed",
+                                                    lang, questions=qs_text))
+            return proceed("questions recorded on the card; it names nobody this tracker can "
+                           "notify, so the work proceeds", **counts)
+        qhash = g.question_hash([p for p, _ in questions])
+        bare = str(ticket.id).strip().lstrip("#")
+        try:
+            already = [x for x in waiting(loop_store.read(project.name), kind=CARD_QUESTION)
+                       if x.subject == bare and x.about == qhash]
+        except Exception:  # noqa: BLE001 — an unreadable ledger must not stop the question
+            activity.logger.warning("gather #%s: could not read the ledger — asking without "
+                                    "checking for an earlier copy of the question", inp.issue,
+                                    exc_info=True)
+            already = []
+        if already:
+            return GatherVerdict(verdict="asked", note="the same question is already on the card "
+                                 "and waiting", **counts)
+        asked_at = _now_iso()
+        from beeverforge.credentials import bot_identity
+        from beeverforge.lifecycle import CardEvent, transition
+
+        poster = bot_identity().login or ""
+        # THROUGH THE CARD'S DOOR (ADR-0055, #414): `question_asked` posts the question (the
+        # comment, marker first), parks the card, and opens the loop the answer closes — in that
+        # order, §5's, and it STOPS at a failed write: a question waits only on a card parked for
+        # it, so a park that did not land opens nothing, and the sweep never parks it an hour
+        # later under a job that went on (`table.STOPS_AT_A_FAILED_WRITE`).
+        moved = transition(
+            project, ticket.id, CardEvent.QUESTION_ASKED, by="the workflow",
+            why=" / ".join(p for p, _ in questions)[:280],
+            facts={"note": tl_voice.say(tl_voice.NARRATION, "gather.asked", lang,
+                                        mention=_mention_for(tracker, requester),
+                                        questions=qs_text, marker=g.marker_for(qhash)),
+                   "about": qhash,
+                   "asked": {"requester": requester, "poster": poster, "asked_at": asked_at,
+                             "paths": "\n".join(p for p, _ in questions),
+                             "question": " / ".join(q for _, q in questions)[:800],
+                             "gap_keys": "\n".join(gp.key for gp in open_qs),
+                             "repo": repo, "language": lang}},
+            tracker=tracker, event_id=_this_activitys_event("question_asked"))
+        if moved.refused:
+            return proceed("the card's door refused the question — the work proceeds",
+                           degraded=f"door: {moved.refused[:160]}", **counts)
+        said, parked = moved.outcome("comment"), moved.outcome("column")
+        if said.startswith("failed"):
+            return proceed("the question could not be posted — the work proceeds",
+                           degraded=f"gather: {said[:160]}", **counts)
+        if parked.startswith("failed"):
+            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.not-parked", lang))
+            return proceed("the park did not land on this tracker — the questions are on the card "
+                           "and the work proceeds", degraded=f"park: {parked[:160]}", **counts)
+        _pf_emit(journal_for(None, live=True), inp.project, inp.issue, "note",
+                 f"gather: asked {len(questions)} question(s) on the card; waiting on {requester}",
+                 verdict="asked")
+        return GatherVerdict(verdict="asked", note=f"{len(questions)} question(s) to {requester} "
+                             f"on the card; {authored} concept(s) authored first", **counts)
+    except Exception as exc:  # noqa: BLE001 — the gather informs; it never fails a job
+        activity.logger.warning("gather #%s failed (%s) — the job proceeds without it",
+                                inp.issue, str(exc)[:200], exc_info=True)
+        return proceed("the gather failed — the job proceeds without it",
+                       degraded=f"gather: {str(exc)[:160]}")
+    finally:
+        discard_fetched_bundle(bundle)
+
+
+@activity.defn
+async def gather_context(inp: GatherInput) -> GatherVerdict:
+    """ADR-0048 §1 — the gather after the sizing, on the WORKER, in its own activity."""
+    return await _heartbeat_while(lambda: _do_gather(inp), f"gather {inp.project}#{inp.issue}")
+
+
+def _answer_into_bundle(project, *, repo: str, paths: list[str], question: str, answer: str,
+                        by: str, at: str, gap_keys: list[str] | None = None) -> bool:
+    """What stops the next card from asking again (ADR-0048 §7): the answer becomes a concept
+    about the file, in the person's name, published where the gate reads — and the bundle's open
+    questions the comment carried (`gap_keys`, from the loop) are RETIRED with the same answer,
+    kept as the record, so the cover pass stops re-authoring on them and the author is told what
+    was already answered. The front door is re-rendered so both show. Best-effort; False when
+    nothing was published, and the sweep says so in the log rather than on the card."""
+    from beeverforge.knowledge import gather as g
+    from beeverforge.knowledge.bundle import _sha256
+    from beeverforge.knowledge.gaps import retire
+    from beeverforge.knowledge.okf import (
+        OKF_INDEX_FILE,
+        read_concepts,
+        read_manifest,
+        render_index,
+        write_okf,
+    )
+    from beeverforge.knowledge.pipeline import (
+        discard_fetched_bundle,
+        fetch_bundle,
+        okf_subpath,
+        publish_bundle,
+    )
+
+    docs_repo = (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+    if not docs_repo or not paths:
+        return False
+    try:
+        repo_path, _manifest, _url, token = _worker_checkout(project, repo)
+    except Exception as exc:  # noqa: BLE001 — a fingerprint is worth having, not worth failing
+        activity.logger.warning("card question: no checkout of %s to fingerprint against (%s)",
+                                repo, str(exc)[:120])
+        repo_path, token = None, ""
+    from beeverforge.adapters.forge.registry import clone_url_for
+    from beeverforge.credentials import bot_identity, deployment_forge_token, forge_token_for
+
+    token = token or forge_token_for(project) or deployment_forge_token(project) or ""
+    context_url = clone_url_for(project, docs_repo, token=token)
+    subpath = okf_subpath(repo)
+    fetched = fetch_bundle(context_url, subpath=subpath)
+    if fetched.path is None:
+        return False
+    bundle = fetched.path
+    try:
+        manifest = read_manifest(bundle)
+        if manifest is None:
+            return False
+        existing = read_concepts(bundle)
+        fresh = []
+        for path in paths:
+            fingerprint = ""
+            if repo_path is not None and (repo_path / path).is_file():
+                fingerprint = _sha256((repo_path / path).read_bytes())
+            fresh.append(g.concept_from_answer(path=path, question=question, answer=answer, by=by,
+                                               at=at, repo=repo, fingerprint=fingerprint))
+        # A KEY THE BUNDLE NO LONGER HOLDS IS SKIPPED, NOT AN ERROR: a refresh between the ask and
+        # the answer may have dropped it, and a person's answer must not cost the sweep that
+        # carried it (`retire`'s own rule).
+        held = {gp.key for gp in manifest.gaps}
+        retired = [key for key in (gap_keys or []) if key in held]
+        for key in retired:
+            manifest = retire(manifest, key, answer=answer, by=by, at=at)
+        if retired:
+            activity.logger.info("card question: %s open question(s) retired in the bundle of %s "
+                                 "by %s", len(retired), repo, by)
+        write_okf(bundle, manifest=manifest, concepts=existing + fresh)
+        (bundle / OKF_INDEX_FILE).write_text(render_index(manifest, existing + fresh),
+                                             encoding="utf-8")
+        bot = bot_identity()
+        return publish_bundle(bundle, context_url, project=project, subpath=subpath,
+                              source_commit="",
+                              author=(bot.name or "beeverforge-bot",
+                                      bot.email or "beeverforge-bot@local"))
+    except Exception:  # noqa: BLE001 — the answer is recorded in the context; the bundle is a copy
+        activity.logger.warning("card question: could not write the answer into the bundle",
+                                exc_info=True)
+        return False
+    finally:
+        discard_fetched_bundle(bundle)
+
+
+def _do_card_question_sweep(project_name: str) -> str:  # noqa: C901 — one round, one story
+    """Read the cards the factory asked a question on; record the answers that arrived, in the
+    requester's name; return the cards to the queue; chase once (ADR-0048 §6). Silent when
+    nothing is open."""
+    from datetime import UTC, datetime
+
+    from beeverforge.knowledge import gather as g
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import (
+        CARD_QUESTION,
+        OPEN,
+        chase_due,
+        waiting,
+    )
+    from beeverforge.techlead import voice as tl_voice
+
+    try:
+        project = ProjectRegistry().get(project_name)
+    except Exception as exc:  # noqa: BLE001
+        activity.logger.error("card questions: project %r is not in the registry (%s)",
+                              project_name, exc)
+        return "no-project"
+    try:
+        ledger = loop_store.read(project.name)
+    except Exception:  # noqa: BLE001 — an unreadable ledger is a round that did nothing, said
+        activity.logger.warning("card questions: could not read the ledger for %s", project_name,
+                                exc_info=True)
+        return "no-ledger"
+    open_qs = waiting(ledger, kind=CARD_QUESTION)
+    if not open_qs:
+        return "nothing-open"
+    lang = str(getattr(project, "language", "") or "")
+    tracker = _tracker_for(project)
+    now = _now_iso()
+    rows = []
+    answered = chased = 0
+    for loop in open_qs:
+        ref = loop.subject
+        ctx = loop.context or {}
+        try:
+            comments = tracker.comments(ref)
+        except Exception as exc:  # noqa: BLE001 — one unreadable thread must not stop the round
+            activity.logger.warning("card questions: could not read #%s (%s)", ref, str(exc)[:120])
+            comments = None
+        if comments is None:
+            continue
+        hit = g.answer_after(comments, asked_at=ctx.get("asked_at", ""),
+                             requester=ctx.get("requester", ""), poster=ctx.get("poster", ""))
+        if hit is None:
+            if loop.state == OPEN:
+                try:
+                    opened = datetime.fromisoformat(loop.ts)
+                    age_h = (datetime.now(UTC) - opened).total_seconds() / 3600
+                except ValueError:
+                    age_h = 0.0
+                due = chase_due([loop], hours_open={(loop.kind, loop.subject, loop.about): age_h},
+                                after_hours=CARD_QUESTION_CHASE_AFTER_HOURS, ts=now)
+                if due:
+                    tracker.comment(ref, tl_voice.say(
+                        tl_voice.NARRATION, "gather.chase", lang,
+                        mention=_mention_for(tracker, ctx.get("requester", ""))))
+                    rows += due
+                    chased += 1
+            continue
+        paths = [p for p in (ctx.get("paths") or "").split("\n") if p.strip()]
+        from beeverforge.product.module import ProductModule
+
+        result = ProductModule(project, via="api").record_answer(
+            about=(paths[0] if paths else f"card {ref}"), question=ctx.get("question", ""),
+            answer=hit.body, said_by=hit.author, where=f"card #{ref}")
+        recorded = bool(result.ok or result.existed)
+        if recorded:
+            _answer_into_bundle(project, repo=ctx.get("repo", ""), paths=paths,
+                                question=ctx.get("question", ""), answer=hit.body, by=hit.author,
+                                at=now,
+                                gap_keys=[k.strip() for k in (ctx.get("gap_keys") or "").split("\n")
+                                          if k.strip()])
+        said = (tl_voice.say(tl_voice.NARRATION, "gather.answered", lang,
+                             who=hit.author, where="product context") if recorded else
+                tl_voice.say(tl_voice.NARRATION, "gather.on-card-only", lang,
+                             who=hit.author, why=(result.detail or "")[:160]))
+        # THROUGH THE CARD'S DOOR (ADR-0055, #413). The card went back to TO-DO from the ledger
+        # alone, so a card closed — or removed — while its question waited was put back in the
+        # queue by the answer. The door reads where the card is first: back to the queue only from
+        # the park the question put it in, the question closed as cancelled on a card that is
+        # gone. The id is the question's, so a round that dies after the door is answered from
+        # the record by the next one, never decided twice.
+        from beeverforge.lifecycle import CardEvent, transition
+
+        moved = transition(project, ref, CardEvent.QUESTION_ANSWERED, by=hit.author or "",
+                           facts={"note": said, "about": loop.about}, tracker=tracker,
+                           event_id=f"question_answered-{ref}-{loop.about}-{loop.ts}")
+        if moved.refused:
+            activity.logger.warning("card questions: #%s answered, and its card could not be "
+                                    "read — left open, tried again next round (%s)", ref,
+                                    moved.refused[:160])
+            continue
+        if moved.outcome("column").startswith("failed") and not moved.recorded:
+            activity.logger.warning("card questions: #%s answered but could not be returned to the "
+                                    "queue, and nothing records it — left for a person", ref)
+        answered += 1
+    if rows:
+        loop_store.write(project.name, rows)
+    return f"answered:{answered} chased:{chased} open:{len(open_qs) - answered}"
+
+
+@activity.defn
+async def card_question_sweep(project_name: str) -> str:
+    """ADR-0048 §6 — the hourly sweep over the questions the factory asked on cards."""
+    return await asyncio.to_thread(_do_card_question_sweep, project_name)
+
+
+@activity.defn
+async def stop_job(inp: RunJobInput) -> int:
+    """Cleanup: stop whatever a REMOTE box left running for this job (0 for a local box, whose
+    process died with the worker). Called by the workflow when a job ends abnormally, so nothing
+    is left orphaned and billing.
+
+    THE SAME QUESTION `_do_run_job` ASKS, answered from the same row — it used to ask `!= "fargate"`
+    and return 0 for every other kind, which for a remote add-on box is the orphaned task the
+    `remote` trait exists to prevent, reported as a clean sweep."""
+    if not installed_box_traits(inp.sandbox).remote:
+        return 0
+    return await asyncio.to_thread(lambda: remote_box(inp.sandbox).stop(_box_for(inp)))
+
+
+def _run_promotion(
+    project_name: str, issue: str, phase: str, extra_env: dict, run_id: str | None = None,
+    *, sandbox: str,
+) -> RunResult:
+    """One promotion phase (`staging` | `release`) on the job's box.
+
+    ONLY A REMOTE BOX HAS AN IMPLEMENTATION TODAY, and this says so rather than dying on a missing
+    vendor environment. The phase runs the box program (`runtime/boxed_job.py`) with
+    `BEEVERFORGE_PROMOTE_PHASE` set, which the local boxes do not run — they run a `JobRunner`, and
+    it has no promotion verb. Until it does, a local deployment whose manifest declares
+    environments reaches this refusal by NAME instead of a `KeyError` about another vendor's
+    cluster; it is non-retryable because repeating it cannot change the answer.
+
+    THE WORDS ARE `after_merge.no_local_promotion`'s, because `beeverforge doctor` says them too,
+    before the first card (#172) — here they arrive after the merge, which is the backstop and
+    not the place an operator should first read them."""
+    from beeverforge.after_merge import no_local_promotion
+    from beeverforge.runtime.boxed_job import BoxConfig
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    # "" = the deployment's box, resolved HERE on the worker: the promotion inputs are built inside
+    # the workflow body, which may not read the environment (see `PromoteInput.sandbox`).
+    sandbox = sandbox or default_sandbox()
+    if not installed_box_traits(sandbox).remote:
+        what, remedy = no_local_promotion(sandbox, phase)
+        raise ApplicationError(f"{what}. Either {remedy} — nothing was promoted.",
+                               non_retryable=True)
+    project = ProjectRegistry().get(project_name)
+    card_repo, bare_issue = _ref_repo(project, issue)  # C-18: promote acts on the card's repo
+
+    def box(references):
+        return BoxConfig(
+            project=project_name,
+            issue=bare_issue,
+            repo=card_repo,
+            board_owner=project.tracker.options.get("board_owner"),
+            board_number=project.tracker.options.get("board_number"),
+            tracker_kind=project.tracker.kind,
+            forge_kind=(project.forge.kind if project.forge else None) or project.tracker.kind,
+            # #162, as in `_box_for`
+            tracker_options=box_options(project, "tracker", references=references),
+            forge_options=box_options(project, "forge", references=references),
+        )
+
+    return _remote_launch(
+        project, sandbox, box,
+        variant=f"-{phase}",
+        extra_env={"BEEVERFORGE_PROMOTE_PHASE": phase, **extra_env},
+        timeout=1800,  # 30min — below the activity's 40min ceiling (R2)
+        run_id=run_id,
+    )
+
+
+@activity.defn
+async def check_pr_merged(inp: MergeCheckInput) -> bool:
+    """Read-only: has the PR actually been merged? The workflow polls this durably
+    between PR_OPEN and promotion, so staging is never verified against a base that
+    doesn't contain the change (A2). Runs on the worker (gh + bot creds baked)."""
+
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+    return await asyncio.to_thread(lambda: forge.pr_merged(pr=inp.pr_url))
+
+
+@activity.defn
+async def check_pr_status(inp: MergeCheckInput) -> str:
+    """Read-only: the PR's lifecycle state — "merged" | "closed" | "open". The durable
+    merge-watch polls this so a PR a human CLOSES without merging ends the watch at once
+    (ADR-0007) instead of holding the floor until the merge deadline. Worker (gh + creds)."""
+
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+    return await asyncio.to_thread(lambda: forge.pr_status(pr=inp.pr_url))
+
+
+@activity.defn
+async def reap_previews() -> list[str]:
+    """End every preview that should not be up any more (ADR-0050 D10), through the deployment's
+    preview runtime — `BEEVERFORGE_PREVIEW_RUNTIME`'s row — and say which, one line each.
+
+    The rules are `beeverforge/preview/reap.py`'s; this composes the world they read: the row's
+    `running()` (exited stacks included), every registered project's policy and newest records,
+    and the forge's answer about each pull request. On a deployment that names no runtime (`none`)
+    nothing runs, and a `starting` record left by a worker that died is still ended."""
+    import time
+
+    from beeverforge import preview
+    from beeverforge.adapters.preview.compose import log_dir_for, work_root
+    from beeverforge.adapters.preview.registry import build_runtime
+    from beeverforge.contracts.project import PreviewPolicy
+    from beeverforge.observability.query import records_of_kind
+    from beeverforge.preview.reap import latest_by_unit, reap
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.temporal.io import default_preview_runtime
+
+    def tick() -> list[str]:
+        projects = {p.name: p for p in ProjectRegistry().list()}
+        return reap(
+            build_runtime(default_preview_runtime()),
+            policies={n: (p.preview or PreviewPolicy()) for n, p in projects.items()},
+            latest_of=lambda name: latest_by_unit(records_of_kind(name, preview.KIND)),
+            pr_status=lambda name, url: _forge_for(projects[name]).pr_status(pr=url),
+            record=preview.record, now=time.time(), work_root=work_root(),
+            log_dir=log_dir_for)
+
+    ended = await asyncio.to_thread(tick)
+    activity.logger.info("BEEVERFORGE_PREVIEW_REAPER %s", "; ".join(ended) or "nothing to end")
+    return ended
+
+
+# ── a preview on demand: the steps of `PreviewWorkflow` (ADR-0050 D6; the design on #265, §5.2) ──
+#
+# THE THIN HALF. What each step DOES is `beeverforge/preview/steps.py`, testable with the engine
+# out of the room; what is here is what only an activity has: the runtime built from the
+# deployment's kind (never inside the workflow — `plugins._load()` scans site-packages), and a
+# HEARTBEAT carrying the step, so a worker that dies mid-build is noticed by the engine within the
+# heartbeat timeout rather than after the whole start timeout. Every one runs ONCE (the workflow's
+# retry policy): a step retried into a half-created stack is worse than a step that failed and
+# said so.
+
+#: How often a long step says it is alive. The workflow's heartbeat timeout is several of these.
+PREVIEW_HEARTBEAT_SECONDS = 10.0
+
+
+async def _heartbeating(step: str, fn):
+    """`fn()` in a thread, the activity heartbeating `step` until it returns."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn))
+    while True:
+        done, _ = await asyncio.wait({work}, timeout=PREVIEW_HEARTBEAT_SECONDS)
+        if done:
+            return work.result()
+        activity.heartbeat(step)
+
+
+def _preview_unit(inp: PreviewStepInput):
+    """(project, runtime) of one step — the registry's project and the deployment's row. The
+    compose row's start timeout is the operator's, so a build is cut where the card says it is."""
+    from beeverforge.adapters.preview.registry import build_runtime
+
+    project = ProjectRegistry().get(inp.project)
+    kw = {"start_timeout": inp.start_timeout_minutes * 60} if inp.runtime == "compose" else {}
+    return project, build_runtime(inp.runtime, **kw)
+
+
+def _preview_world():
+    """What the steps read and write, with THIS worker's forge construction handed in — the one
+    place the worker builds a forge (`_forge_for`)."""
+    from beeverforge.preview import steps
+
+    return steps.World(forge_of=_forge_for)
+
+
+@activity.defn
+async def preview_materialise(inp: PreviewStepInput) -> PreviewStepResult:
+    """The unit's trees, fresh, on the worker's disk — `starting` on the card from its first
+    second, `failed` with why when there is no open pull request or a tree cannot be checked
+    out."""
+    from beeverforge.preview import steps
+    from beeverforge.preview.plan import Refused
+
+    def run():
+        project, runtime = _preview_unit(inp)
+        return steps.materialise(project, inp.unit, runtime=runtime, world=_preview_world(),
+                                 started_by=inp.started_by)
+
+    layout = await _heartbeating("materialise", run)
+    if isinstance(layout, Refused):
+        return PreviewStepResult(ok=False, why=" ".join(layout.reasons))
+    return PreviewStepResult(ok=True, layout=layout)
+
+
+@activity.defn
+async def preview_plan(inp: PreviewPlanInput) -> PreviewStepResult:
+    """The admitted plan from the base's shape — or `failed` with every refusal, the deployment's
+    cap and the unit's budget among them, and the fresh work directory removed."""
+    from beeverforge.preview import steps
+    from beeverforge.preview.plan import Refused
+
+    def run():
+        project, runtime = _preview_unit(inp.step)
+        return steps.plan(project, inp.step.unit, inp.layout, runtime=runtime,
+                          world=_preview_world())
+
+    planned = await _heartbeating("plan", run)
+    if isinstance(planned, Refused):
+        return PreviewStepResult(ok=False, why=" ".join(planned.reasons))
+    return PreviewStepResult(ok=True, plan=planned, expires_at=planned.expires_at)
+
+
+@activity.defn
+async def preview_up(inp: PreviewUpInput) -> PreviewStepResult:
+    """The plan brought up on the deployment's runtime and judged ready — `live` on the card, or
+    `failed` with the service and its last lines."""
+    from beeverforge.preview import steps
+
+    def run():
+        project, runtime = _preview_unit(inp.step)
+        return steps.up(project, inp.step.unit, inp.plan, runtime=runtime, world=_preview_world())
+
+    result = await _heartbeating("up", run)
+    if result.ok:
+        try:
+            # BOUNDED, BECAUSE NOTHING BEATS FOR IT: a tracker told once per card must not be
+            # what has the engine call a stack that came up dead (`_SAID_UP_WITHIN`)
+            await asyncio.wait_for(
+                asyncio.to_thread(_the_preview_is_up, inp.step.project, inp.step.unit),
+                timeout=_SAID_UP_WITHIN)
+        except TimeoutError:
+            activity.logger.warning(
+                "BEEVERFORGE_PREVIEW_TELLING_CUT %s %s — saying the preview is up outlived %ss; "
+                "the step answers that it is up, and the telling is left to finish on its own",
+                inp.step.project, inp.step.unit, _SAID_UP_WITHIN)
+    return PreviewStepResult(ok=result.ok, why=result.why, expires_at=inp.plan.expires_at)
+
+
+def _the_preview_is_up(project_name: str, token: str) -> list[str]:
+    """A preview just came up: said on each of its cards, in the thread that already says "PR
+    ready for review", and to the product role (`events.preview_up`) — the cards told (#405).
+
+    BEFORE THIS NOBODY WAS TOLD. The record went `live` and the card showed buttons to whoever
+    happened to open it; the product role's sentence for it had no producer. Now the preview's own
+    step says it, once per start (the step runs once; the event is keyed by the start).
+
+    THE LINK OPENS THE PANEL, NEVER THE PREVIEW'S OWN HOST: the preview's URL carries a key, and a
+    key written into a tracker is a credential everybody who reads the board holds
+    (`preview/live.py`).
+
+    A REQUIREMENT'S CARDS ARE TOLD ONLY WHEN THEY ALL LIVE IN THIS PROJECT'S REPOSITORY. The
+    record keeps card NUMBERS, and two cards of one requirement in two repositories can share one
+    (ADR-0050 D5's measured limit): a comment addressed by number alone could land on another
+    repository's issue. The product role is still told, by card.
+
+    NEVER RAISES: the preview is up whatever the telling does. And never holds the step: its
+    caller waits `_SAID_UP_WITHIN` and answers, and what is still being told then is told in the
+    background — once, the step having run once."""
+    from beeverforge import preview
+    from beeverforge.preview import demand, live
+    from beeverforge.product import events
+
+    try:
+        project = ProjectRegistry().get(project_name)
+        found = preview.latest(project_name, token)
+    except Exception as exc:  # noqa: BLE001 — see above
+        activity.logger.warning("could not read the preview of %s %s to say it is up (%s)",
+                                project_name, token, str(exc)[:160])
+        return []
+    if found is None or not live.is_up(found):
+        return []
+    language = getattr(project, "language", None)
+    from beeverforge.product.config import repo_match
+
+    own = demand.repo_of_project(project)
+    one_repo = not token.startswith("req") or all(
+        not r or bool(repo_match(r, own)) for r in demand.repos_of(project, found).values())
+    told: list[str] = []
+    for card in found.cards:
+        link = live.route(project_name, card)
+        if one_repo:
+            try:
+                _tracker_for(project).comment(card, live.comment(found, link=link,
+                                                                 language=language))
+                told.append(card)
+            except Exception as exc:  # noqa: BLE001 — the card misses a comment, said
+                activity.logger.warning("BEEVERFORGE_TICKET_COMMENT_LOST %s#%s — the preview is "
+                                        "up and the card does not say so (%s)", project_name,
+                                        card, str(exc)[:160])
+        try:
+            events.preview_up(project, card=card, url=link,
+                              key=f"{token}@{found.started_at}")
+        except Exception as exc:  # noqa: BLE001 — the role's telling is additive
+            activity.logger.warning("the product role was not told that %s %s is up (%s)",
+                                    project_name, card, str(exc)[:160])
+    return told
+
+
+@activity.defn
+async def preview_watch(inp: PreviewStepInput) -> str:
+    """One look at a live unit: `running`, `failed` (recorded, with the exposed services' last
+    lines) or `gone`."""
+    from beeverforge.preview import steps
+
+    def run():
+        project, runtime = _preview_unit(inp)
+        return steps.watch(project, inp.unit, runtime=runtime, world=_preview_world())
+
+    return await _heartbeating("watch", run)
+
+
+@activity.defn
+async def preview_logs(inp: PreviewStepInput) -> list[str]:
+    """Every service's log, kept where the card links to — before ANY down."""
+    from beeverforge.preview import steps
+
+    def run():
+        project, runtime = _preview_unit(inp)
+        return steps.logs(project, inp.unit, runtime=runtime)
+
+    return await _heartbeating("logs", run)
+
+
+@activity.defn
+async def preview_down(inp: PreviewStepInput) -> list[str]:
+    """The unit taken down — containers, its volumes, the images it built, its network, its work
+    directory — and `ended` on the card with why, unless it is about to start again."""
+    from beeverforge.preview import steps
+
+    def run():
+        project, runtime = _preview_unit(inp)
+        return steps.down(project, inp.unit, runtime=runtime, world=_preview_world(), why=inp.why,
+                          record=inp.record)
+
+    return await _heartbeating("down", run)
+
+
+def _forge_for(project):
+    """The project's forge — chosen by the REGISTRY, never named here.
+
+    THE single construction point on the worker: six activities built one independently, each
+    repeating the same repo fallback and the same token dance. A client on another forge now
+    changes one registry value and nothing in this file."""
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import forge_token_for
+    from beeverforge.factory import bot_token_provider_for
+
+    # PER PROJECT, because one deployment hosts N projects and they no longer share a forge. The
+    # process-wide `forge_token()` that stood here is a GitHub credential on every deployment that
+    # sets BEEVERFORGE_BOT_TOKEN, and this is the helper EVERY forge read in this file goes through.
+    tok = forge_token_for(project)
+    return build_forge(project, token=tok,
+                       token_provider=None if tok else bot_token_provider_for(project, "forge"))
+
+
+@activity.defn
+async def pr_mergeable_state(inp: MergeCheckInput) -> str:
+    """Read-only: the PR's mergeability ('clean'/'behind'/'blocked'/'dirty'/'unstable'/'unknown')
+    so the merge-watch can KEEP A BEHIND PR FRESH instead of waiting on a merge that never fires
+    (busy-main starvation). Worker (gh + creds)."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+    return await asyncio.to_thread(lambda: forge.mergeable_state(pr=inp.pr_url))
+
+
+@activity.defn
+async def update_pr_branch(inp: MergeCheckInput) -> bool:
+    """Bring a BEHIND PR up to date with its base via GitHub's update-branch API, so auto-merge
+    can proceed — the self-heal for a PR that keeps falling behind other developers' merges.
+    Best-effort: False on any error (the loop then escalates rather than looping forever)."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+    return await asyncio.to_thread(lambda: forge.update_branch(pr=inp.pr_url))
+
+
+@activity.defn
+async def force_merge_pr(inp: MergeCheckInput) -> bool:
+    """Merge NOW, bypassing the up-to-date gate — the executable 'merge it now' option a human
+    picked on a starving PR. True on success; False if even admin merge is refused (stays
+    parked). Worker (gh + creds)."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def _do() -> bool:
+        try:
+            forge.force_merge(pr=inp.pr_url)
+            return True
+        except Exception as exc:  # noqa: BLE001 — refusal is an answer; it parks
+            activity.logger.warning("admin merge refused for %s (%s) — the PR stays parked",
+                                    inp.pr_url, exc)
+            return False
+
+    return await asyncio.to_thread(_do)
+
+
+@activity.defn
+async def merge_pr_now(inp: MergeCheckInput) -> bool:
+    """Land the PR a human just approved at the merge gate (#68). True on success.
+
+    `forge.merge_pr`, NOT `force_merge` — and that distinction is the whole of this function.
+    `force_merge_pr` above uses `gh pr merge --admin`, which rides through the client's OWN branch
+    protection: their required reviews, their required checks. It is correct THERE because it
+    fires only on a PR already reported clean, where there is nothing left to bypass. Here a
+    person is answering a gate on a PR that may still be blocked, and the platform must not be the
+    way somebody gets around a rule their own organisation set.
+
+    REFUSAL IS AN ANSWER, returned rather than raised, exactly as `force_merge_pr` does — the
+    caller turns False into a parked question naming branch protection, because a merge button
+    that quietly does nothing is the failure this card exists to end."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def _do() -> bool:
+        try:
+            forge.merge_pr(pr=inp.pr_url)
+            return True
+        except Exception as exc:  # noqa: BLE001 — refusal is an answer; the caller asks again
+            activity.logger.warning("merge refused for %s (%s) — the human is told why",
+                                    inp.pr_url, exc)
+            return False
+
+    return await asyncio.to_thread(_do)
+
+
+@activity.defn
+async def merge_pr_saying_why(inp: MergeCheckInput) -> str:
+    """Land the pull request; answer `""` on success and the forge's OWN SENTENCE on a refusal.
+
+    A SECOND ACTIVITY RATHER THAN A WIDER RETURN ON THE ONE ABOVE, and that is a replay
+    constraint rather than a preference: activity RESULTS are recorded in history, so a job parked
+    at the merge gate today has a `false` in its history that a `str`-shaped reader cannot
+    deserialise. The old activity stays, exactly as it is, for those jobs; new runs take this one
+    behind `workflow.patched`.
+
+    WHY THE SENTENCE AT ALL (ADR-0049 D4). The caller turned `False` into a parked question that
+    NAMES A CAUSE IT DID NOT MEASURE — "most likely branch protection this App cannot satisfy" —
+    and on a forge that is a directory on this machine there is no branch protection to satisfy.
+    The true refusal is git's, it names the file, and the person is standing in the repository it
+    is about. It is an improvement for every row: a GitHub refusal's real message beats a guess
+    about it too.
+
+    THE SENTENCE IS THE PROVIDER'S, TRUNCATED ONLY AT A LENGTH A PARK CAN CARRY. Nothing here
+    rewrites it — the whole point is that git names the file and this platform does not."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def _do() -> str:
+        try:
+            forge.merge_pr(pr=inp.pr_url)
+            return ""
+        except Exception as exc:  # noqa: BLE001 — refusal is an answer; the caller asks again
+            said = str(exc).strip() or f"{type(exc).__name__} with no message"
+            activity.logger.warning("merge refused for %s — %s", inp.pr_url, said)
+            return said[:2000]
+
+    return await asyncio.to_thread(_do)
+
+
+@activity.defn
+async def close_pr(inp: MergeCheckInput) -> bool:
+    """Close the PR a human discarded at the merge gate, WITHOUT merging (#68).
+
+    Nothing is deleted: `gh pr close` leaves the branch and its commits exactly where they are, so
+    discard is reversible and does not deserve the password gate a production release has. Said
+    out loud because 'discard' sounds destructive and a human reading the button deserves to know
+    it is not."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def _do() -> bool:
+        try:
+            forge.close_pr(pr=inp.pr_url)
+            return True
+        except Exception as exc:  # noqa: BLE001 — the job is ending either way; say why
+            activity.logger.warning("could not close %s (%s) — the job still frees the floor, so "
+                                    "the PR may be left open on the forge", inp.pr_url, exc)
+            return False
+
+    return await asyncio.to_thread(_do)
+
+
+@activity.defn
+async def adjust_pr(inp: AdjustInput) -> RunResult:
+    """One repair pass against a HUMAN's own words, on the same branch and the same PR (#68).
+
+    The same machinery as `repair_ci` — `machine.repair_ci` checks out the existing branch, runs
+    one agent pass, commits and pushes — with the person's sentence in the prose slot instead of a
+    CI log. Same per-attempt idempotency scoping, and for the same reason: a genuine second pass
+    must launch a fresh task rather than reconcile the first one's stale STOPPED result."""
+    run_id = f"{activity.info().workflow_run_id}-a{inp.attempt}"
+    applied = _this_activitys_event("handed-back")
+    return await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied, _run_adjust(inp, run_id)),
+        f"{inp.project}#{inp.issue} adjust"
+    )
+
+
+def _run_adjust(inp: AdjustInput, run_id: str | None = None) -> RunResult:
+    """The human's instruction reaches the agent through the SAME slot a CI log does.
+
+    THEIR WORDS, AND ONLY THEIR WORDS. The framing — "this is not a build failure, it is a review
+    comment, make exactly the change asked for" — was written HERE and glued to the person's
+    sentence, so the harness received one string, fenced the whole of it as data and closed it
+    with its own "the validations reported above FAILED — do not change the tests" (#205). The
+    machine writes that framing now (`JobRunner.repair_ci(human=True)`), apart from the words it
+    is about; and because what arrives there is the bare comment, an EMPTY one is finally refused
+    by the door that says "the review comment was empty" — a briefing was never empty."""
+    repair = CiRepairInput(project=inp.project, issue=inp.issue, pr_url=inp.pr_url,
+                           sandbox=inp.sandbox, attempt=inp.attempt, change=inp.change)
+    if inp.source == REVIEW_THREAD:
+        words, held = _the_review_comments(inp)
+        if held is not None:
+            return held
+        result = _run_ci_repair(repair, run_id, ci_log=words)
+        from beeverforge.techlead import TREE
+
+        if result.state == JobState.ON_HOLD and result.hold_cause == TREE:
+            # THE NOTE ABOVE SAID WHAT THIS PASS CARRIES, AND NO AGENT RAN (#623): the card's
+            # branch is out in another working tree, which stops the pass at `prepare`, after the
+            # note. Said on the pull request too, so "pass N carries …" does not stand alone, and
+            # the resumed pass's note under the same number reads as the one that ran. Not the
+            # card's sentence: it carries the person's local paths, and on a hosted forge the
+            # pull request may be public (review of 83973c2).
+            _say_on_the_pull_request(
+                _forge_for(ProjectRegistry().get(inp.project)), inp.pr_url,
+                f"Adjust pass {inp.attempt} did not run, so no agent saw these comments: the "
+                f"card's branch is checked out in another working tree. The card says which one "
+                f"and how to free it; the pass runs on resume.")
+        return result
+    return _run_ci_repair(repair, run_id, ci_log=(inp.instruction or "").strip())
+
+
+def _the_review_comments(inp: AdjustInput) -> tuple[str, RunResult | None]:
+    """`(the pass's words, None)`, or `("", a hold)` when there is nothing to carry (#330).
+
+    READ HERE, WHEN THE PASS STARTS, not when the person pressed the button: the row checked a
+    moment ago, and a thread resolved since then must not be sent to an agent.
+
+    NOTHING TO CARRY LAUNCHES NOTHING. A forge that cannot list the comments, or a pull request
+    whose threads are all resolved, ends the pass before any agent runs, with the reason said on
+    the pull request, where the person who commented is. The hold carries `merge_refused` and
+    `code_changed=False`, the marks the empty-instruction hold carries: the pull request is as it
+    was, and the verdict still describes it.
+
+    WHAT THE PASS TAKES IS SAID ON THE PULL REQUEST FIRST (`threads.what_was_carried`), by author
+    and line, so a reader can tell which comments reached the agent."""
+    from beeverforge.adapters.forge.base import CommentsNotListed, review_comments_of
+    from beeverforge.review import threads
+
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+    found = review_comments_of(forge, inp.pr_url)
+    if isinstance(found, CommentsNotListed) or not found:
+        why = (str(found) if isinstance(found, CommentsNotListed) else
+               "nothing people wrote on it still stands: every thread is resolved and no request "
+               "for changes is open")
+        _say_on_the_pull_request(forge, inp.pr_url,
+                                 f"Adjust pass {inp.attempt} did not run: {why}.")
+        return "", RunResult(
+            ticket_id=inp.issue, state=JobState.ON_HOLD, pr_url=inp.pr_url, merge_refused=True,
+            code_changed=False, note=f"no review comment was sent to an agent — {why}")
+    carried = threads.brief_of(found)
+    _say_on_the_pull_request(forge, inp.pr_url, threads.what_was_carried(
+        carried, by=inp.by, pass_number=inp.attempt))
+    return carried.words, None
+
+
+def _say_on_the_pull_request(forge, pr_url: str, body: str) -> None:
+    """A comment on the pull request, best-effort: the pass is the act, and the note about it
+    must not be what stops it."""
+    try:
+        forge.review_pr(pr=pr_url, event="comment", body=body)
+    except Exception as exc:  # noqa: BLE001 — the note is lost, the pass is not
+        activity.logger.warning("could not comment on %s (%s): %s", pr_url, str(exc)[:160],
+                                body[:160])
+
+
+@activity.defn
+async def review_pr(inp: ReviewPassInput) -> RunResult:
+    """Re-run the independent reviewer on the open PR as it stands, because a person asked (#181).
+
+    Same machinery, same box, one difference that matters everywhere: it writes nothing. So it
+    needs no `instruction` slot, cannot conflict with a repair on the same PR (its own variant and
+    idempotency suffix), and the verdict it brings back REPLACES the one the gate was showing."""
+    run_id = f"{activity.info().workflow_run_id}-v{inp.attempt}"
+    applied = _this_activitys_event("handed-back")
+    return await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied,
+                                    _run_review_pass(inp, run_id)),
+        f"{inp.project}#{inp.issue} re-review"
+    )
+
+
+def _run_review_pass(inp: ReviewPassInput, run_id: str | None = None) -> RunResult:
+    project = ProjectRegistry().get(inp.project)
+    repo, _ = _ref_repo(project, inp.issue)  # C-18: it reads where the card's PR lives
+    if not installed_box_traits(inp.sandbox).remote:  # a local box reads it inline
+        view, repo_key = _runner_view(project, inp.issue)
+        # `review=True`, ALWAYS. The repair path builds its runner with `review=False` because
+        # its job is to write; here the reviewer IS the job, and a runner assembled without one
+        # would answer "this deployment has no reviewer" about a deployment that has one.
+        return build_runner(
+            view, inp.issue, sandbox=inp.sandbox,
+            image=_resolved_image(project, sandbox=inp.sandbox), review=True,
+            repo_key=repo_key, change=inp.change,
+        ).review_pr(inp.issue, pr_url=inp.pr_url)
+
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.paths import events_file
+    from beeverforge.runtime.boxed_job import BoxConfig
+
+    def box(references):
+        return BoxConfig(
+            project=inp.project, issue=inp.issue, repo=repo,
+            board_owner=project.tracker.options.get("board_owner"),
+            board_number=project.tracker.options.get("board_number"),
+            tracker_kind=project.tracker.kind,
+            forge_kind=(project.forge.kind if project.forge else None) or project.tracker.kind,
+            # #162, as in `_box_for`
+            tracker_options=box_options(project, "tracker", references=references),
+            forge_options=box_options(project, "forge", references=references),
+        )
+
+    journal = journal_for(events_file(project, inp.issue), dedup=True)
+    return _remote_launch(
+        project, inp.sandbox, box, variant="-review",
+        extra_env={"BEEVERFORGE_PR": inp.pr_url, "BEEVERFORGE_REVIEW_PASS": "1",
+                   **_the_change_env(inp.change)},
+        journal=journal, timeout=1800, run_id=run_id,
+    )
+
+
+@activity.defn
+async def check_ci_status(inp: MergeCheckInput) -> str:
+    """Read-only: the PR's aggregate CI state — "success" | "failure" | "pending" | "none".
+    The durable workflow polls this to react to a red CI (ADR-0004). Worker (gh + creds).
+
+    KEPT FOR THE JOBS ALREADY IN THE MERGE WATCH (#184). A history recorded before
+    `read_ci_checks` replays this activity by name, so it stays — and it answers from the same
+    rows and the same table, so a job that started before the fix stops reading an optional
+    policy as a red build too. What this four-valued word cannot carry (that a person must be
+    asked) is caught one step later, where `repair_ci` asks the table before it launches."""
+    return (await read_ci_checks(inp)).verdict
+
+
+@activity.defn
+async def read_ci_checks(inp: MergeCheckInput) -> CiDecision:
+    """Read-only: what the PR's checks ARE and what the merge watch does about them (#184).
+
+    The forge's row types each check — does it block, is it about the code — and
+    `contracts/checks.py::decide` is the one table that turns them into an act: repair, ask a
+    person, or stay on the path. DECIDED HERE AND RECORDED, not in the workflow: the answer is in
+    the job's history, so a later change to the table cannot re-decide a step that already ran."""
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def decided() -> CiDecision:
+        made = decide(read_checks(forge, inp.pr_url))
+        # NOTHING WAS SUPPOSED TO RUN on a forge that declares it has no CI: the watch is told so,
+        # and does not wait on — or hand to a person — a reading that is the forge's whole answer
+        if made.verdict == NOTHING_RAN and declares_no_checks(forge):
+            return made.model_copy(update={"nothing_expected": True})
+        return made
+
+    return await asyncio.to_thread(decided)
+
+
+@activity.defn
+async def repair_ci(inp: CiRepairInput) -> RunResult:
+    """One CI-repair pass on the open PR (ADR-0004): an ephemeral task checks out the branch,
+    fixes it from the failing CI logs, and pushes. Idempotent by job tag like run_job — but
+    scoped PER ATTEMPT: a genuine second attempt within the same workflow run must launch a
+    fresh task, not reconcile the first attempt's stale STOPPED result (which ECS keeps ~1h,
+    far longer than the 2-min CI poll). Suffixing the run_id with the attempt makes Temporal
+    RETRIES of one attempt still converge (same attempt → same suffix) while a NEW attempt
+    reads as a distinct run and runs fresh."""
+    run_id = f"{activity.info().workflow_run_id}-r{inp.attempt}"
+    await asyncio.to_thread(_the_checks_went_red, inp)
+    applied = _this_activitys_event("handed-back")
+    return await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied, _run_ci_repair(inp, run_id)),
+        f"{inp.project}#{inp.issue} ci-repair"
+    )
+
+
+def _the_checks_went_red(inp: CiRepairInput) -> None:
+    """THE PRODUCT ROLE HEARS IT WHEN IT HAPPENS (#267 slice 3): the merge watch sends a pull
+    request here because a check that blocks it failed on the code, and the card's requester is
+    told — in their conversation, else the product's room, once per pull request however many
+    passes the repair takes (`events.ci_went_red`). Never raises: the repair is the job's, the
+    sentence is a courtesy on top of it."""
+    try:
+        from beeverforge.product import events
+
+        events.ci_went_red(ProjectRegistry().get(inp.project), card=inp.issue,
+                           pr_url=inp.pr_url)
+    except Exception as exc:  # noqa: BLE001 — never the repair's price
+        activity.logger.warning("could not tell the product role that %s#%s went red (%s)",
+                                inp.project, inp.issue, str(exc)[:160])
+
+
+def _nothing_to_repair(project, inp: CiRepairInput) -> tuple[RunResult | None, str]:
+    """`(the hold, "")` when no agent should run on this pull request, else `(None, the log)` —
+    the worker's door into `runtime/repairable.py`, the gate the box goes through as well."""
+    return what_to_repair(lambda: _forge_for(project), inp.issue, inp.pr_url)
+
+
+def _not_rerun(left: list[str], *, quoted: bool, then: str = "") -> str:
+    """"`c3` was not re-run: its failing log was not read, so it is left red<then>", naming the
+    red checks the forge left past the runs whose failing log was read (`Reran.left`), or ""
+    when it left none (#756).
+
+    WITHOUT IT THE COMMENT WAS FALSE (lesson §9; re-review on c4f591b, 2026-10-20). With three
+    red runs GitHub re-runs the two whose logs were read, and the pull request was told "Re-ran
+    the failed jobs of `c1`, `c2` ... so no agent was launched for it". `c3` stayed red, and the
+    watch's next read (`_CI_POLL` later; a fail outranks a pending) launched an agent on it."""
+    if not left:
+        return ""
+    names = ", ".join(f"`{n}`" if quoted else n for n in left)
+    if len(left) == 1:
+        return f"{names} was not re-run: its failing log was not read, so it is left red{then}"
+    return f"{names} were not re-run: their failing logs were not read, so they are left red{then}"
+
+
+def _rerun_what_the_change_does_not_touch(project, inp: CiRepairInput, repo: str,
+                                          evidence: str) -> RunResult | None:
+    """The re-run that stands in for an agent, or `None`: launch the agent as before (#756).
+
+    A blocking check that fails for a reason no changed file touches (a flaky test, a busy shared
+    environment) was handed to a paid agent pass that had nothing to change, and the next attempt
+    failed the same way until `_CI_REPAIR_MAX` parked the card. When the forge can re-run failed
+    jobs, the failing log the gate decided from names no file the pull request changes, and this
+    is the first attempt, the failed jobs are re-run and the watch reads the checks again on its
+    own clock (`_CI_POLL`); no wait is taken here.
+
+    IN THIS ORDER, each step cheaper than the next. The capability first, so Azure Repos, the
+    local forge, every add-on and every test double without `rerun_failed` never pay a diff read
+    for a move they cannot make, and say nothing. Then the bound: the first attempt only (PO
+    answer to Q1, once per head). A wrong "unrelated" (changed `invoice_totals.ts`, failing
+    `checkout.spec.ts`, #258's review) then costs one re-run, not the whole repair budget. Then the
+    diff: one that could not be read or was cut is "could not see", and launches the agent.
+
+    A REFUSED RE-RUN FALLS THROUGH TO THE AGENT, handed the same `evidence`, and is said both in
+    the worker log and on the pull request (PO answer to Q3). `[]` (asked, and nothing was
+    re-runnable) falls through with a warning: nothing was refused, and nothing was re-run.
+
+    A RED CHECK THE FORGE LEFT PAST THE RUNS WHOSE LOG WAS READ (`Reran.left`) is named on the
+    pull request and in the note as not re-run and left red for the next repair attempt; it does
+    not turn the re-run into a refusal."""
+    from beeverforge.adapters.forge.base import RerunRefused, rerun_failed_of
+
+    forge = _forge_for(project)
+    if not callable(getattr(forge, "rerun_failed", None)) or inp.attempt != 1:
+        return None
+    try:
+        diff = forge.pr_diff(pr=inp.pr_url, repo=repo)
+    except Exception as exc:  # noqa: BLE001 — an unread diff is "could not see": the agent runs
+        activity.logger.warning("could not read the diff of %s, so its red check is repaired, "
+                                "not re-run (%s)", inp.pr_url, str(exc)[:160])
+        return None
+    paths = changed_paths(diff if isinstance(diff, str) else None)
+    if paths is None or log_names_the_change(evidence, paths):
+        return None
+    reran = rerun_failed_of(forge, inp.pr_url)
+    if isinstance(reran, RerunRefused):
+        activity.logger.warning("not every failed job of %s could be re-run, so an agent repairs "
+                                "it: %s", inp.pr_url, str(reran)[:300])
+        # SAID AFTER THE FORGE ANSWERED, in its words (lesson §9), and before the agent runs. "NOT
+        # EVERY", because a refusal can be partial: GitHub re-runs run 1 and refuses run 2 ("This
+        # workflow is already running", gh 2.102.0), and "the failed jobs were not re-run" was
+        # false for run 1's checks (review round 1, 2026-10-20).
+        _say_on_the_pull_request(forge, inp.pr_url, (
+            f"Not every failed job could be re-run: {str(reran)[:300]}. No file this pull request "
+            "changes appears in their failing log, so an agent was launched to repair it "
+            "instead."))
+        return None
+    if not reran:
+        activity.logger.warning("the forge found no failed job of %s to re-run, so an agent "
+                                "repairs it", inp.pr_url)
+        return None
+    names = ", ".join(f"`{n}`" for n in reran)
+    # A red check past the runs read stays red, and the attempt after this one takes it up: this
+    # is attempt 1 (the bound above) of `_CI_REPAIR_MAX` = 2 (workflow.py).
+    left = _not_rerun(reran.left, quoted=True, then=" for the next repair attempt")
+    _say_on_the_pull_request(forge, inp.pr_url, (
+        f"Re-ran the failed jobs of {names}: no file this pull request changes appears in their "
+        "failing log, so no agent was launched for it. The checks are read again once they "
+        "finish." + (f" {left}." if left else "")))
+    activity.logger.info("re-ran the failed jobs of %s (%s) instead of launching an agent",
+                         inp.pr_url, ", ".join(reran))
+    # `code_changed=False`: nothing was pushed, so the reviewer's verdict on the head still stands
+    # (`_the_reviewed_code_is_still_here`), and the watch rests `_CI_POLL` before reading again.
+    # NO SETTLE WAIT HERE, measured 2026-10-20 with gh 2.102.0 on a scratch pull request: after
+    # `gh run rerun --failed` the check read `pending` within 3.0-3.7 s in 3 of 4 reruns (the
+    # fourth stayed queued, still not red), and before that `gh pr checks` reported no checks
+    # ("none"); the old red was read 0 of 4 times. The watch's rest of `_CI_POLL` (2 min,
+    # workflow.py after `repair_ci`) is far longer than that gap, so its next read is not stale.
+    return RunResult(ticket_id=inp.issue, state=JobState.PR_OPEN, pr_url=inp.pr_url,
+                     code_changed=False,
+                     note=f"re-ran the failed jobs of {', '.join(reran)}: no changed file "
+                          "appears in their failing log"
+                          + (f"; {_not_rerun(reran.left, quoted=False)}" if reran.left else ""))
+
+
+def _rerun_after_a_pass_that_changed_nothing(forge_of, inp: CiRepairInput, result: RunResult,
+                                             *, human: bool) -> RunResult:
+    """The pass's `result`, the failed jobs re-run once first if the pass changed nothing (#756).
+
+    A pass that answered `PR_OPEN` with `code_changed is False` looked, and found nothing in the
+    change to fix: the red check is not the change's. Nothing was pushed, so nothing asks the forge
+    to run the checks again, and the watch would rest `_CI_POLL` and read the same red off the same
+    run, paying a second agent pass for it. So the failed jobs are re-run once, here, and the watch
+    reads them on its own clock; the attempt the pass spent counts against `_CI_REPAIR_MAX` as it
+    always did.
+
+    NOTHING ELSE RE-RUNS. A pass that pushed has its checks re-run by the push. `code_changed is
+    None` is "could not see" (lesson §2): it may have pushed. A hold, a pause or a failure is the
+    watch's to settle as it is. A person's adjust pass (`human`, #68) answered their words, not a
+    red build. A forge without the capability (`rerun_failed_of` → `None`) is not even built for a
+    pass that changed the code, and says nothing: the result goes back exactly as it came.
+
+    SAID ON THE PULL REQUEST, AFTER THE FORGE ANSWERED (lesson §9): the checks it re-ran (PO answer
+    Q4) and any red check it left past the runs whose log was read (`Reran.left`), or its refusal
+    in its words (Q3), besides the worker log and the result's note. `[]`
+    (asked, nothing re-runnable) is said in the note and the log only: nothing happened to tell."""
+    if human or result.state is not JobState.PR_OPEN or result.code_changed is not False:
+        return result
+    from beeverforge.adapters.forge.base import RerunRefused, rerun_failed_of
+
+    try:
+        forge = forge_of()
+    except Exception as exc:  # noqa: BLE001 — the pass is done; a missing re-run is not its price
+        activity.logger.warning("could not reach the forge of %s to re-run its failed jobs after a "
+                                "pass that changed nothing (%s)", inp.pr_url, str(exc)[:160])
+        return result
+    reran = rerun_failed_of(forge, inp.pr_url)
+    if reran is None:
+        return result
+    if isinstance(reran, RerunRefused):
+        why = str(reran)[:300]
+        activity.logger.warning("not every failed job of %s could be re-run after a repair pass "
+                                "that changed nothing: %s", inp.pr_url, why)
+        # "NOT EVERY": the refusal may be partial, and `why` names what did re-run (see above).
+        _say_on_the_pull_request(forge, inp.pr_url, (
+            f"Not every failed job could be re-run after a repair pass that changed nothing: "
+            f"{why}."))
+        added = f"not every failed job could be re-run: {why}"
+    elif not reran:
+        activity.logger.warning("the forge found no failed job of %s to re-run after a repair pass "
+                                "that changed nothing", inp.pr_url)
+        added = "no failed job was found to re-run"
+    else:
+        names = ", ".join(f"`{n}`" for n in reran)
+        # Not "for the next repair attempt" here: after the last attempt's pass none is left, and
+        # the card parks for a person. What is true on every attempt is that it stays red.
+        left = _not_rerun(reran.left, quoted=True)
+        _say_on_the_pull_request(forge, inp.pr_url, (
+            f"Re-ran the failed jobs of {names}: a repair pass changed nothing in this pull "
+            "request, so its checks are run once more. They are read again once they finish."
+            + (f" {left}." if left else "")))
+        activity.logger.info("re-ran the failed jobs of %s (%s) after a repair pass that changed "
+                             "nothing", inp.pr_url, ", ".join(reran))
+        added = f"re-ran the failed jobs of {', '.join(reran)}: the pass changed nothing" + (
+            f"; {_not_rerun(reran.left, quoted=False)}" if reran.left else "")
+    return result.model_copy(update={"note": f"{result.note}; {added}" if result.note else added})
+
+
+def _run_ci_repair(inp: CiRepairInput, run_id: str | None = None,
+                   ci_log: str | None = None) -> RunResult:
+    project = ProjectRegistry().get(inp.project)
+    repo, _ = _ref_repo(project, inp.issue)  # C-18: the repair runs where the card's PR lives
+    #: A person's own words fill the slot (#68) — not a red build, and never gated as one.
+    human = ci_log is not None
+    if ci_log is None:
+        # ASKED AT THE POINT OF ACTION, WHATEVER SENT US HERE (#184). The merge watch reads the
+        # same table before it calls this — but a job whose history predates that read still
+        # arrives on the bare word `failure`, and the checks can move between the two reads. An
+        # agent is launched only when the table says there is a blocking check about the code
+        # with a failing log to act on; otherwise the pull request is handed to a person with
+        # the check's name, at the price of one forge read instead of one agent pass.
+        held, evidence = _nothing_to_repair(project, inp)
+        if held is not None:
+            return held
+        # A THIRD MOVE, BETWEEN THE HOLD AND THE AGENT (#756): a log that names no changed file
+        # is re-run first. Asked only here, after the gate, so an empty log never reaches it.
+        rerun = _rerun_what_the_change_does_not_touch(project, inp, repo, evidence)
+        if rerun is not None:
+            return rerun
+    else:
+        evidence = ""
+    if not installed_box_traits(inp.sandbox).remote:  # a local box runs the repair inline
+        # `ci_log` is passed in ONLY by the human-adjust path (#68), which has a person's
+        # sentence rather than a build log. None means the ordinary CI repair, and its log is
+        # THE ONE THE DECISION WAS MADE FROM (#184): the gate above answers `repair` only with a
+        # failing log in hand, so there is no second fetch here that could come back different —
+        # or empty — after the decision to launch was already taken.
+        view, repo_key = _runner_view(project, inp.issue)  # C-18: the card's own repository
+        if ci_log is None:
+            ci_log = evidence
+        # RESOLVED, not hard-coded. This built the runner with the framework's image while holding
+        # the project — so a client who configured their own box got it everywhere EXCEPT the CI
+        # repair, which is the shape of bug that surfaces on the second failure of the day and
+        # looks like the repair agent being incompetent rather than the toolchain being absent.
+        passed = build_runner(
+            view, inp.issue, sandbox=inp.sandbox,
+            image=_resolved_image(project, sandbox=inp.sandbox), review=False,
+            repo_key=repo_key, change=inp.change,
+        ).repair_ci(inp.issue, ci_log, pr_url=inp.pr_url, human=human)
+        # A PASS THAT CHANGED NOTHING RE-RUNS ONCE (#756), on this door and the box's alike.
+        return _rerun_after_a_pass_that_changed_nothing(lambda: _forge_for(project), inp, passed,
+                                                        human=human)
+
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.paths import events_file
+    from beeverforge.runtime.boxed_job import BoxConfig
+
+    def box(references):
+        return BoxConfig(
+            project=inp.project, issue=inp.issue, repo=repo,
+            board_owner=project.tracker.options.get("board_owner"),
+            board_number=project.tracker.options.get("board_number"),
+            tracker_kind=project.tracker.kind,
+            forge_kind=(project.forge.kind if project.forge else None) or project.tracker.kind,
+            # #162, as in `_box_for`
+            tracker_options=box_options(project, "tracker", references=references),
+            forge_options=box_options(project, "forge", references=references),
+        )
+
+    journal = journal_for(events_file(project, inp.issue), dedup=True)
+    # A DIFFERENT VARIANT AND A DIFFERENT FLAG for the human path, so the box knows it is acting
+    # on a review comment rather than a red build, and so the launcher's idempotency tag cannot
+    # collide with a CI repair on the same PR.
+    extra = {"BEEVERFORGE_PR": inp.pr_url}
+    extra["BEEVERFORGE_ADJUST" if human else "BEEVERFORGE_CI_REPAIR"] = "1"
+    if human:
+        extra["BEEVERFORGE_ADJUST_TEXT"] = ci_log
+    passed = _remote_launch(
+        project, inp.sandbox, box, variant="-adjust" if human else "-ci-repair",
+        extra_env={**extra, **_the_change_env(inp.change)},
+        journal=journal, timeout=1800, run_id=run_id,
+    )
+    # The box hands `code_changed` back on its result line (`boxed_job._emit` dumps the whole
+    # `RunResult`, measured by the box's own `repair_ci`), so the worker can decide here.
+    return _rerun_after_a_pass_that_changed_nothing(lambda: _forge_for(project), inp, passed,
+                                                    human=human)
+
+
+@activity.defn
+async def fetch_ticket_title(inp: TicketRef) -> str:
+    """Read-only: the ticket's title, so the workflow can stamp it into its memo and the panel
+    shows "#123 Add health check" instead of a bare number. Best-effort — the caller ignores a
+    failure (a title is cosmetic, never worth failing or delaying a job for). Worker (creds)."""
+
+    tracker = _tracker_for(ProjectRegistry().get(inp.project))
+    return await asyncio.to_thread(lambda: tracker.get_ticket(inp.issue).title)
+
+
+@activity.defn
+async def mark_needs_action(inp: HoldSyncInput) -> str:
+    """Reconcile the board to a parked (Needs Action) state from the WORKFLOW, and return the
+    ticket's CREATOR login so the caller can route the escalation to them (there is no assignee
+    in a lights-out flow). The in-job orchestrator normally sets the tracker status as it parks —
+    but a crash or activity timeout kills the job BEFORE it can, so the ticket silently stays
+    'In progress' while it's really waiting for a human (the hole #394 hit). Best-effort and
+    idempotent. Returns "" if the author can't be read. Worker (creds)."""
+    tracker = _tracker_for(ProjectRegistry().get(inp.project))
+    try:
+        state = JobState(inp.state)
+    except ValueError:
+        # A state nobody defined means a caller is out of step with the contract — the ticket is
+        # parked safely, but something upstream is wrong.
+        activity.logger.warning("unknown job state %r — treating #%s as on hold",
+                                inp.state, inp.issue)
+        state = JobState.ON_HOLD
+
+    def _apply() -> str:
+        author = ""
+        try:
+            author = tracker.get_ticket(inp.issue).author or ""
+        except Exception:  # noqa: BLE001 — the creator is a nice-to-have, never worth failing
+            # The escalation goes out addressed to nobody in particular.
+            activity.logger.warning("could not find who created #%s", inp.issue)
+            author = ""
+        # THROUGH THE CARD'S DOOR (ADR-0055, #413): `parked`, the park's own state as the column
+        # and the note as the comment — on every row, where `set_state(reason=…)` wrote it on two
+        # and dropped it on the local board. A park the box reached was applied by the worker
+        # already (#414), and its id answers this from the card's record: one park, one row
+        from beeverforge.lifecycle import CardEvent, transition
+
+        moved = transition(ProjectRegistry().get(inp.project), inp.issue, CardEvent.PARKED,
+                           by="the workflow", facts={"job_state": state.value,
+                                                     "note": inp.note or ""},
+                           tracker=tracker,
+                           event_id=inp.event_id or _this_activitys_event("parked"))
+        if moved.refused:
+            activity.logger.info("mark_needs_action: #%s not parked by the door (%s)", inp.issue,
+                                 moved.refused[:160])
+        return author
+
+    try:
+        return await asyncio.to_thread(_apply)
+    except Exception:  # noqa: BLE001 — reconciliation is best-effort; never fail the park
+        activity.logger.warning(
+            "mark_needs_action: could not set %s#%s → %s", inp.project, inp.issue, state.value)
+        return ""
+
+
+@activity.defn
+async def record_outcome(inp: HoldSyncInput) -> str:
+    """Write a job's TERMINAL state into its journal — the record that outlives the engine.
+
+    THE LIE THIS ENDS (pilot, 2026-08-17). The journal is written by the in-box orchestrator, and
+    the outcome is decided by the WORKFLOW — after that box is gone. So `#89`'s journal read, in
+    full: … validating → reviewing → `review: rejected`, and then nothing. Its `open_pr` had
+    raised (the branch carried zero commits, which GitHub refuses), the workflow caught it and
+    parked the job, the BOARD said *Needs Action* and the engine agreed — and the durable record
+    stopped one event short of the only fact anybody needed.
+
+    That is not a cosmetic gap. Temporal's default namespace keeps 24h of history; a day later the
+    engine is empty and this file is the ONLY answer to "what happened to #89". Both readers that
+    matter get it wrong: the panel's Recent runs called a parked job `reviewing`, and the operator
+    was told *nothing shipped yet* about a floor that had shipped two tickets.
+
+    ONE CALL SITE, AT THE ONE EXIT (`JobWorkflow.run`), on purpose. The terminal state is decided
+    in a dozen branches — a crash, a rate-limit ladder giving up, an operator's skip, an answered
+    merge gate, a chain that ends at its last stage — and a rule that has to be remembered in each
+    of them is a rule most of them will eventually forget. That is the defect this platform has
+    shipped seventeen times; the fix is a seam, not a reminder.
+
+    AND ONE MORE, WHERE A CARD OUTLIVES ITS JOB (#448 slice 5): when the project's watched deploy
+    is the card's last stage, the job ends at the merge with the card In review, and the deploy
+    watch is what ends the card — so it records that ending here too (`DeployWatchWorkflow.
+    _the_last_stage`), after its settle went through the card's door, which announced the
+    delivery when the deploy was green. The job's own line still says `merged`.
+
+    APPENDS, NEVER REWRITES. The journal is append-only like every other record here: the run's
+    own `reviewing` stays true (it WAS reviewing), and this adds what it became.
+
+    NO ANNOUNCEMENT HERE SINCE #414. It asked, for a job that ended with its card done, whether
+    that completed a delivery — the second producer beside the card's door. Every way a card
+    reaches Done is a transition of that door now (the settle at the merge, the box's hand-back at
+    its last stage, a person's close, a close observed on the vendor's own screen), and its
+    `Loops("deliver")` announces what the card completes, recorded once per card.
+
+    NEVER RAISES. The job has already ended; nothing about recording that may fail it.
+    """
+    def _write() -> str:
+        # THE ONE WRITER OF THE ENDING LINE, which the attended driver writes through too (#551)
+        from beeverforge.observability.job_record import record_ending
+
+        return record_ending(ProjectRegistry().get(inp.project), inp.issue, inp.state,
+                             by="the workflow", note=inp.note or "")
+
+    try:
+        recorded = await asyncio.to_thread(_write)
+    except Exception as exc:  # noqa: BLE001 — the job ended; the record failing must not undo it
+        activity.logger.warning(
+            "BEEVERFORGE_OUTCOME_NOT_JOURNALLED %s#%s ended as %s and its journal does not say so "
+            "(%s) — once the engine's retention window passes, nothing will",
+            inp.project, inp.issue, inp.state, str(exc)[:160])
+        recorded = "unrecorded"
+    return recorded
+
+
+#: How long an activity that tells a requester something waits for it — well inside its two
+#: minutes (`tell_the_requester`, `card_adjusted`).
+_ANNOUNCE_WITHIN = 75.0
+
+
+def _ready_to_try(project, card: str, pr_url: str, *, by: str, review: str = "",
+                  tracker=None, ports=None) -> bool:
+    """`pr_opened` through the card's door (ADR-0055, #414): its requester hears the change is
+    theirs to try (`events.ready_to_try`), once per card and pull request. Returns whether they
+    were told NOW. The live preview's link travels when one is up (#405).
+
+    ONE TRANSITION WITH THE BOX'S (`handed_back.gate_event`): the box that opened the pull request
+    handed it back first, and the worker applied it with its column and this telling — so the
+    watch and the round, coming after it, are answered from the card's record. They hand in a
+    gate a person holds (`needs_person`) and no note: the box said the pull request on the card,
+    and a watch or a round that comes first, for a box from before the hand-back, says nothing
+    there twice either."""
+    from beeverforge.lifecycle import CardEvent, transition
+    from beeverforge.lifecycle.handed_back import gate_event
+    from beeverforge.preview.live import link_for
+
+    moved = transition(project, card, CardEvent.PR_OPENED, by=by,
+                       facts={"pr_url": pr_url, "review": review, "needs_person": True,
+                              "note": "", "preview_url": link_for(project, card)},
+                       tracker=tracker, ports=ports, event_id=gate_event(pr_url))
+    if moved.refused:
+        activity.logger.info("#%s: its door did not hand the pull request to its requester (%s)",
+                             card, moved.refused[:160])
+    return moved.outcome("tell") == "told" and not moved.replayed
+
+
+def _pull_requests_waiting(project, gates: list[tuple[str, str]]) -> list[str]:
+    """`events.pull_requests_at_the_gate`, never raising (#267 slice 3) — and, first, the
+    catch-all of the ready-for-you telling (#401): a gate the watch did not announce (a job whose
+    history predates `tell_the_requester`, a merge handed to a person later) is handed to the
+    card's door as `pr_opened` on the first round that sees it, and one the watch did announce is
+    answered from the card's record (#414). Returns the cards told now.
+
+    ONE PORT FOR THE ROUND: the board is read once for every gate it holds, not once per gate."""
+    told: list[str] = []
+    try:
+        from beeverforge.lifecycle.ports import Ports
+        from beeverforge.product import events
+
+        ports = Ports(project, tracker=_tracker_for(project))
+        for card, pr in gates or []:
+            try:
+                if _ready_to_try(project, card, pr, by="the tech-lead's round", ports=ports):
+                    told.append(card)
+            except Exception as exc:  # noqa: BLE001 — one card's telling is not the round's price
+                activity.logger.warning("could not hand #%s's pull request to its requester (%s)",
+                                        card, str(exc)[:160])
+        events.pull_requests_at_the_gate(project, gates)
+    except Exception as exc:  # noqa: BLE001 — never the floor report's price
+        activity.logger.warning("could not tell the product role which pull requests wait on a "
+                                "person (%s)", str(exc)[:160])
+    return told
+
+
+@activity.defn
+async def tell_the_requester(inp: ReadyForYouInput) -> bool:
+    """A PULL REQUEST A PERSON MUST DECIDE JUST ENTERED THE MERGE WATCH, and whoever asked for the
+    card hears it in the conversation they asked in (#401) — `pr_opened`, through the card's door
+    since #414 (`_ready_to_try`), whose one telling the round's catch-all shares.
+
+    HERE, ON THE WORKER, AND NOT WHERE THE PULL REQUEST WAS OPENED. The machine that opens it runs
+    wherever the job runs — on a remote box, another machine with no product memory — and the
+    delivery ledger that says whose conversation a card came from lives here. The watch is also the
+    one point both ways into a human gate pass through: a job that just opened its pull request,
+    and a person resuming a merge the forge refused.
+
+    NEVER RAISES, AND BOUNDED: the job is waiting on a person either way; a telling that could not
+    be made is the tech-lead round's to make on its next pass. Returns whether it was told now."""
+    def _tell() -> bool:
+        try:
+            from beeverforge.product.events import _stance
+
+            project = ProjectRegistry().get(inp.project)
+            # THROUGH THE CARD'S DOOR (ADR-0055, #414), as `pr_opened`, with the review's word and
+            # the preview's link when one is already up (#405): the message then says "try it
+            # here" instead of "start it"; one that comes up later says so itself (`preview_up`)
+            return _ready_to_try(project, inp.issue, inp.pr_url, by="the workflow",
+                                 review=_stance(inp.verdict), tracker=_tracker_for(project))
+        except Exception as exc:  # noqa: BLE001 — the round says it, an hour late at worst
+            activity.logger.warning("could not tell %s#%s's requester it is ready for them (%s)",
+                                    inp.project, inp.issue, str(exc)[:160])
+            return False
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_tell), timeout=_ANNOUNCE_WITHIN)
+    except TimeoutError:
+        activity.logger.warning("telling %s#%s's requester outlived %ss — the round tells them",
+                                inp.project, inp.issue, _ANNOUNCE_WITHIN)
+        return False
+
+
+@activity.defn
+async def card_adjusted(inp: AdjustedInput) -> str:
+    """A PASS A PERSON ASKED FOR REWROTE THE PULL REQUEST, and it ends the way the first pass did
+    (#413 part 3, #448 slice 2): `adjusted` through the card's door — a comment saying whose pass
+    it is, the live preview rebuilt from the new head, and the requester told that THIS pass is
+    theirs to try, keyed by its number.
+
+    THE GAP IT CLOSES, measured on a live run (#448, card #1000007): the operator's adjust pass
+    ended, and nothing rebuilt the preview or told the requester — `ready_for_you` is keyed on the
+    card and the pull request, which a second pass does not change, so it was deduplicated away.
+
+    NEVER RAISES: the pass is pushed and the gate re-opens whatever this manages to say; what
+    failed is the door's record, and the hourly round applies it again."""
+    def _apply() -> str:
+        from beeverforge.lifecycle import CardEvent, transition
+        from beeverforge.product.voice import card_note
+
+        project = ProjectRegistry().get(inp.project)
+        said = card_note("adjusted", who=inp.by or "a person", why=inp.instruction[:280],
+                         language=getattr(project, "language", None))
+        moved = transition(project, inp.issue, CardEvent.ADJUSTED, by=inp.by or "a person",
+                           why=inp.instruction[:280],
+                           facts={"pass_number": inp.pass_number, "pr_url": inp.pr_url,
+                                  "note": said},
+                           tracker=_tracker_for(project), event_id=_pass_event(inp.pass_number))
+        return moved.refused or ", ".join(f"{n}={o}" for n, o in moved.effects)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_apply), timeout=_ANNOUNCE_WITHIN)
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        activity.logger.warning("the adjust pass of %s#%s was not recorded as such (%s)",
+                                inp.project, inp.issue, str(exc)[:160])
+        return "unrecorded"
+
+
+@activity.defn
+async def tell_the_requester_it_merged(inp: MergedInput) -> bool:
+    """A CARD'S PULL REQUEST MERGED, and whoever asked for the card hears it went in (#448 slice 3,
+    `events.merged_for_you`) — whoever merged it: a person, the factory on its own, or the merge a
+    requester's acceptance gave when the look was all that held it.
+
+    HERE, ON THE WORKER, for `tell_the_requester`'s reason: the ledger that says whose conversation
+    a card came from, and the store that says where it was accepted, live here, never in the box.
+
+    THROUGH THE CARD'S DOOR (#448 slice 6, ADR-0055 amended 2026-10-05): `merged`, the one hand of
+    it that knows whether stages follow, keyed by the pull request (`handed_back.merged_event`) —
+    so a retried or replayed activity is answered from the card's record, and its row's telling
+    (`Tell(merged_for_you)`, `events.went_in`) is said once per card and pull request.
+
+    NEVER RAISES, AND BOUNDED: the change is in either way. Returns whether it was told now."""
+    def _tell() -> bool:
+        try:
+            from beeverforge.lifecycle import CardEvent, transition
+            from beeverforge.lifecycle.handed_back import merged_event
+
+            project = ProjectRegistry().get(inp.project)
+            moved = transition(project, inp.issue, CardEvent.MERGED, by="the workflow",
+                               facts={"pr_url": inp.pr_url, "stages_follow": inp.stages_follow,
+                                      "note": ""},
+                               tracker=_tracker_for(project),
+                               event_id=merged_event(inp.pr_url) if inp.pr_url else "")
+            if moved.refused:
+                activity.logger.info("#%s: its door did not hand the merge to its requester (%s)",
+                                     inp.issue, moved.refused[:160])
+            return moved.outcome("tell") == "told" and not moved.replayed
+        except Exception as exc:  # noqa: BLE001 — the merge stands; only the telling is lost
+            activity.logger.warning("could not tell %s#%s's requester it went in (%s)",
+                                    inp.project, inp.issue, str(exc)[:160])
+            return False
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_tell), timeout=_ANNOUNCE_WITHIN)
+    except TimeoutError:
+        activity.logger.warning("telling %s#%s's requester it went in outlived %ss — nothing else "
+                                "says it", inp.project, inp.issue, _ANNOUNCE_WITHIN)
+        return False
+
+
+@activity.defn
+async def settle_ticket(inp: HoldSyncInput) -> str:
+    """Record a job's TERMINAL outcome on the tracker: the board column, and one comment saying
+    why it ended there.
+
+    SEPARATE FROM `mark_needs_action`, WHICH IS THE PARKED TWIN. That one also reads the ticket's
+    author, because a park has to be escalated to somebody; an ended job has nobody to route to,
+    and the read is a request against the same credential the poller and every running job share.
+    Two jobs, two activities — the alternative was calling something named `mark_needs_action` to
+    mark a ticket done, which is the kind of sentence a maintainer later believes.
+
+    WHY THE WORKFLOW HAS TO DO THIS AT ALL (pilot, 2026-08-16). The in-job orchestrator writes the
+    tracker state as it goes, but the human-gated merge happens OUTSIDE it: the operator answers
+    the gate, the workflow lands the PR, and the machine that owns the writing has long since
+    returned. `JobState.MERGED` also maps to *In review* by design (merged is still overseen while
+    it deploys), so for a project whose manifest declares no `environments:` — which is every
+    project this platform's own onboarding creates — the promotion tail never runs, nothing ever
+    writes `DONE`, and the card sits in *In review* for ever. The board's terminal column was
+    unreachable.
+
+    BEST-EFFORT, LIKE ITS TWIN. The ticket has already merged. Nothing about recording that may
+    fail the job or hold the floor."""
+    project = ProjectRegistry().get(inp.project)
+    tracker = _tracker_for(project)
+    try:
+        state = JobState(inp.state)
+    except ValueError:
+        activity.logger.warning("unknown job state %r — not settling #%s", inp.state, inp.issue)
+        return "unknown-state"
+    # THROUGH THE CARD'S DOOR (ADR-0055, #413). A skip is `skipped` — and a person's skip or
+    # discard went through the door from the action row already, so the card is in the backlog and
+    # this settles nothing twice: no second comment on the rows that wrote `set_state`'s reason. A
+    # job settled DONE is `delivered`: the card closes as delivered on every row, and the delivery
+    # it completes is announced (on the local board it never was, the card staying open in Done).
+    #
+    # AND THE TWO ENDS OF A WATCHED DEPLOY THAT IS THE CARD'S LAST STAGE (#448 slice 5), each the
+    # event the box's own outcome is (`handed_back.OUTCOMES`), so a card is one kind of card
+    # whoever moved it: the job's settle at the merge is `merged` — In review, with the job's word
+    # on why it waits — and the watch's deploy that failed or was never seen to finish is `parked`
+    # (`on_hold`, Needs Action), nothing delivered and nobody told it is ready. The green deploy is
+    # the watch's `delivered`, above: the door's `Loops("deliver")` announces it, at the last
+    # stage and nowhere else (`record_outcome`, after it, only writes the journal).
+    from beeverforge.lifecycle import CardEvent, transition
+
+    event = {JobState.SKIPPED: CardEvent.SKIPPED, JobState.DONE: CardEvent.DELIVERED,
+             JobState.MERGED: CardEvent.MERGED, JobState.ON_HOLD: CardEvent.PARKED}.get(state)
+    if event is None:
+        activity.logger.warning("settle_ticket: %s is no ending the door knows — #%s left as it is",
+                                state.value, inp.issue)
+        return "unknown-state"
+    moved = await asyncio.to_thread(lambda: transition(
+        project, inp.issue, event, by="the workflow",
+        facts={"note": inp.note or "", "job_state": state.value}, tracker=tracker,
+        event_id=_this_activitys_event(event.value)))
+    if moved.refused:
+        activity.logger.info("settle_ticket: #%s not settled as %s (%s)", inp.issue, event.value,
+                             moved.refused[:160])
+        return "already-settled"
+    if moved.outcome("column").startswith("failed"):
+        activity.logger.warning(
+            "settle_ticket: could not set %s#%s → %s", inp.project, inp.issue, state.value)
+        return "failed"
+    return state.value
+
+
+@activity.defn
+async def check_deploy_status(inp: DeployStatusInput) -> dict:
+    """Read-only: the deploy workflow's outcome on the PR's MERGE commit —
+    {"status": success|failure|pending|none, "run_url": ..., "sha": ...}. The abandoned
+    deploy-watch polls this and only NOTIFIES; it never gates (ADR-0005). Worker (gh + creds)."""
+
+    forge = _forge_for(ProjectRegistry().get(inp.project))
+
+    def _read() -> dict:
+        sha = forge.merge_commit_sha(pr=inp.pr_url)
+        if not sha:  # not merged yet (shouldn't happen post-merge) → nothing to watch
+            return {"status": "none", "run_url": None, "sha": None}
+        status, url = forge.deploy_run_status(sha=sha, workflow=inp.workflow)
+        return {"status": status, "run_url": url, "sha": sha}
+
+    return await asyncio.to_thread(_read)
+
+
+@activity.defn
+async def notify_deploy(inp: DeployNotifyInput) -> None:
+    """Emit the deploy-watch's outcome via the project's notifier (ADR-0005). A best-effort
+    side channel — the merge already happened and the floor is free; this only informs."""
+    from beeverforge.factory import notifier_for_project
+    from beeverforge.techlead import voice as tl_voice
+
+    project = ProjectRegistry().get(inp.project)
+    lang = str(getattr(project, "language", "") or "")
+    icon = {"success": "✅", "failure": "❌", "timeout": "⏱️"}.get(inp.status, "ℹ️")
+    level = "info" if inp.status == "success" else "error"
+    where = f" — {inp.run_url}" if inp.run_url else ""
+    # A GREEN DEPLOY IS AN INVITATION, NOT A RECEIPT (#122). The outcome used to be reported as a
+    # CI run URL, which answers "was the pipeline green" and says nothing about whether the change
+    # is right — so the person who has to look at it was never told where to look. With an address
+    # declared, the sentence carries it and asks.
+    #
+    # AND WITHOUT ONE IT ASKS NOTHING, deliberately: the previous shape of this idea told a client
+    # the change was "in the test environment, go and have a look" with no address at all, which is
+    # worse than silence because it costs somebody a reply to find out where.
+    invite = ""
+    if inp.status == "success" and inp.url:
+        invite = tl_voice.say(tl_voice.NARRATION, "deploy.invitation", lang, url=inp.url)
+        level = "action_required"
+    # THE STATUS WORD IS TRANSLATED TOO (#160), and it is the one that carries the news: a
+    # Portuguese-speaking client reading "deploy failure" is being told the outcome in a language
+    # they did not ask for, at the moment they most need to understand it. An unknown status falls
+    # through as itself rather than as a key — the adapter's word is better than a placeholder.
+    status = tl_voice.say(tl_voice.NARRATION, f"deploy.status.{inp.status}", lang)
+    msg = tl_voice.say(tl_voice.NARRATION, "deploy.outcome", lang, icon=icon,
+                       project=inp.project, issue=inp.issue, env=inp.env,
+                       status=inp.status if status.startswith("deploy.status.") else status,
+                       where=where, invite=invite)
+    await asyncio.to_thread(lambda: notifier_for_project(project).notify(message=msg, level=level))
+    # THE SECOND SURFACE, from the SAME event (#122, the operator's decision on 2026-08-16:
+    # *"os 2 podem comunicar isso… se a empresa não estiver usando [o PO], continua sendo
+    # relevante independente do canal"*). The operator half above always runs — it does not depend
+    # on the product module being switched on, which is the failure this card was opened for. The
+    # client half is additive and silent when there is no client to tell.
+    if inp.status == "success" and inp.url:
+        await asyncio.to_thread(_invite_the_client_to_look, project, inp)
+
+
+@activity.defn
+async def promote_staging(inp: PromoteInput) -> RunResult:
+    """Post-merge: observe staging; if green, park at AWAITING_PROD_APPROVAL. Runs the box
+    program on the job's REMOTE box (it has the forge credential and the cloned manifest — the
+    worker has neither), H12."""
+    run_id = activity.info().workflow_run_id
+    applied = _this_activitys_event("handed-back")
+    return await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied, _run_promotion(
+            inp.project, inp.issue, "staging", {}, run_id, sandbox=inp.sandbox)),
+        f"{inp.project}#{inp.issue} staging",
+    )
+
+
+@activity.defn
+async def verify_gate_seal(inp: GateSealInput) -> str:
+    """Empty when a human gate's answer carries the panel's seal over exactly these fields for
+    THIS workflow; otherwise the reason it does not (`gate_seal`). An activity, never workflow
+    code: it reads a key from the environment or the disk, and its verdict must be recorded in
+    history so a replay reaches the same decision whatever the key is by then."""
+    from beeverforge import gate_seal
+
+    return gate_seal.refusal(inp.seal, inp.kind, activity.info().workflow_id, *inp.fields)
+
+
+@activity.defn
+async def release_prod(inp: ReleaseInput) -> RunResult:
+    """Tag → prod on an authenticated human approval, then observe prod (D-12). On the job's
+    remote box, like `promote_staging`."""
+    run_id = activity.info().workflow_run_id
+    applied = _this_activitys_event("handed-back")
+    return await _heartbeat_while(
+        lambda: _the_worker_applies(inp.project, inp.issue, applied, _run_promotion(
+            inp.project, inp.issue, "release",
+            {
+                "BEEVERFORGE_RELEASE_VERSION": inp.version,
+                "BEEVERFORGE_RELEASE_APPROVER": inp.approver,
+                "BEEVERFORGE_RELEASE_COMMENT": inp.comment,
+            },
+            run_id,
+            sandbox=inp.sandbox,
+        )),
+        f"{inp.project}#{inp.issue} release",
+    )
+
+
+# --- the autonomous trigger (A1): board scan + workflow start, driven by PollWorkflow ---
+def rate_pause_marker(kind: str, reset_epoch: int) -> str:
+    """The once-per-window marker's file name, keyed by (tracker kind, reset epoch).
+
+    `rate-pause-<kind>-<epoch>.said`; the kind is reduced to the characters a file name on any
+    volume takes, so a stranger's add-on kind cannot name a path. An input with no kind (a
+    history written before budgets were read per vendor) keeps the name that shape had,
+    `rate-pause-<epoch>.said`, so a marker it wrote before the deploy still counts."""
+    slug = "".join(c if c.isalnum() or c in "_-" else "_" for c in (kind or ""))
+    return f"rate-pause-{slug}-{reset_epoch}.said" if slug else f"rate-pause-{reset_epoch}.said"
+
+
+@activity.defn
+async def announce_rate_pause(inp: RatePauseInput) -> bool:
+    """Tell a human the factory is standing still because the API budget ran out.
+
+    THE SELF-IMPOSED WAIT IS STILL A WAIT. The poller skips a tick to protect the quota — right,
+    and invisible: it said so to a workflow log, so the floor went quiet for up to an hour and
+    the operator learned about it from an unrelated command failing (2026-08-14: *"what limit?
+    não recebi nenhum aviso"*). ADR-0038 D2: a wait is a question, never a state.
+
+    ONCE PER RESET WINDOW PER VENDOR, not once per tick — the poller runs every three minutes
+    and an alarm on every one of them is an alarm somebody learns to filter. The marker carries
+    the reset epoch, so the NEXT exhaustion (a different window) speaks again — and the tracker
+    KIND, because budgets are read per vendor now and two vendors spent in the same window (or
+    both reporting no reset, epoch 0) shared one marker: the second stayed silent (found by the
+    branch's own review, 2026-08-26). Best-effort throughout: the announcement never decides
+    whether the poll may end."""
+    from beeverforge.box_prove import PROOF_DIR
+    from beeverforge.factory import notifier_for_project
+
+    marker = PROOF_DIR / rate_pause_marker(inp.kind, inp.reset_epoch)
+    try:
+        if marker.exists():
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(inp.remaining))
+    except OSError:
+        pass  # a read-only proofs dir must not silence the announcement itself
+
+    from beeverforge.techlead import voice as tl_voice
+
+    said = False
+    # COMPOSED PER PROJECT (#160). One text for every project was one language for every project,
+    # and this is the broadest unprompted message the platform sends — it reaches every client of
+    # the deployment at once. Rendering inside the loop also lets each sentence name the project
+    # whose `doctor` would answer it, instead of the `<project>` placeholder a reader has to fill
+    # in themselves.
+    #
+    # THE VENDOR'S NAME IS A PARAMETER, not a word in the sentence — and not a literal in this
+    # activity either, which is what it was ("GitHub", right for exactly one tracker). The
+    # adapter names itself on the `Budget` it reports and the poller carries that name here.
+    #
+    # ONLY THE PROJECTS ON THE EXHAUSTED VENDOR are told (`inp.projects`): a Jira project on a
+    # mixed deployment is still being scanned, and a message saying its pickups are paused would
+    # be false. An empty list is the pre-per-vendor shape and means everybody, so a history
+    # written before this field existed replays with the meaning it had.
+    for project in ProjectRegistry().list():
+        if inp.projects and str(getattr(project, "name", "") or "") not in inp.projects:
+            continue
+        try:
+            lang = str(getattr(project, "language", "") or "")
+            name = str(getattr(project, "name", "") or "")
+            when = (time.strftime("%H:%M", time.localtime(inp.reset_epoch)) if inp.reset_epoch
+                    else tl_voice.say(tl_voice.NARRATION, "rate-pause.soon", lang))
+            text = tl_voice.say(tl_voice.NARRATION, "rate-pause", lang,
+                                forge=inp.vendor or "API",
+                                resource=inp.resource, remaining=inp.remaining, when=when,
+                                project=name or "<project>")
+            await asyncio.to_thread(
+                lambda p=project, t=text: notifier_for_project(p).notify(
+                    message=t, level="warning"))
+            said = True
+        except Exception as exc:  # noqa: BLE001 — a channel is an ADD-ON; never the gate
+            activity.logger.warning("could not announce the rate pause for %s (%s)",
+                                    getattr(project, "name", "?"), exc)
+    return said
+
+
+@activity.defn
+async def tracker_budgets() -> list[dict]:
+    """The API budget of every tracker credential the enabled projects use — one row per
+    (kind, credential), read through the PORT, so the poller can skip the projects on an
+    exhausted vendor and keep scanning the rest.
+
+    IT WAS `github_budget()`, WHICH ASKED ONE VENDOR BY NAME WITH NO PROJECT IN SCOPE. On a Jira
+    deployment every tick spawned `gh api rate_limit` and logged a GitHub remedy; on a mixed one a
+    spent GitHub quota parked the Jira projects too, because the whole tick was skipped. Each row
+    carries `state` (`ok | low | unread | not_reported`), the projects that share the credential,
+    and — when the vendor reports one — the numbers and the vendor's own name. `unread` keeps the
+    poller failing OPEN: it scans anyway, as it always has, and the floor says the safety net is
+    missing rather than pretending the budget is fine."""
+    from beeverforge.floor.reading import budgets
+
+    return await asyncio.to_thread(budgets)
+
+
+@activity.defn
+async def scan_projects() -> list[dict]:
+    """Enabled projects that have a board — the poller's work list, from the registry.
+
+    HAVING A BOARD IS ASKED OF THE FACTORY, NOT OF THE CONFIG. This filtered on
+    `board_owner`/`board_number`, which are GitHub Projects coordinates — and a Jira project has
+    neither, because there its workflow STATUS is the column and the project itself is the board.
+    So a Jira deployment was never scanned at all: box proven, credential wired, `DAR-2` sitting
+    in TO-DO, and the poller's work list simply did not contain it (F-02, found live 2026-08-05).
+
+    `build_board` already answers this question for every provider — it is the one place that
+    knows what a board needs — so the filter asks IT rather than pattern-matching one vendor's
+    configuration. The coordinates still travel, because the GitHub path reads them downstream."""
+    from beeverforge.adapters.board import build_board
+    from beeverforge.contracts.project import before_its_code
+
+    out: list[dict] = []
+    for p in ProjectRegistry().list():
+        if not p.enabled:
+            continue
+        if before_its_code(p):
+            # NOT PICKED UP, AND SAID (#992): a product that started before its code has no code
+            # repository for a job to work in, so a card would be claimed and then fail in a clone.
+            # Its first source (`beeverforge product first-source`) puts it on this list.
+            activity.logger.info("BEEVERFORGE_PICKUP_WAITS_FOR_CODE %s has no code repository "
+                                 "yet — not polled until its first source", p.name)
+            continue
+        bo = p.tracker.options.get("board_owner")
+        bn = p.tracker.options.get("board_number")
+        try:
+            has_board = build_board(p) is not None
+        except Exception as exc:  # noqa: BLE001 — an unknown provider is reported downstream
+            # …by `scan_todo`, which raises naming the known kinds, where there is a person to
+            # tell. Dropping the project from the WORK LIST here would take that report away and
+            # leave a configured project simply never polled — so it stays in on its coordinates,
+            # and the reason it could not be resolved is said once per tick rather than never.
+            activity.logger.warning(
+                "could not resolve a board for %s (%s) — keeping it in the poll list so the "
+                "scan reports the real problem instead of silently never looking",
+                p.name, str(exc)[:160])
+            has_board = bool(bo and bn)
+        if has_board:
+            out.append({
+                # `or ""` because these are GITHUB coordinates and a Jira project has none.
+                # `ScanInput` types them `str`, so passing None through failed validation INSIDE
+                # the workflow — which is not one broken project, it is the whole poll tick
+                # dying on every tick, for every project. Empty is the honest value: this
+                # provider's board is not addressed by coordinates.
+                "project": p.name, "board_owner": bo or "", "board_number": bn or "",
+                # explicit pickup_status wins; else THE BOARD ANSWERS FOR ITSELF (C-14).
+                #
+                # That last step used to be the literal "TO-DO", with a comment claiming a
+                # Portuguese board needed zero extra config. True for one provider: GitHub's
+                # canonical board really is spelled that way. Azure Boards spells it "To Do", so a
+                # correctly-configured ADO deployment asked for a column that does not exist and
+                # read an empty queue every tick — the silent stall, arriving through the front
+                # door of the platform's own default. Each adapter already held the answer; there
+                # was no way to ask for it until `pickup_column()` existed.
+                "pickup_status": (p.tracker.options.get("pickup_status")
+                                  or _pickup_column(p)),
+            })
+    return out
+
+
+def _named_columns(project, *keys: str) -> dict[str, str]:
+    """What this project's board calls each of `keys` — the platform's word for a board that cannot
+    be built or asked (#502). For a sentence about where a card went, never for a move: a move
+    goes through the row's own map (`set_state`), and a name here is only what a person reads."""
+    from beeverforge.adapters.board import build_board
+    from beeverforge.adapters.board.base import stage_column
+
+    try:
+        board = build_board(project)
+    except Exception as exc:  # noqa: BLE001 — a name in a note must not cost the split
+        activity.logger.info("could not build %s's board to name its columns (%s)",
+                             getattr(project, "name", "?"), str(exc)[:160])
+        board = None
+    return {key: stage_column(board, key) for key in keys}
+
+
+def _pickup_column(project) -> str:
+    """What this project's board calls its pickup column — never a guess this module makes.
+
+    Best-effort by design: this runs inside the poll tick's work-list build, which must not die
+    because one project's board could not be constructed. The platform default is the fallback and
+    it is the honest one, because a caller downstream reports which column it looked for."""
+    from beeverforge.adapters.board import build_board
+
+    try:
+        board = build_board(project)
+        got = board.pickup_column() if board is not None else ""
+    except Exception as exc:  # noqa: BLE001 — one bad project must not stop the whole tick
+        activity.logger.warning(
+            "could not ask %s's board what it calls its pickup column (%s) — falling back to "
+            "the platform's own 'TO-DO', which is only right for a board that calls it that",
+            getattr(project, "name", "?"), str(exc)[:160])
+        got = ""
+    # The last resort is the PLATFORM'S OWN name for the key, read from its neutral home — not a
+    # literal, and not GitHub's answer wearing the platform's hat. The warning above still says
+    # out loud that a fallback is a guess about somebody else's board.
+    #
+    # AND IT NO LONGER READS THE `columns` OPTION ON THE WAY (#231). The step between was
+    # `(options.get("columns") or {}).get("todo")`, OUTSIDE the `except` above: `options` is
+    # `dict[str, str]`, so on a deployment that had declared its names the middle term raised
+    # `AttributeError: 'str' object has no attribute 'get'` and took down the whole work-list
+    # build — every project, every tick — rather than one project's board. It could only ever
+    # have worked for a registry that already held a dict, which the contract does not allow;
+    # `build_board` above asks the row, and the row is where that map now lives.
+    return got or CANONICAL_COLUMNS["todo"]
+
+
+@activity.defn
+async def available_slots() -> int:
+    """Free slots on the floor = max_concurrent_jobs() minus the JobWorkflows currently RUNNING
+    (globally — the floor is a single shared agent token in v1). The poller starts at most this
+    many new tickets per tick, so a TO-DO batch is picked up ONE at a time in order, never all
+    at once. Excludes the deploy-watch children + the poller itself (WorkflowType filter): a
+    merged job that spawned a deploy-watch has ALREADY freed the floor (ADR-0005)."""
+    from beeverforge.runtime.temporal import max_concurrent_jobs
+
+    # EVERY POLLER TICK runs this, and every tick used to open an engine client to count one
+    # list — see `engine_client`.
+    client = engine_client()
+    running = 0
+    async for _ in client.list_workflows(
+        'WorkflowType = "JobWorkflow" AND ExecutionStatus = "Running"'
+    ):
+        running += 1
+    return max(0, max_concurrent_jobs() - running)
+
+
+@activity.defn
+async def scan_todo(inp: ScanInput) -> list[str]:
+    """Issue numbers currently in the board's pickup column (read-only)."""
+    from beeverforge.box_prove import announce_gate, clear_gate_announcement, gate_reason
+    from beeverforge.credentials import tracker_token_for
+    from beeverforge.factory import bot_token_provider_for
+
+    project = ProjectRegistry().get(inp.project)
+
+    # THE BOX IS PROVEN BEFORE ANYTHING IS PICKED UP (ADR-0037 D5). Configuration is a declaration
+    # and a proof is a fact — about a world that moves, so it expires when the image, the toolbox
+    # or this project's own commands change underneath it.
+    #
+    # HERE rather than in the workflow body, deliberately: this activity already loads the project
+    # and already returns `[]` for "no board configured". Putting the gate in the body would be a
+    # new command in a workflow with jobs in flight, which breaks replay (TMPRL1100) and needs a
+    # `workflow.patched()` gate. This needs neither.
+    # The sandbox is resolved HERE, in the activity, rather than carried on `ScanInput`. Adding a
+    # field with a `default_factory` that reads the environment would be evaluated inside the
+    # workflow body — the determinism rule `adapters/sandbox/registry.py` states — and adding one
+    # without a factory means the poller passes it, which is a workflow-body change for nothing.
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    async def _gate(repo: str = "") -> str | None:
+        """One repo's gate verdict, OFF the event loop and BOUNDED. `gate_reason` may resolve
+        a checkout (a network fetch) and ask docker for a digest; unbounded it was a sync call
+        that could hold this worker's whole event loop on one slow remote (adversarial review,
+        2026-08-13). On timeout the repo is HELD with the reason said — never silently."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: gate_reason(project, sandbox=default_sandbox(),
+                                        **({"repo": repo} if repo else {}))),
+                timeout=60)
+        except Exception as exc:  # noqa: BLE001 — undecided (incl. timeout) is its own verdict
+            which = repo or "the project"
+            return (f"the box gate could not decide for {which} within its budget "
+                    f"({type(exc).__name__}) — holding this repo's cards; retrying next tick")
+
+    # THE DEFAULT REPO'S GATE HOLDS THE DEFAULT REPO'S CARDS — no longer the whole project.
+    # Returning [] here held every FOREIGN repo's freshly proven cards on the default repo's
+    # expired proof, contradicting the shipped per-repo contract ("front never waits on back's
+    # paperwork" — adversarial review, 2026-08-13). The verdict is taken once, used per card.
+    default_held = await _gate()
+    if default_held:
+        announce_gate(inp.project, default_held, registry_name=inp.project)
+        # BOTH CONTRACTS, precisely: the original gate never spent board quota on a project
+        # that cannot run anything, and the per-repo contract says a proven foreign repo must
+        # not wait on the default's paperwork. A foreign card is only ever admitted on a proof
+        # that exists on disk — so with the default held and NO foreign proof recorded, nothing
+        # could be admitted and the board is not read; one foreign proof appears and the
+        # per-candidate loop below takes over.
+        from beeverforge import box_prove as _bp
+
+        # ASKED OF `box_prove`, not spelled here: `doctor` asks the same question to decide
+        # whether an unreadable API budget is a safety net anybody needs yet, and one condition
+        # written twice is how two answers to one question start to drift.
+        if not _bp.foreign_proofs_recorded(inp.project):
+            return []
+    else:
+        clear_gate_announcement(inp.project)  # so the NEXT breakage speaks
+
+    tok = tracker_token_for(project)
+    if not tok:
+        prov = bot_token_provider_for(project, "tracker")
+        tok = prov() if prov else None
+    # Through the FACTORY: `ScanInput` already carries the project, so the poller never needs to
+    # know which vendor keeps the columns — the registry decides.
+    from beeverforge.adapters.board import build_board
+
+    board = build_board(project, token=tok)
+    if board is None:
+        activity.logger.warning("no board configured for %s/%s — the pickup queue is empty by "
+                                "configuration, not because nothing is waiting",
+                                inp.board_owner, inp.board_number)
+        return []
+    candidates = await asyncio.to_thread(
+        lambda: [str(n) for n in board.items_in_status(inp.pickup_status)]
+    )
+    if not candidates:
+        return []
+    # A CLOSED ISSUE IN THE PICKUP COLUMN IS A STALE CARD, NOT WORK (found live, 2026-08-04):
+    # fx-py-simple#1 merged, its card stayed in TO-DO (the board move had failed on that
+    # deployment), and the next tick RE-RAN the delivered ticket — a full agent pass spent to
+    # discover there was nothing to do, ending in "gh pr create: No commits between main and
+    # sdlc/1", parked ON_HOLD, holding the single-slot floor. Checked here, per candidate,
+    # through the tracker port: candidates are at most a handful and only exist on non-quiet
+    # ticks, so the quota cost is a few reads exactly when work is about to be spent.
+    #
+    # THE STALE CARD IS ALSO HEALED, best-effort: filtering alone would re-log the same skip
+    # every three minutes for ever, and the card's own issue already says where it belongs.
+    tracker = _tracker_for(project)
+    open_refs = await _open_refs(tracker, candidates)
+    for ref in [r for r in candidates if r not in open_refs]:
+        try:
+            healed = await asyncio.to_thread(_a_closed_card_in_the_queue, project, tracker, board,
+                                             ref)
+        except Exception:  # noqa: BLE001 — healing is a bonus; the filter already protected the money
+            activity.logger.info("the stale card #%s could not be healed", ref, exc_info=True)
+            healed = "it could not be moved — it will be skipped again next tick"
+        activity.logger.warning(
+            "BEEVERFORGE_STALE_PICKUP_CARD #%s is closed but sits in %r — not re-running it; %s",
+            ref, inp.pickup_status, healed)
+
+    # C-18'S HALF OF THE GATE (2026-08-13). The project-level gate at the top answered for the
+    # DEFAULT repository — it runs before the board is read, so no card and therefore no repo is
+    # known there. A qualified card belongs to ANOTHER repository, with its own manifest, its
+    # own toolchain and its own proof; admitting it on the default repo's proof was the gate
+    # standing open while looking closed (measured: a `web` card rode the `api` proof). Checked
+    # once per distinct foreign repo — candidates are a handful and only exist on non-quiet
+    # ticks, the same cost argument the stale-card check above already makes.
+    from beeverforge.runtime.card_repo import _is_default_repo
+
+    admitted: list[str] = []
+    held_by_repo: dict[str, str | None] = {}
+    for ref in open_refs:
+        # A CARD OF ANOTHER REPOSITORY OF THE PRODUCT IS NEVER STARTED HERE (#665): it reached
+        # the queue past the door (a drag on the vendor's own board), and is taken out of it
+        if await asyncio.to_thread(_taken_out_for_its_repository, project, tracker, board, ref):
+            continue
+        card_repo, _bare = _ref_repo(project, ref)
+        # _is_default_repo, not string equality: an ADO card arrives QUALIFIED
+        # (`Deskline/fx-ado`) while the registry row is bare (`fx-ado`) — equality read
+        # the default repo as foreign and held its cards on a proof that can never exist
+        if _is_default_repo(project, card_repo):
+            if not default_held:
+                admitted.append(ref)
+            continue
+        if card_repo not in held_by_repo:
+            held_by_repo[card_repo] = await _gate(card_repo)
+        key = _checkout_key(project, card_repo)
+        if held_by_repo[card_repo]:
+            # per-key marker so repos don't overwrite each other; the NOTIFIER is the
+            # project's — a composite key is not a registry name
+            announce_gate(key, held_by_repo[card_repo], registry_name=inp.project)
+            continue
+        clear_gate_announcement(key)
+        admitted.append(ref)
+    return admitted
+
+
+def _taken_out_for_its_repository(project, tracker, board, ref: str) -> bool:
+    """True when `ref`'s change belongs to another repository of the product (#665): the card is
+    refused through its door — out of the queue, back to a person, with the sentence naming where
+    it belongs — and no job starts. False when it belongs here, or when the card cannot be read:
+    an unreadable card is the job's to find out, as `_open_refs` already decides."""
+    from beeverforge.lifecycle import CardEvent, transition
+    from beeverforge.lifecycle.card import _here
+    from beeverforge.product.voice import card_belongs_elsewhere
+    from beeverforge.runtime.card_repo import runs_elsewhere
+
+    try:
+        home = runs_elsewhere(project, getattr(tracker.get_ticket(ref), "belongs_to", None))
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        activity.logger.info("the pickup could not read #%s for its repository (%s)", ref, exc)
+        return False
+    if not home:
+        return False
+    note = card_belongs_elsewhere("pickup", ref=ref, home=home, here=_here(project),
+                                  language=getattr(project, "language", None))
+    moved = transition(project, ref, CardEvent.REFUSED, by="the factory", why=note,
+                       facts={"note": note, "column": "todo", "before": "todo"},
+                       tracker=tracker, board=board)
+    activity.logger.warning("BEEVERFORGE_PICKUP_BELONGS_ELSEWHERE %s#%s belongs to %s — not "
+                            "started; %s", project.name, ref, home,
+                            moved.refused or "taken out of the queue")
+    return True
+
+
+async def _open_refs(tracker, candidates: list[str]) -> list[str]:
+    """Which candidates the tracker still considers OPEN.
+
+    Extracted so it can be exercised against the REAL `Ticket`. It could not be before: the check
+    was inline, and every test reached it through a double that invented a `state` attribute the
+    contract did not have — so the suite was green while the guard could not fire. A guard proven
+    against a fake carrying a field the product lacks proves the fake.
+
+    `state=None` (the provider was not asked) reads as OPEN, deliberately: a tracker that cannot
+    answer must not silently stop every pickup. The same reasoning applies to an unreadable
+    ticket — refusing on a read failure lets one flaky API call halt intake, which is the worse
+    of the two failures."""
+    out: list[str] = []
+    for ref in candidates:
+        try:
+            ticket = await asyncio.to_thread(tracker.get_ticket, ref)
+            state = str(getattr(ticket, "state", None) or "open").lower()
+        except Exception as exc:  # noqa: BLE001 — an unreadable ticket must not hold the queue
+            activity.logger.warning("could not read #%s while scanning TO-DO (%s) — picking it "
+                                    "up anyway; the job itself will find out", ref, exc)
+            out.append(ref)
+            continue
+        if state == "open":
+            out.append(ref)
+    return out
+
+
+#: The wall a JobWorkflow hits when nothing else stops it. Past the 14-day merge wait, because a
+#: job legitimately parked on a human is not a job that failed — this exists for the one that
+#: cannot progress at all, which no other bound in the system can see.
+JOB_EXECUTION_CEILING_DAYS = 21
+
+
+@activity.defn
+async def start_jobs(inp: StartJobsInput) -> list[str]:
+    """Start a JobWorkflow per ticket (id beeverforge-{project}-{issue}). Idempotent: a ticket
+    whose workflow is already running is skipped (WorkflowAlreadyStarted) — the card may
+    sit in TODO for a minute until the job moves it. Dragging a completed ticket back to
+    TODO intentionally re-runs it (a fresh run id — R8 keeps it from adopting old results)."""
+    from datetime import timedelta
+
+    from beeverforge.runtime.temporal import TASK_QUEUE
+
+    client = engine_client()
+    # STAMPED HERE, at launch, because the workflow body may not resolve it: reading the registry
+    # or the environment inside a workflow replays differently on a worker started with a different
+    # configuration (ADR-0037 D4). Resolved once for the whole batch — every issue in it belongs to
+    # the same project, and a per-issue resolve would be N registry reads for one answer.
+    # ONE REGISTRY READ, used twice: the image this deployment runs and the language this project
+    # speaks first (#124). Both are per-project facts an activity may look up and a workflow may
+    # not, which is why they ride on `JobParams` rather than being fetched later.
+    project = ProjectRegistry().get(inp.project)
+    image = _resolved_image(project, sandbox=inp.sandbox)
+    # THE BOX'S TRAITS, STAMPED HERE FOR THE SAME REASON AS THE IMAGE. The workflow asks whether
+    # its box is remote and idempotent, and may only ask the built-in table; an add-on's box is
+    # known on this side (`installed_box_traits` reads the entry points, which is I/O) and travels
+    # to the workflow as data — `JobParams.traits` says what happens when it is absent.
+    traits = installed_box_traits(inp.sandbox)
+    # THE THIRD DOOR, AND THE ONE AN UNATTENDED FACTORY USES (ADR-0049 D3). The poller starts
+    # durable jobs here; `start --durable` refused a box that bounds nothing and this did not, so
+    # the schedule and the button disagreed about the same job in the same box. Refused ONCE, with
+    # the reason, rather than per ticket: the answer is about the box, not about the card.
+    from beeverforge.adapters.sandbox.registry import durable_refusal
+
+    if why := durable_refusal(inp.sandbox):
+        activity.logger.warning("no job was started for %s — %s", inp.project, why)
+        raise ApplicationError(why, non_retryable=True)
+    started: list[str] = []
+    for issue in inp.issues:
+        try:
+            await client.start_workflow(
+                "JobWorkflow",
+                JobParams(project=inp.project, issue=issue, sandbox=inp.sandbox, image=image,
+                          language=str(getattr(project, "language", "") or ""), box=traits,
+                          adjust_passes=project.adjust_passes),
+                id=f"beeverforge-{inp.project}-{issue}",
+                task_queue=TASK_QUEUE,
+                # THE ONLY WORKFLOW WITHOUT A CEILING, and the only one that holds a floor. The
+                # poller, the product sweep and the tech-lead rounds all carry one for exactly
+                # this reason; a job that cannot make progress — a workflow-task failure loop
+                # after a deploy, an unregistered activity type — sat running for ever, counted
+                # as work by the rounds, holding the single slot.
+                #
+                # GENEROUS ON PURPOSE. A real job legitimately waits for a human: the merge gate
+                # is 14 days by default. This is not a deadline for the WORK, it is the wall a
+                # wedged workflow eventually hits, so it is set past the longest legitimate wait
+                # rather than near the longest agent pass.
+                execution_timeout=timedelta(days=JOB_EXECUTION_CEILING_DAYS),
+            )
+            started.append(issue)
+        except Exception as exc:  # already running for this ticket → correct no-op
+            if "AlreadyStarted" not in type(exc).__name__:
+                raise
+    activity.logger.info("poll started %s for %s", started, inp.project)
+    return started
+
+
+# --- the project's tech-lead coordinator (v0: advisory) --------------------------------
+def _do_coordinate(item: CoordinatorItem) -> dict:
+    """Reason as the project's tech lead over a parked decision and return a humanized briefing
+    + a recommended option. v0 is ADVISORY — it never acts; a human still decides. Also posts
+    the briefing on the ticket (a durable channel). Best-effort: {} on any trouble (the decision
+    still stands with its raw options)."""
+    import tempfile
+    from pathlib import Path
+
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.registry import judging_worktree
+    from beeverforge.contracts import parse_advice
+
+    opts = "\n".join(
+        f"- {o.get('key')}: {o.get('label')}"
+        + (f" — {o.get('consequence')}" if o.get("consequence") else "")
+        + (" (mechanically recommended)" if o.get("recommended") else "")
+        for o in item.options
+    ) or "- (no explicit options)"
+    situation = (
+        f"A **{item.kind or 'decision'}** on ticket #{item.issue} (project {item.project}) is "
+        f"PARKED and needs a human.\n\n"
+        f"Problem: {item.note or item.question}\n\n"
+        f"Question to the human: {item.question}\n\n"
+        + (f"Context: {item.context}\n\n" if item.context else "")
+        + f"Options offered:\n{opts}\n\n"
+        "Give your tech-lead briefing as the json block (summary, recommend <one option key>, "
+        "rationale, watch_outs)."
+    )
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-coordinator-"))
+    try:
+        res = _judge_for(item.project).advise(
+            sandbox=judging_worktree(_project_or_none(item.project), root=tmp),
+            workspace=Workspace(path=tmp, branch="main", base_branch="main"),
+            situation=situation,
+        )
+        advice = parse_advice(_sizer_result_text(res))
+    except Exception as exc:  # noqa: BLE001 — the decision still parks; it just parks unexplained
+        activity.logger.warning("could not read the coordinator's advice for %s (%s)",
+                                item.issue, str(exc)[:120])
+        advice = None
+    finally:
+        # `tmp` is the sandbox root for the advise call and is dead the moment it returns. Without
+        # this the worker — which never restarts — kept one directory per PARKED DECISION forever.
+        shutil.rmtree(tmp, ignore_errors=True)
+    if advice is None:
+        logs.announce(activity.logger, f"BEEVERFORGE_COORDINATOR: no parseable advice for "
+                                       f"{item.project}#{item.issue}", logging.WARNING)
+        return {}
+    try:  # post the humanized take on the ticket (durable, channel-agnostic)
+        tracker = _tracker_for(ProjectRegistry().get(item.project))
+        rec = next((o for o in item.options
+                    if str(o.get("key", "")).lower() == advice.recommend.lower()), None)
+        reclabel = rec.get("label") if rec else advice.recommend
+        body = (f"**Tech-lead take** — {advice.summary}\n\n"
+                f"**Recommends: `{advice.recommend}` · {reclabel}** — {advice.rationale}"
+                + (f"\n\n⚠️ Watch out: {advice.watch_outs}" if advice.watch_outs else ""))
+        tracker.comment(f"#{item.issue.lstrip('#')}", body)
+    except Exception:  # noqa: BLE001 — the comment is a bonus; the advice still signals back
+        activity.logger.warning("could not post the coordinator's advice on %s", item.issue)
+    return advice.model_dump()
+
+
+@activity.defn
+async def coordinator_advise(item: CoordinatorItem) -> dict:
+    """ADR-00XX (the coordinator): the tech lead's humanized briefing on a parked decision.
+    v0 advisory — returns {summary, recommend, rationale, watch_outs} (or {} if it can't opine)."""
+    return await _heartbeat_while(lambda: _do_coordinate(item),
+                                  f"coordinate {item.project}#{item.issue}")  # type: ignore[return-value]
+
+
+def _do_diagnose(inp: HoldSyncInput) -> bool:
+    """The tech lead on an IMPEDIMENT (ADR-0015): produce a HandOff and render it to BOTH surfaces
+    — a rich ticket comment (durable) and the channel (the voice).
+
+    PUBLISHING ONLY, SINCE C-23. Producing the diagnosis moved to `techlead/diagnosis.py`, because
+    this function was the ONLY way to get one: the tech-lead could explain a failure the moment it
+    happened and never again, and a human looking at a job that parked yesterday had nowhere to
+    ask. That is `beeverforge-tech-lead-layer-gap`, and it is why the `diagnose` action sat in the
+    catalog
+    as a row that refused.
+
+    THE TWO CALLERS PUBLISH DIFFERENTLY, which is why the split is here and not one layer up. This
+    path MUST post, because nobody is watching a job that just parked. An operator asking
+    `diagnose` from the panel must not: they are looking at the answer, and a duplicate comment per
+    question is how a ticket becomes unreadable.
+
+    Best-effort: returns False on any trouble — the raw [state] note from mark_needs_action still
+    stands, so the human is never left with nothing."""
+    from beeverforge.contracts import handoff_to_markdown, handoff_to_plain
+    from beeverforge.factory import notifier_for_project
+    from beeverforge.techlead import diagnosis
+
+    project = ProjectRegistry().get(inp.project)
+    tracker = _tracker_for(project)
+    # C-18 (the ref may carry the card's own repo) is the TRACKER's problem now: `ticket_url`
+    # locates a qualified or bare ref exactly as every other method does, so this no longer
+    # unpacks a repo and a number just to concatenate a vendor's URL shape by hand.
+    ref = str(inp.issue).strip()
+
+    ho = diagnosis.diagnose(project, issue=inp.issue, state=inp.state, note=inp.note,
+                            tracker=tracker)
+    if ho is None:
+        logs.announce(activity.logger, f"BEEVERFORGE_TECHLEAD: no parseable handoff for "
+                                       f"{inp.project}#{inp.issue}", logging.WARNING)
+        return False
+
+    posted = False
+    try:  # durable record on the ticket
+        tracker.comment(ref, handoff_to_markdown(ho, raw_note=inp.note))
+        posted = True
+    except Exception as exc:  # noqa: BLE001 — the channel below may still carry it
+        activity.logger.warning("the diagnosis never reached ticket %s (%s)", ref, str(exc)[:120])
+    try:  # the voice — this project's channel (Null when unconfigured → no-op locally)
+        # ASK THE TRACKER. This built a github.com URL by hand, so a Jira deployment's park
+        # alert — the one clickable line on a message that exists to get a human to act — sent
+        # them to an issue that does not exist there.
+        try:
+            link = tracker.ticket_url(ref)
+        except Exception as exc:  # noqa: BLE001 — a missing link must not lose the diagnosis
+            # Said out loud: the alert still goes, but WITHOUT the one line a human clicks, and a
+            # silent degradation here reads as "the platform does not link tickets".
+            activity.logger.warning("no ticket link for %s (%s)", ref, str(exc)[:120])
+            link = ""
+        notifier_for_project(project).notify(
+            message=handoff_to_plain(ho, ref=link), level="action_required")
+    except Exception:  # noqa: BLE001 — the ticket comment already carries the diagnosis
+        activity.logger.warning("the diagnosis never reached the channel for %s", ref)
+    return posted
+
+
+@activity.defn
+async def techlead_ask(inp: AskInput) -> dict:
+    """The tech-lead answers a free-text question — on the worker, with the worker's credentials.
+
+    Off the event loop for the same reason `_ask` documented before it moved here:
+    `conversation.answer` clones a repository, shells out to `gh` and runs an agent process."""
+    project = ProjectRegistry().get(inp.project)
+    answer = await asyncio.to_thread(_conversation_answer, project, inp.question,
+                                     tuple(inp.can or ()), inp.thread or "")
+    return {"text": answer.text, "suggestion": list(answer.suggestion or []),
+            "spend": dict(answer.spend or {})}
+
+
+def _conversation_answer(project, question: str, can: tuple[str, ...] = (), thread: str = ""):
+    from beeverforge.techlead import conversation
+
+    return conversation.answer(project, question, can=can, thread=thread)
+
+
+@activity.defn
+async def product_role_ask(inp: ProductAskInput) -> dict:
+    """COMPATIBILITY SHIM for a `ProductAskWorkflow` already in flight — remove after one release.
+
+    `product_ask` is gone (#266 slice 2): the panel's question and the conversation are one row,
+    `product_say`, answered by the one turn engine. But a workflow that scheduled THIS activity
+    before a deploy replays against the new worker, and an activity type the worker no longer
+    registers would leave that workflow retrying its task until somebody terminated it — with the
+    old panel process still awaiting its answer. So the type stays registered and answers the only
+    honest thing it can without being a second conversation: ask again. It runs no model and
+    records nothing; the engine is the one path that does."""
+    del inp  # what was asked is asked again, through the one row
+    return {"ok": False,
+            "error": "the product role's conversation moved while this was being answered — "
+                     "nothing was recorded; please ask again.",
+            "answer": {"ok": False, "error": "asked during an upgrade"}}
+
+
+@activity.defn
+async def product_role_break_down(inp: ProductBreakdownInput) -> list[dict]:
+    """Turn an accepted requirement into units of work — on the worker, where the agent runs.
+
+    ONE RESULT PER CARD, carried whole. `break_down` answers a LIST of `WriteResult`, and the
+    difference between "filed three" and "filed two, and the third already existed" is the whole
+    content of the sentence a client reads afterwards — a boolean here would throw it away."""
+    project = ProjectRegistry().get(inp.project)
+    # HEARTBEATING, like a turn (review of #390): the breakdown now judges each card it files —
+    # minutes of model calls — and a worker that dies mid-breakdown must be noticed at the
+    # heartbeat, not at the activity's ceiling
+    def _break(_abandoned=None):
+        return _product_break_down(project, inp.number, inp.actor, inp.asked_for,
+                                   conversation=inp.conversation, requester=inp.requester)
+
+    # A BREAKDOWN THAT FAILS IS TOLD BY THE WORKFLOW (`product_breakdown_did_not_finish`), for
+    # whatever ended it — this line is never reached by a worker that died
+    results = (await _turning(_break, f"breaking REQ-{inp.number} of {inp.project} into cards")
+               if activity.in_activity() else await asyncio.to_thread(_break))
+    await _tell_the_breakdown(project, inp, results)
+    await _keep_what_was_not_filed(project, inp, results)
+    # THE REFUSAL TRAVELS (#908): a field this dict does not name never reaches the panel, and
+    # there a front the module declined on purpose read as a failure — `""` is "nobody decided".
+    return [{"ok": bool(getattr(r, "ok", False)), "detail": str(getattr(r, "detail", "") or ""),
+             "ref": str(getattr(r, "ref", "") or ""), "url": str(getattr(r, "url", "") or ""),
+             "existed": bool(getattr(r, "existed", False)),
+             "nothing_to_build": bool(getattr(r, "nothing_to_build", False)),
+             "refusal": str(getattr(r, "refusal", "") or ""),
+             "waits_for_code": bool(getattr(r, "waits_for_code", False))}
+            for r in (results or [])]
+
+
+async def _keep_what_was_not_filed(project, inp: ProductBreakdownInput, results) -> None:
+    """The fronts this breakdown did not file, kept where the requirement is shown (#564) — over
+    what the requirement's last breakdown left out. NEVER RAISES: the cards are on the board
+    whether or not the ledger took it, and the log says it did not."""
+    from beeverforge.product import unfiled
+
+    try:
+        await asyncio.to_thread(unfiled.record, project, inp.number, results)
+    except Exception:  # noqa: BLE001 — the cards stand; only the record of what is missing failed
+        activity.logger.exception("BEEVERFORGE_PRODUCT_UNFILED_NOT_KEPT project=%s req=%s",
+                                  inp.project, inp.number)
+
+
+@activity.defn
+async def product_breakdown_did_not_finish(inp: ProductBreakdownInput) -> bool:
+    """The conversation that started a breakdown, told that it did not finish (#563, review of
+    #616). The breakdown's own activity tells it what it filed; but one that raised, a worker that
+    died, or a breakdown past its ceiling or its heartbeat never reaches that line, and on one
+    attempt the workflow just failed — the conversation heard "started" and then nothing. The
+    workflow runs this whenever the breakdown's activity failed, for whatever reason."""
+    project = ProjectRegistry().get(inp.project)
+    await _tell_the_breakdown(project, inp, None)
+    return True
+
+
+async def _tell_the_breakdown(project, inp: ProductBreakdownInput, results) -> None:
+    """What a breakdown filed, said in the conversation that started it (#563 slice 18b, ADR-0051
+    D18 item 3) — the sentence the turn used to answer with, now that the turn only starts it.
+    `results` None is a breakdown that raised. NEVER RAISES: the cards are on the board whether or
+    not the telling worked, and the door logs a telling it refused."""
+    if not inp.conversation:
+        return
+    from beeverforge.product.confirm import breakdown_told
+    from beeverforge.product.door import announce
+
+    try:
+        text = await asyncio.to_thread(breakdown_told, project, inp.number, results,
+                                       asked_for=inp.asked_for, language=inp.language or None)
+        # THE HAPPENING'S ID, so a retried telling is one item the conversation drops
+        run = activity.info().workflow_run_id if activity.in_activity() else ""
+        await announce(project, id=f"breakdown-{inp.project}-{inp.number}" + (f"-{run}" if run
+                                                                            else ""),
+                       conversation=inp.conversation, text=text, room=inp.room)
+    except Exception:  # noqa: BLE001 — the cards stand; only the telling failed, and says so
+        activity.logger.exception("BEEVERFORGE_PRODUCT_BREAKDOWN_UNTOLD project=%s req=%s "
+                                  "conversation=%s", inp.project, inp.number, inp.conversation)
+
+
+@activity.defn
+async def product_role_answer(inp: ProductAnswerInput) -> dict:
+    """Resolve a staged proposal by token — on the worker, where the agent runs.
+
+    THE OUTCOME TRAVELS BESIDE THE SENTENCE, never inferred from it. `answer_staged` names six
+    (`done`, `rejected`, `unauthorized`, `gone`, `replaced`, `expired`) and the caller maps them
+    onto a refusal code; telling them apart by comparing Portuguese prose is how a refusal gets
+    recorded as a decision — the reason the gate started returning a pair at all (C-33)."""
+    project = ProjectRegistry().get(inp.project)
+
+    def _run():
+        from beeverforge.product.confirm import answer_staged
+        from beeverforge.product.module import ProductModule
+
+        # BUILT HERE, WITH THE CALLER'S `via` — AND THE GATE IS TOLD TOO. The gate builds its own
+        # module when handed none, and that default said a chat vendor's name (`api` since #266
+        # slice 6); but the module's `via` covers
+        # only the module's writes, and the gate's own `may_act` kept its default, so a panel
+        # approval was stamped as a Slack one in the only record that says who authorised a
+        # change to a client's requirements, by the very call that had built the module right.
+        via = inp.via or "api"
+        return answer_staged(project, token=inp.token, approved=inp.approved, user=inp.actor,
+                             module=ProductModule(project, via=via), via=via,
+                             message_id=inp.message_id)
+
+    code, sentence = await asyncio.to_thread(_run)
+    return {"outcome": str(code or ""), "message": str(sentence or "")}
+
+
+@activity.defn
+async def product_role_queue(inp: ProductQueueInput) -> dict:
+    """Propose what should start next — on the worker, where the agent runs.
+
+    THE READINESS AND THE ORDERING TRAVEL SEPARATELY, because they are different kinds of claim:
+    the first is arithmetic over the board and is true whatever the model said, the second is the
+    judgement. Collapsing them would lose the answer the role most needs to be able to give —
+    *"nothing is ready; these eleven need acceptance criteria first"* — and turn it into a
+    confident list it invented."""
+    project = ProjectRegistry().get(inp.project)
+    state, proposal, error = await asyncio.to_thread(_product_queue_proposal, project, inp.limit)
+
+    def _dump(x):
+        return x.model_dump(mode="json") if hasattr(x, "model_dump") else x
+
+    return {"error": str(error or ""),
+            "readiness": _dump(state) if state is not None else None,
+            "proposal": _dump(proposal) if proposal is not None else None}
+
+
+#: The two card verbs this activity may run. A registry rather than a free string, for the reason
+#: every other registry here exists: an unknown verb must be refused by name, not silently do
+#: nothing while the caller reports success.
+_CARD_VERBS = ("refine", "align")
+
+
+@activity.defn
+async def product_role_card(inp: ProductCardInput) -> dict:
+    """`refine` or `align` one card — on the worker, where the agent runs.
+
+    The dict carries the module's `refusal` word (#908): the panel rebuilds the result from these
+    keys alone, and without it a card the module declined on purpose ("not yours") answered 500."""
+    from beeverforge.product.authoring import NOT_VALID
+
+    if inp.verb not in _CARD_VERBS:
+        return {"ok": False, "detail": f"unknown card verb {inp.verb!r} — this deployment does: "
+                                       f"{', '.join(_CARD_VERBS)}", "ref": "", "url": "",
+                "existed": False, "refusal": NOT_VALID}
+    project = ProjectRegistry().get(inp.project)
+    result = await asyncio.to_thread(_product_card_write, project, inp)
+    return {"ok": bool(getattr(result, "ok", False)),
+            "detail": str(getattr(result, "detail", "") or ""),
+            "ref": str(getattr(result, "ref", "") or ""),
+            "url": str(getattr(result, "url", "") or ""),
+            "existed": bool(getattr(result, "existed", False)),
+            "refusal": str(getattr(result, "refusal", "") or "")}
+
+
+def _product_card_write(project, inp: ProductCardInput):
+    from beeverforge.product import engine
+    from beeverforge.product.module import ProductModule
+
+    # RELEASED, LIKE A TURN'S (#369): each of these composes a view of the product under the
+    # repository cache, and a module nobody releases leaves it there until the sweep — two hours
+    # of views on the worker's perennial disk, one per call.
+    module = ProductModule(project, via="api")
+    try:
+        if inp.verb == "refine":
+            return module.refine(inp.number, actor=inp.actor)
+        return module.align_card(inp.number, requirement=inp.requirement, actor=inp.actor)
+    finally:
+        engine.release(module)
+
+
+@activity.defn
+async def product_role_baseline(inp: ProductBaselineInput) -> dict:
+    """The brownfield first pass — on the worker, where the agent runs and the docs repo is.
+
+    THE SENTENCE IS COMPOSED HERE for the same reason its neighbour's is: `voice.baseline_done`
+    runs the failure detail through `client_safe_detail` and DELIBERATELY DROPS THE PULL REQUEST
+    URL, and a caller that rebuilt the sentence from the raw fields would quietly undo both.
+
+    NO AUTHORISATION HERE. The row asked before dispatching — `baseline` is on the documented list
+    of verbs that write without checking, so a second check in this activity would either be
+    decoration or a second place for the answer to differ."""
+    project = ProjectRegistry().get(inp.project)
+
+    def _run():
+        from beeverforge.product.module import ProductModule
+        from beeverforge.product.voice import baseline_done
+
+        module = ProductModule(project, via=inp.via or "api")
+        cfg = getattr(project, "product", None)
+        lang = getattr(project, "language", None)
+        name = getattr(cfg, "agent_name", "") or ""
+        try:
+            result = module.baseline(areas=inp.areas)
+        except Exception as exc:  # noqa: BLE001 — a crash here must still reach the person
+            activity.logger.exception("the baseline pass crashed for %s", inp.project)
+            return {"ok": False, "existed": False, "url": "", "ref": "",
+                    "text": baseline_done(ok=False, detail=str(exc)[:200], language=lang,
+                                          agent_name=name)}
+        return {"ok": bool(result.ok), "existed": bool(result.existed),
+                "url": str(result.url or ""), "ref": str(result.ref or ""),
+                "text": baseline_done(ok=result.ok, url=result.url, detail=result.detail,
+                                      existed=result.existed, language=lang, agent_name=name)}
+
+    return await asyncio.to_thread(_run)
+
+
+@activity.defn
+async def product_role_needs_action(inp: ProductNeedsActionInput) -> dict:
+    """What is parked and whose problem it is — on the worker, where the agent runs.
+
+    THE SENTENCE IS COMPOSED HERE, not by the row, and that is not an accident of convenience:
+    `voice.needs_action_report` reads `review.mine()` and `review.handed_back()`, and a `Review`
+    that crossed the workflow boundary as JSON has values and no methods. Sending the text back
+    keeps ONE composer; rebuilding the object on the far side would be a second one, drifting from
+    the first the day somebody changes what counts as `mine`.
+
+    IT WRITES NOTHING — `review_needs_action` hardcodes `may_act=False` at both of its return
+    sites, so every decision is an observation. What it spends is model calls, one per parked
+    ticket, which is why it is here rather than in the caller's process."""
+    project = ProjectRegistry().get(inp.project)
+
+    def _run():
+        from beeverforge.product import engine
+        from beeverforge.product.module import ProductModule
+        from beeverforge.product.voice import needs_action_report
+
+        module = ProductModule(project, via=inp.via or "api")
+        try:
+            review, error = module.review_needs_action(limit=inp.limit)
+        finally:
+            engine.release(module)     # the review's view of the product goes with it (#369)
+        if review is None:
+            return None, "", str(error or "")
+        cfg = getattr(project, "product", None)
+        text = needs_action_report(review, language=getattr(project, "language", None),
+                                   agent_name=getattr(cfg, "agent_name", "") or "")
+        return review, text, ""
+
+    review, text, error = await asyncio.to_thread(_run)
+    if review is None:
+        # THE DIAGNOSIS STAYS ON THIS SIDE. It is loader/board prose written for an operator —
+        # English, with the client's own repo slug in it — and the caller turns this into a
+        # sentence saying the problem is ours.
+        activity.logger.warning("[%s] needs-action could not read the board: %s",
+                                inp.project, error[:400])
+        return {"ok": False, "error": error, "text": "", "decisions": []}
+
+    return {
+        "ok": True, "error": "", "text": text,
+        "mine": len(review.mine()), "theirs": len(review.handed_back()),
+        "decisions": [{"ticket": getattr(d.verdict, "ticket", None),
+                       "cause": str(getattr(d.verdict, "cause", "") or ""),
+                       "acted": bool(getattr(d, "acted", False))}
+                      for d in (getattr(review, "decisions", None) or ())],
+    }
+
+
+@activity.defn
+async def product_role_say(inp: ProductSayInput) -> dict:
+    """COMPATIBILITY SHIM for a `ProductSayWorkflow` already in flight — remove after one release.
+
+    The row no longer starts a workflow per message (#266 slice 3): every message goes through the
+    door onto its conversation's workflow, which takes one turn at a time (`conversation_turn`).
+    But a `ProductSayWorkflow` that scheduled THIS activity before a deploy replays against the new
+    worker, and an activity type the worker no longer registers would leave it retrying its task
+    until somebody terminated it. So the type stays registered and answers the only honest thing it
+    can without being a second way into the conversation: ask again. It runs no turn and records
+    nothing — `product_role_ask` did the same one slice earlier."""
+    del inp  # what was said is said again, through the door
+    return {"ok": False,
+            "error": "the product role's conversation moved while this was being answered — "
+                     "nothing was recorded; please ask again.",
+            "replies": []}
+
+
+# ── the conversation's turns (#266 slice 3, ADR-0051 D3–D6) ─────────────────────────────────────
+
+#: How often a running turn tells the engine it is alive. `conversation.HEARTBEAT` is how long the
+#: engine waits without hearing it before handing the turn to another worker.
+_TURN_PULSE = 5.0
+
+#: How long ONE stage signal may take before the turn stops telling (review of #398). A status
+#: signal is milliseconds on a healthy engine; one that takes longer than this is an engine the
+#: status is not worth waiting on. It bounds the tell only — the heartbeat never waits for a tell
+#: at all (`_turning`), so this can be any size without touching the turn's liveness.
+_TELL_WITHIN = 10.0
+
+
+class _Stages:
+    """WHAT THE TURN'S THREAD SAYS IT IS DOING, handed across to the activity's event loop (#395).
+
+    `say` is the turn's progress sink (`engine.turn(..., progress=)`), called on the turn's thread;
+    it composes the stage in the person's language (`voice.stage_text`) and hands it to the loop,
+    which is the only place a signal can be sent from. Only the LATEST stage is kept: two stages
+    said between two looks are one change, and the conversation is told the one that is true now.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, language: str | None) -> None:
+        self._loop = loop
+        self._language = language
+        self.latest: tuple[str, str] | None = None
+        self.told: tuple[str, str] | None = None
+        self.moved = asyncio.Event()
+
+    def say(self, stage: str, counts: dict) -> None:
+        from beeverforge.product.voice import stage_text
+
+        step = (stage, stage_text(stage, language=self._language, **counts))
+        self._loop.call_soon_threadsafe(self._arrive, step)
+
+    def _arrive(self, step: tuple[str, str]) -> None:
+        self.latest = step
+        self.moved.set()
+
+
+async def _tell_the_conversation(turn: str, stage: str, words: str) -> None:
+    """The stage, signalled to the conversation workflow that is running this turn (#395) — the
+    run that scheduled it, so a stage never lands in a conversation that does not know the turn.
+    With the client this worker already holds (`engine_client`)."""
+    info = activity.info()
+    handle = engine_client().get_workflow_handle(info.workflow_id, run_id=info.workflow_run_id)
+    await handle.signal("progress", TurnProgress(turn=turn, stage=stage, words=words))
+
+
+async def _turning(fn, detail: str, *, stages: _Stages | None = None, tell=None):
+    """Run a turn in a thread while heartbeating every few seconds — a worker that dies mid-turn is
+    noticed in `conversation.HEARTBEAT`, not at the turn's fifteen-minute ceiling — and, when the
+    activity is cancelled, tell the thread, so a turn still waiting for a slot gives up waiting.
+
+    `_heartbeat_while` beats every thirty seconds, which is right for a four-hour pass and is the
+    whole of a turn's bound here; this is its short-lived sibling.
+
+    AND IT SAYS WHAT THE TURN IS DOING (#395). The turn used to be a black box from its receipt to
+    its answer — minutes, on a live deployment, of a model chain with ~0 s between its calls — and
+    the heartbeat said the same sentence throughout. Now each stage the turn reports (`stages`) is
+    passed to `tell` the moment it changes — woken by it, not at the next pulse — and appended to
+    the heartbeat detail, so the engine's own view of the activity says it too. A `tell` that
+    fails is logged once and not tried again for this turn: a status is worth less than the
+    answer it sits beside, and a turn is never failed, slowed or retried for one.
+
+    THE HEARTBEAT NEVER WAITS FOR A TELL (review of #398). The first cut awaited `tell` in this
+    same loop, before the heartbeat and with no timeout: its `except` covered a signal that FAILS,
+    not one that is SLOW, so a signal that took eight seconds made the gap between two beats eight
+    seconds — measured — and one that took thirty let `conversation.HEARTBEAT` pass, and the engine
+    handed the turn to another worker, which RAN IT AGAIN (and, with #397, answered again and
+    replaced the answer). A status call could re-run the turn it was describing. Now the loop
+    beats FIRST and hands the tell to a task it never awaits; the only thing the loop awaits is
+    `asyncio.wait(..., timeout=_TURN_PULSE)`, so the gap between two beats is bounded by
+    `_TURN_PULSE` whatever the tell does — provably, not by a timeout that happens to be shorter
+    than the heartbeat. At most ONE tell is in flight: a stage that moves while one is out is told
+    when it lands (the loop is woken by it, and `latest != told` again). The tell itself is bounded
+    by `_TELL_WITHIN`, and one that times out is a tell that failed — logged once, no more tells
+    for this turn. A tell still out when the turn ends is cancelled: the answer supersedes it."""
+    import threading
+
+    abandoned = threading.Event()
+    work = asyncio.create_task(asyncio.to_thread(fn, abandoned))
+    telling = stages is not None and tell is not None
+    out: asyncio.Future | None = None   # the one tell in flight, never awaited by this loop
+    try:
+        while not work.done():
+            if out is not None and out.done():
+                failed = out.exception() if not out.cancelled() else None
+                out = None
+                if failed is not None:  # a status must never cost the turn
+                    telling = False
+                    activity.logger.info("the turn's stage could not be told to its "
+                                         "conversation (%s) — the turn goes on untold",
+                                         (str(failed) or type(failed).__name__)[:200])
+            fresh = (telling and out is None and stages.latest is not None
+                     and stages.latest != stages.told)
+            if fresh:
+                stages.told = stages.latest
+            told = stages.told[1] if stages is not None and stages.told else ""
+            activity.heartbeat(f"{detail} — {told}" if told else detail)
+            if fresh:
+                out = asyncio.ensure_future(asyncio.wait_for(tell(*stages.told),
+                                                             timeout=_TELL_WITHIN))
+            waiting = {work}
+            moved = None
+            if telling:
+                stages.moved.clear()
+                moved = asyncio.ensure_future(stages.moved.wait())
+                waiting.add(moved)
+            if out is not None:
+                waiting.add(out)
+            await asyncio.wait(waiting, timeout=_TURN_PULSE,
+                               return_when=asyncio.FIRST_COMPLETED)
+            if moved is not None and not moved.done():
+                moved.cancel()
+        return work.result()
+    finally:
+        if out is not None and not out.done():
+            out.cancel()
+        elif out is not None and not out.cancelled():
+            out.exception()   # a tell that failed as the turn ended: seen, not logged as unread
+        if not work.done():
+            abandoned.set()
+            work.cancel()
+
+
+@activity.defn
+async def conversation_turn(inp: TurnInput) -> dict:
+    """One turn of a conversation, on the worker — the ONE turn engine, inside the ceiling.
+
+    THE CEILING IS TAKEN HERE, before the engine is asked anything (`product/cap.py`, ADR-0051 D4):
+    a slot of the turn's PRODUCT and one of the deployment, held for the turn and given back however
+    it ends. A turn waiting for a slot is still a turn of its conversation — the conversation shows
+    it busy, and past the bound it is handed off like any long turn.
+
+    WHAT COMES BACK is the turn's replies without its receipts: the door acknowledged the message
+    the moment it arrived, so a receipt said again beside the answer would say nothing new."""
+    project = ProjectRegistry().get(inp.project)
+    again = _again()
+    # WHAT THE TURN IS DOING, told to its conversation while it works (#395) — in the language the
+    # person wrote in, the project's when the door did not say
+    stages = _Stages(asyncio.get_running_loop(),
+                     inp.language or getattr(project, "language", None) or None)
+
+    async def _tell(stage: str, words: str) -> None:
+        await _tell_the_conversation(inp.id, stage, words)
+
+    replies = await _turning(lambda abandoned: _conversation_turn(project, inp,
+                                                                  abandoned=abandoned,
+                                                                  again=again,
+                                                                  progress=stages.say),
+                             f"the product role's turn in {inp.conversation}",
+                             stages=stages, tell=_tell)
+    return {"replies": [r.model_dump(mode="json") for r in replies if r.kind != "receipt"]}
+
+
+def _again() -> bool:
+    """Whether this activity is running AGAIN — an attempt after one that did not finish (#394).
+    Read on the activity's own task, where its context is; False outside an activity."""
+    try:
+        return activity.info().attempt > 1
+    except RuntimeError:
+        return False
+
+
+def _said(inp) -> dict:
+    """The message's arrival moment, as `Message.at` takes it (#394) — none for an input that
+    carries none (admitted before it existed), and the message stamps the worker's clock."""
+    return {"at": inp.at} if getattr(inp, "at", "") else {}
+
+
+def _conversation_turn(project, inp: TurnInput, *, abandoned=None, again: bool = False,
+                       progress=None):
+    """The turn, as the engine's neutral `Message`, with the module it answers with.
+
+    THE TRANSPORT TRAVELS TO THE GATE. `inp.via` is what the door was told (`panel`, `cli`, the
+    chat adapter's own); it builds the module AND reaches every gate the turn meets, so the release
+    behind a "funcionou o #12" records where the approver spoke from. An empty one — a caller that
+    did not say — is the worker's own name for itself, `api`, and never the channel's.
+
+    `inp.id` IS THE MESSAGE'S OWN ID — the last of the messages this turn answers — so every reply
+    names what it answers, and the conversation marks each of `inp.ids` answered by it.
+
+    Imported inside the call, like every other agent path here: `beeverforge.product.module` pulls
+    in the corpus loader and the authoring stack, and a worker that cannot import them must still
+    start and say so per-activity rather than fail at registration.
+
+    `progress` is the sink the turn's stages are told to (#395, `_Stages.say`); None tells
+    nobody."""
+    from beeverforge.product.cap import ceiling
+    from beeverforge.product.engine import Message, turn
+    from beeverforge.product.module import ProductModule
+
+    via = inp.via or "api"
+    name = getattr(project, "name", "") or ""
+    with ceiling().hold(inp.product, abandoned=abandoned):
+        return turn(project, Message(id=inp.id, project=name, conversation=inp.conversation,
+                                     room=inp.room, speaker=inp.speaker, text=inp.text,
+                                     in_reply_to=inp.in_reply_to, source=inp.source,
+                                     fingerprint=inp.fingerprint, via=via,
+                                     context=dict(inp.context),
+                                     attachments=tuple(dict(a) for a in inp.attachments),
+                                     **_said(inp)),
+                    module=ProductModule(project, via=via), again=again, progress=progress)
+
+
+@activity.defn
+async def conversation_fast(inp: TurnInput) -> dict:
+    """A message that only asks to be shown something, answered beside the turn (ADR-0051 D6).
+
+    NO CEILING: the fast path spends no model call (`engine.FAST`), and the ceiling bounds model
+    calls. What comes back is shaped like `conversation_turn`'s."""
+    project = ProjectRegistry().get(inp.project)
+    replies = await asyncio.to_thread(_conversation_fast, project, inp, again=_again())
+    return {"replies": [r.model_dump(mode="json") for r in replies if r.kind != "receipt"]}
+
+
+def _conversation_fast(project, inp: TurnInput, *, again: bool = False):
+    from beeverforge.product.engine import Message, fast
+    from beeverforge.product.module import ProductModule
+
+    via = inp.via or "api"
+    name = getattr(project, "name", "") or ""
+    return fast(project, Message(id=inp.id, project=name, conversation=inp.conversation,
+                                 room=inp.room, speaker=inp.speaker, text=inp.text,
+                                 in_reply_to=inp.in_reply_to, source=inp.source, via=via,
+                                 context=dict(inp.context),
+                                 attachments=tuple(dict(a) for a in inp.attachments),
+                                 **_said(inp)),
+                module=ProductModule(project, via=via), again=again)
+
+
+@activity.defn
+async def conversation_overheard(inp: OverheardInput) -> dict:
+    """A message in a group that was NOT addressed to the role, KEPT — and nothing more (#266
+    slice 6, ADR-0051 D14, decision 3).
+
+    Recorded in the product's memory under its conversation, marked as not addressed to the role,
+    so the explicit recall finds it (`product_recall`) and no turn's prompt ever reads it
+    (`transcript.recent` and `recall.recall` leave it out unless asked). No model, no ceiling slot,
+    no reply — this is not a turn. A record that did not land RAISES, so the conversation retries
+    it: kept and searchable is the promise."""
+    from beeverforge.memory import transcript
+
+    project = ProjectRegistry().get(inp.project)
+    ts = await asyncio.to_thread(
+        transcript.record, project, thread=inp.conversation, role="person", text=inp.text,
+        actor=inp.speaker, channel=inp.room, message_id=inp.id, in_reply_to=inp.in_reply_to,
+        addressed=False, at=inp.at)
+    if not ts:
+        raise RuntimeError(f"the message {inp.id} not addressed to the role was not recorded")
+    return {"kept": True}
+
+
+@activity.defn
+async def conversation_report(inp: ReportInput) -> dict:
+    """The answer of a turn that outlived its bound, BACK THROUGH THE DOOR (ADR-0051 D6).
+
+    An internal event — the replies, already recorded by the engine that produced them — sent to
+    the conversation through the door's own path for the factory (`door.report`; `receive` refuses
+    an event since #267 slice 3), with the client this worker already holds. A refusal RAISES, so
+    the report is retried; the event's id is derived from the turn's, so a retry that did land
+    the first time is one event, not two."""
+    from beeverforge.product import door
+    from beeverforge.product.engine import Reply
+
+    project = ProjectRegistry().get(inp.project)
+    replies = tuple(Reply.model_validate(r) for r in inp.replies)
+    ack = await door.report(project, id=inp.id, conversation=inp.conversation, room=inp.room,
+                            in_reply_to=inp.in_reply_to, replies=replies,
+                            client=engine_client())
+    if not ack.accepted:
+        raise RuntimeError(f"the door refused the late answer: {ack.reason}")
+    return {"accepted": True, "duplicate": ack.duplicate}
+
+
+def _product_queue_proposal(project, limit: int):
+    from beeverforge.product import engine
+    from beeverforge.product.module import ProductModule
+
+    module = ProductModule(project, via="api")
+    try:
+        return module.propose_queue(limit=limit)
+    finally:
+        engine.release(module)     # its view of the product goes with it (#369)
+
+
+def _product_break_down(project, number: int, actor: str, asked_for: bool, *,
+                        conversation: str = "", requester: str = ""):
+    from beeverforge.product.module import ProductModule
+
+    # WHAT THE DOOR SAID, handed on as it arrived: the workflow is started by an acceptance
+    # (`asked_for=False`) and by the `product_break_down` row (`True`), and only the module may
+    # decide what the difference means (#182). WHERE IT WAS ASKED too, when a conversation started
+    # it: the delivery loop is announced there, whichever door started the breakdown (D18 item 1)
+    return ProductModule(project, via="api").break_down(number, actor=actor, asked_for=asked_for,
+                                                        conversation=conversation,
+                                                        requester=requester)
+
+
+@activity.defn
+async def diagnose_impediment(inp: HoldSyncInput) -> bool:
+    """ADR-0015 — the tech lead's diagnosis of a parked impediment, posted to the ticket + Slack.
+    Best-effort and bounded; the raw note stands if it can't opine. Worker (agent + gh + creds)."""
+    return await _heartbeat_while(lambda: _do_diagnose(inp),
+                                  f"diagnose {inp.project}#{inp.issue}")  # type: ignore[return-value]
+
+
+def _metrics_sink():
+    """The metrics sink this deployment configured (observability/registry.py).
+
+    Which one is a REGISTRY decision now, not a conditional here: `BEEVERFORGE_METRICS_SINK` names
+    it
+    outright, and absent that the answer is inferred exactly as it always was — DynamoDB when
+    `BEEVERFORGE_METRICS_TABLE` is set by terraform, else Null. Still one place, so the activity
+    stays
+    simple and tests can monkeypatch it; the difference is that a deployment can now say `sqlite`
+    without a code change, which is what the local distribution needs.
+
+    THE WORKER'S NAME FOR THE DOOR, AND NOBODY ELSE'S (#178). Six sites of the attended half —
+    the transcript, the messages, the people store, the chat's spend, the product role's — reached
+    across the runtime for THIS wrapper, and this module imports `temporalio`: so on an install
+    made without the `runtime` extra they recorded nothing, and `beeverforge people invite`, the
+    panel's own login on a local-identity deployment, answered `No module named 'temporalio'`.
+    They call the door itself now. This stays a function that asks the door AT CALL TIME rather
+    than a name bound to it at import, so one patch on the door (`tests/the_sink_door.py`) reaches
+    the activities and the attended half alike — two patch points is how the tests for those six
+    sites came to patch a name their subjects could only reach by paying for the engine's client."""
+    from beeverforge.observability.registry import deployment_metrics_sink
+
+    return deployment_metrics_sink()
+
+
+@activity.defn
+async def record_job_metrics(inp: JobMetricsInput) -> None:
+    """Persist per-invocation + job-summary cost telemetry (observability.metrics → the panel's
+    cost dashboard: spend by period / model / harness). One item per agent run + one job summary.
+    BEST-EFFORT: a telemetry write must NEVER affect the job (the sink already swallows write
+    errors; this also shields the build/serialize). Worker (has AWS creds +
+    BEEVERFORGE_METRICS_TABLE)."""
+    # THE ROWS THEMSELVES ARE `observability/job_record.record_job`, because the ATTENDED driver
+    # has to write exactly these and used to write none at all (see that module). What stays here
+    # is this boundary's own business: the thread offload and the activity-level swallow.
+    from beeverforge.observability.job_record import record_job
+
+    def _do() -> None:
+        record_job(project=inp.project, issue=inp.issue, ts=inp.ts, state=inp.state,
+                   title=inp.title, wall_s=inp.wall_s, total_cost_usd=inp.total_cost_usd,
+                   pr_url=inp.pr_url, knowledge=inp.knowledge, agent_runs=inp.agent_runs)
+
+    try:
+        await asyncio.to_thread(_do)
+    except Exception:  # noqa: BLE001 — telemetry is additive; never let it fail the job
+        activity.logger.warning("record_job_metrics failed for %s#%s", inp.project, inp.issue)
+
+
+@activity.defn
+async def notify_coordinator(item: CoordinatorItem) -> None:
+    """SignalWithStart the project's ALWAYS-ALIVE coordinator with a parked decision — starts it
+    if not running (idempotent by the deterministic id beeverforge-coordinator-<project>), else just
+    delivers the signal. Best-effort: a coordinator hiccup must never block the parked job."""
+    from beeverforge.runtime.temporal import TASK_QUEUE
+
+    # ASKED OUTSIDE THE `try`, deliberately. What the `try` forgives is the ENGINE — a coordinator
+    # that cannot be reached must not block the parked job. The seam never fails for the engine's
+    # reasons, only for ours (not an activity, or a `def` one), and that sentence must not be
+    # reduced to "notify_coordinator failed" in a log nobody reads.
+    client = engine_client()
+    try:
+        await client.start_workflow(
+            "CoordinatorWorkflow", CoordinatorInput(project=item.project),
+            id=f"beeverforge-coordinator-{item.project}", task_queue=TASK_QUEUE,
+            start_signal="on_decision", start_signal_args=[item],
+        )
+    except Exception:  # noqa: BLE001 — the decision is already visible; advice is additive
+        activity.logger.warning("notify_coordinator failed for %s#%s", item.project, item.issue)
+
+
+@activity.defn
+async def notify_coordinator_say(inp: CoordinatorSayInput) -> None:
+    """SignalWithStart the project's coordinator with a narrated lifecycle update — a panel toast
+    AND the project's Slack channel, so the tech-lead voices the whole lifecycle (ADR-0015).
+
+    NEEDS_ACTION IS SENT HERE, not left to the diagnosis. It used to be skipped to avoid a
+    double-send, on the reasoning that `diagnose_impediment` would post the full HandOff — which
+    made the ONLY alert for a parked job a side effect of an expensive, failure-prone operation
+    whose failure is deliberately swallowed. On 2026-07-27 that diagnosis could not run (its agent
+    could not authenticate and its GitHub reads were throttled), so #478 parked and the channel
+    stayed silent for eighteen hours while the floor was held and nothing else ran.
+
+    An alert that depends on a model call and a repo clone is not an alert. This one needs neither:
+    the ticket number, the reason and what to do. The diagnosis still follows when it can, and reads
+    as the detail on an alert people have already seen rather than as the first they hear of it.
+
+    `deploy` stays skipped — `notify_deploy` already speaks it."""
+    from beeverforge.runtime.temporal import TASK_QUEUE
+
+    client = engine_client()  # outside the `try`, for `notify_coordinator`'s reason
+    try:
+        await client.start_workflow(
+            "CoordinatorWorkflow", CoordinatorInput(project=inp.project),
+            id=f"beeverforge-coordinator-{inp.project}", task_queue=TASK_QUEUE,
+            start_signal="say", start_signal_args=[inp.text, inp.kind],
+        )
+    except Exception:  # noqa: BLE001
+        activity.logger.warning("coordinator say failed for %s", inp.project)
+    if inp.kind in ("pickup", "merge", "needs_action"):  # the tech-lead's voice in Slack
+        try:
+
+            from beeverforge.factory import notifier_for_project
+
+            project = ProjectRegistry().get(inp.project)
+            msg = inp.text  # e.g. "▶ Picking up #425" — enrich with the TITLE so it reads on mobile
+            m = _ref_in(inp.text)
+            if m:
+                try:
+                    title = _tracker_for(project).get_ticket(m).title
+                    if title:
+                        msg = f"{inp.text} — {title}"
+                except Exception:  # noqa: BLE001 — the title is a bonus; fall back to the number
+                    activity.logger.debug("no title for %s; announcing the number alone",
+                                          inp.text[:40])
+            level = "warning" if inp.kind == "needs_action" else "info"
+            # `about` IS THE WHOLE FIX AND IT GOES THROUGH THE PROTOCOL. This message names a
+            # ticket in prose and asks for an answer; without telling the provider WHICH ticket,
+            # a reply in the alert's own thread — "skip", the verb this very alert asks for —
+            # resolves to nothing, because the number lives only in text the parser never sees.
+            #
+            # Declared here and LINKED by the provider, rather than the core reaching into Slack
+            # to register a thread id: the core does not know what a thread is, and a test enforces
+            # that it never learns (test_provider_seams). A provider with no message identity
+            # ignores `about` and the caller degrades to requiring the number typed out.
+            about = m or ""
+            await asyncio.to_thread(
+                lambda: notifier_for_project(project).notify(
+                    message=msg, level=level, about=about))
+        except Exception:  # noqa: BLE001 — the panel toast already fired; Slack is additive
+            activity.logger.warning("coordinator say -> the project's notifier failed for %s",
+                                    inp.project)
+
+
+#: A ticket ref as it appears in a sentence the platform wrote — `#425`, `DAR-3`, `CONT-412`,
+#: or `owner/name#12`. Anchored to a word boundary so prose around it does not bleed in.
+_REF_IN_TEXT = _re_module.compile(
+    r"(?:(?<=\s)|^)("
+    r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#[A-Za-z0-9]+"   # owner/name#12
+    r"|#\d+"                                                                # #425
+    r"|[A-Za-z][A-Za-z0-9]*-\d+"                                            # DAR-3, CONT-412
+    r")\b"
+)
+
+
+def _ref_in(text: str) -> str:
+    r"""The ticket this sentence is about, or "".
+
+    THIS WAS `re.search(r"#(\d+)")`. On a Jira or Azure DevOps deployment — refs like `CONT-412`
+    — it never matched, so `about` was always empty and the needs-action alert arrived with no
+    ticket identity attached. The comment beside `about` already says what that costs: "a reply in
+    the alert's own thread — `skip`, the verb this very alert asks for — resolves to nothing".
+
+    So the escalation worked and its executable option was not executable from where it was
+    offered: the letter of the invariant kept, the spirit broken, and only on the trackers we do
+    not run ourselves. Same class as #69, which this codebase fixed in `techlead_watch` and left
+    here.
+
+    The `#` is stripped from a bare numeric ref because that is what every tracker method takes."""
+    m = _REF_IN_TEXT.search(f" {text or ''}")
+    return m.group(1).lstrip("#") if m else ""
+
+
+def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
+    """The Knowledge Pipeline (§11), post-merge: regenerate the module map from the base branch's
+    NEW state and publish it into the project's CONTEXT repository (D-2/D-3 — never the client's
+    own source repo). Returns a short outcome word for the log — "off" / "no-repo" /
+    "no-context" / "unchanged" / "published" / "failed".
+
+    Opt-in (`manifest.knowledge_map`) and best-effort throughout: this runs AFTER the ticket has
+    merged, so nothing it does may fail the job or hold the floor. The two properties that make
+    it safe to run on every merge:
+
+    - **It converges.** The bundle is built from commit X and published as a NEW commit, so the
+      provenance stamps always differ. `write_bundle` compares the DERIVED content instead and
+      writes nothing when the sources are unchanged, so a refresh triggered by the previous
+      refresh is a no-op instead of an endless commit chain (§22 D-5).
+    - **It doesn't disturb the client.** Publishing goes into the context repository the platform
+      itself created — never the client's `main` — so it fires no deploy and puts no client PR
+      behind (see `beeverforge.knowledge.pipeline`).
+
+    "no-context": the project has no `product.docs_repo` — never onboarded with a context
+    repository, or onboarded before one existed. A real, legitimate state (the doctor already
+    treats a missing context repo as a PASS-with-note, not a FAIL) — checked FIRST, before the
+    source repo is even resolved, so a never-onboarded project doesn't pay for a clone it can't
+    use, the same way the source-repo check below short-circuits before the source is synced.
+    """
+    from datetime import UTC, datetime
+
+    from beeverforge.adapters.forge.registry import clone_url_for
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+    from beeverforge.knowledge import build_bundle, write_bundle
+    from beeverforge.knowledge.bundle import BUNDLE_DIRNAME, MANIFEST_FILE, MODULES_FILE
+    from beeverforge.knowledge.pipeline import (
+        discard_fetched_bundle,
+        fetch_published_bundle,
+        okf_subpath,
+        publish_bundle,
+    )
+    from beeverforge.loader import load_manifest
+    from beeverforge.runtime.repo_cache import RepoCache
+
+    project = ProjectRegistry().get(inp.project)
+
+    docs_repo = (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+    if not docs_repo:
+        return "no-context"
+    # A PRODUCT THAT STARTED BEFORE ITS CODE (#992) has no code to map — "no-repo", before a
+    # clone: a local row names its own name as its `repo` whether or not a repository is behind it
+    from beeverforge.contracts.project import before_its_code
+
+    if before_its_code(project):
+        return "no-repo"
+
+    # SYNC BEFORE READING THE MANIFEST. `project.repo_path` is a REGISTRY value — on Fargate it is
+    # where the entrypoint clones to; on the WORKER it names no real directory at all. Loading the
+    # manifest from it raises "no manifest at /work/<project>/.beeverforge/project.yaml" before
+    # this ever reaches a checkout, which is why no bundle was ever published: the refresh died on
+    # its first line every time, silently, because the caller treats a failure here as best-effort.
+    #
+    # This is the SAME bug `_do_preflight` above already carries a comment about. It was fixed
+    # there and repeated here.
+    repo = (project.forge.repo if project.forge else None) or project.tracker.repo or ""
+    token = forge_token_for(project) or deployment_forge_token(project) or ""
+    if not repo:
+        return "no-repo"
+    url = clone_url_for(project, repo, token=token)
+    # THE SAME RUNTIME CREDENTIAL AS THE SOURCE URL ABOVE, DELIBERATELY NOT
+    # `onboard.py::context_clone_url` — that resolver's own docstring warns the onboarding
+    # credential and the runtime credential can resolve to DIFFERENT credentials with different
+    # repository visibility on some deployments. This activity is a runtime actor like the rest
+    # of the job path, not onboarding, so it must match `product/module.py`'s runtime pattern.
+    context_url = clone_url_for(project, docs_repo, token=token)
+    subpath = okf_subpath(repo)
+    # base_branch isn't known until the manifest loads, so the first sync asks for the registry's
+    # declared base and otherwise for NOTHING, letting the clone land where the repository points
+    # (#162). The comment above is right that this was `_do_preflight`'s bug repeated here — and
+    # the repetition included the `"main"`, which is not a guess costing a fetch: on a `master`
+    # repository `--branch main` names nothing and the refresh dies on its first line, which is
+    # exactly the silence the comment above describes.
+    from beeverforge.loader import load_manifest_base_branch
+    from beeverforge.runtime.repo_cache import current_branch
+
+    repo_path = RepoCache().sync(project.name, url,
+                                 load_manifest_base_branch(project, default=""))
+    if repo_path is None:
+        return "no-repo"
+
+    manifest = load_manifest(project.model_copy(update={"repo_path": str(repo_path)}))
+    if not manifest.knowledge_map:
+        return "off"
+    declared = manifest.declared_base_branch     # the FILE's word, never the schema default
+    if declared and declared != current_branch(repo_path):
+        repo_path = RepoCache().sync(project.name, url, declared)
+        if repo_path is None:
+            return "no-repo"
+
+    published: Path | None = None
+    try:
+        # Bring the ALREADY-published bundle into the tree first, so `write_bundle` compares
+        # against what is live. Without this a fresh clone has no bundle, every refresh looks
+        # like a change, and the convergence guarantee above evaporates.
+        published = fetch_published_bundle(context_url, subpath=subpath)
+        dest = Path(repo_path) / BUNDLE_DIRNAME
+        shutil.rmtree(dest, ignore_errors=True)
+        if published is not None:
+            # ONLY THE MAP'S TWO FILES BEFORE THE BUILD. `knowledge/` sits inside the tree the map
+            # surveys, and the extension survey excludes exactly these two by name — so anything
+            # else copied here first (the OKF's `okf.yaml`, `concepts/*.md`, `index.md`) was counted
+            # as unread files OF THE CLIENT'S REPOSITORY, a self-report polluted by our own output
+            # since the concepts moved in beside the map. And it broke convergence: a renewal that
+            # writes `index.md` made the next build see one more `.md`, differ, and publish again,
+            # forever. Measured 2026-09-04 by the renewal's own guard.
+            dest.mkdir(parents=True, exist_ok=True)
+            for name in (MODULES_FILE, MANIFEST_FILE):
+                if (published / name).is_file():
+                    shutil.copy2(published / name, dest / name)
+
+        head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30, check=False)
+        commit = head.stdout.strip() if head.returncode == 0 else ""
+        now = datetime.now(UTC).isoformat()
+        bundle = build_bundle(Path(repo_path), commit=commit, generated_at=now)
+        map_changed = write_bundle(bundle, Path(repo_path)) is not None
+        # THE CONCEPTS MOVE WITH THE CODE (ADR-0045; `onboarding/renew.py`). The map above is
+        # regenerated for free; a concept that the checker shows no longer matches this checkout is
+        # re-authored here, under the project's budget, with the backfill's own harness — and the
+        # merge is the moment: the checkout is already here and the change is already known. The
+        # scheduled tick reaches this same line, so a change made outside the factory is caught by
+        # the next tick rather than never. Best-effort like everything after the merge.
+        from beeverforge.onboarding.renew import renew_concepts
+
+        if published is not None:
+            # NOW the rest of what is live — the concepts, their manifest, the index — beside the
+            # map, so the renewal reads what is published and the publish carries everything.
+            for entry in published.iterdir():
+                if entry.name in (MODULES_FILE, MANIFEST_FILE):
+                    continue
+                if entry.is_dir():
+                    shutil.copytree(entry, dest / entry.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(entry, dest / entry.name)
+        renewal = renew_concepts(project, dest, Path(repo_path), commit=commit, generated_at=now)
+        activity.logger.info("concept renewal for %s: %s", inp.project, renewal.summary())
+        # WHAT THE PRODUCT ROLE ASKED TO HAVE DESCRIBED (ADR-0052 D22, `knowledge/requests.py`):
+        # code it read to answer somebody and no concept covered. Taken HERE, at the pipeline's own
+        # entry, and written by the pipeline — the role never writes a bundle — as `no-concept`
+        # gaps merged by key into the manifest this round publishes. Only into a bundle that was
+        # published: the request was judged against one, and a source with none owes a backfill.
+        from beeverforge.knowledge import requests as asked
+        from beeverforge.knowledge.gaps import record_in_bundle
+
+        inbox = asked.inbox_for(project)
+        wanted = asked.pending(inbox, repo) if published is not None else []
+        recorded = record_in_bundle(dest, wanted) if wanted else []
+        if recorded:
+            activity.logger.info("BEEVERFORGE_KNOWLEDGE_REQUESTS_RECORDED project=%s repo=%s "
+                                 "gaps=%d", inp.project, repo, len(recorded))
+        if not map_changed and not renewal.wrote and not recorded:
+            # nothing new among them: each is in the manifest already, or described since
+            asked.taken(inbox, repo, [g.key for g in wanted], at=now)
+            return "unchanged"
+        from beeverforge.credentials import bot_identity
+
+        bot = bot_identity()
+        ok = publish_bundle(dest, context_url, project=project, subpath=subpath,
+                            source_commit=commit,
+                            author=(bot.name or "beeverforge-bot",
+                                    bot.email or "beeverforge-bot@local"))
+        if not ok:
+            return "failed"
+        # TAKEN ONLY ONCE PUBLISHED: a push that failed leaves them pending for the next round
+        asked.taken(inbox, repo, [g.key for g in wanted], at=now)
+        return f"published+concepts:{renewal.rewritten}" if renewal.rewritten else "published"
+    except Exception:  # noqa: BLE001 — the ticket already merged; knowledge must never break it
+        activity.logger.warning("knowledge refresh failed for %s", inp.project, exc_info=True)
+        return "failed"
+    finally:
+        discard_fetched_bundle(published)
+        # Never leave OUR generated bundle in the shared repo cache: the next job's worktree
+        # would inherit it as an untracked file and `git add -A` would commit the map into that
+        # ticket's PR. Restore-then-clean rather than a blind delete, because a project may
+        # legitimately keep `knowledge/` COMMITTED in its own repo (Phase 1's shape) — there the
+        # directory is tracked content that must survive us having written into it.
+        for args in (["checkout", "--", BUNDLE_DIRNAME], ["clean", "-fdq", BUNDLE_DIRNAME]):
+            subprocess.run(["git", "-C", str(repo_path), *args],
+                           capture_output=True, timeout=60, check=False)
+
+
+def _refresh_the_system_layer(inp: KnowledgeRefreshInput) -> str:
+    """The product's system layer (ADR-0052 D17, #268), derived across every declared source and
+    published at `.okf/system/` in the context repository — the same refresh, one level up.
+
+    It rides the module map's refresh rather than a workflow step of its own: the triggers are the
+    same (after a merge, and on the schedule), the bound is the same, and a new activity in the
+    workflow would need a replay marker for nothing the workflow decides. Best-effort like the map:
+    its outcome is a log line, and a failure never reaches the job."""
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+    from beeverforge.knowledge.system.refresh import refresh_system
+
+    project = ProjectRegistry().get(inp.project)
+    token = forge_token_for(project) or deployment_forge_token(project) or ""
+    return refresh_system(project, token=token)
+
+
+@activity.defn
+async def refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
+    """ADR/§11 — regenerate + publish the project's module map after a merge, then the product's
+    system layer. Opt-in, bounded, best-effort: a failure here never touches the merged ticket.
+    Worker (git + App creds).
+
+    The map's outcome is what the activity returns; the system layer's is logged. A project that
+    declared no knowledge (`off`) or has no context repository (`no-context`) gets neither."""
+
+    def both() -> str:
+        outcome = _do_refresh_knowledge(inp)
+        if outcome in ("off", "no-context"):
+            return outcome
+        try:
+            system = _refresh_the_system_layer(inp)
+        except Exception:  # noqa: BLE001 — the ticket already merged; knowledge must never break it
+            activity.logger.warning("system layer refresh failed for %s", inp.project,
+                                    exc_info=True)
+            system = "failed"
+        activity.logger.info("system layer for %s: %s", inp.project, system)
+        return outcome
+
+    return await asyncio.to_thread(both)
+
+
+#: How long one scheduled pass reads documents for. Inside the activity's ten minutes, so a pass
+#: over a product with years of documents stops on its own, says what it left, and the next tick
+#: goes on from there — a model call started just before the budget ends still has room.
+DOCUMENT_PASS_SECONDS = 7 * 60
+
+
+def _a_product_of(inp: KnowledgeRefreshInput):
+    """The registry project `inp` names, when it has a product role — else None."""
+    try:
+        project = ProjectRegistry().get(inp.project)
+    except KeyError:
+        return None
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True):
+        return None
+    return project
+
+
+def _do_ingest_documents(inp: KnowledgeRefreshInput) -> str:
+    """The product's context repository, read on the knowledge pipeline's schedule (#269 slice 1):
+    every document added or changed since the last pass becomes a record, alone, and every one
+    that cannot be read is recorded with why (`product/documents/ingest.py`).
+
+    THROUGH THE PRODUCT ROLE'S OWN CHECKOUT (`ProductModule.context`): the same documentation
+    repository, at the same branch, with the same credential, that a turn reads — so what the role
+    was handed and what was ingested are one tree. Returns the pass's sentence, or a word:
+    "off" (no product role), "no-context" (no checkout of its context repository).
+
+    AND THE PRODUCT'S INDEX BROUGHT UP TO THEM (#269 slice 2), with every vector the turns left to
+    make: what was just read is searchable at the next turn, by its words and its meaning, without
+    that turn paying for it. Best-effort — a turn syncs what it needs anyway.
+
+    THE PASS ITSELF IS `product/refresh.py`'s (#1004), the one an asked refresh runs too
+    (`refresh_product_knowledge`), so what the schedule hands the index an asked pass hands it as
+    well; it records how it went, which `product_status` reads."""
+    from beeverforge.product import refresh as knowledge
+
+    project = _a_product_of(inp)
+    if project is None:
+        return "off"
+    done = knowledge.documents_and_index(project, by=knowledge.SCHEDULE,
+                                         budget_seconds=DOCUMENT_PASS_SECONDS)
+    if done.outcome == knowledge.NO_CONTEXT:
+        return "no-context"
+    if done.outcome == knowledge.FAILED:
+        return "failed"
+    activity.logger.info("the index of %s: %s", inp.project, done.index or "; ".join(done.degraded))
+    return done.documents
+
+
+@activity.defn
+async def ingest_documents(inp: KnowledgeRefreshInput) -> str:
+    """#269 — the product's documents, read after the module map on the same schedule. Bounded
+    and best-effort: a pass that fails or runs out of time is continued by the next one."""
+    return await asyncio.to_thread(lambda: _do_ingest_documents(inp))
+
+
+def _do_refresh_product_knowledge(inp: KnowledgeRefreshInput) -> str:
+    """The product's knowledge brought up to date NOW, because somebody asked (`product_refresh`,
+    #1004): the scheduled pass's documents and index, and the board of every registry project of
+    the product besides (`product/refresh.py`). Returns the pass's sentence, or "off" when the
+    project lost its product role between the ask and the pass."""
+    from beeverforge.product import refresh as knowledge
+
+    project = _a_product_of(inp)
+    if project is None:
+        activity.logger.warning("a knowledge refresh was asked of %s, which has no product role "
+                                "now — nothing was read", inp.project)
+        return "off"
+    return knowledge.documents_and_index(project, by=knowledge.ASKED,
+                                         budget_seconds=DOCUMENT_PASS_SECONDS,
+                                         boards=True).sentence()
+
+
+@activity.defn
+async def refresh_product_knowledge(inp: KnowledgeRefreshInput) -> str:
+    """#1004 — an asked refresh of a product's knowledge, on the worker. It reads documents, and a
+    document's summary is a model's, so it HEARTBEATS while it runs (`_turning`): a worker that dies
+    mid-pass is noticed within `refresh.PASS_HEARTBEAT`, not at the pass's ceiling."""
+    return await _turning(lambda _abandoned: _do_refresh_product_knowledge(inp),
+                          f"refreshing the knowledge of {inp.project}")
+
+
+#: How long one scheduled pass distils conversations for — each is a model call, so a few, and the
+#: rest at the next tick. Inside the activity's ten minutes with a call's worth of room.
+DISTIL_PASS_SECONDS = 5 * 60
+
+
+def _do_distil_conversations(inp: KnowledgeRefreshInput) -> str:
+    """The product's conversations that went quiet, distilled into its context repository
+    (#269 slice 3, ADR-0053 D4, `product/distil.py`) — BEFORE the documents are read on the same
+    tick, so what was distilled is ingested and searchable at once.
+
+    The conversation lines are the product's recall index, refreshed here from the transcript —
+    every registry project of the product and their rows from before the move — and the context
+    repository is the product role's own checkout, as the documents' pass reads it. Returns the
+    pass's sentence, or a word: "off" (no product role), "no-context" (no checkout)."""
+    from beeverforge.memory import recall, transcript
+    from beeverforge.paths import project_memory_dir
+    from beeverforge.product.distil import distil
+    from beeverforge.product.index.retrieval import said_of
+    from beeverforge.product.module import ProductModule
+
+    try:
+        project = ProjectRegistry().get(inp.project)
+    except KeyError:
+        return "off"
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True):
+        return "off"
+    try:
+        module = ProductModule(project, via="api")
+        ctx = module.context()
+        if not ctx.available or not ctx.docs_path:
+            return "no-context"
+        recall.refresh(project.name, project_memory_dir(project),
+                       partition=transcript.partition(project))
+        report = distil(project, module=module, root=Path(ctx.docs_path), said=said_of(project),
+                        budget_seconds=DISTIL_PASS_SECONDS)
+    except Exception:  # noqa: BLE001 — a pass that failed is run again at the next tick
+        activity.logger.warning("the conversations of %s could not be distilled", inp.project,
+                                exc_info=True)
+        return "failed"
+    return report.sentence()
+
+
+@activity.defn
+async def distil_conversations(inp: KnowledgeRefreshInput) -> str:
+    """#269 slice 3 — the product's quiet conversations distilled, on the knowledge refresh's tick,
+    before its documents are read. Bounded and best-effort, like the documents' pass."""
+    return await asyncio.to_thread(lambda: _do_distil_conversations(inp))
+
+
+#: Where a sweep remembers what it already reported. The metrics table, because it is already
+#: there, already read by the panel, and survives the worker being replaced — which an in-process
+#: memory does not, and a sweep that forgets on every deploy re-reports everything.
+_SWEEP_KIND = "product_sweep"
+
+#: What the tech-lead's last round already said. Same mechanism as the sweep's memory and for the
+#: same reason: a watcher with no memory repeats itself, and a channel that repeats itself is one
+#: nobody reads on the hour that matters.
+_WATCH_KIND = "techlead_watch"
+
+#: TWO memories now ride this kind, one per thing the hourly round remembers, so every reader of it
+#: must say WHICH. Read by kind alone, the orphan repair's row is the newest `techlead_watch` row
+#: on the rounds that follow a repair, it carries no `said`, and the watcher would read it as "I
+#: have never mentioned anything" — repeating every standing finding on the hour.
+_WATCH_ROLE = "_watch_"
+_REPOINT_ROLE = "_repoint_"
+
+
+def _watch_history(project_name: str) -> dict[str, float]:
+    """`finding key → how far it had gone when we last mentioned it`."""
+    try:
+        from beeverforge.api.metrics_view import scan_records
+
+        rows = [r for r in scan_records()
+                if r.get("kind") == _WATCH_KIND
+                and str(r.get("role") or _WATCH_ROLE) == _WATCH_ROLE
+                and str(r.get("pk") or r.get("project") or "") == project_name]
+        if not rows:
+            return {}
+        rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+        raw = (rows[0].get("extra") or {}).get("said") or ""
+        out: dict[str, float] = {}
+        for part in str(raw).split("|"):
+            key, _, value = part.rpartition("=")
+            if key:
+                try:
+                    out[key] = float(value)
+                except ValueError:
+                    continue
+        return out
+    except Exception as exc:  # noqa: BLE001
+        # No memory means every round reports everything again — noisy, but never silent, which is
+        # the right way round for this failure. Still worth saying so somebody can fix it.
+        activity.logger.warning("techlead watch: could not read what the last round said (%s) — "
+                                "this round may repeat itself", exc)
+        return {}
+
+
+def _remember_watch(project_name: str, said: dict[str, float]) -> None:
+    try:
+        from datetime import UTC, datetime
+
+        from beeverforge.observability.metrics import MetricRecord
+
+        _metrics_sink().record(MetricRecord(
+            project=project_name, ticket=_WATCH_ROLE, ts=datetime.now(UTC).isoformat(),
+            kind=_WATCH_KIND, role=_WATCH_ROLE,
+            extra={"said": "|".join(f"{k}={v}" for k, v in sorted(said.items()))}))
+    except Exception as exc:  # noqa: BLE001 — remembering is an optimisation, never the job
+        activity.logger.warning("techlead watch: could not record what it said for %s (%s) — the "
+                                "next round may repeat it", project_name, exc)
+
+
+#: A row that says only "this store took a write". It records no sweep and carries no findings, so
+#: every reader of `_SWEEP_KIND` skips it; its whole job is to give the NEXT round's read something
+#: to come back with, since a read that returns nothing proves nothing.
+_SWEEP_PROBE = "probe"
+
+
+def _sweep_rows(project_name: str) -> list[dict] | None:
+    """This project's sweep memory, newest first — or `None` when the read proved nothing.
+
+    THREE ANSWERS, NOT TWO, because one caller cannot live on two. `scan_records` degrades to `[]`
+    on a throttled scan, absent credentials or a table that is not there yet, which is the same
+    shape as a store that has genuinely never been written. To the findings memory those two mean
+    the same thing — report something twice. To the arrival they are opposites: one is a client who
+    has never met this role, the other is a client who has been working with her for weeks.
+
+    THE PROOF IS THE TABLE ANSWERING AT ALL, not this project having a row in it. The table is
+    shared by every project, every job, every agent run and every client message, so a completely
+    empty return is the one state a failed read cannot be told apart from — and a return with any
+    row in it is a read that demonstrably works, which makes the absence of this project's rows an
+    observation rather than a guess.
+    """
+    try:
+        from beeverforge.api.metrics_view import scan_records
+
+        rows = scan_records()
+    except Exception as exc:  # noqa: BLE001
+        activity.logger.warning("product sweep: could not reach the memory store for %s (%s)",
+                                project_name, exc)
+        return None
+    if not rows:
+        return None
+    mine = [r for r in rows
+            if r.get("kind") == _SWEEP_KIND
+            and str(r.get("pk") or r.get("project") or "") == project_name
+            and not (r.get("extra") or {}).get(_SWEEP_PROBE)]
+    mine.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    return mine
+
+
+def _last_sweep_keys(project_name: str) -> list[str]:
+    """What the previous sweep found, as `ticket:kind` fingerprints. `[]` on any trouble — the cost
+    of forgetting is one repeated report, which is far cheaper than a sweep that fails."""
+    rows = _sweep_rows(project_name)
+    if rows is None:
+        # An unreadable history means every finding looks NEW, so the sweep reports the whole
+        # backlog as if it just appeared — the exact noise the "only what changed" rule prevents.
+        activity.logger.warning("could not read what the last sweep reported for %s — this sweep "
+                                "may repeat findings that are not new", project_name)
+        return []
+    if not rows:
+        return []
+    raw = (rows[0].get("extra") or {}).get("findings") or ""
+    return [k for k in str(raw).split(",") if k]
+
+
+def _sweep_history(project_name: str) -> dict | None:
+    """The last sweep's snapshot of the board, `{}` when this project has provably never been
+    swept, and `None` when the store proved nothing at all.
+
+    A count on its own says how bad things are; the same count next to last week's says whether
+    anybody is winning. That is the difference between a report and a trend, and it costs one extra
+    field on a record already being written.
+
+    THIS ROW IS ALSO THE ONLY COPY OF "I HAVE ALREADY INTRODUCED MYSELF TO THIS CLIENT", which is
+    why its absence is split in two. Every other fact the sweep and the rounds remember is
+    re-derived from live state every pass — the board says what is rotten, the corpus says what is
+    promised, the ledger says what is unanswered — so losing one of those costs a repetition.
+    Nothing anywhere says whether this role has ever spoken to this client. An absence read as "we
+    have never met" is therefore not a repetition; it is a first-contact message to somebody who
+    has been working with her for weeks."""
+    rows = _sweep_rows(project_name)
+    if rows is None:
+        return None
+    if not rows:
+        return {}
+    # A row that carried nothing is still a sweep that happened. The arrival is decided on the ROW
+    # existing, never on what it holds, or a memory row that lost its fields greets the client
+    # again on the strength of its own emptiness.
+    return (rows[0].get("extra") or {}) or {"backlog": ""}
+
+
+def _probe_sweep_memory(project_name: str) -> None:
+    """Leave behind a row that says only "this store took a write".
+
+    A round that cannot tell an empty memory from an unreadable one never introduces itself, and
+    for a client whose factory has recorded nothing yet that state would otherwise be permanent —
+    nothing else would put a first row in the table for them, and the arrival would be owed for
+    ever. The next round reads this one, which is the read proving itself, finds no sweep recorded,
+    and arrives one cadence late. That delay is the entire price of never greeting a stranger who
+    is not one."""
+    try:
+        from datetime import UTC, datetime
+
+        from beeverforge.observability.metrics import MetricRecord
+
+        _metrics_sink().record(MetricRecord(
+            project=project_name, ticket="_sweep_", ts=datetime.now(UTC).isoformat(),
+            kind=_SWEEP_KIND, role="_sweep_", extra={_SWEEP_PROBE: "1"}))
+    except Exception as exc:  # noqa: BLE001 — a probe must never fail the schedule it rides on
+        activity.logger.warning("product sweep: could not probe the memory store for %s (%s) — "
+                                "this project's arrival stays owed", project_name, exc)
+
+
+def _remember_sweep(project_name: str, keys: list[str], ts: str, backlog: int = 0) -> None:
+    try:
+        from beeverforge.observability.metrics import MetricRecord
+
+        _metrics_sink().record(MetricRecord(
+            project=project_name, ticket="_sweep_", ts=ts, kind=_SWEEP_KIND, role="_sweep_",
+            extra={"findings": ",".join(keys), "backlog": str(backlog)}))
+    except Exception as exc:  # noqa: BLE001 — remembering is an optimisation, never the job
+        # Except for the one fact this row is the only copy of. A lost findings list costs a
+        # repeated report; a lost FIRST row costs a client their second first-contact message,
+        # because nothing else records that this role has already arrived.
+        activity.logger.error("BEEVERFORGE_PRODUCT_SWEEP_UNREMEMBERED project=%s (%s) — this round "
+                              "is not "
+                              "in the memory; the next one repeats it, and if this was the arrival "
+                              "it introduces itself again", project_name, exc)
+
+
+@activity.defn
+async def product_sweep(project_name: str) -> str:
+    """The product role's scheduled look at the board, posted to its own channel (ADR-0019).
+
+    READ-ONLY, on a schedule exactly as it is on request: this role has the least context precisely
+    when it is told to look at everything at once, and a card it moved at 6am is a card somebody
+    has to un-move.
+
+    STAYS QUIET WHEN THERE IS NOTHING TO SAY. A daily message that says "nothing out of place" every
+    day for three weeks trains people to skip it, and then it is invisible on the day it matters.
+    """
+    def _do() -> str:
+        from datetime import UTC, datetime
+
+        from beeverforge.product.module import ProductModule
+        from beeverforge.product.voice import triage_report
+
+        project = ProjectRegistry().get(project_name)
+        cfg = getattr(project, "product", None)
+        # `channel_destination`, not a bare coordinate (C-25 review): the coordinate was one
+        # vendor's rule, and it silenced every panel-channel deployment — provider shipped, gate
+        # never passed.
+        if cfg is None or not getattr(cfg, "enabled", True) \
+                or not channel_destination(project, product=True):
+            return "off"
+
+        module = ProductModule(project)
+
+        # THE FIRST SWEEP IS AN ARRIVAL, not a report. Nobody has met this role yet, and a first
+        # message that opens with six board findings is a stranger handing you a list.
+        from beeverforge.adapters.channel import build_channel
+
+        channel = build_channel(project)
+        history = _sweep_history(project_name)
+        if history is None:
+            # THE ONE THING THIS SWEEP MAY NOT GUESS. A store that answered nothing at all looks
+            # exactly like one that has never been written, and reading the second as the first
+            # sends a client who has been working with this role for weeks her first-contact
+            # message — every cadence, for as long as the read stays broken.
+            #
+            # NOTHING IS SAID AT ALL on such a round, not merely the arrival. Every message below
+            # is gated on a memory in the table that just answered nothing: the report would
+            # restate the whole backlog as new, and the follow-through dedupes against a ledger in
+            # the same table. Skipping the round costs a week of latency and no facts — the board,
+            # the corpus and the ledger are all re-read next pass — while the two repairs that
+            # cannot wait a week (the proposal rescue, the orphaned cards) ride the HOURLY round.
+            activity.logger.error(
+                "BEEVERFORGE_PRODUCT_SWEEP_MEMORY_UNPROVEN project=%s — the memory store answered "
+                "nothing, so this round cannot tell a new client from one it has already met; "
+                "saying nothing this pass", project_name)
+            _probe_sweep_memory(project_name)
+            return "memory-unproven"
+        if not history:
+            # POST FIRST, remember after: a non-empty history routes every later sweep to the
+            # triage path, so committing the marker before a failed intro would mean the client's
+            # first-ever message from this role is a bare board report a cadence later. A dropped
+            # intro leaves history empty and the next sweep introduces again.
+            if not _product_post(channel, project, cfg, module.introduce()):
+                return "intro-dropped"
+            _remember_sweep(project_name, [], datetime.now(UTC).isoformat())
+            return "introduced"
+
+        report, error = module.triage_board()
+        if report is None:
+            activity.logger.warning("product sweep: %s could not read the board (%s)",
+                                    project_name, error)
+            return "unreadable"
+
+        # ONLY WHAT IS NEW. Without this the same findings arrive every single run until somebody
+        # fixes them, which is how a scheduled report becomes wallpaper — and then it is invisible
+        # on the day it says something that matters.
+        previous = _last_sweep_keys(project_name)
+        fresh = report.since(previous)
+
+        # ── FOLLOW THROUGH runs on EVERY sweep that could read the board — including the quiet
+        # ones. It used to sit behind the freshness returns below, which coupled closing, chasing
+        # and "está pronto" to whether NEW rot appeared that week: the week somebody finally wrote
+        # the missing criteria was, by construction, a week with nothing new — so the question
+        # stayed open for ever and the thank-you was never said. Quiet weeks are exactly when
+        # follow-through is the only thing worth doing.
+        followed = _product_followup(project, module, report, cfg)
+
+        if not fresh.observations:
+            # Nothing needed posting, so remembering the keys claims nothing about the channel —
+            # it only prunes resolved findings and refreshes the backlog count.
+            _remember_sweep(project_name, report.keys(), datetime.now(UTC).isoformat(),
+                            backlog=len(report.observations))
+            if not previous:
+                return f"clean {followed}"   # first look, nothing wrong: no report to post
+            return f"nothing-new {followed}"
+
+        # what did NOT change is reported as counts, not re-listed: a backlog must not vanish by
+        # standing still, and forty repeated ticket numbers are what nobody reads twice
+        seen = set(previous)
+        standing: dict[str, int] = {}
+        for o in report.observations:
+            if f"{o.ticket}:{o.kind}" in seen:
+                standing[o.kind] = standing.get(o.kind, 0) + 1
+
+        text = triage_report(fresh, language=getattr(project, "language", None),
+                             agent_name=getattr(cfg, "agent_name", "") or "",
+                             standing=standing)
+        # The keys commit ONLY after the report lands. Committed first, a dropped post turned
+        # every fresh finding into "standing" for the next sweep — reported to nobody, ever,
+        # with the loop that would heal it blinded by its own memory.
+        if not _product_post(channel, project, cfg, text):
+            return f"report-dropped:{len(fresh.observations)} {followed}"
+        _remember_sweep(project_name, report.keys(), datetime.now(UTC).isoformat(),
+                        backlog=len(report.observations))
+        return f"reported:{len(fresh.observations)} {followed}"
+
+
+
+    try:
+        return await asyncio.to_thread(_do)
+    except Exception:  # noqa: BLE001 — a sweep must never fail a schedule into a retry storm
+        activity.logger.exception("product sweep failed for %s", project_name)
+        return "error"
+
+def _invite_the_client_to_look(project, inp) -> None:
+    """The client's half of a green deploy: their words, their channel, the same address (#122).
+
+    ADDITIVE AND SILENT. No product module, no channel, no client — no message, and the operator
+    already has theirs. This is why the invitation is published from the deploy watch rather than
+    from `product/`: a capability that only exists when an optional module is switched on is the
+    defect this card was opened for, one layer up.
+
+    IT NAMES THE TICKET WHEN THERE IS NO REQUIREMENT BEHIND IT. The client-facing delivery loop
+    opens only for work filed FROM a requirement, and a ticket somebody dragged into TO-DO — the
+    ordinary way a team adopting this works — never opens one. Keying the invitation off that loop
+    would have made it unreachable for exactly the flow the pilot runs.
+
+    NEVER RAISES: the deploy happened and the operator was told. Nothing about the second audience
+    may cost the first one its message."""
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True):
+        return
+    destination = channel_destination(project, product=True)
+    if not destination:
+        return  # no client to tell; the operator's notification already went out
+    try:
+        from beeverforge.adapters.channel import build_channel
+        from beeverforge.product import voice
+
+        # THE TITLE, NOT THE NUMBER — and best-effort, because a tracker that will not answer must
+        # cost the client a vaguer sentence, never the message.
+        what = ""
+        try:
+            what = str(getattr(_tracker_for(project).get_ticket(inp.issue), "title", "") or "")
+        except Exception as exc:  # noqa: BLE001
+            activity.logger.info("could not read #%s's title for the client's invitation (%s)",
+                                 inp.issue, str(exc)[:120])
+        text = voice.deploy_invitation(what=what, url=inp.url,
+                                       language=getattr(project, "language", None))
+        _product_post(build_channel(project), project, cfg, text)
+    except Exception as exc:  # noqa: BLE001 — the client half is additive, never load-bearing
+        activity.logger.warning(
+            "could not invite the client to look at %s#%s on %s (%s) — the operator was told",
+            inp.project, inp.issue, inp.env, str(exc)[:160])
+
+
+def _product_post(channel, project, cfg, text: str) -> bool:
+    """Say it to the product's room AND remember having said it — but only what was actually said.
+
+    Every proactive post — the introduction, the triage report, a delivery notice, a question, a
+    chase — went out through bare `channel.say` and into no record at all. So when a person
+    answered her question, the first turn of that conversation (HER question) was the one turn her
+    memory did not hold: she asked, was answered, and did not know what about. Keyed by where it
+    was posted (`channel_destination`): the product's room — the project's name on the panel, the
+    add-on's own address on a chat add-on, which is where that add-on keys a bare message too.
+
+    THROUGH THE DOOR, NOT BESIDE IT (#267 slice 3, ADR-0051 D13). A post that went straight to the
+    channel landed in the room whenever it was sent — in the middle of somebody's answer being
+    written. It goes through the room's conversation now (`events.to_room` → `door.announce`),
+    recorded the moment the door takes it and published when its turn comes, like every other
+    proactive message; a
+    transport shows what its conversations publish (the panel's socket; a chat add-on through
+    `door.watch`). `channel` is kept for the callers that hand one over, and no longer spoken
+    through.
+
+    Returns whether the door TOOK it — never raises. THE ONE SEAM every caller must gate its
+    record on: a post the door did not take leaves no ledger row at the call site, so the item
+    stays eligible for the next sweep instead of being remembered as asked/announced/reported to
+    a room that never heard it (ADR-0021 — memory closes on observation, never on self-report)."""
+    from beeverforge.product import events
+
+    del channel, cfg  # the product's room is read from the project, like every other gate here
+    if not events.to_room(project, text):
+        activity.logger.error(
+            "BEEVERFORGE_PRODUCT_POST_DROPPED project=%s channel=%s chars=%d — the door did not "
+            "take it; the item stays eligible for the next sweep",
+            getattr(project, "name", ""), events.room_of(project), len(text))
+        return False
+    return True
+
+
+def _product_followup(project, module, report, cfg) -> str:
+    """Close what the board resolved, ask what is new, chase what went quiet — once.
+
+    Separated from the sweep body because it is a different job with a different failure mode: the
+    report going wrong makes a message worse, this going wrong makes her forget, and the second is
+    the one that has to be visible."""
+    from beeverforge.adapters.channel import build_channel
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import ACCEPTANCE, CHASED, DECISION, QUESTION, chase_due, waiting
+    from beeverforge.product import agenda, events, followup
+
+    name = getattr(cfg, "agent_name", "") or ""
+    lang = getattr(project, "language", None)
+
+    # A LIVE provider client, or mentions cannot exist. Calling mention() bare used to run one
+    # `gh api` per login (the shared App quota) toward a directory lookup that ALWAYS returned
+    # empty — and poisoned two process caches on the way, so even later callers with a client got
+    # nothing. Every "she names the person" promise was structurally a plain-text name.
+    channel = build_channel(project)
+    web_client = getattr(channel, "client", lambda _p: None)(project)
+
+    def _mention(login: str) -> str:
+        # NO TOKEN. `module.token` is the FORGE credential (`ProductModule.token` resolves through
+        # `forge_token_for`), and handing it to a person lookup is how a GitHub App token reached
+        # an Atlassian site. The tracker axis resolves its own from the project (#162).
+        return channel.mention(login, web_client=web_client, project=project) if login else ""
+
+    ledger = loop_store.read(project.name)
+    open_now = waiting(ledger, owner=followup.OWNER)
+
+    # 1. CLOSE what the world resolved. A question whose finding is gone was answered by the world,
+    #    which is the only kind of answer that counts (see followup.py).
+    settled = _the_board_answered(project, ledger, open_now, report)
+    if settled:
+        # The in-memory view must include what was just settled, or the chase pass below reads the
+        # PRE-close ledger and reminds somebody about a question this very round resolved — a
+        # message that tells the reader, precisely, that the agent is not paying attention.
+        ledger = ledger + settled
+
+    # 2. WHAT GOT DELIVERED IS THE CARD'S DOOR'S TO SAY, NEVER THIS SWEEP'S (#414). Every way a card
+    #    reaches Done — its job's settle at the merge, the box's hand-back at its last stage, a
+    #    person's close, a close observed on the vendor's own screen — is a transition whose
+    #    `Loops("deliver")` announces what the card completes, to the conversation its requester
+    #    asked in, recorded once per card; THE DELIVERY LOOP CLOSES AND THE ACCEPTANCE LOOP OPENS
+    #    there (ADR-0025). This sweep was the catch-all beside it, a second announcer reading the
+    #    board; its second chance is the door's own now — `converge`, which applies again an
+    #    announcement the board or the conversation did not take, as the hourly round does.
+    asking = {x.key for x in waiting(ledger, owner=followup.OWNER) if x.kind == ACCEPTANCE}
+    _the_door_converges(project)
+    ledger = loop_store.read(project.name)
+    accepting = [x for x in waiting(ledger, owner=followup.OWNER)
+                 if x.kind == ACCEPTANCE and x.key not in asking]
+
+    # 3. ASK what is new, at the person who can answer.
+    ts = _now_iso()
+    fresh = followup.to_open(
+        followup.questions_from(report.observations, module._board_tickets or [],
+                                language=lang),
+        open_now, ts=ts)
+    if fresh:
+        # ONE message for the whole batch (see ask_batch): three separate posts, each repeating
+        # the same closing paragraph, is what actually reached the client channel on 2026-07-28
+        # — it reads as a machine emptying a queue rather than a colleague asking.
+        # A dropped batch persists NO question rows: to_open dedupes against open QUESTION loops,
+        # so a row for a never-delivered ask would suppress the question for ever.
+        if not _product_post(channel, project, cfg, followup.ask_batch(
+                [(loop, _mention(loop.context.get("person") or "")) for loop in fresh],
+                agent_name=name, language=lang)):
+            fresh = []
+
+    # 4. CHASE what went quiet — ONCE. Two failure modes sit either side of this: a question that
+    #    evaporates, and an agent that asks the same thing until somebody mutes the channel.
+    ages = {(QUESTION, x.subject, x.about): _hours_since(x.ts)
+            for x in open_now if x.kind == QUESTION}
+    chased = chase_due(ledger, hours_open=ages, after_hours=followup.CHASE_AFTER_HOURS, ts=ts)
+    # The chase pass wears the SAME cap as the ask pass, for the same reason. Thirteen questions
+    # went out in one pre-cap burst (2026-07-28, the first real sweep); left uncapped, the 48h
+    # chase would have replayed all thirteen as one burst of reminders a week later — the flood
+    # arriving twice. The rest stay OPEN (not CHASED), so later passes take the next few.
+    # A CHASED row is only written for a chase that LANDED — the one chase a question ever gets
+    # must not be spent on a post nobody received; a dropped one stays OPEN for the next sweep.
+    chased = [loop for loop in
+              [x for x in chased if x.state == CHASED][:followup.MAX_QUESTIONS_PER_PASS]
+              if _product_post(channel, project, cfg, followup.chase_text(
+                  loop, mention=_mention(loop.context.get("person") or ""), agent_name=name,
+                  days=max(2, int(_hours_since(loop.ts) // 24)), language=lang))]
+
+    # 5. CHASE an unanswered "did it work?" — once, and never close it by time. Silence is not
+    #    acceptance; an acceptance loop left open is the honest record of a delivery nobody
+    #    confirmed, and it is supposed to stay visible until a person answers.
+    acc_open = [x for x in waiting(ledger, owner=followup.OWNER) if x.kind == ACCEPTANCE]
+    acc_ages = {(ACCEPTANCE, x.subject, x.about): _hours_since(x.ts) for x in acc_open}
+    #    WHERE IT WAS ASKED (#267 slice 3): a "did it work?" asked in somebody's own conversation
+    #    is followed up there — the room never heard the delivery, and must not hear the reminder.
+    room = events.room_of(project)
+
+    def _where_asked(loop, text: str) -> bool:
+        where = str((loop.context or {}).get("conversation") or "")
+        if not where or where == room:
+            return _product_post(channel, project, cfg, text)
+        return events.say_to(project, where, text)
+
+    acc_chased = [loop for loop in
+                  [x for x in chase_due(ledger, hours_open=acc_ages,
+                                        after_hours=followup.ACCEPTANCE_AFTER_HOURS, ts=ts)
+                   if x.state == CHASED and x.kind == ACCEPTANCE][:followup.MAX_QUESTIONS_PER_PASS]
+                  if _where_asked(loop, followup.acceptance_chase_text(
+                      loop, mention=_mention(loop.context.get("asked_by") or ""),
+                      agent_name=name, language=lang))]
+
+    # 6. CHASE a decision nobody made — once, and never closed by time. A decision she asked for
+    #    and nobody answered is the most expensive thing to lose silently: work either stops or
+    #    proceeds on an assumption nobody agreed to.
+    #    ONLY THE ROOM'S, IN THE ROOM (#267 slice 3). The chase repeats the decision word for word,
+    #    and one asked in somebody's private conversation is theirs: the ledger keeps where it was
+    #    asked as a digest, which cannot be sent to, so it stays on their own agenda — never read
+    #    out to the room (`agenda.audience`).
+    dec_open = [x for x in waiting(ledger, owner=followup.OWNER) if x.kind == DECISION
+                and agenda.audience(x, room=room).room]
+    dec_ages = {(DECISION, x.subject, x.about): _hours_since(x.ts) for x in dec_open}
+    dec_chased = [loop for loop in
+                  [x for x in chase_due(ledger, hours_open=dec_ages,
+                                        after_hours=followup.DECISION_AFTER_HOURS, ts=ts)
+                   if x.state == CHASED and x.kind == DECISION][:followup.MAX_QUESTIONS_PER_PASS]
+                  if _product_post(channel, project, cfg, followup.decision_chase_text(
+                      loop, mention=_mention(loop.context.get("person") or ""),
+                      agent_name=name, language=lang))]
+
+    # 7. LAND any proposal that is not in the base yet (ADR-0032) — also run on the HOURLY
+    #    tech-lead rounds (see techlead_watch), because this failure is client-visible within one
+    #    message while this sweep's cadence is a week.
+    _land_product_proposals(project, token=module.token or "")
+
+    # `accepting` is not written again: the door's announcement that opened each wrote it
+    # (`lifecycle.loops.announce`)
+    loop_store.write(project.name, fresh + chased + acc_chased + dec_chased)
+    return (f"asked:{len(fresh)} chased:{len(chased)} closed:{len(settled)} "
+            f"accepting:{len(accepting)}")
+
+
+def _the_board_answered(project, ledger, open_now, report) -> list:
+    """Close the product role's QUESTIONS the board resolved — a question whose finding is gone was
+    answered by the world, the only kind of answer that counts (`followup.answered`). Returns the
+    rows written.
+
+    APART FROM THE SWEEP ON PURPOSE (#414): these are the role's questions about the board, not a
+    promise about a card. The door's guard reads a function that names a card's loops (a
+    delivery, a card question) and closes a loop as a promise kept beside the door; this one names
+    neither, so it is seen for what it is, and a delivery closed here would be seen too."""
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import close_by_observation
+    from beeverforge.product import followup
+
+    live = {f"{o.ticket}:{o.kind}" for o in report.observations}
+    settled = close_by_observation(ledger, followup.answered(open_now, live))
+    if settled:
+        loop_store.write(project.name, settled)
+    return settled
+
+
+def _the_door_converges(project) -> list[str]:
+    """`lifecycle.converge`, on the weekly sweep: what the card's door applied and the world did
+    not take — a delivery the board could not be read for, an announcement the conversation
+    refused — applied again, logged. The sweep's second chance for a delivery is the door's own
+    (#414). Never raises: the sweep's other steps are not its price."""
+    try:
+        from beeverforge.lifecycle import converge
+
+        said = converge(project)
+    except Exception as exc:  # noqa: BLE001 — see the docstring
+        activity.logger.warning("the weekly sweep could not converge the card door (%s)",
+                                str(exc)[:160])
+        return []
+    for line in said:
+        activity.logger.info("card transition converged: %s", line)
+    return said
+
+
+def _land_product_proposals(project, *, token: str | None = None) -> list[str]:
+    """Get every `req/*` proposal branch INTO the docs base (ADR-0032 recovery). Never raises.
+
+    An unmerged proposal is client-visible within ONE message — the role denies its own
+    requirement ("não encontrei o requisito N") until the branch lands — so this repair cannot
+    ride only the weekly product sweep: that left up to seven days of denial, and none at all
+    while the board was unreadable (the sweep skips follow-through entirely then). It runs on the
+    HOURLY tech-lead rounds too, deliberately decoupled from both the board read and the sweep.
+
+    IT RAN EVERY ROUND AND SWEPT NOTHING, and a live Azure deployment said so hourly for a day:
+    `BEEVERFORGE_PRODUCT_SWEEP_NO_FORGE repo=<the docs repository>`. #95 gave the sweep four
+    acts that each name a repository and #97 gave the module an adapter that can, but this call
+    site — the only one there is — went on handing it a `token` the sweep accepts and ignores, so
+    it answered `None` before looking at a single branch. `land_open_proposals`' own docstring
+    named the fix and named this file as the one it could not edit; this is that edit. The adapter
+    is the MODULE's, so the sweep reads the documentation repository with this project's own
+    credential on whatever forge the project runs — which is what the port was for."""
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True) or not getattr(cfg, "docs_repo", ""):
+        return []
+    try:
+        from beeverforge.product.authoring import land_open_proposals
+        from beeverforge.product.module import ProductModule
+
+        # ONE module for both arguments, built with the token the caller already resolved: `.token`
+        # still falls back to the deployment's credential when it is given none, and `_forge()`
+        # offers that same token to the registry — whose Azure row refuses an ambient one and mints
+        # its own, which is why offering it is right on every row.
+        module = ProductModule(project, token=token)
+        rescued = land_open_proposals(
+            docs_repo=cfg.docs_repo,
+            forge=module._forge(),
+            token=module.token or "",
+            base=getattr(cfg, "docs_branch", "main"),
+            # the folder a proposal may touch and still land unattended (#265 §6.4): the one the
+            # product declares, never a guess — an unreadable context keeps the default, and a
+            # proposal in another folder is then left open and said, never merged
+            requirements_dir=module.context().requirements_dir,
+            # the review request it opens is read in the project's language (#535)
+            language=getattr(project, "language", None))
+        if rescued:
+            activity.logger.warning("BEEVERFORGE_PRODUCT_PROPOSAL_RESCUE project=%s landed %s "
+                                    "proposal(s) into the base: %s",
+                                    getattr(project, "name", ""), len(rescued),
+                                    ", ".join(rescued))
+        # `None` is the sweep's word for "I did not run", and it says that itself, at ERROR, naming
+        # the repository — repeating it here would only double the line an operator greps for. What
+        # THIS function answers is what landed, and the annotation has always said so.
+        return rescued or []
+    except Exception as exc:  # noqa: BLE001 — a rescue never breaks the round it rides on
+        # A rotated token, a renamed docs repo or a worker image without `gh` makes this raise on
+        # EVERY hourly round, and the client meets the failure inside one message: the role denies
+        # its own requirement. Unnamed and uncaused, that is one warning an hour that nobody can
+        # act on and no alert can be built from — the same silence the orphan repair below already
+        # had to be taught out of.
+        activity.logger.error("BEEVERFORGE_PRODUCT_PROPOSAL_LAND_FAILED project=%s (%s) — open "
+                              "proposals "
+                              "are not in the base, so the role denies requirements it wrote",
+                              getattr(project, "name", ""), exc, exc_info=True)
+        return []
+
+
+#: How many facts one memory row carries before the rest are dropped. A row is one DynamoDB item;
+#: unbounded it eventually exceeds the item limit, the write starts failing, and a memory that
+#: cannot be written is a client who hears the same announcement every hour. It bounds ONE round's
+#: delta, not the memory — dropping is loud (see `_remember_repoint`) because a dropped fact is a
+#: repair nobody will ever be told about.
+_REPOINT_MEMORY_LIMIT = 500
+
+
+def _repoint_facts(raw) -> list[tuple[str, int | None]]:
+    """`card:requirement` pairs out of one stored field.
+
+    A bare `510` is the FIRST shape this memory was written in, when the card alone was the key.
+    Rows in that shape exist in the live table, and the requirement such an entry was announced at
+    is the one the same row recorded as repaired — so the caller resolves it there rather than
+    dropping it, which would re-announce a repair the client already heard about.
+
+    THE CARD IS THE PROVIDER'S OWN STRING (C-05). It was `int(card)` behind an `.isdigit()` filter,
+    so a `CONT-412` board's every fact was skipped on read AND could never be written — the memory
+    was structurally empty on any tracker that does not number its tickets, and a memory that is
+    always empty announces every repair for ever. Rows already in the live table are numeric and
+    read back as `"510"`, which is exactly what `Ticket.number` carries for the same card, so the
+    shapes meet without a migration."""
+    out: list[tuple[str, int | None]] = []
+    for part in str(raw or "").split("|"):
+        card, _, requirement = part.partition(":")
+        if not card.strip():
+            continue
+        out.append((card.strip(), int(requirement) if requirement.strip().isdigit() else None))
+    return out
+
+
+def _repoint_memory(project_name: str) -> tuple[dict[str, int], set[tuple[str, int]]]:
+    """`{card: the requirement it now cites}` for every repair made, and every `(card, requirement)`
+    the client has actually been told about.
+
+    TWO FACTS, NOT ONE, and the whole point is that they can disagree: the repair is observed from
+    the board write, the announcement only from the channel confirming the post. Collapsed into a
+    single "done" flag, a repair whose message was dropped is either announced twice or never — and
+    never is the one that ships silently, because the repair is idempotent and the second run finds
+    nothing left to notice.
+
+    THE PAIR IS THE KEY, NOT THE CARD. Supersession recurs — this client's chain already runs
+    0002→0004→0006, three replacements in one day — so a card being repointed a SECOND time is the
+    ordinary course of things, not an edge. Keyed by the card alone, that second repair counts as
+    already announced the moment it is made: thirteen cards move onto a promise the client has never
+    heard named, carrying criteria written against a text two supersessions old, and the paragraph
+    that is the whole point of the message is never said.
+
+    EVERY ROW, NOT THE NEWEST. A row is a DELTA of what one round learned and the memory is their
+    union. `scan_records` swallows its own failures and returns `[]`, so an unreadable table is
+    indistinguishable here from an empty one; read as a snapshot, the next round's write would
+    REPLACE a row recording repairs the client was never told about — and nothing could rediscover
+    them, the cards having stopped being orphans the moment they were repaired. Accumulated, a read
+    that came back empty costs a round's delay and at worst one repeated sentence, never a fact.
+    """
+    repaired: dict[str, int] = {}
+    announced: set[tuple[str, int]] = set()
+    try:
+        from beeverforge.api.metrics_view import scan_records
+
+        rows = [r for r in scan_records()
+                if r.get("kind") == _WATCH_KIND
+                and str(r.get("role") or "") == _REPOINT_ROLE
+                and str(r.get("pk") or r.get("project") or "") == project_name]
+        rows.sort(key=lambda r: str(r.get("ts") or ""))
+        for row in rows:
+            extra = row.get("extra") or {}
+            # oldest → newest, so the citation in force is the LAST repair recorded for that card
+            here = {c: r for c, r in _repoint_facts(extra.get("repaired")) if r is not None}
+            repaired.update(here)
+            for card, requirement in _repoint_facts(extra.get("announced")):
+                resolved = requirement if requirement is not None else here.get(card)
+                if resolved is not None:
+                    announced.add((card, resolved))
+        return repaired, announced
+    except Exception as exc:  # noqa: BLE001
+        # Forgetting here is not silence: the repair still runs (it is idempotent), the rows stay
+        # where they are, and the client is told again or told next hour. Repeating an announcement
+        # is the harmless side of this failure, which is why it is the side it falls on — and it is
+        # only harmless because the write below never replaces what this read could not see.
+        activity.logger.warning("BEEVERFORGE_PRODUCT_ORPHANS_MEMORY_UNREAD project=%s (%s) — the "
+                                "client "
+                                "may hear about one of these repairs twice", project_name, exc)
+        return repaired, announced
+
+
+def _UNSTORABLE(ref: str) -> bool:
+    """Whether a ref cannot survive this memory's `card:req|card:req` encoding."""
+    return "|" in str(ref) or ":" in str(ref)
+
+
+def _remember_repoint(project_name: str, repaired: dict[str, int],
+                      announced: set[tuple[str, int]]) -> None:
+    """Append what THIS round learned. One row is a delta; `_repoint_memory` unions them.
+
+    DELTAS, NOT A SNAPSHOT, because a snapshot row supersedes the memory: a round whose read came
+    back empty for any reason would erase repairs nobody has been told about, and a repaired card is
+    no longer an orphan for a later round to rediscover. This one's facts exist nowhere else once
+    the board is repaired, so the row is the only copy.
+
+    WHICH IS NOT A LICENCE FOR THE SIBLINGS TO SNAPSHOT. `_watch_history` and `_last_sweep_keys`
+    hold facts that ARE re-derived from live state every round, so a lost row there costs a
+    repetition — but the row `_last_sweep_keys` reads is also the only record that this role has
+    already introduced itself to this client, and that fact is derived from nothing at all. What
+    makes a memory safe to lose is never the mechanism; it is what the round does with the answer,
+    and the arrival is guarded where that decision is made (see `_sweep_history`)."""
+    if not repaired and not announced:
+        return
+    try:
+        from datetime import UTC, datetime
+
+        from beeverforge.observability.metrics import MetricRecord
+
+        # A REF THAT WOULD CORRUPT THE ROW IS DROPPED LOUDLY, not written. `|` and `:` are this
+        # field's own punctuation, and a provider free to issue arbitrary strings may put either in
+        # a ticket id — one such ref would not merely lose itself, it would split into two
+        # unrecognisable facts and desynchronise the whole memory.
+        illegal = sorted({c for c in repaired if _UNSTORABLE(c)}
+                         | {c for c, _ in announced if _UNSTORABLE(c)}, key=ref_sort_key)
+        if illegal:
+            activity.logger.error("BEEVERFORGE_PRODUCT_ORPHANS_MEMORY_UNSTORABLE project=%s "
+                                  "cards=%s — these refs carry this memory's own separators, so "
+                                  "they cannot be remembered and will be announced again",
+                                  project_name, ",".join(ref_label(c) for c in illegal))
+        repaired = {c: r for c, r in repaired.items() if not _UNSTORABLE(c)}
+        announced = {(c, r) for c, r in announced if not _UNSTORABLE(c)}
+        if not repaired and not announced:
+            return
+        kept_repaired = dict(sorted(repaired.items(),
+                                    key=lambda kv: ref_sort_key(kv[0]))[:_REPOINT_MEMORY_LIMIT])
+        kept_announced = sorted(announced,
+                                key=lambda pair: ref_sort_key(pair[0]))[:_REPOINT_MEMORY_LIMIT]
+        dropped = (len(repaired) - len(kept_repaired)) + (len(announced) - len(kept_announced))
+        if dropped:
+            activity.logger.error("BEEVERFORGE_PRODUCT_ORPHANS_MEMORY_FULL project=%s dropped=%d "
+                                  "fact(s) "
+                                  "— those cards were repaired and nobody will be told",
+                                  project_name, dropped)
+        extra = {}
+        if kept_repaired:
+            extra["repaired"] = "|".join(f"{c}:{r}" for c, r in kept_repaired.items())
+        if kept_announced:
+            extra["announced"] = "|".join(f"{c}:{r}" for c, r in kept_announced)
+        _metrics_sink().record(MetricRecord(
+            project=project_name, ticket=_REPOINT_ROLE, ts=datetime.now(UTC).isoformat(),
+            kind=_WATCH_KIND, role=_REPOINT_ROLE, extra=extra))
+    except Exception as exc:  # noqa: BLE001 — remembering is an optimisation, never the job
+        activity.logger.warning("could not record the card repairs for %s (%s) — the next round "
+                                "may announce them again", project_name, exc)
+
+
+#: What the client hears when cards that cited a retired requirement were put back on the live one.
+#: THE POINT OF THE MESSAGE is the second paragraph: the criteria on those cards were written
+#: against a text that is no longer the promise, and the person who accepted the new promise is the
+#: only one who can say whether they still want what those cards describe. Announcing the repair
+#: without that is bookkeeping nobody needed to read.
+#:
+#: It names the requirement in force and the cards, and nothing else — the retired number, the
+#: mapping and the writes are in the operator log, where somebody is paid to care about them.
+_ORPHANS_REPOINTED = {
+    "pt-BR": {
+        "one": ("{head}Fiz um acerto por conta própria, e vocês precisam saber antes de qualquer "
+                "trabalho começar: uma frente ainda se apoiava num texto anterior, que já não "
+                "vale — passou a se apoiar no requisito {new}, que é a promessa em vigor "
+                "({cards}).\n\nO que ela diz que precisa ser verdade para dar por pronta continua "
+                "escrito como estava, do tempo do texto anterior. Não mexi nisso de propósito: "
+                "mudaria o que vai ser construído, e isso é decisão de vocês. Se já não fizer "
+                "sentido do jeito que está, é só dizer."),
+        "many": ("{head}Fiz um acerto por conta própria, e vocês precisam saber antes de qualquer "
+                 "trabalho começar: {n} frentes ainda se apoiavam num texto anterior, que já não "
+                 "vale — passaram a se apoiar no requisito {new}, que é a promessa em vigor "
+                 "({cards}).\n\nO que cada uma delas diz que precisa ser verdade para dar por "
+                 "pronta continua escrito como estava, do tempo do texto anterior. Não mexi nisso "
+                 "de propósito: mudaria o que vai ser construído, e isso é decisão de vocês. Se "
+                 "alguma já não fizer sentido do jeito que está, é só dizer."),
+    },
+    "en": {
+        "one": ("{head}I made a correction on my own, and you should know before any work starts: "
+                "one piece of work still rested on an earlier text that no longer holds — it now "
+                "rests on requirement {new}, which is what we promise today ({cards}).\n\n"
+                "What it says has to be true before we call it done is still written the way it "
+                "was, from back when the text was the other one. I left that alone on purpose: "
+                "rewriting it would change what gets built, and that is your call. If it no "
+                "longer makes sense as it stands, just say so."),
+        "many": ("{head}I made a correction on my own, and you should know before any work "
+                 "starts: {n} pieces of work still rested on an earlier text that no longer "
+                 "holds — they now rest on requirement {new}, which is what we promise today "
+                 "({cards}).\n\nWhat each of them says has to be true before we call it done is "
+                 "still written the way it was, from back when the text was the other one. I "
+                 "left that alone on purpose: rewriting it would change what gets built, and "
+                 "that is your call. If any of them no longer makes sense as it stands, just "
+                 "say so."),
+    },
+}
+
+
+def _card_ref(ref: str) -> str:
+    """The card a `WriteResult` is about, from the `#510` its writer put in `ref`. `""` when the
+    result names nothing — which pairs with no orphan, so an unnamed write is never announced.
+
+    THE PROVIDER'S OWN STRING (C-05), and this used to reduce it to the digits it contained. That
+    was not merely wrong for a `CONT-412` board, which it silently dropped: the cards it produced
+    were INTS and the orphans it was matched against are `Ticket.number`, which is a `str`. So
+    `card in written` compared a string to a set of integers and was FALSE on every board, on every
+    vendor — the repair ran, and every round reported "clean" and blamed a race that had not
+    happened. Measured before this line changed: two cards repaired, nothing remembered, nothing
+    said, `BEEVERFORGE_PRODUCT_ORPHANS_UNPAIRED` logged about a window that never opened."""
+    return str(ref or "").strip().lstrip("#").strip()
+
+
+def _repointed_text(cards: list[str], requirement: int, *,
+                    language: str | None, agent_name: str) -> str:
+    """The sentence for ONE requirement in force, and the cards that now rest on it.
+
+    Both templates say "a promessa em vigor" in the singular because that is what is true of any one
+    card. A round that repairs two retired chains — ordinary, since chains are independent and the
+    debt also accumulates across rounds whose post was dropped — earns two sentences, not a list of
+    numbers glued into a sentence written for one. Taking the requirement as an argument is what
+    makes the plural unwritable rather than merely unwritten."""
+    from beeverforge.product.voice import DEFAULT_LANGUAGE
+
+    lang = (language or DEFAULT_LANGUAGE).strip()
+    table = _ORPHANS_REPOINTED.get(lang) or _ORPHANS_REPOINTED[DEFAULT_LANGUAGE]
+    # SORTED AS REFS AND RENDERED AS THE PROVIDER WRITES THEM (C-05). `sorted` on strings puts
+    # "#10" before "#9", and `f"#{c}"` turns a Jira `CONT-412` into `#CONT-412` — punctuation
+    # nobody on that board uses and a ref a reader cannot paste back.
+    ordered = sorted(cards, key=ref_sort_key)
+    return table["one" if len(ordered) == 1 else "many"].format(
+        head=f"{agent_name}: " if agent_name.strip() else "",
+        n=len(ordered),
+        new=requirement,
+        cards=", ".join(ref_label(c) for c in ordered))
+
+
+async def _offer_the_release_to_the_client(project, client) -> str:
+    """Ask the client to try what is parked waiting to go live — the staging bridge (board #6).
+
+    THE CADENCE IS THE POINT. The weekly product sweep is where every other follow-up lives; this
+    one cannot be there, because a parked release HOLDS THE PIPELINE. The change is built, staging
+    is green, and nothing moves until somebody looks — so a week of silence is a week of a factory
+    that finished and did not ship, which is exactly the stall this platform exists to make
+    impossible. Hourly, on the tech-lead's rounds, beside the other two repairs that earned the
+    same argument.
+
+    IT RUNS HERE AND POSTS THERE. The tech-lead's round is where the live workflows are already
+    listed, so asking costs no second Temporal sweep — but the message goes to the PRODUCT channel
+    through the one seam that reaches it. The two surfaces stay apart (ADR-0026); only the code
+    that observes is shared.
+
+    OPENED ONLY IF THE ASK LANDED, the rule the delivery announcement already learned the hard way:
+    a loop recorded for a post nobody received turns the 20h chase into the client's first-ever
+    message about the release — a reminder about something they were never told.
+
+    AND THE PERSON WHO ASKED FOR IT HEARS IT WHERE THEY ASKED (#448 slice 4). The room is asked
+    exactly as before; once it was, the card's requester is told in their own conversation
+    (`events.to_try_at_the_stage`, once per run of the job), and only when they were is a second
+    copy of the question opened there — so their answer, given where they asked, is read, and the
+    room's turns never see their copy. Neither is asked again while either copy is open; a verdict
+    that counts closes both (`engine._maybe_release`). A telling the door did not take opens no copy
+    of theirs: the room's question is visible from their conversation too, so their answer still
+    lands.
+
+    THROUGH THE CARD'S DOOR (#448 slice 6, ADR-0055 amended 2026-10-05): each asking is the card's
+    `staged`, whose ACT is the room's question — so a card the door refuses, or one it cannot read,
+    is asked nothing, and a question that did not land records and opens nothing — and whose row
+    opens the room's copy, tells the requester and opens theirs (`table.consequences`).
+    """
+    from beeverforge.lifecycle import CardEvent, transition
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import waiting
+    from beeverforge.product import followup, release
+
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True) \
+            or not channel_destination(project, product=True):
+        return ""     # no client to ask; the panel's operator path is untouched and still works
+    try:
+        pending = await release.parked_for_release(client, project.name)
+    except Exception as exc:  # noqa: BLE001 — a round must not die because Temporal blinked
+        activity.logger.info("release watch: could not list parked jobs (%s)", exc)
+        return ""
+    if not pending:
+        return ""     # silent when there is nothing to ask — the expected case almost every hour
+
+    from beeverforge.adapters.channel import build_channel
+
+    channel = build_channel(project)
+    ledger = await asyncio.to_thread(loop_store.read, project.name)
+    open_now = waiting(ledger, owner=followup.OWNER)
+    # ALREADY ASKED IS NOT ASK AGAIN. Without this the same release is announced every hour until
+    # somebody answers — the fastest way to teach a client to mute the channel that is trying to
+    # give them a release button.
+    asked = {followup.is_release(x) for x in open_now}
+    name = getattr(cfg, "agent_name", "") or ""
+    # THE DEPRECATED FALLBACK. `staging_url` is one string on the DEPLOYMENT's registry, with no
+    # command that writes it and no way to name more than one stage; the manifest declares an
+    # address per environment and the job carries the answer back from the box that read it
+    # (#122). Kept working for deployments that already set it, and said out loud when it is what
+    # ends up being used, because a value nobody can find is a value nobody can correct.
+    fallback = str(getattr(cfg, "staging_url", "") or "")
+    tracker = _tracker_for(project)
+    offered: set[str] = set()
+    theirs = 0
+    for issue, declared, run in pending:
+        if str(issue) in asked:
+            continue
+        where = declared or fallback
+        if not declared and fallback:
+            activity.logger.info(
+                "%s#%s has no `url:` in its manifest — falling back to the deployment's "
+                "`staging_url`, which is deprecated", project.name, issue)
+        requirement = followup.requirement_behind(issue, open_now)
+        text = followup.release_question(
+            requirement=requirement,
+            where=where, agent_name=name,
+            language=getattr(project, "language", None))
+
+        def _the_room_is_asked(text: str = text) -> str | None:
+            """The asking's act: the room's question, posted — the transition is recorded only
+            once it landed, so nothing is opened for a post nobody received."""
+            return None if _product_post(channel, project, cfg, text) else "not landed"
+
+        # THE CARD'S `staged`, ONE PER ASKING: its act asks the room, and its row opens the room's
+        # copy, tells the requester (once per run) and opens THEIR copy only if they were told
+        # (#448 slice 4) — a question of theirs recorded for a telling that never reached them would
+        # be chased, in their conversation, as the first they ever heard of it
+        moved = await asyncio.to_thread(
+            lambda issue=issue, where=where, run=run, requirement=requirement,
+            ask=_the_room_is_asked: transition(
+                project, str(issue), CardEvent.STAGED, by="the tech-lead's round",
+                facts={"asked_at": _now_iso(), "run": run, "where": where,
+                       "requirement": requirement, "note": "",
+                       "room": channel_destination(project, product=True)},
+                act=ask, tracker=tracker))
+        if moved.refused or moved.answer is not None:
+            activity.logger.info("release watch: %s#%s was not asked (%s)", project.name, issue,
+                                 moved.refused[:160] or moved.answer)
+            continue
+        said = dict(moved.effects)
+        if said.get("loops:release:ask", "").startswith(("asked", "the room was asked")):
+            offered.add(str(issue))
+        theirs += said.get("loops:release:ask-theirs", "") == "asked them"
+    # ONE ISSUE ASKED IN TWO PLACES IS ONE OFFER: the log and the count are of releases, not rows
+    if offered:
+        activity.logger.warning(
+            "BEEVERFORGE_RELEASE_OFFERED project=%s issues=%s requesters=%d — the client was asked "
+            "to try it; their answer is what releases", project.name, sorted(offered), theirs)
+    return f"release-asked:{len(offered)}"
+
+
+def _repoint_product_orphans(project) -> str:
+    """Cards left citing a requirement that is no longer live, put back on the one that replaced
+    it — and the client told, once, that it happened. Never raises.
+
+    HOURLY, ON THE TECH-LEAD'S ROUNDS, not on the weekly product sweep, and the cadence is chosen
+    by blast radius: a card citing a retired text is something the floor can start building against
+    within the hour, under a printed rule telling the agent not to go beyond that requirement. A
+    weekly healer repairs the citation after the work was already built against the wrong promise.
+    Same round, same argument, as the proposal rescue above — and, like it, deliberately upstream of
+    Temporal and of the floor queries, so a Temporal outage cannot also stop this.
+
+    SILENT WHEN THERE IS NOTHING TO REPAIR: no post, no log line, no board write, no channel built.
+    A repair that reports every hour is wallpaper by the second day, and this one is expected to
+    find nothing almost every time it runs.
+
+    THE READ-ONLY QUESTION IS ASKED FIRST. `orphaned_cards` is deterministic and costs no model
+    call; `repoint_orphans` writes. Gating on the query is what makes the quiet path provably free
+    of writes, and it is also the only place the successor number is available — a WriteResult does
+    not carry it and the client's sentence is about nothing else.
+
+    THE REPAIR IS GATED ON THE BOARD, THE ANNOUNCEMENT ON THE CHANNEL. Gating both on the channel
+    left a project with a docs repo and a board but no product channel citing a retired text for
+    ever, and saying nothing about it — the floor still builds from those cards. What a project
+    without somebody to tell loses is the message, not the repair; the debt is kept, so a channel
+    configured later still hears it.
+    """
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True) or not getattr(cfg, "docs_repo", ""):
+        return "off"
+    name = getattr(project, "name", "")
+    try:
+        from beeverforge.product.module import ProductModule
+
+        module = ProductModule(project)
+        orphans = module.orphaned_cards()
+        repaired, announced = _repoint_memory(name)
+
+        done = 0
+        refused = 0
+        if orphans:
+            # NO ACTOR: nobody asked for this. Re-pointing a citation is bookkeeping the platform
+            # owes, and putting a person's id on it would attribute a write to someone who never
+            # made it — the same lie in the opposite direction from the writes that need one.
+            #
+            # THIS IS THE UNGATED WRITE, and it is the only one this factory makes into a client's
+            # board with no human anywhere. The exemption to "nothing irreversible without a yes"
+            # is declared beside the rule it departs from — the AUTHORITY block of
+            # `beeverforge/product/module.py` — together with the boundary that makes it safe: it
+            # changes
+            # which requirement a card CITES and nothing else. Nothing here may hand it a card or a
+            # requirement; the moment a caller chooses the target, the argument above stops holding.
+            results = module.repoint_orphans()
+            # PAIRED BY THE CARD EACH RESULT NAMES, never by position. There is one result per card
+            # WRITTEN, and a card whose citation already read correctly is skipped without one — so
+            # the two lists are different lengths and a positional pair would name the wrong cards
+            # to the client while leaving the repaired ones unannounced for ever.
+            written = {_card_ref(getattr(r, "ref", "")) for r in results
+                       if getattr(r, "ok", False)} - {""}
+            fresh = {card: successor for (card, _cited, successor) in orphans
+                     if card in written}
+            refusals = [r for r in results if not getattr(r, "ok", False)]
+            refused = len(refusals)
+            # COUNTED FROM THE WRITES, NAMED WHERE THEY CAN BE: a refusal whose result names no
+            # card must still be reported, or the one shape of this failure that carries no label
+            # is also the one that passes in silence.
+            named = sorted({_card_ref(getattr(r, "ref", "")) for r in refusals} - {""},
+                           key=ref_sort_key)
+            if refusals:
+                # A ROUND THAT REPAIRED NOTHING IS NOT A CLEAN BOARD, and nothing else here would
+                # say so: with every write refused there is no repair to log, no fact to remember
+                # and no sentence to send, so the whole round used to pass in silence and report
+                # itself clean. Every one of these writes goes through ONE credential to ONE
+                # repository, which is why the ordinary shape of this failure is all of them at
+                # once — an exhausted quota, a rotated token, a permission removed — repeating
+                # hourly while the floor is free to pick up any of these cards and build against a
+                # promise nobody holds. The per-card cause is on the product logger; what was
+                # missing here is that it happened at all.
+                activity.logger.error(
+                    "BEEVERFORGE_PRODUCT_ORPHANS_REFUSED project=%s refused=%d of=%d cards=%s "
+                    "— the "
+                    ""
+                    "board "
+                    "would not take the repair, so they still cite a requirement that was retired",
+                    name, refused, len(orphans),
+                    ",".join(ref_label(c) for c in named) or "unnamed")
+            unpaired = sorted(written - set(fresh), key=ref_sort_key)
+            if unpaired:
+                # The board is asked once and written once, and it changes in between: a card whose
+                # citation is edited onto the retired text inside that window is repaired without
+                # this round ever seeing which requirement it moved onto, and it is not an orphan
+                # for the next round to find. The sentence cannot be written truthfully, so the
+                # write is at least never silent. The window closes only where the write accepts the
+                # list it was asked about — `repoint_orphans` takes none, and a WriteResult carries
+                # no successor to recover it from here.
+                activity.logger.error(
+                    "BEEVERFORGE_PRODUCT_ORPHANS_UNPAIRED project=%s cards=%s — repaired on the "
+                    "board "
+                    "after this round read it, so they are neither remembered nor announced",
+                    name, ",".join(ref_label(c) for c in unpaired))
+            if fresh:
+                done = len(fresh)
+                activity.logger.warning(
+                    "BEEVERFORGE_PRODUCT_ORPHANS_REPOINTED project=%s cards=%s now citing %s",
+                    name, ",".join(ref_label(c) for c in sorted(fresh, key=ref_sort_key)),
+                    ",".join(f"REQ-{r}" for r in sorted(set(fresh.values()))))
+                repaired.update(fresh)
+                # PERSISTED BEFORE THE POST, because the board write already happened. Recorded
+                # after it, a dropped announcement would leave a repair nothing owes a message for
+                # — and the next round cannot rediscover it, the cards having stopped being orphans
+                # the moment they were repaired.
+                _remember_repoint(name, fresh, set())
+
+        # "clean" IS A CLAIM ABOUT THE BOARD, so it is only ever said by a round that has one:
+        # every refusal is carried into the report, or an hourly repair that achieves nothing reads
+        # exactly like an hourly repair that had nothing to do.
+        parts: list[str] = []
+        if done:
+            parts.append(f"repointed:{done}")
+        if refused:
+            parts.append(f"refused:{refused}")
+
+        owed = {card: req for card, req in repaired.items() if (card, req) not in announced}
+        if not owed:
+            return " ".join(parts) or "clean"
+
+        if not channel_destination(project, product=True):
+            # NOBODY TO SAY IT TO is a chat add-on given no room for the product; the panel always
+            # has one, the project's own (the C-25 rule every other say-path here keeps).
+            # Only when something was repaired THIS round: owed survives every round until there is
+            # somebody to say it to, and an hourly line about a standing debt is the wallpaper this
+            # repair is written not to produce.
+            if done:
+                activity.logger.warning(
+                    "BEEVERFORGE_PRODUCT_ORPHANS_UNANNOUNCED project=%s cards=%s — this "
+                    "project has "
+                    ""
+                    "no "
+                    "product channel, so nobody was told the promise under them changed",
+                    name, ",".join(ref_label(c) for c in sorted(owed, key=ref_sort_key)))
+            return " ".join([*parts, f"unannounced:{len(owed)}"])
+
+        from beeverforge.adapters.channel import build_channel
+
+        channel = build_channel(project)
+        said: set[tuple[str, int]] = set()
+        dropped = 0
+        # ONE MESSAGE PER REQUIREMENT IN FORCE, so each sentence is true of every card it names.
+        for requirement in sorted(set(owed.values())):
+            cards = sorted((card for card, req in owed.items() if req == requirement),
+                           key=ref_sort_key)
+            if _product_post(channel, project, cfg, _repointed_text(
+                    cards, requirement, language=getattr(project, "language", None),
+                    agent_name=getattr(cfg, "agent_name", "") or "")):
+                said |= {(card, requirement) for card in cards}
+            else:
+                dropped += len(cards)
+        if said:
+            _remember_repoint(name, {}, said)
+            parts.append(f"announced:{len(said)}")
+        if dropped:
+            parts.append(f"announce-dropped:{dropped}")
+        return " ".join(parts)
+    except Exception as exc:  # noqa: BLE001 — a repair must never break the round it rides on
+        # A build_channel or a registry entry that raises makes this dead EVERY hour, with cards
+        # citing a retired requirement the whole time. Without the cause and a marker to alert on,
+        # that is one unattributable warning an hour and nothing anybody can act on.
+        activity.logger.error("BEEVERFORGE_PRODUCT_ORPHANS_FAILED project=%s (%s) — cards "
+                              "may still "
+                              ""
+                              "cite "
+                              "a requirement that was retired", name, exc, exc_info=True)
+        return "error"
+
+
+def _finding_reminders(project_name: str, ledger: list, language: str = "") -> list:
+    """Open review findings, as findings the round will report — chased once, then left visible.
+
+    A loop that opens and nothing ever closes is the failure this whole module warns about, so the
+    close here is an explicit human `ack #N` rather than an invented observation: a merged ticket
+    carrying a critical review has no state change left to watch.
+
+    `language` IS PASSED IN (#160): `report()` renders `detail` and `action` verbatim, so a
+    finding composed here in one language survives the whole trip to the channel. Every other
+    finding in that same list already came from `watch()`, which is localized — so a round could
+    print four sentences in the project's language and this one in Portuguese."""
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import CHASED, FINDING, chase_due, waiting
+    from beeverforge.techlead import voice as tl_voice
+    from beeverforge.techlead.watch import STUCK, Finding
+
+    open_findings = waiting(ledger, kind=FINDING, owner=OWNER)
+    if not open_findings:
+        return []
+    ages = {(FINDING, x.subject, x.about): _hours_since(x.ts) for x in open_findings}
+    chased = chase_due(ledger, hours_open=ages, after_hours=24.0, ts=_now_iso())
+    chased = [x for x in chased if x.kind == FINDING and x.state == CHASED]
+    if chased:
+        loop_store.write(project_name, chased)
+    return [
+        Finding(
+            # The subject verbatim (#69). `int(...) if isdigit() else None` dropped the ticket
+            # entirely for a Jira/ADO ref, and `report()` renders `*#{ticket}*` only when it is
+            # truthy — so the reminder lost the one number it was about, while the very next line
+            # still told somebody to reply `ack CONT-412`.
+            kind=STUCK, ticket=str(loop.subject) or None,
+            resumable=False, progress=_hours_since(loop.ts),
+            detail=tl_voice.say(tl_voice.NARRATION, "finding.unacked.detail", language,
+                                detail=(loop.context or {}).get("detail", "")[:160]),
+            action=tl_voice.say(tl_voice.NARRATION, "finding.unacked.action", language,
+                                ticket=loop.subject),
+        )
+        for loop in chased
+    ]
+
+
+def _hours_since(iso: str) -> float:
+    from datetime import UTC, datetime
+
+    try:
+        then = datetime.fromisoformat(iso)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - then).total_seconds() / 3600.0)
+    except (ValueError, TypeError):
+        # An unreadable timestamp must never make something look old enough to chase — that would
+        # ping somebody about a question asked a minute ago.
+        activity.logger.info("could not read when a loop opened (%r) — not chasing it", iso)
+        return 0.0
+
+
+def _this_activitys_event(event: str) -> str:
+    """An event id for a transition this activity applies: its workflow run and its own activity
+    id, so a retried activity is answered from the card's record and never decided twice (ADR-0055
+    D5). `""` outside an activity — a direct call lets the door derive one."""
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return ""
+    return f"{event}-{info.workflow_run_id}-{info.activity_id}"
+
+
+def _pass_event(pass_number: int) -> str:
+    """The id of one adjust pass's transition: the run's activity id and the pass, so a retried
+    activity is answered from the record and a second pass is never mistaken for the first. `""`
+    outside an activity, where the door derives one."""
+    run = _this_activitys_event("adjusted")
+    return f"{run}-pass{pass_number}" if run else ""
+
+
+def _where_a_closed_card_goes(project, tracker, board, ref: str) -> JobState:
+    """Where the stale-pickup healer moves a closed card (#413): Backlog for a card the tracker
+    says was closed as NOT delivered, Done otherwise.
+
+    HOW IT WAS CLOSED, NOT THAT IT WAS. The healer moved every closed card to Done, so a card
+    withdrawn as NOT PLANNED was filed as delivered work — `done`, the report that must stay
+    trustworthy. Where the tracker says so (`lifecycle.ports.withdrawn`: the local board and GitHub
+    keep the reason), the card goes to Backlog, where the tracker's own not-delivered close puts
+    one. Where it cannot say, the card goes to Done as it always did: the merged card left in
+    TO-DO that this healer was written for (2026-08-04) is the common case, and a row that keeps
+    no reason gives no ground to move it anywhere else."""
+    from beeverforge.lifecycle.ports import withdrawn
+
+    try:
+        ticket = tracker.get_ticket(ref)
+    except Exception:  # noqa: BLE001 — unread is "cannot say": what it always did
+        activity.logger.info("could not read how #%s was closed", ref, exc_info=True)
+        return JobState.DONE
+    return JobState.SKIPPED if withdrawn(ticket) else JobState.DONE
+
+
+def _a_closed_card_in_the_queue(project, tracker, board, ref: str) -> str:
+    """The stale-pickup healer's card, THROUGH ITS DOOR (ADR-0055 D8, #414). A card closed while
+    it sat in the pickup column is a close the platform did not make there — every close of ours
+    takes the card out of the queue's column on every row — so it is handed to the door as an
+    observed `closed`: its promise cancelled and its requester told when it was withdrawn, exactly
+    as a close through the platform; and the board follows the close, filing the card where the
+    close puts it (`table.consequences`), with the map every other move speaks (C-14).
+
+    TWO CLOSES ARE NOT A PERSON'S, and neither is handed over: one the record already holds (the
+    door refuses it, and says so), and a SPLIT card's — the splitter closes it as not delivered
+    and its children carry its work, so its promise is not cancelled (`triage.delivered_numbers`).
+    Returns what happened, for the healer's line."""
+    from beeverforge.lifecycle import OBSERVED, CardEvent, transition
+
+    if _children_safe(tracker, ref):
+        return "it was split, and its children carry its work — left where it is"
+    target = _where_a_closed_card_goes(project, tracker, board, ref)
+    moved = transition(project, ref, CardEvent.CLOSED, by=OBSERVED,
+                       facts={"delivered": target is JobState.DONE, "column": "todo",
+                              "before": "todo"},
+                       tracker=tracker, board=board)
+    if moved.refused:
+        return f"not moved: {moved.refused}"
+    # THE COLUMN AS THIS BOARD CALLS IT (#502): the line names where the close put the card, and a
+    # renamed board has no `Done` for the operator to find
+    from beeverforge.adapters.board.base import stage_column
+
+    where = stage_column(board, "done" if target is JobState.DONE else "backlog")
+    return f"moving the card to {where} ({moved.outcome('column') or 'nothing to move'})"
+
+
+def _converge_card_transitions(project) -> None:
+    """`lifecycle.observe`, then `lifecycle.converge`, on the hourly round, logged — see their call
+    in `techlead_watch`. OBSERVED FIRST (ADR-0055 D8, #414): a card closed on the vendor's own
+    screen is a transition the record did not hold, and what follows it is converged like any
+    other's."""
+    from beeverforge.lifecycle import converge, observe
+
+    for line in observe(project):
+        activity.logger.info("card change observed: %s", line)
+    for line in converge(project):
+        activity.logger.info("card transition converged: %s", line)
+
+
+@activity.defn
+async def techlead_watch(project_name: str) -> str:
+    """The tech-lead's rounds (ADR-0020 §3): look at the floor, say what is stuck, resume what the
+    factory already knows how to fix.
+
+    Reads the live workflows rather than a stored snapshot, because the question is what is
+    happening NOW — and a park that nobody answered is invisible to every other path here: no event
+    fires again after the one that created it.
+
+    Silent when there is nothing to say. A watcher that reports "all fine" every hour is one nobody
+    reads on the hour that matters."""
+    from datetime import UTC, datetime
+
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import (
+        REMEDY,
+        close_by_observation,
+        open_loop,
+        reassert_waiting,
+        waiting,
+    )
+    from beeverforge.runtime.temporal import view as tv_view
+    from beeverforge.runtime.temporal.view import parse_job_id as tv_parse_job_id
+    from beeverforge.techlead.classify import classify, remedy_for
+    from beeverforge.techlead.memory import learn_from, remedy_verdicts, temper
+    from beeverforge.techlead.memory import signature as mem_signature
+    from beeverforge.techlead.watch import (
+        RESUME_FAILED,
+        RESUMED,
+        AtAGate,
+        FloorState,
+        Parked,
+        report,
+        watch,
+        worth_saying,
+    )
+
+    try:
+        project = ProjectRegistry().get(project_name)
+    except Exception as exc:  # noqa: BLE001
+        # A schedule exists for a project the registry cannot resolve: the rounds will return
+        # "no-project" every hour, for ever, and look exactly like a quiet floor.
+        activity.logger.error("techlead watch: project %r is not in the registry (%s) — these "
+                              "rounds do nothing and nobody is watching that floor",
+                              project_name, exc)
+        return "no-project"
+
+    # ADR-0032 recovery on the HOURLY cadence, BEFORE anything that can fail this round (the
+    # Temporal read, the floor queries): an unmerged proposal makes the product role deny its own
+    # requirement within one client message, and the weekly sweep was its only healer.
+    await asyncio.to_thread(_land_product_proposals, project)
+
+    # Cards still citing a requirement that was replaced, before the floor can pick one up and
+    # build against a promise nobody holds any more. Same position and the same reason: upstream of
+    # everything that can fail this round.
+    await asyncio.to_thread(_repoint_product_orphans, project)
+
+    # WHAT A CARD'S DOOR RECORDED AND COULD NOT APPLY (ADR-0055 D5) — the tracker blinked, the
+    # engine was away — applied again while its transition is still the card's latest, superseded
+    # otherwise. Upstream of nothing, and it never raises.
+    await asyncio.to_thread(_converge_card_transitions, project)
+
+    client = engine_client()
+
+    # The staging bridge (board #6), on this round because a parked release holds the pipeline and
+    # the weekly sweep would let it hold it for a week. Best-effort and upstream of nothing: a
+    # failure here must not cost the floor report, which is what this activity is for.
+    try:
+        await _offer_the_release_to_the_client(project, client)
+    except Exception as exc:  # noqa: BLE001
+        activity.logger.warning("could not offer the parked release to the client (%s)", exc)
+
+    parked: list[Parked] = []
+    long_running: list[tuple[str, float]] = []
+    at_a_gate: list[AtAGate] = []
+    at_the_merge_gate: list[tuple[str, str]] = []
+    running = 0
+    #: tickets whose state we POSITIVELY observed this round: parked, or running-and-answering.
+    #: A query that failed contributes nothing — for the memory pass below, "could not see" must
+    #: never be readable as anything at all.
+    observed_tickets: set[str] = set()
+    now = datetime.now(UTC)
+
+    #: EVERY registered project, not just this one — read ONCE, outside the loop.
+    #:
+    #: `parse_job_id` splits a workflow id on the known project names, LONGEST FIRST. Handing it
+    #: only `[project_name]` would defeat the very guard it exists for: with `["acme"]` alone,
+    #: `beeverforge-acme-web-478` parses as project `acme`, ticket `web-478`, and this project's
+    #: rounds
+    #: would count — and RESUME — a sibling project's job. With both names present, `acme-web`
+    #: matches first and the id is correctly not ours. A test asserts exactly this.
+    known_projects = [p.name for p in ProjectRegistry().list()]
+
+    async for wf in client.list_workflows(
+        'WorkflowType = "JobWorkflow" AND ExecutionStatus = "Running"'
+    ):
+        # `parse_job_id` RATHER THAN A LOCAL REGEX (#69). The regex here was
+        # `^beeverforge-{project}-(\d+)$` — digits only — so on a Jira/ADO deployment (`CONT-412`)
+        # it
+        # matched no workflow at all and this whole subsystem went blind: `parked` stayed empty,
+        # and since `_idle_minutes` derives idleness FROM `parked`, the idle-floor finding could
+        # not fire either. The rounds returned "clean" every hour while the floor was held.
+        #
+        # The shared parser carries the very guard this regex's own comment cited as its reason to
+        # exist — it splits on the REGISTERED project names, longest first, so
+        # `beeverforge-acme-web-478`
+        # cannot be read as project `acme` (see `runtime/temporal/view.py`, whose round-trip
+        # property is asserted in tests/test_non_numeric_refs_reach_the_api.py). Passing
+        # `known_projects` explicitly keeps this pure of a registry read on a hot path.
+        project_of, ticket = tv_parse_job_id(str(wf.id), known_projects=known_projects)
+        if project_of != project_name or not ticket:
+            continue
+        running += 1
+        try:
+            handle = client.get_workflow_handle(wf.id)
+            state = await handle.query("awaiting_action")
+        except Exception as exc:  # noqa: BLE001 — a job that cannot answer is left alone
+            # Counted as running, which is the safe side; but if every job stops answering, the
+            # rounds see a busy floor and never report the parks holding it.
+            activity.logger.info("techlead watch: %s did not answer (%s) — counted as running",
+                                 wf.id, exc)
+            continue
+        observed_tickets.add(ticket)
+        hours_running = (now - wf.start_time).total_seconds() / 3600 if wf.start_time else 0.0
+        if not state:
+            # A GATE ANSWERS EXACTLY LIKE A WEDGED JOB, and that cost the pilot the worst message
+            # this platform has sent (2026-08-16). `awaiting_action` is the PARK query — the merge
+            # gate and the production gate have their own, and `view.answer_merge_gate` says so in
+            # as many words: *"THE MERGE GATE IS NOT A PARK … `awaiting_action` is None"*. So a
+            # pull request waiting overnight for its author was counted as RUNNING, crossed
+            # `LONG_RUNNING_HOURS`, and was announced as *"rodando há 10h sem parar nem terminar —
+            # não consegui identificar a causa"*, with two verbs its gate does not accept, to the
+            # person it was waiting for.
+            #
+            # ASKED FROM ONE LIST (`view.HUMAN_GATES`), so a gate added to the workflow cannot be
+            # invisible here — a guard derives that list from the workflow's own queries.
+            gate, payload = "", {}
+            for query, name in tv_view.HUMAN_GATES.items():
+                try:
+                    answer = await handle.query(query)
+                except Exception as exc:  # noqa: BLE001 — one unanswered gate is not a verdict
+                    activity.logger.info("techlead watch: %s did not answer %s (%s)",
+                                         wf.id, query, exc)
+                    continue
+                if answer:
+                    gate = name
+                    payload = answer if isinstance(answer, dict) else {}
+                    break
+            if gate == "merge" and payload.get("auto"):
+                # ARMED AUTO-MERGE IS WAITING FOR A BUILD, NOT FOR A PERSON. It sits in the same
+                # watch and answers the same query; without this line the round would tell somebody
+                # *"o portão é de vocês"* about a job nobody can advance.
+                gate = "ci"
+            if gate == "merge" and payload.get("pr_url"):
+                # A PULL REQUEST WAITING ON A PERSON — the product role's event once it has waited
+                # 48 h (#267 slice 3), counted from the first round that saw it here
+                at_the_merge_gate.append((ticket, str(payload.get("pr_url"))))
+            if gate:
+                running -= 1  # waiting on a person is not work; it holds the floor without using it
+                at_a_gate.append(AtAGate(
+                    ticket=ticket, hours=hours_running, gate=gate,
+                    deaf=tv_view.gate_cannot_hear(payload) if gate == "merge" else ""))
+                continue
+            # RUNNING AND ANSWERING, so not parked — but a job in a workflow-task failure loop
+            # answers exactly like this, for ever, holding the single slot while counted as work.
+            # Nothing else could see it: the idle finding requires `running == 0`.
+            #
+            # ASKED OF `view.is_wedged`, NOT RE-DERIVED (#164). That function is the rule — "a
+            # function rather than an expression, because it is a rule and rules get tested" — and
+            # this line reproduced two of its three conditions with the third (`action is None`)
+            # standing in as the `if not state` above. Two derivations of one rule is how the Stop
+            # button and the alarm come to disagree about the same job, which is the defect
+            # `is_wedged` was extracted to end.
+            if tv_view.is_wedged({"action": None, "start_time": wf.start_time}, live=True):
+                long_running.append((ticket, hours_running))
+            continue
+        running -= 1  # parked is not running: it holds the floor without using it
+        parked.append(Parked(ticket=ticket, hours=hours_running,
+                             note=str(state.get("note") or ""),
+                             kind=str(state.get("kind") or "impediment"),
+                             attempts_spent=int(state.get("attempts_spent") or 0),
+                             # WHAT THE PARK SAID IT IS (`RunResult.hold_cause`), so this
+                             # round reads a declaration instead of re-deriving the cause
+                             # from a note that quotes a check's name and a vendor's
+                             # remedy. "" for every park that did not say.
+                             cause=str(state.get("cause") or ""),
+                             # WHEN THE ENGINE ITSELF WILL RESUME IT (#146). The park has carried
+                             # this since #140 and the rounds never read it, so a job minutes from
+                             # resuming on its own was announced to a client as needing a decision
+                             # — while the panel, reading the same payload, said the opposite.
+                             wakes_at=str(state.get("wakes_at") or "")))
+
+    # THE PRODUCT ROLE'S EVENT, BESIDE THE TECH-LEAD'S ROUND: the round already listed who waits
+    # at the merge gate, so asking costs nothing more — and the answer goes to the requester's
+    # conversation, not to the floor (`events.pull_requests_at_the_gate`). Best-effort: the floor
+    # report is what this activity is for.
+    await asyncio.to_thread(_pull_requests_waiting, project, at_the_merge_gate)
+
+    queued = await asyncio.to_thread(_queued_tickets, project)
+    state = FloorState(parked=parked, running=running, queued=queued,
+                       long_running=long_running, at_a_gate=at_a_gate,
+                       idle_minutes=_idle_minutes(parked, running),
+                       recent_causes=await asyncio.to_thread(_recent_causes, project_name))
+
+    # ── MEMORY FIRST (ADR-0021). Before deciding anything, close what the world already resolved.
+    #
+    # ONLY POSITIVE EVIDENCE CLOSES. The first version closed by ABSENCE — "not parked right now"
+    # was read as "worked" — and a reviewer built two damning counterexamples from it: a deploy
+    # mid-round makes the query fail, the ticket drops out of the parked set, and a still-broken
+    # remedy is credited a success; or the resume simply un-parks the job for the ninety minutes
+    # its agent pass runs, the next round sees it "not parked", and every slow-recurring failure
+    # books `worked` for ever. One false `worked` poisons `hopeless()` permanently — it requires
+    # worked == 0 — so the factory would retry a useless remedy at full price, indefinitely,
+    # each attempt looking like diligence. The same not-seen-equals-fixed disease was fixed on the
+    # product board the same day. Verdicts now:
+    #     parked, same signature            → did-not-work
+    #     parked, same cause, new wording   → still PENDING (same disease, different rash —
+    #                                         neither credit nor blame on a string drift)
+    #     parked, different cause           → worked (that failure, at least, is gone)
+    #     gone from the floor              → ask Temporal for the workflow's TERMINAL state
+    #     running / unqueryable            → still PENDING; absence is not an outcome
+    parked_now = {p.ticket: (mem_signature(p.note), classify(p.note, cause=p.cause).cause)
+                  for p in parked}
+    ledger = await asyncio.to_thread(loop_store.read, project_name)
+    open_remedies = waiting(ledger, kind=REMEDY, owner=OWNER)
+    # end-states for tickets gone from the floor, prefetched so the DECISION is a pure function
+    # a test can hold row by row (remedy_verdicts) instead of logic buried in this activity
+    terminal: dict[str, str] = {}
+    for loop in open_remedies:
+        # `str(...)`, not `_as_int(...)`: the ledger already stores the subject as the provider's
+        # own string, and the int conversion mapped every non-numeric ref to 0 — falsy, so the
+        # `if ticket` below skipped it, `terminal` was never populated, and every open remedy on a
+        # Jira deployment stayed PENDING for ever (#69).
+        ticket = str(loop.subject)
+        if ticket and ticket not in parked_now and ticket not in observed_tickets \
+                and ticket not in terminal:
+            terminal[ticket] = await _terminal_outcome(client, project_name, ticket)
+    verdicts = remedy_verdicts(open_remedies, parked_now=parked_now,
+                               observed=observed_tickets, terminal=terminal)
+    settled = close_by_observation(ledger, verdicts)
+
+    # Keep every still-waiting loop inside the store's read window (see reassert_waiting): an open
+    # obligation that ages out of view evaporates without a close, a log, or an ack.
+    still_open = reassert_waiting(ledger + settled)
+    if settled or still_open:
+        await asyncio.to_thread(loop_store.write, project_name, settled + still_open)
+        ledger = ledger + settled
+    history = learn_from(ledger)
+
+    # THE PROJECT SPEAKS FIRST HERE — a scheduled round nobody asked for — so it is the
+    # configured language, never a question's (#124).
+    lang = str(getattr(project, "language", "") or "")
+    findings = watch(state, language=lang)
+
+    # Review findings nobody has acknowledged yet, due for their one reminder. Computed BEFORE the
+    # clean-floor return below: the first version lived after it, which quietly made the reminder
+    # conditional on the floor ALSO having some unrelated problem — a merged ticket carrying a
+    # critical finding would only ever be chased on a day something else happened to break too.
+    reminders = await asyncio.to_thread(_finding_reminders, project_name, ledger, lang)
+
+    if not findings and not reminders:
+        # Nothing wrong now, so nothing is being watched — and the memory has to be cleared, or a
+        # problem that comes back later is suppressed by an entry from the last time it happened.
+        await asyncio.to_thread(_remember_watch, project_name, {})
+        return "clean"
+
+    # ── ACT FIRST, on EVERY finding — deduplication governs speech, never remediation. The first
+    # version tempered-then-resumed only what survived worth_saying, which coupled the factory's
+    # one remedy to its politeness: a resume whose signal failed at 21h could not be retried until
+    # the 6h repeat threshold let the finding be MENTIONED again. Whether to try again is the
+    # memory's decision (temper/hopeless); how often to talk about it is the channel's.
+    resumed = []
+    outcomes: dict[str, str] = {}
+    opened: list = []
+    acted: list = []
+    parked_tickets = {p.ticket for p in parked}
+    for finding in findings:
+        # ONLY A PARKED FINDING IS TEMPERED OR RESUMED (sweep B5, 2026-08-16). The classifier and
+        # the memory reason over a PARK NOTE; for a wedged or gate-held job there is none, so this
+        # loop classified the empty string — UNKNOWN cause — and OVERWROTE the crafted message
+        # with escalation boilerplate offering `resume`/`skip`, two verbs the engine refuses for
+        # a job that is not parked. That boilerplate is the exact text of the false 10h alarm the
+        # pilot received about his own healthy pull request.
+        if finding.ticket not in parked_tickets:
+            continue
+        # WHAT THE RECORD SAYS COMES FIRST. A remedy that has failed twice on this same failure
+        # with no successes is not tried a third time — it is escalated, carrying what was learned.
+        # This is the whole point of having a memory: it can only make the factory more cautious.
+        sig = _sig_of(finding, parked)
+        # temper() is the ONE integration point between history and a remedy — the same function
+        # the tests exercise. An inline re-implementation here (which is what v1 did) is how the
+        # tested behaviour and the shipped behaviour quietly stop being the same thing.
+        here = next((p for p in parked if p.ticket == finding.ticket), None)
+        verdict_now = classify(here.note if here else "", cause=here.cause if here else "")
+        spent = here.attempts_spent if here else 0
+        tempered = temper(
+            remedy_for(verdict_now, already_spent=spent, language=lang), history.get(sig),
+            language=lang)
+        if finding.resumable and tempered.action != "retry":
+            from beeverforge.techlead.memory import MEMORY
+            from beeverforge.techlead.voice import say as tech_say
+
+            finding.resumable = False
+            finding.action = tempered.say or (tempered.reason
+                                              + tech_say(MEMORY, "needs_a_person", lang))
+        if not (finding.resumable and finding.ticket):
+            continue
+        # One open remedy per (ticket, signature) at a time: a resume already in flight from the
+        # last round — its job still running its agent pass — must not be stacked with another.
+        if any(str(x.subject) == finding.ticket and x.about == sig for x in open_remedies):
+            continue
+        try:
+            handle = client.get_workflow_handle(f"beeverforge-{project_name}-{finding.ticket}")
+            # `args=[...]`, NOT two positionals. `WorkflowHandle.signal` is
+            # `(signal, arg=UNSET, *, args=[])` — `args` is keyword-only, so a second value
+            # passed positionally is a TypeError before anything reaches the server. This was
+            # the bug: the tech-lead's ONE remediation, pressing resume, raised on every
+            # attempt in every deployment, and the handler logged no exception, so the round
+            # reported the impediment and looked like it had acted on it.
+            await handle.signal("act_on_impediment", args=["resume", ""])
+            resumed.append(finding.ticket)
+            outcomes[finding.key] = RESUMED
+            acted.append(finding)
+            # Opened as PENDING, never as a success — a later round decides by looking. The
+            # cause travels with it so "same disease, different wording" stays undecidable
+            # instead of being miscredited as a cure.
+            opened.append(open_loop(
+                REMEDY, str(finding.ticket), owner=OWNER, about=sig, ts=_now_iso(),
+                context={"note": finding.detail[:200],
+                         "cause": next((c for t, (g, c) in parked_now.items()
+                                        if t == finding.ticket), "")}))
+        except Exception as exc:  # noqa: BLE001 — saying it still matters if the signal missed
+            # WHY it failed is the whole message. "could not resume #478" told an operator
+            # nothing they could act on, and hid a TypeError for as long as it existed.
+            activity.logger.warning(
+                "techlead watch: could not resume #%s (%s: %s) — the impediment stays parked "
+                "and a person has to press it", finding.ticket, type(exc).__name__, exc)
+            # The channel is told the truth: it tried, it could not, a person must.
+            outcomes[finding.key] = RESUME_FAILED
+            acted.append(finding)
+
+    if opened:
+        await asyncio.to_thread(loop_store.write, project_name, opened)
+
+    # ── SPEECH. Deduplicate the unchanged findings; what was ACTED ON this round is always said
+    # (a quiet action is indistinguishable from no action), and the ack reminders ride along —
+    # never resumable, the ticket already merged; the only button left is a person's `ack`.
+    said = await asyncio.to_thread(_watch_history, project_name)
+    acted_keys = {f.key for f in acted}
+    quiet = [f for f in findings if f.key not in acted_keys]
+    to_say, remember = worth_saying(quiet, said)
+    await asyncio.to_thread(_remember_watch, project_name, remember)
+    to_say = acted + to_say + reminders
+    if not to_say:
+        return f"nothing-new resumed:{len(resumed)}"
+
+    text = report(to_say, agent_name="Tech lead", outcomes=outcomes, language=lang)
+    channel = channel_destination(project)
+    if channel:
+        from beeverforge.adapters.channel import build_channel
+
+        await asyncio.to_thread(
+            lambda: build_channel(project).say(project=project, channel=channel, text=text))
+    return f"reported:{len(to_say)} resumed:{len(resumed)}"
+
+
+@activity.defn
+async def open_review_loop(inp: ReviewLoopInput) -> str:
+    """Record that something shipped carrying a review the factory did not act on (ADR-0021).
+
+    Opened, not closed: the tech-lead's next round chases it once, and it closes when a person
+    acknowledges. The alternative — announcing it and moving on — is what happened to #478, where a
+    critical finding was produced, was correct, and reached nobody."""
+    def _do() -> str:
+        from beeverforge.memory import store as loop_store
+        from beeverforge.memory.ledger import FINDING, open_loop
+
+        loop = open_loop(
+            FINDING, str(inp.issue), owner=OWNER, about=inp.decision, ts=_now_iso(),
+            context={"detail": inp.detail[:400], "score": str(inp.score), "pr": inp.pr_url},
+        )
+        written = loop_store.write(inp.project, [loop])
+        return f"opened:{written}"
+
+    return await asyncio.to_thread(_do)
+
+
+async def _terminal_outcome(client, project_name: str, ticket: str) -> str:
+    """What actually happened to a job that is no longer on the running floor — or "" if we
+    cannot tell, in which case the remedy loop stays PENDING rather than guessing.
+
+    This is the positive-evidence half of "the ticket moved on": COMPLETED means the resume
+    genuinely carried the job home; FAILED or TIMED_OUT means it did not survive; a human
+    terminating or cancelling is neither — the loop closes neutral (`abandoned`), which
+    `learn()` counts as neither success nor failure, so it can never tip `hopeless()` either
+    way."""
+    from temporalio.client import WorkflowExecutionStatus
+
+    from beeverforge.techlead.memory import DID_NOT_WORK, WORKED
+
+    try:
+        desc = await client.get_workflow_handle(f"beeverforge-{project_name}-{ticket}").describe()
+    except Exception as exc:  # noqa: BLE001 — cannot see → no verdict; PENDING is the honest state
+        activity.logger.info("techlead memory: could not learn how #%s ended (%s) — its remedy "
+                             "stays pending", ticket, exc)
+        return ""
+    status = desc.status
+    if status == WorkflowExecutionStatus.COMPLETED:
+        return WORKED
+    if status in (WorkflowExecutionStatus.FAILED, WorkflowExecutionStatus.TIMED_OUT):
+        return DID_NOT_WORK
+    if status in (WorkflowExecutionStatus.TERMINATED, WorkflowExecutionStatus.CANCELED):
+        return "abandoned"
+    return ""  # still RUNNING under another id shape, or CONTINUED_AS_NEW — no verdict
+
+
+#: Who owns the loops this activity opens. A string rather than a role object: the ledger is read
+#: by other passes, and an owner they can filter on has to survive a scan.
+OWNER = "techlead"
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
+
+
+def _sig_of(finding, parked: list) -> str:
+    """The failure fingerprint behind a finding, so history is looked up on WHAT BROKE rather than
+    on which ticket it broke. The same throttling on #478 and #503 must reach one history, or a
+    recurring problem is remembered as unrelated one-offs and nothing is ever learned."""
+    from beeverforge.techlead.memory import signature
+
+    for job in parked:
+        if job.ticket == finding.ticket:
+            return signature(job.note)
+    return signature(finding.detail)
+
+
+def _idle_minutes(parked: list, running: int) -> float:
+    """How long the floor has had nothing moving. A parked job holds the floor but is not work, so
+    a board full of parks reads as idle — which is exactly what it is."""
+    if running:
+        return 0.0
+    return 60.0 * max((p.hours for p in parked), default=0.0)
+
+
+def _queued_tickets(project) -> list[str]:
+    """What is waiting in TO-DO — the other half of "the floor is idle and could be working".
+
+    RETURNS STRINGS, converting at this boundary (#69). `readiness().todo` is still `list[int]`
+    and stays that way here: that is `product/queue.py`, whose int-vs-ref classification is C-05's
+    remaining scope and must not be changed as a side effect of this fix. The tech-lead subsystem
+    speaks the provider's own ref end to end, so the conversion belongs at the seam between them
+    rather than being smeared through either side.
+
+    THE TOKEN IS NOT OPTIONAL. Called with none, `gh` runs unauthenticated and the read fails with
+    "please run gh auth login"; the empty list that came back was indistinguishable from an empty
+    TO-DO, so the tech-lead's idle-floor finding could never fire. It was observed in production
+    doing exactly that. Resolved the same way `ProductModule.token` resolves it, and for the same
+    reason: every real caller constructs this with nothing."""
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+    from beeverforge.product.board import read_board
+    from beeverforge.product.queue import readiness
+
+    # THE TRACKER'S AXIS, because a board IS a tracker object — `product/board._credential` says so
+    # in writing and this site asked the forge anyway. It survived because that function tries
+    # `tracker_token_for` first and only consults the caller's token after, so the wrong axis was
+    # a last resort rather than the first. On a deployment whose two axes differ it is still the
+    # wrong question, and the answer it produces is an empty board rather than an error.
+    token = tracker_token_for(project) or deployment_tracker_token(project) or None
+    tickets, error = read_board(project, token=token)
+    if error:
+        # An unreadable board is not an empty board. Reporting "nothing queued" here would tell the
+        # tech-lead the floor has nothing to do — the exact opposite of what an unreadable board
+        # means, and a lie it would then act on.
+        activity.logger.warning(
+            "techlead watch: could not read the board (%s) — this round cannot tell whether the "
+            "floor is idle with work waiting, so it will not claim either way", error)
+        return []
+    # BY KEY, AS THIS BOARD NAMES ITS COLUMNS (#502): read by the platform's `TO-DO`, a board whose
+    # queue is `A Fazer` had nothing queued, and the idle-floor finding fired beside a full queue
+    from beeverforge.product.board import stages_for
+
+    return [str(n) for n in readiness(tickets, stages=stages_for(project, tickets,
+                                                                 token=token)).todo]
+
+
+def _recent_causes(project_name: str) -> dict[str, int]:
+    """How many DIFFERENT tickets failed each way lately. Three tickets failing the same way is one
+    problem wearing three numbers, and no single diagnosis can see that."""
+    from beeverforge.techlead.classify import classify
+
+    try:
+        from beeverforge.api.metrics_view import scan_records
+
+        seen: dict[str, set] = {}
+        for row in scan_records():
+            if row.get("kind") != "job" or not row.get("note"):
+                continue
+            if str(row.get("pk") or row.get("project") or "") != project_name:
+                continue
+            cause = classify(str(row.get("note"))).cause
+            seen.setdefault(cause, set()).add(str(row.get("ticket")))
+        return {c: len(t) for c, t in seen.items()}
+    except Exception as exc:  # noqa: BLE001 — a pattern we cannot see is not a reason to be silent
+        # Losing this loses recurrence detection specifically: three tickets failing the same way
+        # stop being one systemic cause and go back to looking like three unrelated parks.
+        activity.logger.warning("could not read recent failure causes (%s) — this round cannot "
+                                "spot a repeating cause", exc)
+        return {}

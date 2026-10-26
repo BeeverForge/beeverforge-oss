@@ -1,0 +1,1428 @@
+"""GitHubForge — branches, PRs, reviews, merges via the `gh` CLI (v1).
+
+Runs as the bot when a token is provided (GH_TOKEN in the subprocess env); falls
+back to ambient `gh` auth otherwise (dev only).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import subprocess
+import urllib.parse
+
+from beeverforge.adapters.forge.base import (
+    BranchProtection,
+    CommentsNotListed,
+    ForgeAdapter,
+    Reran,
+    ReviewComment,
+    ReviewEvent,
+)
+from beeverforge.adapters.forge.base import truncated as _truncated
+from beeverforge.adapters.github_cli import LoginRefused, credential_of, nothing_named, refused
+
+log = logging.getLogger("beeverforge.forge.github")
+
+
+def discover_token() -> str | None:
+    """The `gh` login's token on THIS machine, or None — never raises, never logs the value.
+
+    THE GITHUB FORGE'S OWN CAPABILITY, reached through the credential registry's `github` row.
+    It lived in `cli.py` as `_gh_token_if_logged_in`, which made the core spawn a vendor's CLI
+    by name on a path that asks "what forge did you choose?" one line earlier. A convenience
+    with a warning attached at the call site: it is a PERSON's credential, so the factory would
+    commit as them. The generator says so in its remaining-steps list rather than here, because
+    this function's job is only to answer whether one exists."""
+    try:
+        done = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (done.stdout or "").strip() or None if done.returncode == 0 else None
+
+_EVENT_FLAG = {
+    "approve": "--approve",
+    "comment": "--comment",
+    "request-changes": "--request-changes",
+}
+
+
+def _ci_status_from_checks(checks: list[dict], *, required: bool = False) -> str:
+    """Aggregate `gh pr checks --json bucket` rows into one CI state. Fail wins over pending
+    wins over pass; an empty set is "none". `cancel` → failure: a cancelled required check must
+    not read as green. `skipping` did not run, and what that means depends on the read:
+
+    - over the REQUIRED checks (`required=True`) a skipped one is SATISFIED — the repository's own
+      rules left it out of this diff (a path filter), and branch protection reads it so; a set
+      that is all skipped is "success" (review of #320);
+    - over every check, which is only asked when none is required, it is ignored, so a set that
+      is all skipped is "none": nothing ran (#184)."""
+    buckets = {(c.get("bucket") or "").lower() for c in checks}
+    if not buckets:
+        return "none"
+    ran = buckets - {"skipping"}
+    if "fail" in ran or "cancel" in ran:
+        return "failure"
+    if "pending" in ran:
+        return "pending"
+    if not ran:
+        return "success" if required else "none"
+    return "success"
+
+
+#: A workflow run as GitHub links a check it ran: `https://github.com/<owner>/<repo>/actions/runs/
+#: <run id>/job/<job id>` (recorded 2026-09-24). Another app's check run links to `/<repo>/runs/
+#: <id>`, and a commit status to wherever the app that posted it chose.
+_ACTIONS_RUN = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+)(?:/|$)")
+
+#: How many failing runs the CI repair reads a log from, and so re-runs: the two `failed_ci_logs`
+#: has read since #184. One bound for both, because a run re-run whose log the decision never
+#: read is retried blind (measured 2026-10-20 with three red runs: logs of 1 and 2, re-run 1-3).
+_RUNS_READ = 2
+
+
+def _redact(text: str) -> str:
+    """Strip any token embedded in an authenticated URL before it reaches a log/error."""
+    return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text or "")
+
+
+# ---- merge gates: one wording for GitHub's two mechanisms (#184, #206) --------------------------
+#
+# A repository can set the same gate in a RULESET and in CLASSIC branch protection, and the two
+# documents spell it differently (`require_code_owner_review` / `require_code_owner_reviews`,
+# `required_review_thread_resolution` / `required_conversation_resolution.enabled`). Both are
+# mapped through these, so a gate set twice is one row — named once, by one name.
+
+def _process_gate(name: str, remedy: str) -> dict:
+    return {"name": name, "blocking": True, "kind": "process", "remedy": remedy}
+
+
+def _review_gates(*, approvals: object, code_owner: object, conversations: object) -> list[dict]:
+    rows: list[dict] = []
+    wanted = int(approvals or 0)
+    if wanted > 0:
+        rows.append(_process_gate(f"Required approving reviews ({wanted})",
+                                  "A person with write access must approve the pull request."))
+    if code_owner:
+        rows.append(_process_gate("Code owner review",
+                                  "A code owner of the changed files must approve the pull "
+                                  "request."))
+    if conversations:
+        rows.append(_process_gate("Conversation resolution",
+                                  "Resolve the open review conversations on the pull request."))
+    return rows
+
+
+def _signed_commits_gate() -> dict:
+    return _process_gate("Signed commits",
+                         "The factory's commits are not signed: exempt its identity from the "
+                         "rule, or relax it for this branch.")
+
+
+def _status_check_gates(required: object) -> list[dict]:
+    """`required_status_checks` in either spelling: a ruleset's `[{context, integration_id}]`, or
+    classic protection's `{checks: [{context, app_id}], contexts: [...]}` — the same object
+    whether an administrator read the protection or anybody read the branch.
+
+    `unknown`, NEVER `code`. What posts a status is not knowable before it has run once, and
+    knowing the APP is not knowing the subject: on python/cpython@main (read 2026-09-19) GitHub
+    Actions, app 15368, posts `lint` — and `DO-NOT-MERGE`, which no change to the code settles."""
+    if isinstance(required, dict):
+        # BOTH LISTS. A live answer says each check twice — `checks`, and the older `contexts`
+        # GitHub is closing down — and its documented example says `contexts` alone. Naming each
+        # once is `_named_once`'s work, downstream of every caller that reads this shape.
+        required = [*(required.get("checks") or []), *(required.get("contexts") or [])]
+    rows: list[dict] = []
+    for check in required if isinstance(required, list) else []:
+        context = str((check.get("context") if isinstance(check, dict) else check) or "").strip()
+        if context:
+            rows.append({"name": context, "blocking": True, "kind": "unknown"})
+    return rows
+
+
+def _ruleset_gates(rules: list) -> list[dict]:
+    """ONLY RULES ABOUT THE PULL REQUEST ARE GATES. `deletion`, `non_fast_forward`,
+    `required_linear_history` and the like constrain the branch or the merge method, not whether
+    this pull request may land, and are left out."""
+    rows: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        kind, params = rule.get("type"), rule.get("parameters") or {}
+        if kind == "pull_request":
+            rows += _review_gates(approvals=params.get("required_approving_review_count"),
+                                  code_owner=params.get("require_code_owner_review"),
+                                  conversations=params.get("required_review_thread_resolution"))
+        elif kind == "required_signatures":
+            rows.append(_signed_commits_gate())
+        elif kind == "required_status_checks":
+            rows += _status_check_gates(params.get("required_status_checks"))
+    return rows
+
+
+def _classic_gates(protection: dict) -> list[dict]:
+    """A readable `branches/<b>/protection`, typed as `_ruleset_gates` types the same gates.
+
+    `required_linear_history`, `allow_force_pushes`, `allow_deletions` and `enforce_admins` are
+    left out for the reason they are in a ruleset. A LOCKED BRANCH IS IN: it is read-only, so
+    nothing merges until an administrator unlocks it, and no change to the code does that."""
+    def enabled(key: str) -> bool:
+        value = protection.get(key)
+        return isinstance(value, dict) and value.get("enabled") is True
+
+    reviews = protection.get("required_pull_request_reviews")
+    reviews = reviews if isinstance(reviews, dict) else {}
+    rows = _review_gates(approvals=reviews.get("required_approving_review_count"),
+                         code_owner=reviews.get("require_code_owner_reviews"),
+                         conversations=enabled("required_conversation_resolution"))
+    if enabled("required_signatures"):
+        rows.append(_signed_commits_gate())
+    if enabled("lock_branch"):
+        rows.append(_process_gate("Locked branch",
+                                  "The branch is locked (read-only): a repository administrator "
+                                  "must unlock it before anything can merge."))
+    return rows + _status_check_gates(protection.get("required_status_checks"))
+
+
+def _named_once(rows: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    return [r for r in rows if not (r["name"] in seen or seen.add(r["name"]))]
+
+
+class GitHubForge(ForgeAdapter):
+    #: THE WORD THIS FORGE CLOSES ITS OWN ISSUE WITH, written only on a card it owns (#167, see
+    #: `contracts/item_space.py`). It was declared because on GitHub it was the ONLY thing that
+    #: closed a delivered issue: the tracker row's `set_state(DONE)` moved the board column or the
+    #: `beeverforge:done` label and left the issue itself open. Since #180 the tracker row closes
+    #: the issue at Done on every pairing, so this is no longer what delivery depends on. It stays
+    #: for what it still gives: the pull request and its issue linked natively in the forge's own
+    #: screens, and the issue closed at the merge rather than a step later. The tracker row reads
+    #: the issue before it closes it, so on this pairing it finds the issue closed and writes
+    #: nothing: one writer per close.
+    closing_keyword = "Closes"
+
+    #: `pr_checks`' ROWS SAY WHAT EACH CHECK IS (#184, `contracts/checks.py`): whether branch
+    #: protection requires it, and whether it is one of this repository's own workflows (whose
+    #: failing log `failed_ci_logs` can read) or a status some other app posted. The core reads
+    #: the rows instead of the aggregate because of this declaration.
+    checks_are_typed = True
+
+    #: What this forge is called in a sentence a person or an agent reads (`base.display_name`).
+    display_name = "GitHub"
+
+    def __init__(self, repo: str, *, token: str | None = None, token_provider=None,
+                 refused: str = "") -> None:
+        self.repo = repo  # "owner/name"
+        self._static_token = token
+        self._token_provider = token_provider  # re-mints a fresh token at use (long jobs)
+        #: why the credential store refused the credential this forge was meant to use (#742) —
+        #: then it runs nothing on the machine's own login (`github_cli.credential_of`)
+        self.refused = refused
+
+    @property
+    def token(self) -> str | None:
+        # resolved at each use so a job that outlives the ~1h App token still pushes (H3)
+        return credential_of(self)
+
+    def _env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if self.token:
+            env["GH_TOKEN"] = self.token
+        return env
+
+    def _gh(self, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        # NEVER A GUESSED REPOSITORY, OWNER OR BRANCH (`adapters/github_cli.py`), as the
+        # tracker's row
+        why = nothing_named(args)
+        if why:
+            log.warning("BEEVERFORGE_GH_NOTHING_NAMED %s", why)
+            return refused(args, why)
+        try:
+            env = self._env()
+        except LoginRefused as exc:
+            # A FAILED CALL, SAID, as every other refusal of this method is — `gh` never runs
+            log.warning("BEEVERFORGE_GH_LOGIN_REFUSED %s", exc)
+            return refused(args, str(exc))
+        return subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=timeout, env=env
+        )
+
+    def push_remote(self) -> str | None:
+        # GitHub scheme: the token is the password for the x-access-token user.
+        if not self.token:
+            return None
+        return f"https://x-access-token:{self.token}@github.com/{self.repo}.git"
+
+    def authenticated_url(self, url: str) -> str:
+        """`url` with this adapter's token as the x-access-token password — if it is on THIS
+        GitHub, which for an Enterprise deployment is not github.com."""
+        from beeverforge.adapters.forge.base import carries_credentials, host_of
+
+        token = self.token
+        if not token or carries_credentials(url) or host_of(url) != self._host():
+            return url
+        return url.replace("https://", f"https://x-access-token:{token}@", 1)
+
+    def item_space(self) -> tuple[str, str] | None:
+        """Where the `#N` a pull request, a commit or a closing keyword here names an item: this
+        repository, on this host (#167). The tracker row answers the same tuple for a card that
+        lives in this repository — and only then does the job write the card's `#N` into what this
+        forge reads. See `contracts/item_space.py`."""
+        repo = (self.repo or "").strip().strip("/")
+        return ("github", f"{self._host()}/{repo}".lower()) if repo else None
+
+    def _host(self) -> str:
+        """Which GitHub this adapter is talking to — github.com, or an Enterprise deployment."""
+        import os
+
+        return (os.environ.get("GH_HOST") or os.environ.get("GITHUB_HOST")
+                or "github.com").strip().lower()
+
+    def clone_url(self, repo: str, *, token: str | None) -> str:
+        """`https://x-access-token:<token>@<host>/<owner>/<name>.git`, or the plain URL.
+
+        `GH_HOST` is honoured for the same reason `ticket_url` honours it: a GitHub Enterprise
+        deployment is not on github.com, and a clone aimed there fails with a 404 that reads like a
+        missing repository rather than like a wrong host. The bare `github.com` literal this
+        replaced did not even have that."""
+        host = self._host()
+        name = (repo or self.repo or "").strip().strip("/")
+        if token:
+            return f"https://x-access-token:{token}@{host}/{name}.git"
+        return f"https://{host}/{name}.git"
+
+    # ---- reading an ARBITRARY repository -------------------------------------------------------
+
+    def _repo_or_self(self, repo: str) -> str:
+        """`owner/name` for whichever repository the caller meant. "" means this adapter's own."""
+        return (repo or "").strip().strip("/") or self.repo
+
+    def _gh_read(self, args: list[str], what: str) -> subprocess.CompletedProcess[str] | None:
+        """`_gh` for the three reads below, with a FAILURE OF THE PROCESS folded into "could not
+        read" instead of thrown. None = the command never produced an answer at all.
+
+        `subprocess.run` does not answer for every failure — it RAISES for two of them: a `gh` that
+        hangs past the 120s timeout (`TimeoutExpired`) and a `gh` that is not on PATH in the first
+        place (`FileNotFoundError`, the shape a worker image without the CLI takes). Every other
+        method in this class lets those escape, and for a write that is right: a PR that could not
+        be opened must stop the job. These three are different, and the port says so in two places
+        — `delete_branch` promises NEVER RAISES because its caller is an hourly convergence sweep
+        that must survive one bad hour, and both reads promise None as the word for a failed read.
+        An escaping exception is a third answer no caller is written for, and the Azure sibling
+        does not produce it: its transport errors already arrive as `AzureDevOpsError` and come
+        back as None/False. Two providers behind one port must fail in the same vocabulary, or the
+        product's claim that a provider is configuration stops being true at the first timeout.
+        """
+        try:
+            return self._gh(args)
+        except (subprocess.SubprocessError, OSError) as exc:
+            # `gh` never answered, so there is nothing to parse and nothing to conclude.
+            log.warning("gh could not be run to %s: %s", what, _redact(str(exc))[:200])
+            return None
+
+    def list_branches(self, repo: str = "", *, prefix: str = "") -> list[str] | None:
+        """Bare branch names, filtered server-side by `prefix`. `[]` = none; `None` = unreadable.
+
+        `git/matching-refs/heads/<prefix>` RATHER THAN `/branches`, which is what the product
+        module shells out to today. The branches route cannot filter, so a documentation
+        repository with a thousand branches is paged through in full to find nine `req/*` ones.
+        Verified live on this platform's own GitHub repository: matching-refs answers `[]` for a
+        prefix nothing matches and 404s for a repository that is not there — exactly the two-answer
+        split this method has to make — and it answers an ARRAY even when one ref matches, unlike
+        the older `git/refs/{ref}` route, which answers a bare object and would break a parser on
+        the single-branch repository.
+
+        `--paginate` IS LOAD-BEARING AND ONE `json.loads` IS ENOUGH, which is two facts that argue
+        with each other until you measure them. Without the flag GitHub hands back the first page
+        and nothing that says there was a second, so a repository over `per_page` silently loses
+        branches. With it, `gh` (2.83.2) MERGES the pages into a single JSON array rather than
+        concatenating one document per page — checked by forcing `per_page=1` against a
+        two-branch repository and finding no `][` anywhere in the output. A parser written for the
+        concatenated shape would be defending against something this tool does not do.
+        """
+        import json as _json
+
+        path = f"repos/{self._repo_or_self(repo)}/git/matching-refs/heads/"
+        # `safe="/"` because a branch prefix is a path here: `req/` must stay two segments.
+        path += urllib.parse.quote((prefix or "").lstrip("/"), safe="/")
+        p = self._gh_read(["api", "--paginate", f"{path}?per_page=100"],
+                          f"list the branches of {self._repo_or_self(repo)}")
+        if p is None:
+            return None  # `_gh_read` already logged why the command produced nothing
+        if p.returncode != 0:
+            log.warning("could not list the branches of %s: %s",
+                        self._repo_or_self(repo), _redact(p.stderr)[-200:])
+            return None
+        try:
+            rows = _json.loads(p.stdout or "[]")
+        except ValueError:
+            log.warning("gh api matching-refs returned output that is not JSON for %s",
+                        self._repo_or_self(repo))
+            return None
+        if not isinstance(rows, list):
+            # An answer we do not understand is not an empty repository. `[]` here would tell the
+            # product module there are no proposals in flight and let it mint a number already
+            # taken by one.
+            log.warning("gh api matching-refs answered a %s rather than a list for %s",
+                        type(rows).__name__, self._repo_or_self(repo))
+            return None
+        names = [str((r or {}).get("ref") or "") for r in rows if isinstance(r, dict)]
+        return [n.removeprefix("refs/heads/") for n in names if n.startswith("refs/heads/")]
+
+    def delete_branch(self, name: str, *, repo: str = "") -> bool:
+        """True when the branch is gone, False when it may still be there. See the port.
+
+        THE EXIT STATUS IS NOT THE ANSWER, and that is the whole method. `gh api -X DELETE
+        repos/…/git/refs/heads/<b>` answers `422 Reference does not exist` for a branch that was
+        already deleted and `403` for one the credential may not touch, and both exit 1 — so a
+        provider that returns `p.returncode == 0` reports a refusal as a successful cleanup and a
+        sweep re-tries it hourly for ever with nothing in the log. Both statuses were observed
+        live against this repository (the 422 by deleting a branch that does not exist, which is
+        a request that changes nothing).
+
+        So a failure is resolved by RE-READING the refs, which is the only evidence that settles
+        it. A re-read that itself fails is False: not knowing is not the same as gone, and this
+        method's False costs one wasted sweep while a wrong True loses the branch from the sweep's
+        attention permanently.
+        """
+        branch = (name or "").strip().strip("/")
+        if not branch:
+            log.warning("refusing to delete an unnamed branch in %s", self._repo_or_self(repo))
+            return False
+        target = self._repo_or_self(repo)
+        p = self._gh_read(["api", "-X", "DELETE", f"repos/{target}/git/refs/heads/{branch}"],
+                          f"delete {branch} in {target}")
+        if p is None:
+            # `gh` never ran, so the branch is certainly still there. False is the answer that
+            # keeps it in the sweep's attention, which is what NEVER RAISES buys.
+            return False
+        if p.returncode == 0:
+            return True
+        present = self.list_branches(target, prefix=branch)
+        if present is None:
+            log.warning("could not delete %s in %s (%s) and could not re-read the branch list "
+                        "either — reporting it as still there", branch, target,
+                        _redact(p.stderr)[-160:])
+            return False
+        if branch in present:
+            log.warning("%s in %s was NOT deleted (%s) — it is still on the remote",
+                        branch, target, _redact(p.stderr)[-200:])
+            return False
+        log.info("%s was already gone from %s — nothing to delete", branch, target)
+        return True
+
+    def pr_for_head(self, head: str, *, repo: str = "") -> str | None:
+        """The newest pull request opened from `head`, any state. "" = none; None = unreadable.
+
+        SORTED HERE RATHER THAN TRUSTED FROM `gh`. A `req/*` branch really can carry several pull
+        requests — proven on the Azure side, where one probe branch answered three — and "the
+        newest" is only meaningful if something guarantees the order. `gh pr list` happens to sort
+        newest-first today; asking for `createdAt` and taking the maximum makes that a property of
+        this method instead of a property of a CLI's default, and costs one JSON field.
+
+        A NON-LIST ANSWER IS UNREADABLE, NOT AN ABSENCE — the same check `list_branches` makes two
+        methods up, which is where it was learned. Iterating a JSON OBJECT yields its keys, so
+        `{"message": "Moved Permanently"}` survives `json.loads`, filters down to no rows and reads
+        as `""`: this branch was never proposed. That is the single answer that makes the caller
+        open a duplicate pull request, and it is the collapse the whole port exists to prevent.
+        """
+        import json as _json
+
+        p = self._gh_read(["pr", "list", "--repo", self._repo_or_self(repo), "--head", head,
+                           "--state", "all", "--json", "url,createdAt"],
+                          f"look up the pull requests for {head}")
+        if p is None:
+            return None
+        if p.returncode != 0:
+            log.warning("could not look up the pull requests for %s: %s",
+                        head, _redact(p.stderr)[-200:])
+            return None
+        try:
+            answer = _json.loads(p.stdout or "[]")
+        except ValueError:
+            log.warning("gh pr list returned malformed JSON for head %s", head)
+            return None
+        if not isinstance(answer, list):
+            log.warning("gh pr list answered a %s rather than a list for head %s — unreadable, "
+                        "not absent", type(answer).__name__, head)
+            return None
+        if not answer:
+            return ""
+        rows = [r for r in answer if isinstance(r, dict)]
+        if not rows:
+            log.warning("gh pr list answered %d rows this adapter cannot read for head %s",
+                        len(answer), head)
+            return None
+        newest = max(rows, key=lambda r: str(r.get("createdAt") or ""))
+        # A row with no URL is an answer we cannot use, not an absent pull request.
+        return (str(newest.get("url") or "").strip() or None)
+
+    # ---- pull requests -------------------------------------------------------------------------
+
+    def open_pr(self, *, head: str, base: str, title: str, body: str, repo: str = "") -> str:
+        target = self._repo_or_self(repo)
+        # Idempotent (D-16): if an open PR already exists for this branch — a retry,
+        # or a re-triggered job — return it instead of opening a second one. Scoped to `target`
+        # and not to `self.repo`: on the product path this is the DOCS repository, and a lookup
+        # aimed at the code would answer "no PR" about every proposal ever made.
+        existing = self._open_pr_for_head(head, repo=target)
+        if existing:
+            # …AND BROUGHT UP TO DATE with what this call was handed (#304, see the port): a retry
+            # hands the same text, a later attempt on this head describes the commit now on it.
+            self._bring_up_to_date(existing, repo=target, title=title, body=body)
+            return existing
+        p = self._gh(
+            ["pr", "create", "--repo", target, "--head", head, "--base", base,
+             "--title", title, "--body", body]
+        )
+        if p.returncode != 0:
+            try:  # lost a race with a concurrent create?
+                recovered = self._open_pr_for_head(head, repo=target)
+            except RuntimeError as exc:
+                # We lost a race and then could not find the winner either — the caller will treat
+                # this as "no PR", which is the one case where a duplicate can be opened.
+                log.warning("could not recover the PR for %s after a race (%s)",
+                            head, str(exc)[:120])
+                recovered = None
+            if recovered:
+                return recovered
+            raise RuntimeError(f"gh pr create failed: {_redact(p.stderr)}")
+        return p.stdout.strip()
+
+    def _bring_up_to_date(self, pr: str, *, repo: str, title: str, body: str) -> bool:
+        """`gh pr edit --title --body` on the open pull request `open_pr` is answering with (#304).
+        True when the forge took it.
+
+        IN THE REPOSITORY THE LOOKUP FOUND IT IN, so the write goes where the read went — on the
+        product path that is the documentation repository, not this adapter's own.
+
+        A REFUSAL IS NOT RAISED AND NOT SILENT, for `set_pr_body`'s reason: the pull request exists
+        and the work under it is pushed, so failing the attempt over a description would lose the
+        half that worked — but the pull request now describes an earlier attempt, and the log says
+        so by name."""
+        try:
+            done = self._gh(["pr", "edit", pr, "--repo", repo, "--title", title, "--body", body])
+        except (subprocess.SubprocessError, OSError) as exc:
+            done = subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=str(exc))
+        if done.returncode != 0:
+            log.warning("BEEVERFORGE_PR_BODY_REFUSED pr=%s — the pull request still describes an "
+                        "earlier attempt, not the commit that is its head (%s)", pr,
+                        _redact(done.stderr or "").strip()[-200:])
+            return False
+        return True
+
+    def _open_pr_for_head(self, head: str, *, repo: str = "") -> str | None:
+        """The OPEN pull request on `repo` ("" = this adapter's own), or None — `open_pr`'s
+        idempotency check and nothing else.
+
+        RENAMED AWAY FROM `_pr_for_head` when the public `pr_for_head` arrived, because the two
+        differ by one underscore and disagree about what None means: here None is "there is no
+        open PR" and a failed lookup RAISES; there None is "I could not read" and a clean empty
+        answer is "". Two neighbouring methods with inverted sentinels is the kind of collision
+        that gets found by a duplicate pull request in production."""
+        p = self._gh(
+            ["pr", "list", "--repo", self._repo_or_self(repo), "--head", head, "--state", "open",
+             "--json", "url", "--jq", ".[0].url"]
+        )
+        # a FAILED lookup is "unknown", not "no PR" — raise so callers don't blindly
+        # create a duplicate on a transient error (idempotency, engineering.md #3).
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr list failed: {_redact(p.stderr)}")
+        return p.stdout.strip() or None
+
+    def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:
+        self._gh(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event], "--body", body])
+
+    def request_reviewers(self, *, pr: str, reviewers: list[str]) -> None:
+        if not reviewers:
+            return
+        self._gh(["pr", "edit", pr, "--repo", self.repo, "--add-reviewer", ",".join(reviewers)])
+
+    def merge_pr(self, *, pr: str, repo: str = "") -> None:
+        # --auto arms auto-merge (merges once required checks pass) — but it needs the
+        # repo to have auto-merge + branch protection enabled. Where it doesn't, fall
+        # back to an immediate squash merge so the autonomy chain isn't broken (A3).
+        target = self._repo_or_self(repo)
+        p = self._gh(["pr", "merge", pr, "--repo", target, "--squash", "--auto"])
+        if p.returncode != 0:
+            p = self._gh(["pr", "merge", pr, "--repo", target, "--squash"])
+            if p.returncode != 0:
+                raise RuntimeError(f"gh pr merge failed: {_redact(p.stderr)}")
+
+    def force_merge(self, *, pr: str) -> None:
+        """Merge NOW, bypassing the up-to-date / required-check gate — the executable option a
+        human picks when a PR keeps starving behind a busy base (owner: the factory acts on the
+        decision). Uses admin override; raises if even that is refused (then it stays parked)."""
+        p = self._gh(["pr", "merge", pr, "--repo", self.repo, "--squash", "--admin"])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr merge --admin failed: {_redact(p.stderr)}")
+
+    def close_pr(self, *, pr: str, reason: str = "") -> None:
+        """`gh pr close` — closes without merging and LEAVES THE BRANCH. Deliberately no
+        `--delete-branch`: the work must survive a discard, so the answer is reversible."""
+        argv = ["pr", "close", pr, "--repo", self.repo]
+        if reason.strip():
+            argv += ["--comment", reason.strip()[:500]]
+        p = self._gh(argv)
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr close failed: {_redact(p.stderr)}")
+
+    def pr_merged(self, *, pr: str) -> bool:
+        """Whether the PR (URL or number) has actually been merged — the workflow's
+        durable wait-for-merge gate before promotion (A2)."""
+        import json as _json
+
+        p = self._gh(["pr", "view", pr, "--repo", self.repo, "--json", "mergedAt"])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+        try:
+            return bool(_json.loads(p.stdout or "{}").get("mergedAt"))
+        except ValueError as exc:
+            raise RuntimeError("gh pr view returned malformed JSON") from exc
+
+    def pr_status(self, *, pr: str, repo: str = "") -> str:
+        """The PR's lifecycle state for the durable merge-watch: "merged" | "closed" | "open".
+        A `mergedAt` timestamp wins (state may lag). "closed" means a human closed the PR
+        WITHOUT merging — the watch must stop immediately instead of polling until the merge
+        deadline (which would freeze the floor for days on a floor of one). "open" keeps the
+        watch going. Reads state+mergedAt in ONE call so the poll adds no extra history.
+
+        `repo` is the port's rule: "" is this adapter's own, and a `pr` that is a full URL wins
+        over it — measured, `gh pr view <url of A#6> --repo <B>` answers A#6 and says nothing
+        about the argument it ignored. It matters for a BARE number, where `--repo` is the only
+        thing that decides which repository's #2 the answer is about."""
+        import json as _json
+
+        p = self._gh(["pr", "view", pr, "--repo", self._repo_or_self(repo),
+                      "--json", "state,mergedAt"])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+        try:
+            data = _json.loads(p.stdout or "{}")
+        except ValueError as exc:
+            raise RuntimeError("gh pr view returned malformed JSON") from exc
+        if data.get("mergedAt"):
+            return "merged"
+        if (data.get("state") or "").upper() == "CLOSED":
+            return "closed"
+        return "open"
+
+    def mergeable_state(self, *, pr: str) -> str:
+        """The PR's mergeability, so the merge-watch can KEEP IT FRESH instead of waiting on a
+        merge that will never fire. GitHub's mergeStateStatus, lowercased: 'clean' (ready to
+        merge), 'behind' (base advanced — needs an update or auto-merge stalls), 'blocked'
+        (required checks pending/failing or a review required), 'dirty' (conflicts — a human
+        must resolve), 'unstable'/'has_hooks', or 'unknown'. Best-effort — 'unknown' on error so
+        the loop degrades to plain polling rather than crashing."""
+        import json as _json
+
+        p = self._gh(["pr", "view", pr, "--repo", self.repo, "--json", "mergeStateStatus"])
+        if p.returncode != 0:
+            return "unknown"
+        try:
+            return (_json.loads(p.stdout or "{}").get("mergeStateStatus") or "unknown").lower()
+        except ValueError:
+            return "unknown"
+
+    def _api_read(self, path: str, what: str, expect: type) -> tuple[object, str]:
+        """`gh api <path>` as `(document, "")`, or `(None, why)` — why in GitHub's own words
+        ("Not Found (HTTP 404)") — for the three reads `merge_gates` makes. NEVER SILENT: an
+        answer its caller expected is still a line somebody can find."""
+        import json as _json
+
+        p = self._gh_read(["api", path], what)
+        if p is None:
+            return None, "gh did not answer"  # `_gh_read` already logged why
+        if p.returncode != 0:
+            why = (_redact(p.stderr or "").strip().removeprefix("gh: ")[-160:]
+                   or f"gh exited {p.returncode}")
+            log.info("could not %s: %s", what, why)
+            return None, why
+        try:
+            document = _json.loads(p.stdout or "")
+        except ValueError:
+            document = None
+        if not isinstance(document, expect):
+            log.info("could not %s: gh answered something that is not the JSON %s expected",
+                     what, expect.__name__)
+            return None, "an answer that could not be understood"
+        return document, ""
+
+    def merge_gates(self, *, base: str) -> list[dict] | None:
+        """The rules that gate every merge into `base`, typed like `pr_checks`' rows — ahead of
+        any pull request (#184, `forge/base.py::merge_gates_of`). `None` when unreadable, and
+        `GatesNotListed` RAISED, with the reason, when the listing is known to be incomplete.
+
+        GITHUB HAS TWO MECHANISMS AND ONLY ONE IS OURS TO READ (#206). `rules/branches/<b>`
+        answers the active RULESET rules to anybody with read access. CLASSIC branch protection
+        — `branches/<b>/protection`, still what most existing repositories use — is shown only to
+        a repository administrator, which this platform should not be. Reading the first alone
+        answered `[]` for a branch requiring two approvals, and the doctor said "no gate on this
+        repository needs a person": absence read as compliance. Measured 2026-09-19, read-only:
+
+          - `branches/<b>` is readable by anybody who can read the repository, and
+            `protection.enabled` is what says CLASSIC. `protected` cannot: it is `true` for a
+            branch only a ruleset gates (this platform's own `main`, `enabled: false`). The
+            summary carries classic's required status checks and nothing about its reviews.
+          - `branches/<b>/protection` answers a non-admin 404 "Not Found" (a `repo`-scoped OAuth
+            token, on every public repository tried; GitHub documents 403 "Resource not
+            accessible by …" for a fine-grained or installation token without `Administration:
+            read`) — and answers an ADMIN of a branch with no classic rules 404 "Branch not
+            protected", which is an answer about the rules, not about the asker.
+          - `rules/branches/<b>` answers `[]` for a branch that does not exist.
+
+        SO: the rulesets, then the branch, and the administrator's read ONLY when the branch says
+        classic rules may be there — a ruleset-only repository is never sent to be refused. A
+        refusal is an expected answer: logged, never an error. What it leaves is a listing KNOWN
+        TO BE INCOMPLETE, and that is given only when it already names a gate a person settles:
+        every sentence built from it stays true, and a gate that was read stays named. With none
+        in it, it would be read as "no gate needs a person" — the one claim it cannot carry — so
+        the row says `GatesNotListed`, and why, in words the person reading can act on.
+
+        Shape of a rule, recorded from a live repository: `[{type: "pull_request", parameters:
+        {required_approving_review_count: 1, required_review_thread_resolution: true,
+        require_code_owner_review: false}}, {type: "required_linear_history"}, …]`. The READABLE
+        protection document is GitHub's documented one: nothing this was run against had one."""
+        from beeverforge.adapters.forge.base import GatesNotListed
+
+        where = f"{self.repo}@{base}"
+        rules, _ = self._api_read(f"repos/{self.repo}/rules/branches/{base}",
+                                  f"list the rules of {where}", list)
+        if rules is None:
+            return None
+        rows = _ruleset_gates(rules)
+
+        branch, why = self._api_read(f"repos/{self.repo}/branches/{base}",
+                                     f"read the branch {where}", dict)
+        if branch is None:
+            unseen = (f"the rulesets of '{base}' were read, but not whether the branch is also "
+                      f"under classic branch protection ({why})")
+        else:
+            summary = branch.get("protection")
+            summary = summary if isinstance(summary, dict) else {}
+            classic = summary.get("enabled")
+            if classic is False or (classic is not True and branch.get("protected") is not True):
+                return rows  # no classic rules here: the rulesets are the whole listing
+            protection, why = self._api_read(f"repos/{self.repo}/branches/{base}/protection",
+                                             f"read the classic protection of {where}", dict)
+            if protection is not None:
+                return _named_once(rows + _classic_gates(protection))
+            if why.startswith("Branch not protected"):
+                return rows
+            rows = _named_once(rows + _status_check_gates(summary.get("required_status_checks")))
+            unseen = (f"'{base}' is a protected branch whose classic branch protection could not "
+                      f"be read with this credential ({why}): GitHub shows it only to a "
+                      "repository administrator, while the same rules set in a ruleset are "
+                      "listed with read access")
+        if any(row["kind"] == "process" for row in rows):
+            return rows
+        raise GatesNotListed(unseen)
+
+    # ---- what a certificate reads (#356, `forge/base.py`'s three optional capabilities) ---------
+
+    #: THE GRANTS THAT REACH `.github/workflows/`, in GitHub's two vocabularies: a classic token's
+    #: or a CLI login's OAuth scope `workflow`, and an App's `workflows` permission, which has
+    #: only one level. `repo` does not include it — a token without `workflow` is refused a push
+    #: that touches a workflow file — so a certificate asks for exactly these two names.
+    ci_write_permissions = frozenset({"workflow", "workflows:write"})
+
+    def branch_protection(self, repo: str, branch: str) -> BranchProtection | None:
+        """What protects `branch`, from GitHub's two mechanisms, and whether auto-merge is on.
+
+        `rules/branches/<b>` ALONE IS NOT ENOUGH, whatever its name suggests. It answers the
+        active RULESET rules, repository and organisation alike, to anybody with read access —
+        and nothing about CLASSIC branch protection, which still guards most repositories: #206
+        measured it answering `[]` for a branch that requires two approvals. So this reads the way
+        `merge_gates` reads, and for the same measured reasons (its docstring has them): the
+        rulesets first, then `branches/<b>`, whose `protection.enabled` says whether classic
+        rules are there at all, and `branches/<b>/protection` only then — a document GitHub shows
+        to a repository administrator alone, so its refusal is expected and leaves `None` in
+        whatever the rulesets did not already settle.
+
+        THE MAPPING, the same rule from either mechanism:
+
+            pr_required          ruleset `pull_request`, or classic `required_pull_request_reviews`
+            linear_history       ruleset `required_linear_history`, or classic
+                                 `required_linear_history.enabled`
+            force_push_blocked   ruleset `non_fast_forward`, or a classic protection whose
+                                 `allow_force_pushes.enabled` is false (its default)
+            auto_merge_enabled   the repository's `allow_auto_merge` (`repos/<o>/<r>`)
+
+        A mechanism that sets a fact settles it; a fact neither sets is `False` only when BOTH
+        were read. `allow_auto_merge` is a field GitHub may leave out for a credential that cannot
+        administer the repository, and a field left out is `None`, never `False`.
+
+        None when the rulesets themselves could not be read — the one read every other answer
+        here builds on."""
+        target = self._repo_or_self(repo)
+        name = (branch or "").strip()
+        if not target or not name:
+            return None
+        where = f"{target}@{name}"
+        rules, _ = self._api_read(f"repos/{target}/rules/branches/{name}",
+                                  f"list the rules of {where}", list)
+        if rules is None:
+            return None  # the read every other answer here builds on
+        types = {str(r.get("type") or "") for r in rules if isinstance(r, dict)}
+        said: dict[str, bool | None] = {
+            "pr_required": True if "pull_request" in types else None,
+            "linear_history": True if "required_linear_history" in types else None,
+            "force_push_blocked": True if "non_fast_forward" in types else None,
+        }
+        classic = self._classic_protection(target, name, where)
+        if classic is not None:
+            for fact, value in classic.items():
+                said[fact] = said[fact] or value
+        settings, _ = self._api_read(f"repos/{target}", f"read the settings of {target}", dict)
+        auto = (settings or {}).get("allow_auto_merge")
+        return BranchProtection(**said, auto_merge_enabled=auto if isinstance(auto, bool) else None)
+
+    def _classic_protection(self, target: str, name: str, where: str) -> dict[str, bool] | None:
+        """The three facts as CLASSIC branch protection sets them — all `False` when the branch
+        has none — or None when whether it has any, or what it says, could not be read."""
+        off = {"pr_required": False, "linear_history": False, "force_push_blocked": False}
+        summary_of, _ = self._api_read(f"repos/{target}/branches/{name}",
+                                       f"read the branch {where}", dict)
+        if summary_of is None:
+            return None
+        summary = summary_of.get("protection")
+        summary = summary if isinstance(summary, dict) else {}
+        enabled = summary.get("enabled")
+        if enabled is False or (enabled is not True and summary_of.get("protected") is not True):
+            return off
+        protection, why = self._api_read(f"repos/{target}/branches/{name}/protection",
+                                         f"read the classic protection of {where}", dict)
+        if protection is None:
+            return off if why.startswith("Branch not protected") else None
+
+        def on(key: str) -> bool:
+            value = protection.get(key)
+            return value.get("enabled") is True if isinstance(value, dict) else False
+
+        return {"pr_required": isinstance(protection.get("required_pull_request_reviews"), dict),
+                "linear_history": on("required_linear_history"),
+                "force_push_blocked": not on("allow_force_pushes")}
+
+    def credential_permissions(self) -> frozenset[str] | None:
+        """What the credential this row holds is granted, in GitHub's words — or None.
+
+        TWO CREDENTIALS, TWO READS, and neither mints anything to ask:
+
+          an App        `GET /app/installations/<id>` signed with the App's own JWT
+                        (`github_app.installation_permissions`): its `permissions`, each as
+                        `<name>:<level>` — `contents:write`, `workflows:write`. Asked of the
+                        provider this row was built with, so it is the installation a job acts as.
+          a token       the `X-OAuth-Scopes` header GitHub sends back on any call made with a
+                        classic token or an OAuth login (`gh`'s own): `repo`, `workflow`. Read off
+                        `GET /rate_limit`, which spends no rate limit.
+
+        NONE FOR WHAT GITHUB DOES NOT PUBLISH. A fine-grained token and an installation token
+        handed in as a value carry permissions, not scopes, and GitHub tells neither what they
+        are; the header is then missing, or present and EMPTY. An empty header is not believed:
+        "a classic token granted nothing" and "a token whose grants this header does not list"
+        look the same in it, and only one of them would make a certificate's answer true."""
+        from beeverforge.adapters.github_app import GitHubAppTokenProvider
+
+        app = getattr(self._token_provider, "__self__", None)
+        if isinstance(app, GitHubAppTokenProvider):
+            granted = app.permissions()
+            return (None if granted is None
+                    else frozenset(f"{k}:{v}" for k, v in granted.items()))
+        p = self._gh_read(["api", "--include", "rate_limit"], "read the credential's scopes")
+        if p is None or p.returncode != 0:
+            if p is not None:
+                log.info("could not read the credential's scopes: %s", _redact(p.stderr)[-160:])
+            return None
+        for line in (p.stdout or "").splitlines():
+            if not line.strip():
+                break  # the headers end at the first blank line; the body is not read
+            header, _, value = line.partition(":")
+            if header.strip().lower() == "x-oauth-scopes":
+                scopes = frozenset(s.strip() for s in value.split(",") if s.strip())
+                return scopes or None
+        log.info("GitHub listed no OAuth scopes for this credential: a fine-grained or an "
+                 "installation token, whose permissions it does not publish to the token")
+        return None
+
+    def published_releases(self, url: str) -> list[str] | None:
+        """The tags of the published releases of the repository `url` names — no draft and no
+        pre-release, as GitHub lists them (`repos/<o>/<r>/releases`) — or None.
+
+        ONLY A REPOSITORY ON THIS ROW'S HOST. A URL on another host is not this credential's to
+        carry there (`authenticated_url`'s rule), and answering for it would read somebody else's
+        forge with this one's token. Public releases are readable with any token."""
+        import json as _json
+
+        parts = urllib.parse.urlsplit((url or "").strip())
+        path = [s for s in (parts.path or "").removesuffix(".git").split("/") if s]
+        if parts.scheme != "https" or (parts.hostname or "").lower() != self._host() \
+                or len(path) != 2:
+            return None
+        target = "/".join(path)
+        p = self._gh_read(["api", f"repos/{target}/releases?per_page=100"],
+                          f"list the releases of {target}")
+        if p is None or p.returncode != 0:
+            if p is not None:
+                log.info("could not list the releases of %s: %s", target,
+                         _redact(p.stderr)[-160:])
+            return None
+        try:
+            rows = _json.loads(p.stdout or "")
+        except ValueError:
+            return None
+        if not isinstance(rows, list):
+            return None
+        return [str(r["tag_name"]) for r in rows
+                if isinstance(r, dict) and r.get("tag_name")
+                and r.get("draft") is not True and r.get("prerelease") is not True]
+
+    def _repo_of_pr(self, pr: str) -> str:
+        """The repository a pull request lives in: the one its URL names, else the configured one
+        (C-18). For the ops that are NOT `gh pr …` — which resolves a URL itself — and so would
+        otherwise act on a same-numbered pull request, or the runs, of the DEFAULT repository."""
+        if "github.com/" in pr:
+            tail = pr.split("github.com/", 1)[1].split("/pull", 1)[0]
+            return tail if "/" in tail else self.repo
+        return self.repo
+
+    def update_branch(self, *, pr: str) -> bool:
+        """Bring a BEHIND PR branch up to date with its base so auto-merge can proceed (the
+        self-heal for busy-main starvation: other developers keep advancing main, our single
+        PR falls behind). Uses GitHub's update-branch API. Best-effort — True if accepted.
+
+        THE REPO COMES FROM THE URL when the PR is one (C-18): every sibling op hands `pr` to
+        the gh CLI, which resolves owner/repo from a URL itself — this is the one op composed
+        as a REST path, and `self.repo` here silently updated a same-numbered PR in the DEFAULT
+        repo when the card lived in another."""
+        num = pr.rstrip("/").rsplit("/", 1)[-1]
+        repo = self._repo_of_pr(pr)
+        p = self._gh(["api", "--method", "PUT",
+                      f"repos/{repo}/pulls/{num}/update-branch"])
+        return p.returncode == 0
+
+    def disable_auto_merge(self, *, pr: str) -> None:
+        """Disarm a previously-armed `--auto` merge (best-effort). Used when the CI-repair
+        pass introduced a gate suppression: the change must go to a human, so auto-merge must
+        NOT fire when CI next goes green. A no-op if auto-merge wasn't armed."""
+        self._gh(["pr", "merge", pr, "--repo", self.repo, "--disable-auto"])
+
+    def _checks_json(self, pr: str, fields: str, *, required: bool) -> list[dict]:
+        """`gh pr checks --json <fields>` as rows — `[]` when nothing is there, RAISING when the
+        answer could not be read. One reader for the aggregate and for the rows, so the two
+        cannot come to disagree about what an empty answer means (#184)."""
+        import json as _json
+
+        # `gh pr checks` normalizes check-runs AND status-contexts into a single `bucket`
+        # (pass/fail/pending/skipping/cancel); it exits non-zero when checks fail/pend, so
+        # parse stdout regardless of returncode. No checks → gh writes a message to stderr.
+        # `--required` scopes to the checks that actually GATE the merge, so the CI-repair
+        # loop reacts to the same failures `--auto` blocks on — a flaky ADVISORY check (e.g.
+        # a non-required e2e) never triggers a spurious repair (ADR-0004).
+        p = self._gh(["pr", "checks", pr, "--repo", self.repo,
+                      *(["--required"] if required else []), "--json", fields])
+        if not (p.stdout or "").strip():
+            # TWO different sentences mean "nothing gates this merge", and only one was known:
+            # "no checks reported" (a repo with no CI at all) and "no REQUIRED checks reported" —
+            # a repo WITH workflows but WITHOUT branch protection, which is the commonest real
+            # client shape there is. The moment fx-jira gained its ci.yml (F-02, 2026-08-05),
+            # every status poll raised, the activity retried forever, and the merge watch died
+            # on a repo that was perfectly healthy. CI existing does not mean CI is REQUIRED.
+            stderr = (p.stderr or "").lower()
+            if "no checks" in stderr or "no required checks" in stderr:
+                return []
+            raise RuntimeError(f"gh pr checks failed: {_redact(p.stderr)}")
+        try:
+            checks = _json.loads(p.stdout)
+        except ValueError as exc:
+            raise RuntimeError("gh pr checks returned malformed JSON") from exc
+        return [c for c in checks if isinstance(c, dict)] if isinstance(checks, list) else []
+
+    def pr_ci_status(self, *, pr: str) -> str:
+        """The port's word (`forge/base.py`): `failure` | `pending` | `success` over the REQUIRED
+        checks, a skipped one satisfied — and where none is required, `advisory` when checks ran
+        and `none` when nothing did (#184). F-02's repository — workflows, and no branch
+        protection — said `none`, the word for a pull request nothing has looked at."""
+        verdict = _ci_status_from_checks(self._checks_json(pr, "bucket", required=True),
+                                         required=True)
+        if verdict != "none":
+            return verdict
+        ran = _ci_status_from_checks(self._checks_json(pr, "bucket", required=False))
+        return "none" if ran == "none" else "advisory"
+
+    def pr_checks(self, *, pr: str) -> list[dict]:
+        """Every check on the PR as {name, bucket, state, blocking, kind, url} — the rows the
+        panel draws (which of lint/vitest/e2e/pg_integration/… ran and how they landed) and the
+        rows the core's one table decides on (#184, `contracts/checks.py`). Empty on none.
+
+        `blocking` IS `--required`, ASKED ONCE MORE. `gh` has no per-row "required" field, so the
+        required names are a second read; a repository with workflows and no branch protection
+        answers "no required checks" there, and every row is then advisory — F-02, said per row.
+
+        `kind` IS WHAT THIS ROW CAN HONESTLY TELL. A check that carries a `workflow` is one of
+        this repository's own GitHub Actions runs: a change to the code can turn it green, and
+        `failed_ci_logs` can read why it is red. A status some other app posted (another CI, a
+        CLA or DCO bot) carries none, and whether it is about the code is not something GitHub
+        says — so it is `unknown`, and the core repairs it only when there is a log to act on.
+
+        RAISES WHEN THE ANSWER COULD NOT BE READ, where it used to answer `[]`: an unreadable gate
+        is not "no checks" now that a decision is made from these rows. The panel's reader
+        already degrades an exception to "no checks shown"."""
+        rows = self._checks_json(pr, "name,bucket,state,link,workflow", required=False)
+        if not rows:
+            return []
+        required = {r.get("name") for r in self._checks_json(pr, "name", required=True)}
+        return [
+            {"name": r.get("name"), "bucket": r.get("bucket"), "state": r.get("state"),
+             "blocking": r.get("name") in required,
+             "kind": "code" if str(r.get("workflow") or "").strip() else "unknown",
+             "url": str(r.get("link") or "")}
+            for r in rows
+        ]
+
+    def pr_body(self, *, pr: str, repo: str = "") -> str | None:
+        """`gh pr view --json body` — the description, or None when the read failed.
+
+        NONE AND "" ARE DIFFERENT ANSWERS, exactly as they are for `pr_diff` one method down: a
+        pull request may genuinely have an empty description, and amending from a failed read
+        would publish a body assembled out of nothing over whatever is really there."""
+        got = self._gh(["pr", "view", pr, "--repo", repo or self.repo, "--json", "body",
+                        "-q", ".body"])
+        if got.returncode != 0:
+            log.warning("could not read the description of %s (%s)", pr,
+                        (got.stderr or "").strip()[:160])
+            return None
+        # `-q .body` prints the field and a trailing newline; an empty description prints just
+        # that newline, which is "" and not None.
+        return (got.stdout or "").rstrip("\n")
+
+    def set_pr_body(self, *, pr: str, body: str, repo: str = "") -> bool:
+        """`gh pr edit --body` — True when the forge took it."""
+        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body", body])
+        if done.returncode != 0:
+            log.warning("could not update the description of %s (%s)", pr,
+                        (done.stderr or "").strip()[:160])
+            return False
+        return True
+
+    #: One page of each. A pull request with a hundred open threads is not one a single pass can
+    #: answer, and the pass says how many it carried.
+    _COMMENTS_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!) {"
+        " repository(owner: $owner, name: $name) { pullRequest(number: $number) {"
+        " reviewThreads(first: 100) { nodes { isResolved path line"
+        " comments(first: 50) { nodes { author { login } body url viewerDidAuthor } } } }"
+        " reviews(last: 100) { nodes { author { login } body state url viewerDidAuthor } }"
+        " } } }")
+
+    def review_comments(self, *, pr: str) -> list[ReviewComment]:
+        """What people wrote on `pr` that still stands (#330, `forge/base.py::review_comments_of`).
+
+        TWO KINDS, BOTH ASKED OF GITHUB'S OWN STATE:
+          · every comment in a thread nobody has resolved;
+          · the body of a person's latest review, while that review requests changes. A later
+            approval or a dismissal withdraws it, as it does on the pull request's own page.
+        A review that only commented has no state that says whether it was answered, so its body
+        is not carried. NEVER WHAT THIS CREDENTIAL WROTE (`viewerDidAuthor`): the platform's own
+        review is fed back by the blocking review loop, and its notes are not a person's."""
+        repo = self._repo_of_pr(pr)
+        owner, _, name = repo.partition("/")
+        number = pr.rstrip("/").rsplit("/", 1)[-1]
+        if not (owner and name and number.isdigit()):
+            raise CommentsNotListed(f"`{pr}` does not name a pull request on GitHub")
+        got = self._gh_read(["api", "graphql", "-f", f"query={self._COMMENTS_QUERY}",
+                             "-f", f"owner={owner}", "-f", f"name={name}",
+                             "-F", f"number={number}"], "list the review comments")
+        if got is None or got.returncode != 0:
+            why = _redact((got.stderr if got is not None else "") or "").strip()[-160:]
+            raise CommentsNotListed(
+                f"GitHub did not list the review comments on {pr}" + (f" ({why})" if why else ""))
+        import json as _json
+
+        try:
+            node = _json.loads(got.stdout or "")["data"]["repository"]["pullRequest"]
+            threads = node["reviewThreads"]["nodes"]
+            reviews = node["reviews"]["nodes"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise CommentsNotListed(
+                f"GitHub answered something that is not the pull request's review threads "
+                f"({type(exc).__name__})") from None
+        out: list[ReviewComment] = []
+        for thread in threads:
+            if thread.get("isResolved"):
+                continue
+            for c in (thread.get("comments") or {}).get("nodes") or []:
+                if c.get("viewerDidAuthor") or not str(c.get("body") or "").strip():
+                    continue
+                out.append(ReviewComment(
+                    author=str((c.get("author") or {}).get("login") or "someone"),
+                    body=str(c["body"]), path=str(thread.get("path") or ""),
+                    line=int(thread.get("line") or 0), url=str(c.get("url") or "")))
+        standing: dict[str, dict] = {}
+        for r in reviews:  # oldest first: a person's later review replaces their earlier one
+            who = str((r.get("author") or {}).get("login") or "")
+            if r.get("viewerDidAuthor") or not who or r.get("state") == "COMMENTED":
+                continue
+            standing[who] = r
+        for who, r in standing.items():
+            if r.get("state") == "CHANGES_REQUESTED" and str(r.get("body") or "").strip():
+                out.append(ReviewComment(author=who, body=str(r["body"]),
+                                         url=str(r.get("url") or "")))
+        return out
+
+    def pr_diff(self, *, pr: str, repo: str = "", max_chars: int = 60000) -> str | None:
+        """`gh pr diff` — the changes themselves, or None when the read failed.
+
+        NONE AND "" ARE DIFFERENT ANSWERS. `gh` exits non-zero when it cannot see the pull request
+        (no credential, wrong repo, rate limit); it exits ZERO with empty output for a pull request
+        that genuinely changes nothing. Reporting the first as the second tells a reader their diff
+        is empty when the platform simply could not look.
+        """
+        got = self._gh(["pr", "diff", pr, "--repo", repo or self.repo])
+        if got.returncode != 0:
+            log.warning("could not read the diff of %s (%s)", pr,
+                        (got.stderr or "").strip()[:160])
+            return None
+        return _truncated(_redact(got.stdout or ""), max_chars)
+
+    def failed_ci_logs(self, *, pr: str, max_chars: int = 6000) -> str:
+        """The failing log of the red REQUIRED checks that are workflow runs of the pull request's
+        own repository — read from the run each of them links to, and from nothing else (#184).
+
+        IT READ THE TWO NEWEST FAILED RUNS ON THE HEAD BRANCH: of any workflow, required or not,
+        red for this failure or another. While the log was only a repair's input that cost a noisy
+        brief. Since the log is what makes a red check repairable at all, a failed run of some
+        other workflow made a required commit STATUS — a CI this forge cannot read, a CLA bot —
+        look like a build with a failure to fix, and gave a red required build another run's log.
+
+        So the runs read are the ones the failing blocking `code` rows of `pr_checks` link to: the
+        rows the verdict is red for, the way the Azure sibling reads the builds its red policy
+        evaluations name. A status or another app's check run has no run here, and a status's link
+        — whatever the app that posted it wrote — is never followed. Empty when no such row is red,
+        or none of their runs has a failing log; the core reads that as "nothing to act on".
+
+        THE RUNS OF THE PULL REQUEST'S OWN REPOSITORY (C-18): `gh run` does not resolve a URL, and
+        a link to another repository's run is not this pull request's check. The first two such
+        runs are read; `rerun_failed` re-runs the same runs, chosen by the same `_failing_runs`,
+        and of those only the ones whose log `_failing_log` reads here too."""
+        repo = self._repo_of_pr(pr)
+        try:
+            rows = self.pr_checks(pr=pr)
+        except RuntimeError as exc:
+            # Every run read below is named by these rows, so an unreadable answer would come out
+            # as "no failing log" — which asks a person instead of repairing, and says why here.
+            log.warning("could not read the checks of %s to collect their logs (%s)",
+                        pr, str(exc)[:160])
+            return ""
+        chunks: list[str] = []
+        for rid in self._failing_runs(repo, rows)[0]:
+            text, _why_not = self._failing_log(repo, rid)
+            if text:
+                chunks.append(text)
+        return _redact("\n".join(chunks))[-max_chars:]
+
+    def _failing_log(self, repo: str, rid: str) -> tuple[str, str]:
+        """`(the failing log of run rid, "")` when it reads, else `("", why not)`: one definition
+        of "the log of this run was read", for `failed_ci_logs` and `rerun_failed` (#756).
+
+        "COULD NOT BE READ" AND "WAS EMPTY" ARE TOLD APART (lesson §2): `gh run view --log-failed`
+        exits non-zero for a log it could not fetch (expired, not yet archived, a 404), and zero
+        with nothing for a run with no failing step's log."""
+        got = self._gh(["run", "view", rid, "--repo", repo, "--log-failed"], timeout=180)
+        if got.returncode != 0:
+            said = _redact(got.stderr or "").strip().removeprefix("gh: ")[-160:]
+            return "", f"could not be read ({said})" if said else "could not be read"
+        return (got.stdout, "") if got.stdout else ("", "was empty")
+
+    @staticmethod
+    def _failing_runs(repo: str, rows: list[dict]) -> tuple[dict[str, list[str]], list[str]]:
+        """Run id → the names of the failing blocking `code` rows of `pr_checks` that link to it,
+        for the workflow runs of `repo` only (C-18), in the rows' order, the first `_RUNS_READ`;
+        and the names of the rows whose run is past them.
+
+        ONE SELECTION FOR THE LOG AND THE RE-RUN (#756): the CI repair decides from the log of
+        these runs whether the change touched the failure, then re-runs their failed jobs. Two
+        loops could come to pick different runs, and the re-run would retry a check whose log the
+        decision never read. The bound is here for the same reason: when it was `[:2]` in
+        `failed_ci_logs` alone, a third red run was re-run on the first two's logs (measured
+        2026-10-20 with three red runs: logs of runs 1 and 2 read, runs 1-3 re-run). A run past
+        the bound is neither read nor re-run: it stays red, and the next attempt takes it up.
+        Its checks are answered beside the selection so that `rerun_failed` can name them: the
+        pull request is told they were not re-run (re-review on c4f591b, 2026-10-20)."""
+        runs: dict[str, list[str]] = {}
+        for row in rows:
+            if not (row["blocking"] and row["kind"] == "code"
+                    and str(row.get("bucket") or "").lower() in ("fail", "cancel")):
+                continue
+            named = _ACTIONS_RUN.match(str(row.get("url") or ""))
+            if named and named.group(1).lower() == repo.lower():
+                runs.setdefault(named.group(2), []).append(str(row.get("name") or ""))
+        ordered = list(runs.items())
+        return (dict(ordered[:_RUNS_READ]),
+                [name for _rid, names in ordered[_RUNS_READ:] for name in names])
+
+    def rerun_failed(self, *, pr: str) -> Reran:
+        """Re-run the failed jobs of the runs `failed_ci_logs` read a log from (#756): `gh run
+        rerun <id> --failed --repo <the pull request's repository>`, once per run. Answers the
+        names of the checks whose run was re-run, and in `left` the red checks whose run was past
+        the `_RUNS_READ` whose logs were read, so neither read nor re-run; `[]` when no red
+        required check is a run of this repository (a status, another app's check, a GitHub
+        Enterprise run URL `_ACTIONS_RUN` does not match). A run left past the bound is not a
+        refusal: refusing would launch the agent at once on the logs that named no changed file.
+
+        A RUN WHOSE FAILING LOG DOES NOT READ IS NOT RE-RUN. `failed_ci_logs` skips a run whose
+        `gh run view --log-failed` fails or comes back empty, so the decision to re-run instead of
+        repairing never saw that run's failure; until the human round of 2026-10-20 it was re-run
+        all the same (measured on 28e9226: run 2's read exits 1, and `gh run rerun 2 --failed` was
+        asked). So each selected run's log is read again here, by `_failing_log`, before it is
+        re-run: one more `gh run view --log-failed` per selected run (at most `_RUNS_READ`, so
+        two), on the re-run paths only; `failed_ci_logs` makes no extra call. Read here rather
+        than remembered from `failed_ci_logs`, because the two are called from different
+        activities and nothing carries the adapter's state between them.
+
+        RAISES `RerunRefused` when the checks could not be read, when a run's log did not read
+        (naming the run and why), or when `gh` refused a run: an App without `Actions: write`
+        (HTTP 403), a run still in progress. Every run is asked even after one refused, so the
+        refusal names each run left out, and the checks that did re-run."""
+        from beeverforge.adapters.forge.base import RerunRefused
+
+        repo = self._repo_of_pr(pr)
+        try:
+            rows = self.pr_checks(pr=pr)
+        except RuntimeError as exc:
+            raise RerunRefused(f"the checks of this pull request could not be read "
+                               f"({str(exc)[:160]})") from exc
+        rerun: list[str] = []
+        refusals: list[str] = []
+        unread: list[str] = []
+        selected, left = self._failing_runs(repo, rows)
+        for rid, names in selected.items():
+            _text, why_not = self._failing_log(repo, rid)
+            if why_not:
+                unread.append(f"run {rid}, whose failing log {why_not}")
+                continue
+            p = self._gh(["run", "rerun", rid, "--failed", "--repo", repo])
+            if p.returncode == 0:
+                rerun.extend(names)
+            else:
+                refusals.append(f"run {rid}: "
+                                f"{_redact(p.stderr or '').strip().removeprefix('gh: ')[-200:]}")
+        if refusals or unread:
+            done = f"; re-ran {', '.join(rerun)}" if rerun else ""
+            said = ([f"did not re-run {'; '.join(unread)}"] if unread else []) + (
+                [f"gh run rerun refused {'; '.join(refusals)}"] if refusals else [])
+            raise RerunRefused(f"{'; '.join(said)}{done}")
+        return Reran(rerun, left=left)
+
+    def merge_commit_sha(self, *, pr: str) -> str | None:
+        import json as _json
+
+        p = self._gh(["pr", "view", pr, "--repo", self.repo, "--json", "mergeCommit"])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+        try:
+            mc = _json.loads(p.stdout or "{}").get("mergeCommit") or {}
+        except ValueError as exc:
+            raise RuntimeError("gh pr view returned malformed JSON") from exc
+        return (mc.get("oid") or "").strip() or None
+
+    def deploy_run_status(self, *, sha: str, workflow: str) -> tuple[str, str | None]:
+        import json as _json
+
+        # Find the deploy workflow's run ON THIS COMMIT — scoped by --workflow (the deploy's
+        # file/name) and matched on headSha so a later unrelated run never fools the watch.
+        p = self._gh([
+            "run", "list", "--repo", self.repo, "--workflow", workflow, "--limit", "30",
+            "--json", "databaseId,headSha,status,conclusion,url",
+        ])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh run list failed: {_redact(p.stderr)}")
+        try:
+            runs = _json.loads(p.stdout or "[]")
+        except ValueError as exc:
+            raise RuntimeError("gh run list returned malformed JSON") from exc
+        run = next((r for r in runs if (r.get("headSha") or "") == sha), None)
+        if not run:
+            return "none", None
+        url = run.get("url")
+        # A run that hasn't reached "completed" is still deploying — pending, not judged.
+        if (run.get("status") or "").lower() != "completed":
+            return "pending", url
+        return ("success" if (run.get("conclusion") or "").lower() == "success"
+                else "failure"), url
+
+    def dispatch_workflow(self, *, workflow: str, ref: str) -> None:
+        """Trigger a `workflow_dispatch` GitHub Actions workflow (on-demand e2e, ADR-0008)."""
+        p = self._gh(["workflow", "run", workflow, "--repo", self.repo, "--ref", ref])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh workflow run {workflow} failed: {_redact(p.stderr)}")
+
+    def latest_run(self, *, workflow: str) -> dict | None:
+        """The most recent run of `workflow` as {id, status, conclusion, url, created_at} —
+        for polling a just-dispatched run to completion. None if there are none."""
+        import json as _json
+
+        p = self._gh([
+            "run", "list", "--repo", self.repo, "--workflow", workflow, "--limit", "1",
+            "--json", "databaseId,status,conclusion,url,createdAt",
+        ])
+        if p.returncode != 0:
+            raise RuntimeError(f"gh run list failed: {_redact(p.stderr)}")
+        try:
+            rows = _json.loads(p.stdout or "[]")
+        except ValueError:
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        return {"id": r.get("databaseId"), "status": r.get("status"),
+                "conclusion": r.get("conclusion"), "url": r.get("url"),
+                "created_at": r.get("createdAt")}
+
+    def create_repository(self, *, name: str, private: bool = True,
+                          description: str = "") -> tuple[str, bool]:
+        """See `RepositoryCreatingForge`. `(owner/name, created)`.
+
+        THE OWNER COMES FROM THE PROJECT'S OWN REPO, never from a parameter. A caller that could
+        name the organisation could create a repository in one this deployment was never pointed
+        at — and the credential is an installation with write access to a client's org, so that is
+        not a hypothetical. `name` is the repository only; the org is where this project already
+        lives.
+
+        EXISTENCE IS CHECKED FIRST, and the check is what makes this idempotent: `gh repo create`
+        fails with "Name already exists" and that failure is indistinguishable, by exit status,
+        from a permission refusal. Asking first turns the expected case into a normal return and
+        leaves the raise for the case that genuinely cannot proceed.
+        """
+        owner = (self.repo or "").split("/")[0].strip()
+        if not owner:
+            raise ValueError(
+                "cannot create a repository: this project does not name an `owner/name` repo, so "
+                "there is no organisation to create it in. Refusing to guess one — the credential "
+                "here can write to a client's whole organisation.")
+        bare = name.strip().strip("/").split("/")[-1]
+        if not bare:
+            raise ValueError(f"cannot create a repository called {name!r}")
+        full = f"{owner}/{bare}"
+
+        seen = self._gh_read(["repo", "view", full, "--json", "name"], f"look up {full}")
+        if seen is not None and seen.returncode == 0:
+            return full, False
+
+        made = self._gh(["repo", "create", full,
+                         "--private" if private else "--public",
+                         *(["--description", description] if description else [])])
+        if made.returncode != 0:
+            err = (made.stderr or made.stdout or "").strip()
+            if "not accessible by integration" not in err.lower():
+                raise RuntimeError(f"could not create {full}: {err[:300]}")
+            # `gh repo create` is a GraphQL mutation GitHub refuses to EVERY App installation
+            # token, and the raw refusal reads like a platform bug when it is a credential
+            # class (pilot, 2026-08-13). What exists instead depends on who the owner is, so
+            # the owner is asked first — the probe-then-decide the board setup already earned
+            # on a live personal account.
+            kind = self._gh(["api", f"users/{owner}", "--jq", ".type"])
+            owner_type = (kind.stdout or "").strip() if kind.returncode == 0 else ""
+            if owner_type == "Organization":
+                rest = self._gh(["api", "--method", "POST", f"orgs/{owner}/repos",
+                                 "-f", f"name={bare}",
+                                 "-F", f"private={'true' if private else 'false'}",
+                                 *(["-f", f"description={description}"] if description else [])])
+                if rest.returncode != 0:
+                    raise RuntimeError(
+                        f"the GitHub App cannot create {full}: its Repository → Administration "
+                        f"permission is not Read and write. Grant it on the App's settings "
+                        f"page, accept the permission update on the installation "
+                        f"(docs/setup/github.md §1), and re-run — this step is idempotent. Or "
+                        f"create the repository yourself and declare it: "
+                        f"`beeverforge product declare <project> {full}`")
+            else:
+                raise RuntimeError(
+                    f"a GitHub App token cannot create a repository on a personal account "
+                    f"({owner} is a user, not an organisation) — no permission changes that. "
+                    f"Two ways forward: keep the classic PAT the board already uses (scopes "
+                    f"repo+project, docs/setup/github.md §6) in BEEVERFORGE_TRACKER_TOKEN and "
+                    f"re-run — the factory creates the repository with it; or create {full} "
+                    f"yourself and declare it: `beeverforge product declare <project> {full}`. "
+                    f"Both are idempotent.")
+        # RE-READ RATHER THAN TRUST THE EXIT STATUS, the same rule `delete_branch` documents one
+        # screen up: `gh` has answered 0 for requests that changed nothing. A creation reported as
+        # done over a repository that does not exist would have the product role fail to write a
+        # requirement an hour later, in a message about something else entirely.
+        again = self._gh_read(["repo", "view", full, "--json", "name"], f"confirm {full}")
+        if again is None or again.returncode != 0:
+            raise RuntimeError(
+                f"{full} was reported created and cannot be read back — treating it as not "
+                f"created, because a repository nobody can reach is worse than one nobody made")
+        return full, True
+
+    #: `state` values GitHub uses for a workflow that will not run. `active` is the only live one;
+    #: everything else here means the file is on disk and the forge is ignoring it.
+    #:
+    #: LISTED RATHER THAN INVERTED (`!= "active"`) on purpose: a state GitHub adds later would
+    #: otherwise be silently treated as disabled, and demoting a LIVE gate into a question is the
+    #: error that costs a client their real CI. An unknown state stays live and is logged.
+    _DEAD_STATES = frozenset({"disabled_manually", "disabled_inactivity", "disabled_fork"})
+
+    def disabled_ci_paths(self, repo: str = "") -> list[str] | None:
+        """Workflow files GitHub reports as switched off. `None` when the API would not answer.
+
+        The state is a property of the FORGE, not of the file — which is the whole reason this
+        exists: `.github/workflows/ci.yml` reads identically whether it runs on every push or has
+        not run since somebody disabled it in the Actions tab (pilot, 2026-08-14)."""
+        target = repo or self.repo
+        p = self._gh_read(
+            ["api", f"repos/{target}/actions/workflows?per_page=100",
+             "--jq", ".workflows[] | .state + \"\\t\" + .path"],
+            f"list the workflows of {target}")
+        if p is None or p.returncode != 0:
+            # NOT `[]`. A repository whose workflows we could not list is not a repository with no
+            # disabled ones, and the caller renders those two differently by design.
+            if p is not None:
+                log.info("could not read the workflow states of %s (%s) — the onboarding will "
+                         "not know which pipelines are switched off", target,
+                         _redact(p.stderr)[:160])
+            return None
+        out: list[str] = []
+        for line in p.stdout.splitlines():
+            state, _tab, path = line.partition("\t")
+            state, path = state.strip(), path.strip().lstrip("/")
+            if not path:
+                continue
+            if state in self._DEAD_STATES:
+                out.append(path)
+            elif state != "active":
+                log.info("%s reports workflow %s in state %r, which this adapter does not know — "
+                         "treating it as live, because demoting a working gate is the more "
+                         "expensive mistake", target, path, state)
+        return sorted(set(out))
+
+    def latest_tag(self) -> str | None:
+        p = self._gh(["api", f"repos/{self.repo}/tags?per_page=1", "--jq", ".[0].name"])
+        name = p.stdout.strip()
+        return name or None
+
+    def create_tag(self, *, tag: str, ref: str) -> None:
+        # Idempotent (D-16): if the tag already exists, a retry is a no-op — never a
+        # duplicate ref or an error. Otherwise resolve `ref` to a sha and create it.
+        if self._tag_exists(tag):
+            return
+        sha = self._ref_sha(ref)
+        p = self._gh(
+            ["api", "--method", "POST", f"repos/{self.repo}/git/refs",
+             "-f", f"ref=refs/tags/{tag}", "-f", f"sha={sha}"]
+        )
+        if p.returncode != 0:
+            if self._tag_exists(tag):  # created concurrently between our check and POST
+                return
+            raise RuntimeError(f"create tag {tag} failed: {_redact(p.stderr)}")
+
+    def _tag_exists(self, tag: str) -> bool:
+        return self._gh(["api", f"repos/{self.repo}/git/ref/tags/{tag}"]).returncode == 0
+
+    def _ref_sha(self, ref: str) -> str:
+        p = self._gh(["api", f"repos/{self.repo}/commits/{ref}", "--jq", ".sha"])
+        sha = p.stdout.strip()
+        if not sha:
+            raise RuntimeError(f"could not resolve sha for {ref!r}: {_redact(p.stderr)}")
+        return sha

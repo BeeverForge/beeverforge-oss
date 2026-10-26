@@ -1,0 +1,74 @@
+"""#162 (activities.py:616): the base branch is asked, never assumed.
+
+The reverses matter as much as the fix: `""` must mean "nobody said", not "ignore what the caller
+asked for", and an unnamed sync must not throw away a working checkout on every round.
+"""
+
+TEST = "tests/test_the_base_branch_is_asked_not_assumed.py"
+CACHE = "beeverforge/runtime/repo_cache.py"
+LOADER = "beeverforge/loader.py"
+ACT = "beeverforge/runtime/temporal/activities.py"
+FACTORY = "beeverforge/factory.py"
+ONBOARD = "beeverforge/onboarding/propose_manifest.py"
+
+MUTATIONS = [
+    # ── the weld ────────────────────────────────────────────────────────────────────────────────
+    ("the preflight clones the literal `main` again", ACT,
+     '    asked = load_manifest_base_branch(project, default="")',
+     '    asked = "main"'),
+
+    # RE-PINNED 2026-09-12 (#112): the fetch gained a `ref or …` override, so the anchor moved by
+    # six characters. The claim is untouched — this row still cuts the default away and watches
+    # the guard notice `main` coming back.
+    ("the repo fetch falls back to `main` again", FACTORY,
+     '                                ref or load_manifest_base_branch(project, default=""))',
+     "                                ref or load_manifest_base_branch(project))"),
+
+    ("the helper's unknown becomes `main` whatever the caller asked for", LOADER,
+     "    return named or default", '    return named or "main"'),
+
+    # ── the cache ───────────────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-10-10 (#594): every clone passes `--no-local`
+    ("an unnamed sync clones a branch called nothing", CACHE,
+     '            rc, out = _git(["clone", "--no-local",\n'
+     '                            *(["--branch", base_branch] if base_branch else []),\n'
+     '                            "--", clone_url, str(master)])',
+     '            rc, out = _git(["clone", "--no-local", "--branch", base_branch, "--", clone_url, '
+     "str(master)])"),
+
+    ("…and the reverse: a NAMED branch is ignored, every sync lands on the default", CACHE,
+     '            rc, out = _git(["clone", "--no-local",\n'
+     '                            *(["--branch", base_branch] if base_branch else []),\n'
+     '                            "--", clone_url, str(master)])',
+     '            rc, out = _git(["clone", "--no-local", "--", clone_url, str(master)])'),
+
+    # The remote-vs-cache cuts live in 162f, whose TEST file holds their guards — this plan
+    # predates `remote_default_branch` existing.
+
+    ("a detached HEAD reads as a branch called HEAD", CACHE,
+     '    return named if (rc == 0 and named and named != "HEAD") else ""',
+     '    return named or ""'),
+
+    ("a tree that is not a checkout is asked anyway", CACHE,
+     '    if not (at / ".git").exists():   # modules and one of them stores them as text\n'
+     '        return ""', "    pass"),
+
+    # ── the re-sync comparison ──────────────────────────────────────────────────────────────────
+    ("the re-sync compares against the literal `main` again", ACT,
+     "    declared = manifest.declared_base_branch\n"
+     "    if declared and declared != current_branch(repo_path):\n"
+     "        repo_path = RepoCache().sync(cache_key, url, declared)",
+     '    if manifest.base_branch != "main":\n'
+     "        repo_path = RepoCache().sync(cache_key, url, manifest.base_branch)"),
+
+    # ── one home ────────────────────────────────────────────────────────────────────────────────
+    ("onboarding grows its own copy of the git question back", ONBOARD,
+     "    from beeverforge.runtime.repo_cache import current_branch\n\n"
+     '    return current_branch(checkout) or "main"',
+     '    rc, out = _git(["-C", str(checkout), "rev-parse", "--abbrev-ref", "HEAD"])\n'
+     '    named = (out or "").strip().splitlines()[0].strip() if out else ""\n'
+     '    return named if (rc == 0 and named and named != "HEAD") else "main"'),
+
+    ("…and the reverse: its own unknown stops being `main`, so a proposal names nothing", ONBOARD,
+     '    return current_branch(checkout) or "main"', "    return current_branch(checkout)"),
+]

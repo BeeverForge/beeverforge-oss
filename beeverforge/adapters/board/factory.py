@@ -1,0 +1,388 @@
+"""Which board implementation a project gets — decided from its tracker kind.
+
+UNKNOWN KINDS RAISE, they never degrade to a default. The same rule the harness registry follows
+(ADR-0018): a typo that silently produced a GitHub board on a Jira deployment would fail later,
+somewhere else, as a confusing permission error — and the ONE thing worse than an unsupported
+tracker is a supported-looking one that writes to the wrong system.
+
+THE THIRD COMES FROM OUTSIDE (2026-08-26). This was an if-chain over three vendor names with the
+GitHub coordinates gate ABOVE it, so a stranger's `board.<kind>` entry point was loaded and never
+asked: with board_owner/board_number set the chain raised "no board provider", without them it
+answered None — tickets only — and a Jira-shaped add-on (whose project IS its board) could never
+have one. The chain is a table now, the lookup comes first, and each row decides for itself
+whether this project has a board.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+
+from beeverforge import plugins
+from beeverforge.adapters.board.base import BoardAdapter
+
+log = logging.getLogger("beeverforge.board")
+
+#: The entry-point axis name: `board.<kind>`, keyed — like the table below — by TRACKER kind,
+#: because a board is what a tracker's cards are arranged on and no project declares one apart.
+AXIS = "board"
+
+
+def _json_map(raw, project, option: str, consequence: str) -> dict[str, str] | None:
+    """A registry option that travels as a JSON object. `None` when absent or unparseable.
+
+    `ProviderRef.options` is `dict[str, str]` by contract, so a map has to arrive as a string —
+    exactly as the Jira `status_map` does:
+
+        columns: '{"todo": "A Fazer", "done": "Concluído"}'
+        areas:   '{"Portal": "dsk-ui"}'
+
+    A map that will not parse is an ERROR and then `None`, never a half-applied dict: the adapter
+    falls back to its default and the mismatch surfaces loudly at the first use rather than as a
+    card that quietly never travels. `consequence` is what the operator loses by the fallback, and
+    it is a parameter because the two maps lose different things — saying "falling back to the
+    defaults" for both would make one of the two messages useless."""
+    if not raw:
+        return None
+    if isinstance(raw, dict):  # a loose registry (or a test) that already holds the map
+        return {str(k): str(v) for k, v in raw.items()}
+    import json
+
+    try:
+        parsed = json.loads(raw)
+        return {str(k): str(v) for k, v in parsed.items()}
+    except (ValueError, AttributeError) as exc:
+        log.error("the board `%s` map for %s is not a JSON object (%s) — %s",
+                  option, getattr(project, "name", "?"), exc, consequence)
+        return None
+
+
+def declared_columns(project, options: dict) -> dict[str, str] | None:
+    """The client's own column names, keyed by the neutral lifecycle keys (C-14).
+
+    PUBLIC, AND THE ONE PLACE THIS OPTION IS TURNED INTO A MAP (#231). Two rows read `columns` and
+    only one of them parsed it: the Azure row came through here while the GitHub row passed the raw
+    option straight to a board that does `(columns or {}).items()` on it. A deployment that
+    declared its names the ONLY way the contract allows — `columns: '{"todo": "A Fazer"}'`, a
+    string, like the Jira `status_map` beside it — got `AttributeError: 'str' object has no
+    attribute 'items'` out of `build_board`, inside a poll tick. Parsed here, every reader is handed
+    a mapping or `None`, and a value a person typed wrong is an ERROR with a remedy rather than a
+    traceback somewhere downstream. `adapters/tracker/registry.py` reads it through this too.
+
+    AND THE QUEUE A DEPLOYMENT NAMED DIRECTLY IS IN IT (#502) — see `with_the_queue`."""
+    return with_the_queue(project, options, _json_map(
+        options.get("columns"), project, "columns",
+        "falling back to the platform's default column names, which will NOT match a board that "
+        "renamed them"), option="columns")
+
+
+def declared_queue(options: dict) -> str:
+    """The column a deployment named its queue with `pickup_status`, or `""` when it did not."""
+    return str((options or {}).get("pickup_status") or "").strip()
+
+
+def with_the_queue(project, options: dict, named: dict[str, str] | None, *,
+                   option: str) -> dict[str, str] | None:
+    """`named` — a row's map of the deployment's column names — with `pickup_status`, when the
+    deployment declared one, as the name of the queue key `todo` (#502).
+
+    TWO READERS OF ONE COLUMN, AND ONLY ONE OF THEM READ THE OPTION. The poller has always pulled
+    from `pickup_status` when a project names it (`activities.scan_projects`, `cli pickup`,
+    `actions/catalog._scan`); the product role queues an approved card through the row's own map
+    (`stage_column(board, "todo")`, #496), which never heard of it. A deployment that named its
+    queue `Pronto` with `pickup_status` and nothing in the map had every promotion land in `TO-DO`,
+    a column the poller never looks at — accepted, announced, and never started, which is the
+    money path failing in silence.
+
+    SO `pickup_status` IS THE QUEUE'S NAME, folded into the map every shipped row names its
+    stages from, rather than a second answer one caller knows about. The row then says it in
+    every direction at once: `pickup_column()` is it, `stage_column("todo")` is it, and a card
+    sitting in it is `todo` to `stage_key` — the edit and close gate stops calling the queue a
+    column nobody maps. Refusing the option at registry load was the other way, and it was not
+    taken: the doctor's own remedy offers `pickup_status` as a way to name the queue, and one bad
+    row would make every project in the registry unloadable.
+
+    DECLARED BOTH WAYS AND APART, THE POLLER'S PRECEDENCE HOLDS — `pickup_status` wins, as it
+    always has where the money is spent — and the disagreement is logged naming both, because
+    the column the map named is the one now nobody reads."""
+    queue = declared_queue(options)
+    if not queue:
+        return named
+    mapped = str((named or {}).get("todo") or "").strip()
+    if mapped and mapped != queue:
+        log.warning("BEEVERFORGE_BOARD_QUEUE_NAMED_TWICE project=%s — `pickup_status` names the "
+                    "queue %r and `%s` maps `todo` to %r; the poller pulls from %r, so the product "
+                    "role queues there too and %r is read as no stage at all. Keep one of them.",
+                    getattr(project, "name", "?"), queue, option, mapped, queue, mapped)
+    return {**(named or {}), "todo": queue}
+
+
+def _local(project, *, token, token_provider, options):
+    # SAME ABSENCE OF COORDINATES AS JIRA AND AZURE, and one turn tighter: the cards and the
+    # columns are rows in the same file, so the project itself is the board and there is nothing
+    # to point at. The tracker is built here because a BOARDS row receives no instance — one
+    # file, one truth (ADR-0049 D5).
+    from beeverforge.adapters.board.local import LocalBoard
+    from beeverforge.adapters.tracker.registry import build_tracker
+
+    # THE QUEUE A DEPLOYMENT NAMED DIRECTLY (#502): this row's names are its own rows, so the one
+    # it is told is folded in where it reads them — see `with_the_queue`
+    return LocalBoard(build_tracker(project, token=token, token_provider=token_provider),
+                      queue=declared_queue(options))
+
+
+def _jira(project, *, token, token_provider, options):
+    # NO board_owner/board_number, and that absence is the design rather than an omission.
+    # A Jira project's workflow STATUS is its column, so the project itself is the board —
+    # there is no second object to point at, and demanding coordinates for one would be
+    # inventing configuration a Jira deployment cannot supply. The pickup queue is a JQL
+    # query over the project the tracker already names.
+    from beeverforge.adapters.board.jira import JiraProjectBoard
+    from beeverforge.adapters.tracker.registry import build_tracker
+
+    return JiraProjectBoard(build_tracker(project, token=token, token_provider=token_provider))
+
+
+def _azure_devops(project, *, token, token_provider, options):
+    # SAME ABSENCE OF board_owner/board_number AS JIRA, for the same reason: an Azure Boards
+    # column IS a work item state, so the project's own board is the board and there is no
+    # second object to point at. What Azure DevOps needs instead is one level MORE nesting
+    # than GitHub — organization / project / team — and the team is the part a deployment
+    # cannot be asked to guess, so it is optional here and discovered from the project itself.
+    #
+    # The board is built from the SHARED client rather than through `build_tracker`, which is
+    # where this differs from Jira: there, auth, the site URL and the status map all lived
+    # inside the tracker, so a board with its own REST client would have drifted from it. Here
+    # the credential already lives one level up, in `adapters/azure_devops.py` (C-20 — one
+    # HTTP client for every Azure DevOps axis), so the board holds no vendor knowledge the
+    # tracker also holds, and a deployment can run Azure Boards with a GitHub forge.
+    from beeverforge.adapters.azure_devops import coordinates
+    from beeverforge.adapters.board.azure_devops import AzureBoardsBoard
+    from beeverforge.adapters.forge.registry import repo_of
+
+    tracker = project.tracker
+    # THE SAME COORDINATES THE TRACKER REGISTRY READS, spelling for spelling. Not a courtesy:
+    # `tracker/registry.py:_azure_devops` accepts `org` as an alias for `organization` and
+    # falls back to `tracker.repo` for the ADO project, so a row written the way IT documents
+    # built a working tracker and a board whose constructor raised ValueError — and
+    # `scan_todo` does not catch it, so that is a poller tick with a stack trace where the
+    # pickup queue should be. Reading them differently is the worse bug of the two: the axes
+    # would then resolve to DIFFERENT projects and the board would report on work items the
+    # tracker never writes to. If either registry's spelling moves, both move together.
+    organization, ado_project = coordinates(project, ref=tracker)
+    return AzureBoardsBoard(
+        organization=organization,
+        project=ado_project,
+        team=options.get("team", ""),
+        board=options.get("board", ""),
+        # the client's own column names (C-14) — the same registry row the Jira status_map and
+        # the GitHub board columns use.
+        columns=declared_columns(project, options),
+        order_by=options.get("order_by", ""),
+        # C-18: the repository a bare card belongs to, and the area→repo map for the ones that
+        # do not. Absent → refs stay bare and nothing moves, which is every single-repo project.
+        # PROJECT-QUALIFIED to match what `_repo_for_area` mints, so a card sitting in the
+        # default repository's own area comes back BARE rather than needlessly qualified.
+        default_repo=(f"{ado_project}/{repo_of(project)}" if repo_of(project) else ""),
+        areas=_json_map(
+            options.get("areas"), project, "areas",
+            "falling back to the convention that an area's leaf name IS the repository name. "
+            "On a product whose areas are named differently, every card then routes to the "
+            "default repository"),
+        token=token,
+        token_provider=token_provider,
+        options=options,
+    )
+
+
+def _github(project, *, token, token_provider, options):
+    # THE COORDINATES GATE IS THIS ROW'S, not the registry's. GitHub Projects v2 is a second
+    # object beside the repository, so a project points at it with board_owner/board_number and
+    # their absence means "tickets only". Jira and Azure Boards have no such object, and a
+    # stranger's board may be shaped either way — which is why the gate sat in the wrong place
+    # while it was above the dispatch: a Jira-shaped add-on without coordinates read as "no board"
+    # before its builder was ever asked (measured 2026-08-26).
+    owner, number = options.get("board_owner"), options.get("board_number")
+    if not (owner and number):
+        return None  # tickets only — a legitimate configuration
+
+    from beeverforge.adapters.tracker.github_project import GitHubProjectBoard
+    from beeverforge.credentials import github_refusal
+
+    return GitHubProjectBoard(str(owner), str(number), token=token,
+                              token_provider=token_provider,
+                              # never the machine's own login after a refusal (#742)
+                              refused="" if token else github_refusal(project, "tracker"),
+                              # PARSED, NOT THE RAW OPTION (#231): `options` is
+                              # `dict[str, str]`, so a client's map arrives as a JSON string and
+                              # this board does `(columns or {}).items()` on what it is given.
+                              columns=declared_columns(project, options),
+                              # C-18: what a BARE ref on this board means. Cards from any other
+                              # repo leave (and are matched) as `owner/name#n`.
+                              default_repo=getattr(project.tracker, "repo", "") or "")
+
+
+# ── what each row SAYS ──────────────────────────────────────────────────────────────────────────
+#
+# A board's words hang off its builder — beside `display_name`, the way an observer's name does
+# (`environment/registry.py`) — and are read through `plugins.sentence`, WITHOUT building the
+# board: the doctor asks them at the moment the board could not be read. Until 2026-09-19 they
+# were three `if kind == …` chains in `doctor.py`, so a stranger's board was located in Jira's
+# option names (`site`, `project_key`) and had no remedy of its own to give.
+#
+#   display_name     what the board is called to a reader
+#   coordinates      WHICH board, in the vendor's own coordinates — a callable of the project
+#   when_unreadable  what to do when it is configured and could not be read — a string, or a
+#                    callable of the project when the words name the variable it declared
+#   setup            what setting this board up means when there is no board to CREATE
+#
+# Every one optional. A row that says nothing is located by its tracker's `repo` and given the
+# doctor's own vendor-free remedy.
+
+def _options(project) -> dict:
+    return getattr(getattr(project, "tracker", None), "options", None) or {}
+
+
+def _token_variable(project, default: str) -> str:
+    return str(_options(project).get("token_env") or "").strip() or default
+
+
+def _github_coordinates(project) -> str:
+    options = _options(project)
+    return f"{options.get('board_owner', '?')}/{options.get('board_number', '?')}"
+
+
+def _azure_devops_coordinates(project) -> str:
+    # THE SPELLING THIS ROW'S BUILDER ALREADY USES (`adapters/azure_devops.py::coordinates`), and
+    # for its reason: four copies is how two of them came to disagree about which ADO project a
+    # registry row names. The doctor's own copy read `org` and `organization` by hand.
+    from beeverforge.adapters.azure_devops import coordinates
+
+    organization, ado_project = coordinates(project, ref=getattr(project, "tracker", None))
+    return f"{organization or '?'}/{ado_project or '?'}"
+
+
+def _jira_coordinates(project) -> str:
+    # the project IS the board, so its own coordinate — the site and the key — is the answer
+    tracker = getattr(project, "tracker", None)
+    options = _options(project)
+    key = options.get("project_key") or getattr(tracker, "repo", "") or "?"
+    return f"{options.get('site', '')} {key}".strip()
+
+
+def _azure_devops_unreadable(project) -> str:
+    return (f"check that {_token_variable(project, 'AZURE_DEVOPS_PAT')} is set for THIS process "
+            "and grants read on Work Items — Azure DevOps answers a wrong credential with HTTP "
+            "200 and a sign-in PAGE rather than a 401, so this reads as an empty board. A GitHub "
+            "token reaching this axis produces exactly that; the board takes the TRACKER's "
+            "credential, never the forge's.")
+
+
+def _jira_unreadable(project) -> str:
+    return (f"check that {_token_variable(project, 'JIRA_API_TOKEN')} is set for THIS process "
+            "and that the account can browse the project")
+
+
+_local.display_name = "this panel's own board"
+
+_github.display_name = "GitHub Projects"
+_github.coordinates = _github_coordinates
+_github.when_unreadable = (
+    "this is almost always the credential rather than the board: check that "
+    "BEEVERFORGE_BOT_TOKEN or the App's BEEVERFORGE_GH_APP_ID/KEY/INSTALLATION_ID are set for "
+    "THIS process, and that the installation covers the board's organisation")
+
+_jira.display_name = "Jira"
+_jira.coordinates = _jira_coordinates
+_jira.when_unreadable = _jira_unreadable
+
+_azure_devops.display_name = "Azure Boards"
+_azure_devops.coordinates = _azure_devops_coordinates
+_azure_devops.when_unreadable = _azure_devops_unreadable
+_azure_devops.setup = ("its columns are the project's work item states: "
+                       "docs/setup/azure-devops.md §3 is the recipe")
+
+
+#: tracker kind → the board it implies. Each row answers `None` for "this project has no board",
+#: which is a first-class answer on this axis (a deployment can run on tickets alone). A stranger's
+#: row joins through the `board.<kind>` entry point with the same signature:
+#: `build(project, *, token, token_provider, options) -> BoardAdapter | None`.
+BOARDS: dict[str, Callable[..., BoardAdapter | None]] = {
+    "local": _local,
+    "github": _github,
+    "jira": _jira,
+    "azure_devops": _azure_devops,
+}
+
+#: The public spelling of the built-in kinds — kept as a tuple because the tests and the docs
+#: read it as one; the table above is the source, this is its projection.
+BOARD_KINDS = tuple(BOARDS)
+
+
+def board_row(project) -> Callable[..., BoardAdapter | None] | None:
+    """The ROW this project's board comes from — built-in or an add-on's — or None. Found the way
+    `build_board` finds it and NOT called: what a row says (`plugins.sentence`) is asked when the
+    board could not be read, which is exactly when building it again proves nothing."""
+    tracker = getattr(project, "tracker", None)
+    kind = (getattr(tracker, "kind", "") or "").strip().lower()
+    return BOARDS.get(kind) or plugins.builder(AXIS, kind, builtin=BOARDS)
+
+
+def board_names(*, hosted: bool = True) -> list[str]:
+    """What every board this deployment can build is CALLED — shipped plus installed, each by its
+    row's own `display_name`, a row that declares none by its kind.
+
+    `hosted` KEEPS ONLY THE ONES THAT LIVE ON SOMEBODY'S SERVICE: the rows whose vendor needs a
+    credential (`CredentialRow.needs`). The panel's how-to says "this panel holds one itself,
+    which needs no account anywhere" and then lists the others — and "the others" is that
+    question, asked of the row, never `kind != "local"`."""
+    from beeverforge.adapters.credential.registry import credential_row
+
+    names = []
+    for kind in plugins.known(AXIS, BOARDS):
+        row = BOARDS.get(kind) or plugins.builder(AXIS, kind, builtin=BOARDS)
+        if hosted and not getattr(credential_row(kind), "needs", True):
+            continue
+        names.append(plugins.display_name(row, kind))
+    return names
+
+
+def build_board(project, *, token: str | None = None, token_provider=None) -> BoardAdapter | None:
+    """The project's board, or `None` when it has no board configured.
+
+    `None` is a first-class answer, not a failure: a board is OPTIONAL (a deployment can run
+    perfectly on tickets alone), and every caller already handles its absence. What is not
+    acceptable is guessing a provider.
+
+    THE LOOKUP COMES BEFORE ANY GATE. The tracker kind picks the row — built-in or the add-on's
+    `board.<kind>` entry point — and the ROW decides whether this project has a board. The
+    registry only refuses when no row exists AND the project points at a board anyway
+    (board_owner/board_number set): that is a project configured for a provider this deployment
+    cannot build, and leaving it pointing at nothing is the confusing-permission-error shape the
+    module docstring refuses. Without those options an unknown kind is tickets-only, as before.
+
+    `token_provider` is a callable resolved at each USE rather than here — the same idiom the forge
+    and tracker already take. Two reasons it belongs on the board too: an App installation token
+    lasts about an hour and a job can outlive one, and a caller that only *might* read the board
+    (the doctor, on a project that may have none) must not pay a token mint to find out it has
+    nothing to authenticate for."""
+    tracker = getattr(project, "tracker", None)
+    if tracker is None:
+        return None
+    options = getattr(tracker, "options", None) or {}
+    kind = (getattr(tracker, "kind", "") or "").strip().lower()
+
+    builder = BOARDS.get(kind) or plugins.builder(AXIS, kind, builtin=BOARDS)
+    if builder is not None:
+        return builder(project, token=token, token_provider=token_provider, options=options)
+
+    owner, number = options.get("board_owner"), options.get("board_number")
+    if not (owner and number):
+        return None  # tickets only — a legitimate configuration
+
+    known = ", ".join(plugins.known(AXIS, BOARDS))
+    raise ValueError(
+        f"no board provider for tracker kind {kind!r} (known: {known}). "
+        f"A project configures a board with board_owner/board_number; if this tracker has no "
+        f"board, remove those options rather than leaving them pointing at nothing."
+    )

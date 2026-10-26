@@ -1,0 +1,255 @@
+"""Which tracker a project uses — resolved from config, never from an import.
+
+Same seam as the harness registry, for the same reason and after the same discovery: the platform
+was agnostic in its protocols and hardcoded in its composition root. `TrackerAdapter` has always
+been a Protocol, and `GitHubIssuesTracker` was still constructed by name in a dozen places, so a
+Jira deployment meant editing a dozen files rather than changing one value.
+
+The pilot is Python on GitHub. That is a PILOT, not the shape of the product: the same platform is
+sold to clients whose tickets live in Jira, and "agnostic" has to be structurally true before the
+first of them arrives, not promised for later.
+
+AN UNKNOWN KIND RAISES. Falling back to GitHub would have a Jira deployment quietly writing its
+tickets into a repository nobody reads — the one failure worse than an unsupported tracker is a
+supported-LOOKING one pointed at the wrong system.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from beeverforge import plugins
+
+# No default. Removing the model default alone would not have removed the GitHub default:
+# these resolvers ended in `or DEFAULT_KIND`, so `kind: ""` still landed on GitHub AFTER the
+# contracts change — and the kernel AST guard stayed green, because a provider registry is
+# correctly outside its scope. Both had to land together or C-08 would have shipped a
+# checkable claim that was still false.
+
+
+def _github(project, **kw):
+    from beeverforge.adapters.board.factory import declared_columns
+    from beeverforge.adapters.tracker.github import GitHubIssuesTracker
+    from beeverforge.credentials import github_refusal
+
+    options = (getattr(project.tracker, "options", None) or {})
+    return GitHubIssuesTracker(
+        project.tracker.repo or "",
+        board_owner=options.get("board_owner"),
+        board_number=options.get("board_number"),
+        token=kw.get("token"),
+        token_provider=kw.get("token_provider"),
+        # with no token, never the machine's own login after a refusal (#742)
+        refused="" if kw.get("token") else github_refusal(project, "tracker"),
+        # the client's own column names (C-14) — same registry row the Jira status_map uses,
+        # and PARSED where the board registry parses it (#231): this row handed the raw option
+        # to a board that does `(columns or {}).items()` on it, so a deployment that declared
+        # its names the only way `dict[str, str]` allows got an AttributeError out of
+        # `build_tracker`.
+        board_columns=declared_columns(project, options),
+    )
+
+
+def _jira(project, **kw):
+    import json
+    import logging
+
+    from beeverforge.adapters.tracker.jira import JiraTracker
+
+    log = logging.getLogger("beeverforge.tracker")
+    options = (getattr(project.tracker, "options", None) or {})
+    # `options` is dict[str,str] by contract, so the status map travels as a JSON string:
+    #   status_map: '{"in_progress": "Em andamento", "done": "Concluído"}'
+    # Without it every set_state is a no-op-with-warning — an audit found the whole state-mapping
+    # feature unreachable because nothing ever passed the map in.
+    status_map: dict[str, str] = {}
+    raw = options.get("status_map", "")
+    if raw:
+        try:
+            status_map = {str(k): str(v) for k, v in json.loads(raw).items()}
+        except (ValueError, AttributeError) as exc:
+            log.error("jira status_map for %s is not valid JSON (%s) — issues will NOT be "
+                      "transitioned until it is fixed", getattr(project, "name", "?"), exc)
+    # THE QUEUE A DEPLOYMENT NAMED WITH `pickup_status` IS THIS MAP'S `todo` (#502): the poller
+    # pulls from it, and the board names every stage — the product role's queue among them — off
+    # this map. See `board/factory.py::with_the_queue`.
+    from beeverforge.adapters.board.factory import with_the_queue
+
+    status_map = with_the_queue(project, options, status_map, option="status_map") or {}
+    # THE VENDOR'S OWN CREDENTIAL, NEVER THE CALLER'S PROVIDER — the same refusal the forge
+    # registry's Azure row makes, and it was missing here. `token_provider` on this axis is
+    # ALWAYS `factory._bot_token_provider`, the GitHub App minter: every caller that has no
+    # explicit token passes it. Honouring it meant the sweep that stopped handing this row a
+    # GitHub token as `token=` simply changed which door the same token came in by — a fix that
+    # only looks like one, which is worse than the gap. Found by adversarial review, 2026-08-20,
+    # measured: a Jira project with no `JIRA_API_TOKEN` still built a `JiraTracker` whose token
+    # was the minted `ghs_…`, before AND after the sweep.
+    #
+    # Jira's API token is static and named by `_VENDOR_DEFAULT_ENV`, so there is nothing a
+    # provider would buy even if it were this vendor's: nothing configured → None → the adapter
+    # fails saying which variable to set, which is an honest error rather than a mystery 401.
+    # Jira answers the empty token as an anonymous request (404 on the card, measured
+    # 2026-10-19), so the saying is `jira._not_one_account`'s "no API token reached this
+    # tracker … Set JIRA_API_TOKEN, or the variable the project's tracker.options.token_env
+    # names." (#749). Only when the deployment has no generic token pair either: a caller that
+    # passes `token=` resolved it through `credentials.tracker_token_for`, which falls back to
+    # that pair, so a GitHub token reaches Jira and reads as "different accounts" (measured on a
+    # Jira Cloud site, 2026-10-19).
+    from beeverforge.credentials import axis_refusal, vendor_default
+
+    # …AND NOT AFTER A REFUSAL (#822): `JIRA_API_TOKEN` is the step after the project's own
+    # reference, and a refused reference ends the resolution, here as in `credentials`.
+    refused = "" if kw.get("token") else axis_refusal(project, "tracker")
+    token = kw.get("token") or (None if refused
+                                else vendor_default(getattr(project, "tracker", None)))
+    return JiraTracker(
+        # …and the sentence an anonymous answer gets says the refusal, not "Set JIRA_API_TOKEN",
+        # which would send the operator to set a variable that is already set
+        refused=refused,
+        site=options.get("site", ""),
+        project_key=options.get("project_key") or project.tracker.repo or "",
+        email=options.get("email", ""),
+        token=token,
+        status_map=status_map,
+        issue_type=options.get("issue_type", "Task"),
+        # THE SITE'S OWN NAME for "closed, and the work was not done" (#203) — `Won't Do` on one
+        # site, `Não será feito` on the next, absent on a third. No default here either: unset is
+        # a state the row handles by name (`JiraTracker.close_ticket`), and a literal would be a
+        # resolution most sites do not have.
+        #   not_delivered_resolution: "Won't Do"
+        not_delivered_resolution=options.get("not_delivered_resolution", ""),
+        # …or its STATUS for the same thing, where the site says it with a column of its own — the
+        # only way a team-managed project has. Beside the resolution and not inside `status_map`:
+        # that map is keyed by the states a job can be in, and this is a word of the close.
+        #   not_delivered_status: "Cancelado"
+        not_delivered_status=options.get("not_delivered_status", ""),
+        # …and the status its workflow creates a new issue in (#543): Jira publishes it only to an
+        # administrator, and a workflow with two statuses an issue could start in is not read
+        # without it. `JiraProjectBoard.intake_column` checks it against the type's statuses.
+        #   intake_status: "A Fazer"
+        intake_status=options.get("intake_status", ""),
+        # …and the project's slice of a Jira project it shares with other registry projects
+        # (#752): a JQL condition ANDed onto every board read and onto `find_ticket`. Unset, the
+        # whole Jira project, as before. Single-quoted in YAML, because JQL quotes with `"`.
+        #   scope_jql: 'labels = "bf-api"'
+        scope_jql=options.get("scope_jql", ""),
+        # for the one note the row writes in its own name — see `JiraTracker.language`
+        language=getattr(project, "language", None),
+    )
+
+
+def _azure_devops(project, **kw):
+    from beeverforge.adapters.azure_devops import coordinates
+    from beeverforge.adapters.tracker.azure_devops import AzureBoardsTracker
+
+    options = (getattr(project.tracker, "options", None) or {})
+    # `state_map` travels as a JSON string for the same reason Jira's `status_map` does — options
+    # is dict[str,str] by contract:
+    #   state_map: '{"in_progress": "Doing", "needs_action": "Needs Action", "done": "Done"}'
+    # `needs_review` is answered by this map alone (no category means it); unnamed, a pull request
+    # waiting for a person's review takes `needs_action`'s state (#753).
+    # Unlike Jira this is optional: Azure DevOps publishes each state's CATEGORY, so an
+    # unconfigured deployment still moves cards correctly for every bucket the vendor classifies.
+    state_map = _json_map(options.get("state_map", ""), project, "state_map")
+    # THE VENDOR'S OWN CREDENTIAL, NEVER THE CALLER'S PROVIDER — the same refusal the forge
+    # registry's Azure row makes, and it was missing here. `token_provider` on this axis is
+    # ALWAYS `factory._bot_token_provider`, the GitHub App minter: every caller that has no
+    # explicit token passes it. Honouring it meant the sweep that stopped handing this row a
+    # GitHub token as `token=` simply changed which door the same token came in by — a fix that
+    # only looks like one, which is worse than the gap. Found by adversarial review, 2026-08-20,
+    # measured: a Jira project with no `JIRA_API_TOKEN` still built a `JiraTracker` whose token
+    # was the minted `ghs_…`, before AND after the sweep.
+    #
+    # AND NOTHING ELSE IS NEEDED HERE. The shared `AzureDevOpsClient` below reads the variable this
+    # project NAMES (`options.token_env`, default `AZURE_DEVOPS_PAT`) on its own — measured, both
+    # the default and a named one. A `or token_for(options)` on this line would look like the fix
+    # and change no answer, which is the shape this whole card is about; the caller's explicit
+    # token is passed through because it is the one thing the client cannot know about.
+    token = kw.get("token")
+    organization, ado_project = coordinates(project, ref=getattr(project, "tracker", None))
+    return AzureBoardsTracker(
+        # ONE HOME FOR THIS SPELLING (`adapters/azure_devops.py::coordinates`). Four registries
+        # each carried a copy promising the other three would move with it; two had already
+        # drifted, and a drift here means the axes resolve to DIFFERENT ADO projects.
+        organization=organization,
+        project=ado_project,
+        # `options` travels too: with no explicit token the shared client reads the variable this
+        # project NAMES in `token_env`, so a credential never has to pass through the registry
+        token=token,
+        work_item_type=options.get("work_item_type", "Issue"),
+        state_map=state_map,
+        options=options,
+        # for the one note the row writes in its own name — see `AzureBoardsTracker.language`
+        language=getattr(project, "language", None),
+    )
+
+
+def _json_map(raw: str, project, field: str) -> dict[str, str]:
+    """A JSON-encoded option, or {} — never a crash and never a silent empty.
+
+    A malformed map is LOGGED AS AN ERROR rather than swallowed: it degrades a state change into a
+    no-op, and a no-op nobody was told about is a card that stops moving for a reason no one can
+    see."""
+    import json
+    import logging
+
+    if not raw:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in json.loads(raw).items()}
+    except (ValueError, AttributeError) as exc:
+        logging.getLogger("beeverforge.tracker").error(
+            "%s for %s is not valid JSON (%s) — work items will NOT be transitioned by it until "
+            "it is fixed", field, getattr(project, "name", "?"), exc)
+        return {}
+
+
+def _local(project, **kw):
+    """The board the platform itself holds, in `board.db` (ADR-0049 D1).
+
+    IT TAKES THE PROJECT'S NAME, not a `repo`, and the difference is the design. Every other row
+    here is pointed at somebody else's object — `owner/name`, a Jira key, an organization — while
+    this one's cards live in a file this deployment owns, keyed by the project the registry already
+    names. `tracker.repo` is still written by the doors (four consumers need it non-empty) and is
+    still the project's own name, so nothing downstream has to learn a new shape."""
+    from beeverforge.adapters.tracker.local import LocalTracker
+
+    options = (getattr(project.tracker, "options", None) or {})
+    return LocalTracker(
+        getattr(project, "name", "") or (project.tracker.repo or ""),
+        db_path=options.get("board_db") or None,
+        token=kw.get("token"),
+        token_provider=kw.get("token_provider"),
+    )
+
+
+#: kind → builder. Adding a tracker is ONE entry here plus its module; a test asserts that no call
+#: site anywhere goes back to naming a concrete class.
+TRACKERS: dict[str, Callable[..., object]] = {
+    "local": _local,
+    "github": _github,
+    "jira": _jira,
+    # spelled like the shared client's module (`beeverforge/adapters/azure_devops.py`) so one kind
+    # names
+    # this vendor on every axis it appears on
+    "azure_devops": _azure_devops,
+}
+
+
+def tracker_kind(project) -> str:
+    tracker = getattr(project, "tracker", None)
+    return (getattr(tracker, "kind", "") or "").strip().lower()
+
+
+def build_tracker(project, *, token=None, token_provider=None):
+    """The project's tracker. Raises on an unknown kind — never guesses a provider."""
+    kind = tracker_kind(project)
+    builder = TRACKERS.get(kind) or plugins.builder('tracker', kind, builtin=TRACKERS)
+    if builder is None:
+        _known = ', '.join(plugins.known('tracker', TRACKERS))
+        raise ValueError(
+            f"unknown tracker {kind!r} — known: {_known}. Refusing to fall "
+            f"back to a default: a deployment whose tickets live elsewhere would have this "
+            f"one silently writing into a repository nobody reads."
+        )
+    return builder(project, token=token, token_provider=token_provider)

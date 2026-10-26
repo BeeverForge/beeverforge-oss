@@ -1,0 +1,923 @@
+"""Session-wide guarantees for the test suite.
+
+The one that matters: **a test can never hold a credential that acts on something real.**
+
+This is not hypothetical. `beeverforge/cli.py` used to call `load_dotenv()` at module import time, so any
+test that imported it — directly or transitively — pulled the whole of `.env` into the process:
+live GitHub App credentials for a client's repository, a Slack bot token, a Temporal API key, a
+Claude OAuth token. Under `pytest-randomly` the tests that ran afterwards inherited them, and two
+of them made a real authenticated HTTPS call to GitHub, surfacing as a `ReadTimeout` that vanished
+in isolation.
+
+The import-time load is fixed at its source. This is the floor underneath it, because the fix and
+the floor fail differently: the fix can be undone by the next person who adds a convenience import
+of `load_dotenv`, and nothing about that change would look dangerous in review.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import tempfile
+import uuid
+from pathlib import Path
+
+import pytest
+
+#: Everything that would let a test ACT on real infrastructure. Deliberately not "every secret" —
+#: the criterion is authority, not confidentiality.
+LIVE_CREDENTIALS = (
+    # the forge: create issues, comment, push, merge
+    "BEEVERFORGE_GH_APP_ID",
+    "BEEVERFORGE_GH_APP_INSTALLATION_ID",
+    "BEEVERFORGE_GH_APP_KEY",
+    "BEEVERFORGE_GH_APP_KEY_CONTENT",
+    "BEEVERFORGE_BOT_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    # the channel: post to a client's workspace
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    # the durable engine: start and signal real workflows
+    "TEMPORAL_API_KEY",
+    "TEMPORAL_TLS_CERT",
+    "TEMPORAL_TLS_KEY",
+    # the harness: spend money
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    # the cloud: launch tasks, write telemetry
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+)
+
+
+def _axis_overrides() -> tuple[str, ...]:
+    """The deployment's OPINIONS about which harness, model and auth route to use.
+
+    Not credentials — configuration — and it leaks by the same route and does the same damage. A
+    `.env` carrying `BEEVERFORGE_EXECUTOR_MODEL=opus` reaches the session through any entry point that
+    loads it, outlives the test that called one, and then every later test resolves a model the
+    developer's machine chose rather than the one the test declared. Assertions about the harness
+    axis silently measure `.env`; under `pytest-randomly` a different set each run.
+
+    It surfaced when the OpenCode adapter started refusing a model with no `provider/` prefix:
+    29 tests failed on a random seed and none on a fixed one, which is the signature of a leak
+    rather than a flake — the same signature the credential half of this file was written for.
+
+    DERIVED from the registries rather than listed, so a new role or a new override cannot join
+    the axis and quietly stay out of the strip."""
+    from beeverforge.adapters.agent.registry import ROLE_MODELS, ROLES
+    from beeverforge.adapters.embed.local import DIGEST_ENV, MODEL_ENV
+    from beeverforge.adapters.embed.registry import KIND_ENV
+
+    return (*ROLES.values(), *ROLE_MODELS.values(), "BEEVERFORGE_PLANNER_MODEL",
+            # what `routes.py` reads to decide where the harness talks
+            "BEEVERFORGE_HARNESS_ENDPOINT", "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+            # which model makes the product index's vectors (#269 slice 2): a developer's local
+            # model must not decide whether a test's search ran by meaning
+            KIND_ENV, MODEL_ENV, DIGEST_ENV)
+
+
+def _strip() -> None:
+    """Delete rather than blank: `os.environ["X"] = ""` still satisfies `"X" in os.environ`, and
+    several call sites test membership rather than truthiness."""
+    import os
+
+    for name in (*LIVE_CREDENTIALS, *_axis_overrides()):
+        os.environ.pop(name, None)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_live_credentials_at_import() -> None:
+    """Strip before anything is collected.
+
+    Session scope is what catches an IMPORT-time loader — the failure that started this. A
+    function-scoped fixture runs after every module has already been imported, by which time the
+    damage is done.
+    """
+    _strip()
+
+
+#: THE OPERATOR'S OWN WORLD, captured ONCE before anything here redirects it (#365). A real
+#: BeeverForge deployment lives under `~/.beeverforge/` — the generated `env`, `registry.yaml`,
+#: `board.db`, `metrics.db` — and it exports its configuration into the shell that launches the
+#: suite (`BEEVERFORGE_BOARD_DB`, `BEEVERFORGE_OWN_WORK`, `TEMPORAL_ADDRESS`, …). ADR-0049 puts
+#: that deployment on the very machine a contributor works on, so the suite read BOTH: a default
+#: with no override falls to `namespace.operator_path` — `Path.home()/.beeverforge/…`, the
+#: operator's live files — and the box kind, the engine address and `own_work` read the loaded
+#: shell. A suite whose meaning, and whose WRITES, depend on who runs it is the leak the credential
+#: floor and the registry floor above are earlier halves of. `tests/test_the_suite_reads_no_
+#: operators_beeverforge.py` is the guard.
+_OPERATOR_HOME: Path | None = None
+#: name → sha256 of the value. DIGESTS, NEVER VALUES: these are the operator's secrets (a panel
+#: token, a bot token), and the point of taking them away is that no test can read them — a copy
+#: kept for the guard to compare against would be one more place to read them from.
+_OPERATOR_ENV: dict[str, str] = {}
+
+#: HOW AN xdist WORKER LEARNS WHAT THE CONTROLLER TOOK AWAY. Workers are spawned after the
+#: controller's `pytest_configure` has already stripped the variables and re-homed `HOME`, so a
+#: worker capturing for itself would capture the controller's suite home and an empty environment,
+#: and every check against them would be vacuous under `-n`. The controller hands both down in
+#: xdist's own `workerinput` (`_HandDown`) — NOT through the environment, which every nested pytest
+#: a test starts would inherit and mistake for its own operator.
+_HANDED_DOWN = "beeverforge_suite_operator"
+
+
+class _HandDown:
+    """Registered on the controller only when xdist is installed: an unknown `pytest_*` hook in a
+    conftest is an error where the plugin is absent."""
+
+    @staticmethod
+    def pytest_configure_node(node) -> None:
+        node.workerinput[_HANDED_DOWN] = {"home": str(_OPERATOR_HOME), "env": dict(_OPERATOR_ENV)}
+
+#: The two prefixes a deployment's environment carries. Everything the platform reads by
+#: configuration is `BEEVERFORGE_*` (`environ.ENV_PREFIX`), and the durable engine adds `TEMPORAL_*`
+#: — both are the operator's when they arrive in the shell, and both are stripped so no test reads
+#: them. The suite SETS its own under `BEEVERFORGE_*` (a registry, a log dir, a cache); those are
+#: written back AFTER this strip, by the fixtures and hooks that own them.
+OPERATOR_PREFIXES = ("BEEVERFORGE_", "TEMPORAL_")
+
+
+def _isolate_the_operator(suite_home: Path, workerinput: dict | None = None) -> None:
+    """Capture the operator's home and ambient `BEEVERFORGE_*`/`TEMPORAL_*`, then take both away:
+    point `HOME` at a directory of the suite's own and delete every one of those variables.
+
+    Called from `pytest_configure`, BEFORE collection — the same window the registry hook below
+    runs in, and for the same reason: a module or a module-scoped fixture that resolves a default
+    at import would otherwise read the operator's home first. Captured before it is changed, so the
+    guard can prove what a test no longer sees."""
+    global _OPERATOR_HOME
+
+    handed_down = (workerinput or {}).get(_HANDED_DOWN)
+    if handed_down:
+        # an xdist worker: the controller has already captured and stripped — take its capture
+        _OPERATOR_HOME = Path(handed_down["home"])
+        _OPERATOR_ENV.update(handed_down["env"])
+    else:
+        _OPERATOR_HOME = Path(os.environ.get("HOME") or Path.home()).resolve()
+        _OPERATOR_ENV.update({name: _digest(value) for name, value in os.environ.items()
+                              if name.startswith(OPERATOR_PREFIXES)})
+    for name in [n for n in os.environ if n.startswith(OPERATOR_PREFIXES)]:
+        os.environ.pop(name, None)
+    suite_home.mkdir(parents=True, exist_ok=True)
+    _carry_dockers_plugins(suite_home)
+    os.environ["HOME"] = str(suite_home)
+    # AND THE `gh` CLI'S OWN LOGIN, which is not only under `HOME`: `GH_CONFIG_DIR`, else
+    # `XDG_CONFIG_HOME/gh`, else `~/.config/gh`. Re-homing hid it only while neither variable was
+    # set in the operator's shell, and with it found, a test whose project names no repository
+    # commented on the repository the suite runs from (`adapters/github_cli.py`, 31 times on
+    # `beeverforge-oss#12`). Pointed at an empty directory of the suite's own, whatever was set.
+    gh_config = suite_home / ".config" / "gh"
+    gh_config.mkdir(parents=True, exist_ok=True)
+    os.environ["GH_CONFIG_DIR"] = str(gh_config)
+
+
+def _digest(value: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _carry_dockers_plugins(home: Path) -> None:
+    """Link the operator's `~/.docker/cli-plugins` into `home`, when there is one.
+
+    DOCKER'S OWN PER-USER CONFIGURATION IS NOT THE DEPLOYMENT THIS FIXTURE HIDES. Docker Desktop
+    installs `docker compose` per user, at `~/.docker/cli-plugins/docker-compose`, and the preview
+    runtime finds it through `HOME` (`compose.docker_config()` falls back to `~/.docker`). An empty
+    home took the plugin away, and the real-daemon preview tests went red on a maintainer's Mac:
+    `unknown shorthand flag: 'p' in -p` is `docker` failing to find `compose` (review of #454).
+
+    THE PLUGINS AND NOTHING ELSE: `~/.docker/config.json` can hold the operator's registry logins,
+    which no test may read."""
+    if _OPERATOR_HOME is None:
+        return
+    plugins = _OPERATOR_HOME / ".docker" / "cli-plugins"
+    link = home / ".docker" / "cli-plugins"
+    if plugins.is_dir() and not link.exists() and not link.is_symlink():
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(plugins, target_is_directory=True)
+
+
+def operators_real_home() -> Path:
+    """The home the shell that launched the suite named — the one no test may read (#365)."""
+    assert _OPERATOR_HOME is not None, "pytest_configure has not captured the operator's home yet"
+    return _OPERATOR_HOME
+
+
+def operators_ambient_environment() -> dict[str, str]:
+    """The `BEEVERFORGE_*`/`TEMPORAL_*` the shell that launched the suite carried, name → sha256
+    of the value (`_digest`) — the deployment's own configuration, which no test may read (#365).
+    The same under `-n`: a worker reads the controller's capture."""
+    return dict(_OPERATOR_ENV)
+
+
+def ambient_digest(value: str) -> str:
+    """The digest `operators_ambient_environment` holds for `value`, to compare against."""
+    return _digest(value)
+
+
+@pytest.fixture(autouse=True)
+def _a_home_of_its_own(monkeypatch, tmp_path_factory, request) -> None:
+    """`HOME` is a directory of THIS test's own, so `Path.home()` — and every `~/.beeverforge/…`
+    a default resolves to (`namespace.operator_path`, `board_db.db_path`, `gate_seal`) — lands
+    there and never at the operator's real deployment (#365).
+
+    Named after the node id and created empty, like the journals and registries above: a test
+    starts from nothing, and a test that wants its own home still sets `HOME` and wins, because
+    this runs first as an autouse fixture does. The session-wide strip in `pytest_configure` has
+    already re-homed `HOME` for the import window; this narrows it to one directory per test so a
+    file one test writes under its home is never the next test's."""
+    import hashlib
+
+    own = hashlib.sha1(request.node.nodeid.encode()).hexdigest()[:12]
+    home = tmp_path_factory.getbasetemp() / "homes" / own
+    home.mkdir(parents=True, exist_ok=True)
+    _carry_dockers_plugins(home)
+    monkeypatch.setenv("HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
+def _the_suite_never_borrows_this_machines_az_login(monkeypatch) -> None:
+    """A LIVE CREDENTIAL THAT `_strip()` CANNOT REACH, because it lives behind a subprocess.
+
+    `adapters/azure_devops.token_for` falls back to minting a JWT from the machine's `az` login
+    when the variable a project names is empty — and in this suite that variable is ALWAYS empty,
+    because `_strip()` deletes it. So on a developer's laptop, signed into a real tenant, every
+    test that builds an Azure adapter without an explicit token would quietly acquire a working
+    credential and could reach dev.azure.com; the same test on a CI runner with no Azure CLI gets
+    None. That is a suite whose meaning depends on who runs it, which is the exact failure the
+    credential strip at the top of this file was written for.
+
+    Neutralised at `_az_mint` rather than at `az_token` on purpose: the caching, the refresh margin
+    and the refusal to evict a live token on a failed refresh are real behaviour with guards of
+    their own, so they must stay reachable. A test that wants the minter supplies its own
+    `_az_mint`, which lands after this fixture and wins.
+
+    The cache is reset with it — it is a module global, so a token one test mints would otherwise
+    still be held by the next one, and under `pytest-randomly` that is a different next one each
+    run."""
+    from beeverforge.adapters import azure_devops as _ado
+
+    monkeypatch.setattr(_ado, "_az_mint", lambda: None)
+    _ado._AZ_LOGIN.forget()
+    # THE MACHINE'S OWN IDENTITY, for the same reason (#373): a developer on a cloud VM holds a
+    # live one, and a laptop would wait out a timeout on an endpoint that is not there.
+    monkeypatch.setattr(_ado, "_workload_mint", lambda client_id="": None)
+    monkeypatch.setattr(_ado, "_WORKLOAD", {})
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _git_asks_this_suite_who_it_is() -> object:
+    """The suite commits as ITSELF, never as whoever happens to own the machine.
+
+    Dozens of tests build a real repository and commit into it. Thirty-one of them pass
+    `-c user.name=… -c user.email=…`; six do not, and those six borrowed the developer's global
+    git config. On a machine that has no identity — a fresh CI runner, a container, a new
+    contributor's laptop before their first commit — git refuses with *"Please tell me who you
+    are"* and exits 128. It passed here for the same reason everything else did: this machine has
+    an identity, so the dependency was invisible.
+
+    A CONFIG FILE, NOT `GIT_AUTHOR_*`. The environment variables would win over a test's own
+    `-c user.email=…`, and `test_product_authoring.py` reads `%an <%ae>` back to prove the bot
+    signed a commit — that assertion must keep measuring what the product does, not what this
+    fixture does. `GIT_CONFIG_GLOBAL` sits below command-line config, which is exactly the rank a
+    default should have.
+
+    It also cuts the OTHER ambient dependencies in the same stroke: a developer with
+    `commit.gpgsign = true` cannot run this suite at all, and `init.defaultBranch` differs between
+    machines — both are the machine leaking into the measurement.
+
+    AND NO GIT MAINTENANCE RUNS BEHIND A TEST'S BACK (#592). A commit, and a push into a bare
+    repository, end with `git maintenance run --auto`, DETACHED: it repacks the repository in the
+    background after the command has returned. Newer git (the CI runner's 2.55) repacks on far less
+    than the old `gc --auto` thresholds, so the fixture repositories this suite builds get repacked
+    while the next line clones them — and a clone of a local path copies the objects directory file
+    by file. It met a pack being written (`hardlink different from source at
+    …/objects/pack/tmp_idx_…`) or a loose object just packed away (`failed to copy file to
+    …/objects/5b/908c…: No such file or directory`), about one CI run in ten, a different test
+    each time. Which git the machine runs is the machine leaking into the measurement too."""
+    config = Path(tempfile.mkdtemp(prefix="beeverforge-suite-git")) / "gitconfig"
+    config.write_text(
+        "[user]\n\tname = BeeverForge Suite\n\temail = suite@beeverforge.invalid\n"
+        "[commit]\n\tgpgsign = false\n"
+        "[tag]\n\tgpgsign = false\n"
+        "[gpg]\n\tformat = openpgp\n"
+        "[maintenance]\n\tauto = false\n"
+        "[gc]\n\tauto = 0\n"
+        "[receive]\n\tautogc = false\n"
+    )
+    patch = pytest.MonkeyPatch()
+    patch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    patch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    yield
+    patch.undo()
+    shutil.rmtree(config.parent, ignore_errors=True)
+
+
+#: A CACHE ROOT PER WORKER (#185). `RepoCache()` built with no root asks `default_root()`, whose
+#: fallback is ONE fixed `/tmp` directory — so a `-n auto` run has several workers cloning
+#: different repositories into the same tree and swapping it under one another. The loser's
+#: pre-flight degrades with "clone: could not reach the repo — proceeding UNSIZED", which is
+#: indistinguishable from the live #37 bug the offline harness exists to catch. It cost most of a
+#: day of intermittency wearing two different masks — `test_local_flow` and `test_preflight`,
+#: never the same one twice, roughly one run in three.
+#:
+#: SET ONLY WHEN NOBODY ELSE DID, so a test that wants its own root still says so and wins.
+@pytest.fixture(autouse=True)
+def _repo_cache_is_not_shared_between_workers(monkeypatch, tmp_path_factory, request) -> None:
+    if os.environ.get("BEEVERFORGE_REPO_CACHE"):
+        return
+    worker = getattr(getattr(request.config, "workerinput", None), "get", lambda *_: None)(
+        "workerid") or os.environ.get("PYTEST_XDIST_WORKER") or "main"
+    monkeypatch.setenv("BEEVERFORGE_REPO_CACHE",
+                       str(tmp_path_factory.getbasetemp() / f"repo-cache-{worker}"))
+
+
+@pytest.fixture(autouse=True)
+def _the_suite_never_reads_the_operators_registry(monkeypatch, tmp_path_factory) -> None:
+    """Every test's registry is a file of its own that does not exist until the test writes it.
+
+    THE PRODUCT'S MEMORY READS THE REGISTRY (#266 slice 3). A registry project does not know its
+    siblings, so every read of a conversation asks the registry which other registry projects
+    belong to the same product (`memory/transcript.py::partition`). With no registry named, that is
+    `~/.beeverforge/registry.yaml` — the OPERATOR's, on whatever machine runs the suite — and on
+    the machine this was written on it logged an ERROR on every conversational turn of every test,
+    because that registry spans two organisations. A suite whose memory reads depend on who runs it
+    is the leak this file exists to close, so the name is set for every test: a test or fixture that
+    names its own registry still wins, because it sets the variable after this runs."""
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(
+        tmp_path_factory.getbasetemp() / "registries" / f"{uuid.uuid4().hex}.yaml"))
+
+
+@pytest.fixture(autouse=True)
+def _no_tree_pollution_by_url_paths() -> None:
+    """Fail the test that treats a clone URL as a filesystem path in the repository root.
+
+    Found as debris, not as a failure: `https:/github.com/acme/demo.git/knowledge/*.yaml` and
+    `https:/…/.sdlc-logs/…` sitting untracked in the repo root (2026-08-02, -06, -13) — some
+    caller handed `Path("https://…")` to a writer, the write SUCCEEDED into a directory literally
+    named `https:`, and every suite run stayed green. The polluter fires rarely (ordering-
+    dependent; four full-suite spy runs could not reproduce the 08-13 write), which is exactly
+    why absence-of-debris cannot be the check: this trips inside the polluting test itself, the
+    one time it runs.
+    """
+    yield
+    for stray in ("https:", "http:"):
+        if os.path.exists(stray):
+            found = [str(p) for p in Path(stray).rglob("*") if p.is_file()][:5]
+            shutil.rmtree(stray, ignore_errors=True)  # keep ONE test red, not every test after
+            pytest.fail(
+                f"this test wrote through a clone URL treated as a path: ./{stray} now exists "
+                f"(e.g. {found}) — find the Path(url) and route it through resolve_repo_path"
+            )
+
+
+@pytest.fixture(autouse=True)
+def _a_case_does_not_outlive_its_test(monkeypatch, tmp_path_factory, request) -> None:
+    """The intake store is a module global keyed by PROJECT NAME (`product/case.py::_CASES`), and
+    twenty-five test files name their project `books` and hold their conversation in `C1`. A case
+    one test opens is therefore the next test's "latest open case in this conversation" — and
+    `proposed()` picks its target by conversation, not by person.
+
+    MEASURED ON CI, TWICE IN ONE AFTERNOON (2026-09-06), on commits that did not touch the store:
+    `test_after_a_rejection_the_prompt_no_longer_claims_a_pending_proposal` failed with
+    `answer() got an unexpected keyword argument 'intake'`. A leftover open case of the same
+    person made `block_for` non-empty; the intake block is passed only when there is one, so a
+    fake that predates the intake broke on a case it never opened. Green on every laptop and on
+    the same file run alone, because WHICH leftovers exist depends on the set and order of the
+    tests that ran before. Reproduced by seeding two open cases on `books`/`C1` — one by that
+    person, a later one by another — ahead of that one test.
+
+    Cleared BEFORE each test, not after: what a test leaves behind is its own business, and
+    clearing before is what makes the next one start from nothing whatever came earlier.
+
+    AND THE DISK HALF (the review of #66). Clearing `_LOADED` makes the bucket RELOAD its
+    `cases.json` on the next touch, so on a machine where the default journal directory is
+    writable — root, or `/work` — a case written by an EARLIER RUN came back through the clear:
+    opened hours before, still open, `block_for` non-empty, the very shape of the CI red. So the
+    journals of every test go to a directory of that test's own, named but not created (the code
+    creates it on its first write); a test about the default location unsets the variable and
+    wins, a test that wants a directory of its own sets one and wins. It also stops the suite
+    writing `/work/.beeverforge-logs` on the machines where it could (issue #57's shape).
+
+    ONE FUNCTION: `case._reset_for_tests` is what the two files that reset by hand already call.
+    A copy of its three lines here would drift the day a fourth global is added there."""
+    import hashlib
+
+    from beeverforge.product import case as _case
+
+    _case._reset_for_tests()
+    own = hashlib.sha1(request.node.nodeid.encode()).hexdigest()[:12]
+    monkeypatch.setenv("BEEVERFORGE_LOG_DIR",
+                       str(tmp_path_factory.getbasetemp() / "beeverforge-logs" / own))
+
+
+@pytest.fixture(autouse=True)
+def _a_staged_proposal_does_not_outlive_its_test() -> None:
+    """The SAME SHAPE as the fixture above, one module across: `product/staging.py::_PENDING` is a
+    process-wide dict keyed by CONVERSATION, and those same twenty-five files hold theirs in `C1`.
+
+    A proposal one test stages is therefore the next test's "proposal awaiting approval", and
+    `find_waiting` even scans by channel so it is found from outside the thread too. What that
+    costs is a model call nobody asked for, attributed to the wrong sentence: the reply is judged
+    as a confirmation of the leftover before it is read as anything else.
+
+    MEASURED ON CI (2026-09-21, PR #261 run 502, on a change that touches none of this):
+    `test_the_chat_s_own_gesture_IS_an_explicit_request` failed `2 == 1` — a person typed `quebra
+    o requisito 12 em tarefas`, it was judged against a stale proposal first (the breakdown
+    fixture's JSON arriving where a one-word verdict was expected, logged as unparseable), and the
+    breakdown was the SECOND call. Green on every laptop, green on that file alone under twelve
+    seeds, and reproduced in one second by staging a single entry under `C1` ahead of it.
+
+    Eight fixtures already rebind `_PENDING` to isolate themselves, which is the tell: isolation
+    that every file has to remember is isolation most files will not have. Cleared BEFORE each
+    test, for the reason the fixture above gives: what a test leaves behind is its own business,
+    and clearing before is what makes the next one start from nothing."""
+    from beeverforge.product import staging as _staging
+
+    _staging._reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _a_floor_read_does_not_outlive_its_test() -> None:
+    """Clear both memos in `beeverforge/floor/reading.py` — the intake window (GitHub issue #146)
+    and the budget one that has been there all along.
+
+    THE SAME SHAPE AS THE POOL BELOW, and the same reason. Both are module globals, and the floor
+    is driven by a great many test files with a fake client apiece: an `intake` answer one test's
+    double produced would otherwise be the NEXT test's floor for ten seconds of wall clock, and a
+    budget one for a minute. Which tests that hits depends on the set and order of what ran before
+    — under `pytest-randomly` a different set every run, and under `-n auto` a different worker.
+    That is a state leak, not flake.
+
+    `_budget_memo` was already exposed to this and had no reset: two files monkeypatch it to
+    `None` by hand (`test_public_core_names_no_forge.py`, `test_the_floor_is_a_platform_
+    capability.py`), which is the tell that the need was real and met one call site at a time.
+    Clearing it here is a fix, not a widening — the hand-written resets stay correct and redundant.
+
+    Cleared BEFORE each test, for the reason the rest of this file gives: what a test leaves behind
+    is its own business; clearing before is what makes the next one start from nothing whatever
+    came earlier.
+    """
+    from beeverforge.floor import reading as _reading
+
+    _reading._intake_memo = None
+    _reading._budget_memo = None
+    # …and the read IN FLIGHT (#166), the same module global one step earlier. A read left
+    # registered by a test whose loop is gone would never be JOINED — a reader joins only on its
+    # own loop — but this file's rule is that a test starts from nothing, not from something inert.
+    # ASKED WITH `getattr`, because this file also runs against a tree that has neither seam:
+    # a red-first check points the suite at an older `beeverforge/`, and a reset that explodes
+    # there would report a fixture error where a guard's own claim should be speaking.
+    for slot in ("_intake_read", "_budget_read"):
+        shared = getattr(_reading, slot, None)
+        if shared is not None:
+            shared.forget()
+
+
+@pytest.fixture(autouse=True)
+def _a_job_list_does_not_outlive_its_test() -> None:
+    """Clear `beeverforge/runtime/temporal/view.py`'s job-list memo and the scan in flight (#754).
+
+    THE FLOOR READ'S SHAPE ABOVE, AND ITS REASON: a list one test's fake engine answered is handed
+    to the next reader asking the same question for `LIST_TTL_S`, and the memo holds the loop and
+    the client by identity, so only a test reusing that very client and loop could be served it;
+    but this file's rule is that a test starts from nothing, not from something inert. Cleared
+    BEFORE each test, for the reason the fixtures above give.
+
+    ASKED WITH `getattr` and IMPORTED INSIDE THE FIXTURE, for the two reasons the fixtures on
+    either side give: a red-first run points the suite at a tree with no `forget_jobs`, and `view`
+    imports `temporalio`, an extra a collection-time import would turn into a suite that collects
+    nothing."""
+    from beeverforge.runtime.temporal import view as _view
+
+    forget_jobs = getattr(_view, "forget_jobs", None)
+    if forget_jobs is not None:
+        forget_jobs()
+
+
+@pytest.fixture(autouse=True)
+def _a_readiness_answer_does_not_outlive_its_test() -> None:
+    """Clear `beeverforge/observability/health.py`'s kept answers, the questions in flight and
+    the verdicts its log already said (#681) — the floor's memos' shape, one module over, and the
+    same leak: a route sweep that asks `/readyz` against one test's engine double would otherwise
+    answer the next test's readiness for `WINDOW_S` of wall clock. A tree without the module (a red-first run
+    against an older `beeverforge/`) has nothing to clear, and says nothing here."""
+    try:
+        from beeverforge.observability import health as _health
+    except ImportError:
+        return
+    _health.forget()
+
+
+@pytest.fixture(autouse=True)
+def _a_product_read_for_the_logs_does_not_outlive_its_test() -> None:
+    """Clear `beeverforge/observability/logs.py`'s copy of the products and its read in flight
+    (second review of #818) — the same leak one module over: a case that read one registry's
+    products would otherwise tag the next case's lines with them for a window, and a read begun
+    in one case must not land in the next. A tree without the seam has nothing to clear."""
+    from beeverforge.observability import logs as _logs
+
+    forget = getattr(_logs, "forget", None)
+    if forget is not None:
+        forget()
+
+
+@pytest.fixture(autouse=True)
+def _an_engine_client_does_not_outlive_its_test() -> None:
+    """Clear `beeverforge/runtime/temporal/view.py::_CLIENTS` — the pool the panel's read side now
+    holds one client per engine target in (GitHub issue #134).
+
+    THE POOL IS A MODULE GLOBAL, so it is exactly the shape the fixture above was written for. Some
+    forty test files patch `view.connect` or `connection.connect` with a fake; the ones that patch
+    `connection.connect` go through the real pool, which then keeps that fake client keyed by
+    whatever `TEMPORAL_ADDRESS` that test set. A later test reading the same target would be served
+    the earlier test's object — and it would pass or fail depending on which tests ran before it,
+    under `pytest-randomly` a different set each run. That is a state leak, not flake, and this
+    file already carries the lesson (see the intake store above).
+
+    Cleared BEFORE each test, for the same reason: what a test leaves behind is its own business;
+    clearing before is what makes the next one start from nothing whatever came earlier.
+
+    IMPORTED INSIDE THE FIXTURE, never at module level. `view` imports `temporalio`, which is an
+    extra (`pip install -e '.[runtime]'`); a conftest that imports it at collection time would turn
+    a missing optional dependency into a suite that collects nothing — and this repository has
+    already had CI execute zero tests for fifteen days that way (CONTRIBUTING, 2026-08-06).
+    """
+    from beeverforge.product import release as _release
+    from beeverforge.runtime.temporal import connection as _connection
+    from beeverforge.runtime.temporal import view as _view
+
+    _view.reset_clients()
+    # AND THE ONE CLIENT `connection.connect()` HOLDS FOR THE PROCESS (#681) — the same shape one
+    # door down: a test whose library-level `Client.connect` hands back a double would otherwise
+    # hand that double to every later test that connects to the same target.
+    _connection.forget()
+    # AND THE ONE CLIENT THE RELEASE PATH KEEPS (#201) — the same shape, so the same leak: a test
+    # that approves through a patched `connection.connect` leaves its fake engine in a module
+    # global, and the next test to approve would deliver its signal to it.
+    _release.forget_the_client()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_credentials_per_test() -> None:
+    """Strip again before each test, because the session fixture only runs once and the code
+    under test puts them back.
+
+    Two ways that happens, both legitimate for the function and poisonous for the session:
+
+        `materialize_app_key` WRITES `BEEVERFORGE_GH_APP_KEY` into `os.environ` — that is its job, and
+        `test_fargate_entrypoint` asserts it. The value then outlives the test.
+
+        `load_dotenv()` still lives inside `worker.main`, `starter`, `schedule` and the Slack bot.
+        Those are entry points and are right to load it; a test that calls one re-imports the whole
+        of `.env` into the session.
+
+    Session-scope alone therefore protects only the tests that run first, which under
+    `pytest-randomly` is a different set every time — the exact shape of the bug this file exists
+    to end.
+    """
+    _strip()
+
+
+@pytest.fixture(autouse=True)
+def _the_environment_is_restored_after_every_test():
+    """Every test leaves `os.environ` exactly as it found it — whatever the CODE UNDER TEST wrote
+    (#426).
+
+    `monkeypatch` restores what the TEST changed through it, and nothing else. A test of
+    `cli._load_environment()` exists to watch that function write into `os.environ`; its
+    `monkeypatch.delenv("BEEVERFORGE_PANEL_URL", raising=False)` recorded nothing to restore
+    because the variable was absent, so the value the function wrote survived the test. In CI,
+    which runs the suite in one process, the next test to ask where the panel is (#408's preview
+    link, read at call time by design) got `http://localhost:8787` and went red — deterministically,
+    by order alone, and invisibly to a `-n` run that put the two in different workers.
+    `_no_live_credentials_per_test` above strips the credentials it knows by name; this closes the
+    class for every name: a snapshot before, and after the test every key it added is removed and
+    every key it changed or removed is put back."""
+    before = dict(os.environ)
+    yield
+    for name in [n for n in os.environ if n not in before]:
+        del os.environ[name]
+    for name, value in before.items():
+        if os.environ.get(name) != value:
+            os.environ[name] = value
+
+
+#: THE REGISTRY A SHELL NAMES IS THE PERSON'S, NEVER THE SUITE'S (#260). `ProjectRegistry()` with
+#: no path reads `BEEVERFORGE_REGISTRY` and, when that is unset, the operator's own
+#: `~/.beeverforge/registry.yaml` — and the tests that register a project through it wrote into
+#: whichever of the two the machine had. MEASURED 2026-09-24: with the variable pointing at a file,
+#: the files that touch the registry or the CLI ran green (2789 passed) and left a project `p` in
+#: that file, written by `test_the_synchronous_release_asks_the_same_question`. Green, and writing
+#: into the registry of whoever ran it: the credential floor's shape exactly, one variable over.
+#:
+#: CI RUNS THE SUITE AS PARALLEL JOBS, and a test that no job selected would leave the gate green
+#: over nothing. So the jobs take their part by an option rather than a list: `--shard I/N` keeps
+#: one slice of whatever the marker expression selected, fixed by the test's node id, so a test
+#: added tomorrow lands in exactly one slice with no file to edit. And every job writes the tests
+#: it STARTED (`--record-ids`), which CI compares with the whole collection
+#: (`scripts/every_test_ran_once.py`): missing, doubled or unknown fails the run.
+#:
+#: OUTSIDE THE TREE, or refused. Written into `test-ids/` at the repository's root, the ids file was
+#: read mid-run by `test_no_live_infrastructure_coordinate_is_published`, which scans the tree's
+#: `.txt` files: a test id naming a maintainer failed it in one CI slice and not the next, as the
+#: random order put the scan before or after that line was written.
+#:
+#: Stdlib and pytest only, like the rest of this file: the live-engine probe copies it.
+def pytest_addoption(parser) -> None:
+    group = parser.getgroup("beeverforge", "the suite's own options")
+    group.addoption("--shard", default="", metavar="I/N",
+                    help="run only the I-th of N slices of the selected tests, fixed by node id")
+    group.addoption("--record-ids", default="", metavar="PATH",
+                    help="append to PATH the node id of every test this run starts (with "
+                         "--collect-only: every test it collects), one per line")
+
+
+def _in_slice(nodeid: str, index: int, count: int) -> bool:
+    """CRC32, NOT `hash()`: a string's hash is salted per process, and every xdist worker and
+    every CI job has to put a test in the same slice."""
+    import zlib
+
+    return zlib.crc32(nodeid.encode()) % count == index - 1
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    spec = config.getoption("--shard", default="")
+    if not spec:
+        return
+    index, _, count = spec.partition("/")
+    if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):
+        raise pytest.UsageError(f"--shard {spec}: expected I/N with 1 <= I <= N")
+    kept = [item for item in items if _in_slice(item.nodeid, int(index), int(count))]
+    left = [item for item in items if not _in_slice(item.nodeid, int(index), int(count))]
+    if left:
+        config.hook.pytest_deselected(items=left)
+        items[:] = kept
+
+
+def _without_the_group(nodeid: str) -> str:
+    """The node id the collection names. Under `--dist loadgroup` pytest-xdist suffixes a grouped
+    test's id with `@<group>` — CI's sixth run reported the four real-daemon tests MISSING and
+    their suffixed ids UNKNOWN. Only that suffix matches: a function name cannot hold `@`, and a
+    parametrized id ends in `]`."""
+    return re.sub(r"@[\w.-]+$", "", nodeid)
+
+
+class _RecordIds:
+    """Registered on the run that REPORTS — the controller under xdist, never a worker, or every
+    test would be written twice. One line per SETUP report: every test has exactly one, whether
+    it then passes, fails or skips, so a skipped test counts as run and a test a crashed worker
+    never started does not."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def pytest_collection_finish(self, session) -> None:
+        if session.config.option.collectonly:
+            self._write(item.nodeid for item in session.items)
+
+    def pytest_runtest_logreport(self, report) -> None:
+        if report.when == "setup":
+            self._write([_without_the_group(report.nodeid)])
+
+    def _write(self, ids) -> None:
+        with self.path.open("a", encoding="utf-8") as out:
+            out.writelines(f"{nodeid}\n" for nodeid in ids)
+
+
+#: SET, NOT STRIPPED. Deleting the variable would send `ProjectRegistry()` to the operator's home
+#: file, which is the other half of the same damage. So the suite names a registry of its own: an
+#: empty temporary file per test, which every test that sets its own still overrides.
+REGISTRY_VARIABLE = "BEEVERFORGE_REGISTRY"
+_SESSION_REGISTRY: dict[str, Path] = {}
+
+
+def pytest_configure(config) -> None:
+    """BEFORE COLLECTION, which a session fixture is not: fixtures run after every test module is
+    imported, and a module or a module-scoped fixture that builds a `ProjectRegistry()` would
+    resolve the shell's path first. One temporary registry for that window; each xdist worker runs
+    this hook too and gets its own."""
+    home = Path(tempfile.mkdtemp(prefix="beeverforge-suite-registry"))
+    _SESSION_REGISTRY["home"] = home
+    # FIRST, so the operator's ambient BEEVERFORGE_* (a shell's BEEVERFORGE_REGISTRY among them) is
+    # gone before the suite names its own on the next line, and HOME points nowhere near the real
+    # deployment for the whole import window (#365).
+    _isolate_the_operator(home / "operator-home", getattr(config, "workerinput", None))
+    if config.pluginmanager.hasplugin("xdist") and not hasattr(config, "workerinput"):
+        config.pluginmanager.register(_HandDown(), "beeverforge-suite-operator-hand-down")
+    os.environ[REGISTRY_VARIABLE] = str(home / "registry.yaml")
+    record = config.getoption("--record-ids", default="")
+    if record and not hasattr(config, "workerinput"):
+        if config.rootpath.resolve() in Path(record).resolve().parents:
+            raise pytest.UsageError(
+                f"--record-ids {record}: write the ids outside the tree — a test that scans the "
+                f"tree reads the file while this run is still writing it")
+        config.pluginmanager.register(_RecordIds(record), "beeverforge-suite-record-ids")
+
+
+def pytest_unconfigure(config) -> None:
+    home = _SESSION_REGISTRY.pop("home", None)
+    if home is not None:
+        shutil.rmtree(home, ignore_errors=True)
+    if _OPERATOR_HOME is not None:
+        os.environ["HOME"] = str(_OPERATOR_HOME)
+
+
+@pytest.fixture(autouse=True)
+def _a_registry_of_its_own(monkeypatch, tmp_path_factory, request) -> None:
+    """AND AGAIN BEFORE EVERY TEST, for the reason the credential strip above gives: code under
+    test writes the variable back (`runtime/boxed_job.py` sets it in `os.environ`), and a registry
+    one test filled would otherwise be the next test's — under `pytest-randomly` a different next
+    test each run. Named but not created, like the journals above: `ProjectRegistry` makes the
+    directory on its first write and reads a missing file as empty.
+
+    `tests/test_the_suite_never_writes_the_registry_your_shell_names.py` is the guard."""
+    import hashlib
+
+    own = hashlib.sha1(request.node.nodeid.encode()).hexdigest()[:12]
+    monkeypatch.setenv(REGISTRY_VARIABLE,
+                       str(tmp_path_factory.getbasetemp() / "registries" / own / "registry.yaml"))
+
+
+#: THE CREDENTIAL FLOOR ABOVE CANNOT SEE THIS ONE, and the reason is written into its own
+#: criterion: *"the criterion is authority, not confidentiality."* A durable engine on
+#: `localhost:7233` needs **no credential at all** — `connection.address()` defaults to it and
+#: `_auth()` adds nothing — so stripping `TEMPORAL_API_KEY` protects exactly the deployment that
+#: was never reachable from a laptop, and none of the ones that are.
+#:
+#: MEASURED, NOT SUSPECTED (#107). With the OSS `docker compose` stack up — which is the
+#: development loop this repository ships and documents — a suite run left a REAL workflow behind:
+#:
+#:     workflow_id : beeverforge-demo-7
+#:     identity    : 40513@Mac.lan          ← the host running pytest
+#:     input       : {"project":"demo","issue":"7","sandbox":"worktree", …}
+#:     state       : on_hold — KeyError: "project not registered: 'demo'"
+#:
+#: It parked because `demo` is a test name that no registry has. A project that HAPPENED to exist
+#: under that name would have been worked on for real: an agent, a checkout, a client's board.
+#: And the suite stayed green throughout, which is what makes it this repository's signature
+#: defect rather than a flake — the damage is invisible from inside the run that caused it.
+_LIVE_ENGINE = (
+    "a test tried to open a REAL connection to a durable engine.\n\n"
+    "Nothing in this suite may reach one. `connect()` defaults to localhost:7233 with no auth, so "
+    "on any machine running the OSS compose stack this starts real workflows — measured: a suite "
+    "run created `beeverforge-demo-7` on a developer's engine (#107).\n\n"
+    "Patch the seam the code under test resolves instead — `beeverforge.runtime.temporal.view.connect` "
+    "for a row or a route, `beeverforge.runtime.temporal.connection.connect` for the engine itself — and "
+    "hand back a double. Every durable test in this suite already does.\n\n"
+    "If an integration test one day genuinely needs a live engine, it has to say so here, "
+    "deliberately, with the reason — not by deleting this fixture."
+)
+
+
+#: The one legitimate reason to open a real connection: a test that STARTS ITS OWN engine and
+#: throws it away. `temporalio.testing.WorkflowEnvironment` does exactly that — an ephemeral
+#: server on a port it picked, which is not a deployment's engine in any sense that matters.
+#:
+#: A MARKER RATHER THAN AN ADDRESS COMPARISON, and the two failure directions are why. Allowing
+#: "anything that is not the configured address" reads well and fails silently in the direction
+#: that costs — a test that reached some OTHER real engine would sail through. A marker cannot do
+#: that: it is declared on the file, it is greppable, and the guard in
+#: `test_the_suite_cannot_reach_a_live_engine` proves every file carrying it really does start
+#: its own server.
+OWNS_ITS_ENGINE = "owns_its_engine"
+
+
+@pytest.fixture(autouse=True)
+def _no_live_durable_engine(request, monkeypatch) -> None:
+    """No test may open a connection to a durable engine it did not start itself.
+
+    BLOCKED AT THE LIBRARY, not at our wrapper, and that is the whole point. Six production call
+    sites resolve `connect` by four different routes, and **three of them bind it at module
+    import** (`worker.py`, `schedule.py`, `starter.py`) — so a `monkeypatch` of
+    `connection.connect` would leave those three untouched while looking like a barrier. That is
+    this repository's signature defect wearing a guard's clothes: green, and blind to half of what
+    it names. `Client.connect` is where a socket is actually opened; below it there is nowhere to
+    go.
+
+    A DOUBLE NEVER REACHES THIS. Every durable test patches a seam above it and hands back a fake
+    client, so this fixture is invisible to them — it only fires for a call that would have talked
+    to a server, which is exactly the set it is written to stop.
+    """
+    if request.node.get_closest_marker(OWNS_ITS_ENGINE):
+        return
+
+    async def _refuse(*_args, **_kwargs):
+        raise RuntimeError(_LIVE_ENGINE)
+
+    monkeypatch.setattr("temporalio.client.Client.connect", _refuse)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Every failure's NAME survives the run, in a ledger nothing truncates.
+
+    An order-dependent failure hit ONE test in ~18 full-suite runs (2026-08-14) and its name
+    was lost — the run's output went through `tail -1`, pytest's `lastfailed` is a palimpsest
+    that targeted runs keep rewriting, and the randomly seed had been overwritten by the next
+    run. Fifteen full suites were spent hunting a name this hook would have kept for free.
+
+    Appended, never truncated; gitignored; carries the seed so `-p randomly
+    --randomly-seed=<n>` can replay the exact order. Reading it costs `tail`.
+
+    KNOWN NOISE, on purpose: tests that spawn an INNER pytest (the live-engine barrier probes)
+    make this hook fire in the inner session too, so their deliberate failures appear here
+    (`test__live_engine_probe__` and kin) while the outer run stays green. Filtered out would
+    mean a list of exemptions this file has to chase; recorded, they are self-explanatory by
+    name and cost a `grep -v`."""
+    failed = terminalreporter.stats.get("failed", []) + terminalreporter.stats.get("error", [])
+    if not failed:
+        return
+    import datetime as _dt
+    from pathlib import Path as _Path
+
+    seed = getattr(config.option, "randomly_seed", None)
+    stamp = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _Path(__file__).with_name(".failures.log").open("a", encoding="utf-8") as fh:
+        for rep in failed:
+            fh.write(f"{stamp} seed={seed} {rep.nodeid}\n")
+
+
+def code_only(source: str) -> str:
+    """`source` with every COMMENT and every DOCSTRING removed — the code, and only the code.
+
+    ONE HOME FOR THIS BECAUSE THE HAND-WRITTEN VERSIONS KEEP FAILING THE SAME WAY. A guard that
+    asserts "this vendor's name does not appear here" reads the paragraph explaining why it must
+    not appear and fails on it. That has now happened with `#135` as a hex colour, an `onclick=`
+    example, a `hash(text)` mention inside the note describing the fix, and — writing the guard
+    below — the sentence "`x-access-token:<token>@` into ANY https URL" in the docstring of the
+    function that stopped doing it.
+
+    Comments were already being stripped by several callers; docstrings were not, and a docstring
+    is where the explanation actually lives.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    drop: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None) or []
+        first = body[0] if body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            drop.update(range(first.lineno, (first.end_lineno or first.lineno) + 1))
+
+    kept = [("" if n in drop else re.sub(r"(^|\s)#.*$", "", line))
+            for n, line in enumerate(source.splitlines(), start=1)]
+    # A TRAILING NEWLINE, so `code_only(src).splitlines()` has the SAME length as
+    # `src.splitlines()` and line N of one is line N of the other. `"\n".join(...)` alone drops the
+    # final element whenever the last line strips to nothing — a trailing comment, a blank line, or
+    # the tail of a docstring — which is true of 14 modules in this package including `api/app.py`.
+    # A caller aligning two readings of one file (a marker in the raw text, the code with prose
+    # gone) would have been silently off by one on exactly the files that matter.
+    # …and an EMPTY file stays empty: `"\n".join([]) + "\n"` is one line where the source had none,
+    # which is the same off-by-one facing the other way (four `__init__.py` files in this package).
+    return ("\n".join(kept) + "\n") if kept else ""
+
+
+#: WHAT IS INSTALLED IN THIS INTERPRETER IS A FACT ABOUT THE BENCH, NOT ABOUT THE CASE. The
+#: repository's own add-on packages under `addons/` are installed by `make install` — which is
+#: what CI runs — and NOT by a developer's `pip install -e '.[dev]'`. On 2026-08-26 that one
+#: difference was five tests red on CI and green on every laptop: four asserting an exact
+#: `FallbackState` and one asserting that `channel: slack` is REFUSED before its row is served.
+#: Both read `importlib.metadata.entry_points()`, which answers the truth about the machine.
+#:
+#: This is the same doctrine as the credential floor above, one axis over: the suite's view of
+#: "what is installed" becomes a controlled input. The platform's own declared rows are filtered
+#: out of discovery; a test that wants one SERVES it (`vendor_addons.install`, which replaces
+#: this function outright and therefore wins), and a stranger's distribution
+#: (`stranger_addon.installed`) is untouched, because the filter hides only what the packages
+#: under `addons/` declare. In the public tree there is no `addons/`, nothing is declared, and
+#: the filter is a no-op — which is correct, since nothing is installed there either.
+@pytest.fixture(autouse=True)
+def _the_bench_is_not_the_case(monkeypatch) -> None:
+    import importlib.metadata as _md
+
+    try:
+        import vendor_addons
+    except ImportError:  # a context that does not put tests/ on sys.path
+        return
+    ours = vendor_addons.declared()
+    if not ours:
+        return
+
+    real = _md.entry_points
+
+    def _filtered(**params):
+        points = real(**params)
+        return vendor_addons.not_ours(points, ours) if params.get("group") else points
+
+    monkeypatch.setattr(_md, "entry_points", _filtered)
+    from beeverforge import plugins as _plugins
+    monkeypatch.setattr(_plugins, "_cache", None)

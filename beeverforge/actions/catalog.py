@@ -1,0 +1,9549 @@
+"""The actions themselves — one row each, one implementation each (C-23).
+
+READ `beeverforge/actions/__init__.py` FIRST; it says why this exists and what it deliberately is
+not.
+
+**Why the list is longer than the card's.** #51 named eight: resume, skip, approve_prod, promote,
+enable, scan, ask, diagnose. Two more are here because they already exist in production and
+leaving them out would defeat the whole point — `ack` (Slack only, closes a review finding's open
+loop) and `start` (the panel's two launch routes). An action that stays outside the layer is an
+action that drifts, and the ones that had already drifted are precisely these.
+
+**Why the messages are in English.** The tech-lead's Slack channel speaks pt-BR today and these
+sentences will read colder there. That is the accepted trade: this platform's rule for the two
+surfaces is that the *client's* channel owes a voice and the *operator's* owes an answer — terse
+and technical is allowed there, silence never is. Writing every sentence twice, or building an i18n
+layer, would be the voice work the rule says to cut. A front end that wants warmth decorates; it
+must not have to translate to be correct.
+
+**Why every implementation is async and lazy-imports its dependencies.** Async so the three
+transports have one calling convention (`await` in the panel, `asyncio.run` in Slack's threads and
+the CLI). Lazy because half of these reach `temporalio`, which the panel is explicitly built to
+serve without — the import graph is a feature here, not an accident.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from beeverforge import namespace
+from beeverforge.actions.base import (
+    CONFLICT,
+    DENIED,
+    FAILED,
+    FLOOR,
+    INVALID,
+    NOT_FOUND,
+    PRODUCT,
+    STEP_ALREADY,
+    STEP_DONE,
+    STEP_FAILED,
+    STEP_SKIPPED,
+    UNAVAILABLE,
+    ActionSpec,
+    Actor,
+    Outcome,
+    done,
+    failure_reference,
+    refused,
+)
+from beeverforge.actions.base import step as _step
+
+log = logging.getLogger("beeverforge.actions")
+
+
+# ── shared plumbing ─────────────────────────────────────────────────────────────────────────────
+
+def _project(name: str):
+    """`(project, None)` or `(None, Outcome)` — resolving a project name in ONE place.
+
+    The three front ends had three answers to an unknown project: the panel's `ProjectRegistry.get`
+    raised a `KeyError` that FastAPI turned into a 404 with no body worth reading, Slack never
+    looked it up at all (it holds a project object from its own registry walk), and the CLI printed
+    a traceback. Naming the registered projects in the refusal is what makes this actionable — the
+    single most common cause is a typo, and the second is a worker running with a registry that was
+    baked without the project (see the `deploy/registry.yaml` memory)."""
+    from beeverforge.registry import ProjectRegistry
+
+    registry = ProjectRegistry()
+    try:
+        return registry.get(name), None
+    except KeyError:
+        known = ", ".join(p.name for p in registry.list()) or "none"
+        return None, refused(
+            NOT_FOUND,
+            f"there is no project called {name!r} on this deployment — it knows: {known}.",
+        )
+
+
+async def _connected():
+    """`(client, None)` or `(None, Outcome)` — the durable engine, or a sentence about its absence.
+
+    UNAVAILABLE RATHER THAN FAILED, because the two send an operator to different places: the
+    engine being down is somebody else's outage and the action can simply be repeated, while a
+    failure means the action was attempted and something about *this* request is wrong. Both front
+    ends already made this distinction by hand (the panel's 503, Slack's "não consegui"), which is
+    two hand-written copies of one rule."""
+    from beeverforge.runtime.temporal import view as tv
+    from beeverforge.util.causes import first_message
+
+    try:
+        return await tv.connect(), None
+    except Exception as exc:  # noqa: BLE001 — unreachable engine is a state, not a crash
+        return None, refused(
+            UNAVAILABLE,
+            f"the durable engine is not answering ({first_message(exc, limit=140)}) — nothing was "
+            f"sent, so this is safe to repeat once it is back.",
+        )
+
+
+def _looks_missing(exc: BaseException) -> bool:
+    """Whether an engine error means 'no such workflow' rather than 'something went wrong'.
+
+    Matched on text because the Temporal SDK raises a generic `RPCError` for both and the status
+    enum is not part of its public surface at this version. Deliberately narrow: a false positive
+    here would tell an operator their ticket does not exist when the real cause was transient, and
+    they would go looking at the board instead of at the engine."""
+    from beeverforge.util.causes import first_message
+
+    blob = f"{type(exc).__name__} {first_message(exc)}".lower()
+    return "not found" in blob or "notfound" in blob
+
+
+# ── resume / skip — a parked job's two ways forward ──────────────────────────────────────────────
+
+async def _signal_parked(*, project: str, issue: str, by: Actor, action: str,
+                         choice: str = "") -> Outcome:
+    """The body both `resume` and `skip` are. One function because they differ in exactly one
+    string, and the previous arrangement — two front ends each branching on that string — is how
+    `choice` came to exist on one side only.
+
+    THE PARKED CHECK IS NOT DEFENSIVE. `tv.act_job` queries `awaiting_action` before signalling, so
+    a signal is never delivered to a running or finished job. Without it a stray `skip` on a job
+    that had already moved on would be accepted, do nothing, and be reported as done — the platform
+    telling somebody it acted when it did not, which is worse than refusing."""
+    from beeverforge.runtime.temporal import view as tv
+    from beeverforge.util.causes import first_message
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    try:
+        await tv.act_job(client, found.name, issue, action=action, choice=choice)
+    except RuntimeError as exc:  # the engine answered: this job is not parked
+        return refused(
+            CONFLICT,
+            f"#{issue} is not parked waiting for anybody — there is nothing to {action}. "
+            f"({first_message(exc, limit=120)})",
+        )
+    except ValueError as exc:  # act_job's own guardrail: only resume/skip may be signalled
+        return refused(FAILED, first_message(exc))
+    except Exception as exc:  # noqa: BLE001
+        if _looks_missing(exc):
+            return refused(
+                NOT_FOUND,
+                f"no job has ever run for #{issue} on {found.name} — check the ticket reference, "
+                f"or start it first.",
+            )
+        raise
+    picked = f" with option {choice!r}" if choice else ""
+    return done(
+        f"#{issue}: {action} sent{picked} — {by} asked, and the job is picking it up now.",
+        project=found.name, issue=issue, action=action, choice=choice or None,
+    )
+
+
+async def _resume(*, project: str, issue: str, by: Actor, choice: str = "") -> Outcome:
+    return await _signal_parked(project=project, issue=issue, by=by, action="resume", choice=choice)
+
+
+async def _skip(*, project: str, issue: str, by: Actor) -> Outcome:
+    """Answer a park with "stop working on this" — THROUGH THE CARD'S DOOR (ADR-0055), so the card
+    goes back to the backlog with one comment saying who decided, its requester is told where it
+    is, its preview comes down and the role's snapshot is forgotten. The engine's half — the
+    signal, refused when the job is not parked — runs inside the door, after it asked whether the
+    card may be skipped at all."""
+    from beeverforge.lifecycle import CardEvent
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    said: dict[str, Outcome] = {}
+
+    async def signal() -> Outcome:
+        said["it"] = await _signal_parked(project=project, issue=issue, by=by, action="skip")
+        return said["it"]
+
+    moved = await _through_the_door(proj, issue, CardEvent.SKIPPED, by=by, act=signal,
+                                    tracker=tracker, board=board)
+    return _refusal_of(moved) or _after_the_door(moved, said["it"])
+
+
+# ── the card's door, from a row (ADR-0055) ───────────────────────────────────────────────────────
+
+async def _through_the_door(proj, issue: str, event, *, by: Actor, why: str = "",
+                            facts: dict | None = None, act=None, tracker=None, board=None,
+                            stage: _Stage | None = None, columns: dict[str, str] | None = None):
+    """`lifecycle.transition`, from an async row. The door reads and writes through blocking
+    ports, so it runs on a thread; `act` — the engine's half of the decision, a coroutine function
+    returning an `Outcome` — runs back on THIS loop, where the row's engine client lives, between
+    the door's `allowed` and its record. A refused act is returned untouched as the answer.
+
+    `stage` is where the row's own gate read the card (`_withdraw_refusal`): handed to the door as
+    the board's answer, so the gate and the door judge one read, not two (#162). `columns` is the
+    same answer for a row that read no stage — a card it has just written is on no column yet."""
+    import asyncio
+
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.lifecycle import transition
+
+    loop = asyncio.get_running_loop()
+    if stage is not None and not stage.cannot_tell:
+        columns = {canonical_ref(issue): stage.column} if stage.column else {}
+
+    def engine():
+        outcome = asyncio.run_coroutine_threadsafe(act(), loop).result()
+        return None if outcome is None or outcome.ok else outcome
+
+    return await asyncio.to_thread(lambda: transition(
+        proj, issue, event, by=str(by), why=why, facts=facts, act=engine if act else None,
+        tracker=tracker, board=board, columns=columns))
+
+
+def _refusal_of(moved) -> Outcome | None:
+    """The row's refusal for a transition the door did not make — the engine's own answer when it
+    said no, else the door's sentence."""
+    if moved.answer is not None:
+        return moved.answer
+    if moved.refused:
+        return refused(CONFLICT, moved.refused)
+    return None
+
+
+def _after_the_door(moved, outcome: Outcome) -> Outcome:
+    """`outcome`, saying also what of the transition did not land. RECORDED, a failed effect is the
+    sweep's to apply again within the hour, and the sentence says so; UNRECORDED (a store that
+    cannot keep the record), nothing will retry it, and the sentence names what is left to do by
+    hand. Either way the decision happened: a row whose own write failed unrecorded refuses before
+    calling this, and a comment or a telling that did not land does not undo a close."""
+    data = {**(outcome.data or {}), "event": moved.event.value, "recorded": moved.recorded,
+            "told": moved.outcome("tell")}
+    if not moved.failed:
+        return Outcome(ok=outcome.ok, message=outcome.message, data=data, code=outcome.code)
+    left = "; ".join(moved.failed)
+    said = outcome.message.rstrip()
+    said += " " if said.endswith((".", "!", "?")) else ". "
+    if moved.recorded:
+        return Outcome(ok=outcome.ok, data={**data, "pending": moved.failed}, code=outcome.code,
+                       message=f"{said}Not everything landed yet ({left}) — it is recorded, "
+                               f"and applied again within the hour.")
+    return Outcome(ok=outcome.ok, data={**data, "pending": moved.failed}, code=outcome.code,
+                   message=f"{said}Not everything landed ({left}), and this deployment keeps "
+                           f"no record to apply it again — finish it by hand.")
+
+
+# ── ack — a person has this one ─────────────────────────────────────────────────────────────────
+
+async def _ack(*, project: str, issue: str, by: Actor) -> Outcome:
+    """Close a review finding's open loop (ADR-0021). Touches no job.
+
+    IT EXISTS BECAUSE THE ALTERNATIVE WAS A LIST THAT ONLY GROWS. A finding flagged on an already
+    merged ticket has nothing the factory could ever OBSERVE to close it — no reply to read, no
+    state change to watch — so without a person saying "I have this" it sits open for ever, and a
+    list that only grows is a list everybody learns to ignore.
+
+    MOVED HERE FROM `runtime/slack/bot.py::_ack_finding`, which is where it had been living: a
+    capability that changes the deployment's memory ledger, reachable only by typing a verb into
+    one vendor's chat product. The panel — the surface that actually *shows* the open loops — had
+    no way to close one."""
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import FINDING, close_by_observation, waiting
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+
+    ledger = loop_store.read(found.name)
+    mine = [x for x in waiting(ledger, kind=FINDING) if x.subject == str(issue)]
+    if not mine:
+        return refused(
+            CONFLICT,
+            f"there is nothing open about #{issue} on {found.name} — nothing to acknowledge.",
+        )
+    # The observed key is built FROM the loops found, because `close_by_observation` matches on
+    # (kind, subject, about) and FINDING loops carry the decision in `about`. A hand-built key
+    # without it closes nothing while the reply still claims success — which is what the first
+    # version of this did.
+    closed = close_by_observation(
+        ledger, {(x.kind, x.subject, x.about): "acknowledged" for x in mine})
+    if not closed:
+        # A concurrent pass beat us to it, or nothing matched. Success may not be claimed for a
+        # write that lands no rows: the loop would stay open behind a checkmark, which is the
+        # precise failure this whole mechanism exists to prevent.
+        return refused(
+            FAILED,
+            f"could not close the open finding on #{issue} just now — it is still on the list, "
+            f"which is the safe side of this error. Try again.",
+        )
+    loop_store.write(found.name, closed)
+    what = (mine[0].context or {}).get("detail", "")
+    return done(
+        f"#{issue} noted as handled by {by} — it will stop being raised."
+        + (f" It was about: {what[:200]}" if what else ""),
+        project=found.name, issue=issue, closed=len(mine), about=what[:200],
+    )
+
+
+# ── scan — pick up TO-DO right now, instead of waiting for the poller's tick ────────────────────
+
+async def _scan(*, project: str, by: Actor) -> Outcome:
+    """Scan this project's board TO-DO column right now — the 'don't wait for the 3-min tick'
+    button. Starts a job per TO-DO card the floor has room for (skipping any already running) and
+    reports what happened. The engine still runs one job at a time; extra cards queue.
+
+    MOVED FROM `api/app.py::scan_now`. Three defects live in the ordering below, which is why it
+    is not simplified on the move:
+
+    - the board is built from the PROJECT OBJECT, never the path string — passing the string once
+      made the button die silently, always reporting "Nothing in TO-DO", right after this same
+      function had already validated that the board exists;
+    - the floor count is GLOBAL — every running JobWorkflow, not just this project's — so a manual
+      scan honours the same one-at-a-time floor as the poller;
+    - an `AlreadyStarted` skip still counts against the floor: treating it as free and falling
+      through to the next ticket would let a double-click or a scan racing the 3-minute tick
+      overrun it (F1).
+
+    ONE NORMALISATION ON THE MOVE: a `resolve_box_image` refusal used to return 200 with the
+    refusal folded into `message` — the one branch of this endpoint that did not raise. Every
+    other box.image refusal in this codebase (`temporal_start`, `cli.poll`) is a 400. There was no
+    test pinning the 200, so this now reports it the same way everyone else does — `INVALID`,
+    mapped to 400 by the panel."""
+    import asyncio
+
+    from beeverforge.adapters.board import build_board
+    from beeverforge.adapters.sandbox.registry import durable_refusal
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+    from beeverforge.factory import resolve_box_image
+    from beeverforge.runtime.temporal import TASK_QUEUE, max_concurrent_jobs
+    from beeverforge.runtime.temporal.io import JobParams, default_sandbox
+
+    proj, bad = _project(project)
+    if bad:
+        return bad
+
+    # THE FACTORY DECIDES WHETHER THERE IS A BOARD, not a pair of GitHub-shaped option names. The
+    # `board_owner`/`board_number` gate that stood here refused every Jira project — and now every
+    # Azure one — with "has no board configured" while `build_board` built one without complaint.
+    # Both put the column ON the work item, so neither has coordinates to give. See cli.py's
+    # `pickup` for the same fix; the two sites had grown the same wrong question independently.
+    # THE TRACKER AXIS ASKS ITS OWN. This resolved `… or _bot_token_provider()()` — the GitHub
+    # App minter in bare-call shape, invisible to the ratchet that matches the `or` shape — so a
+    # Jira project with no `JIRA_API_TOKEN` got a board whose tracker held a `ghs_…` token, and
+    # Jira answers a foreign token with an EMPTY search, not a 401 (measured 2026-08-24).
+    tok = tracker_token_for(proj) or deployment_tracker_token(proj)
+    board = build_board(proj, token=tok)
+    if board is None:
+        return refused(INVALID, f"{proj.name} has no board configured — nothing to scan.")
+    # THE BOARD NAMES ITS OWN PICKUP COLUMN. A literal "TO-DO" here asked an Azure board for a
+    # column it does not have and reported a correct-looking empty queue with cards waiting in
+    # it — `cli.py`'s `pickup` grew the same fix independently; the two sites had grown the same
+    # wrong question separately.
+    status = proj.tracker.options.get("pickup_status") or (board.pickup_column() if board else "")
+    todo = ([] if board is None
+            else await asyncio.to_thread(lambda: [str(n) for n in board.items_in_status(status)]))
+
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.runtime.temporal import view as tv
+
+    # The floor is a single agent token (v1) — count ALL running JobWorkflows, not just this
+    # project's, so a manual scan honours the same one-at-a-time floor as the poller.
+    running_all, running = 0, []
+    async for wf in client.list_workflows(
+            'WorkflowType="JobWorkflow" AND ExecutionStatus="Running"'):
+        running_all += 1
+        p, iss = tv.parse_job_id(wf.id)
+        if p == proj.name:
+            running.append(iss)
+    slots = max(0, max_concurrent_jobs() - running_all)
+
+    if not todo:
+        msg = "Nothing in TO-DO to run."
+        if running:
+            msg += f" (#{running[0]} is already running.)"
+        return done(msg, started=[], skipped=[], todo=[], running=running)
+    if slots <= 0:
+        return done(
+            f"Floor busy ({running_all} in flight) — TO-DO will be picked up one at a time as "
+            f"each finishes.",
+            started=[], skipped=todo, todo=todo, running=running,
+        )
+
+    # Resolved ONCE, against the sandbox JobParams will ACTUALLY use — the same default_factory
+    # the model would apply — because resolving against nothing would skip the refusal and hand a
+    # declaring project an image its box cannot honour, silently. Passing it explicitly also stops
+    # the two from ever drifting apart.
+    scan_sandbox = default_sandbox()
+    # THE SAME GATE THE BUTTON BESIDE THIS ONE CARRIES. `scan` starts durable jobs exactly as
+    # `start --durable` does, and was exempted by omission rather than by design — the identical
+    # hole `box.image` had across these three doors (ADR-0049 D3).
+    if why := durable_refusal(scan_sandbox):
+        return refused(INVALID, why, started=[], skipped=todo, todo=todo, running=running)
+    try:
+        scan_image = resolve_box_image(proj, sandbox=scan_sandbox)
+    except ValueError as exc:
+        return refused(INVALID, str(exc), started=[], skipped=todo, todo=todo, running=running)
+
+    # Start only as many as the floor can take (in board order); the rest wait in TO-DO. `claimed`
+    # counts BOTH fresh starts AND AlreadyStarted skips against the floor.
+    started, skipped = [], []
+    claimed = 0
+    try:
+        for issue in todo:
+            if claimed >= slots:
+                skipped.append(issue)  # deferred — floor full, a later scan/tick picks it up
+                continue
+            try:
+                await client.start_workflow(
+                    "JobWorkflow",
+                    JobParams(project=proj.name, issue=issue, sandbox=scan_sandbox,
+                              image=scan_image, adjust_passes=proj.adjust_passes),
+                    id=f"beeverforge-{proj.name}-{issue}", task_queue=TASK_QUEUE,
+                )
+                started.append(issue)
+                claimed += 1
+            except Exception as exc:
+                if "AlreadyStarted" in type(exc).__name__:
+                    skipped.append(issue)
+                    claimed += 1  # this ticket already holds a slot — don't hand it to another
+                else:
+                    raise
+    finally:
+        # THE PANEL RE-READS THE LIST 600 ms AFTER THIS BUTTON, inside the window the stream tick
+        # just filled: without this the jobs started here were missing from it (`view._a_write`
+        # holds the writes `view.py` makes; these are made here). On every exit: a start that
+        # raised may still have been taken, and the ones before it were.
+        tv.forget_jobs()
+    if started:
+        msg = f"Started {len(started)} job(s): " + ", ".join("#" + s for s in started)
+        if skipped:
+            msg += f" — {len(skipped)} left in TO-DO (one at a time)."
+    else:
+        msg = "All TO-DO items are already running."
+    return done(msg, started=started, skipped=skipped, todo=todo, running=running)
+
+
+# ── start — one job for one ticket ──────────────────────────────────────────────────────────────
+
+async def _start(*, project: str, issue: str, by: Actor, sandbox: str = "",
+                 promote: bool = False, durable: bool = False) -> Outcome:
+    """Start one job for one ticket. `durable` picks the ENGINE, not just a flag:
+
+        durable=False (default)   `trigger_job` — a detached subprocess (`beeverforge run …`), the
+                                   worktree/local execution path
+        durable=True               `temporal_start` — a durable Temporal workflow, which only
+                                   the cloud worker runs and which therefore only accepts
+                                   `sandbox="fargate"`
+
+    MOVED FROM `api/app.py::trigger_job` AND `::temporal_start` — TWO routes because they were
+    two different launch mechanisms wearing the same `NewJob` body, not because they differ in
+    what a human is asking for: "run this ticket." One action, one parameter picking the engine,
+    is what stops a third mechanism from needing a third route.
+
+    A GAP CARRIED OVER, NOT INTRODUCED: `promote` only ever reached the workflow on the durable
+    path (`JobParams.promote` → `JobWorkflow` auto-releasing after landing). The local/subprocess
+    path (`build_runner(...).run(...)`) has no equivalent hook — `beeverforge run` does not even
+    have a
+    `--promote` flag — so `promote=True` with `durable=False` is accepted and silently has no
+    effect, exactly as `trigger_job` always did. Fixing that means designing what "auto-promote"
+    means for the synchronous CLI runner, which is new functionality, not a move; it is a genuine
+    pre-existing gap and is named here so it is not lost in the drift moving this action was meant
+    to end."""
+    from beeverforge.factory import resolve_box_image
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+
+    # UNSET MEANS THE DEPLOYMENT'S BOX. It defaulted to `"worktree"` — the box that isolates the
+    # code state and nothing else — so every caller that did not name one got the weakest box on
+    # the list, while `BEEVERFORGE_SANDBOX` sat in the compose file being read by the durable path
+    # alone.
+    sandbox = (sandbox or "").strip().lower() or default_sandbox()
+
+    if durable:
+        return await _start_durable(found, issue, by=by, sandbox=sandbox, promote=promote)
+
+    # The local path never validated `box.image` before this — a project that declared one for a
+    # sandbox that cannot honour it failed silently, inside the detached subprocess, minutes
+    # later, in a log file nobody was watching yet. `resolve_box_image` is cheap (no network, no
+    # ports touched) and every other launch path already pays for it up front (`cli.poll`,
+    # `temporal_start`, `scan`); this is the one that had been exempted by omission, not by
+    # design.
+    try:
+        resolve_box_image(found, sandbox=sandbox)
+    except ValueError as exc:
+        return refused(INVALID, str(exc))
+
+    import subprocess
+    import sys
+
+    from beeverforge.paths import project_log_dir
+
+    log_dir = project_log_dir(found)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out = (log_dir / f"{issue}-run.log").open("w")
+    subprocess.Popen(  # noqa: S603 — fixed argv, no shell, every element is ours or validated
+        [sys.executable, "-m", "beeverforge.cli", "run", found.name, issue, "--sandbox", sandbox],
+        stdout=out, stderr=out,
+    )
+    return done(f"#{issue}: started ({sandbox}) — {by} asked. Follow it at {log_dir}.",
+                project=found.name, issue=issue, sandbox=sandbox, durable=False)
+
+
+async def _start_durable(found, issue: str, *, by: Actor, sandbox: str, promote: bool) -> Outcome:
+    from beeverforge.adapters.sandbox.registry import durable_refusal
+    from beeverforge.factory import resolve_box_image
+    from beeverforge.runtime.temporal.io import JobParams
+
+    # A DURABLE JOB RUNS ON THE WORKER, so its box must bound more than the code state — the
+    # agent's arbitrary code would otherwise execute in the worker's own filesystem, beside the
+    # scheduler that launched it, with the worker's credentials.
+    #
+    # IT USED TO SAY `!= "fargate"`, on the reasoning *"the cloud worker has no other execution
+    # path"* — true of the deployment it was written on, false of the one this product SHIPS. On
+    # a compose install the durable engine is Temporal OSS and the box is `container`, so the whole
+    # durable path (the human merge gate, park/resume, every deadline) could not be started at all.
+    # Measured by trying it, not by reading it.
+    # ONE ANSWER, ASKED BY EVERY DOOR (ADR-0049 D3). This refusal used to live here and only
+    # here, so the panel's `scan` row and the poller's own activity started the same job in the
+    # same box without a word — and those two are the doors an unattended factory actually uses.
+    if why := durable_refusal(sandbox):
+        return refused(INVALID, why)
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.runtime.temporal import view as tv
+
+    try:
+        params = JobParams(project=found.name, issue=issue, sandbox=sandbox, promote=promote,
+                           image=resolve_box_image(found, sandbox=sandbox),
+                           adjust_passes=found.adjust_passes)
+    except ValueError as exc:
+        return refused(INVALID, str(exc))
+    try:
+        wf_id = await tv.start_job(client, params)
+    except Exception as exc:
+        if "AlreadyStarted" in type(exc).__name__:
+            return refused(CONFLICT, f"a job for #{issue} is already running.")
+        raise
+    return done(f"#{issue}: durable job started ({wf_id}) — {by} asked.",
+                project=found.name, issue=issue, sandbox=sandbox, durable=True,
+                workflow_id=wf_id)
+
+
+# ── a preview of the product, on demand (ADR-0050 D6; the design on #265, §5.5) ─────────────────
+#
+# IN THE PRODUCT AREA, because a card's preview is exactly what the business analyst who asked
+# for the change wants to click through before it merges — a floor row would hand the button to
+# everybody except the person it is for. The panel reaches them through routes of their own under
+# `/api/preview/` (both areas read there); `/api/act/<name>` is the floor's door and stays so.
+
+
+def _preview_target(project: str, unit: str):
+    """`(project, token, record, None)` — or `(None, "", None, Outcome)` saying why not.
+
+    THE PROJECT IS THE REGISTRY'S AND THE RECORD MUST NAME IT. The token only narrows which record
+    is read; a record that names another project (slugs collide, and a store is shared) is refused
+    rather than acted on, so a person scoped to what a project shows can never start, stop or
+    rebuild another project's preview by addressing it under this one's name."""
+    from beeverforge import preview
+
+    found, bad = _project(project)
+    if bad:
+        return None, "", None, bad
+    token = (unit or "").strip().lower().lstrip("#")
+    if not preview.UNIT_RE.fullmatch(token):
+        return None, "", None, refused(
+            INVALID, f"a preview is addressed by a card number or a requirement (`req0012`) — "
+                     f"{unit!r} is neither.")
+    try:
+        # a card of a requirement is previewed AS the requirement (D1); its record says which
+        token = preview.unit_of_card(found.name, token)
+        was = preview.latest(found.name, token)
+    except Exception as exc:  # noqa: BLE001 — an unreadable store starts nothing by itself
+        return None, "", None, refused(
+            UNAVAILABLE, f"the preview records could not be read ({str(exc)[:120]}) — nothing was "
+                         f"done, and this is safe to repeat.")
+    if was is not None and was.project != found.name:
+        return None, "", None, refused(
+            DENIED, f"the preview record of {token} names the project {was.project!r}, not "
+                    f"{found.name!r} — nothing was done.")
+    return found, token, was, None
+
+
+def _who(by: Actor) -> str:
+    return by.display or by.id or "somebody"
+
+
+async def _preview_start(*, project: str, unit: str, by: Actor) -> Outcome:
+    """Start a preview of one unit: `PreviewWorkflow` under the unit's one id, through the engine
+    a job starts on. A second start while one is starting answers `starting` — the engine refused a
+    duplicate, and that is the true state, not an error. Refused by name on a deployment that names
+    no runtime: a button that starts nothing would be the silence this platform exists to end."""
+    from beeverforge import preview
+    from beeverforge.contracts.project import PreviewPolicy
+    from beeverforge.preview import demand
+    from beeverforge.runtime.temporal.io import PreviewParams, default_preview_runtime
+
+    found, token, was, bad = _preview_target(project, unit)
+    if bad:
+        return bad
+    kind = default_preview_runtime()
+    policy = getattr(found, "preview", None) or PreviewPolicy()
+    why = demand.why_not_here(kind, required=policy.required)
+    if why:
+        return refused(CONFLICT, why[:1].upper() + why[1:])
+    if was is not None and was.live and not was.expired():
+        return done(f"the preview of {token} is already up — open it from its card.",
+                    project=found.name, unit=token, state=preview.LIVE)
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.runtime.temporal import view as tv
+
+    params = PreviewParams(project=found.name, unit=token, started_by=_who(by), runtime=kind,
+                           start_timeout_minutes=policy.start_timeout_minutes)
+    try:
+        wf_id = await tv.start_preview(client, params)
+    except tv.PreviewAlreadyStarted:
+        return done(f"a preview of {token} is already starting — it takes minutes.",
+                    project=found.name, unit=token, state=preview.STARTING)
+    return done(f"a preview of {token} is starting — {by} asked. It takes minutes, and the first "
+                f"page can take a minute more.", project=found.name, unit=token,
+                state=preview.STARTING, workflow_id=wf_id)
+
+
+async def _preview_stop(*, project: str, unit: str, by: Actor) -> Outcome:
+    """Take a unit's preview down now — its logs kept first, `ended` on the card with who asked.
+    Refused when none is running: a stop reported done over nothing would be the platform telling
+    somebody it acted when it did not."""
+    found, token, _was, bad = _preview_target(project, unit)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.runtime.temporal import view as tv
+
+    if not await tv.signal_preview(client, found.name, token, "stop", _who(by)):
+        return refused(CONFLICT, f"no preview of {token} is running — there is nothing to stop.")
+    return done(f"the preview of {token} is being taken down — {by} asked. Its logs are kept.",
+                project=found.name, unit=token, state="stopping")
+
+
+async def _preview_rebuild(*, project: str, unit: str, by: Actor) -> Outcome:
+    """Build a unit's preview again from its pull request's head — logs, down, a fresh checkout,
+    fresh data, up, under the same id. A unit with nothing running is simply started: a rebuild of
+    what is not up is a start, and refusing it would send the person to another button."""
+    from beeverforge import preview
+
+    found, token, _was, bad = _preview_target(project, unit)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.runtime.temporal import view as tv
+
+    if await tv.signal_preview(client, found.name, token, "rebuild", _who(by)):
+        return done(f"the preview of {token} is being rebuilt from its pull request's head — {by} "
+                    f"asked. It takes minutes.", project=found.name, unit=token,
+                    state=preview.STARTING)
+    return await _preview_start(project=project, unit=unit, by=by)
+
+
+def _a_product_admin(project, by: Actor) -> bool:
+    """A person on the product's own admin list (`product.admins`, `module.may_act`), or the CLI —
+    a shell on the host outranks every row here.
+
+    NARROWER THAN `needs_admin` ON PURPOSE. On the panel every credential that got in is `admin`,
+    a product-scoped one included, which is right for starting a preview of somebody's change and
+    wrong for letting a preview run what that change declares (#348)."""
+    from beeverforge.product.module import may_act
+
+    if getattr(by, "via", "") == "cli":
+        return True
+    return may_act(project, str(getattr(by, "id", "") or ""), via=str(getattr(by, "via", "") or
+                                                                     "api"))
+
+
+async def _preview_own_shape(*, project: str, unit: str, by: Actor) -> Outcome:
+    """Allow a unit's preview to run its change's OWN shape — the digest its last start read — and
+    build it again with it (#348, ADR-0050 D3 amended).
+
+    A PERSON UNLOCKS IT, AFTER READING IT. The shape is read from the base branch because the
+    compose file is in the repository the agent edits; a change whose point is a new service was
+    previewed without its point. The pull request lists every file a preview would read with a
+    hash, and the card says the digest of the change's shape. This row allows exactly that digest:
+    a push that changes the shape is a different one, and the preview goes back to the base's.
+
+    ONLY WHAT A START HAS MEASURED. The digest comes from the unit's record, never from a
+    parameter, so what is allowed is what the platform read, not what somebody typed."""
+    import asyncio
+
+    from beeverforge import preview
+    from beeverforge.preview import own
+
+    found, token, was, bad = _preview_target(project, unit)
+    if bad:
+        return bad
+    if not _a_product_admin(found, by):
+        return refused(DENIED, f"only a product admin of {found.name} (`product.admins`) may let a "
+                               f"preview run a change's own shape: it runs what the change "
+                               f"declares.")
+    if was is None or not was.own_shape:
+        return refused(CONFLICT, f"the change of {token} does not edit the product's shape — or no "
+                                 f"preview of it has read it yet. Start its preview first; its "
+                                 f"card then says whether it does.")
+    if was.shape_from == "change" and (own.allowed(found.name, token) or ("",))[0] == \
+            was.own_shape:
+        return done(f"{token}'s preview already runs its change's own shape "
+                    f"({own.short(was.own_shape)}).", project=found.name, unit=token,
+                    state=was.state)
+    if not own.allow_shape(found.name, token, was.own_shape, _who(by)):
+        return refused(UNAVAILABLE, "the allowance could not be recorded — nothing changed, and "
+                                    "this is safe to repeat.")
+    said = (f"{_who(by)} allowed this pull request's own preview shape "
+            f"({own.short(was.own_shape)}). The next preview runs it, admitted key by key as the "
+            f"base's is; a push that changes the shape goes back to the base's until somebody "
+            f"looks again.")
+    try:
+        _, _, forge = await asyncio.to_thread(_forge_and_manifest, found.name)
+        for url in was.pr_urls:
+            await asyncio.to_thread(forge.review_pr, pr=url, event="comment", body=said)
+    except Exception as exc:  # noqa: BLE001 — the allowance stands; the pull request was not told
+        log.warning("[%s] could not tell the pull request of %s about its shape (%s)",
+                    found.name, token, str(exc)[:160])
+    # AND IT IS BUILT AGAIN NOW, with what was allowed: a rebuild of a unit with nothing running
+    # is a start. Its own refusal (no runtime named, an engine that is down) is said beside the
+    # allowance, which stands either way.
+    rebuilt = await _preview_rebuild(project=project, unit=unit, by=by)
+    return done(f"{token}: {said} {rebuilt.message}", project=found.name, unit=token,
+                digest=was.own_shape,
+                state=str((rebuilt.data or {}).get("state") or was.state or preview.STARTING))
+
+
+# ── enable — is this project picked up at all ───────────────────────────────────────────────────
+
+async def _enable(*, project: str, by: Actor, enabled: bool = True) -> Outcome:
+    """Turn pickup on or off for one project. The panel had this; Slack did not, which #51 names
+    as a live defect — an operator watching a runaway board in a channel had to go find the panel
+    to stop it.
+
+    NOT A PAUSE OF THE POLLER. `enabled` is per project; the poller's schedule is deployment-wide.
+    Said explicitly because they look interchangeable from a channel and are not: disabling every
+    project still leaves auto-split refilling TO-DO, and only pausing the schedule holds the queue
+    (`emptying-todo-does-not-hold-the-queue`)."""
+    from beeverforge.registry import ProjectRegistry
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    ProjectRegistry().set_enabled(found.name, bool(enabled))
+    state = "enabled" if enabled else "disabled"
+    tail = ("new tickets in TO-DO will be picked up." if enabled
+            else "nothing new will be picked up; jobs already running are unaffected.")
+    return done(f"{found.name} is {state} — {tail} ({by})",
+                project=found.name, enabled=bool(enabled))
+
+
+# ── prod release — shared plumbing for approve_prod and promote ────────────────────────────────
+#
+# `_forge_and_manifest` and `_env_prod_approvers` MOVED HERE FROM `api/app.py`, where
+# `promote_info` (the read-only dialog-prefetch route, `GET /api/promote/{project}/{issue}`) still
+# imports them from this module. That import points the way you would expect FROM a front end —
+# `promote_info` is not becoming an action (it does nothing, it only fetches what a form needs to
+# populate itself with), but the two things it reads from are genuine capability logic with no
+# transport in them, and duplicating them back into app.py would be exactly the drift this whole
+# card exists to end, one function sooner.
+
+def _forge_and_manifest(project_name: str):
+    """`(project, manifest, forge)` — or `KeyError` (unknown project) / `FileNotFoundError` (a
+    deployed panel's placeholder `repo_path`, no checkout on disk). BOTH ARE RAISED, NOT RETURNED
+    AS AN OUTCOME, unlike everything else in this module: `promote_info` (still a plain app.py
+    route, not an action) is one of its two callers and needs a real exception to catch. `_promote`
+    is the other. NEITHER CALLER LETS THE `KeyError` OUT ANY MORE (#204): each asks its own layer's
+    lookup first (`_project` here, `_project_or_404` on the panel), because both let it through —
+    a bare 500 from the route, and FAILED with the exception's repr from `perform`'s catch-all.
+    The `FileNotFoundError` still reaches that catch-all from `_promote`: a placeholder checkout
+    has no manifest to release FROM, and there is nothing that path could do about it."""
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+    from beeverforge.loader import load_manifest
+    from beeverforge.registry import ProjectRegistry
+
+    p = ProjectRegistry().get(project_name)
+    manifest = load_manifest(p)
+    # THE FORGE AXIS ASKS ITS OWN CREDENTIAL. `github_app.token_from_env()` stood here — one
+    # vendor's mint handed to `build_forge` for ANY forge kind, and it OVERRODE a project's own
+    # `forge.options.token_env` because an explicit `token=` wins over what a row resolves for
+    # itself. Measured 2026-08-24: a GitHub project naming its own PAT was built with the
+    # deployment's, and a third-party forge add-on was handed a `ghp_…` it never asked for.
+    forge = build_forge(p, token=forge_token_for(p) or deployment_forge_token(p))
+    return p, manifest, forge
+
+
+def _env_prod_approvers() -> list[str]:
+    """BEEVERFORGE_PROD_APPROVERS (comma-separated) — the deployed panel's allowlist, where no
+    repo/manifest exists on disk."""
+    import os
+
+    raw = os.environ.get("BEEVERFORGE_PROD_APPROVERS", "")
+    return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+def _prod_allowlist(project) -> list[str]:
+    """Who may approve a production release for THIS project, from the first source that answers:
+    the deployment-wide env allowlist, else the project's own manifest, else — on a deployed panel
+    whose registry `repo_path` is a placeholder with no checkout — the password store's own
+    logins. ONE injected secret (BEEVERFORGE_APPROVERS) then arms the whole gate."""
+    allowed = _env_prod_approvers()
+    if allowed:
+        return allowed
+    try:
+        _, manifest, _ = _forge_and_manifest(project.name)
+        return manifest.prod_approvers
+    except FileNotFoundError:
+        from beeverforge.approvals import list_approvers
+
+        log.warning(
+            "BEEVERFORGE_PROD_ALLOWLIST_FROM_STORE: no BEEVERFORGE_PROD_APPROVERS and no manifest "
+            "on disk "
+            "for %r — allowing the password store's logins", project.name,
+        )
+        return list_approvers()
+
+
+def _approval_denied(approver: str = "") -> Outcome:
+    """An empty password store is a deployment config error no password can cure. It must be a
+    loud UNAVAILABLE for the operator, never a DENIED that reads as a typo — a structurally dead
+    approve button parks a release forever, and the two look identical from a rejected click."""
+    from beeverforge import approvals
+
+    # THE SAME RULE, FOR ONE LOGIN. `approver`'s own entry is not a hash, so no password she types
+    # can match it: measured 2026-09-19, `{"ana": null}` answered her "bad password" for ever and
+    # `{"ana": 5}` answered a 500 carrying `'int' object has no attribute 'startswith'`. Everybody
+    # else's entry is untouched by hers, and a typo of theirs is still a DENIED, below.
+    entry = approvals.source().why_no_password_works_for(approver)
+    if entry:
+        log.error("BEEVERFORGE_APPROVER_ENTRY_MALFORMED: prod approval refused — %s", entry)
+        return refused(UNAVAILABLE, f"approval store not usable for this login — {entry} "
+                                    f"(tell the operator)")
+    if approvals.list_approvers():
+        return refused(DENIED, "not an authorized approver / bad password")
+    src = approvals.source()
+    if src.malformed or (src.problem and not src.variable):
+        # A STORE IS THERE AND AUTHORIZES NOBODY — the file cannot be read, or no entry in either
+        # store is a hash. Until 2026-09-19 the first never got here: it left `source()` as
+        # `json.loads`'s or the OS's exception and reached the dialog as a 500 with that text.
+        # The branch at the bottom would call both "not configured … until the secret is
+        # provisioned", about a store somebody has to REPAIR.
+        log.error("BEEVERFORGE_APPROVER_STORE_MISSING: prod approval refused — %s",
+                  src.unreadable or src.unusable)
+        why = (f"the file store {src.path} cannot be read: {src.problem}" if src.problem else
+               f"no entry in {src.where} is a hash: {src.malformed_named}")
+        return refused(UNAVAILABLE, f"approval store not usable on this deployment — {why}, so "
+                                    f"no password can work until it is repaired (tell the "
+                                    f"operator)")
+    if src.variable:
+        # THE SECRET IS THERE AND YIELDS NOBODY (#202) — not JSON, not an object, or `{}`. The
+        # branch below called that "no store" and "until the secret is provisioned", about a
+        # secret that WAS provisioned, and sent the operator to `beeverforge approver add` where
+        # the panel runs: with the variable set, that is the verb that refuses.
+        why = src.problem or "names nobody"
+        log.error("BEEVERFORGE_APPROVER_STORE_MISSING: prod approval refused — %s",
+                  src.unreadable or f"`{approvals.VARIABLE}` is set on this runtime and names "
+                                    f"nobody. {src.how_to_add()}")
+        return refused(
+            UNAVAILABLE, f"approval store not usable on this deployment — "
+                        f"`{approvals.VARIABLE}` is set and {why}, so no password can work until "
+                        f"it is corrected where the deployment sets it (tell the operator)")
+    log.error(
+        "BEEVERFORGE_APPROVER_STORE_MISSING: prod approval refused — this runtime has no "
+        "approver "
+        "password store. Inject the BEEVERFORGE_APPROVERS secret (JSON login->hash, SSM "
+        "SecureString: `beeverforge approver add <login>` then put "
+        "~/.beeverforge/approvers.json "
+        "in the parameter) or run `beeverforge approver add` where the panel runs."
+    )
+    return refused(
+        UNAVAILABLE, "approval store not configured on this deployment — no password can "
+                    "work until the BEEVERFORGE_APPROVERS secret is provisioned (tell the "
+                    "operator)")
+
+
+# ── approve_prod — answer the durable release gate ──────────────────────────────────────────────
+
+async def _approve_prod(*, project: str, issue: str, version: str, approver: str, password: str,
+                        by: Actor, comment: str = "") -> Outcome:
+    """Deliver an authenticated human decision on a job's production-release gate, as a durable
+    signal to the parked workflow (D-12) — the human-in-the-loop path of the runtime.
+
+    MOVED FROM `api/app.py::temporal_approve`. Distinct from `promote`: this SIGNALS a workflow
+    that is already parked waiting for the answer; `promote` RUNS the release itself, synchronously,
+    outside Temporal entirely. Two mechanisms because the durable path exists specifically for the
+    cloud worker, which has no synchronous request to answer from — the signal is how the answer
+    reaches a workflow that may have been waiting for hours.
+
+    THROUGH THE CARD'S DOOR (#448 slice 6, ADR-0055 amended 2026-10-05): `released`, whose act is
+    the signal — so a release the job did not take records nothing — and whose row closes every
+    copy of the question the product role asked about it as worked."""
+    from beeverforge.util.causes import first_message
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    from beeverforge.approvals import verify_approver
+
+    if not verify_approver(approver, password, _prod_allowlist(found)):
+        return _approval_denied(approver)
+    client, bad = await _connected()
+    if bad:
+        return bad
+    from beeverforge.lifecycle import CardEvent
+    from beeverforge.runtime.temporal import view as tv
+
+    async def signal() -> Outcome | None:
+        from beeverforge import gate_seal
+
+        try:
+            await tv.approve_job(client, found.name, issue, version=version, approver=approver,
+                                 comment=comment)
+        except gate_seal.KeyRefused as exc:  # the answer could not be sealed: said as itself
+            return refused(FAILED, first_message(exc))
+        except RuntimeError as exc:  # not parked at the approval gate
+            return refused(CONFLICT, first_message(exc))
+        return None
+
+    moved = await _through_the_door(found, issue, CardEvent.RELEASED, by=by, why=comment,
+                                    facts={"gate": "last", "version": version,
+                                           "approver": approver, "note": ""}, act=signal)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    return _after_the_door(moved, done(
+        f"#{issue}: production release ({version}) approved by {approver}.",
+        project=found.name, issue=issue, version=version, approver=approver, signaled=True))
+
+
+# ── promote — run the release in this process ───────────────────────────────────────────────────
+
+async def _promote(*, project: str, issue: str, version: str, approver: str, password: str,
+                   by: Actor, comment: str = "") -> Outcome:
+    """Authenticated human action to release to prod (ADR-0001 D-12), run synchronously in this
+    process rather than signalled to a durable workflow — the local/dev path, where there is no
+    parked Temporal job waiting for the answer because the ticket was never durable to begin with.
+
+    MOVED FROM `api/app.py::promote_prod` verbatim, including what it does NOT do: no
+    `FileNotFoundError` guard around `_forge_and_manifest`, unlike `approve_prod`'s allowlist
+    lookup. A deployed panel's placeholder checkout has no manifest to release FROM either, so
+    there is nothing this path could do about it — it now surfaces as a FAILED outcome carrying
+    the real message (`perform`'s catch-all), where it used to be a bare 500."""
+    from beeverforge.adapters.environment.registry import build_observer
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.approvals import verify_approver
+    from beeverforge.observability.registry import journal_for
+    from beeverforge.orchestrator.promotion import PromotionRunner
+    from beeverforge.paths import events_file
+
+    # THE ONE ROW THAT DID NOT ASK `_project` (#204). Every other row in this catalog refuses a
+    # name nobody registered by name; this one went straight to `_forge_and_manifest`, whose
+    # `KeyError` reached `perform`'s catch-all — FAILED, which the panel maps to 500, carrying
+    # `could not promote: "project not registered: 'x'"`: an exception's repr, to the person
+    # submitting the approval dialog for a project somebody had just renamed.
+    _, bad = _project(project)
+    if bad:
+        return bad
+    p, manifest, forge = _forge_and_manifest(project)
+    if not verify_approver(approver, password, manifest.prod_approvers):
+        return _approval_denied(approver)
+    # EACH AXIS ASKS ITS OWN (#162). `token_from_env()` was `BEEVERFORGE_BOT_TOKEN`, else a minted
+    # GitHub App installation token — one vendor's credential, handed to a tracker and to an
+    # observer on a path that names no vendor. It also OVERRODE a project's own PAT, because an
+    # explicit `token=` wins over everything the registry rows resolve for themselves. The
+    # observer watches the FORGE's CI, so it takes the forge axis's credential.
+    from beeverforge.credentials import (
+        deployment_forge_token,
+        deployment_tracker_token,
+        forge_token_for,
+        tracker_token_for,
+    )
+
+    tracker_tok = tracker_token_for(p) or deployment_tracker_token(p)
+    runner = PromotionRunner(
+        tracker=build_tracker(p, token=tracker_tok), forge=forge,
+        observer=build_observer(p, token=forge_token_for(p) or deployment_forge_token(p)),
+        manifest=manifest,
+        events=journal_for(events_file(p, issue)),
+        language=str(getattr(p, "language", "") or ""),  # #160: the release speaks the project's
+    )
+    result = runner.release_prod(f"#{issue.lstrip('#')}", version=version, approver=approver,
+                                 comment=comment)
+    # THE RELEASE HANDS ITS OUTCOME BACK (ADR-0055 D7, #414) — delivered, or parked on a rollback —
+    # and this row is the worker that ran it, so the card hears it through its door
+    from beeverforge.lifecycle.handed_back import apply as the_outcome_goes_through_the_door
+
+    the_outcome_goes_through_the_door(p, f"#{issue.lstrip('#')}", result,
+                                      tracker=getattr(runner, "tracker", None))
+    return done(f"#{issue}: {result.note or result.state.value}",
+                project=p.name, issue=issue, state=result.state.value, note=result.note)
+
+
+# ── merge / adjust / discard — the human-gated PR becomes a question (#68, C-32) ────────────────
+#
+# THE GATE COULD NOT BE ANSWERED AT ALL before these. With `merge_policy: human` the workflow
+# stays alive inside its merge watch for up to fourteen days, but `_paused` is never set — so
+# `awaiting_action` is None, `act_job` refuses before signalling, and resume/skip both come back
+# CONFLICT. The human path cannot self-heal either: the one branch that merges a clean PR is
+# gated on `auto_merge`, which is False precisely when a human is the gate. A green, reviewed,
+# human-gated PR had exactly two exits — somebody clicking merge on github.com, or fourteen days
+# elapsing. That is the "In review nobody is asked" the card is named for.
+#
+# ONE SEAM, THREE ROWS. All three go through `view.answer_merge_gate`, which queries the gate
+# before signalling so a stale answer is refused rather than swallowed.
+
+#: How long an `adjust` instruction may be. It is free text typed into a panel that lands in an
+#: agent's context at the same trust level as the ticket body, and verbatim in an audit line.
+_ADJUST_MAX_CHARS = 2000
+
+
+async def _answer_gate(*, project: str, issue: str, by: Actor, answer: str,
+                       instruction: str = "") -> tuple[dict | None, Outcome | None]:
+    """`(merge-wait dict, None)` or `(None, refusal)` — the part all three rows share."""
+    from beeverforge.runtime.temporal import view as tv
+    from beeverforge.util.causes import first_message
+
+    found, bad = _project(project)
+    if bad:
+        return None, bad
+    client, bad = await _connected()
+    if bad:
+        return None, bad
+    from beeverforge import gate_seal
+
+    try:
+        gate = await tv.answer_merge_gate(client, found.name, issue, answer=answer,
+                                          instruction=instruction, by=str(by))
+    except gate_seal.KeyRefused as exc:
+        # THE ANSWER COULD NOT BE SEALED (#742): the job IS waiting, and "not waiting on a merge"
+        # would send the person to do again what they just did. The key's own refusal, by name.
+        return None, refused(FAILED, first_message(exc))
+    except tv.GateDeaf as exc:
+        # The OPPOSITE of the case below: the job IS waiting on a merge, and its run can never
+        # consume an answer (pre-patch replay). Folding this into 'not waiting on a merge' told
+        # the operator the PR may have merged when the truth is the gate is deaf.
+        return None, refused(CONFLICT, f"#{issue} is waiting on a merge it cannot hear: {exc}")
+    except tv.AdjustsSpent as exc:
+        # WHAT HAPPENS NEXT, NOT ONLY WHAT WAS REFUSED (#448): the job is waiting on a person,
+        # and past the project's budget that person decides — merge, or discard. The job's own
+        # standing note says the same sentence (`vocabulary.adjusts_spent_note`).
+        from beeverforge.runtime.temporal.vocabulary import adjusts_spent_note
+
+        return None, refused(CONFLICT, f"#{issue}: {adjusts_spent_note(exc.passes)}.")
+    except RuntimeError as exc:  # the engine answered: this job is not at the merge gate
+        # WAITING ON SOMETHING ELSE IS SAID, WITH ITS VERBS (#660). In journey 0 a job parked for a
+        # person held the deployment's only slot; the operator tried `discard` and read that it
+        # "may have merged already, been closed, or never opened a PR" — three guesses, none true,
+        # and not the two verbs that answer it. `stop` and `close` already ask the workflow.
+        waiting = None
+        try:
+            waiting = await _what_it_is_waiting_on(
+                client.get_workflow_handle(tv.job_id(found.name, issue)))
+        except Exception as ask:  # noqa: BLE001 — the refusal stands; only its reason is lost
+            log.info("could not ask #%s what it waits on instead (%s)", issue, ask)
+        if waiting:
+            what, how = waiting
+            return None, refused(
+                CONFLICT,
+                f"#{issue} is not waiting on a merge — it is waiting on {what}. Answer it with "
+                f"`{how}`.")
+        return None, refused(
+            CONFLICT,
+            f"#{issue} is not waiting on a merge — it may have merged already, been closed, or "
+            f"never opened a PR. ({first_message(exc, limit=120)})")
+    except Exception as exc:  # noqa: BLE001
+        if _looks_missing(exc):
+            return None, refused(
+                NOT_FOUND, f"no job has ever run for #{issue} on {found.name}.")
+        raise
+    return gate, None
+
+
+async def _merge(*, project: str, issue: str, by: Actor, comment: str = "") -> Outcome:
+    """Land the PR a human-gated job is waiting on.
+
+    TAKES NO `pr` PARAMETER, deliberately. The PR comes from the engine's own gate payload, so
+    holding the panel token cannot be turned into merging an arbitrary PR in the repository.
+
+    SAYS ASKED, NEVER MERGED. The forge can still refuse — branch protection this App cannot
+    satisfy — and it reports that by returning False rather than raising, so the only honest
+    thing this can claim is that the factory is now landing it. The workflow parks with the
+    reason if the forge says no."""
+    gate, bad = await _answer_gate(project=project, issue=issue, by=by, answer="merge")
+    if bad:
+        return bad
+    return done(
+        f"#{issue}: merging the PR now — {by} approved it. The card moves to Merged when the "
+        f"forge confirms; if branch protection refuses, the job parks and says so.",
+        project=project, issue=issue, answer="merge", pr_url=(gate or {}).get("pr_url"),
+        by=str(by), comment=comment[:280])
+
+
+async def _adjust(*, project: str, issue: str, instruction: str, by: Actor) -> Outcome:
+    """Send the PR back for ONE repair pass against a human's own words — same branch, same PR.
+
+    FREE TEXT, which is the product owner's decision and the reason this is a signal parameter
+    rather than a `DecisionRequest` option key: a key is matched against a fixed list at both
+    consumption sites and anything unmatched is silently dropped, so free text would arrive and
+    then vanish.
+
+    THE WHITESPACE CHECK IS NOT REDUNDANT. `perform` refuses a missing or empty required
+    parameter, but its test is `in (None, "")` — so `"   "` passes it and would reach an agent as
+    an instruction to do nothing in particular, at full price."""
+    text = (instruction or "").strip()
+    if not text:
+        return refused(
+            INVALID,
+            "say what needs changing — 'adjust' is your own words, e.g. 'the button should be on "
+            "the right' or 'this needs a test for the empty case'.")
+    if len(text) > _ADJUST_MAX_CHARS:
+        return refused(
+            INVALID,
+            f"that is {len(text)} characters and the limit is {_ADJUST_MAX_CHARS} — it becomes "
+            f"an agent's instruction, so it has to stay a request rather than a document.")
+    gate, bad = await _answer_gate(project=project, issue=issue, by=by, answer="adjust",
+                                  instruction=text)
+    if bad:
+        return bad
+    # THE SIZE, IN THE SENTENCE (#150). This confirmation is the only thing that stands between a
+    # human's words and an agent spending a full pass on them, and it echoed a 120-character
+    # PREFIX — which is indistinguishable from a whole short instruction. On the pilot a pasted
+    # paragraph reached this function as its last twenty-six characters, was confirmed as a
+    # success, and cost a pass. No surface can detect that; every surface can print the number,
+    # and a person who typed a paragraph knows at a glance that 26 is wrong.
+    return done(
+        f"#{issue}: sent back for one pass — {by} asked for ({len(text)} characters): "
+        f"{text[:120]}{'…' if len(text) > 120 else ''}. It pushes to the same PR and the gate "
+        f"re-opens when the pass is done.",
+        project=project, issue=issue, answer="adjust", pr_url=(gate or {}).get("pr_url"),
+        by=str(by), instruction=text[:280], length=len(text))
+
+
+async def _address(*, project: str, issue: str, by: Actor) -> Outcome:
+    """Send the PR back for ONE pass against what people wrote on it (#330) — same branch, same PR.
+
+    `adjust` with its words taken from the forge rather than typed. The comments existed, written
+    against the lines they are about, and the only way to act on them was to read the threads,
+    compress them into one paragraph and paste it into `adjust`: a lossy copy nobody could audit.
+
+    THE PULL REQUEST IS READ FIRST. A forge that cannot list its comments, or a pull request with
+    nothing standing on it, is refused here by name, before the gate is answered and before a pass
+    is spent. The pass reads them again when it starts, because a thread can be resolved in
+    between, and says on the pull request which ones it took."""
+    import asyncio
+
+    from beeverforge.adapters.forge.base import CommentsNotListed, review_comments_of
+    from beeverforge.runtime.temporal import view as tv
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    try:
+        waiting = await tv.merge_gate_of(client, found.name, issue)
+    except Exception as exc:  # noqa: BLE001
+        if _looks_missing(exc):
+            return refused(NOT_FOUND, f"no job has ever run for #{issue} on {found.name}.")
+        raise
+    pr_url = str((waiting or {}).get("pr_url") or "")
+    if not pr_url:
+        return refused(CONFLICT, f"#{issue} is not waiting on a merge — there is no pull request "
+                                 f"whose comments a pass could take.")
+    _, _, forge = await asyncio.to_thread(_forge_and_manifest, found.name)
+    comments = await asyncio.to_thread(review_comments_of, forge, pr_url)
+    if isinstance(comments, CommentsNotListed):
+        return refused(CONFLICT, f"#{issue}: {comments}. Say what needs changing with 'adjust' "
+                                 f"instead.")
+    if not comments:
+        return refused(CONFLICT, f"#{issue}: nothing people wrote on the pull request still "
+                                 f"stands — every thread is resolved and no request for changes "
+                                 f"is open, so there is nothing for a pass to address.")
+    gate, bad = await _answer_gate(project=project, issue=issue, by=by, answer="address")
+    if bad:
+        return bad
+    return done(
+        f"#{issue}: sent back for one pass on the {len(comments)} review comment"
+        f"{'s' if len(comments) != 1 else ''} standing on the pull request. The pass lists the "
+        f"ones it takes on the pull request, pushes to the same PR, and the gate re-opens when it "
+        f"is done.",
+        project=project, issue=issue, answer="address", pr_url=(gate or {}).get("pr_url"),
+        by=str(by), comments=len(comments))
+
+
+async def _review(*, project: str, issue: str, by: Actor) -> Outcome:
+    """Ask the independent reviewer to read the open pull request again, as it stands (#181).
+
+    THE ANSWER TO A REJECTION THAT WAS ANSWERED. `adjust` sends the work back against a person's
+    own words; until this verb existed there was no way to ask whether the change did what it was
+    made for, so the operator either merged on their own reading of the diff — the work an
+    independent review exists to remove — or merged against a verdict about code that was gone.
+
+    IT WRITES NOTHING, and that is the sentence that distinguishes it from its two neighbours:
+    the branch, the commits and the pull request are exactly as they were. What it changes is the
+    verdict on the card, which it REPLACES rather than adds to.
+
+    AND IT COSTS. A review is a model pass, so this says the price out loud instead of reading as
+    a refresh button."""
+    gate, bad = await _answer_gate(project=project, issue=issue, by=by, answer="review")
+    if bad:
+        return bad
+    return done(
+        f"#{issue}: reading the pull request again for {by} — it changes no code, and the verdict "
+        f"on the card is replaced by what this pass finds. The gate re-opens when it is done.",
+        project=project, issue=issue, answer="review", pr_url=(gate or {}).get("pr_url"),
+        by=str(by))
+
+
+async def _discard(*, project: str, issue: str, by: Actor, reason: str = "") -> Outcome:
+    """Close the PR without merging and free the floor.
+
+    NOTHING IS DELETED — `gh pr close` leaves the branch and its commits, so this is reversible
+    and needs no password gate. The message says so, because the word promises more destruction
+    than the operation performs.
+
+    THROUGH THE CARD'S DOOR (ADR-0055). The gate's answer is the engine's half and runs inside the
+    door; the card's half — back to the backlog, one comment saying who decided, the requester told
+    where it is, the preview down, the snapshot forgotten — is the table's. The job's own settle
+    still writes the column too, until slice 2 moves job endings in (#413)."""
+    from beeverforge.lifecycle import CardEvent
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    gate: dict = {}
+
+    async def answer() -> Outcome | None:
+        gate["it"], refusal = await _answer_gate(project=project, issue=issue, by=by,
+                                                 answer="discard")
+        return refusal
+
+    moved = await _through_the_door(proj, issue, CardEvent.DISCARDED, by=by, why=reason[:280],
+                                    act=answer, tracker=tracker, board=board)
+    return _refusal_of(moved) or _after_the_door(moved, done(
+        f"#{issue}: PR closed without merging by {by} — the floor is free. The branch and its "
+        f"commits are untouched, so the work can be picked up again.",
+        project=project, issue=issue, answer="discard", pr_url=(gate.get("it") or {}).get("pr_url"),
+        by=str(by), reason=reason[:280], freed=True))
+
+
+# ── stop — end a job that is going nowhere, without opening the engine ──────────────────────────
+
+async def _stop(*, project: str, issue: str, by: Actor, reason: str = "") -> Outcome:
+    """End a RUNNING job that nothing else can reach, and settle its ticket (#127).
+
+    THE GAP THIS CLOSES. A wedged job — a workflow-task failure loop — holds the single-slot floor
+    for ever, and until now no row in this catalogue could end one. `resume` and `skip` answer a
+    PARK, and the engine refuses them with CONFLICT for a job that is not parked; the merge-gate
+    verbs answer a GATE. So the tech-lead's own rounds ended up saying, honestly, *"the exit is in
+    the engine: open Temporal and terminate"* — a true sentence, and a raw-engine operation being
+    asked of an operator on the one surface this product promises they will never need.
+
+    IT REFUSES A JOB THAT IS MERELY WAITING, and that refusal is the whole safety of the row.
+    A park has `resume`/`skip`; a merge gate has `merge`/`adjust`/`discard`; a production gate has
+    an authenticated approval. Terminating any of those would destroy a job a person was about to
+    advance, and would do it under a verb that sounds like tidying up. Every one of them is named
+    in the refusal, with the verb that fits, so the answer teaches the right gesture rather than
+    just withholding the wrong one.
+
+    IT IS NOT REVERSIBLE AND SAYS SO. `discard` can afford a softer sentence because `gh pr close`
+    leaves the branch; a terminated workflow does not resume — the ticket goes back to the board
+    and a fresh job starts from the beginning, losing whatever the run had in flight. Admin-gated
+    for that reason.
+
+    THE TICKET IS SETTLED, NOT LEFT. A workflow terminated with nobody told is the wedged job's
+    own failure mode repeated by hand: the floor frees, and the card sits wherever it was, with no
+    record of who ended it or why. Since ADR-0055 the card's half is the door's: the terminate is
+    the engine's half and runs inside it, and what follows is `stopped`'s row of the table — which
+    is also what tells the requester and takes the preview down, which the settle never did.
+    """
+    import asyncio
+
+    from beeverforge.lifecycle import CardEvent
+    from beeverforge.runtime.temporal import view as tv
+    from beeverforge.util.causes import first_message
+
+    found, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    client, unreachable = await _connected()
+    if unreachable:
+        return unreachable
+
+    handle = client.get_workflow_handle(tv.job_id(found.name, issue))
+    try:
+        described = await handle.describe()
+    except Exception as exc:  # noqa: BLE001 — a job nobody can find is not a job to terminate
+        return refused(
+            NOT_FOUND,
+            f"there is no job for {found.name}#{issue} in the engine "
+            f"({first_message(exc, limit=120)}) — nothing was stopped.")
+    if str(tv.status_label(described.status)) != "running":
+        return refused(
+            CONFLICT,
+            f"#{issue} is not running ({tv.status_label(described.status)}) — there is nothing to "
+            f"stop, and the floor is not being held by it.")
+
+    # WAITING IS NOT WEDGED. Asked of the workflow itself, through the same queries every other
+    # surface uses, so a gate added later is refused here without this function being edited.
+    waiting = await _what_it_is_waiting_on(handle)
+    if waiting:
+        what, how = waiting
+        return refused(
+            CONFLICT,
+            f"#{issue} is not stuck — it is waiting on {what}, which is the platform working. "
+            f"Answer it with `{how}` instead. Stopping a job somebody is about to advance loses "
+            f"the run, and `stop` is for a job nothing else can reach.")
+
+    why = str(reason or "").strip()[:280]
+
+    async def terminate() -> Outcome | None:
+        try:
+            await handle.terminate(reason=f"stopped by {by}" + (f": {why}" if why else ""))
+        except Exception as exc:  # noqa: BLE001 — the engine refused; nothing changed
+            log.exception("could not stop %s#%s", found.name, issue)
+            return refused(
+                FAILED,
+                f"could not stop #{issue}: {first_message(exc, limit=160)} — nothing was changed, "
+                f"and the floor is still held.")
+        finally:
+            # THE PANEL RE-READS THE LIST RIGHT AFTER THIS, inside the window the stream tick just
+            # filled: without this the stopped job stayed listed as running, Stop button and all
+            # (`view._a_write` holds the writes `view.py` makes; this one is made here). On every
+            # exit, as `_a_write` does: a terminate that raised may still have been taken.
+            tv.forget_jobs()
+        return None
+
+    moved = await _through_the_door(found, issue, CardEvent.STOPPED, by=by, why=why,
+                                    act=terminate, tracker=tracker, board=board)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    settled = not moved.outcome("column").startswith("failed")
+    await asyncio.to_thread(_journal_the_stop, found, issue, by=by, why=why)
+    return _after_the_door(moved, done(
+        f"#{issue}: stopped by {by} — the floor is free. This does not resume: the ticket goes "
+        f"back to the board and a fresh job starts from the beginning, so whatever that run had "
+        f"in flight is gone.",
+        project=found.name, issue=issue, by=str(by), reason=why, freed=True, settled=settled))
+
+
+def _journal_the_stop(project, issue: str, *, by: Actor, why: str) -> None:
+    """The job's journal says how it ended (#413). `record_outcome` writes that line when
+    `JobWorkflow.run` returns, and a terminated workflow never returns — so a stopped job's
+    journal ended one event short of the only fact anybody needed, exactly the lie
+    `record_outcome` was written to end. Best-effort: the stop stands whatever the journal says."""
+    try:
+        from beeverforge.contracts import JobState
+        from beeverforge.observability.job_record import record_ending
+
+        # THE ONE WRITER OF THE ENDING LINE, which both drivers write through (#551)
+        record_ending(project, issue, JobState.SKIPPED.value, by=str(by),
+                      note=f"stopped by {by}" + (f": {why}" if why else ""))
+    except Exception:  # noqa: BLE001 — the stop stands; only its journal line is missing
+        log.warning("BEEVERFORGE_STOP_NOT_JOURNALLED project=%s issue=%s — the job was stopped "
+                    "and its journal does not say so", getattr(project, "name", "?"), issue,
+                    exc_info=True)
+
+
+#: What a job may be waiting for, and HOW A PERSON ANSWERS IT — in words they can act on.
+#:
+#: NOT THE GATE'S OWN LABEL. The first version returned `tv.HUMAN_GATES`' values, so the refusal
+#: for a job at the production gate told the reader to "answer it with `prod_approval`" — a label
+#: this codebase uses internally and no surface parses. Teaching a verb nothing accepts is the
+#: defect the merge gate paid for (#68), reproduced inside the refusal that exists to prevent a
+#: worse mistake. The keys are still checked against `HUMAN_GATES` below, so a gate added later
+#: is refused rather than terminated; it simply gets its own name until somebody writes its
+#: sentence.
+_HOW_TO_ANSWER = {
+    "awaiting_action": ("a person's decision", "resume` or `skip"),
+    "awaiting_merge": ("a person's merge", "merge`, `adjust` or `discard"),
+    "awaiting_approval": ("a production approval",
+                          "the Approve button on the panel — it needs a version and the "
+                          "approver's password, which is why it is not a chat verb"),
+}
+
+
+async def _what_it_is_waiting_on(handle) -> tuple[str, str] | None:
+    """`(what it waits for, how a person answers it)` — or None when nothing is waiting.
+
+    THE GATES COME FROM THE SHARED TABLE, so one added to the workflow later is refused by `stop`
+    without this function being touched — it just describes itself by its query name until
+    somebody gives it a sentence. The park query is asked first and separately: it is the one that
+    answers with a payload rather than a flag, and it is the commonest of the three."""
+    from beeverforge.runtime.temporal import view as tv
+
+    for query in ("awaiting_action", *tv.HUMAN_GATES):
+        try:
+            answered = await handle.query(query)
+        except Exception as exc:  # noqa: BLE001 — a job that cannot answer is not a job at a gate
+            log.info("stop: %s did not answer %s (%s)", handle.id, query, str(exc)[:120])
+            continue
+        if answered:
+            return _HOW_TO_ANSWER.get(query, (f"whatever `{query}` reports", "the panel"))
+    return None
+
+
+# ── ask — the tech-lead answers a question, from any front end ──────────────────────────────────
+
+async def _ask(*, project: str, question: str, by: Actor) -> Outcome:
+    """The tech-lead's read-only answer about a project (C-24 made this movable).
+
+    IT WAS REACHABLE FROM ONE VENDOR'S CHAT PRODUCT AND NOWHERE ELSE. The capability now lives in
+    `techlead/conversation.py`; this row is what lets the panel and `beeverforge act ask` reach the
+    same tech-lead the channel reaches, rather than each front end growing its own.
+
+    NOT ADMIN-GATED, deliberately: this reads and answers, it does not act. The `suggestion` it may
+    carry is a PROPOSAL — approving it means calling `resume` or `skip`, which are gated.
+
+    RUN OFF THE EVENT LOOP. `conversation.answer` clones a repository, shells out to `gh` and runs
+    an agent process, and it calls `asyncio.run` internally to read Temporal — which RAISES if
+    there is already a running loop on this thread. Every caller of this layer is async, so the
+    whole call goes to a worker thread; blocking the loop would also stall every other action the
+    panel is serving.
+    """
+    found, bad = _project(project)
+    if bad:
+        return bad
+    text = str(question or "").strip()
+    if not text:
+        return refused(INVALID, "a question with no words in it has no answer — say what to ask.")
+
+    # THE THREAD IS WRITTEN DOWN, BOTH HALVES (#123). Everything the factory says already lands in
+    # the panel's message store; what a PERSON said lived in a browser tab, so a refresh lost the
+    # question, the answer and any staged suggestion — and the two halves rendered as two blocks,
+    # which is why a narration could appear above a question asked before it. One feed, one clock.
+    #
+    # Best-effort and BEFORE the work: a store that will not write must cost the thread its record,
+    # never the operator their answer.
+    _remember(found.name, text, by=by)
+
+    # AN INSTRUCTION IS NOT A QUESTION (#120). This row is deliberately not admin-gated because it
+    # reads and answers — so it does not act here either: `_floor_say_as_an_intent` routes through
+    # `perform`, which applies the same scope and admin check the panel's button goes through, to
+    # the same actor. A credential that cannot press Merge cannot type its way past it.
+    #
+    # Anything that is not an unambiguous instruction — a question, a sentence about merging
+    # rather than an order to merge, an ambiguous floor with two jobs waiting — falls through to
+    # the tech-lead below and is answered in prose, which is what this row was always for.
+    # A PLAIN "YES" ANSWERS THE QUESTION THE PLATFORM ITSELF ASKED (#156), and it is checked FIRST
+    # because it is the least ambiguous thing in this function: the tech-lead put a button on the
+    # screen, and the person is looking at it. It only fires when something is actually staged —
+    # `run_staged` says which of superseded/answered/expired when it is not, so a yes arriving a
+    # minute late is told what happened instead of quietly becoming a new question.
+    from beeverforge.actions.floor_intents import is_affirmation
+
+    if is_affirmation(text):
+        from beeverforge.memory import messages as channel
+
+        try:
+            live = channel.staged(found.name)
+        except Exception as exc:  # noqa: BLE001 — an unreadable store must not eat the question
+            log.warning("could not check whether %s has a staged suggestion (%s) — the message "
+                        "goes to the tech-lead as a question", found.name, str(exc)[:160])
+            live = None
+        if live is not None:
+            accepted = await run_staged(project=found.name, by=by)
+            _remember(found.name, accepted.message, factory=True)
+            return accepted
+
+    routed = await _floor_say_as_an_intent(text, project=found.name, by=by)
+    if routed is not None:
+        # A ROUTED INSTRUCTION IS PART OF THE CONVERSATION TOO. It never reaches the worker, so
+        # nothing else would ever write it down — and "I told it to merge and it said X" is
+        # precisely the turn somebody will want to find again.
+        _remember(found.name, routed.message, factory=True)
+        return routed
+
+    # DISPATCHED TO THE WORKER, never executed here. This used to call
+    # `conversation.answer` in whichever process served the request — and the panel's
+    # process holds no harness credential (deliberately; it is the outward-facing
+    # surface), so the tech-lead's "answer" there was the CLI's own "Not logged in ·
+    # Please run /login", returned with a straight face. The agent runs where agents
+    # run and authenticate: the worker, as a workflow, so the question also survives
+    # the asker and shows up costed in the engine like every other invocation.
+    client, bad = await _connected()
+    if bad:
+        return bad
+    # WHAT THIS ASKER MAY ACTUALLY BE OFFERED, decided HERE and carried as data (#121). The
+    # tech-lead runs on the worker, where the actor does not travel and must not be reinvented —
+    # authority resolved down there would be authority granted down there. So the two checks
+    # `perform` applies are applied here, to the actor that came through the door, and the answer
+    # travels as a list of row names. A credential that cannot press Merge is never told to ask
+    # for it, and its "ok" would be refused by `perform` anyway if it were.
+    from beeverforge import actions as _actions
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import AskInput
+
+    try:
+        raw = await client.execute_workflow(
+            "AskWorkflow", AskInput(project=found.name, question=text,
+                                    can=list(_actions.proposable(by)),
+                                    thread=_thread_so_far(found.name, without=text)),
+            # A FRESH ID PER QUESTION (#167). This was `abs(hash(text)) % 10**8`, which reads as
+            # idempotency and is neither: Python's `hash` is salted per PROCESS, so the same
+            # question asked twice in one panel deduplicates against itself — the second asker
+            # silently receives the first one's answer — while the same question after a restart
+            # does not. A question is not idempotent spend (`maximum_attempts=1` says so one file
+            # over); two people asking the same thing deserve two answers.
+            id=f"beeverforge-ask-{found.name}-{uuid.uuid4().hex[:12]}",
+            task_queue=TASK_QUEUE,
+        )
+    except Exception:  # noqa: BLE001 — an answer path must degrade, never raise
+        log.exception("the tech-lead could not answer a question about %s", found.name)
+        return refused(FAILED, "I could not work that out just now.")
+
+    answer_text = str((raw or {}).get("text") or "")
+    suggestion = [s for s in (raw or {}).get("suggestion") or [] if s]
+    if not answer_text:
+        return refused(FAILED, "the tech-lead produced no answer — check the worker's logs.")
+    _remember(found.name, answer_text, factory=True,
+              suggestion=(str(suggestion[0]), str(suggestion[1])) if len(suggestion) >= 2
+              else None,
+              # THE INSTRUCTION RIDES WITH THE PROPOSAL (#170), or `adjust` stages a button that
+              # `perform` refuses for a missing required parameter — an approval that does nothing.
+              params={"instruction": str(suggestion[2])} if len(suggestion) >= 3 and suggestion[2]
+              else None)
+    return done(answer_text,
+                suggestion=suggestion or None,
+                # WHAT IT COST, on the Outcome the asker already reads (#167). Every other agent
+                # pass in this platform is priced; the one a person talks to was not.
+                spend=(raw or {}).get("spend") or None,
+                asked_by=by.id)
+
+
+#: How much of the thread rides along. A budget in CHARACTERS rather than turns, because a turn
+#: can be one word or a diagnosis — and token-efficiency is a promise, not a preference. Roughly
+#: six ordinary exchanges; `transcript.recent` is newest-biased inside it.
+_THREAD_BUDGET = 2400
+
+
+def _thread_so_far(project: str, *, without: str = "") -> str:
+    """The prior turns of this project's tech-lead conversation, rendered for the prompt (#168).
+
+    NEVER RAISES AND NEVER BLOCKS AN ANSWER. A thread that cannot be read is a poorer answer, not a
+    missing one — the same posture `_remember` takes one function down, for the same reason.
+
+    `without` drops the turn just recorded: the question is already in the prompt as the question,
+    and reading it back as history invites the model to answer it twice.
+    """
+    from beeverforge.memory import transcript
+
+    try:
+        turns = [t for t in transcript.of_messages(project, budget=_THREAD_BUDGET)
+                 if not (without and t.text == without)]
+        return transcript.render(turns, agent_name="tech-lead")
+    except Exception as exc:  # noqa: BLE001 — a thread we cannot read must not cost the answer
+        log.warning("could not read the tech-lead thread for %s (%s) — answering without it",
+                    project, str(exc)[:160])
+        return ""
+
+
+def _remember(project: str, text: str, *, by: Actor | None = None, factory: bool = False,
+              suggestion: tuple[str, str] | None = None,
+              params: dict[str, str] | None = None) -> None:
+    """Write one turn of the tech-lead thread into the panel's own message store (#123).
+
+    THE SAME STORE EVERYTHING ELSE THE FACTORY SAYS ALREADY USES — no new database, no new
+    retention to forget, nothing to provision, and the free deployment keeps its promise that
+    nothing is lost without a cloud. It is also what makes the thread ORDERED: both halves now
+    carry a timestamp from one clock, where before the browser held one half with no clock at all
+    and drew it after everything the server knew.
+
+    AND THE STAGED SUGGESTION TRAVELS WITH IT. That was the expensive half of the refresh: the
+    tech-lead ends an answer proposing one concrete action, the panel renders it as a button, and
+    the operator approves by pressing it. Held only in the tab, a refresh at that moment discarded
+    a decision the platform had just asked a human to make — a wait ending in nothing, which is the
+    one shape this platform is not allowed to have. The proposal now rides on the row as a token
+    and a payload, so the button is rebuilt from the store on any screen (`messages.staged`).
+
+    NEVER RAISES AND NEVER BLOCKS AN ANSWER. Losing the record of a question is a bad day; refusing
+    to answer it because the record failed is a worse one."""
+    import json
+
+    from beeverforge.memory import messages
+
+    try:
+        if not factory:
+            messages.told(project, text, by=str(by or ""), channel=project)
+            return
+        token = payload = ""
+        if suggestion:
+            token = messages.suggestion_token(suggestion[0], suggestion[1])
+            payload = json.dumps({"suggestion": list(suggestion[:2]),
+                                  "params": dict(params or {})})
+        messages.say(project, text, channel=project, token=token, payload=payload)
+    except Exception as exc:  # noqa: BLE001 — the conversation matters more than its transcript
+        log.warning("could not record a tech-lead turn for %s (%s) — the answer still went out",
+                    project, str(exc)[:160])
+
+
+# ── running what the tech-lead proposed — ONE implementation, two doors (#156) ───────────────────
+
+async def run_staged(*, project: str, by: Actor, token: str = "") -> Outcome:
+    """Perform the action the tech-lead staged, and retire the button — whoever accepted it.
+
+    THE DEFECT THAT MADE THIS A FUNCTION. The tech-lead ended an answer proposing `merge #101`; the
+    operator typed *"pode seguir"*; nothing happened. The proposal could only be accepted by
+    PRESSING it — so on the one screen where the platform itself asks a yes/no question, an answer
+    in words did not count. That is this repository's own rule inverted: a wait is a QUESTION, and
+    "a human who has decided in words has decided" is the sentence `floor_intents` exists for.
+
+    A SECOND COPY OF THIS SEQUENCE WOULD HAVE BEEN THE REAL MISTAKE. `perform` → `answer` → `say`
+    is three steps and every one of them matters: the first applies the scope and admin check to
+    the credential that ACCEPTED (not the one that composed), the second retires the button on
+    every screen, and the third puts the outcome in the thread. Written twice, the two doors drift
+    — which is the defect class this file already paid for on the product gate (#105).
+
+    `token` is the button's rule and the words path leaves it empty: pressing names WHICH proposal,
+    so a click on a stale page is refused rather than applied to the replacement; typing "yes"
+    means the one that is live, whatever it is, because that is what the person is looking at.
+    """
+    from beeverforge import actions
+    from beeverforge.memory import messages as channel
+    from beeverforge.observability.query import StoreUnreadable
+
+    try:
+        found = channel.staged(project)
+    except StoreUnreadable as exc:
+        # NEVER "the tech-lead is not proposing that". An outage that renders as a refusal blames
+        # a person for a decision nobody made — the rule `_readable_store` states for the routes.
+        log.error("the message store would not answer while checking %s's proposal: %s",
+                  project, exc)
+        return refused(UNAVAILABLE,
+                       "could not check what the tech-lead is proposing — the message store did "
+                       "not answer. Nothing was lost and nothing was done; try again.")
+    if found is None or (token and found[0].token != token):
+        return refused(CONFLICT,
+                       "that is not what the tech-lead is proposing now — reload the "
+                       "conversation. Nothing was done.")
+    message, why = found
+    if why:
+        return refused(CONFLICT, {
+            "answered": "somebody already ran that one — nothing was done again.",
+            "expired": "that suggestion is too old to press; ask the tech-lead again so it can "
+                       "look at the floor as it is now.",
+        }.get(why, f"that suggestion is no longer open ({why})."))
+    proposal = channel.read_suggestion(message)
+    if proposal is None:  # pragma: no cover — `staged` only returns rows that decode
+        return refused(CONFLICT, "that suggestion cannot be read any more")
+
+    # `**params` IS THE POINT OF THE THIRD SLOT (#170). A staged `adjust` without its instruction
+    # is `perform` refusing a required parameter — an approval that does nothing, which is the one
+    # failure shape a button must never have. `perform` type-checks whatever arrives, both
+    # directions, so this widens what can be PROPOSED and not what can be performed.
+    action, ref, params = proposal
+    outcome = await actions.perform(action, by=by, project=project, issue=ref, **params)
+    # THE DECISION IS RECORDED WHATEVER THE OUTCOME — it retires the button either way. A refusal
+    # is an answer, and a proposal somebody has pressed and been refused must not sit there
+    # inviting the same click. What went wrong travels in the thread beside it.
+    #
+    # WHO PRESSED IS THE ACTOR'S ID, or for an anonymous actor the name its credential is known by
+    # (`display`). Never `by.label`: that is what the caller said about itself, and recording it
+    # here wrote a shared token's label into the record as the person who pressed.
+    channel.answer(project, token=message.token, answer="approve", by=str(by.id or by.display))
+    channel.say(project, outcome.message, channel=project)
+    return Outcome(ok=outcome.ok, message=outcome.message, code=outcome.code,
+                   data={**dict(outcome.data), "token": message.token,
+                         "action": action, "issue": ref, "params": params})
+
+
+# ── diagnose — why is it parked, and what would move it ─────────────────────────────────────────
+
+async def _diagnose(*, project: str, issue: str, by: Actor) -> Outcome:
+    """The tech-lead's analysis of a parked job, produced on demand.
+
+    THE GAP THIS CLOSES. Diagnosing lived inside `activities._do_diagnose`, reachable only from the
+    impediment path a workflow takes on its way to parking — so the tech-lead could explain a
+    failure the moment it happened and never again. A human looking at a job that parked yesterday
+    had nowhere to ask, and that is precisely the layer humans were staffing by hand.
+
+    IT PUBLISHES NOTHING. The impediment path posts a ticket comment and a channel notice because
+    nobody is watching a job that just parked; an operator asking this IS watching, and a duplicate
+    comment per question is how a ticket becomes unreadable.
+
+    REFUSED WHEN THE JOB IS NOT PARKED, rather than answered anyway. Diagnosing a running job costs
+    an agent pass and a repository clone to explain a problem that does not exist yet.
+
+    RUN OFF THE EVENT LOOP: this clones a repository, shells out to `gh` and runs an agent process.
+    """
+    import asyncio
+
+    from beeverforge.contracts import handoff_to_plain
+    from beeverforge.runtime.temporal import view as tv
+
+    # ALIASED. Unaliased, this line SHADOWS the module-level `from beeverforge import namespace`,
+    # and the call below then reads identically whether the shadow is there or not — one of the two
+    # spellings raises `TypeError`. `_waiting_on_a_human` is where that cost a merge.
+    from beeverforge.runtime.temporal.connection import namespace as temporal_namespace
+    from beeverforge.techlead import diagnosis
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+
+    ref = str(issue).lstrip("#")
+    job = next((j for j in await tv.list_jobs(client, temporal_namespace())
+                if j.get("project") == found.name and str(j.get("issue")) == ref), None)
+    if job is None:
+        return refused(NOT_FOUND, f"no job for #{ref} on {found.name} — nothing to diagnose.")
+    act = job.get("action") or {}
+    if not (job.get("attention") or act.get("note") or act.get("decision")):
+        return refused(
+            CONFLICT,
+            f"#{ref} is not waiting on anybody — it is {job.get('state') or 'running'}. "
+            f"A diagnosis costs an agent pass and a checkout; ask when it parks.")
+
+    ho = await asyncio.to_thread(diagnosis.diagnose, found, issue=ref,
+                                 state=str(job.get("state") or ""),
+                                 note=str(act.get("note") or ""))
+    if ho is None:
+        return refused(
+            FAILED,
+            f"the tech-lead could not produce a readable diagnosis of #{ref}. The raw note still "
+            f"stands: {str(act.get('note') or '')[:200]}")
+    return done(handoff_to_plain(ho), issue=ref, headline=ho.headline, asked_by=by.id)
+
+
+# ── env — the onboarding round: PROPOSE, then verify, and write only on consent ─────────────────
+#
+# WHY THESE ROWS EXIST, in one sentence: everything this platform had before them VERIFIES what a
+# client already declared. `doctor` grades the machine, `conformance` grades the manifest, `box
+# prove` grades the box — three graders and nothing that PROPOSES. On a fifteen-year-old codebase
+# the hard part is not verifying the test command; it is finding it among four candidates, three of
+# which only work on one developer's laptop. There is an agent that can read a repository sitting
+# right there, and until now nothing pointed it at this question.
+#
+# WHY THEY ARE ROWS AND NOT JUST TYPER CODE (ADR-0039, ADR-0038). The panel is the reference
+# surface. A `beeverforge env` that existed only as CLI code would be the next capability reachable
+# from
+# exactly one place — the defect class this repository has shipped some twenty times — and the one
+# place would be a laptop, which is the machine that cannot answer the question. The CLI below is a
+# mapping onto these three rows and holds no logic of its own.
+#
+# WHAT THEY MAY NOT DO, and it is physical rather than a promise: nothing here touches the tracker,
+# the board, a branch or a pull request; `env_read` and `env_check` write not one byte anywhere;
+# and `env_apply` writes exactly one file, in the client's own checkout, only when a human passed
+# `yes`, and never over an existing file without `force`. A client whose hand-tuned
+# `.beeverforge/project.yaml` is destroyed by a helpful tool is a client who never runs that tool
+# again.
+
+#: What this platform is allowed to say about a value it proposes, strongest first. Same shape, and
+#: the same reading, as `product/brownfield.py`'s evidence tiers: an unrecognised confidence
+#: degrades DOWNWARD to `unknown`, never upward, because a mislabelled reading that claimed
+#: `observed` would borrow provenance it does not have.
+OBSERVED, INFERRED, UNKNOWN = "observed", "inferred", "unknown"
+_CONFIDENCE = (OBSERVED, INFERRED, UNKNOWN)
+
+#: A value a human typed in the room. Not a confidence the inference can produce — it is what
+#: `env_apply --set` records, and it outranks everything above because a person said it out loud.
+ANSWERED = "answered"
+
+
+def _measured_on(by: Actor) -> str:
+    """`worker` · `panel` · `local` — WHERE this answer was measured. Never omitted, never guessed.
+
+    A finding with no provenance is a finding about the wrong machine, and that is how a client
+    gets blamed for a Docker daemon that was fine: `doctor` runs `shutil.which` and `docker info`
+    on whatever laptop typed the command and then reports the verdict in the vocabulary of the
+    factory. Every row below carries this so a reader can tell the two apart.
+
+    Only `worker` is DETECTED, and it is detected from something this process actually did rather
+    than from an environment variable somebody has to remember to set: which registry file it read.
+    `/var/lib/beeverforge/registry.yaml` is the deployment's own mounted registry
+    (`LIVE_REGISTRY_PATH`),
+    so a process reading that file is running inside the deployment. The transport answers the
+    other two, because the panel knows it is the panel and a shell knows it is a shell."""
+    from beeverforge.registry import LIVE_REGISTRY_PATH, ProjectRegistry
+
+    if (by.via or "").strip().lower() == "panel":
+        return "panel"
+    if ProjectRegistry().path == LIVE_REGISTRY_PATH:
+        return "worker"
+    return "local"
+
+
+def _jsonable(value: object) -> object:
+    """A value any transport can carry — the panel serialises to JSON and the CLI prints.
+
+    The fallback is `str()` rather than a drop, because a value this function cannot classify is
+    still a value somebody proposed, and silently omitting it would take a field out of the report
+    that the inference had actually found."""
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
+def _declares(value: object) -> bool:
+    """Would writing this value into a manifest DECLARE anything? `None` and the empties do not.
+
+    THIS IS THE `None` / `[]` RULE ARRIVING AT THE FILE, and it took a measurement to see. The two
+    are different ANSWERS — `[]` is *we read the source and it installs nothing*, which is a real
+    reading with evidence behind it — but they are the same DECLARATION, which is none: every
+    manifest field this pass proposes already defaults to the empty container (`setup: []`,
+    `components: {}`, `validate: {}`), so a line carrying one changes no behaviour at all.
+
+    What it does change is the only signal anybody has that a human ever filled the file in.
+    `Manifest.declared_keys()` reports `model_fields_set`, and `doctor._manifest` reads exactly
+    that to tell "declares nothing — this project has no gates and a run with no gates reports
+    green having proven nothing" (`ok=False`) from "declares N of 31 settings" (`ok=True`).
+    Measured before this guard existed, on a one-stack repository with no readable CI:
+    `env apply --yes` wrote a manifest whose entire content was `components: {}`, exited 0, and
+    `doctor` then reported it `ok` as *"declares 2 of 31 settings"* — a file with no gates in it,
+    graded healthy, produced by us. The refusal that exists two branches below ("an empty manifest
+    LOADS, declares nothing, and is then reported as healthy, which is worse than no file at all")
+    never fired, because an empty container had been counted as a field.
+
+    The reading is NOT lost: the row stays in the report, in the YAML header, and in `skipped`
+    with its citation. Only the no-op line in the document goes. This is also what
+    `onboarding/infer.to_manifest_dict` already does for both fields — the sibling that writes the
+    same document by another route — so the two agree rather than differing by an accident.
+
+    A HUMAN'S OWN ANSWER IS EXEMPT (see the caller). This judges what the PLATFORM proposed; a
+    person who typed `--set setup=` said something, and overruling the person in the room is not
+    this function's business.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str | Mapping | list | tuple | set | frozenset):
+        return bool(value)  # 0 and False are values somebody set; "" and [] and {} are not
+    return True
+
+
+def _entry_point(thing: object, *names: str) -> tuple[object | None, str]:
+    """`(callable, "")` or `(None, what-it-does-export)` — how this layer asks another module.
+
+    THREE SHAPES, AND THE THIRD IS NOT HYPOTHETICAL. `beeverforge/onboarding/__init__.py` re-exports
+    its
+    own `infer` FUNCTION, which shadows the `infer` SUBMODULE on the package — so
+    `from beeverforge.onboarding import infer` hands back a function and `infer.propose` is an
+    `AttributeError`, measured. That is the same defect class as `getattr(bundle, "modules")` on a
+    field actually called `module_map`: it does not crash where you can see it, it crashes inside
+    a `try` and comes back as a sentence about the client's repository.
+
+    So the entry point is RESOLVED and a failure to resolve it NAMES what the module does export,
+    rather than sending the one person who does not yet know this system to read a two-thousand
+    line module hunting for a function name."""
+    import types
+
+    for name in names:
+        found = getattr(thing, name, None)
+        if callable(found):
+            return found, ""
+    if callable(thing) and not isinstance(thing, types.ModuleType):
+        return thing, ""
+    exports = ", ".join(n for n in dir(thing) if not n.startswith("_"))
+    return None, exports or "nothing public"
+
+
+def _cite(entry: object, get) -> str:
+    """Where a proposed value came from, as one string a human can go and open.
+
+    TWO SPELLINGS, both first-class. A plain `source` string is what the contract named; a list of
+    evidence objects with `path`/`line` is what the module that landed produces, and reading only
+    the first would have printed `(no source recorded)` under EVERY field of a proposal that cited
+    every one of them — a confident, wrong, and very calm report."""
+    direct = str(get("source", "") or "")
+    if direct:
+        return direct
+    raw = get("evidence", None)
+    if raw is None:
+        return ""
+    items = raw if isinstance(raw, list | tuple) else [raw]
+    out = []
+    for item in items[:3]:  # three citations is already more than anybody reads aloud
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        locator = getattr(item, "locator", None)
+        if isinstance(locator, str) and locator:
+            out.append(locator)
+            continue
+        pick = item.get if isinstance(item, Mapping) else (lambda k, _i=item: getattr(_i, k, None))
+        path, line = pick("path"), pick("line")
+        if path:
+            out.append(f"{path}:{line}" if line else str(path))
+    return ", ".join(out)
+
+
+def _row(name: str, entry: object) -> dict | None:
+    """One proposed field as a plain dict, or `None` when `entry` is not a proposed field at all.
+
+    A `confidence` is what makes an entry a proposal: without one there is no claim about how sure
+    the platform is, and printing the value anyway would give a guess the same weight as a
+    measurement in the one report a client's developers read out loud."""
+    get = entry.get if isinstance(entry, Mapping) else (lambda k, d=None: getattr(entry, k, d))
+    raw = get("confidence", None)
+    if raw is None:
+        return None
+    confidence = str(raw).strip().lower()
+    if confidence not in _CONFIDENCE:
+        confidence = UNKNOWN
+    # THE RUNNERS-UP ARE CARRIED, not dropped. On a legacy repository there are four candidate test
+    # commands and the interesting output is the list, not the winner: the developer in the room
+    # recognises theirs faster from a list of four than from one confident wrong line.
+    others = []
+    for alt in (get("candidates", None) or [])[1:4]:
+        pick = (alt.get if isinstance(alt, Mapping)
+                else (lambda k, d=None, _a=alt: getattr(_a, k, d)))
+        others.append({"value": _jsonable(pick("value", None)),
+                       "source": _cite(alt, pick), "why": str(pick("why", "") or "")})
+    return {
+        "name": name,
+        "value": _jsonable(get("value", None)),
+        "source": _cite(entry, get),
+        "confidence": confidence,
+        "note": str(get("note", "") or ""),
+        "candidates": others,
+    }
+
+
+#: What a proposal may also carry ABOUT ITSELF — coverage, and the questions it refuses to guess.
+#: Read tolerantly and never required: a proposal without them is a smaller answer, not a broken
+#: one. Every entry here exists because its ABSENCE would read as good news — "no unreadable
+#: directories" and "nobody looked" are the same silence.
+_PROPOSAL_EXTRAS = ("cannot_express", "questions", "ci_files_read", "ci_files_seen",
+                    "not_attempted", "unreadable_dirs", "files_walked", "truncated",
+                    # the preview's draft, tiers and all (#265 slice 4) — reported, never applied
+                    "preview")
+
+
+def _extras(proposal: object) -> dict:
+    out: dict[str, object] = {}
+    for name in _PROPOSAL_EXTRAS:
+        value = getattr(proposal, name, None)
+        if value is None and isinstance(proposal, Mapping):
+            value = proposal.get(name)
+        if value not in (None, [], ""):
+            out[name] = _jsonable(value)
+    return out
+
+
+def _proposed_rows(proposal: object) -> tuple[list[dict] | None, int]:
+    """`(rows, unreadable)` — the proposal flattened, or `(None, n)` when it could not be READ.
+
+    **`None` and `[]` are different answers and this is where the difference is most expensive.**
+    `[]` means the inference ran and proposed nothing, which is an honest thing to say about an
+    empty repository. `None` means `beeverforge.onboarding.infer` returned a shape this transport
+    does not
+    understand — and rendering that as an empty proposal would put a confident blank report in
+    front of a client's developers, which is the failure-looks-like-an-answer defect with an
+    audience. The caller refuses on `None`; it prints on `[]`.
+
+    `unreadable` counts entries that were present and not field-shaped. They are skipped rather
+    than fatal — a proposal object carrying its own metadata (`repo`, `commit`) alongside the
+    fields is a reasonable shape — but the count is returned so the report can SAY it skipped
+    something instead of quietly narrowing what the client is shown.
+    """
+    if proposal is None:
+        return None, 0
+    raw: object = proposal
+    for attr in ("fields", "proposed", "proposal"):
+        if hasattr(raw, attr):
+            raw = getattr(raw, attr)
+            break
+    else:
+        dump = getattr(raw, "model_dump", None)  # a pydantic proposal, flattened by its own rules
+        if callable(dump):
+            raw = dump()
+
+    if isinstance(raw, Mapping):
+        entries: list[tuple[str, object]] = [(str(k), v) for k, v in raw.items()]
+    elif isinstance(raw, list | tuple):
+        entries = [(str(_field_name(e) or f"field[{i}]"), e) for i, e in enumerate(raw)]
+    else:
+        return None, 0
+
+    rows, unreadable = [], 0
+    for name, entry in entries:
+        one = _row(name, entry)
+        if one is None:
+            unreadable += 1
+        else:
+            rows.append(one)
+    if not rows and unreadable:
+        # Every entry was unreadable: this is the "shape I do not understand" case, not an empty
+        # repository. Reporting it as an empty proposal is the exact lie this returns None to stop.
+        return None, unreadable
+    return rows, unreadable
+
+
+def _field_name(entry: object) -> str:
+    get = entry.get if isinstance(entry, Mapping) else (lambda k, d=None: getattr(entry, k, d))
+    return str(get("name", "") or get("field", "") or "")
+
+
+def repo_for(target: str) -> tuple[object | None, Path | None, Outcome | None]:
+    """`(project|None, checkout, None)` or `(None, None, refusal)` for a `<path|project>` handle.
+
+    THE INTERPRETATION IS RETURNED, NOT ASSUMED. A bare word is looked up in the registry first and
+    only then treated as a directory, and the caller prints which reading won — because "I read the
+    wrong repository" is a mistake that produces a plausible report, and a plausible wrong report
+    read aloud to a client's developers is worse than an error.
+
+    Every refusal here is a DISTINCT sentence, which is the whole lesson of `doctor.py`: a project
+    registered with a clone URL, a project whose `repo_path` points at a directory that does not
+    exist (`docs/ONBOARDING.md`'s `/work/myapp # placeholder`, which today raises a
+    `FileNotFoundError` at the client and reads as their fault) and a plain typo are three causes
+    that used to arrive as one traceback.
+
+    PUBLIC BECAUSE THE CLI SHARES IT. `beeverforge env context --ask` runs the harness on the
+    shell's own
+    machine — the panel process has no checkout and no sandbox — so it needs the resolved path
+    before it can call anything, and a second copy of this resolution in `cli.py` would mean the
+    same handle could read one repository through the panel and another through the terminal."""
+    from beeverforge.registry import ProjectRegistry
+
+    handle = (target or "").strip()
+    if not handle:
+        return None, None, refused(INVALID, "say which repository — a path, or a project name.")
+
+    registry = ProjectRegistry()
+    looks_like_path = handle.startswith(("/", ".", "~")) or "/" in handle or "\\" in handle
+    if not looks_like_path:
+        try:
+            project = registry.get(handle)
+        except KeyError:
+            project = None
+        if project is not None:
+            raw = str(project.repo_path)
+            if "://" in raw or raw.startswith("git@"):
+                return None, None, refused(
+                    INVALID,
+                    f"{handle} is registered as a clone URL ({raw}), not a checkout on disk. "
+                    f"`env read` reads a repository that is already here — clone it and pass the "
+                    f"path, e.g. `beeverforge env read ./{handle}`.")
+            checkout = Path(raw).expanduser()
+            if not checkout.is_dir():
+                return None, None, refused(
+                    NOT_FOUND,
+                    f"{handle} is registered with repo_path {raw!r} and there is no directory "
+                    f"there. Fix the registry entry (`beeverforge project add …`) or pass a "
+                    f"path directly — nothing was read.")
+            return project, checkout, None
+
+    checkout = Path(handle).expanduser()
+    if not checkout.is_dir():
+        known = ", ".join(p.name for p in registry.list()) or "none"
+        return None, None, refused(
+            NOT_FOUND,
+            f"{handle!r} is neither a directory on this machine nor a project this deployment "
+            f"knows (it knows: {known}) — nothing was read.")
+    return None, checkout.resolve(), None
+
+
+# ── the product role, on every transport ────────────────────────────────────────────────────────
+#
+# ADR-0038 says the panel is the reference surface and a channel is a transport; ADR-0040 records
+# the product owner settling where the product role belongs: *"the product role is available ON THE
+# PLATFORM, not in Slack"*. Both were TRUE AS DECISIONS AND FALSE AS CODE. Measured when #98 was
+# opened:
+#
+#     beeverforge/runtime/slack/product_channel.py     2,165 lines, 54 functions
+#     beeverforge/actions/catalog.py, product rows     0
+#     beeverforge/api/app.py, product routes           0
+#
+# So on a deployment without Slack the role swept and reconciled on a schedule and NOBODY COULD
+# TALK TO IT: no way to propose a requirement, accept it, drop it or ask it anything.
+#
+# THE LOGIC WAS NEVER THE PROBLEM, which is why these rows are thin. `beeverforge/product/module.py`
+# already holds every verb — `draft`, `propose`, `accept`, `drop`, `file_issues` — with its own
+# authorization, its own refusals and its own voice. The 2,165 lines in the Slack package are
+# THREADS, MENTIONS AND MESSAGE FORMATTING wrapped around them. What was missing was a second
+# transport, and ADR-0039 says exactly what that costs: one action, one implementation, N
+# transports.
+
+
+def _product_module(name: str, *, by: Actor | None = None):
+    """`(module, project, None)` or `(None, None, refusal)`.
+
+    The refusals are distinct on purpose. "No such project" and "this project has no product role"
+    send different people to fix different things, and a single False would start a support
+    conversation instead of ending one."""
+    project, bad = _project(name)
+    if bad:
+        return None, None, bad
+    cfg = getattr(project, "product", None)
+    if cfg is None or not getattr(cfg, "enabled", True):
+        return None, None, refused(
+            INVALID,
+            f"{name} has no product role enabled — there is nothing here to talk to. It is turned "
+            f"on in the project's registry entry (`product:`), together with the documentation "
+            f"repository it reasons over.")
+    try:
+        from beeverforge.product.module import ProductModule
+    except ImportError as exc:
+        from beeverforge.util.causes import first_message
+
+        return None, None, refused(
+            UNAVAILABLE,
+            f"this deployment has no product module ({first_message(exc, limit=120)}).")
+    # `via` IS THE TRUTH ABOUT WHERE THIS CAME FROM, and it is passed rather than defaulted
+    # because a default is somebody else's name (a chat vendor's until #266 slice 6, `api` now): a
+    # panel or CLI write recorded as another transport's is a lie in the only record that says
+    # who authorised a change to a client's requirements.
+    return ProductModule(project, via=getattr(by, "via", "") or "api"), project, None
+
+
+#: THE CODE EACH REFUSAL OF THE PRODUCT MODULE ANSWERS (#908). The keys are the module's closed
+#: vocabulary (`beeverforge.product.authoring.REFUSALS`), written here as words so this module does
+#: not import the product role on every front end's import path; the family test
+#: (`tests/test_every_refusal_a_product_write_names_answers_its_code_over_http.py`) holds the two
+#: equal. None is FAILED or UNAVAILABLE: a refusal is somebody's decision, never a breakage.
+_REFUSAL_CODE: Mapping[str, str] = {
+    "not_yours": DENIED,
+    "not_found": NOT_FOUND,
+    "not_waiting": CONFLICT,
+    "already_closed": CONFLICT,
+    "already_there": CONFLICT,
+    "not_valid": INVALID,
+}
+
+
+def _write_outcome(result, *, did: str, **data) -> Outcome:
+    """One `WriteResult` rendered as an Outcome, keeping ITS sentence rather than inventing one.
+
+    `product/voice.py` exists because these sentences are read by a client who was never meant to
+    edit a configuration file. A transport that replaced them with "operation failed" would throw
+    away the one thing this module spent a thousand lines getting right.
+
+    A REFUSAL IS NOT A FAILURE (#908). A not-ok result whose `refusal` names a word of the module's
+    vocabulary was declined on purpose — "not yours", "already closed" — and answers that word's
+    code (`_REFUSAL_CODE`: 403, 404, 409 or 400), with the module's word in `data["refusal"]`;
+    `data["reason"]` stays the code, so the public reasons list is unchanged. Until then every
+    not-ok result answered FAILED: measured on 620bb577, a stranger's `product_withdraw_card`
+    answered HTTP 500 with the module's own "only the person who asked for #1 … can close it".
+
+    Only a result nobody decided — `refusal` empty, absent (a worker older than the field), or a
+    word this panel does not know (a worker newer than it) — is a FAILURE: it is logged as
+    `BEEVERFORGE_PRODUCT_FAILURE_ANSWERED reference=…`, and the same reference travels in
+    `data["reference"]`. The sentence is the module's, unchanged; the reference is not in it."""
+    ok = bool(getattr(result, "ok", False))
+    detail = str(getattr(result, "detail", "") or "")
+    url = str(getattr(result, "url", "") or "")
+    ref = str(getattr(result, "ref", "") or "")
+    payload = dict(data, url=url, ref=ref, detail=detail,
+                   number=int(getattr(result, "number", 0) or 0),
+                   merged=bool(getattr(result, "merged", False)),
+                   existed=bool(getattr(result, "existed", False)))
+    if not ok:
+        said = detail or (f"could not {did}, and the module said nothing about why — which is "
+                          f"itself a defect worth reporting.")
+        return _not_done(said, _refusal_word(result), did=did, **payload)
+    # THE CLIENT READS `detail`; THE REF AND THE URL ARE FOR AN OPERATOR. `detail` is the sentence
+    # `product/voice.py` composed for somebody who was never meant to open a pull request — and it
+    # was arriving prefixed with a branch slug and a forge URL: "accepted requirement 12 —
+    # req/0012-fechamento-mensal (https://github.com/acme/…/pull/57). Pronto, escrevi…". Both
+    # already travel in `payload`, which is what a surface with an operator for a reader renders.
+    # The `did` line survives only when the module said nothing, because a silent success still
+    # has to say something happened.
+    return done(detail or f"{did}{f' — {ref}' if ref else ''}", **payload)
+
+
+def _refusal_word(result) -> str:
+    """The module's word for why `result` is not ok — off a `WriteResult` or off the dict the
+    worker hands back for one (`product_role_card`, `product_role_break_down`); `""` when it names
+    none, which is how a worker older than the word answers."""
+    if isinstance(result, Mapping):
+        return str(result.get("refusal", "") or "")
+    return str(getattr(result, "refusal", "") or "")
+
+
+def _not_done(said: str, why: str, *, did: str, **payload) -> Outcome:
+    """What a write the module did not make answers: the code of its refusal word, or a failure.
+
+    ONE MAPPING FOR EVERY ROW THAT RENDERS A WRITE (#908): `_write_outcome` for one result, and
+    `_none_done` for the rows that render a list of them — so a code is never chosen twice.
+
+    A word of `_REFUSAL_CODE` answers its code, with the word in `data["refusal"]`. No word, or a
+    word this panel does not know (a worker newer than it, logged), is a FAILURE: logged as
+    `BEEVERFORGE_PRODUCT_FAILURE_ANSWERED reference=…`, with the same reference in
+    `data["reference"]`. `said` is the module's sentence, unchanged; the reference is not in it."""
+    code = _REFUSAL_CODE.get(why)
+    # ONE `refused` PER CODE, each naming its constant: the action layer's reason guard
+    # (`tests/test_the_action_layer.py`) reads every row's codes off this source, and a code
+    # looked up at run time is one it cannot see.
+    if code == DENIED:
+        return refused(DENIED, said, **payload, refusal=why)
+    if code == NOT_FOUND:
+        return refused(NOT_FOUND, said, **payload, refusal=why)
+    if code == CONFLICT:
+        return refused(CONFLICT, said, **payload, refusal=why)
+    if code == INVALID:
+        return refused(INVALID, said, **payload, refusal=why)
+    if why:
+        # A WORD THIS PANEL DOES NOT KNOW — a worker newer than it, mid-upgrade. Read as
+        # nobody's decision rather than guessed at, and said, so the drift is seen.
+        log.error("BEEVERFORGE_PRODUCT_REFUSAL_UNKNOWN did=%s refusal=%r — answered as a "
+                  "failure; this panel knows %s", did, why, ", ".join(sorted(_REFUSAL_CODE)))
+    return _failed(said, did=did, **payload)
+
+
+def _failed(said: str, *, did: str, **payload) -> Outcome:
+    """A product write that was tried and did not happen, as `/api/act` answers it: 500 `failed`,
+    the sentence unchanged, and a reference that is in `data["reference"]` AND in the one line
+    logged here — `_not_done`'s failure arm, and a worker's answer that is not ok where no word can
+    travel (`product_baseline`), or that names no outcome (`product_answer`). FAILED only, so a
+    row that reaches this and not `_not_done` declares no refusal code it cannot answer.
+
+    A PREFIX OF ITS OWN, NOT `BEEVERFORGE_PRODUCT_WRITE_FAILED`: the module already logged that
+    line for the same write (`_could_not`, `act=…`), and whoever counts that prefix counts writes
+    that did not happen — on a647d604 each one counted twice (review of PR #970). This line is the
+    one a person's reference names, and the one to quote."""
+    reference = failure_reference()
+    log.error("BEEVERFORGE_PRODUCT_FAILURE_ANSWERED reference=%s did=%s project=%s ref=%s — %s",
+              reference, did, payload.get("project") or "-", payload.get("ref") or "-", said)
+    return refused(FAILED, said, **payload, reference=reference)
+
+
+def _none_done(results, said: str, *, did: str, **payload) -> Outcome:
+    """A row whose list of results holds not one that was made (`product_promote`,
+    `product_reorder`, `product_break_down`), answered through `_not_done`'s one mapping.
+
+    THE REFUSAL EVERY RESULT NAMES, OR A FAILURE (#908). Until then these rows answered FAILED
+    whenever nothing was done — measured on 620bb577, a stranger's promote and reorder, and a
+    breakdown whose every front the role declined, each answered HTTP 500. When every not-ok
+    result names the same word, that word is the answer. Mixed words, an untagged result, or no
+    result at all is nobody's single decision: a failure, with a reference.
+
+    Every result is read: each caller answers `done` first when any result was made (`if not
+    started`, `if not placed`, `if made: return`), so none reaches here. A filter for made results
+    was here and was dead code (review of 3a996b0a: its removal survived 1578 tests); a caller that
+    passes a made result gets a failure, never a refusal it did not mean."""
+    words = {_refusal_word(r) for r in results}
+    why = next(iter(words)) if len(words) == 1 else ""
+    return _not_done(said, why, did=did, **payload)
+
+
+async def _product_status(*, project: str, by: Actor) -> Outcome:
+    """Whether the product role can see its corpus at all, and where that was measured.
+
+    THE FIRST THING TO ASK ON A NEW DEPLOYMENT, and the one whose failure is silent everywhere
+    else: the documentation repository is private, so a missing credential makes every other verb
+    below answer "I can't see the requirements" while every test passes."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    health = await asyncio.to_thread(module.status_line)
+    available = await asyncio.to_thread(lambda: module.available)
+    ctx = await asyncio.to_thread(module.context)
+
+    from beeverforge.product.voice import corpus_state
+    # THE DIAGNOSIS IS THE TEAM'S, THE SENTENCE IS THE CLIENT'S — and until now this row handed
+    # `status_line` straight to whoever asked. Seen on the PO's own page, in both themes: "could
+    # not read `.beeverforge/product.yaml` in acme/dsk-context: could not check out acme/dsk-context
+    # (branch 'main')" — a repository slug, a file path and a branch name, in front of a business
+    # analyst who can act on none of them and now believes the product is broken.
+    # `voice.unavailable` already existed for exactly this, and it says the true thing: the role
+    # cannot see the requirements, so its answers would be guesses, and the team has been told.
+    # The diagnosis still travels, under `detail`, for a surface whose reader is an operator.
+    # BOTH BRANCHES, AND THE FIRST FIX ONLY DID ONE. `health()` is an operator's line in both
+    # states, not just when it fails: the healthy one reads "product module ready on
+    # acme/dsk-context — 12 requirements … 2 warnings" and carries `ProductLink.warnings`, which
+    # are English sentences about `.beeverforge/project.yaml`. Hiding the diagnosis only on the
+    # failing path left the slug in front of the client on every working day and made the guard
+    # pass — its fake answered `available=False`, so the arm that ships was never exercised.
+    corpus = getattr(ctx, "corpus", None)
+    requirements = list(getattr(corpus, "requirements", None) or ())
+    promises = list(getattr(corpus, "promises", lambda: ())() or ()) if corpus is not None else []
+    if not available:
+        log.warning("[%s] the product corpus is unreadable: %s", proj.name, str(health)[:400])
+    # WHEN THE PRODUCT'S KNOWLEDGE WAS LAST BROUGHT UP TO DATE, AND HOW (#1004): the record every
+    # pass leaves — the schedule's and an asked one's (`product_refresh`) — read as it stands. A
+    # client that asked for a refresh reads here when it finished, whether it degraded and why,
+    # and whether one is running now; a pass that failed or stopped is said, never left out.
+    from beeverforge.product import refresh as knowledge
+
+    refreshed = await asyncio.to_thread(knowledge.state, proj)
+    return done(corpus_state(available=bool(available), requirements=len(requirements),
+                             promises=len(promises), language=getattr(proj, "language", None)),
+                project=proj.name, available=bool(available),
+                requirements=len(requirements), accepted=len(promises),
+                knowledge=refreshed,
+                # THE OPERATOR'S LINE IS NOT LOST — it travels for a surface whose reader has a
+                # checkout, and a client-safe sentence that discarded the diagnosis would trade
+                # one bad outcome for nobody able to fix the thing.
+                detail=str(health or ""), measured_on=_measured_on(by))
+
+
+async def _product_requirements(*, project: str, by: Actor) -> Outcome:
+    """The corpus itself — every requirement, its number, title and status.
+
+    THE READ THE WRITES ALREADY ASSUMED. `product_accept` and `product_drop` take a NUMBER, and
+    until this row existed nothing on any transport could tell you what the numbers were: the
+    Slack channel knew, because it had posted them into a thread somebody could scroll back
+    through. On a surface without that history the only honest instruction was "type a number you
+    got from somewhere else", which is how a client accepts the wrong requirement.
+
+    `status` IS CARRIED VERBATIM, not reduced to a boolean. `proposed`, `accepted` and `observed`
+    are three different things — the third is a reading of the code that nobody has confirmed
+    (ADR-0019) — and a surface that showed two states would invite exactly the confirmation the
+    `observed` status exists to withhold.
+
+    READ-ONLY, so `needs_admin` is False: seeing what a client's product promises is not authority
+    to change it, and a business analyst who cannot list them cannot use the writes either.
+    """
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ctx = await asyncio.to_thread(module.context)
+    if not ctx.available:
+        return refused(UNAVAILABLE, ctx.reason or "the product corpus could not be read.",
+                       project=proj.name)
+    corpus = ctx.corpus
+    # WHAT THE LAST BREAKDOWN OF EACH LEFT OUT (#564), read beside the corpus: the reply that said
+    # it was a toast, and the row went on looking like everything had been filed. A ledger that
+    # cannot be read costs this column, never the list.
+    from beeverforge.product import unfiled
+
+    try:
+        left_out = await asyncio.to_thread(unfiled.open_fronts, proj)
+    except Exception:  # noqa: BLE001 — the list stands without it, and the log says why
+        log.warning("the fronts not filed for %s could not be read", proj.name, exc_info=True)
+        left_out = {}
+    # `came_from_the_code` IS THE SERVER'S VERDICT, sent so no surface derives its own (#182). It is
+    # the predicate `ProductModule.accept` decides on — an entry a baseline pass read off the code
+    # is accepted with NO work filed — and the page's confirm dialog says which of the two things
+    # a click will do from this field alone. A page that guessed from `status == "observed"` would
+    # agree today and drift the day the rule learns something the status does not say.
+    rows = [{"number": r.number, "title": r.title, "status": r.status, "slug": r.slug,
+             "asked_by": r.asked_by, "date": r.date, "path": r.path,
+             "has_decisions": bool(r.has_decisions), "affects": list(r.affects or ()),
+             "came_from_the_code": r.came_from_the_code,
+             "evidence": r.evidence, "observed_at": r.observed_at,
+             "unfiled": left_out.get(r.number, [])}
+            for r in sorted(corpus.requirements, key=lambda r: r.number)]
+    return done(corpus.summary(), project=proj.name, requirements=rows,
+                accepted=len(corpus.promises()), observed=len(corpus.observed()),
+                # THE CORPUS'S OWN COMPLAINTS travel with it. A requirement that contradicts
+                # another is a thing the person reading this list is the one who can settle.
+                findings=[{"level": f.level, "message": f.message, "path": getattr(f, "path", "")}
+                          for f in corpus.findings],
+                measured_on=_measured_on(by))
+
+
+#: How long one ingestion started from a row may read before it answers — inside a request a
+#: person is waiting on. What it did not reach is said, and the next scheduled pass reads it.
+PRODUCT_INGEST_SECONDS = 90
+
+
+async def _product_ingest(*, project: str, by: Actor, path: str = "") -> Outcome:
+    """Read the product's documents now: the file `path` alone — the EVENT "this file was added or
+    changed" (#269 slice 1) — or, with no path, whatever changed in the context repository since
+    the last pass, for as long as a request may wait.
+
+    THE DOOR THE UPLOAD WILL USE. #269 point 10 makes a panel upload the first way a document
+    arrives; the upload commits the file and then asks for exactly this. Until it exists, this is
+    how an operator, or a script after a push, says "read this one now" instead of waiting for the
+    schedule's next tick.
+
+    ADMIN ONLY: a pass writes the product's derived records and may spend a model's tokens on a
+    summary or an image, which is not a thing a reader of the product may start."""
+    import asyncio
+
+    from beeverforge.product.documents.ingest import ingest
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ctx = await asyncio.to_thread(module.context)
+    if not ctx.docs_path:
+        return refused(UNAVAILABLE, ctx.reason or "the context repository could not be checked "
+                                                  "out, so there is nothing to read yet.",
+                       project=proj.name)
+    wanted = [p for p in (path or "").split(",") if p.strip()]
+    # BROUGHT BY THIS PERSON: "a document was ingested" is said in their own conversation, the
+    # panel's for a panel actor; one with none (the CLI) is heard in the room — for a client's
+    # document only (`ingest._told_where`)
+    report = await asyncio.to_thread(
+        ingest, proj, root=Path(ctx.docs_path), commit=ctx.docs_commit,
+        paths=wanted or None, terms=[fact.term for fact in ctx.domain.live()],
+        conversation=str(getattr(by, "conversation", "") or ""),
+        budget_seconds=PRODUCT_INGEST_SECONDS)
+    if wanted and report.refused and not report.ingested and not report.unchanged:
+        return refused(INVALID, "; ".join(f"{p}: {why}" for p, why in report.refused),
+                       project=proj.name)
+    return done(report.sentence(), project=proj.name, ingested=report.ingested,
+                unreadable=[{"path": p, "reason": why} for p, why in report.unreadable],
+                unchanged=report.unchanged, removed=report.removed,
+                refused=[{"path": p, "reason": why} for p, why in report.refused],
+                left=report.left)
+
+
+
+async def _product_refresh(*, project: str, by: Actor) -> Outcome:
+    """Bring the product's knowledge up to date NOW (#1004): its documents read as the scheduled
+    pass reads them, and its search index brought up to them, to its requirements and to the board
+    of every registry project of the product (`product/refresh.py`) — so the next read of the
+    product's knowledge searches today's, without waiting for the schedule's tick.
+
+    IT ANSWERS AT ONCE, AND THE WORK RUNS ON THE WORKER. `product_ingest` reads inside the request
+    for up to `PRODUCT_INGEST_SECONDS`, and a caller whose own call is bounded tighter than that is
+    told the core is unreachable while the pass goes on. This row STARTS
+    `ProductKnowledgeRefreshWorkflow` and never awaits it: the answer says whether it started a pass
+    or joined one, and `product_status` says afterwards when it finished, how, and what it did not
+    bring up. `product_ingest` keeps its answer — a named file, read now and reported on, is what
+    its callers read it for.
+
+    ONE FLIGHT PER PRODUCT. The workflow's id is the product's (`refresh.workflow_id`), so the
+    engine refuses a second start while one runs, whichever registry project of the product it is
+    asked through, and this row answers that the ask joined it. One that has finished is started
+    afresh.
+
+    ADMIN ONLY, like `product_ingest`: a pass writes the product's derived records and may spend a
+    model's tokens on a summary. With no durable engine it is refused as unavailable — nothing was
+    started, so it is safe to ask again."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the pass runs on the worker; this resolved the project and its product role
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.product import refresh as knowledge
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import KnowledgeRefreshInput
+
+    try:
+        await client.start_workflow(
+            "ProductKnowledgeRefreshWorkflow", KnowledgeRefreshInput(project=proj.name),
+            id=knowledge.workflow_id(proj), task_queue=TASK_QUEUE,
+            execution_timeout=knowledge.FLIGHT_CEILING)
+        flight = knowledge.STARTED
+    except Exception as exc:  # noqa: BLE001 — a start the engine refused is said, never raised
+        if "AlreadyStarted" not in type(exc).__name__:
+            # THE REFERENCE IS IN THE LINE AND IN THE ANSWER (#908), as `perform`'s RAISED arm
+            reference = failure_reference()
+            log.exception("the knowledge refresh of %s could not be started reference=%s (%s)",
+                          proj.name, reference, exc)
+            return refused(FAILED, "the knowledge refresh could not be started just now.",
+                           project=proj.name, reference=reference)
+        flight = knowledge.JOINED
+    return done(knowledge.sentence_for(proj.name, flight), project=proj.name, refresh=flight,
+                knowledge=await asyncio.to_thread(knowledge.state, proj))
+
+async def _product_pending(*, project: str, by: Actor) -> Outcome:
+    """What the product role has STAGED and is waiting on a person for.
+
+    THE ONE THING NOTHING COULD ASK. `messages.pending` is reached from exactly one place —
+    `/api/inbox`, a route — so the panel could show a waiting proposal and no other surface could
+    even discover one existed. A client on the CLI had a proposal staged in their name, addressed
+    to them, with no way to find it: the silent wait this platform exists to make impossible,
+    inside the machinery built to prevent it.
+
+    IT READS THE DURABLE STORE, NOT `_PENDING`. The in-process dict belongs to whichever worker
+    staged the proposal; a panel or a CLI asking it would answer "nothing waiting" with perfect
+    confidence about the wrong process's memory. `remember()` mirrors every proposal into the
+    store precisely so the answer survives the process that produced it.
+
+    THE FILTER IS STRUCTURAL, and it has to be, because this is a scoped credential reading a
+    shared store. `messages.pending` returns every unanswered question the factory asked — the
+    tech-lead's impediments included — and a product credential must not see the floor's. The
+    discriminator is NOT the `key|fingerprint` token shape: that is a convention any caller of
+    `ask_to_confirm` could match by accident, and building an authorization boundary on a string
+    convention is how one becomes a leak. A staged proposal carries a FROZEN PAYLOAD, and `_thaw`
+    VALIDATES it against the entry models rather than pattern-matching — anything that does not
+    thaw into a proposal is, by construction, not one."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the corpus is not read here — what is staged is waiting, not written
+
+    from beeverforge.memory import messages
+    from beeverforge.product.staging import _thaw
+
+    try:
+        waiting = await asyncio.to_thread(messages.pending, proj.name)
+    except Exception:  # noqa: BLE001 — an unreadable store is an answer, not a crash
+        log.exception("could not read what is staged for %s", proj.name)
+        return refused(FAILED, "I could not read what is waiting just now.", project=proj.name)
+
+    rows = []
+    for q in waiting:
+        entry = _thaw(getattr(q, "payload", "") or "")
+        if entry is None:
+            continue
+        rows.append({
+            "token": q.token, "text": q.text, "since": q.ts,
+            # WHAT is waiting, not just that something is. "a drop" and "a decision" send the
+            # reader to different judgements, and a list that says neither makes them open each.
+            "kind": str(entry.get("kind") or "proposal"),
+            "number": entry.get("number"),
+            "approve": q.approve, "reject": q.reject,
+            "thread": q.token.partition("|")[0],
+        })
+
+    # THE CLIENT'S LANGUAGE, AND NO INTERNAL SLUGS. This answered "2 proposal(s) waiting on a
+    # person (accept, draft)" — English, in a thread whose every other line is the product's
+    # Portuguese voice, listing routing keys nobody outside this codebase has a meaning for. The
+    # kinds still travel in `pending` for a surface that wants to group by them.
+    from beeverforge.product.voice import waiting_on_you
+
+    return done(waiting_on_you(count=len(rows), language=getattr(proj, "language", None)),
+                project=proj.name, pending=rows, count=len(rows),
+                measured_on=_measured_on(by))
+
+
+#: How a staged proposal may be answered, and the third thing is never accepted. Named here rather
+#: than compared inline so the refusal can list them: a transport sending `"sim"` or `"true"` is
+#: telling us it does not know the vocabulary, and "that is not an answer" with the two words in it
+#: ends the support conversation instead of starting one.
+_ANSWERS = ("approve", "reject")
+
+
+async def _product_answer(*, project: str, token: str, answer: str, by: Actor,
+                          yes: object = False, message_id: str = "") -> Outcome:
+    """Answer a proposal the product role STAGED — the pair of `product_pending`.
+
+    `product_pending` lists what is waiting and hands back a token per row; this is what a person
+    does about it. Until now the only ways to answer were a Slack button, a typed "sim" in the
+    product channel, or the panel's own answer route — so a client who found a proposal from the
+    CLI, staged in their name and addressed to them, had no way to say yes to it. A list you can
+    read and cannot act on is the silent wait wearing a nicer shape.
+
+    IT RUNS ON THE WORKER, AND THAT IS NOT A COPY OF THE CHEAP SIBLING'S SHAPE. Seven of the nine
+    kinds are pure writes, but `accept` chains into the breakdown (an agent pass per unit of work)
+    and `align` ends in `_role().ask_json` — and WHICH KIND A TOKEN NAMES CANNOT BE KNOWN before
+    the entry is read, which only the compare-and-swap that performs it may do. So the process is
+    chosen by the worst case: answering in-process would run an agent on somebody's laptop, or in
+    the panel's container, which carries the harness binary and no credential for it.
+
+    THE CONSENT IS ASKED FOR EVEN THOUGH THE ANSWER IS THE CONSENT, and the reason is that the
+    answer is not always yes-shaped to the caller. A transport spells this `answer=approve`; the
+    thing on the other side of it is a requirement entering a client's corpus, a card leaving
+    their board or money being spent. Every other row that writes says so out loud, and one that
+    quietly did not would be the exception a script reaches for.
+
+    AUTHORISATION IS NOT RE-IMPLEMENTED HERE. `answer_staged` gates it — an approval needs
+    `may_act`, a rejection allows the requester too — and names the outcome, which is what makes
+    the refusal a code instead of a sentence somebody compares.
+    """
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the act runs on the worker; this resolved the project and the product role
+
+    # CONSENT BEFORE THE PAYLOAD, like `product_propose` two rows down. The order is not cosmetic:
+    # it is what makes "refused for the wrong reason" impossible to mistake for the consent gate
+    # working — a caller sending a malformed answer with no `yes` hears about the `yes`, which is
+    # the thing standing between them and a write in a client's repository.
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was answered: this performs what was staged — which can be a requirement "
+            f"entering {proj.name}'s corpus, a card leaving their board, or work being queued. "
+            f"Send `yes` to confirm. Read it first with `product_pending`.", project=proj.name)
+    tok = (token or "").strip()
+    if not tok:
+        return refused(
+            INVALID,
+            "which proposal — the `token` is missing. `product_pending` lists what is waiting and "
+            "carries one per row.", project=proj.name)
+    said = (answer or "").strip().lower()
+    if said not in _ANSWERS:
+        return refused(
+            INVALID,
+            f"a staged proposal is answered with {' or '.join(_ANSWERS)}, not {answer!r} — a "
+            f"question with two buttons cannot be answered with a third thing. Nothing was "
+            f"recorded.", project=proj.name)
+    # THE CLICK'S OWN ID, the page's (#402): the answer is recorded as the reply to it, so the
+    # page that drew the answer finds it in the transcript by identity and draws it once. Held to
+    # the shape `product_say` holds a message id to — it travels into a record and a workflow.
+    minted = str(message_id or "").strip()
+    if minted and not _MESSAGE_ID.match(minted):
+        return refused(INVALID, "a message id is 8 to 128 letters, digits, '-' or '_'.",
+                       project=proj.name)
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductAnswerInput
+
+    # KEYED BY THE TOKEN, which already carries the conversation AND the fingerprint of exactly
+    # what was staged. Two people answering the same proposal collide on purpose — the second gets
+    # the first one's result rather than performing it twice — while a replacement, having a
+    # different fingerprint, is a different workflow.
+    answering = f"beeverforge-product-answer-{proj.name}-{_workflow_safe(tok)}"
+    try:
+        raw = await client.execute_workflow(
+            "ProductAnswerWorkflow",
+            ProductAnswerInput(project=proj.name, token=tok, approved=(said == "approve"),
+                               actor=by.id, via=getattr(by, "via", "") or "",
+                               message_id=minted),
+            id=answering, task_queue=TASK_QUEUE)
+    except WorkflowAlreadyStartedError:
+        # THE COLLISION ABOVE WAS PROMISED AND NEVER KEPT (#456). The engine does not hand a second
+        # start the running execution's result: it refuses the start. That refusal fell into the
+        # generic branch below, so a second answer while the first was still running — a double
+        # click, two tabs, the CLI beside the page, for up to the answer's 12-minute bound — was
+        # told "nothing was performed" as an HTTP 500, while the first answer was performing it
+        # (measured on the live bed, 2026-10-01). Waiting on THE SAME execution makes the second
+        # answer read exactly what the first one reads, and performs nothing a second time.
+        try:
+            raw = await client.get_workflow_handle(answering).result()
+        except Exception as exc:  # noqa: BLE001 — a write path must report, never raise
+            # STILL NOT "NOTHING WAS PERFORMED": the earlier answer holds the proposal and may
+            # have performed it. A conflict with an answer already given, and where to look.
+            log.warning("a second answer to %s could not read the first one's outcome (%s)",
+                        answering, exc)
+            return refused(
+                CONFLICT,
+                "That proposal was already being answered when this answer arrived, so this one "
+                "was not performed a second time. The earlier answer's reply goes to whoever gave "
+                "it, and `product_pending` stops listing the proposal once it is taken; one still "
+                "listed can be answered again.", project=proj.name)
+    except Exception as exc:  # noqa: BLE001 — a write path must report, never raise
+        # THE EXCEPTION DOES NOT GO IN THE SENTENCE: a Temporal timeout rendered to a client is
+        # the same leak a repo slug would be. THE REFERENCE IS IN THE LINE AND THE ANSWER, as on
+        # every other write row: this one performs a requirement entering the corpus or a card
+        # leaving the board, and answered its engine's failure with no reference (review of
+        # 2b58340a: 500 `failed`, `data={"project", "reason"}`).
+        reference = failure_reference()
+        log.exception("the staged proposal could not be answered for %s reference=%s (%s)",
+                      proj.name, reference, exc)
+        return refused(FAILED, "I could not answer that just now, and nothing was performed.",
+                       project=proj.name, reference=reference)
+
+    raw = raw or {}
+    from beeverforge.product.voice import strip_markup
+
+    outcome = str(raw.get("outcome") or "")
+    # STRIPPED, LIKE EVERY OTHER PRODUCT ROW. These sentences are written for a chat client and
+    # carry `**bold**`; `Outcome.message` forbids markup, and the panel renders it as asterisks.
+    text = strip_markup(str(raw.get("message") or ""))
+    if outcome == "unauthorized":
+        return refused(DENIED, text, project=proj.name)
+    if outcome in ("gone", "replaced", "expired"):
+        # CONFLICT, NOT FAILED. Nothing is wrong with the request: the proposal was answered
+        # already, or replaced by a newer one, or aged out. The caller re-reads `product_pending`.
+        return refused(CONFLICT, text, project=proj.name)
+    if not outcome:
+        # NOBODY'S DECISION: the worker answered and named no outcome. A failure with a reference
+        # its own line names (review of 2b58340a: it answered 500 with none and logged nothing).
+        return _failed("I could not tell what happened to that proposal, so treat it as "
+                       "unanswered and look again.", did="answer the staged proposal",
+                       project=proj.name)
+    return done(text, project=proj.name, token=tok, answer=said, outcome=outcome)
+
+
+def _workflow_safe(token: str) -> str:
+    """A workflow id fragment from a proposal token. `key|fingerprint` carries a Slack channel id
+    and a hex digest, but the key is caller-supplied — so anything outside the safe set becomes
+    `-` rather than travelling into an id, and the length is capped."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", token)[:120]
+
+
+async def _product_triage(*, project: str, by: Actor) -> Outcome:
+    """Read the board and report what is wrong with it. Writes NOTHING.
+
+    ONE OF NINE INTENTS THAT ALREADY HAD A ROW, AND ONE OF FOUR THAT DID NOT. `_run_intent`'s
+    dispatch predates the action layer, so "faz a triagem do board" reached `module.triage_board`
+    through the Slack handler and through nothing else — the same client asking on the panel got
+    conversation. This is the row that closes it, and it is a READ: ADR-0019's first-pass rule
+    holds, because on request or on a schedule this role has the least context exactly when it is
+    asked to look at everything at once.
+
+    THE PROSE IS `voice.triage_report`, NOT A SECOND COPY. The channel composes the same sentence
+    from the same function; a row that wrote its own would drift from it by the second release,
+    and the client would learn that the answer depends on where they asked."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    report, error = await asyncio.to_thread(module.triage_board)
+    if report is None:
+        # THE DIAGNOSIS IS OPERATOR PROSE — English, with a repo slug in it. The log keeps it
+        # whole; the caller hears that the problem is ours, which is the channel's own rule.
+        log.warning("[%s] triage could not read the board: %s", proj.name, str(error)[:400])
+        return refused(UNAVAILABLE, "I could not read the board just now.", project=proj.name)
+
+    from beeverforge.product.voice import strip_markup, triage_report
+
+    cfg = getattr(proj, "product", None)
+    # PLAIN, BECAUSE `Outcome.message` SAYS SO. `triage_report` writes for a person reading a chat
+    # client, where `**7**` is the difference between a report and a wall of numbers — and this
+    # layer forbids markup in as many words, because a message pre-decorated for Slack renders as
+    # literal asterisks in the panel. One prose, two renderings; the row strips at the boundary
+    # that states the rule.
+    text = strip_markup(triage_report(report, language=getattr(proj, "language", None),
+                                      agent_name=getattr(cfg, "agent_name", "") or ""))
+    observations = list(getattr(report, "observations", None) or ())
+    return done(text, project=proj.name, findings=len(observations),
+                observations=[{"kind": str(getattr(o, "kind", "") or ""),
+                               "ref": str(getattr(o, "ref", "") or ""),
+                               "detail": str(getattr(o, "detail", "") or "")}
+                              for o in observations],
+                measured_on=_measured_on(by))
+
+
+async def _product_baseline(*, project: str, by: Actor, yes: object = False) -> Outcome:
+    """The brownfield first pass: the whole codebase read and written up as OBSERVATIONS.
+
+    ADR-0019's shape — what the code DOES is observed, never agreed, until a person confirms it.
+    It opens a pull request on the client's documentation repo and stops there.
+
+    THIS ROW IS THE GATE, and that is not a style choice. `ProductModule.baseline` is on the
+    module's own documented list of four verbs that write WITHOUT checking `may_act`, whose header
+    says "THE YES IS ONE LAYER UP" — the channel was that layer and this row is the other one.
+    `needs_admin` alone would not do: the panel hands `admin=True` to everybody who got through
+    the door, so without the re-check any panel token opens a pull request on a client's
+    documentation with nobody on `product.admins` involved. It is the `product_release` shape, for
+    the same reason.
+
+    AND IT WAITS, RATHER THAN ANNOUNCING. The channel's version runs off-thread and posts the
+    result when it lands — correct there, where blocking a Socket Mode handler takes the channel
+    down for everyone, and it already carries a named failure for when the announcement never
+    arrives (`BEEVERFORGE_PRODUCT_BASELINE_UNANNOUNCED`: the work happened, the pull request may
+    exist,
+    and nobody was told). A row has no such constraint and no such channel: the caller waits, like
+    `product_say`, and the answer is the return value. Nothing to deliver is nothing to lose.
+
+    IDEMPOTENT WHERE IT COUNTS. `propose_baseline` asks the forge whether the branch already
+    carries an open proposal and reports `existed` instead of writing a second one — which is what
+    makes the workflow's bounded retry safe."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the pass runs on the worker; this resolved the project and the product role
+
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"this reads {proj.name}'s whole codebase through an agent and opens a pull request on "
+            f"its documentation repository — it spends real money and writes. Send `yes` to "
+            f"confirm.", project=proj.name)
+
+    import asyncio
+
+    from beeverforge.product.module import may_act, unauthorized_message
+
+    via = getattr(by, "via", "") or "api"
+    if not await asyncio.to_thread(lambda: may_act(proj, by.id, via=via)):
+        return refused(DENIED, unauthorized_message(proj), project=proj.name)
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductBaselineInput
+
+    try:
+        raw = await client.execute_workflow(
+            "ProductBaselineWorkflow",
+            ProductBaselineInput(project=proj.name, actor=by.id, via=via),
+            id=f"beeverforge-product-baseline-{proj.name}", task_queue=TASK_QUEUE)
+    except Exception as exc:  # noqa: BLE001 — a write path must report, never raise
+        # THE REFERENCE IS IN THE LINE AND IN THE ANSWER (#908), as `perform`'s RAISED arm: this is
+        # where the module raising on the worker lands — on a647d604 a 500 with no reference
+        reference = failure_reference()
+        log.exception("the baseline pass could not run for %s reference=%s (%s)", proj.name,
+                      reference, exc)
+        return refused(FAILED, "I could not run the first pass just now.", project=proj.name,
+                       reference=reference)
+
+    raw = raw or {}
+    from beeverforge.product.voice import strip_markup
+
+    # THE SENTENCE COMES FROM THE WORKER, NOT FROM `_write_outcome`. `voice.baseline_done` runs the
+    # failure detail through `client_safe_detail` and deliberately drops the pull request URL; the
+    # generic helper interpolates both, which is the difference between a client-safe line and a
+    # stack trace with a link in it.
+    text = strip_markup(str(raw.get("text") or ""))
+    if not raw.get("ok"):
+        # nobody's decision — the code copy unreadable, the survey drafted nothing (#908)
+        return _failed(text or "the first pass did not finish.", did="run the first pass",
+                       project=proj.name)
+    return done(text, project=proj.name, existed=bool(raw.get("existed")),
+                url=str(raw.get("url") or ""), ref=str(raw.get("ref") or ""),
+                measured_on=_measured_on(by))
+
+
+async def _product_needs_action(*, project: str, by: Actor, limit: object = 10) -> Outcome:
+    """What is parked and WHOSE problem it is — the real classification, not a proxy.
+
+    It reads the diagnosis the tech-lead already left on each ticket and decides whether the
+    REQUIREMENT is what is wrong or somebody else's work is. Two agents conversing with no human
+    in the loop is where two mistakes compound with nobody owning the result, so this reads and
+    reports and touches nothing: `review_needs_action` hardcodes `may_act=False` at both return
+    sites, and every decision it produces is an observation.
+
+    IT DISPATCHES TO THE WORKER, AND `product_triage` NEXT DOOR DOES NOT — the two look like the
+    same kind of read and are not. `triage_board` is a board read plus deterministic
+    classification and costs nothing; this composes a git worktree of both repositories and then
+    spends ONE MODEL CALL PER PARKED TICKET. Answering it in-process would run an agent inside
+    the panel container, which carries the harness binary and neither its token nor the docker
+    socket — a failure that passes every test here and appears only in production.
+
+    NOT ADMIN-GATED, like `product_queue`: looking is not acting. What bounds it is `limit`, which
+    is a BUDGET rather than a page size — it is what stands between a board with three hundred
+    parked tickets and three hundred model calls."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the pass runs on the worker; this resolved the project and the product role
+    try:
+        want = max(1, min(50, int(str(limit).strip() or 10)))
+    except ValueError:
+        return refused(INVALID, f"{limit!r} is not a number of parked tickets to look at.")
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductNeedsActionInput
+
+    try:
+        raw = await client.execute_workflow(
+            "ProductNeedsActionWorkflow",
+            ProductNeedsActionInput(project=proj.name, limit=want,
+                                    via=getattr(by, "via", "") or ""),
+            id=f"beeverforge-product-needs-action-{proj.name}-{want}", task_queue=TASK_QUEUE)
+    except Exception as exc:  # noqa: BLE001 — a reading path must degrade, never raise
+        # THE EXCEPTION DOES NOT GO IN THE SENTENCE. `log.exception` above keeps it whole, and a
+        # Temporal timeout or a connection error rendered to a client is the same defect this
+        # session already closed one row over — the class does not care that the text came from
+        # an engine rather than from a repo slug.
+        log.exception("the product role could not review what is parked for %s (%s)",
+                      proj.name, exc)
+        return refused(FAILED, "I could not work that out just now.", project=proj.name)
+
+    raw = raw or {}
+    if not raw.get("ok"):
+        # the operator's diagnosis stayed on the worker, in the log — this says whose fault it is
+        return refused(UNAVAILABLE, "I could not look at what is parked just now.",
+                       project=proj.name)
+
+    from beeverforge.product.voice import strip_markup
+
+    return done(strip_markup(str(raw.get("text") or "")), project=proj.name,
+                mine=raw.get("mine", 0), theirs=raw.get("theirs", 0),
+                decisions=list(raw.get("decisions") or ()),
+                measured_on=_measured_on(by))
+
+
+async def _product_announce(*, project: str, by: Actor) -> Outcome:
+    """The role arrives and says where things stand — the sentence a channel gets on joining.
+
+    READ-ONLY and cheap, which is why it is worth having: it is the shortest proof a deployment
+    can run that the product role is configured, sees its corpus and can speak the client's
+    language, without spending an agent pass to find out."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    from beeverforge.product.voice import strip_markup
+
+    # `announcement()` writes `*O que eu faria primeiro:*` — emphasis for someone reading a chat
+    # client, and literal asterisks in the panel. Same boundary as `product_triage`.
+    text = await asyncio.to_thread(module.introduce)
+    return done(strip_markup(str(text or "")), project=proj.name, measured_on=_measured_on(by))
+
+
+def _conversation_key(thread: str, by: Actor) -> tuple[str, Outcome | None]:
+    """The conversation a product turn belongs to — ONE rule for `ask`, `say` and `thread`.
+
+    The thread the caller named, else the actor's own (`Actor.conversation`, #33 slice 3); and a
+    refusal when the name is somebody else's private key — `product/conversation.py` says why that
+    is the one name no argument may carry, and measured what it reached before this existed.
+    Refused BEFORE the engine is asked: a workflow that has already recorded the turn under her
+    key has done the harm the refusal exists to prevent."""
+    from beeverforge.product.conversation import key_for
+    key = key_for(named=thread, own=getattr(by, "conversation", "") or "")
+    if key is None:
+        return "", refused(DENIED, "that conversation is one person's alone — name the project's "
+                                   "room, or nothing for your own.")
+    return key, None
+
+
+#: How many of the product's transcript rows the list of a person's conversations reads — more than
+#: a turn's window (`transcript.SCAN_ROWS`), because a conversation a person left last week must
+#: still be in the list they come back to.
+SESSION_SCAN = 5000
+
+
+def _session_title(text: str) -> str:
+    """A conversation's title: its first line, without the role's handle, cut at a word near 60
+    characters. The first thing a person asked is what they will look for it by — and no model is
+    asked for it, so a title costs nothing."""
+    import re
+
+    first = next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+    first = re.sub(r"(^|\s)@(po|product)\b[,:]?\s*", " ", first, flags=re.I).strip()
+    if len(first) <= 60:
+        return first
+    cut = first[:60].rsplit(" ", 1)[0]
+    return (cut or first[:60]).rstrip(" ,.;:") + "…"
+
+
+async def _product_sessions(*, project: str, by: Actor) -> Outcome:
+    """Your conversations with the product role: the project's room, and each of your own (#335).
+
+    THE PAGE IS A LIST OF CONVERSATIONS, LIKE EVERY CHAT A PERSON ALREADY USES: the room pinned
+    at the top, shared, and below it every private conversation of the person asking — each with
+    its title (the first thing they asked), when it last moved and how many turns it holds. Read
+    from the transcript the turns are recorded in, under the owner rule every private read has
+    (`product/conversation.py::owner_of`): a person is listed their own conversations and nobody
+    else's, whatever this is asked with. A caller the panel could not key has no private
+    conversations to list — the room is still theirs to read."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    from beeverforge.memory import transcript
+    from beeverforge.product.conversation import is_private, owner_of, session_of
+
+    own = str(getattr(by, "conversation", "") or "").strip()
+    try:
+        found, _full = transcript.rows(proj, limit=SESSION_SCAN)
+    except Exception as exc:  # noqa: BLE001 — said, and the page keeps its room
+        log.warning("[%s] could not read the conversations to list them (%s)", proj.name, exc)
+        return refused(UNAVAILABLE, "I could not read your conversations just now — the room "
+                                    "is still here; try the list again in a moment.")
+    room = proj.name
+    room_last: dict = {}
+    sessions: dict[str, dict] = {}
+    # OLDEST FIRST, whatever the store handed back: a title is the FIRST thing asked
+    for row in sorted(found, key=lambda r: str(r.get("ts", "") or "")):
+        key = str(row.get("ticket", "") or "")
+        extra = row.get("extra") or {}
+        text = str(extra.get("text", "") or "").strip()
+        ts = str(row.get("ts", "") or "")
+        role = str(row.get("role", "") or "") or "person"
+        if not text:
+            continue  # an erased line: its conversation was deleted
+        if key == room:
+            room_last = {"ts": ts, "text": text[:160], "role": role}
+            continue
+        if not own or not is_private(key) or owner_of(key) != own:
+            continue
+        item = sessions.setdefault(key, {"session": session_of(key), "title": "", "turns": 0,
+                                         "first_ts": ts, "last_ts": ts, "last": ""})
+        item["turns"] += 1
+        item["last_ts"] = ts
+        item["last"] = text[:160]
+        if not item["title"] and role != "agent" and text:
+            item["title"] = _session_title(text)
+    listed = sorted(sessions.values(), key=lambda it: it["last_ts"], reverse=True)
+    # THE NAMES THE PERSON GAVE, over the first question (`product/sessions.py`)
+    from beeverforge.product.key import product_key
+    from beeverforge.product.sessions import titles
+
+    named = titles(product_key(proj), own) if own else {}
+    for item in listed:
+        item["named"] = bool(named.get(item["session"]))
+        item["title"] = named.get(item["session"]) or item["title"] or "Untitled conversation"
+    agent = getattr(getattr(proj, "product", None), "agent_name", "") or ""
+    return done(f"{len(listed)} conversation(s) of yours with the product role",
+                room={"key": room, **room_last}, sessions=listed, keyed=bool(own), agent=agent)
+
+
+def _listed(value: object) -> list[str]:
+    """A list a caller handed as a list or as comma-separated words — ids, never parsed further."""
+    if value in (None, "", [], ()):
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    return [str(i).strip() for i in items if str(i).strip()]
+
+
+def _own_conversation(by: Actor, session: str) -> tuple[str, Outcome | None]:
+    """The caller's OWN private conversation named `session` ("" — their first one), or why not:
+    a room is nobody's to rename or delete, a caller the panel could not key has none, and a
+    session id is the server's shape or nothing (`conversation.session_key`)."""
+    from beeverforge.product.conversation import is_private, session_key
+
+    own = str(getattr(by, "conversation", "") or "").strip()
+    if not is_private(own):
+        return "", refused(DENIED, "only a person this panel identified has conversations of "
+                                   "their own — the project's room is everybody's")
+    session = str(session or "").strip().lower()
+    if not session:
+        return own, None
+    key = session_key(own, session)
+    if key is None:
+        return "", refused(INVALID, "that is not a conversation of yours this page can name.")
+    return key, None
+
+
+async def _product_session_rename(*, project: str, by: Actor, session: str = "",
+                                  title: str = "") -> Outcome:
+    """Name one of your conversations, the way every chat lets you (#335) — or clear the name,
+    and it is titled by its first question again. Yours only: the room is everybody's."""
+    import asyncio
+
+    _module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    conversation, why = _own_conversation(by, session)
+    if why:
+        return why
+    from beeverforge.product.conversation import owner_of, session_of
+    from beeverforge.product.key import product_key
+    from beeverforge.product.sessions import rename
+
+    try:
+        name = await asyncio.to_thread(rename, product_key(proj), owner_of(conversation),
+                                       session_of(conversation), title)
+    except Exception as exc:  # noqa: BLE001 — said, never a stack trace on the page
+        log.warning("[%s] could not name a conversation (%s)", proj.name, exc)
+        return refused(UNAVAILABLE, "I could not keep that name just now — try again.")
+    return done(f"named “{name}”" if name else "the name was cleared",
+                session=session_of(conversation), title=name)
+
+
+async def _product_session_delete(*, project: str, by: Actor, session: str = "") -> Outcome:
+    """Delete one of your conversations — ERASED, not hidden (`product/sessions.py`): what you
+    said in it leaves the transcript, the product's memory and its index, and the role never reads
+    it again. What it already became in the product — a requirement, a decision, a card — stays,
+    and the answer says so. Yours only: the room is everybody's and nobody deletes it."""
+    import asyncio
+
+    _module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    conversation, why = _own_conversation(by, session)
+    if why:
+        return why
+    from beeverforge.product.conversation import session_of
+    from beeverforge.product.sessions import delete
+    from beeverforge.util.filelock import Waited
+
+    try:
+        gone = await asyncio.to_thread(delete, proj, conversation=conversation)
+    except Waited:
+        return refused(UNAVAILABLE, "the product's memory is busy writing — nothing is reported "
+                                    "deleted until it is; try again in a moment.")
+    except Exception as exc:  # noqa: BLE001 — said, never a stack trace on the page
+        log.warning("[%s] could not delete a conversation (%s)", proj.name, exc)
+        return refused(UNAVAILABLE, "I could not delete that conversation just now, and nothing "
+                                    "is reported deleted — try again.")
+    said = ("deleted: what you said in it is erased and the role will not read it again. What it "
+            "already became in the product — a requirement, a decision, a card — stays.")
+    if not gone.complete:
+        said += (" Older lines may lie beyond what one read reaches; ask an operator to "
+                 "confirm the rest.")
+    return done(said, session=session_of(conversation), lines=gone.lines,
+                complete=gone.complete)
+
+
+async def _product_file_attachment(*, project: str, by: Actor, attachment: str,
+                                   room: object = False, session: str = "") -> Outcome:
+    """File a file sent in one of your conversations into the product's documents (#336): it is
+    committed to `from-chat/` in the context repository, read at once, and from then on the role
+    finds it in every conversation — it is the product's.
+
+    A WRITE, SO WHOSE YES WRITES DECIDES: a product admin's (`may_act`), as for a requirement or a
+    card. The file must be one sent in the conversation the page names — the room or one of the
+    person's own — found there by the rule every read of a file has."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    from beeverforge.api.product_chat import conversation_for
+    from beeverforge.product import attachments as files
+    from beeverforge.product.key import product_key
+    from beeverforge.product.module import may_act
+
+    if not may_act(proj, by.id, via=getattr(by, "via", "") or "api"):
+        return refused(DENIED, "filing a document writes to the product's context repository, and "
+                               "that is a product admin's to do — ask one to file it.")
+    asked_room = str(room).strip().lower() in ("1", "true", "yes")
+    conversation, why = conversation_for(by, proj, {"room": asked_room, "session": session})
+    if not conversation:
+        return refused(DENIED, why)
+    key = product_key(proj)
+    found = files.find(key, conversation=conversation, ident=attachment)
+    data = files.data_of(key, found) if found else None
+    if found is None or data is None:
+        return refused(NOT_FOUND, "that file is not one sent in this conversation.")
+    already = next((f["filed"] for f in files.listed_in(key, conversation)
+                    if f["id"] == found.id and f["filed"]), "")
+    if already:
+        return done(f"{found.name} is already the product's, at {already}.", path=already,
+                    filed=True)
+    written = await asyncio.to_thread(module.file_document, name=found.name, data=data,
+                                      brought_by=by.id, conversation=conversation)
+    if not written.ok or not written.ref:
+        return refused(UNAVAILABLE, written.detail or "the document could not be filed just now.")
+    files.mark_filed(key, found.id, written.ref)
+    # READ AT ONCE, from a checkout that holds the commit just made: the role finds it in the next
+    # turn of any conversation, and the conversation it was brought from is told it was read
+    from beeverforge.product.documents.ingest import ingest
+
+    ctx = await asyncio.to_thread(module.context, refresh=True)
+    read = ""
+    if ctx.docs_path:
+        report = await asyncio.to_thread(
+            ingest, proj, root=Path(ctx.docs_path), commit=ctx.docs_commit, paths=[written.ref],
+            terms=[fact.term for fact in ctx.domain.live()], conversation=conversation,
+            budget_seconds=PRODUCT_INGEST_SECONDS)
+        read = "" if written.ref in report.ingested else " It will be read on the next pass."
+    return done(f"{found.name} is the product's now, at {written.ref}.{read}", path=written.ref,
+                filed=True)
+
+
+async def _product_discard_attachment(*, project: str, by: Actor, attachment: str,
+                                      room: object = False, session: str = "") -> Outcome:
+    """Discard a file sent in one of your conversations (#336): it leaves the conversation — it
+    can no longer be opened there, and a message rebuilt from a queue no longer reaches it — and
+    its bytes are erased when no other conversation holds it. The message that carried it still
+    names it, and what the role already said of it stays; a file already filed stays the
+    product's.
+
+    YOURS IN YOUR OWN CONVERSATION; IN THE ROOM, AN ADMIN'S. The room is everybody's, so a file in
+    it is taken out only by a product admin, as filing one would be. The need follows the
+    conversation the row RESOLVES to (`product/conversation.py::is_room`), not the `room`
+    parameter: a caller with no conversation of its own reaches the project's room whatever it
+    passed, and needs a product admin there like anybody else."""
+    _module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    from beeverforge.api.product_chat import conversation_for
+    from beeverforge.product import attachments as files
+    from beeverforge.product.conversation import is_room
+    from beeverforge.product.key import product_key
+    from beeverforge.product.module import may_act
+
+    asked_room = str(room).strip().lower() in ("1", "true", "yes")
+    conversation, why = conversation_for(by, proj, {"room": asked_room, "session": session})
+    if not conversation:
+        return refused(DENIED, why)
+    if is_room(conversation) and not may_act(proj, by.id, via=getattr(by, "via", "") or "api"):
+        return refused(DENIED, "a file in the project's room is everybody's — a product admin "
+                               "takes it out.")
+    found = files.find(product_key(proj), conversation=conversation, ident=attachment)
+    if found is None or not files.discard(product_key(proj), conversation=conversation,
+                                          ident=found.id):
+        return refused(NOT_FOUND, "that file is not one sent in this conversation.")
+    return done(f"{found.name} was discarded from this conversation.", discarded=found.id)
+
+
+async def _product_thread(*, project: str, by: Actor, thread: str = "",
+                          before: str = "") -> Outcome:
+    """The recent turns of one conversation with the product role — the room, or your own.
+
+    WHAT MAKES THE ROOM A ROOM. The panel offered one box and kept what it said in the page:
+    reload, and the conversation the role still remembered was gone from the screen; and a room
+    every participant writes into is a mailbox until each of them can read what the others said.
+    This row is that read — the store the worker's turn records into (`memory/transcript.py`),
+    under the same key rule as `ask` and `say`, so a private conversation is reachable by its own
+    person and nobody else for the same reason, in the same line.
+
+    READ-ONLY and ungated, like every read of the product area: what the product promises is not
+    a secret from the channel it is discussed in. What it will not do is hand one person another's
+    private conversation — `_conversation_key` refuses that name before the store is asked."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    key, bad_key = _conversation_key(thread, by)
+    if bad_key:
+        return bad_key
+    from beeverforge.memory import transcript
+    from beeverforge.product.conversation import is_private
+    name = proj.name
+    # AN EMPTY KEY IS THE ROOM — the resolution the worker makes (`inp.thread or name`), made
+    # here too, so the CLI reads the conversation it writes into.
+    key = key or name
+    # THE PRODUCT'S MEMORY (ADR-0051 D2): the conversation as every registry project of this
+    # product holds it, rows from before the move included — the one the door's turns write to.
+    # EVERY LINE OF IT, the ones the room said to each other included (ADR-0051 D14): this SHOWS
+    # the conversation to the people in it, who saw them anyway — it builds no prompt. A PAGE AT A
+    # TIME, by the conversation's key (#566): it read the prompt's 6,000-character window, so the
+    # CLI showed the end of a conversation and nothing could reach the rest. `earlier` is the
+    # cursor of the page before this one, passed back as `before`.
+    turns, earlier = transcript.page(proj, thread=key, before=(before or "").strip())
+    agent = getattr(getattr(proj, "product", None), "agent_name", "") or "product"
+    rows = [{"role": t.role, "actor": agent if t.role == "agent" else (t.actor or ""),
+             "text": t.text, "ts": t.ts} for t in turns]
+    said = transcript.render(turns, agent_name=agent) or "nothing was said here yet."
+    if earlier:
+        said += f"\n\n(earlier turns: pass before={earlier})"
+    return done(said, thread=key, private=is_private(key), turns=rows, earlier=earlier)
+
+
+async def _product_agenda(*, project: str, by: Actor) -> Outcome:
+    """What waits on the person — the product role's open loops it is waiting FOR, the Pending tab
+    (#267 slice 3; ADR-0055 D11). What it OWES is not here: the person cannot act on a promise, so
+    it is one line on the card it is about (`_product_board`'s `owed`).
+
+    FILTERED LIKE THE CHAT, BY WHO IS ASKING (`product/agenda.py`): the room's items, and the
+    items of this person's own conversation — the one the credential names (`Actor.conversation`),
+    never one a caller passes, so there is no argument here that could name somebody else's. Each
+    item says what is owed or awaited and "you" or "the room", never a name. The CLI, which keys
+    no private conversation, sees the room's.
+
+    READ-ONLY, like every read of the product area."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    from beeverforge.memory import store as loop_store
+    from beeverforge.product import agenda, events
+
+    viewer = agenda.Viewer(own=getattr(by, "conversation", "") or "", person=by.id,
+                           may_read_room=by.may_enter(PRODUCT))
+    rows = await asyncio.to_thread(loop_store.read, proj.name)
+    # AND WHAT THE NEWEST IMPORT LEFT OPEN (#994), read from its record and the corpus as they are
+    # now: an item to ask each, the room's — never stored, so nothing here can go stale
+    try:
+        review = await asyncio.to_thread(module.import_under_review)
+    except Exception:  # noqa: BLE001 — the ledger's items stand without it, and the log says why
+        log.warning("the newest import of %s could not be read for its agenda", proj.name,
+                    exc_info=True)
+        review = None
+    # IN THE PROJECT'S LANGUAGE, AND SAYING WHAT IT IS (#401): a pt-BR product's person read
+    # "tell you when the problem reported is fixed · owed · you" under a tab nothing explained.
+    # `about` and `empty` are the panel's to draw; its own English is only the fallback.
+    from beeverforge.product.voice import agenda_about, agenda_empty
+
+    language = getattr(proj, "language", None)
+    found = [*agenda.pending(rows, viewer, room=events.room_of(proj), language=language),
+             *agenda.from_the_import(review, viewer, language=language)]
+    agent = getattr(getattr(proj, "product", None), "agent_name", "") or ""
+    return done(agenda.render(found, language=language), project=proj.name,
+                measured_on=_measured_on(by), items=[item.as_dict() for item in found],
+                about=agenda_about(agent_name=agent, language=language),
+                empty=agenda_empty(language))
+
+
+async def _product_cases(*, project: str, by: Actor, thread: str = "") -> Outcome:
+    """What is in progress in a conversation with the product role — the open intakes, typed
+    (#33 hole 7): what each person said, what the role asked back, what was drafted, what landed.
+
+    Reads stay ungated; a private conversation's cases come back only to its own person — the
+    same key rule as `product_thread` (`_conversation_key`)."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    key, bad_key = _conversation_key(thread, by)
+    if bad_key:
+        return bad_key
+    from beeverforge.product.case import open_cases, render_case
+    key = key or proj.name
+    cases = open_cases(proj, key)
+    rows = [{"id": c.id, "opened_by": c.opened_by, "kind": c.kind, "state": c.state,
+             "facts": list(c.facts), "asked": list(c.asked), "draft": dict(c.draft),
+             "result": dict(c.result), "note": c.note} for c in cases]
+    text = "\n\n".join(f"{c.opened_by}:\n{render_case(c)}" for c in cases)
+    return done(text or "nothing is in progress in this conversation.", thread=key, cases=rows)
+async def _product_recall(*, project: str, query: str, by: Actor) -> Outcome:
+    """What was said about something, anywhere in this project — by whom, where, when (#33 hole 3).
+
+    ONE READ OVER BOTH STORES: every conversation with the product role (every thread, every
+    person) and the factory's own channel — indexed per project, refreshed from what is new, and
+    forgetting what retention forgets. `product_thread` is one conversation; this is the project.
+
+    A PRIVATE CONVERSATION COMES BACK ONLY TO ITS OWN PERSON — the key #46 made the one control
+    over who reads a conversation is the same key here. Reads stay ungated otherwise.
+
+    AND WHAT A GROUP SAID TO SOMEBODY ELSE IS FOUND HERE (#266 slice 6, ADR-0051 D14): kept and
+    searchable is the promise, and this is the search. Each hit says whether it was addressed to
+    the role (`addressed`); no turn's prompt ever reads the ones that were not."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    asked = (query or "").strip()
+    if not asked:
+        return refused(INVALID, "say what to look for — a few words, a card number, a name.")
+    from beeverforge.memory import transcript
+    from beeverforge.memory.recall import recall, render_recall
+    from beeverforge.paths import project_memory_dir
+    own = getattr(by, "conversation", "") or ""
+    hits = recall(proj.name, asked, index_dir=project_memory_dir(proj), own=own,
+                  partition=transcript.partition(proj), overheard=True)
+    agent = getattr(getattr(proj, "product", None), "agent_name", "") or "product"
+    rows = [{"ts": h.said.ts, "where": h.said.where, "store": h.said.store, "role": h.said.role,
+             "actor": h.said.actor, "text": h.said.text, "score": round(h.score, 3),
+             "addressed": h.said.addressed}
+            for h in hits]
+    # THE OPERATOR ASKED, SO NAMES ARE THE ANSWER — the one caller that opts in (ADR-0051 D9)
+    return done(render_recall(hits, agent_name=agent, name_people=True)
+                or f"nothing in this project mentions {asked!r}.", hits=rows)
+
+
+#: A message id a transport mints itself — the shape the door's workflow id and a log line can
+#: carry. The door bounds its length (`door.MAX_ID`); this bounds what it may contain.
+_MESSAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
+
+#: How a caller says not to wait for the answer. The default WAITS, so only an explicit no leaves
+#: it — the reverse of `_said_yes`, for the same reason: a JSON "false" is a truthy string.
+_NO_WAIT = frozenset({"false", "no", "n", "0"})
+
+
+def _waits(wait: object) -> bool:
+    if wait is False:
+        return False
+    return not (isinstance(wait, str) and wait.strip().lower() in _NO_WAIT)
+
+
+def _names_the_role(mentioned: object) -> bool:
+    """Whether the caller says the message names the product role (#266 slice 6, ADR-0051 D14).
+
+    ONLY AN EXPLICIT NO LEAVES IT, the rule `_waits` has: calling the product role's own row IS
+    naming it — the CLI's `product say`, a script, a panel page that asks the role — and the one
+    caller that knows better is a room, whose transport detects the mention its own way and says
+    `false` for a message the people in it said to each other (`api/product_chat.py`)."""
+    return _waits(mentioned)
+
+
+async def _product_say(*, project: str, message: str = "", by: Actor, thread: str = "",
+                       context: object = None, message_id: str = "",
+                       wait: object = True, mentioned: object = None,
+                       attachments: object = None) -> Outcome:
+    """One message to the product role — THE ONE ROW, through THE ONE DOOR (#266 slices 2 and 3,
+    ADR-0051 D1, D12).
+
+    TWO ROWS WERE ONE CONVERSATION CUT IN HALF, AND THE CUT WAS THE DEFECT. `product_ask` — the
+    panel's one free-text box — answered and drafted and never settled, so a typed "sim" there
+    confirmed nothing and the draft needed a button of its own. This row, `product_say`, settled
+    and answered and never drafted, and no panel button, CLI verb or channel called it. A fourth
+    copy (`_say_as_an_intent`) routed four read-only intents through their rows before either
+    reached the worker. All of that is the turn engine now (`product/engine.py`), on the worker,
+    and this is the one row in front of it: a typed yes confirms what the panel staged, and every
+    intent the chat surface had reaches the panel too.
+
+    THROUGH THE DOOR, NOT A WORKFLOW OF ITS OWN (slice 3). The message goes onto its
+    conversation's queue (`product/door.py`): one turn at a time inside the conversation, many
+    conversations at once, the read-only asks answered beside a busy turn, and a turn past its
+    bound handed off with a promise. Then, unless told not to (`wait`, below), this row WAITS —
+    bounded — for the replies published for its own message id, which is how the CLI prints an
+    answer in one call. A wait that ends first returns the door's acknowledgement with `pending`:
+    the message is enqueued, and its answer lands in the conversation.
+
+    ANYONE MAY SPEAK; EVERY WRITE IS GATED WHERE IT HAPPENS. By the action layer's measure the row
+    writes nothing (`needs_admin=False`): whatever a message can lead to is staged for a yes that
+    `may_act` gates, or — the two declared exceptions of `product/intents.py`, a typed breakdown
+    and a typed refine — refused by `may_act` in the engine before anything runs. That list is the
+    deployment's own (`product.admins`), so a sentence reaches nothing the product's admins do not
+    allow, whatever credential carried it.
+
+    The message's id is minted here, so two people typing "sim" at once are two messages — a hash
+    of the words collided on exactly the message a confirmation is (ADR-0051 D1) — and a retry of
+    the same message is one. A transport that shows the conversation mints it itself
+    (`message_id`), so the page can put its own words on screen at once and know the answer to
+    them when it arrives; a retry of that send is the same message, deduplicated by the door.
+
+    THE PAGE IT WAS WRITTEN ON (#266 slice 5). `context` is what the panel says the person is
+    looking at — a page, its project, a card — ADMITTED here against the person, before the door:
+    a card of another project, or a card for a credential that may not read the board, is refused
+    with the message (`product/page.py::admit`). What passes reaches the turn as its current state.
+
+    `wait=false` IS THE PANEL'S CHAT (#266 slice 5): the row hands the message to the door and
+    returns its acknowledgement, and the answer reaches the page over the product socket as it is
+    published — nothing here, and nothing in the browser, asks for it again. The default waits,
+    for the CLI, which has nowhere else to print the answer.
+
+    WHO IT IS FOR (#266 slice 6, ADR-0051 D14). `mentioned` is what the transport detected: the
+    default — calling this row names the role — is what the CLI and every direct caller mean, and
+    the panel's room says `false` for a message that did not name the role. The door and the
+    conversation decide the rest (`product/addressing.py`): in a room, what is not addressed to
+    the role is kept and searchable, starts no turn and never reaches a prompt, and the row
+    returns the door's acknowledgement saying so (`state: overheard`).
+
+    WHAT COMES BACK: the answer's text as the message, and in `data` every reply the turn published
+    (`replies`, each with its kind), the door's acknowledgement (`acknowledged`), whether the answer
+    is still to come (`pending`) and — when the answer asks for a yes — the `token` and the two
+    labels, which is what `product_answer` takes to answer it by click."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    del module  # the turn runs on the worker; this resolved the project and the product role
+    said = (message or "").strip()
+    named_files = _listed(attachments)
+    if not said and not named_files:
+        return refused(INVALID, "say something to the product role — an empty message spends a "
+                                "pass finding that out.")
+
+    # THE CONVERSATION TRAVELS (#33): the key `_conversation_key` resolves — the thread the caller
+    # named, else the actor's own, else the project's room; never somebody else's private
+    # conversation, refused here before the door is asked.
+    key, bad_key = _conversation_key(thread, by)
+    if bad_key:
+        return bad_key
+    key = key or proj.name
+
+    # THE FILES IT CARRIES (#336), each one sent in THIS conversation — an id is not a key to
+    # somebody else's file
+    files: list[dict] = []
+    if named_files:
+        from beeverforge.product.attachments import resolve
+        from beeverforge.product.key import product_key
+
+        found, why = resolve(product_key(proj), conversation=key, idents=named_files)
+        if why:
+            return refused(INVALID, why)
+        files = [a.as_dict() for a in found]
+        said = said or " ".join(f"[{a.name}]" for a in found)
+
+    from beeverforge.product import page
+
+    # WHAT THE PERSON IS LOOKING AT, as far as they may: a card is a read of the board, and the
+    # board is the floor's (`product/page.py`)
+    looking, bad_page = page.admit(proj, context, may_read_board=by.may_enter(FLOOR))
+    if bad_page:
+        log.warning("DENIED_PAGE_CONTEXT %s by %s: %s", proj.name, by, bad_page)
+        return refused(DENIED, bad_page, project=proj.name)
+    minted = str(message_id or "").strip()
+    if minted and not _MESSAGE_ID.match(minted):
+        return refused(INVALID, "a message id is 8 to 128 letters, digits, '-' or '_'.")
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    import uuid
+
+    from beeverforge.product import door
+    from beeverforge.product.engine import Message
+
+    said_it = Message(id=minted or uuid.uuid4().hex, project=proj.name, conversation=key,
+                      speaker=by.id, text=said, via=getattr(by, "via", "") or "api",
+                      context=looking, mentions_role=_names_the_role(mentioned),
+                      attachments=tuple(files))
+    if not _waits(wait):
+        ack = await door.receive(said_it, project=proj, client=client)
+        if not ack.accepted:
+            log.error("the door refused a message for %s: %s", proj.name, ack.reason)
+            return refused(FAILED, ack.reason, project=proj.name)
+        return done(ack.text or "", project=proj.name, measured_on=_measured_on(by), thread=key,
+                    id=ack.id, state=ack.state, ahead=ack.ahead, duplicate=ack.duplicate,
+                    replies=[], acknowledged=ack.text, pending=True, asks=False, token="",
+                    approve="", reject="")
+    ack, replies = await door.converse(said_it, project=proj, client=client)
+    if not ack.accepted:
+        log.error("the door refused a message for %s: %s", proj.name, ack.reason)
+        return refused(FAILED, ack.reason, project=proj.name)
+    if replies is None:
+        # the wait ended first: the message is enqueued and its answer will be published — the
+        # acknowledgement is the honest thing to show until then
+        return done(ack.text or "", project=proj.name, measured_on=_measured_on(by), thread=key,
+                    replies=[], acknowledged=ack.text, pending=True, asks=False, token="",
+                    approve="", reject="")
+    answer = next((r for r in reversed(replies) if r.kind in ("answer", "handoff")), None)
+    options = answer.options if answer is not None else None
+    # a message the room kept (ADR-0051 D14) is answered by nobody: what the caller is shown is
+    # the door's word that it was kept, and how to ask the role instead
+    return done(answer.text if answer is not None else (ack.text or ""),
+                project=proj.name, measured_on=_measured_on(by), thread=key,
+                replies=[r.model_dump(mode="json") for r in replies], state=ack.state,
+                acknowledged=ack.text,
+                pending=answer is not None and answer.kind == "handoff",
+                asks=options is not None,
+                token=options.token if options else "",
+                approve=options.approve if options else "",
+                reject=options.reject if options else "")
+
+
+async def _waiting_on_a_human(project: str) -> list[dict] | None:
+    """The project's jobs parked at the merge gate — `[{issue, pr_url}]` — or None for "I could
+    not look".
+
+    THE SAME `action.kind` THE PANEL'S MERGE BUTTON READS, imported from the module that produces
+    it, so a sentence and a button can never disagree about which job is waiting.
+
+    THREE ANSWERS, NOT TWO, AND THE PILOT PAID FOR THE MISSING ONE (2026-08-16). `[]` and "the read
+    failed" used to be the same value, and this function then failed for a reason of its own: it
+    called `namespace()`, which at module scope is `beeverforge.namespace` — a MODULE. Every call
+    raised `TypeError`, the blanket `except` below turned it into "nothing is waiting", and the
+    operator's *"pode fazer o merge"* was handed to the tech-lead, which answered — correctly, for
+    a floor it was told was empty — that there was nothing for it to merge. A live pull request was
+    sitting at the gate the whole time, on screen, one button away.
+
+    So `None` is now its own answer and the caller must say it out loud. An unreadable floor is a
+    thing that happened; it is not a floor with nothing on it.
+    """
+    from beeverforge.runtime.temporal import view as tv
+
+    # ALIASED, NOT SHADOWED. `from …connection import namespace` would also work here — it is what
+    # `_diagnose` did — but only by re-binding a module-level name inside one function, which is
+    # exactly the arrangement that produced the defect above: the call reads as correct in both
+    # functions and is correct in only one of them.
+    from beeverforge.runtime.temporal.connection import namespace as temporal_namespace
+
+    try:
+        client, bad = await _connected()
+        if bad:
+            return None  # the engine is unreachable — say so; do not report an empty floor
+        return [{"issue": str(j.get("issue") or ""),
+                 "pr_url": ((j.get("action") or {}).get("pr_url") or "")}
+                for j in await tv.list_jobs(client, temporal_namespace())
+                if j.get("project") == project
+                and (j.get("action") or {}).get("kind") == tv.MERGE_WAIT
+                and j.get("issue")]
+    except Exception:  # noqa: BLE001 — an unreadable floor is not a ticket number
+        # EXCEPTION, AND AT WARNING. The previous line logged at INFO, which neither the panel nor
+        # the worker prints, and without a traceback — so a `TypeError` in this function's own body
+        # was invisible on both surfaces while the feature it gates did nothing at all.
+        log.exception("could not read which jobs await a human on %s", project)
+        return None
+
+
+async def _floor_say_as_an_intent(said: str, *, project: str, by: Actor) -> Outcome | None:
+    """The floor row a typed sentence asks for, performed — or None (#120).
+
+    THE SIBLING OF THE PRODUCT SIDE'S INTENT ROUTING — `_say_as_an_intent`, which #266 slice 2
+    folded into the product turn engine — and here for the reason that one existed: the pilot typed
+    *"pode fazer o merge"* to the tech-lead with the Merge button on screen, and was told merge is
+    "ação de humano, fora do que eu executo". `merge_policy: human` makes the DECISION a human's;
+    the EXECUTION is this catalogue's, and the button posts to the very row below. A human who has
+    decided in words has decided.
+
+    THROUGH `perform`, NEVER BY CALLING THE ROW — the scope and the admin check are applied to the
+    SAME actor that came through the door, so a product-scoped credential that cannot press the
+    button cannot type its way past it either. That is also why this lives here rather than on the
+    worker: `AskInput` carries a bare project and a string, and a gate built down there would be
+    inventing authority rather than checking it.
+
+    WHICH JOB, ASKED RATHER THAN ASSUMED. One waiting → that one. None → hand the sentence to the
+    tech-lead, who can say why nothing is waiting. More than one → say so and list them, because
+    merging the wrong pull request is not a mistake a rephrase can undo."""
+    from beeverforge.actions.floor_intents import FLOOR_ROWS, match_floor_intent
+
+    matched = match_floor_intent(said)
+    if not matched:
+        return None
+    intent, captures = matched
+    # A JOB THAT IS NOT AT A GATE IS NOT IN THE MERGE-WAIT LIST (#127). `stop` exists precisely for
+    # the job no gate can reach, so resolving it through "what is waiting on a human" would refuse
+    # every sentence it was written for. Its matcher REQUIRES a ref for the same reason the row is
+    # admin-gated — terminating is not undoable — so there is nothing here to disambiguate.
+    # `resume` AND `skip` JOIN IT (#159): the tech-lead's own diagnosis ends with "Reply
+    # `resume #NN`", and the panel chat — the reference surface — executed neither. A message
+    # dictating a command no matcher accepts is the defect with a number (#68/#120), and this
+    # time the platform was dictating it to itself.
+    if intent in ("stop", "resume", "skip"):
+        ref = str(captures.get("ref") or "").lstrip("#")
+        if not ref:  # pragma: no cover — the patterns cannot match without one
+            return None
+        from beeverforge import actions
+
+        outcome = await actions.perform(FLOOR_ROWS[intent], by=by, project=project, issue=ref)
+        return Outcome(ok=outcome.ok, message=outcome.message, code=outcome.code,
+                       data={**dict(outcome.data), "read_as": intent,
+                             "performed": FLOOR_ROWS[intent], "issue": ref})
+    row = FLOOR_ROWS.get(intent)
+    if row is None:  # pragma: no cover — the table and the matcher are one file apart
+        return None
+
+    waiting = await _waiting_on_a_human(project)
+    if waiting is None:
+        # THE INSTRUCTION IS NOT SWALLOWED. Falling through here hands a decided human an answer
+        # about what the tech-lead does and does not do, which reads as a refusal of the request
+        # rather than as what it is: we could not see the floor. The button is still there and
+        # still works, so the honest sentence names it.
+        return refused(
+            UNAVAILABLE,
+            f"I read that as `{intent}`, but I could not read the floor just now — so I will not "
+            f"guess at which job you meant. Try again in a moment, or use the {intent.title()} "
+            f"button on the panel, which acts on the same job.")
+    if not waiting:
+        return None  # nothing to act on; the tech-lead answers, and can explain why
+
+    # THE REF THE SENTENCE NAMES IS BINDING (sweep, 2026-08-16). It used to be dropped on the
+    # floor, which cost all three ways at once: "merge #90" merged whatever happened to be
+    # waiting; and with two PRs at the gate, the refusal below dictated the reply `merge #87` —
+    # whose ref the matcher then threw away, re-entering this same refusal for ever. Acting on a
+    # different job than the one named is worse than refusing.
+    wanted = str(captures.get("ref") or "").lstrip("#").lower()
+    if wanted:
+        hit = next((w for w in waiting
+                    if str(w["issue"]).lstrip("#").lower() == wanted), None)
+        if hit is None:
+            listed = ", ".join(f"#{w['issue']}" for w in waiting[:6])
+            return refused(
+                NOT_FOUND,
+                f"#{captures['ref']} is not waiting on you — waiting: {listed}. I will not "
+                f"{intent} a different job than the one you named.")
+        issue = hit["issue"]
+    elif len(waiting) > 1:
+        listed = ", ".join(f"#{w['issue']}" for w in waiting[:6])
+        return refused(
+            INVALID,
+            f"{len(waiting)} jobs are waiting on you ({listed}) — say which one, e.g. "
+            f"\"{intent} #{waiting[0]['issue']}\". Merging the wrong pull request is not "
+            "something a rephrase undoes.")
+    else:
+        issue = waiting[0]["issue"]
+    log.info("FLOOR_SAY_AS_INTENT project=%s intent=%s row=%s issue=%s by=%s",
+             project, intent, row, issue, by)
+    from beeverforge import actions
+
+    extra = {"instruction": captures["instruction"]} if intent == "adjust" else {}
+    outcome = await actions.perform(row, by=by, project=project, issue=issue, **extra)
+    # THE ROUTE TRAVELS WITH THE ANSWER, exactly as the product side does: a surface can then say
+    # "I read that as a merge" instead of leaving somebody wondering why a question about the
+    # board produced a merged pull request.
+    return Outcome(ok=outcome.ok, message=outcome.message, code=outcome.code,
+                   data={**dict(outcome.data), "read_as": intent, "performed": row,
+                         "issue": issue})
+
+
+async def _product_propose(*, project: str, by: Actor, answer: object = None,
+                           question: str = "", yes: object = False) -> Outcome:
+    """Record a drafted requirement as a pull request — the sign-off surface.
+
+    `answer` is a drafted `ProductAnswer`, handed straight back. Without it this REFUSES rather
+    than re-drafting: `propose` promises that what a human read is what gets committed, and a
+    transport that re-derived the text would break that promise silently, in the one artefact the
+    client is being asked to sign off.
+
+    NO ROW OF THE CORE HANDS ONE OUT SINCE #266 SLICE 2. `product_ask` returned the draft for this
+    row to commit; the conversation (`product_say`) now STAGES its own draft and performs it on a
+    yes — typed, or `product_answer` by token — so that one draft has one way to be written. This
+    row stays for a caller that holds a drafted answer of its own.
+
+    MERGING IS NOT ACCEPTING (ADR-0032). This lands the requirement as `proposed`; `product_accept`
+    is what turns it into a promise the factory argues from."""
+    import asyncio
+
+    from beeverforge.product.role import ProductAnswer
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            "nothing was written: proposing a requirement opens a pull request in the client's "
+            "documentation repository, so it needs `yes`. Read the draft first — that is what it "
+            "is for.")
+    if answer is None:
+        return refused(
+            INVALID,
+            "nothing was written: hand back the drafted `answer` you were shown. Re-drafting "
+            "from the same words produces a DIFFERENT text, and committing that would mean the "
+            "requirement signed off is not the one anybody read." + (
+                f" (In the conversation a request is drafted and staged for a yes: product_say "
+                f"project={project} message={question!r}, then answer it with product_answer.)"
+                if question else ""))
+    try:
+        parsed = ProductAnswer.model_validate(answer)
+    except Exception as exc:  # noqa: BLE001 — any transport may send any shape
+        from beeverforge.util.causes import first_message
+
+        return refused(
+            INVALID,
+            f"nothing was written: `answer` is not a drafted answer of the product role "
+            f"({first_message(exc, limit=160)}).")
+
+    if parsed.draft is None:
+        # EVERY FIELD OF `ProductAnswer` HAS A DEFAULT, so pydantic accepts `{"nope": 1}` and hands
+        # back a well-formed answer carrying nothing. Measured: it validated, reached `propose`,
+        # and came back in the client's voice — *"não consegui transformar isso num texto de
+        # requisito que se sustentasse"* — which blames the model for what is a malformed payload
+        # from the transport. Same shape as every other confusion in this file: a failure of ours
+        # wearing a claim about somebody else.
+        return refused(
+            INVALID,
+            "nothing was written: that answer carries no requirement draft. The product role only "
+            "drafts one when it reads the message as a REQUEST rather than a question. Ask for "
+            "the thing you want built.")
+
+    result = await asyncio.to_thread(
+        lambda: module.propose(parsed, actor=by.id, asked_by=by.id))
+    return _write_outcome(result, did="proposed the requirement", project=proj.name)
+
+
+async def _product_accept(*, project: str, number: str, by: Actor,
+                          yes: object = False) -> Outcome:
+    """Turn a written requirement into a PROMISE the factory defends (ADR-0032).
+
+    The single most consequential act on this surface: after it, the factory ARGUES FROM this
+    statement. Gated by an authorised person and one confirmation, exactly as the channel is.
+
+    AND THEN THE CARDS, which is the third of the card's own acceptance test — *"propose a
+    requirement, accept it and see the card born on the board"* — and was reachable only through
+    Slack. `ProductModule.accept` writes the agreement and stops; the accept→`break_down` chain
+    lived in `runtime/slack/product_channel.py` and nowhere else, so on a Slack-less deployment a
+    client could agree to something and no work would ever appear.
+    """
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    num, bad_num = _requirement_number(number)
+    if bad_num:
+        return bad_num
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was accepted: after this the factory argues FROM requirement {num}, and "
+            f"refuses work that contradicts it. That needs `yes`.")
+    result = await asyncio.to_thread(lambda: module.accept(num, actor=by.id))
+    accepted = _write_outcome(result, did=f"accepted requirement {num}", project=proj.name)
+    if not accepted.ok:
+        return accepted
+    if getattr(result, "nothing_to_build", False) is True:
+        return _with_nothing_to_build(accepted, project=proj, number=num)
+    from beeverforge.contracts.project import before_its_code
+
+    if before_its_code(proj):
+        return _with_the_breakdown_waiting(accepted, project=proj, number=num)
+    return await _with_the_work_filed(accepted, project=proj.name, number=num, by=by, proj=proj)
+
+
+# ── a product before its code (#992) ─────────────────────────────────────────────────────────
+
+def _refused_before_code(exc) -> Outcome:
+    """`product.before_code.Refused` in the action layer's words — its kind is one of three."""
+    from beeverforge.product import before_code
+
+    if exc.kind == before_code.CONFLICT:
+        return refused(CONFLICT, exc.message)
+    if exc.kind == before_code.UNAVAILABLE:
+        return refused(UNAVAILABLE, exc.message)
+    return refused(INVALID, exc.message)
+
+
+async def _product_start(*, project: str, docs_repo: str, by: Actor, provider: object = "",
+                         token_env: object = "", language: object = "") -> Outcome:
+    """Start a product before its code (#992): register `project` with its context repository and
+    no code repository — `product.before_code.start_before_code`, which says what that state is.
+
+    READ BACK, like a declared context (`product declare`): "registered" and "readable" are
+    different facts, and both credentials that will read the context are tried here, while
+    somebody is watching. An unreadable context is still REGISTERED (`reachable: false`): fixing
+    the access must not mean registering again, and running this again converges.
+
+    OFF THE LOOP: the read runs `git` against the context with each credential, which takes
+    seconds, and the panel serves every other request from the loop this runs on."""
+    import asyncio
+
+    from beeverforge.product import before_code
+
+    try:
+        got = await asyncio.to_thread(
+            before_code.start_before_code, project, docs_repo, provider=str(provider or ""),
+            token_env=str(token_env or ""), language=str(language or ""))
+    except before_code.Refused as exc:
+        return _refused_before_code(exc)
+    head = (f"{got.project} started before its code" if got.registered
+            else f"{got.project} had already started before its code")
+    where = f"its context repository is {got.docs_repo}" + (
+        " (created on this machine)" if got.created else "")
+    said = f"{head}: {where}, and it has no code repository yet."
+    if got.active:
+        said += (" Its product owner's conversation, its requirements and its context work now; "
+                 "breaking a requirement into cards waits for its first source "
+                 f"(`beeverforge product first-source {got.project} <repository>`).")
+    elif not got.reachable:
+        said += (f" The context could not be read: {got.why}. The registration stands — fix the "
+                 "access and nothing needs registering again.")
+    elif got.link == "conflict":
+        # NOT "WRITE THE DECLARATION": a context that names another product or already lists
+        # sources belongs to a product this one is not, and writing into it is the breach
+        said += f" The product role is off: {got.reason.rstrip('.')}."
+    else:
+        said += (f" The product role is not on yet: {got.reason.rstrip('.')}. `beeverforge "
+                 f"product init {got.project} --write` proposes the declaration it reads.")
+    return done(said, project=got.project, docs_repo=got.docs_repo, kind=got.kind,
+                registered=got.registered, created=got.created, reachable=got.reachable,
+                why=got.why, active=got.active, reason=got.reason, link=got.link)
+
+
+async def _product_first_source(*, project: str, repo_path: str, by: Actor,
+                                token_env: object = "", board_owner: object = "",
+                                board_number: object = "") -> Outcome:
+    """Give a product that started before its code its code repository (#992): the first entry of
+    `sources:` in its context, then the registry's `repo_path` and axes — and the breakdown needs no
+    other step. `product.before_code.first_source` says why in that order.
+
+    THE REQUIREMENTS THAT WAITED ARE NAMED, not broken down here: a breakdown is the product
+    owner's to ask for (ADR-0057 D3, `product-owner`), and this act is the operator's. Each one is
+    a single `product_break_down` away, and every acceptance from now on files its cards itself."""
+    import asyncio
+
+    from beeverforge.product import before_code
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    try:
+        got = await asyncio.to_thread(
+            before_code.first_source, found.name, repo_path, token_env=str(token_env or ""),
+            board_owner=str(board_owner or ""), board_number=str(board_number or ""))
+    except before_code.Refused as exc:
+        return _refused_before_code(exc)
+    listed = ("listed in `sources:` of" if got.listed_now else "already listed in `sources:` of")
+    said = (f"{got.project}'s first source is {got.entry}: {listed} {got.docs_repo}, and recorded "
+            f"as its code repository ({got.repo_path}). Breaking a requirement into cards needs "
+            "no other step now, and every acceptance files its own.")
+    if got.waiting:
+        numbers = ", ".join(str(n) for n in got.waiting)
+        said += (f" Accepted while it waited: {numbers} — ask for each to be broken down "
+                 f"(`beeverforge product break-down {got.project} <number> --yes`).")
+    return done(said, project=got.project, repo_path=got.repo_path, entry=got.entry,
+                docs_repo=got.docs_repo, listed_now=got.listed_now, waiting=list(got.waiting))
+
+
+def _with_the_breakdown_waiting(accepted: Outcome, *, project, number: int) -> Outcome:
+    """The acceptance on a product that started before its code (#992): the promise is recorded
+    and its breakdown waits for the code repository its cards would be worked in.
+
+    NO ENGINE IS CONNECTED TO, as for a reading of the code (#182): a breakdown that could file
+    nothing is not started, and the sentence is the product's own, in the project's language —
+    the one every door into a breakdown says (`voice.breakdown_waits_for_code`). `filed` is in the
+    data, empty, and `waits_for_code` is true, so a surface asks one key on every acceptance."""
+    from beeverforge.product.voice import breakdown_waits_for_code
+
+    data = {**accepted.data, "project": getattr(project, "name", ""), "number": number,
+            "filed": [], "nothing_to_build": False, "waits_for_code": True}
+    said = breakdown_waits_for_code(number=number, language=getattr(project, "language", None))
+    return done(f"{accepted.message} {said}", **data)
+
+
+def _with_nothing_to_build(accepted: Outcome, *, project, number: int) -> Outcome:
+    """The acceptance of a READING OF THE CODE: the promise is recorded and nothing is filed (#182).
+
+    A baseline pass reverse-engineers a codebase into `observed` entries, each describing something
+    the system already does, and the product page offers Accept on every one. Confirming that such
+    behaviour is intended ran the chain below like any other acceptance — a workflow on the worker,
+    an agent pass told to *"Break the requirement below into issues"*, where an empty answer is an
+    error and the only shapes on offer are "create it" and "already on the board". Found with 65
+    entries waiting for a yes.
+
+    THE MODULE DECIDED, FROM THE REQUIREMENT'S OWN DATA. `ProductModule.accept` sets
+    `nothing_to_build` from `Requirement.came_from_the_code` — the evidence the baseline wrote into
+    the file — and the conversation's executor reads the same field, so the two doors cannot
+    answer one requirement two ways. Nothing here asks who clicked or from where.
+
+    NO ENGINE IS CONNECTED TO, which is the point and not an optimisation: a start IS the spend.
+    `filed` is still in the data, empty, so a surface that renders the list renders none; and the
+    sentence is the product's own, in the project's language, because "nothing was filed" said
+    without its reason reads as the breakdown having failed.
+
+    THE WAY THROUGH STAYS OPEN: `product_break_down` files the work when a person asks for it —
+    the case of a text edited into more than the code does, which no field in the file can show.
+    """
+    from beeverforge.product.voice import nothing_to_build
+
+    data = {**accepted.data, "project": getattr(project, "name", ""), "number": number,
+            "filed": [], "nothing_to_build": True}
+    said = nothing_to_build(number=number, language=getattr(project, "language", None))
+    return done(f"{accepted.message} {said}", **data)
+
+
+async def _with_the_work_filed(accepted: Outcome, *, project: str, number: int,
+                               by: Actor, proj=None) -> Outcome:
+    """The acceptance, plus whatever the automatic breakdown produced.
+
+    THE BREAKDOWN MUST NEVER BE ABLE TO COST THE AGREEMENT — the channel's rule, kept verbatim
+    because it is right. The promise is already written and pushed when this runs, so every way
+    this can go wrong still ends with the client told plainly that the requirement is agreed.
+    That is why the whole thing sits under a catch-all, and why the failure sentence says WHAT
+    STILL HOLDS before it says what did not happen: the other order reads as "your acceptance
+    failed", about the one thing that certainly did not.
+
+    TWO SHAPES, AND THEY ARE DIFFERENT NEWS. Work filed → say what was filed. Nothing filed → say
+    so, say the agreement stands anyway, and offer the retry. Silence would leave a client
+    believing cards exist that do not.
+    """
+    filed: list[dict] = []
+    try:
+        # `asked_for=False`: nobody typed a request for this — it is the acceptance's own second
+        # act, and saying so is what lets the module refuse a reading of the code (#182).
+        filed = await _broken_down_on_the_worker(project=project, number=number, by=by,
+                                                 asked_for=False)
+    except _AlreadyBreakingDown as running:
+        data = {**accepted.data, "project": project, "number": number,
+                "filed": running.filed or [], "nothing_to_build": False, "running": True}
+        return done(f"{accepted.message} {_the_running_breakdown(number, running.filed)}",
+                    **data)
+    except Exception:  # noqa: BLE001 — the promise is written; this is a courtesy on top of it
+        # ERROR, UNDER ITS OWN CODE. This catch-all is wide enough to swallow a refactor: rename
+        # the workflow and every acceptance would go on answering politely that it filed nothing,
+        # for ever, while the client assumes the platform is merely busy. A guard pins the
+        # dispatch so a drift fails a build; this line is what makes the runtime version findable
+        # in one grep instead of inferred.
+        log.exception("BEEVERFORGE_PRODUCT_AUTOBREAK_FAILED project=%s req=%s — the acceptance "
+                      "stands "
+                      "and no work was filed", project, number)
+
+    # MERGED, NOT SPLATTED ALONGSIDE. `_write_outcome` already puts `project` and `number` in the
+    # acceptance's data, so passing them again as keywords is a TypeError on the first SUCCESSFUL
+    # acceptance — the one path a refusal test never reaches. Caught by running it.
+    # `nothing_to_build` IS ALWAYS IN THE DATA, False here, so a surface asks one key on every
+    # acceptance instead of learning that its absence means no (#182).
+    data = {**accepted.data, "project": project, "number": number, "filed": filed,
+            "nothing_to_build": False}
+    made = [r for r in filed if r.get("ok")]
+    if made:
+        # EVERY ROW, NOT ONLY THE ONES THAT LANDED (#564): what was not filed, and why, is said in
+        # the module's own sentence, the way the conversation says it
+        import asyncio
+
+        said = await asyncio.to_thread(_breakdown_said, proj, number, filed)
+        return done(f"{accepted.message} {said}", **data)
+    detail = next((r.get("detail") for r in filed if not r.get("ok") and r.get("detail")), "")
+    return done(f"{accepted.message} I could not turn it into units of work "
+                f"{f'({detail}) ' if detail else ''}— the agreement is recorded either way, and "
+                f"asking me to break it down will try again.", **data)
+
+
+def _breakdown_said(proj, number: int, filed: list[dict]) -> str:
+    """A breakdown's outcome as every surface says it — `confirm.breakdown_outcome`, the
+    conversation's own rendering, in the project's language and naming this board's backlog
+    (#564). The board's word is a courtesy: one that cannot be read leaves the platform's.
+
+    BLOCKING — IT ASKS THE BOARD (review of #580): on Jira and Azure the column's name is an HTTP
+    read, so the async doors call this in a thread, never on the event loop. `proj` is the
+    registry project the caller already holds; it was read again by name here."""
+    from beeverforge.product.confirm import breakdown_outcome
+    from beeverforge.util.causes import first_message
+
+    backlog = ""
+    try:
+        from beeverforge.adapters.board import build_board
+        from beeverforge.adapters.board.base import stage_column
+
+        board = build_board(proj)
+        backlog = stage_column(board, "backlog") if board is not None else ""
+    except Exception as exc:  # noqa: BLE001 — a column's name is a courtesy; the outcome is not
+        log.info("could not ask %s's board what it calls its backlog (%s) — the platform's word "
+                 "is said instead", getattr(proj, "name", ""), first_message(exc, limit=120))
+    return breakdown_outcome(filed, number=number, project=proj, backlog=backlog)
+
+
+async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
+                                     asked_for: bool) -> list[dict]:
+    """One requirement's breakdown, run where the agent runs — one row per card. RAISES when the
+    engine cannot be reached or the workflow fails, because its two callers owe different
+    sentences for that: an acceptance says the agreement stands, a request says nothing was filed.
+
+    ONE DISPATCH FOR BOTH DOORS, and `asked_for` is the only thing they send differently. The
+    workflow id is shared on purpose: an acceptance still breaking a requirement down and a person
+    asking for the same breakdown are one piece of work, and the engine refuses the second start
+    rather than filing every card twice."""
+    import asyncio
+
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductBreakdownInput, breakdown_workflow_id
+
+    client, bad = await _connected()
+    if bad:
+        raise RuntimeError(bad.message)
+    breaking = breakdown_workflow_id(project, number)
+    # TOLD WHERE THE REQUIREMENT WAS WRITTEN (#563 slice 18e, ADR-0051 D18 item 3): this door has no
+    # conversation, so the one the requirement was asked in hears what it filed, when its record
+    # names one; otherwise this door's own answer is all that is said, as before
+    conversation, room = await asyncio.to_thread(_where_it_was_written, project, number)
+    try:
+        return await client.execute_workflow(
+            "ProductBreakdownWorkflow",
+            ProductBreakdownInput(project=project, number=number, actor=by.id,
+                                  asked_for=asked_for, conversation=conversation, room=room),
+            id=breaking,
+            task_queue=TASK_QUEUE,
+        ) or []
+    except WorkflowAlreadyStartedError:
+        # THE REFUSAL THIS ID WAS SHARED FOR, SAID AS WHAT IT IS (#563, ADR-0051 D18). The engine
+        # does not hand a second start the running execution's result: it refuses the start, and
+        # both callers' catch-alls turned that into "nothing was filed" / "I could not turn it
+        # into units of work" while the first breakdown was filing the cards. This door files
+        # nothing and waits on THE SAME execution, as a second answer to a proposal does (#456).
+        log.info("BEEVERFORGE_PRODUCT_BREAKDOWN_RUNNING project=%s req=%s — another start of it "
+                 "is running; this one files nothing and reads its result", project, number)
+        try:
+            filed = await client.get_workflow_handle(breaking).result() or []
+        except Exception as exc:  # noqa: BLE001 — what it filed is on the board either way
+            log.warning("the running breakdown of %s req=%s could not be read (%s)", project,
+                        number, str(exc)[:200])
+            raise _AlreadyBreakingDown(None) from exc
+        raise _AlreadyBreakingDown(list(filed)) from None
+
+
+def _where_it_was_written(project: str, number: int) -> tuple[str, str]:
+    """`(conversation, room)` the requirement was asked in, from its delivery loop
+    (`breaking.written_from`) — `("", "")` when nothing names one, or the ledger cannot be read
+    (logged): the breakdown is filed either way, and only the telling is lost."""
+    from beeverforge.product import breaking
+    from beeverforge.product.events import room_of
+    from beeverforge.registry import ProjectRegistry
+
+    try:
+        proj = ProjectRegistry().get(project)
+        where = breaking.written_from(proj, number)
+    except Exception:  # noqa: BLE001 — the breakdown runs anyway; only the telling is lost
+        log.warning("where requirement %s of %s was written could not be read", number, project,
+                    exc_info=True)
+        return "", ""
+    return where, (where if where and where == room_of(proj) else "")
+
+
+class _AlreadyBreakingDown(Exception):
+    """A breakdown of the same requirement was already running when this door asked for one, and
+    this door filed nothing (#563). `filed` is what the running one filed, read off the same
+    execution — None when it could not be read."""
+
+    def __init__(self, filed: list[dict] | None) -> None:
+        super().__init__("a breakdown of this requirement was already running")
+        self.filed = filed
+
+
+def _the_running_breakdown(number: int, filed: list[dict] | None) -> str:
+    """What a door says when the breakdown it asked for was already running: that, and what it
+    filed — never "nothing was filed", which is what a person was told while the first one was
+    filing the cards (#563)."""
+    if filed is None:
+        return (f"A breakdown of requirement {number} was already running, so this did not start "
+                f"another; its cards will be on the board when it ends.")
+    made = [r for r in filed if r.get("ok")]
+    if made:
+        refs = ", ".join(r.get("ref") or r.get("url") or "?" for r in made)
+        return (f"A breakdown of requirement {number} was already running, so this did not start "
+                f"another; it filed {refs}. Starting any of it is still a person's decision.")
+    detail = next((r.get("detail") for r in filed if not r.get("ok") and r.get("detail")), "")
+    return (f"A breakdown of requirement {number} was already running, so this did not start "
+            f"another, and it filed nothing{f': {detail}' if detail else '.'}")
+
+
+async def _product_break_down(*, project: str, number: str, by: Actor,
+                              yes: object = False) -> Outcome:
+    """Turn one ACCEPTED requirement into units of work because a person asked for it (#182).
+
+    THE DOOR THE PAGE AND THE COMMAND LINE DID NOT HAVE. "Break requirement 7 into tasks" was a
+    sentence only the conversation could act on; everywhere else the breakdown happened as the
+    second act of an acceptance and at no other time. That was survivable while every acceptance
+    chained into it. It stopped being survivable the day an acceptance could rightly file nothing:
+    a requirement read off the code describes what is already built, so accepting it records the
+    promise and stops — and a person who then edits that text into something the product does not
+    do yet needs a way to say "now there is work", on whichever surface they are using. It is also
+    the retry the acceptance's own failure sentence has always promised.
+
+    A PERSON ASKING IS THE WHOLE DIFFERENCE, and it is sent as data: `asked_for=True` reaches
+    `ProductModule.break_down` on the worker, which files for a requirement that came from the
+    code only when it is told somebody wants it.
+
+    REFUSED HERE, BEFORE ANY ENGINE, for the three things that need no agent to find out: consent,
+    authority, and whether the number names a promise at all. Each would otherwise cost a workflow
+    start to be told no, and the last one in the module's own words — a proposal, a retired text
+    and an unconfirmed reading of the code are three different next steps (`_not_a_promise`).
+    """
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    num, bad_num = _requirement_number(number)
+    if bad_num:
+        return bad_num
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was filed: breaking requirement {num} down runs an agent and opens cards on "
+            f"{proj.name}'s board. That needs `yes`.", project=proj.name, number=num)
+
+    from beeverforge.product.module import _not_a_promise, may_act, unauthorized_message
+
+    via = getattr(by, "via", "") or "api"
+    if not await asyncio.to_thread(lambda: may_act(proj, by.id, via=via)):
+        return refused(DENIED, unauthorized_message(proj), project=proj.name, number=num)
+    ctx = await asyncio.to_thread(module.context)
+    if not ctx.available:
+        return refused(UNAVAILABLE, ctx.reason or "the product corpus could not be read.",
+                       project=proj.name, number=num)
+    requirement = ctx.corpus.by_number(num)
+    if requirement is None:
+        from beeverforge.product.voice import requirement_not_found
+
+        return refused(NOT_FOUND, requirement_not_found(
+            number=num, language=getattr(proj, "language", None)), project=proj.name, number=num)
+    if not requirement.is_promise:
+        return refused(INVALID, _not_a_promise(num, requirement), project=proj.name, number=num)
+
+    try:
+        filed = await _broken_down_on_the_worker(project=proj.name, number=num, by=by,
+                                                 asked_for=True)
+    except _AlreadyBreakingDown as running:
+        data = {"project": proj.name, "number": num, "filed": running.filed or [],
+                "running": True}
+        said = _the_running_breakdown(num, running.filed)
+        if running.filed is not None and not any(r.get("ok") for r in running.filed):
+            # THE RUNNING ONE FILED NOTHING: its fronts' one refusal, or a failure with a
+            # reference, through the same mapping as this row's own (#908; on a647d604 a 500
+            # with neither — review of PR #970)
+            return _none_done(running.filed, said, did="break the requirement down", **data)
+        return done(said, **data)
+    except Exception as exc:  # noqa: BLE001 — an engine that is down is an answer, not a crash
+        from beeverforge.util.causes import first_message
+
+        # the reference is in the line and in the answer (#908): on a647d604 neither had one
+        reference = failure_reference()
+        log.exception("BEEVERFORGE_PRODUCT_BREAKDOWN_FAILED reference=%s project=%s req=%s — a "
+                      "person asked for the breakdown and no work was filed", reference,
+                      proj.name, num)
+        return refused(FAILED, f"nothing was filed for requirement {num}: the breakdown runs on "
+                               f"the worker and it did not answer "
+                               f"({first_message(exc, limit=160)}). Asking again is safe.",
+                       project=proj.name, number=num, reference=reference)
+
+    data = {"project": proj.name, "number": num, "filed": filed}
+    made = [r for r in filed if r.get("ok")]
+    if made:
+        # THE SAME RENDERING AS THE ACCEPTANCE AND THE CONVERSATION (#564): a front not filed is
+        # named beside the ones that were, never dropped because another one landed
+        return done(await asyncio.to_thread(_breakdown_said, proj, num, filed), **data)
+    detail = next((r.get("detail") for r in filed if not r.get("ok") and r.get("detail")), "")
+    why = f": {detail}" if detail else " — the breakdown produced no unit of work"
+    return _none_done(filed, f"nothing was filed for requirement {num}{why.rstrip('.')}.",
+                      did="break the requirement down", **data)
+
+
+async def _product_drop(*, project: str, number: str, by: Actor, reason: str = "",
+                        yes: object = False) -> Outcome:
+    """Drop a proposed requirement, with the reason recorded beside it."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    num, bad_num = _requirement_number(number)
+    if bad_num:
+        return bad_num
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was dropped: requirement {num} stays as it is without "
+                                f"`yes`.")
+    result = await asyncio.to_thread(
+        lambda: module.drop(num, actor=by.id, reason=(reason or "").strip()))
+    return _write_outcome(result, did=f"dropped requirement {num}", project=proj.name)
+
+
+async def _product_release(*, project: str, issue: str, by: Actor,
+                           yes: object = False) -> Outcome:
+    """The client's approval putting a delivery in front of their own users.
+
+    THE HIGHEST-CONSEQUENCE THING THAT ONLY SLACK COULD DO. `_maybe_release` in the product channel
+    was the single path to `product.release.release`, so on a deployment without Slack a client
+    could not release production at all — measured, not assumed: the release module has no other
+    caller in the tree.
+
+    TWO OF THE CHANNEL'S THREE RULES ARE KEPT HERE, and the third belongs to the transport:
+
+    1. AUTHORISATION IS RE-CHECKED, and it must be. `release()` says of itself *"the caller has
+       ALREADY authorised the person… this is the pen, not the judgement"*, and unlike every other
+       product row this one does NOT go through `ProductModule` — so nothing else would ask.
+       `may_act` is the deployment's declared product allowlist, which is a different and stronger
+       trust than `Actor.admin`: the operator who may skip a job and the client who may put
+       software in front of users are not the same person, and never were.
+    2. THE ACT IS OBSERVED BEFORE IT IS CLAIMED. `release()` re-asks the engine whether the job is
+       still parked and returns the honest sentence when it is not; that sentence is carried
+       through unchanged. A client told "it is going out" over a signal that reached nothing is
+       the worst outcome available on this path.
+    3. Ambiguity — *"which of the two deliveries did you test?"* — is NOT here on purpose. It is a
+       question about reading a message, and this row is handed an issue by name. The channel is
+       what turns "funcionou" into an issue, and what refuses to guess when two are waiting.
+
+    `yes` because a release is the one act on this surface whose blast radius is the client's own
+    users.
+    """
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(issue or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which delivery to release — releasing 'the last one' is a "
+                                "guess about which software the client's users get.")
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was released: this puts #{ref} in front of the client's users, with your "
+            f"name on it as the approval. That needs `yes`.")
+
+    from beeverforge.product.module import may_act, unauthorized_message
+
+    via = getattr(by, "via", "") or "api"
+    if not await asyncio.to_thread(lambda: may_act(proj, by.id, via=via)):
+        return refused(DENIED, unauthorized_message(proj))
+
+    from beeverforge.lifecycle import CardEvent
+    from beeverforge.product.release import release
+
+    async def signal() -> Outcome | None:
+        ok, why = await asyncio.to_thread(
+            lambda: release(proj, ref, approver=by.id,
+                            comment=f"approved by {by} on the product surface"))
+        if ok:
+            return None
+        # THE MODULE'S OWN SENTENCE, not a status phrase. It is written for a client and it is the
+        # only thing that knows whether the window closed or somebody else already released it.
+        return refused(CONFLICT, why or f"#{ref} could not be released, and nothing said why.",
+                       project=proj.name, issue=ref)
+
+    # THROUGH THE CARD'S DOOR (#448 slice 6): `released`, whose act is the release, and whose row
+    # closes every copy of the question the product role asked about it as worked
+    moved = await _through_the_door(proj, ref, CardEvent.RELEASED, by=by,
+                                    facts={"gate": "last", "note": ""}, act=signal)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    return _after_the_door(moved, done(
+        f"#{ref} is going to production now, approved by {by}. Who released it and when is on "
+        f"the record.", project=proj.name, issue=ref, approver=by.id))
+
+
+async def _product_queue(*, project: str, by: Actor, limit: object = 5) -> Outcome:
+    """What should start next, in order — and why each one, and why not the others.
+
+    TWO ANSWERS, KEPT APART, because they are different kinds of claim. The readiness is
+    arithmetic over the client's board and is true whatever the model said; the ordering is the
+    judgement. Collapsing them would lose the answer this role most needs to be able to give —
+    *"nothing is ready; these eleven need acceptance criteria first"* — and replace it with a
+    confident list it invented.
+
+    WRITES NOTHING, so it is not admin-gated: proposing is thinking, and `product_promote` below
+    is where the money is spent."""
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    try:
+        want = max(1, min(50, int(str(limit).strip() or 5)))
+    except ValueError:
+        return refused(INVALID, f"{limit!r} is not a number of tickets to propose.")
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductQueueInput
+
+    try:
+        raw = await client.execute_workflow(
+            "ProductQueueWorkflow", ProductQueueInput(project=proj.name, limit=want),
+            id=f"beeverforge-product-queue-{proj.name}-{want}", task_queue=TASK_QUEUE)
+    except Exception:  # noqa: BLE001 — a proposal path must degrade, never raise
+        log.exception("the product role could not propose a queue for %s", proj.name)
+        return refused(FAILED, "I could not work that out just now.")
+
+    raw = raw or {}
+    if raw.get("error"):
+        return refused(FAILED, str(raw["error"]), project=proj.name)
+    return done(f"queue proposed for {proj.name}.", project=proj.name,
+                readiness=raw.get("readiness"), proposal=raw.get("proposal"),
+                measured_on=_measured_on(by))
+
+
+async def _product_promote(*, project: str, numbers: object, by: Actor,
+                           yes: object = False) -> Outcome:
+    """Move approved tickets into the queue — the ONE act here that spends money.
+
+    THE SPEND GATE, AND UNTIL NOW IT HAD EXACTLY ONE DOOR. `ProductModule.promote` was reachable
+    only by saying yes in the product channel, so a deployment without Slack could proposeated
+    work and never start any of it — and, read the other way, the decision that costs a client
+    money had no record outside one chat product.
+
+    ORDER IS PRESERVED, and that is not cosmetic: the poller pulls in board order, so an approved
+    sequence that arrives shuffled is not the sequence anybody approved.
+
+    `may_act` is NOT re-checked here — `promote` asks it itself, and asking twice would mean two
+    places to keep the answer right."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    wanted = [str(n).strip().lstrip("#") for n in
+              (numbers if isinstance(numbers, (list, tuple)) else str(numbers or "").split(","))]
+    wanted = [n for n in wanted if n]
+    if not wanted:
+        return refused(INVALID, "say which tickets to start — an empty list starts nothing and "
+                                "spends a call finding that out.")
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was started: this puts {len(wanted)} ticket(s) into the queue and the "
+            f"factory begins spending on them. That needs `yes`.")
+
+    results = await asyncio.to_thread(lambda: module.promote(wanted, actor=by.id))
+    results = list(results or [])
+    started = [r for r in results if getattr(r, "ok", False)]
+    if not started:
+        detail = next((str(getattr(r, "detail", "") or "") for r in results
+                       if getattr(r, "detail", "")), "")
+        return _none_done(results, detail or "nothing could be moved into the queue, and the "
+                                             "module said nothing about why.",
+                          did="queue approved work", project=proj.name)
+    refs = ", ".join(str(getattr(r, "ref", "") or "?") for r in started)
+    # THE PARTIAL CASE IS SAID, never rounded up to success: the client is spending on what did
+    # start, and needs to know what did not.
+    missed = [r for r in results if not getattr(r, "ok", False)]
+    tail = (f" {len(missed)} did not move: "
+            + "; ".join(str(getattr(r, "detail", "") or "?") for r in missed)) if missed else ""
+    return done(f"started {len(started)} of {len(results)}: {refs}.{tail}",
+                project=proj.name, started=[str(getattr(r, "ref", "")) for r in started],
+                failed=[str(getattr(r, "detail", "")) for r in missed])
+
+
+# ── the six write verbs that had no row (#105) ──────────────────────────────────────────────────
+#
+# Each was a branch of `product_channel._handle` and existed nowhere else, so a deployment without
+# Slack could not close a card, align one to its requirement, refine one, record a decision taken
+# after acceptance, write down something the client said, or file a broken promise as work.
+#
+# NONE OF THEM RE-CHECKS `may_act`. Unlike `product_release` — which reaches `product.release`
+# directly and is therefore the only place the question would otherwise go unasked — every verb
+# below is a `ProductModule` method that asks for itself. Asking twice would mean two places to
+# keep the answer right, which is how they drift.
+
+async def _product_reorder(*, project: str, numbers: object, by: Actor,
+                           yes: object = False) -> Outcome:
+    """Write the backlog order — top first, in the sequence given. Spends nothing; the next
+    `promote` follows it, which is why it asks for a yes like the act that does spend."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    wanted = [str(n).strip().lstrip("#") for n in
+              (numbers if isinstance(numbers, (list, tuple)) else str(numbers or "").split(","))]
+    wanted = [n for n in wanted if n]
+    if not wanted:
+        return refused(INVALID, "say which tickets, in order — an empty list orders nothing.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was moved: this rewrites the order of {len(wanted)} "
+                                f"card(s) on the client's board, and the next promote follows it. "
+                                f"That needs `yes`.")
+    results = list(await asyncio.to_thread(lambda: module.reorder(wanted, actor=by.id)) or [])
+    placed = [r for r in results if getattr(r, "ok", False)]
+    missed = [r for r in results if not getattr(r, "ok", False)]
+    if not placed:
+        detail = next((str(getattr(r, "detail", "") or "") for r in missed), "")
+        return _none_done(results, detail or "nothing could be reordered, and the module said "
+                                             "nothing about why.",
+                          did="reorder the backlog", project=proj.name)
+    refs = ", ".join(str(getattr(r, "ref", "") or "?") for r in placed)
+    tail = (f" {len(missed)} did not move: "
+            + "; ".join(str(getattr(r, "detail", "") or "?") for r in missed)) if missed else ""
+    return done(f"reordered {len(placed)} of {len(results)}: {refs}.{tail}", project=proj.name,
+                placed=[str(getattr(r, "ref", "")) for r in placed],
+                failed=[str(getattr(r, "detail", "")) for r in missed])
+
+
+async def _product_close_card(*, project: str, number: str, by: Actor, in_favour_of: str = "",
+                              reason: str = "", yes: object = False) -> Outcome:
+    """Close one card, naming the one that stays — the hand behind a decision already taken."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card to close.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was closed: #{ref} stays as it is without `yes`.")
+    result = await asyncio.to_thread(
+        lambda: module.close_card(ref, actor=by.id,
+                                  in_favour_of=(in_favour_of or "").strip() or None,
+                                  reason=(reason or "").strip()))
+    return _write_outcome(result, did=f"closed #{ref}", project=proj.name)
+
+
+async def _product_correct_card(*, project: str, number: str, by: Actor, text: str = "",
+                                title: str = "", yes: object = False) -> Outcome:
+    """Correct a card the product role opened from a request or a defect — its text or its title.
+
+    THE PRODUCT OWNER'S HAND ON THEIR OWN CARD (#156). The board refuses to change such a card
+    (#150), and this row is what the refusal points at. It spends no agent pass, so it runs here
+    like `product_close_card`."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card to correct.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was corrected: #{ref} stays as it is without `yes`.")
+    wanted_text, wanted_title = (text or "").strip(), (title or "").strip()
+    if not wanted_text and not wanted_title:
+        return refused(INVALID, f"say what #{ref} should say — a correction with neither a text "
+                                f"nor a title changes nothing.")
+    result = await asyncio.to_thread(
+        lambda: module.correct_card(ref, actor=by.id, text=wanted_text, title=wanted_title))
+    return _write_outcome(result, did=f"corrected #{ref}", project=proj.name)
+
+
+async def _product_board(*, project: str, by: Actor, card: str = "") -> Outcome:
+    """The cards on the board, and one card's own view — for the product surface (#384).
+
+    THE PRODUCT VIEW HAD NO CARD TO ACT ON. Its Board tab asked the role to triage and nothing more,
+    and `GET /api/board/{project}` was a floor read a product credential was refused — so a person
+    who asked for a card and wanted it gone could not even open it where they work. (Since #562
+    the product owner reads that board too, read only; this stays their page's own view of a
+    card, with its controls.) This is the
+    read that page needs: the open cards with their column, and, for the card they opened, its text
+    and what its controls do (`card_view`). It writes nothing; the controls are
+    `product_withdraw_card`, and `product_promote` for a card nobody started (#562).
+
+    THE THREE ANSWERS TRAVEL, as on the floor's board: `cards` is `None` when the board could not be
+    read and `[]` when it was read and is empty."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    _proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+
+    def _read() -> dict:
+        from beeverforge.adapters.board.base import stage_key
+        from beeverforge.adapters.board.columns import has_started
+        from beeverforge.product.authoring import filed_by_the_product_role
+
+        placed = board.columns() if board is not None else {}
+        summaries = tracker.list_tickets(state="open")
+        cards = None
+        if placed is not None and summaries is not None:
+            cards = [{"ref": s.ref, "title": s.title, "column": placed.get(s.ref, ""),
+                      "started": has_started(stage_key(board, placed.get(s.ref, "")))
+                      if board is not None and placed.get(s.ref) else False,
+                      "opened_by_product": filed_by_the_product_role(s.body or "")}
+                     for s in summaries]
+        detail = None
+        if (wanted := (card or "").strip()):
+            try:
+                ticket = tracker.get_ticket(wanted)
+            except Exception:  # noqa: BLE001 — a card that cannot be read is an answer
+                log.info("the product view could not read card %r", wanted, exc_info=True)
+                detail = {"ref": wanted, "readable": False}
+            else:
+                raw = getattr(ticket, "raw", "") or ""
+                opened = filed_by_the_product_role(raw)
+                state = getattr(ticket, "state", "") or "open"
+                from beeverforge.contracts.refs import canonical_ref
+
+                column = (placed or {}).get(canonical_ref(wanted)) if placed is not None else None
+                detail = {"ref": canonical_ref(wanted), "readable": True, "title": ticket.title,
+                          "body": raw, "state": state, "column": column or "",
+                          "opened_by_product": opened,
+                          "owed": _owed_line(proj, by, wanted, column=column or "", board=board),
+                          **card_view(proj, tracker, board, wanted, opened_by=opened,
+                                      column=column, state=state)}
+        return {"cards": cards, "card": detail}
+
+    read = await asyncio.to_thread(_read)
+    # ANOTHER PASS, FROM THE CARD (#448). The engine is asked only about a card the factory took up
+    # and has not finished — the one place a change can be waiting on the person who asked for it —
+    # and the module says whether THIS viewer may send it back (`ProductModule.adjust_view`).
+    shown = read["card"]
+    if (shown and shown.get("readable") and shown.get("open") and shown.get("started")
+            and not shown.get("finished")):
+        vouched = bool(by.admin) and by.may_enter(FLOOR)
+        shown["adjust"] = await asyncio.to_thread(
+            lambda: module.adjust_view(shown["ref"], actor=by.id, vouched=vouched))
+        # …AND ITS OTHER HALF, "THIS IS IT" (#448 slice 3): drawn only where the module says this
+        # viewer may accept and there is a head they tried
+        if callable(getattr(module, "accept_view", None)):
+            shown["accept"] = await asyncio.to_thread(
+                lambda: module.accept_view(shown["ref"], actor=by.id, vouched=vouched))
+    # PUT IN THE QUEUE, FROM THE CARD (#562): the product owner reads the board, and a card nobody
+    # started is one they may say the factory takes up next — the module says whether it is
+    # offered to THIS person (`ProductModule.queue_view`); the press is `product_promote`
+    if shown and shown.get("readable") and shown.get("open") and not shown.get("started"):
+        shown["queue"] = await asyncio.to_thread(
+            lambda: module.queue_view(shown["ref"], actor=by.id, column=shown.get("column", ""),
+                                      board=board))
+    count ="could not be read" if read["cards"] is None else f"{len(read['cards'])} open"
+    return done(f"{proj.name}'s board — {count}", project=proj.name, **read)
+
+
+def _owed_line(proj, by: Actor, card: str, *, column: str, board) -> str:
+    """WHAT THE PRODUCT ROLE OWES, ON THE CARD IT IS ABOUT (ADR-0055 D11) — `""` when it owes
+    nothing about it that this person may see. A card the work stopped on is in the backlog, and
+    the line says so: the promise is still open (D10), and "I will tell you" alone would read as
+    work under way."""
+    from beeverforge.adapters.board.base import stage_key
+    from beeverforge.memory import store as loop_store
+    from beeverforge.product import agenda, events
+    from beeverforge.product.voice import card_owed
+
+    viewer = agenda.Viewer(own=getattr(by, "conversation", "") or "", person=by.id,
+                           may_read_room=by.may_enter(PRODUCT))
+    try:
+        if not agenda.owed_on(loop_store.read(proj.name), viewer, card,
+                              room=events.room_of(proj)):
+            return ""
+    except Exception:  # noqa: BLE001 — a courtesy line; the card reads on without it
+        log.info("could not read what is owed about %s", card, exc_info=True)
+        return ""
+    # BACK IN THE BACKLOG, NOT NEW TO IT: every card the role files lands in Backlog (ADR-0019 §5),
+    # and the first live run of this line told the person who had just reported a defect that the
+    # work on it "stopped". Only a card whose work a person ended is back there — which only the
+    # card's record says (ADR-0055 D4).
+    from beeverforge.lifecycle import back_in_the_backlog
+
+    backlog = bool(board is not None and column and stage_key(board, column) == "backlog"
+                   and back_in_the_backlog(proj, card))
+    return card_owed(agent_name=getattr(getattr(proj, "product", None), "agent_name", "") or "",
+                     in_backlog=backlog, language=getattr(proj, "language", None))
+
+
+async def _product_withdraw_card(*, project: str, number: str, reason: str, by: Actor,
+                                 remove: object = False) -> Outcome:
+    """Close a card, or remove one nobody has started, from the card on the product view (#384).
+
+    THE CONTROL ON THE CARD, NOT A CONVERSATION. `product_close_card` is the conversation's hand —
+    staged, confirmed with `yes`, naming a survivor — and it asks no stage gate, because the chat
+    that stages it reads nothing first. This row is the card's own control: the confirmation is
+    the one the person just gave on the card, and the gate is the board's, the same one the floor's
+    `card_close` and `card_remove` ask (`_withdraw_refusal`), so the two surfaces refuse the same
+    card for the same sentence. It goes through the product role for every card, whoever opened
+    it: this is the product surface, and the role is who writes on it.
+
+    WHO MAY is the module's answer (`withdraw_card`): a product admin, the person who asked for
+    the card, or an operator (an admin who may enter the floor), whom this row vouches for as the
+    floor's rows do. So the row does not demand `needs_admin` — the requester of a card is on no
+    allowlist, and dropping what you asked for yourself needs nobody's yes."""
+    import asyncio
+
+    _module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    _proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card.")
+    said = (reason or "").strip()
+    if not said:
+        return refused(INVALID, "say why — the reason is what the next reader of the card has, "
+                                "and one made only of spaces says nothing.")
+    removing = _said_yes(remove)
+    _kind, unreadable = await asyncio.to_thread(_opened_by, tracker, ref)
+    if unreadable:
+        return refused(CONFLICT, unreadable)
+    stage, refusal = await _withdraw_refusal(proj, board, ref, remove=removing)
+    if refusal:
+        return refused(CONFLICT, refusal)
+    from beeverforge.adapters.board.columns import has_finished
+
+    # AN OPERATOR MAY DROP A CARD FROM HERE TOO (#384, decided on the issue: no bureaucracy in
+    # the first cut). The floor's rows already vouch for one; on this surface an operator is the
+    # actor the transport says is an admin AND who may enter the floor — a product-scoped
+    # credential never is, so a business analyst gains nothing by it.
+    operator = bool(by.admin) and by.may_enter(FLOOR)
+    return await _by_the_product_role(proj, ref, by=by, reason=said, remove=removing,
+                                      delivered=has_finished(stage.key) and not removing,
+                                      vouched=operator)
+
+
+async def _product_adjust(*, project: str, number: str, instruction: str, by: Actor,
+                          criteria: str = "") -> Outcome:
+    """Send the change on a card back for another pass, from the card on the product view (#448).
+
+    THE FLOOR'S `adjust`, FOR THE PERSON WHO TRIED THE CHANGE. That row is the operator's (FLOOR,
+    admin); the person who asked for the card and tried its preview — the one who can judge it —
+    could only ask somebody else to press it. This row is the card's own control, #384's pattern
+    (`product_withdraw_card`): the confirmation is the one they just gave on the card, and WHO MAY
+    is the module's answer (`send_back`) — a product admin, the card's own requester, or an
+    operator (an admin who may enter the floor), whom this row vouches for. So no `needs_admin`.
+
+    `criteria` IS THE CARD'S BAR AS THE PERSON EDITED IT, one per line; empty leaves it as it is.
+    The module corrects the card first and then sends the pass, so the pass and its review read
+    the corrected bar — the same act the conversation's yes performs (`confirm._confirm_adjust`)."""
+    import asyncio
+
+    module, _proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card.")
+    bar = [line.strip().lstrip("-*").strip() for line in str(criteria or "").splitlines()]
+    # AN OPERATOR IS VOUCHED FOR as on `product_withdraw_card` (#384): an admin who may enter
+    # the floor — a product-scoped credential never is
+    vouched = bool(by.admin) and by.may_enter(FLOOR)
+    result = await asyncio.to_thread(
+        lambda: module.send_back(ref, actor=by.id, instruction=instruction,
+                                 criteria=[c for c in bar if c], vouched=vouched))
+    if not result.ok:
+        return _write_outcome(result, did=f"send #{ref} back for another pass", project=project,
+                              issue=ref, through="product")
+    from beeverforge.product.adjust import headline
+
+    # THE SAME SENTENCE THE CONVERSATION'S YES GETS, in the project's language, and what did not
+    # land after it (`confirm._confirm_adjust`)
+    said = headline(result, instruction=instruction.strip(),
+                    language=getattr(_proj, "language", None))
+    return done("\n\n".join(filter(None, [said, str(result.detail or "")])), project=project,
+                issue=ref, through="product", pass_number=result.pass_number,
+                passes=result.passes, corrected=result.corrected)
+
+
+async def _product_accept_change(*, project: str, number: str, by: Actor,
+                                 head: str = "") -> Outcome:
+    """Record that the change on a card, as its requester tried it, is what they asked for — from
+    the card on the product view (#448 slice 3).
+
+    `product_adjust`'s OTHER HALF, and #384's pattern again: the card's own control, the
+    confirmation the one they just gave on the card, and WHO MAY the module's answer
+    (`accept_change`) — a product admin, the card's own requester, or an operator this row vouches
+    for. So no `needs_admin`.
+
+    `head` IS THE ONE THE CARD SHOWED, when the page sent it: a preview rebuilt between the look and
+    the click is refused by name, never accepted in the person's name. When the look is all that
+    holds the merge, the module gives the gate its `merge` — the same act as the conversation's
+    yes (`confirm._confirm_accept_change`)."""
+    import asyncio
+
+    module, _proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card.")
+    vouched = bool(by.admin) and by.may_enter(FLOOR)
+    # WHERE "IT WENT IN" IS TOLD when no delivery of the card names a conversation: this person's
+    # own (`Actor.conversation`, #33 slice 3), or nowhere
+    where = str(getattr(by, "conversation", "") or "")
+    result = await asyncio.to_thread(
+        lambda: module.accept_change(ref, actor=by.id, head=str(head or "").strip(),
+                                     where=where, vouched=vouched))
+    if not result.ok:
+        return _write_outcome(result, did=f"accept #{ref}'s change", project=project, issue=ref,
+                              through="product")
+    from beeverforge.product.accept import headline
+
+    said = headline(result, language=getattr(_proj, "language", None))
+    return done("\n\n".join(filter(None, [said, str(result.detail or "")])), project=project,
+                issue=ref, through="product", head=getattr(result, "head", ""),
+                merging=bool(getattr(result, "merging", False)))
+
+
+async def _product_record_decision(*, project: str, number: str, decision: str, by: Actor,
+                                   yes: object = False) -> Outcome:
+    """Write a decision taken AFTER the acceptance into the requirement's own register.
+
+    THE PROVENANCE IS THE TRANSPORT'S, not invented here. `where` records the room the decision
+    was taken in, and a row that hardcoded one would attribute every decision to the same place
+    however it arrived."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    num, bad_num = _requirement_number(number)
+    if bad_num:
+        return bad_num
+    said = (decision or "").strip()
+    if not said:
+        return refused(INVALID, "a decision with no words in it records nothing — say what was "
+                                "decided.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was recorded on requirement {num} without `yes`.")
+    where = f"{by} ({getattr(by, 'via', '') or 'api'})"
+    result = await asyncio.to_thread(
+        lambda: module.record_decision(num, decision=said, actor=by.id, where=where))
+    return _write_outcome(result, did=f"recorded a decision on requirement {num}",
+                          project=proj.name)
+
+
+async def _product_confirm_capability(*, project: str, capability: str, by: Actor,
+                                     yes: object = False) -> Outcome:
+    """Confirm a business capability — a flow the platform observed across the product's sources,
+    or one written without a confirmation — as the product's own (ADR-0052 D19, #268 slice 3).
+
+    THE ONE DOOR TO CURATED TRUTH. Until a person of the product says so here, a capability is an
+    observation the role may cite as evidence and never as how the product is organised; after
+    it, the factory reads the capability's links as the product's word. So it needs `yes`, and the
+    person it records is the one who gave it."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    slug = (capability or "").strip()
+    if not slug:
+        return refused(INVALID, "a confirmation names the capability it confirms — its slug, as "
+                                "`.okf/flows/flows.yaml` or `capabilities/` spell it.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was confirmed: after this the factory reads {slug!r} as "
+                                f"how the product is organised. That needs `yes`.")
+    result = await asyncio.to_thread(lambda: module.confirm_capability(slug, actor=by.id))
+    return _write_outcome(result, did=f"confirmed the capability {slug!r}", project=proj.name)
+
+
+async def _product_note_fact(*, project: str, term: str, body: str, by: Actor,
+                             yes: object = False) -> Outcome:
+    """Write down one thing somebody said about the business — as `aprendido`, attributed.
+
+    IT REFUSES TO OVERWRITE, and that refusal is the module's: a term that already exists is
+    answered with what is written, because two versions of the same fact is worse than either."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    handle, said = (term or "").strip(), (body or "").strip()
+    if not handle or not said:
+        return refused(INVALID, "a fact needs both the term it is filed under and what is true "
+                                "about it.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was written about {handle!r} without `yes`.")
+    where = f"{by} ({getattr(by, 'via', '') or 'api'})"
+    result = await asyncio.to_thread(
+        lambda: module.note_fact(term=handle, body=said, said_by=by.id, where=where))
+    return _write_outcome(result, did=f"noted {handle!r}", project=proj.name)
+
+
+def _import_source(proj, source: object, *, by: Actor) -> tuple[Path | None, Outcome | None]:
+    """Where the folder or archive `source` names is, for THIS caller — or the refusal (#993).
+
+    THE COMMAND LINE NAMES ANY PATH, EVERY OTHER CALLER ONLY ONE IN THE PRODUCT'S IMPORT INBOX.
+    A shell on the host already reads every file there, so a path is only what it says. Over the
+    API the same parameter would let any credential that reaches a product row read the server's
+    own files — a key, an environment file — into a context repository and then read them back
+    from it. So anywhere but the CLI, `source` is a name inside `importing.inbox`, and one that
+    resolves outside it (`..`, an absolute path, a link out) is refused before anything is read."""
+    from beeverforge.product import importing
+    from beeverforge.product.voice import import_said
+
+    lang = getattr(proj, "language", None)
+    raw = str(source or "").strip()
+    if not raw:
+        return None, refused(INVALID, import_said("no_source", language=lang),
+                             project=proj.name)
+    if getattr(by, "via", "") == "cli":
+        return Path(raw).expanduser(), None
+    box = importing.inbox(proj)
+    candidate = box / raw
+    spelled = Path(raw)
+    try:
+        inside = (not spelled.is_absolute() and ".." not in spelled.parts
+                  and candidate.resolve().is_relative_to(box.resolve())
+                  and candidate.resolve() != box.resolve())
+    except (OSError, RuntimeError):
+        inside = False
+    if not inside:
+        return None, refused(DENIED, import_said("outside_the_inbox", language=lang),
+                             project=proj.name)
+    return candidate, None
+
+
+async def _product_import(*, project: str, by: Actor, source: str = "", origin: str = "",
+                          token: str = "", yes: object = False) -> Outcome:
+    """Import a folder — or an archive of one — of requirements, facts and documents into the
+    product, under its corpus's rules (#993): numbered after every number it ever used, the same
+    promise never written twice, nothing accepted touched.
+
+    SHOWS BEFORE IT WRITES, the shape `product init` has. Without `yes` this answers the PLAN —
+    every requirement with what becomes of it, every fact, every document, every file left out and
+    why — and its token, and writes nothing. With `yes` it plans again under the product's
+    semaphore and lands that, in one commit pushed once; a `token` from the plan shown makes a
+    product that moved in between come back as the new plan, never as a write nobody saw.
+
+    WHOSE YES LANDS IT is the product's (`may_act`), asked HERE before the folder is even read, and
+    again by the module: an import writes a client's requirements, and reading a folder on the
+    server is not a thing anybody else may make this row do. Without `yes`, a person who may not
+    import is refused for the missing yes, like every row that asks for one — and shown no plan."""
+    import asyncio
+
+    from beeverforge.product import importing
+    from beeverforge.product.module import may_act, unauthorized_message
+    from beeverforge.product.voice import import_said
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    lang = getattr(proj, "language", None)
+    if not await asyncio.to_thread(lambda: may_act(proj, by.id, via=by.via or "api")):
+        if not _said_yes(yes):
+            return refused(INVALID, import_said("no_yes", language=lang), project=proj.name,
+                           written=False)
+        return refused(DENIED, unauthorized_message(proj), project=proj.name)
+    where, bad = _import_source(proj, source, by=by)
+    if bad:
+        return bad
+    # THE FOLDER IS READ WITH THE PRODUCT'S OWN NAME FOR ITS REQUIREMENTS' FOLDER, when the
+    # folder has one by that name — the checkout the module plans against (cached, read once)
+    ctx = await asyncio.to_thread(module.context)
+    try:
+        brought = await asyncio.to_thread(
+            importing.read, where,
+            requirements_dir=getattr(ctx, "requirements_dir", "") or "requirements")
+    except importing.NotImportable as exc:
+        said = import_said(exc.reason, language=lang, **exc.values)
+        if exc.reason == "not_found":
+            return refused(NOT_FOUND, said, project=proj.name)
+        return refused(INVALID, said, project=proj.name)
+    said_origin = str(origin or "").strip()
+    if not _said_yes(yes):
+        shown = await asyncio.to_thread(
+            lambda: module.plan_import(brought, actor=by.id, origin=said_origin))
+        the_plan = getattr(shown, "plan", None)
+        if not shown.ok or getattr(shown, "existed", False) or the_plan is None:
+            return _write_outcome(shown, did="plan the import", project=proj.name,
+                                  plan=the_plan.as_dict() if the_plan else {})
+        return refused(INVALID, shown.detail, project=proj.name, plan=the_plan.as_dict(),
+                       token=the_plan.token, written=False)
+    result = await asyncio.to_thread(
+        lambda: module.import_requirements(brought, actor=by.id, origin=said_origin,
+                                           token=str(token or "").strip()))
+    the_plan = getattr(result, "plan", None)
+    if getattr(result, "moved", False) and the_plan is not None:
+        return refused(CONFLICT, result.detail, project=proj.name, plan=the_plan.as_dict(),
+                       token=the_plan.token, written=False)
+    return _write_outcome(result, did="imported the folder", project=proj.name,
+                          plan=the_plan.as_dict() if the_plan else {},
+                          landed=list(getattr(result, "landed", []) or []))
+
+
+async def _product_file_defect(*, project: str, restated: str, by: Actor, violates: str = "",
+                               severity: str = "", yes: object = False) -> Outcome:
+    """Register a broken promise as work — classified, citing the requirement it violates.
+
+    `violates` IS OPTIONAL AND MEANINGFUL WHEN ABSENT: a defect nobody can tie to a written
+    promise is still a defect, and refusing to file it would make the corpus the price of
+    reporting one."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    said = (restated or "").strip()
+    if not said:
+        return refused(INVALID, "say what is broken — an empty defect files nothing.")
+    against: int | None = None
+    if str(violates or "").strip():
+        against, bad_num = _requirement_number(violates)
+        if bad_num:
+            return bad_num
+    if not _said_yes(yes):
+        return refused(INVALID, "nothing was filed: this puts a card on the client's board and "
+                                "needs `yes`.")
+    result = await asyncio.to_thread(
+        lambda: module.file_defect(restated=said, reported_by=by.id, violates=against,
+                                   severity=(severity or "").strip()))
+    return _write_outcome(result, did="filed the defect", project=proj.name)
+
+
+# ── the board's own three verbs (ADR-0049 D6) ────────────────────────────────────────────────
+#
+# ONE ACT, TWO SURFACES. These exist so a card can be opened, moved and answered from the shell
+# BEFORE the Board has a page (slice 2), and so the page — when it arrives — writes through the
+# same three functions rather than growing its own second copy. That is the whole reason this
+# layer exists: `resume` came to accept a parked job's chosen option in the panel and not in
+# Slack, because two front ends each implemented it.
+#
+# VENDOR-NEUTRAL BY CONSTRUCTION. Nothing here names a provider: they call `build_tracker` and
+# `build_board`, so on a GitHub project `card_move` is the same `set_column` the poller makes.
+
+
+def _board_pair(project: str):
+    """`(project, tracker, board, None)` or `(…, Outcome)` — the resolution these three share.
+
+    The board may legitimately be `None` (a deployment can run on tickets alone), so a row that
+    needs one says so itself rather than having this refuse for everybody."""
+    from beeverforge.adapters.board import build_board
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+    proj, bad = _project(project)
+    if bad:
+        return None, None, None, bad
+    token = tracker_token_for(proj) or deployment_tracker_token(proj)
+    return proj, build_tracker(proj, token=token), build_board(proj, token=token), None
+
+
+def _pickup_says(tracker, ref: str) -> str | None:
+    """The spec gate's verdict on a card AS THE TRACKER NOW HOLDS IT — `""` when pickup would take
+    it, the refusal when it would not, None when the card could not be read back.
+
+    Read back rather than parsed from what was sent, because that is what pickup reads: a hosted row
+    converts and sanitises a body on the way in, and the verdict on the text somebody typed is not
+    the verdict on the card."""
+    from beeverforge.orchestrator.machine import spec_verdict
+
+    try:
+        return spec_verdict(tracker.get_ticket(ref))
+    except Exception as exc:  # noqa: BLE001 — the write landed; no verdict is not a failure
+        log.warning("BEEVERFORGE_CARD_VERDICT_UNREAD card=%s: the card was written but could not "
+                    "be read back to ask the spec gate, so no verdict is reported — %s", ref, exc)
+        return None
+
+
+def _as_pickup_would(message: str, verdict: str | None) -> tuple[str, dict]:
+    """A write's line, with what pickup would say added when it would refuse the card (#150)."""
+    if verdict is None:
+        return message, {}
+    if verdict:
+        return f"{message}. As written, pickup would refuse it: {verdict}", {"refusal": verdict}
+    return message, {"refusal": ""}
+
+
+async def _card_check(*, project: str, by: Actor, title: str = "", body: str = "") -> Outcome:
+    """What pickup would say about a card before it is saved — the spec gate, run on a draft.
+
+    WRITES NOTHING, and is a row anyway (ADR-0039): the page that writes a card asks it on every
+    pause in typing, and a verdict computed by the page would be the second rule this exists to
+    avoid. The answer also carries the draft as the parser reads it, which is how the page learns
+    whether its form can hold a card's whole body before it offers the form for editing it."""
+    from beeverforge.adapters.tracker.parse import form_fields, parse_ticket_body
+    from beeverforge.orchestrator.machine import spec_verdict
+
+    proj, bad = _project(project)
+    if bad:
+        return bad
+    repo = getattr(getattr(proj, "tracker", None), "repo", "") or proj.name
+    draft = parse_ticket_body(id="draft", title=(title or "").strip(), body=body or "", repo=repo)
+    verdict = spec_verdict(draft)
+    count = len(draft.acceptance_criteria)
+    said = verdict or (f"pickup would take this card as written — {count} "
+                       f"{'criterion' if count == 1 else 'criteria'}")
+    return done(said, project=proj.name, refusal=verdict,
+                criteria=[c.text for c in draft.acceptance_criteria],
+                fields=form_fields(body or ""))
+
+
+async def _card_create(*, project: str, title: str, by: Actor, body: str = "",
+                       column: str = "") -> Outcome:
+    """Open a card on this project's board."""
+    import asyncio
+
+    from beeverforge.lifecycle import CardEvent
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    name = (title or "").strip()
+    if not name:
+        return refused(INVALID, "say what the card is called — an empty title opens nothing.")
+    # WHERE IT IS FILED IS ASKED BEFORE ANYTHING IS WRITTEN (#414): the backlog unless the person
+    # named the queue. A card opened into a column the factory writes would be a card nobody
+    # started shown as started, and refusing it after the write would leave it on no column
+    wanted = (column or "").strip()
+    key = "backlog"
+    if wanted and board is not None:
+        key, bad = await asyncio.to_thread(_operators_column, proj, board, wanted)
+        if bad:
+            return bad
+    # …AND WHERE IT WOULD BE BORN (#543): a card opened to wait, on a board where a new card is
+    # born in the pickup column, is one the poller takes with nobody queueing it (ADR-0019 §5) —
+    # the product role's filing was held there by #536, and this is the same board. A card the
+    # person opens IN the queue is not asked: that is the one gesture that spends, and theirs.
+    if key == "backlog":
+        bad = await asyncio.to_thread(_born_in_the_queue, proj, tracker, board)
+        if bad:
+            return bad
+
+    def _open() -> str:
+        # THE REQUESTER IS WHOEVER FILED IT (ADR-0049 D7). A row whose namespace is the platform's
+        # answers its own id back, so the factory has somebody to ask; a hosted row answers "" and
+        # the deployment's declared map is what resolves one, exactly as before.
+        from beeverforge.product.requester import forge_identity_for
+
+        who = forge_identity_for(proj, by.id, tracker) or by.id
+        try:
+            ref = tracker.create_ticket(title=name, body=(body or "").strip(),
+                                        author=by.id, requester=who)
+        except TypeError:
+            # A row that takes only the port's two arguments — every hosted vendor — is called
+            # with exactly those. The card then carries what the body says, which is what a
+            # hosted deployment has always had.
+            ref = tracker.create_ticket(title=name, body=(body or "").strip())
+        return ref
+
+    try:
+        ref = await asyncio.to_thread(_open)
+    except Exception as exc:  # noqa: BLE001 — a board that refused is an outcome, not a traceback
+        return refused(UNAVAILABLE, f"the card was not opened: {exc}")
+    # THROUGH THE CARD'S DOOR (ADR-0055, #414): `filed`, placed in the column it is filed in —
+    # named, where a hosted board otherwise holds a new item with no status of its own — and the
+    # role's snapshot forgotten. Opened is opened: what of the filing did not land is said after
+    # it, never as a refusal of a card that exists.
+    moved = await _through_the_door(proj, ref, CardEvent.FILED, by=by,
+                                    facts={"column": key if board is not None else ""},
+                                    tracker=tracker, board=board, columns={})
+    line = f"opened {ref} on {proj.name}'s board ({by})"
+    if moved.refused:
+        line += f" — and it was not placed: {moved.refused}"
+    said, gate = _as_pickup_would(line, await asyncio.to_thread(_pickup_says, tracker, ref))
+    out = done(said, project=proj.name, issue=str(ref), url=tracker.ticket_url(ref), **gate)
+    return out if moved.refused else _after_the_door(moved, out)
+
+
+def _born_in_the_queue(proj, tracker, board) -> Outcome | None:
+    """The refusal to open a card that would be born in the pickup column, or on a board that
+    could not say where it would be — `None` when it may be opened (#543).
+
+    THE DECISION IS `board.base.intake_held`, the one every writer of a new card asks; the sentence
+    is the product's, in the project's language, because the person reading it is on the board —
+    and it names the way they DO have: opening the card in the queue themselves."""
+    from beeverforge.adapters.board.base import intake_held
+    from beeverforge.product.voice import card_open_held
+
+    born = intake_held(tracker, board)
+    if born is None:
+        return None
+    lang = getattr(proj, "language", None)
+    if born.queued:
+        return refused(CONFLICT, card_open_held("queue", column=str(born.column), language=lang),
+                       project=proj.name, column=str(born.column))
+    if born.unknown:
+        return refused(CONFLICT, card_open_held("undeclared", column=born.queue, language=lang),
+                       project=proj.name, column=born.queue)
+    return refused(UNAVAILABLE, card_open_held("unread", language=lang), project=proj.name)
+
+
+def _operators_column(proj, board, wanted: str) -> tuple[str, Outcome | None]:
+    """`(key, None)` when `wanted` is one of the operator's two columns — the backlog or the queue —
+    else `("", the refusal)`. THE OTHER FIVE ARE THE FACTORY'S (#414): a card is in progress, in
+    review, waiting on a person's review, waiting on a person or done because a job put it there,
+    and a drag that says so of a card no job holds — or that takes one a job holds out from under
+    it — is the board telling a story nobody lived. A column this platform does not map cannot be
+    judged, as in `_stage`."""
+    from beeverforge.adapters.board.base import stage_key, stage_option
+
+    key = stage_key(board, wanted)
+    if key in ("backlog", "todo"):
+        return key, None
+    try:
+        known = board.column_names()
+    except Exception:  # noqa: BLE001 — the names are for the sentence; unread says so
+        log.info("%s's board could not list its columns for a move", proj.name, exc_info=True)
+        known = None
+    if not key and wanted not in (known or []):
+        names = ", ".join(known) if known else "the board could not say"
+        return "", refused(NOT_FOUND, f"{proj.name}'s board has no column {wanted!r} — its "
+                                      f"columns are: {names}.")
+    if not key:
+        named = stage_option(board)
+        repair = (f"Map it with the project's tracker option `{named}`" if named else
+                  "Map it in the project's tracker options")
+        return "", refused(CONFLICT, f"{wanted!r} is not a column this platform maps, so it "
+                                     f"cannot tell where a card there is in its life. {repair}. "
+                                     f"Nothing was changed.")
+    return "", refused(CONFLICT, (
+        f"{wanted!r} is the factory's column — a card is there because a job put it there. A "
+        f"person puts a card in the queue or back in the backlog; the work on one is ended with "
+        f"`stop`, `skip` or `discard`, which tell its job, and a card is finished by closing it. "
+        f"Nothing was changed."))
+
+
+async def _card_move(*, project: str, issue: str, column: str, by: Actor) -> Outcome:
+    """Move a card to a column by name — the queueing gesture.
+
+    THROUGH THE CARD'S DOOR (ADR-0055, #414): to the queue is `promoted`, the one gesture that
+    spends; to the backlog is `reordered`. Either is recorded and forgets the role's snapshot, and
+    neither is allowed out of a column the factory holds the card in — that is ending a job, and
+    `stop`, `skip` and `discard` are the verbs that tell it."""
+    import asyncio
+
+    from beeverforge.adapters.board.columns import WAITING_ON_A_PERSON_KEYS
+    from beeverforge.lifecycle import CardEvent
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    if board is None:
+        return refused(INVALID, f"{proj.name} has no board configured — there is nothing to move "
+                                f"a card on.")
+    wanted = (column or "").strip()
+    if not wanted:
+        return refused(INVALID, "say which column to move it to — the board's own name for it.")
+    key, bad = await asyncio.to_thread(_operators_column, proj, board, wanted)
+    if bad:
+        return bad
+    stage = await asyncio.to_thread(_stage, proj, board, issue)
+    if stage.cannot_tell:
+        return refused(CONFLICT, stage.cannot_tell)
+    event = CardEvent.PROMOTED if key == "todo" else CardEvent.REORDERED
+
+    async def no_job_waits() -> Outcome | None:
+        """A parked card goes back to the queue by hand only when no job waits on it: one that does
+        is answered (`resume`, `skip`), or it would be queued under a job still holding it."""
+        job = await _job_on_the_card(proj.name, issue)
+        if job.cannot_tell:
+            return refused(CONFLICT, job.cannot_tell)
+        if job.running:
+            how = f"`{job.answer_it}`" if job.answer_it else "`resume` or `skip`"
+            return refused(CONFLICT, f"{issue} is in {stage.column!r} and its job is still "
+                                     f"waiting on {job.waiting_on or 'a person'} — answer it with "
+                                     f"{how}; queueing the card would not reach that job.")
+        return None
+
+    parked = event is CardEvent.PROMOTED and stage.key in WAITING_ON_A_PERSON_KEYS
+    moved = await _through_the_door(proj, issue, event, by=by, act=no_job_waits if parked else None,
+                                    tracker=tracker, board=board, stage=stage)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    return _after_the_door(moved, done(f"moved {issue} to {wanted} on {proj.name}'s board ({by})",
+                                       project=proj.name, issue=str(issue), column=wanted))
+
+
+@dataclass(frozen=True)
+class _Stage:
+    """Where a card is on its board, read ONCE, in the platform's own words (#162).
+
+    `key` is the neutral column key (`""` when the card is on no board or in no column);
+    `column` is the board's own name for it; `cannot_tell` is the sentence to refuse with when the
+    board could not answer — an unreadable board, or a column this platform does not map."""
+    key: str = ""
+    column: str = ""
+    cannot_tell: str = ""
+
+
+def _stage(proj, board, issue: str) -> _Stage:
+    """Read where `issue` is. One board read, shared by the refusal and by what a close records.
+
+    IT WAS INSIDE `_stage_refusal`, which answered only in sentences — so the close, which since
+    #162 needs the KEY as well (a card in Done is closed as delivered), would have read the board
+    a second time to learn what the refusal had just looked at, and the two reads could disagree
+    about a card that moved between them.
+
+    A CARD THE BOARD DID NOT RETURN IS ASKED ABOUT, WHERE THE BOARD CAN BE ASKED (review of #752).
+    A board that reads only its project's slice of a shared tracker (Jira's `scope_jql`) leaves
+    out another project's cards, which an edit, a close or a removal still reaches by key — so
+    "not in `columns()`" no longer meant "nobody moved it", and another project's running card
+    went through all three. Such a board answers `holds(ref)`, read through `getattr` so the port
+    does not learn it: `False` refuses by name, `None` refuses as an unreadable board does, and a
+    board without the capability, or with no slice declared, answers as before."""
+    from beeverforge.adapters.board.base import stage_key, stage_option
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.product.voice import card_outside_the_slice, card_unmapped
+
+    if board is None:
+        return _Stage()      # tickets only, no columns at all: nothing can have moved it
+    unreadable = _Stage(cannot_tell=(
+        f"{proj.name}'s board could not be read, so there is no way to tell whether the "
+        f"factory has already taken {issue} up. Nothing was changed — try again, and if "
+        f"the board stays unreadable, say it on the card instead."))
+    where = board.columns()
+    if where is None:
+        return unreadable
+    column = where.get(canonical_ref(issue)) or where.get(str(issue))
+    if not column:
+        holds = getattr(board, "holds", None)
+        inside = holds(issue) if callable(holds) else True
+        if inside is None:
+            return unreadable
+        if inside is False:
+            # ANOTHER PROJECT'S CARD, which this board's read leaves out (review of #752): what
+            # column it is in, and whether a job holds it, is that project's to answer. `is False`,
+            # not falsiness: only the row's own answer refuses, as `stage_key` believes only a real
+            # one — a test double's board answers a `MagicMock` and keeps reading as before
+            # In the project's language (review of PR #884, point 4): the product view's close
+            # and remove show this sentence, and a pt-BR project read it in English
+            named = getattr(board, "scope_named", None)
+            return _Stage(cannot_tell=card_outside_the_slice(
+                ref=issue, project=proj.name, within=named() if callable(named) else "",
+                language=getattr(proj, "language", None)))
+        return _Stage()      # not on the board: nobody has moved it anywhere
+    # THE BOARD ROW ANSWERS, NOT AN OPTION NAME READ FROM HERE (#231). This was
+    # `key_for(column, renamed=proj.tracker.options.get("columns"))`, and `ProviderRef.options` is
+    # `dict[str, str]`: absent, it mapped nothing and refused every edit and every close on a board
+    # whose columns are not the platform's six — which on Jira is every board, because a Jira
+    # board's columns ARE the site's statuses; present, `key_for` raised `TypeError: 'str' object
+    # is not a mapping` in front of an operator. The row holds the deployment's names already, by
+    # whatever option IT documents (`adapters/board/base.py::Staged`).
+    key = stage_key(board, column)
+    if not key:
+        # STILL A REAL ANSWER — a column nobody maps cannot be judged, and guessing is the
+        # direction this gate must not fail in. Only the remedy changed: the option to edit is the
+        # one THIS board reads, and generic code no longer claims to know its name.
+        #
+        # AND IT IS THE DOOR'S OWN SENTENCE (#521). `card_move` refuses here, before the door, so
+        # a queueing from Azure's stock `New` read this one — and the door's said the same thing
+        # in other words, with a different remedy, in English only. One sentence now, in the
+        # project's language, with the line of configuration that maps the column in it.
+        return _Stage(column=column, cannot_tell=card_unmapped(
+            ref=issue, column=column, option=stage_option(board),
+            language=getattr(proj, "language", None)))
+    return _Stage(key=key, column=column)
+
+
+def _stage_refusal(proj, board, issue: str, *, act: str = "edit",
+                   stage: _Stage | None = None) -> str:
+    """Why this card may not be edited (or closed), or `""` when it may (#150).
+
+    ONLY BEFORE THE FACTORY HAS IT. An agent works from the text it read at pickup, so an edit
+    afterwards moves the target under it with nobody seeing — the card is the factory's from that
+    moment, and a correction is a comment. `todo` and `backlog` are the operator's columns; the
+    other four are where `set_state` put the card, which is the platform's own record that it was
+    taken up (`adapters/board/columns.py`).
+
+    SIX ANSWERS, AND ONLY ONE OF THEM IS SILENCE. A project with no board cannot have moved the
+    card, an unreadable board cannot say, a card outside the project's slice of a shared board
+    (Jira's `scope_jql`) is another project's to judge, a card nobody put on the board has not
+    moved, a column this platform does not map cannot be judged, and a column it does map answers
+    outright. The three "cannot tell" cases REFUSE: letting an edit through on a card that may
+    already be running is the failure this gate exists to prevent, and it is the direction it must
+    not fail in.
+
+    CLOSING ASKS THE SAME QUESTION (review of #153). A card closed from the board while a job works
+    on it leaves the board with the job still running and nothing telling it, and a reopen then
+    puts it in Backlog as though nobody were on it. `act="close"` gets the same gate and says what
+    to do instead: stop the job first.
+
+    …AND THE CLOSE'S ANSWER IS ONLY HALF THE GATE (review of #191). What is written here is the
+    BOARD's half, and it stops at "may": `_card_close` then asks the engine whether a job really
+    is on the card, and this sentence is what stands when one is — running, waiting on nobody,
+    which is the single shape `stop` accepts.
+
+    …BUT NOT OF A CARD THE FACTORY HAS FINISHED WITH (#162). "Taken up" was read as "a job may be
+    running", and Done is the one column where that is false: the card was told to stop a job that
+    had ended, and triage meanwhile reported it as `done-but-open` and asked for the very close
+    this refused. A close is refused where `may_be_running`; a finished card closes, as delivered
+    (`_card_close`). An EDIT of one stays refused — the text is the record of what was asked — in
+    a sentence that is true of it: no job is coming to read a comment next."""
+    from beeverforge.adapters.board.columns import has_finished, has_started, may_be_running
+
+    at = stage if stage is not None else _stage(proj, board, issue)
+    if at.cannot_tell:
+        return at.cannot_tell
+    key, column = at.key, at.column
+    if act == "remove":
+        # ONLY BEFORE PICKUP, AND NARROWER THAN A CLOSE (#384). Removing is for the cheapest moment
+        # to drop work — nothing spent, nobody reading the card — and a card the factory has taken
+        # up is past it whether or not a job is still on it: what was spent and what was said on
+        # it is history a close keeps and a removal would erase. So `has_started`, not
+        # `may_be_running`, and the engine is never asked. Where a job may be on the card the
+        # close's own sentence stands — ONE copy of it, below; after the job, the sentence says
+        # what is left: close it.
+        if has_started(key) and not may_be_running(key):
+            return (f"{issue} is in {column!r} — the factory has already taken it up, so it can "
+                    f"no longer be removed: what was done and said on it is history. Close it "
+                    f"instead, and the reason stays on the card.")
+        act = "close"
+    if act == "close":
+        if may_be_running(key):
+            return (f"{issue} is in {column!r} — the factory has taken it up, and a job may be "
+                    f"working on it right now. Closing it would take it off the board with that "
+                    f"job still running and nothing telling it. Stop the job first (`stop`), or "
+                    f"say it on the card.")
+        return ""
+    if has_finished(key):
+        return (f"{issue} is in {column!r} — the factory delivered it from the text it read at "
+                f"pickup, and that text is the record of what was asked. Editing it now would "
+                f"rewrite that record. Say it on the card, or open a new card for what should "
+                f"change.")
+    if has_started(key):
+        return (f"{issue} is in {column!r} — the factory has taken it up, and it works from the "
+                f"text it read at pickup. Editing it now would move the target with nobody "
+                f"seeing. Say it on the card instead: a comment is what the factory reads next.")
+    return ""
+
+
+@dataclass(frozen=True)
+class _JobOnTheCard:
+    """What the ENGINE says about the job for one card — the half the board cannot answer.
+
+    `running` is True only when the engine said so. `waiting_on` and `answer_it` describe what
+    that job is parked on and the verb that answers it, both empty when it is parked on nothing.
+    `cannot_tell` is the sentence to refuse with when the engine could not be asked — kept apart
+    from "no job" for the reason the tracker port gives about every read it owns: a read that
+    could not be made is not a negative answer, and folding the two here would close a card from
+    under a running job the first time the engine blinked."""
+    running: bool = False
+    waiting_on: str = ""
+    answer_it: str = ""
+    cannot_tell: str = ""
+
+
+async def _job_on_the_card(project: str, issue: str) -> _JobOnTheCard:
+    """Whether a job is still on `issue`, asked of the engine rather than inferred from a column.
+
+    THE COLUMN IS NOT THE JOB, AND #162 FIXED ONLY THE CASE IT WAS FILED FOR (review of #191,
+    measured 2026-09-20 by reading the workflow). `may_be_running` answers for four columns, and
+    a job is genuinely alive in only some of them:
+
+      - `in_progress`: the job is inside `run_job` and nothing is waiting on a person, so `stop`
+        terminates it — the sentence and its remedy are both true.
+      - `in_review`: alive — `_watch_to_merge` holds the floor in `_ci_merge_loop` for up to
+        `merge_deadline_days`, so a card does keep its job through review. But it answers
+        `awaiting_merge`, and
+        `_stop` REFUSES a job at a gate: *"it is not stuck … answer it with `merge`, `adjust` or
+        `discard`"*. The remedy the close named was one this platform declines to perform.
+      - `needs_review` (#753): a pull request a person must review. The job is in
+        `_watch_to_merge` as for `in_review`, alive and answering at its merge gate, which
+        `_stop` refuses as it does there; a card left there by a job that has since ended is the
+        case the engine, not the column, has to answer.
+      - `needs_action`: the card is there in three ways and the job is gone in two of them. A park
+        holds on `wait_condition` (`_wait_operator`) and answers `awaiting_action`, which `_stop`
+        also refuses; the gather's question parks the card and RETURNS `SKIPPED`, completing the
+        workflow; and an elapsed impediment deadline returns the park untouched and completes with
+        the card left in Needs Action. In those last two *"a job may be working on it right now …
+        Stop the job first"* is false end to end — `stop` answers "there is no job for this card"
+        — and the card could never be closed at all. That is #162's own defect, one column over.
+
+    SO THE GATE ASKS THE ENGINE, and only where the column says it might matter: a card in Done,
+    Backlog or TO-DO never reaches here, so the close that #162 opened takes on no engine
+    dependency and the ordinary withdraw stays one board read."""
+    from beeverforge.runtime.temporal import connection
+    from beeverforge.runtime.temporal import view as tv
+    from beeverforge.util.causes import first_message
+
+    try:
+        connection.address()
+    except connection.EngineNotDeclared:
+        # NOWHERE FOR A JOB TO LIVE — an answer, not a failure to get one (#243, found reviewing
+        # #191). `--no-engine` is a supported shape: `run` and `poll` work without the engine and
+        # `JobRunner` writes these very columns on that attended path, so a card parked in Needs
+        # Action there is ordinary. Refusing it was PERMANENT — the remedy the refusal offers
+        # never resolves, and the `stop` the older sentence prescribed cannot run either — which
+        # is worse than the falsehood #191 replaced.
+        #
+        # ASKED OF `address()` RATHER THAN OF THE SENTENCE `_connected` returns. #163 gave this
+        # its own exception type precisely so a caller can degrade honestly instead of matching
+        # prose, and it is the one distinction this gate turns on: an engine that was never
+        # configured is not an engine that blinked, and only the second must keep refusing.
+        #
+        # WHAT THIS DOES NOT CLAIM: an attended `run` in somebody's terminal is invisible here,
+        # as it is to every other surface — the engine is the only register of jobs there is. The
+        # gate answers for the jobs this deployment can have, and on this one that is none.
+        return _JobOnTheCard()
+
+    client, unreachable = await _connected()
+    if unreachable:
+        # ITS OWN SENTENCE, NOT A SUMMARY OF IT. `_connected` names the cause, and the cause is
+        # what tells an operator whether the engine is down or was never configured on this
+        # deployment — two situations with different next moves, and one of them is not an outage.
+        return _JobOnTheCard(cannot_tell=(
+            f"there is no way to tell whether a job is still on {issue} — {unreachable.message} "
+            f"Closing a card from under a running job is what this gate exists for, so nothing "
+            f"was changed; say it on the card meanwhile."))
+    handle = client.get_workflow_handle(tv.job_id(project, issue))
+    try:
+        described = await handle.describe()
+    except Exception as exc:  # noqa: BLE001 — an engine that cannot answer is a state, not a crash
+        if _looks_missing(exc):
+            return _JobOnTheCard()   # no job was ever started for this card, or it aged out
+        log.info("card close: the engine did not describe the job for %s#%s (%s)",
+                 project, issue, str(exc)[:120])
+        return _JobOnTheCard(cannot_tell=(
+            f"the engine could not say whether a job is still on {issue} "
+            f"({first_message(exc, limit=120)}) — nothing was changed. Try again, or say it on "
+            f"the card."))
+    if str(tv.status_label(described.status)) != "running":
+        return _JobOnTheCard()       # it ended: whatever the column still says, nothing holds it
+    waiting = await _what_it_is_waiting_on(handle)
+    if waiting:
+        what, how = waiting
+        return _JobOnTheCard(running=True, waiting_on=what, answer_it=how)
+    return _JobOnTheCard(running=True)
+
+
+#: How each kind of card the product role opens is named in a refusal, and where the change is
+#: asked for instead.
+_OPENED_FROM = {
+    "requirement": ("from a requirement",
+                    " It changes the requirement first, and then realigns this card to it."),
+    "request": ("from a request somebody made in the conversation",
+                " It can correct the text there: “corrige o #N: …”."),
+    "defect": ("from a reported defect", " It can correct the text there: “corrige o #N: …”."),
+}
+
+
+def _opened_by(tracker, issue: str) -> tuple[str, str]:
+    """`(which of the product role's writers opened this card, "")` — `""` for a card written on
+    the board — or `("", why nobody can tell)` when the card could not be read (#150, #384).
+
+    ONE READ, TWO QUESTIONS. The edit asks it to refuse (`_product_owned_refusal`); the close and
+    the removal ask it to know WHOSE path the act goes through — the board's own, or the product
+    role's (`_by_the_product_role`). An unreadable card answers neither, and both refuse on it."""
+    from beeverforge.product.authoring import filed_by_the_product_role
+
+    try:
+        ticket = tracker.get_ticket(issue)
+    except Exception as exc:  # noqa: BLE001 — an unreadable card is an answer, and it refuses
+        log.warning("BEEVERFORGE_CARD_OWNER_UNREAD card=%s: could not read the card to tell who "
+                    "opened it, so the board's act is refused — %s", issue, exc)
+        return "", (f"{issue} could not be read, so there is no way to tell whether the product "
+                    f"role opened it — and a card it opened only the product owner may change. "
+                    f"Nothing was changed; try again.")
+    return filed_by_the_product_role(getattr(ticket, "raw", "") or ""), ""
+
+
+def _product_owned_refusal(tracker, issue: str, *, act: str) -> str:
+    """Why this card may not be `act`-ed from the board, or `""` when it may (#150).
+
+    A CARD THE PRODUCT ROLE OPENED IS THE PRODUCT OWNER'S, in every column. Written on the board it
+    is correctable until pickup (`_stage_refusal`); opened from a requirement, a request or a defect
+    it is what somebody asked for, and only they change it — through the product role, which keeps
+    the requirement and the card saying the same thing. Decided on #150 in place of "record the edit
+    and ask again": the second yes accepts the requirement, so a yes on an edited card would accept
+    a text no requirement holds.
+
+    A CARD THAT CANNOT BE READ REFUSES. Whether the product role opened it is the question, and
+    letting the act through on a card that may be somebody's promise is the direction this must not
+    fail in — the same choice `_stage_refusal` makes about a board it cannot read.
+
+    NOW ASKED OF AN EDIT AND A REOPEN ONLY (#384). A close or a removal of such a card is no longer
+    refused: it goes through the product role's own path (`_by_the_product_role`), because
+    dropping a card creates none of the drift this rule exists for — no job reads it, and the role
+    records the drop itself. Changing what the card SAYS still does, and stays refused here."""
+    kind, unreadable = _opened_by(tracker, issue)
+    if unreadable:
+        return unreadable
+    if not kind:
+        return ""
+    source, then = _OPENED_FROM[kind]
+    return (f"{issue} was opened by the product role {source}, so only the product owner {act} it. "
+            f"Nothing was changed. Ask for it in the conversation with the product role.{then}")
+
+
+async def _card_edit(*, project: str, issue: str, by: Actor, title: str = "",
+                     body: str = "") -> Outcome:
+    """Correct a card's title or description, before the factory has taken it up."""
+    import asyncio
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    wanted_title, wanted_body = (title or "").strip(), (body or "").strip()
+    if not wanted_title and not wanted_body:
+        return refused(INVALID, "say what to change — an edit carrying neither a title nor a "
+                                "description changes nothing.")
+
+    # ASKED OF THE ROW, NOT OF THE PORT (#150). Renaming is not something every tracker can be
+    # made to do, and putting it on `TrackerAdapter` would fail every adapter a stranger already
+    # shipped — measured: it also made `check_tracker` report the missing method INSTEAD of the
+    # read-side findings it exists for. `say` on this axis is reached the same way.
+    # WHOSE CARD AND WHICH STAGE FIRST, then whether this tracker can rename: a card the product
+    # role opened is refused for that, which is the reason a person can act on, rather than for a
+    # capability that would not have mattered (review of #153).
+    stage = await asyncio.to_thread(_stage, proj, board, issue)
+    refusal = (await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="changes")
+               or _stage_refusal(proj, board, issue, stage=stage))
+    if refusal:
+        return refused(CONFLICT, refusal)
+
+    rename = getattr(tracker, "update_title", None)
+    if wanted_title and rename is None:
+        return refused(INVALID,
+                       f"{proj.name}'s tracker cannot rename a card from here — it can only change "
+                       f"the description. Rename it in the tracker's own screen, or send this "
+                       f"edit without a title.")
+
+    def _plan() -> tuple[bool, list[str]]:
+        """`(whether the title moves, the sections of the body that do)`.
+
+        ONLY WHAT MOVED IS WRITTEN, AND NAMED (#150). The panel's form sends the title and the
+        whole body on every save, so writing what was sent recorded every save as a rewrite of
+        both. The card as it stands is read first; a title that is the same is not renamed, a
+        body that says the same thing is not rewritten, and the note lists the sections that did
+        change. A save that changes nothing writes nothing, leaves no note and goes through no
+        door: nothing happened to the card."""
+        from beeverforge.adapters.tracker.parse import changed_sections
+
+        current = tracker.get_ticket(issue)
+        renamed = bool(wanted_title and wanted_title != (current.title or "").strip())
+        sections = (changed_sections(getattr(current, "raw", "") or "", wanted_body)
+                    if wanted_body else [])
+        return renamed, sections
+
+    try:
+        renamed, sections = await asyncio.to_thread(_plan)
+    except Exception as exc:  # noqa: BLE001 — the card could not be read, so nothing was written
+        return refused(UNAVAILABLE, f"nothing was changed on {issue}: {exc}")
+    if not renamed and not sections:
+        line = (f"nothing to change on {issue} — its title and description already say what was "
+                f"sent ({by})")
+        said, gate = _as_pickup_would(line, await asyncio.to_thread(_pickup_says, tracker, issue))
+        return done(said, project=proj.name, issue=str(issue), changed="", **gate)
+
+    landed: dict[str, object] = {"changed": [], "failure": ""}
+    # THE NOTE IS THE WRITE'S TO NAME: which parts moved is known only once the write ran, inside
+    # the door (`act`), so it fills these facts there — the door reads them after its `act`
+    facts: dict[str, object] = {}
+
+    async def write() -> Outcome | None:
+        """The text, written between the door's `allowed` and its record (ADR-0055, #414).
+
+        EACH WRITE IS ITS OWN OUTCOME (review of #153). The rename and the body are separate
+        tracker calls — two `gh` invocations on GitHub — and one `except` around them answered
+        "nothing was changed" over a card already renamed; a retry then found the title matching
+        and the rename was never recorded at all. What landed is the transition, and its note — the
+        door's comment, in the project's language (#160) — says which parts; a write that landed
+        nothing is refused, and nothing is recorded."""
+        from beeverforge.product.voice import card_edit_note
+
+        def _write() -> tuple[list[str], str]:
+            changed: list[str] = []
+            try:
+                if renamed:
+                    rename(issue, wanted_title)
+                    changed.append("title")
+                if sections:
+                    tracker.update_body(issue, wanted_body)
+                    changed.extend(sections)
+            except Exception as exc:  # noqa: BLE001 — what landed before it is still reported
+                return changed, str(exc) or type(exc).__name__
+            return changed, ""
+
+        changed, failure = await asyncio.to_thread(_write)
+        landed.update(changed=changed, failure=failure)
+        if not changed:
+            return refused(UNAVAILABLE, f"nothing was changed on {issue}: {failure}")
+        facts["note"] = card_edit_note(who=str(by), parts=changed,
+                                       language=getattr(proj, "language", None))
+        return None
+
+    from beeverforge.lifecycle import CardEvent
+    from beeverforge.product.voice import card_edit_parts
+
+    moved = await _through_the_door(proj, issue, CardEvent.EDITED, by=by, facts=facts, act=write,
+                                    tracker=tracker, board=board, stage=stage)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    changed, failure = list(landed["changed"]), str(landed["failure"])
+    what = card_edit_parts(changed, language="en")
+    # EVERY EDIT LEAVES A RECORD, in the platform's own voice rather than the person's: the note is
+    # ABOUT what somebody did, and `update_body` is a port method of its own so that rewriting
+    # somebody else's text is visible. A note the tracker refused is a failed effect of a recorded
+    # transition, and the hourly round leaves it.
+    noted = not moved.outcome("comment").startswith("failed")
+    if not noted:
+        log.warning("BEEVERFORGE_CARD_EDIT_UNNOTED card=%s: %s changed and the note recording it "
+                    "could not be left — %s", issue, ",".join(changed), moved.outcome("comment"))
+    if failure:
+        record = ("the thread records what did" if noted
+                  else "and nothing on the thread records it yet")
+        return refused(UNAVAILABLE, f"only {what} of {issue} changed — the rest of the edit did "
+                                    f"not: {failure}. {record[0].upper()}{record[1:]}.",
+                       project=proj.name, issue=str(issue), changed=",".join(changed))
+    unnoted = "" if noted else ", but the note recording it could not be left on the card"
+    line = f"edited {what} of {issue} ({by}){unnoted}"
+    said, gate = _as_pickup_would(line, await asyncio.to_thread(_pickup_says, tracker, issue))
+    return _after_the_door(moved, done(said,  # the operator's line
+                                       project=proj.name, issue=str(issue),
+                                       changed=",".join(changed), **gate))
+
+
+async def _withdraw_refusal(proj, board, issue: str, *, remove: bool) -> tuple[_Stage, str]:
+    """`(where the card is, why it may not be closed — or removed — now)`, `""` when it may.
+
+    THE ONE GATE BOTH SURFACES' CONTROLS ASK (#384), taken out of `_card_close` whole, so the
+    product view's "Close card" is refused where the board's is and for the same sentence — a
+    second copy is where one surface would come to close a card from under a running job.
+
+    A CLOSE reads the board once (for the refusal AND for the word it records, #162) and asks the
+    engine only where the column says a job may be on the card (review of #191). A REMOVAL asks
+    only the board: it is refused on every card the factory has taken up, job or no job
+    (`_stage_refusal`), so the engine has nothing to add."""
+    import asyncio
+
+    stage = await asyncio.to_thread(_stage, proj, board, issue)
+    if remove:
+        return stage, _stage_refusal(proj, board, issue, act="remove", stage=stage)
+    refusal = _stage_refusal(proj, board, issue, act="close", stage=stage)
+    if refusal and not stage.cannot_tell:
+        # THE COLUMN SAYS A JOB *MAY* BE ON IT; THE ENGINE SAYS WHETHER ONE IS (review of #191).
+        # `_job_on_the_card` has the measurement: a card in Needs Action is often one no job is on
+        # at all, and there the refusal's whole sentence — and the `stop` it prescribes — is
+        # false, which is #162's defect one column over. A board that could not be read is NOT
+        # asked: that refusal is about the board, and an engine answering "no job" would turn a
+        # card nobody can place into a card anybody can close.
+        job = await _job_on_the_card(proj.name, issue)
+        if job.cannot_tell:
+            refusal = job.cannot_tell
+        elif not job.running:
+            refusal = ""            # nothing holds the card: the close is the operator's to make
+        elif job.answer_it:
+            refusal = (f"{issue} is in {stage.column!r} and its job is waiting on "
+                       f"{job.waiting_on} — closing the card would leave that job holding the "
+                       f"floor with nothing telling it. Answer it with `{job.answer_it}` first; "
+                       f"the card closes once no job is on it.")
+        # else: a job is running and waiting on nobody, which is exactly what `_stage_refusal`
+        # describes and the one shape `stop` accepts. Its sentence stands.
+    return stage, refusal
+
+
+async def _by_the_product_role(proj, issue: str, *, by: Actor, reason: str, remove: bool,
+                               delivered: bool, vouched: bool) -> Outcome:
+    """Close or remove a card THROUGH THE PRODUCT ROLE — the path a card it opened takes from
+    either surface's control, and the product view's for every card (#384).
+
+    THE BOARD ASKS THE ROLE, THE ROLE WRITES. `withdraw_card` is `close_card`'s own close (and the
+    tracker's own removal), so the requirement and the card stay saying the same thing and the
+    conversation the card was asked in is told. The gate that says whether the card may be touched
+    YET is the caller's, asked before this (`_withdraw_refusal`). `vouched` is True only from a
+    floor row, which the action layer let only a floor admin reach."""
+    import asyncio
+
+    from beeverforge.contracts.refs import canonical_ref
+
+    module, _proj, bad = _product_module(proj.name, by=by)
+    if bad:
+        return bad
+    result = await asyncio.to_thread(
+        lambda: module.withdraw_card(canonical_ref(issue), actor=by.id, reason=reason,
+                                     remove=remove, delivered=delivered, vouched=vouched))
+    return _write_outcome(result, did=f"{'removed' if remove else 'closed'} {issue}",
+                          project=proj.name, issue=str(issue), removed=bool(remove),
+                          delivered=bool(delivered), through="product")
+
+
+async def _card_close(*, project: str, issue: str, by: Actor, reason: str = "") -> Outcome:
+    """Take a card off the board, with a reason — the operator's own 'this should not be here'."""
+    import asyncio
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    # A REASON OF ONLY SPACES IS NO REASON. `required` makes `perform` refuse a reason that is
+    # missing or exactly `""` — equality, not emptiness — so `"   "` reached this row and closed the
+    # card with a note ending in a space. This check was once removed as dead, on a surviving
+    # mutation row; the row survived because nothing drove a whitespace-only reason (review of
+    # #153), which is a weak guard, not dead code.
+    said = (reason or "").strip()
+    if not said:
+        return refused(INVALID, "say why the card is being closed — the reason is what the next "
+                                "reader of the card has, and one made only of spaces says nothing.")
+    # WHOSE CARD FIRST — BUT NO LONGER TO REFUSE IT (#384). A card the product role opened was
+    # refused here ("only the product owner closes it … ask for it in the conversation"), and the
+    # person who wanted it gone had no button that worked anywhere. It now goes through the role's
+    # own path below; a card nobody can read still refuses, for #150's reason.
+    kind, unreadable = await asyncio.to_thread(_opened_by, tracker, issue)
+    if unreadable:
+        return refused(CONFLICT, unreadable)
+    # ONE READ OF THE BOARD, for the refusal AND for the word the close records (#162).
+    stage, refusal = await _withdraw_refusal(proj, board, issue, remove=False)
+    if refusal:
+        return refused(CONFLICT, refusal)
+
+    from beeverforge.adapters.board.columns import has_finished
+
+    # THE COLUMN DECIDES THE WORD, NOT THE CALLER (#162). An operator closing a card from the board
+    # means "this should not be on my board", never "this shipped" — and `triage.Ticket.delivered`
+    # reads exactly this word: eleven cards closed as duplicates once came back downstream as
+    # completed work. A card in Done is the mirror image. It DID ship, this is the only close verb
+    # a board has, and recording it as withdrawn would drop delivered work from every account of
+    # what was delivered. So nobody chooses: finished work closes as delivered, everything else
+    # as not.
+    delivered = has_finished(stage.key)
+    if kind:
+        return await _by_the_product_role(proj, issue, by=by, reason=said, remove=False,
+                                          delivered=delivered, vouched=True)
+
+    # THROUGH THE CARD'S DOOR (ADR-0055), whose close goes through the port's own seam
+    # (`tracker/base.py::close_ticket`, #203) and is followed by `closed`'s row of the table: the
+    # requester told, the promise cancelled, the preview down, the snapshot forgotten — none of
+    # which this row's own close did.
+    from beeverforge.lifecycle import CardEvent
+
+    moved = await _through_the_door(proj, issue, CardEvent.CLOSED, by=by, why=said,
+                                    facts={"delivered": delivered}, tracker=tracker, board=board,
+                                    stage=stage)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    if moved.outcome("close").startswith("failed") and not moved.recorded:
+        return refused(UNAVAILABLE, f"{issue} is still open: {moved.outcome('close')}")
+    how = (f"as delivered, because it was in {stage.column!r} — what it shipped stays on the "
+           f"record" if delivered else "it is off the board, not deleted")
+    return _after_the_door(moved, done(f"closed {issue} ({by}) — {how}, and its thread is intact",
+                                       project=proj.name, issue=str(issue), delivered=delivered))
+
+
+async def _card_remove(*, project: str, issue: str, by: Actor, reason: str = "") -> Outcome:
+    """Remove a card nobody has started from the board, with a reason (#384).
+
+    THE CHEAPEST MOMENT TO DROP WORK HAD NO VERB. A card in Backlog that nobody has picked up, filed
+    wrong or twice or no longer wanted, could only be CLOSED — kept in the tracker's history as
+    withdrawn, counted by triage, shown on every list that includes closed cards. This is the
+    removal, and it is allowed only where it cannot hide anything: before pickup (`_stage_refusal`
+    with `act="remove"`); after it, the close is the verb, and the refusal says so.
+
+    WHAT "REMOVE" MEANS IS THE TRACKER ROW'S (`tracker/base.py::remove_ticket`): the local board
+    deletes the card, never reuses its number and keeps an audit line; a row with no removal of its
+    own closes it as not delivered, and this answer says the card stays in that tracker's history.
+    A card the product role opened is removed THROUGH the role (`_by_the_product_role`)."""
+    import asyncio
+
+    proj, tracker, board, bad = _board_pair(project)
+    if bad:
+        return bad
+    said = (reason or "").strip()
+    if not said:
+        return refused(INVALID, "say why the card is being removed — the reason is what the audit "
+                                "keeps, and one made only of spaces says nothing.")
+    kind, unreadable = await asyncio.to_thread(_opened_by, tracker, issue)
+    if unreadable:
+        return refused(CONFLICT, unreadable)
+    stage, refusal = await _withdraw_refusal(proj, board, issue, remove=True)
+    if refusal:
+        return refused(CONFLICT, refusal)
+    if kind:
+        return await _by_the_product_role(proj, issue, by=by, reason=said, remove=True,
+                                          delivered=False, vouched=True)
+
+    # THROUGH THE CARD'S DOOR (ADR-0055): a card that is already closed is refused by its table
+    # (`removed` is not allowed from `closed`), and the removal is followed by what the card's
+    # removal means for the promise, the requester and the preview.
+    from beeverforge.lifecycle import CardEvent
+
+    moved = await _through_the_door(proj, issue, CardEvent.REMOVED, by=by, why=said,
+                                    tracker=tracker, board=board, stage=stage)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    if moved.outcome("remove").startswith("failed") and not moved.recorded:
+        return refused(UNAVAILABLE, f"{issue} is still on the board: {moved.outcome('remove')}")
+    removed = moved.outcome("remove") == "removed"
+    how = ("it is gone from the board, its number will not be used again, and who removed it, "
+           "when and why is kept" if removed else
+           "this tracker can only close a card, so it was closed as not delivered and stays in "
+           "the tracker's history")
+    return _after_the_door(moved, done(f"removed {issue} ({by}) — {how}", project=proj.name,
+                                       issue=str(issue), removed=removed))
+
+
+def card_view(proj, tracker, board, ref: str, *, opened_by: str, column: str | None = None,
+              state: str = "open") -> dict:
+    """What a card's close and remove controls need to know, for BOTH surfaces (#384): whether the
+    factory has taken the card up, whether it finished it, whether this tracker REMOVES or can only
+    close, and the words the controls and the sentence under the card carry, in the project's
+    language (`voice.card_controls`).
+
+    `started` IS A HINT TO THE PAGE, NEVER THE GATE. It spares a person a button the row would
+    refuse; the row asks the board again when the button is pressed (`_withdraw_refusal`). A column
+    this platform does not map reads as not started here, and the row refuses it by name."""
+    from beeverforge.adapters.board.base import stage_key
+    from beeverforge.adapters.board.columns import has_finished, has_started
+    from beeverforge.adapters.tracker.base import removes
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.product.voice import card_controls
+
+    if column is None and board is not None:
+        try:
+            placed = board.columns() or {}
+        except Exception:  # noqa: BLE001 — a hint, not a gate
+            log.info("could not read where %s is to draw its controls — the row asks again when "
+                     "one is pressed", ref, exc_info=True)
+            placed = {}
+        column = placed.get(canonical_ref(ref)) or placed.get(str(ref)) or ""
+    key = stage_key(board, column) if (board is not None and column) else ""
+    started, finished = has_started(key), has_finished(key)
+    can_remove = removes(tracker)
+    return {"started": started, "finished": finished, "removes": can_remove,
+            "open": (state or "open") == "open",
+            # `finished` is the same reading `_card_close` decides `delivered` with, so the control
+            # says the word the close will record (#534)
+            "words": card_controls(opened_by_product=bool(opened_by), started=started,
+                                   removes=can_remove, finished=finished,
+                                   language=getattr(proj, "language", None))}
+
+
+async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
+    """Put a closed card back — the undo a close on the only surface an operator has must have."""
+    import asyncio
+
+    proj, tracker, _board, bad = _board_pair(project)
+    if bad:
+        return bad
+    owned = await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="reopens")
+    if owned:
+        return refused(CONFLICT, owned)
+
+    # NAMED, NOT `getattr`-ed, AND ONLY THE LOOKUP IS GUARDED. `reopen_ticket` is not on the tracker
+    # port (#150: putting it there made `check_tracker` report the missing method instead of the
+    # read-side findings it exists for), but `test_the_action_layer.py` asks every action row for a
+    # marker the catalog USES — and a string inside `getattr` is not a name. The `AttributeError`
+    # branch once wrapped the reopen AND its note, so an `AttributeError` from the note described a
+    # card that had been reopened as one this tracker cannot reopen (review of #153).
+    try:
+        tracker.reopen_ticket  # noqa: B018 — asked before the door records a reopen it cannot do
+    except AttributeError:
+        return refused(INVALID,
+                       f"{proj.name}'s tracker cannot reopen a card from here. Reopen it in the "
+                       f"tracker's own screen — the card, its thread and its number are all still "
+                       f"there, because closing never deleted anything.")
+    # THROUGH THE CARD'S DOOR (ADR-0055). Its table allows a reopen of a CLOSED card only: this row
+    # once reopened an open one, and on the local board that threw a card in progress back into
+    # Backlog. The note saying who reopened it is the door's comment, and the promise the close
+    # cancelled waits on the card again.
+    from beeverforge.lifecycle import CardEvent
+
+    moved = await _through_the_door(proj, issue, CardEvent.REOPENED, by=by, tracker=tracker,
+                                    board=_board)
+    bad = _refusal_of(moved)
+    if bad:
+        return bad
+    if moved.outcome("reopen").startswith("failed") and not moved.recorded:
+        return refused(UNAVAILABLE, f"{issue} is still closed: {moved.outcome('reopen')}")
+    reopened = f"reopened {issue} ({by}) — it is back on the board for somebody to pick up"
+    if moved.outcome("comment").startswith("failed"):
+        # TWO WRITES, TWO OUTCOMES: the card IS open, whatever happens to the note that says who
+        log.warning("BEEVERFORGE_CARD_REOPEN_UNNOTED card=%s: reopened, and the note saying who "
+                    "reopened it could not be left — %s", issue, moved.outcome("comment"))
+        reopened += ", but the note saying who reopened it could not be left on the card"
+    return _after_the_door(moved, done(reopened, project=proj.name, issue=str(issue)))
+
+
+async def _pr_merge(*, project: str, pr: str, by: Actor) -> Outcome:
+    """Land a pull request NO DURABLE JOB IS WAITING ON — the local forge's own fast-forward.
+
+    THE `merge` ROW ANSWERS A GATE; THIS ONE PERFORMS AN ACT, and the difference is which world
+    the pull request is in. `merge` signals a workflow parked inside its merge watch: the engine
+    is holding the job, the answer travels as a signal, and the workflow does the landing with
+    everything after it — the deploy watch, the promotion chain — still ahead. A pull request that
+    no job is waiting on has no gate to answer: one `beeverforge run`, one `poll` on a machine
+    with no engine up, or a card whose job ended at `pr_open`. Answering a gate that is not there
+    comes back "not waiting on a merge", which is true and useless — the pull request is open, the
+    person is looking at it, and the only way to land it was git by hand.
+
+    LOCAL ONLY, AND THE REFUSAL SAYS WHY. On a hosted forge the merge is the workflow's: the CI
+    the platform observes, the branch protection the vendor enforces and the promotion chain all
+    live on the other side of that button. For `forge.local` the fast-forward IS the whole act —
+    the same one the workflow would perform — so performing it here changes nothing about what
+    lands, only about who asked.
+
+    GIT'S OWN SENTENCE ON A REFUSAL. `merge_pr` raises with what git said, and this hands it
+    through: the file that is in the way is named in it, and the person is standing in the
+    repository it is about."""
+    found, bad = _project(project)
+    if bad:
+        return bad
+    kind = (getattr(getattr(found, "forge", None), "kind", "") or "").strip().lower()
+    if kind != "local":
+        return refused(
+            INVALID,
+            f"this project's forge is {kind or 'not local'}, and there the merge belongs to the "
+            f"job that opened the pull request: the CI this platform observes, the branch "
+            f"protection your vendor enforces and the promotion chain are all on the other side "
+            f"of it. Answer the job's own gate with `merge`, or merge it at the forge.")
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+
+    forge = build_forge(found, token=forge_token_for(found) or deployment_forge_token(found))
+    try:
+        forge.merge_pr(pr=pr)
+    except Exception as exc:  # noqa: BLE001 — the refusal IS the answer, in git's own words
+        return refused(CONFLICT, str(exc)[:2000])
+    # WHAT THE SENTENCE CLAIMS IS WHAT IS TRUE ON EVERY REPOSITORY. It said "nothing else was
+    # touched" until #142: on the installation's bare context repository a proposal whose base moved
+    # is rebased before the fast-forward, so its branch WAS touched, and `merge_pr` returns nothing
+    # this line could tell the two cases apart by.
+    return done(f"{pr} merged — its commits are on the base now, fast-forwarded, "
+                "with no merge commit.",
+                project=found.name, pr=pr, by=str(by))
+
+
+async def _card_comment(*, project: str, issue: str, message: str, by: Actor) -> Outcome:
+    """Say something on a card, in the person's own name."""
+    import asyncio
+
+    proj, tracker, _board, bad = _board_pair(project)
+    if bad:
+        return bad
+    said = (message or "").strip()
+    if not said:
+        return refused(INVALID, "an empty comment says nothing — write what you want to say.")
+
+    def _say() -> None:
+        # IN THE PERSON'S NAME WHERE THE ROW CAN, and as the platform otherwise. The answer sweep
+        # accepts a comment only from the requester and not from the platform's own posting
+        # identity (ADR-0048 §6), so a person's answer written as the bot is an answer that never
+        # counts — and the sweep would chase them for something they had already written.
+        say_as = getattr(tracker, "say", None)
+        if say_as is not None:
+            say_as(issue, said, author=by.id)
+        else:
+            tracker.comment(issue, said)
+
+    try:
+        await asyncio.to_thread(_say)
+    except Exception as exc:  # noqa: BLE001 — see `_card_create`
+        return refused(UNAVAILABLE, f"nothing was posted on {issue}: {exc}")
+    return done(f"said it on {issue} ({by})", project=proj.name, issue=str(issue))
+
+
+async def _product_file_ticket(*, project: str, title: str, by: Actor, body: str = "",
+                               yes: object = False) -> Outcome:
+    """Open a card as the person described it — no requirement behind it, nothing started."""
+    import asyncio
+
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    name = (title or "").strip()
+    if not name:
+        return refused(INVALID, "say what the card is called — an empty title opens nothing.")
+    if not _said_yes(yes):
+        return refused(INVALID, "nothing was opened: this puts a card on the client's board and "
+                                "needs `yes`.")
+    result = await asyncio.to_thread(
+        lambda: module.file_ticket(title=name, described=(body or "").strip(),
+                                   reported_by=by.id))
+    return _write_outcome(result, did="opened the card", project=proj.name)
+
+
+async def _product_card(verb: str, *, project: str, number: str, by: Actor,
+                        requirement: int = 0, yes: object = False) -> Outcome:
+    """`refine` or `align` one card — dispatched to the worker, because both run an agent pass.
+
+    ONE HELPER FOR TWO ROWS: they differ only in the verb and in whether a requirement travels,
+    and two copies of this dispatch would be two places for the timeout and the refusal to drift.
+    """
+    module, proj, bad = _product_module(project, by=by)
+    if bad:
+        return bad
+    ref = str(number or "").strip().lstrip("#")
+    if not ref:
+        return refused(INVALID, "say which card.")
+    if not _said_yes(yes):
+        return refused(INVALID, f"nothing was written: rewriting #{ref} needs `yes`.")
+
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import ProductCardInput
+
+    try:
+        raw = await client.execute_workflow(
+            "ProductCardWorkflow",
+            ProductCardInput(project=proj.name, number=ref, verb=verb,
+                             requirement=requirement, actor=by.id),
+            id=f"beeverforge-product-card-{verb}-{proj.name}-{ref}", task_queue=TASK_QUEUE)
+    except Exception as exc:  # noqa: BLE001 — a write path must degrade, never raise
+        # the module raising on the worker lands here: the reference is in the line and in the
+        # answer (#908) — on a647d604 a 500 with `data={"project", "reason"}`
+        reference = failure_reference()
+        log.exception("the product role could not %s #%s on %s reference=%s (%s)", verb, ref,
+                      proj.name, reference, exc)
+        return refused(FAILED, f"I could not rewrite #{ref} just now.", project=proj.name,
+                       reference=reference)
+
+    # The activity returns the `WriteResult`'s fields as data (it crossed a Temporal boundary);
+    # `_write_outcome` reads them off an object, so it is handed one. Missing keys fall through to
+    # its own defaults, which is why this is a namespace rather than a re-validated model.
+    from types import SimpleNamespace
+
+    return _write_outcome(SimpleNamespace(**(raw or {})), did=f"{verb}d #{ref}",
+                          project=proj.name)
+
+
+async def _product_refine_card(*, project: str, number: str, by: Actor,
+                               yes: object = False) -> Outcome:
+    """Give a backlog ticket something testable to be judged against.
+
+    The most common reason a job parks is a ticket nobody can evaluate. The module REFUSES one
+    that already says when it would be done, and that refusal arrives here as `existed`."""
+    return await _product_card("refine", project=project, number=number, by=by, yes=yes)
+
+
+async def _product_align_card(*, project: str, number: str, requirement: str, by: Actor,
+                              yes: object = False) -> Outcome:
+    """Make a card execute the requirement it should — the citation AND what it must satisfy."""
+    num, bad_num = _requirement_number(requirement)
+    if bad_num:
+        return bad_num
+    return await _product_card("align", project=project, number=number, by=by,
+                               requirement=num, yes=yes)
+
+
+def _requirement_number(raw: str) -> tuple[int, Outcome | None]:
+    """`REQ-0007`, `#7`, `7` → 7. A refusal names what it got, because the alternative is acting on
+    a number nobody meant."""
+    text = str(raw or "").strip().lstrip("#").upper().removeprefix("REQ-")
+    if not text.isdigit():
+        return 0, refused(INVALID, f"{raw!r} is not a requirement number — say `7`, `#7` or "
+                                   f"`REQ-0007`.")
+    return int(text), None
+
+
+
+async def _env_context(*, target: str, by: Actor, ask: object = False,
+                       write: str = "", yes: object = False) -> Outcome:
+    """Survey a repository and PROPOSE the context an agent will read from then on.
+
+    THE OTHER HALF OF `env_read`, AND THE BIGGER ONE. `env_read` proposes how to BUILD the project;
+    this proposes what the project IS — what it does, its vocabulary, its entry points, its
+    invariants, and the questions only a developer can answer. On a legacy codebase that is the
+    real work: the manifest is four fields, and the context is why anybody can write a requirement
+    that means something in this domain.
+
+    TWO MODES, AND THE FREE ONE IS THE DEFAULT.
+
+    Without `ask`, this is DETERMINISTIC and costs nothing: the modules, the entry points, the
+    domain words taken from file names and public symbols, and — the measurement that matters on a
+    legacy repository — how many modules describe themselves by their own folder name, which is the
+    deterministic reader working correctly and producing nothing.
+
+    With `ask`, ONE read-only agent pass adds the semantic layer. `beeverforge/knowledge` says of
+    itself
+    "never an LLM, never invented", and that is correct for an artefact regenerated at every merge.
+    It is not this artefact: an agent proposing "this system does X, its entities are Y" is not
+    hallucinating when a developer corrects it in the room. What makes it safe is not the promise —
+    it is that every citation is checked against the filesystem before its sentence is allowed to
+    exist, and a claim whose citation does not resolve is DEMOTED into a question carrying the
+    sentence and the bad citation together.
+
+    THE PASS IS REFUSED WHERE IT CANNOT RUN, AND THAT IS MEASURED RATHER THAN ASSUMED. The harness
+    binary is looked for on this process's PATH: the panel serves HTTP from an image that has no
+    coding agent in it (ADR-0038 — the worker runs agents), and letting the pass start there would
+    hang a request for the harness timeout and then report a model failure, which is a claim about
+    the model and not about us. `which` answers that in microseconds, on whichever machine is
+    actually asking.
+
+    `write` NEEDS `yes`, and never overwrites. These are documents about somebody else's codebase.
+    """
+    import asyncio
+
+    from beeverforge.util.causes import first_message
+
+    where = _measured_on(by)
+    project, checkout, bad = repo_for(target)
+    if bad:
+        return bad
+    if checkout is None:  # unreachable by construction; a silent None here would print nothing
+        return refused(FAILED, f"could not resolve {target!r} to a repository.")
+
+    try:
+        from beeverforge.onboarding import context as ctx
+    except ImportError as exc:
+        return refused(
+            UNAVAILABLE,
+            f"this deployment has no context module ({first_message(exc, limit=120)}) — "
+            f"`beeverforge.onboarding.context` is what surveys a repository and proposes its "
+            f"documentation. Nothing was read.")
+
+    wants_ask = _said_yes(ask)
+    ask_fn = None
+    if wants_ask:
+        # BUILT BEFORE THE WALK, so a harness nobody can run fails in front of a client with the
+        # sentence that names the configuration, rather than after a survey of their monolith.
+        try:
+            ask_fn = _semantic_pass(project, checkout, ctx)
+        except (TypeError, ValueError) as exc:
+            return refused(INVALID, str(exc))
+        except FileNotFoundError as exc:
+            return refused(UNAVAILABLE, str(exc))
+
+    try:
+        survey = await asyncio.to_thread(ctx.survey, str(checkout))
+    except Exception as exc:  # noqa: BLE001 — a client's repository may be anything at all
+        log.exception("env_context failed surveying %s", checkout)
+        return refused(
+            FAILED,
+            f"could not survey {checkout} ({first_message(exc, limit=200)}) — nothing was written "
+            f"and nothing is proposed. This is the platform's fault, not the repository's.")
+
+    try:
+        proposal = await asyncio.to_thread(
+            lambda: ctx.propose_context(survey, ask=ask_fn, docs_root=write or None))
+        report = ctx.render_context_report(proposal)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("env_context failed proposing for %s", checkout)
+        return refused(
+            FAILED,
+            f"surveyed {checkout} and could not shape the proposal "
+            f"({first_message(exc, limit=200)}). Nothing was written.")
+
+    modules = len(getattr(survey, "modules", ()) or ())
+    questions = len(getattr(proposal, "questions", ()) or ())
+    common = dict(project=(project.name if project is not None else None), target=str(checkout),
+                  measured_on=where, semantic=bool(getattr(proposal, "semantic", False)),
+                  asked=int(getattr(proposal, "asked", 0) or 0), report=report,
+                  questions=list(getattr(proposal, "questions", ()) or []),
+                  documents=[d.path for d in (getattr(proposal, "documents", ()) or [])])
+
+    # A FAILED AGENT PASS IS A REFUSAL, NOT A THINNER REPORT. `propose_context` returns the
+    # deterministic documents either way — correctly, they were never the model's — but an outcome
+    # that came back `ok` with the semantic half missing would read as "your code says nothing",
+    # which is a claim about the client while the truth is a claim about us. The report travels
+    # with the refusal, so nothing measured is lost.
+    if not getattr(proposal, "ok", True):
+        return refused(FAILED, str(getattr(proposal, "refusal", "") or
+                                   "the agent pass did not land"), **common)
+
+    if not write:
+        return done(
+            f"surveyed {checkout} — {modules} modules, {questions} questions only your developers "
+            f"can answer. Nothing was written.", **common)
+
+    if not _said_yes(yes):
+        return refused(
+            INVALID,
+            f"nothing was written: writing into {write} needs `yes` (`--yes`). These are documents "
+            f"about somebody else's codebase, and putting them in their repository is a decision "
+            f"said out loud, not a side effect of producing them.", **common)
+
+    outcome = await asyncio.to_thread(
+        lambda: ctx.write_documents(proposal, write, consent=True))
+    if outcome.refusal:
+        return refused(INVALID, outcome.refusal, **common)
+    common.update(wrote=list(outcome.wrote), skipped=list(outcome.skipped),
+                  failed=list(outcome.failed), docs_root=write)
+    if outcome.failed:
+        return refused(
+            FAILED,
+            f"{len(outcome.wrote)} document(s) written and {len(outcome.failed)} that could not "
+            f"be: {'; '.join(outcome.failed)}", **common)
+    return done(
+        f"{len(outcome.wrote)} document(s) written into {write}"
+        + (f", {len(outcome.skipped)} left untouched because a file was already there"
+           if outcome.skipped else "")
+        + f" — {questions} questions only your developers can answer.", **common)
+
+
+def _semantic_pass(project, checkout: Path, ctx):
+    """The read-only agent primitive `propose_context` takes, bound to THIS deployment's harness.
+
+    Raises rather than returning None on every failure, because each one is a different sentence a
+    human acts on: no harness configured, a harness that cannot judge, or a harness that is not
+    installed on the machine being asked."""
+    import shutil
+
+    from beeverforge.adapters.agent import build_asker
+    from beeverforge.adapters.agent.registry import harness_binary, harness_kind
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.registry import judging_worktree
+
+    kind = harness_kind(project, "techlead")
+    binary = harness_binary(kind)
+    if shutil.which(binary) is None:
+        # WHAT THIS MEASURES, AND WHAT IT DOES NOT. A product row used to make the same check to
+        # keep agent work off the panel, and that use was DELETED because it does not do it:
+        # measured inside the running panel container, `claude` is at `/usr/local/bin/claude`,
+        # because `docker-compose.yml` builds the panel from `docker/worker.Dockerfile` and that
+        # ends in `npm install -g @anthropic-ai/claude-code`. The binary is present on the process
+        # this was meant to stop; what is absent there is `CLAUDE_CODE_OAUTH_TOKEN` and the docker
+        # socket. The product conversation dispatches to the worker (#98; `product_say` since
+        # #266 slice 2) so the question cannot arise.
+        #
+        # IT IS STILL RIGHT HERE, for the narrower thing it actually says: `env context --ask` is a
+        # CLI verb aimed at a laptop, and on a laptop with no harness installed this is exactly
+        # true and the remedy below is exactly the one that helps. It is a RAISE rather than a
+        # shared refusal because it carries a second sentence the product rows do not — the
+        # deterministic survey is a complete answer on its own, and "run it again without `ask`"
+        # beats sending somebody to another machine for something they can have here, for free.
+        raise FileNotFoundError(
+            f"the semantic pass needs the {kind} harness and {binary!r} is not on this process's "
+            f"PATH. The panel serves the surface and the worker runs agents (ADR-0038), so run "
+            f"`beeverforge env context <target> --ask` where the harness is installed. The "
+            f"deterministic survey needs none of this and costs nothing — run it again "
+            f"without `ask`.")
+    return ctx.agent_ask(
+        build_asker(project),
+        sandbox=judging_worktree(project, root=checkout),
+        workspace=Workspace(path=str(checkout), branch="main", base_branch="main"))
+
+
+async def _env_read(*, target: str, by: Actor) -> Outcome:
+    """Read a repository and PROPOSE what its `.beeverforge/project.yaml` should say. Writes
+    nothing.
+
+    THE ONLY VERB IN THIS PLATFORM THAT PROPOSES. Every field comes back with the value, the place
+    in the repository it was read from, and how sure the platform is — and the `unknown` ones are
+    the point, not the leftovers: they are the questions a developer answers out loud while the
+    report is on the screen. A tool that emitted `setup: []` instead of "nothing in this repository
+    says how to install dependencies" would produce a manifest that loads, declares nothing, and is
+    reported healthy by `doctor` — which is this file's most expensive defect class, at the exact
+    moment a client is deciding whether to buy.
+
+    PURE, AND SAFE ANYWHERE. It clones nothing, runs nothing from the repository, and spends no
+    tokens of its own — so unlike `env_check` it is honest on a laptop, and it says so."""
+    import asyncio
+
+    from beeverforge.util.causes import first_message
+
+    where = _measured_on(by)
+    project, checkout, bad = repo_for(target)
+    if bad:
+        return bad
+    if checkout is None:  # unreachable by construction; a silent None here would print nothing
+        return refused(FAILED, f"could not resolve {target!r} to a repository.")
+
+    manifest_path = getattr(project, "manifest_path", None) or namespace.MANIFEST
+    try:
+        # THE ONE READER DECIDES WHETHER THIS REPOSITORY HAS A MANIFEST. `exists()` on the current
+        # name alone read a repository still on the directory's retired name as "nothing declared"
+        # and proposed it a manifest that, once applied, shadowed the one the client already obeyed
+        # — while the loader, the doctor and onboarding refused the same repository by name
+        # (review, 2026-08-25). The proposal is a proposal for a second manifest; the rename comes
+        # first, and the sentence says so.
+        destination = namespace.resolve(
+            checkout, manifest_path, project=getattr(project, "name", "") or checkout.name)
+    except namespace.RetiredNamespace as exc:
+        return refused(
+            CONFLICT, str(exc),
+            verb="read", measured_on=where, wrote=None,
+            project=getattr(project, "name", None), repo=str(checkout),
+            read_as=("project" if project is not None else "path"))
+
+    try:
+        from beeverforge.onboarding import infer
+    except ImportError as exc:
+        return refused(
+            UNAVAILABLE,
+            f"this deployment has no inference module ({first_message(exc, limit=120)}) — "
+            f"`beeverforge.onboarding.infer` is what reads a repository and proposes a manifest, "
+            f"and "
+            f"without it there is nothing to propose. Nothing was read.")
+
+    entry, exports = _entry_point(infer, "propose", "infer")
+    if entry is None:
+        return refused(
+            UNAVAILABLE,
+            f"`beeverforge.onboarding.infer` exports neither `propose(repo)` nor `infer(repo)` — "
+            f"this "
+            f"transport does not know how to ask it. It exports: {exports}")
+    try:
+        proposal = await asyncio.to_thread(entry, str(checkout))
+    except Exception as exc:  # noqa: BLE001 — a client's repository may be anything at all
+        log.exception("env_read failed on %s", checkout)
+        return refused(
+            FAILED,
+            f"could not read {checkout} ({first_message(exc, limit=200)}) — nothing was written, "
+            f"and nothing is proposed. This is the platform's fault, not the repository's; the "
+            f"answer is still `beeverforge env interview`-shaped: ask the developers.")
+
+    rows, unreadable = _proposed_rows(proposal)
+    if rows is None:
+        # THE PROPOSAL EXISTS AND THIS TRANSPORT CANNOT READ IT. Refusing beats rendering an empty
+        # report: an empty report says "your repository told me nothing", which is a claim about
+        # the client, while the truth is a claim about us.
+        return refused(
+            FAILED,
+            f"the inference produced a result this transport cannot read "
+            f"({type(proposal).__name__}, {unreadable} entr{'y' if unreadable == 1 else 'ies'} "
+            f"with no `confidence`). A field must carry value, source and confidence. Nothing is "
+            f"proposed, deliberately — a blank report would read as 'your repository says "
+            f"nothing'.")
+
+    counts = {tier: sum(1 for r in rows if r["confidence"] == tier) for tier in _CONFIDENCE}
+    message = (
+        f"{len(rows)} field(s) proposed for {checkout.name}: {counts[OBSERVED]} observed, "
+        f"{counts[INFERRED]} inferred, {counts[UNKNOWN]} only your developers can answer. "
+        f"Nothing was written."
+        if rows else
+        f"read {checkout} and could propose nothing about it — that is an answer, not an error: "
+        f"no build file, no CI file and no default branch were found. The whole manifest is a "
+        f"question for your developers.")
+    return done(
+        message,
+        verb="read", measured_on=where, wrote=None,
+        project=getattr(project, "name", None), repo=str(checkout),
+        read_as=("project" if project is not None else "path"),
+        fields=rows, counts=counts, unreadable=unreadable,
+        destination=str(destination), destination_exists=destination.exists(),
+        uncited=[r["name"] for r in rows if r["confidence"] != UNKNOWN and not r["source"]],
+        **_extras(proposal),
+    )
+
+
+async def _preview_proposal(*, target: str, by: Actor, accept: object = None) -> Outcome:
+    """What `beeverforge preview propose` would propose for a repository (#265 slice 4) — the
+    draft's every line with its tier and source, the files it would write, and what it asks.
+    Writes nothing into the repository and builds nothing.
+
+    A project the factory reaches by URL is read from a shallow clone that is removed before this
+    answers: the same checkout the proposal itself would draft into, so what is shown here is what
+    the pull request would carry."""
+    import asyncio
+    import shutil
+
+    from beeverforge.util.causes import first_message
+
+    where = _measured_on(by)
+    handle = (target or "").strip()
+    project = None
+    if handle and not (handle.startswith(("/", ".", "~")) or "/" in handle):
+        try:
+            from beeverforge.registry import ProjectRegistry
+
+            project = ProjectRegistry().get(handle)
+        except KeyError:
+            project = None
+    raw = str(getattr(project, "repo_path", "") or "")
+    clone: Path | None = None
+    repo = ""
+    if project is not None and ("://" in raw or raw.startswith("git@")):
+        from beeverforge.adapters.forge.registry import clone_url_for, repo_of
+        from beeverforge.credentials import deployment_forge_token, forge_token_for
+        from beeverforge.onboarding.propose_manifest import clone_for_proposal
+
+        repo = repo_of(project)
+        try:
+            url = clone_url_for(project, repo, token=forge_token_for(project)
+                                or deployment_forge_token(project))
+        except Exception as exc:  # noqa: BLE001 — the message is the finding
+            return refused(UNAVAILABLE, f"could not compose a clone URL for {project.name}: "
+                                        f"{first_message(exc, limit=160)}")
+        clone, why = await asyncio.to_thread(clone_for_proposal, clone_url=url)
+        if clone is None:
+            return refused(UNAVAILABLE, f"could not clone {repo} to read it ({why}) — nothing "
+                                        f"was read.")
+        checkout = clone
+    else:
+        project, checkout, bad = repo_for(handle)
+        if bad:
+            return bad
+        if checkout is None:
+            return refused(FAILED, f"could not resolve {target!r} to a repository.")
+        if project is not None:
+            from beeverforge.adapters.forge.registry import repo_of
+
+            repo = repo_of(project)
+    name = getattr(project, "name", None) or checkout.name
+
+    def _read():
+        from beeverforge.onboarding.preview_infer import infer_preview
+        from beeverforge.onboarding.preview_propose import draft
+
+        found = infer_preview(checkout, name=(repo.rsplit("/", 1)[-1] if repo else ""))
+        return found, draft(found, accept=_said_yes(accept))
+
+    try:
+        found, drafted = await asyncio.to_thread(_read)
+    except Exception as exc:  # noqa: BLE001 — a client's repository may be anything at all
+        log.exception("preview_proposal failed on %s", checkout)
+        return refused(FAILED, f"could not read {checkout} ({first_message(exc, limit=200)}) — "
+                               f"nothing was written.")
+    finally:
+        if clone is not None:
+            shutil.rmtree(clone, ignore_errors=True)
+    rows = [{"name": r.field, "value": _jsonable(r.value), "confidence": r.confidence,
+             "source": ", ".join(e.locator for e in r.evidence), "note": r.note}
+            for r in found.rows()]
+    counts = {tier: sum(1 for r in rows if r["confidence"] == tier) for tier in _CONFIDENCE}
+    def say(text: object) -> str:
+        return str(text).replace("<project>", name)
+
+    if found.case == "declared":
+        message = (f"{name} already declares `preview:` in its manifest — there is nothing to "
+                   f"propose; edit it in the repository. Nothing was written.")
+    else:
+        message = (f"{len(rows)} line(s) read for a preview of {name}: {counts[OBSERVED]} "
+                   f"observed, {counts[INFERRED]} inferred, {counts[UNKNOWN]} only your team can "
+                   f"answer. Nothing was written"
+                   + (f"; `beeverforge preview propose {name} --yes` proposes it." if project
+                      is not None else "."))
+    return done(
+        message, verb="read", measured_on=where, project=getattr(project, "name", None),
+        repo=repo or str(checkout), case=found.case, fields=rows, counts=counts,
+        files=list(drafted.files), block=_jsonable(drafted.block), first=say(drafted.first),
+        left_out=[say(x) for x in drafted.left_out], questions=[say(q) for q in found.questions],
+        registry=[f"{r.locator}: `{r.service}` reads `{r.name}` — {r.why}" for r in found.registry],
+        flags=[f"{f.locator}: `{f.service}` is given a literal `{f.name}` — {f.why}"
+               for f in found.flags],
+        notes=[say(n) for n in found.notes])
+
+
+#: Verdict words this transport recognises as "pickup is not blocked". NARROW ON PURPOSE: anything
+#: unrecognised is reported as NOT ready, because the expensive direction of this mistake is the
+#: confident false green — the card that opened this work measured `env check` printing READY over
+#: a project whose box had never been proven, and called trading three honest disagreements for one
+#: confident wrong answer worse than the state it replaced.
+_READY_WORDS = frozenset({"READY", "PRONTO", "OK"})
+#: …and the ones that mean "something is deliberately holding pickup", which is not the same as an
+#: unfinished setup and sends a reader somewhere else entirely.
+_HELD_WORDS = frozenset({"HELD", "SEGURADO", "BLOCKED", "BLOQUEADO"})
+
+
+def _verdict(raw: str) -> tuple[str, bool, bool]:
+    """`(word, ready, understood)` for whatever the readiness module returned.
+
+    UNDERSTOOD IS A SEPARATE ANSWER from ready. A verdict this transport cannot classify must not
+    be rendered as either colour: it is reported as not-ready AND as not-understood, so the reader
+    goes and looks at the readiness module instead of at their own repository."""
+    word = (str(raw or "").strip().split() or [""])[0].strip(":.,").upper()
+    if word in _READY_WORDS:
+        return word, True, True
+    if word in _HELD_WORDS or word:
+        return word, False, word in _HELD_WORDS or word.startswith(("NOT", "FALTA", "MISSING"))
+    return "", False, False
+
+
+async def _env_check(*, project: str, by: Actor) -> Outcome:
+    """ONE verdict on whether this project can actually be picked up — with its provenance.
+
+    THE PROBLEM IT REPLACES, measured live in the card that opened it: `doctor`, `conformance` and
+    `box status` were asked about the same project in the same minute and gave four answers in four
+    scopes, none of which knew about the others. This is the composition, and the composition is
+    only worth anything if it says WHERE it measured — which is why every finding carries
+    `measured_on` and why the message leads with it when the answer came from a laptop.
+
+    `ok` IS ABOUT THE PLATFORM, NOT ABOUT THE ANSWER (see `actions/__init__.py`): checking a
+    project and finding it not ready is a successful check. `data["ready"]` is the answer, and the
+    CLI's exit code maps from it — never from `ok`."""
+    import asyncio
+
+    from beeverforge.util.causes import first_message
+
+    where = _measured_on(by)
+    found, bad = _project(project)
+    if bad:
+        return bad
+
+    try:
+        from beeverforge.onboarding import readiness
+    except ImportError as exc:
+        return refused(
+            UNAVAILABLE,
+            f"this deployment has no readiness module ({first_message(exc, limit=120)}) — "
+            f"`beeverforge.onboarding.readiness` is the one place that composes doctor, "
+            f"conformance, "
+            f"the "
+            f"floor and the box gate into a single verdict. Until it lands, `beeverforge doctor "
+            f"{found.name}` and `beeverforge box status {found.name}` are the honest partial "
+            f"answers.")
+
+    entry, exports = _entry_point(readiness, "check", "readiness_for")
+    if entry is None:
+        return refused(
+            UNAVAILABLE,
+            f"`beeverforge.onboarding.readiness` exports neither `check(project)` nor "
+            f"`readiness_for(project)` — this transport does not know how to ask it. It exports: "
+            f"{exports}")
+    try:
+        result = await asyncio.to_thread(entry, found)
+    except Exception as exc:  # noqa: BLE001 — a probe that raises must not read as "ready"
+        log.exception("env_check failed for %s", found.name)
+        return refused(
+            FAILED,
+            f"could not work out whether {found.name} is ready ({first_message(exc, limit=200)}) "
+            f"— treat this as NOT ready: a check that crashed has proven nothing.")
+
+    # TWO SHAPES, BOTH ACCEPTED. The card specified `(findings, verdict)`; the module that landed
+    # returns a `Report` whose `verdict` is a property computed from its own findings — which is
+    # the stronger design (a stored verdict can drift from its evidence) and the reason this reads
+    # it rather than insisting on the tuple. Neither is guessed at: a shape that is neither is
+    # refused below, in a sentence, instead of being unpacked into something plausible.
+    if isinstance(result, tuple | list) and len(result) == 2:
+        raw_findings, verdict_text = result
+        holds = []
+    elif hasattr(result, "findings") and hasattr(result, "verdict"):
+        raw_findings = result.findings
+        verdict_text = result.verdict
+        holds = [str(h) for h in (getattr(result, "holds", None) or [])]
+    else:
+        return refused(
+            FAILED,
+            f"the readiness check returned {type(result).__name__}, which is neither "
+            f"(findings, verdict) nor a report carrying both — this transport cannot tell ready "
+            f"from not ready, so it says neither.")
+
+    rows = []
+    for f in raw_findings or []:
+        get = f.get if isinstance(f, Mapping) else (lambda k, d=None, _f=f: getattr(_f, k, d))
+        rows.append({
+            "check": str(get("check", "") or "?"),
+            "ok": bool(get("ok", False)),
+            "message": str(get("message", "") or ""),
+            "remedy": str(get("remedy", "") or ""),
+            # DEFAULTS TO TRUE so a findings source that has no such concept is not silently
+            # reported as having asked nothing. `False` is the third marker: not a pass and not a
+            # failure, but "no answer exists on this machine" — and it must never be rendered as a
+            # shade of ok.
+            "answered": bool(get("answered", True)),
+            # "" MEANS THE FINDING DID NOT SAY, and the renderer prints that as `?` rather than
+            # inheriting the run's own provenance. Borrowing it would let a finding measured on a
+            # laptop be presented as measured in the factory, which is the one substitution this
+            # whole field exists to prevent.
+            "measured_on": str(get("measured_on", "") or ""),
+        })
+    word, ready_word, understood = _verdict(verdict_text)
+    failing = [r for r in rows if not r["ok"] and r["answered"]]
+    unattributed = [r["check"] for r in rows if not r["measured_on"]]
+    unanswered = [r["check"] for r in rows if not r["answered"]]
+    # BOTH HAVE TO AGREE, AND SO DOES `holds`. A verdict of READY over a failing finding, or over a
+    # live hold, is a contradiction — and the safe reading of a contradiction is the pessimistic
+    # one. Nobody was ever harmed by being told to look again; the card that opened this work was
+    # opened because the opposite mistake printed READY over a box that had never been proven.
+    ready = bool(ready_word and understood and not failing and not holds)
+
+    if not understood:
+        message = (f"{found.name}: the readiness module answered {str(verdict_text)!r}, which this "
+                   f"transport does not recognise — reporting NOT ready, because an unrecognised "
+                   f"verdict must never read as a green one.")
+    elif ready:
+        message = (f"{found.name} is READY — {len(rows) - len(unanswered)} check(s) pass, measured "
+                   f"on {where}. A card in the pickup column starts on its own.")
+    elif holds:
+        message = (f"{found.name} is HELD — {holds[0]} (measured on {where}). Nothing is picked "
+                   f"up while that is true, whatever else is also unmet.")
+    else:
+        message = (f"{found.name} is NOT ready — {len(failing)} of "
+                   f"{len(rows) - len(unanswered)} answered check(s) failing (measured on "
+                   f"{where}).")
+    if unanswered:
+        # A GREEN REPORT THAT ASKED NOTHING IS NOT A GREEN REPORT. Counted in the sentence, never
+        # counted in the verdict.
+        message += (f" {len(unanswered)} check(s) could not be answered here and are counted "
+                    f"neither way: {', '.join(unanswered)}.")
+    if where != "worker":
+        # THE FIRST THING A READER MUST KNOW. This is the correction the design attacked itself
+        # over: a verdict about a laptop, delivered with the authority of a verdict about the
+        # factory, is the same disease with a better interface.
+        message += (f" Measured on {where}: this is the machine you typed on, not the one that "
+                    f"runs your tickets — a docker, a PATH or a credential can differ there.")
+    return done(
+        message,
+        verb="check", measured_on=where, wrote=None, project=found.name,
+        ready=ready, verdict=str(verdict_text or ""), verdict_word=word,
+        verdict_understood=understood, findings=rows, holds=holds,
+        failing=[r["check"] for r in failing], unattributed=unattributed,
+        unanswered=unanswered,
+    )
+
+
+#: How a caller SPELLS the two things this verb takes, so a refusal names the option the reader
+#: actually has. The action layer speaks no transport — this is the same lesson `_parse_params`'
+#: `flag` argument already encodes, keyed off `Actor.via`, which is the only thing here that
+#: knows which door the request came through.
+#:
+#: WHY IT MATTERED: the refusal below taught `accept=[…]` and `answers={'validate.test': '…'}` —
+#: PYTHON API syntax — to somebody who had just typed `beeverforge env apply`. A remedy in a
+#: language the reader is not writing is the `conformance` mistake this file names twice already.
+#: Each entry: (accept in general, answer in general, accept THIS field, answer THIS field).
+_SPELLING = {
+    "cli": ("`--accept <field>` (or `--accept all`)", "`--set <field>=<value>`",
+            "`--accept {name}`", "`--set {name}=…`"),
+    "panel": ("`accept: [\"<field>\"]` (or `[\"all\"]`)", "`answers: {\"<field>\": \"<value>\"}`",
+              "`accept: [\"{name}\"]`", "`answers: {{\"{name}\": \"…\"}}`"),
+}
+_SPELLING_DEFAULT = ("`accept=[…]`, or `accept=['all']`", "`answers={'validate.test': '…'}`",
+                     "`accept=['{name}']`", "`answers={{'{name}': '…'}}`")
+
+
+def _how_to_say_it(by: Actor) -> tuple[str, str]:
+    """`(how to accept, how to answer)` in the vocabulary of whoever is reading."""
+    return _SPELLING.get(str(getattr(by, "via", "") or "").lower(), _SPELLING_DEFAULT)[:2]
+
+
+def _how_to_say_this_field(by: Actor, name: str, *, answer: bool) -> str:
+    """The same, for ONE named field — what a schema error prints beside the thing it is missing.
+
+    THIS ONE WAS HARDCODED TO THE CLI (`--set`, `--accept`), which is the same defect as the
+    generic message being hardcoded to the Python API, pointing the other way: a panel reader was
+    handed command-line flags for a surface with no command line."""
+    entry = _SPELLING.get(str(getattr(by, "via", "") or "").lower(), _SPELLING_DEFAULT)
+    return entry[3 if answer else 2].format(name=name)
+
+
+def _wants_a_list(dotted: str) -> bool:
+    """Does the manifest field this dotted name starts at hold a LIST?
+
+    ASKED OF THE SCHEMA, never guessed. `setup` is `list[str]`, so `--set setup="uv sync"` handed
+    a bare string to a field that cannot take one — and the CLI's own printed remedy for a missing
+    `setup` is exactly `--set setup=<the answer>`. The platform documented a command that could
+    only ever end in a validation error (pre-pilot review, 2026-08-09).
+    """
+    from typing import get_origin
+
+    from beeverforge.contracts.manifest import Manifest
+
+    head = str(dotted or "").split(".")[0].split("[")[0]
+    aliases = {(f.alias or n): n for n, f in Manifest.model_fields.items()}
+    field = Manifest.model_fields.get(aliases.get(head, head))
+    if field is None:
+        return False
+    # `get_origin`, not string-comparing type reprs — the process audit (2026-08-17) flagged the
+    # first cut's two overlapping repr checks as the fragile spelling of exactly this question.
+    return get_origin(field.annotation) is list or field.annotation is list
+
+
+def _as_the_schema_wants(dotted: str, value: object) -> object:
+    """A person's answer in the shape the field can hold.
+
+    ONE SCALAR BECOMES ONE ELEMENT, and `&&` splits — because that is how a human writes two
+    commands on one line and it is the shape the CLI's own `--set` can carry. Anything already a
+    list, and any field that does not want one, passes through untouched: this widens what a
+    person can type, never what the schema accepts.
+
+    AN EMPTY ANSWER IS NOT WIDENED, and that is the interesting case. `--set setup=` is somebody
+    saying "nothing", and the first cut of this turned it into `[""]` — a list the schema accepts,
+    written to their repository as an install step that runs the empty string. The rule this
+    action is built around is that a person's answer is never silently discarded AND never
+    silently improved: an empty one goes to `Manifest` as it is, is refused in a sentence naming
+    the field, and nothing is written. Corrected by the schema, which is the only thing here
+    entitled to correct it."""
+    if not isinstance(value, str) or not _wants_a_list(dotted):
+        return value
+    parts = [p.strip() for p in value.split("&&") if p.strip()]
+    return parts or value
+
+
+def _steps(dotted: str) -> tuple[list[str | int], str]:
+    """`base_branch` → `['base_branch']`; `validate.test` → `['validate','test']`;
+    `setup[1]` → `['setup', 1]`. Or `([], why)`.
+
+    Those three shapes are how a human points at a manifest field out loud, which is why the
+    proposal names fields that way and why this exists. A name this cannot parse REFUSES rather
+    than inventing a key: `Manifest` is `extra="forbid"`, so a mangled key produces a file the
+    platform's own loader rejects — at the client, who then reads it as their own mistake."""
+    import re
+
+    segment = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)((?:\[\d+\])*)$")
+    steps: list[str | int] = []
+    for part in str(dotted).split("."):
+        match = segment.match(part)
+        if not match:
+            return [], f"{dotted!r} is not a field name this can place (at {part!r})"
+        steps.append(match.group(1))
+        steps.extend(int(i) for i in re.findall(r"\[(\d+)\]", match.group(2)))
+    return steps, ""
+
+
+def _place(doc: dict, dotted: str, value: object) -> str:
+    """Put `value` at `dotted` inside `doc`; return `""`, or WHY it could not be placed.
+
+    A GAP IN A LIST IS REFUSED, not padded. `setup[2]` proposed without `setup[0]` and `setup[1]`
+    would have to be filled with something, and whatever that something is, it is a command that
+    would run — in order, inside a client's box. There is no safe filler for that."""
+    steps, problem = _steps(dotted)
+    if problem:
+        return problem
+    node: object = doc
+    for depth, step in enumerate(steps[:-1]):
+        want: object = [] if isinstance(steps[depth + 1], int) else {}
+        node, problem = _descend(node, step, want, dotted)
+        if problem:
+            return problem
+    return _assign(node, steps[-1], value, dotted)
+
+
+def _descend(node: object, step: str | int, want: object, dotted: str) -> tuple[object, str]:
+    """One step down, creating the container the NEXT step needs. `(node, "")` or `(None, why)`."""
+    if isinstance(step, int):
+        if not isinstance(node, list):
+            return None, f"{dotted!r}: [{step}] was proposed on something that is not a list"
+        if step > len(node):
+            return None, (f"{dotted!r}: index {step} was proposed but {len(node)} was not — a gap "
+                          f"in a list would have to be filled with something nobody proposed")
+        if step == len(node):
+            node.append(want)
+        return node[step], ""
+    if not isinstance(node, dict):
+        return None, f"{dotted!r}: {step!r} would have to live inside a mapping and does not"
+    return node.setdefault(step, want), ""
+
+
+def _assign(node: object, step: str | int, value: object, dotted: str) -> str:
+    if isinstance(step, int):
+        if not isinstance(node, list):
+            return f"{dotted!r}: [{step}] was proposed on something that is not a list"
+        if step > len(node):
+            return (f"{dotted!r}: index {step} was proposed but {len(node)} was not — a gap in a "
+                    f"list would have to be filled with something nobody proposed")
+        if step == len(node):
+            node.append(value)
+        else:
+            node[step] = value
+        return ""
+    if not isinstance(node, dict):
+        return f"{dotted!r}: {step!r} would have to live inside a mapping and does not"
+    node[step] = value
+    return ""
+
+
+def _yaml_header(written: list[dict], skipped: list[dict], *, when: str, who: str) -> str:
+    """The provenance block that goes at the top of the file this writes.
+
+    THE COMMENTS ARE PART OF THE PRODUCT. This file is the thing a client's developer opens in six
+    months to ask "who decided our test command is that?" — and the answer being in the file, next
+    to the value, with the line of the CI file it was read from, is the difference between a
+    configuration artefact and the beginning of the context this platform keeps promising to
+    create. It also states what is DELIBERATELY ABSENT, so a reader never has to wonder whether a
+    missing field was an omission or a decision."""
+    width = max((len(w["name"]) for w in written), default=0)
+    lines = [
+        f"# Written by `beeverforge env apply` on {when}, asked for by {who}.",
+        "# Proposed by reading this repository; every value below was accepted by a human.",
+        "#",
+        "# field, how sure the platform was, and where it came from:",
+    ]
+    lines += [f"#   {w['name']:<{width}}  {w['confidence']:<8}  {w['source'] or '—'}"
+              for w in written]
+    if skipped:
+        lines += [
+            "#",
+            "# NOT written, on purpose — nobody answered these, and an empty value would be a",
+            "# declaration that this project has no such thing:",
+        ]
+        # THE TWO REASONS ARE DIFFERENT AND THE FILE SAYS WHICH. "nobody answered it" sends a
+        # reader to their developers; "we read it and it is empty" sends them nowhere, because
+        # there is nothing to do — and a reader who cannot tell them apart chases the second one.
+        lines += [f"#   {s['name']}  ({s['confidence']}){'  ' + s['source'] if s['source'] else ''}"
+                  + ("  — read, and empty: writing it would only repeat the default"
+                     if s.get("empty") else "")
+                  for s in skipped]
+    return "\n".join(lines) + "\n"
+
+
+def _said_yes(value: object) -> bool:
+    """Consent, and ONLY consent. `True`, or a word a human recognises as yes; nothing else.
+
+    NOT `bool(value)`, and this is the whole reason the helper exists. A transport that sends JSON
+    can send the STRING `"false"`, which is truthy in Python — so `if not yes` would let a form
+    field carrying the word "false" overwrite a client's manifest. Consent that can be given by
+    accident is not consent, and this is the one parameter in this module where being wrong costs
+    somebody their file."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "y", "1"}
+    return value is True
+
+
+async def _env_apply(*, project: str, by: Actor, yes: object = False, force: object = False,
+                     accept: object = None, answers: object = None,
+                     out: object = "", pr: object = False) -> Outcome:
+    """Write the manifest — and, on the `pr` path, RELEASE the clone it wrote into.
+
+    A thin wrapper for one reason: the pull-request path makes a temporary clone that must
+    outlive the function that creates it (`propose_manifest.clone_for_proposal`) and be removed
+    however this ends — including the half-dozen refusals between the clone and the push. A
+    `finally` here is the one place that covers all of them, which is why the growth guard's
+    `_RELEASED_BY_CALLER` names this function by name."""
+    import shutil
+
+    holder: dict[str, Path] = {}
+    try:
+        return await _env_apply_impl(
+            project=project, by=by, yes=yes, force=force, accept=accept, answers=answers,
+            out=out, pr=pr, _clone_holder=holder)
+    finally:
+        stale = holder.get("dir")
+        if stale is not None:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
+async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
+                          force: object = False, accept: object = None, answers: object = None,
+                          out: object = "", pr: object = False,
+                          _clone_holder: dict | None = None) -> Outcome:
+    """Write the proposed `.beeverforge/project.yaml` — the ONLY verb here that writes, and it
+    is fenced.
+
+    THE FENCES, each paid for by a different incident:
+
+    1. **`yes` is required.** Without it this returns the exact file it WOULD write and refuses,
+       which is the same shape `product init` already uses ("shows before it writes"). It is the
+       client's repository; the first thing this platform does to it should be reviewable.
+    2. **An existing manifest is never overwritten without `force`,** and even then the previous
+       file is copied to `<name>.bak` first and the path is reported. A client with a hand-tuned
+       manifest losing it to a helpful tool is the last time that tool gets run.
+    3. **Only fields a human accepted are written.** `observed` fields — the ones actually measured
+       in the repository — are written by default; `inferred` ones need naming in `accept` (or
+       `accept=["all"]`); `unknown` ones are never written at all unless `answers` supplies the
+       value, because there is nothing to write and an empty value is a claim.
+    4. **The result is validated against `Manifest` before it touches the disk.** `Manifest` is
+       `extra="forbid"`, so a field name this transport misread would otherwise produce a file the
+       platform's own loader rejects — the client following our instructions and being told they
+       did it wrong, which is the loop this whole card exists to break.
+    5. **The write is atomic** (temp file in the same directory, then `os.replace`), so an
+       interrupted apply cannot leave a client with half a manifest.
+    """
+    import asyncio
+    import os
+    import shutil
+    import tempfile
+    from datetime import UTC, datetime
+
+    from pydantic import ValidationError
+
+    from beeverforge.contracts.manifest import Manifest
+    from beeverforge.util import yaml_io
+    from beeverforge.util.causes import first_message
+
+    where = _measured_on(by)
+    consented, replace = _said_yes(yes), _said_yes(force)
+    found, bad = _project(project)
+    if bad:
+        # A PATH IS AS GOOD AN ANSWER AS A NAME, and `env read` has always accepted both. Only
+        # `apply` demanded a registered name — so the onboarding path grew an extra
+        # registration whose ONLY purpose was to let this verb resolve a directory it was
+        # about to be handed anyway. The pilot asked why ("mas quero entender o porquê disso
+        # se o código fica todo no docker", 2026-08-12) and the honest answer was "no reason".
+        # The manifest still belongs in the client's checkout — that part is design, and the
+        # refusal below still holds for a URL-registered project.
+        # A PATH LOOKS LIKE A PATH. Accepting any bare word that happens to match a directory
+        # in the process's working directory would let a typo'd project name write a manifest
+        # into whatever the worker's cwd contains — and the worker's cwd is the platform's own
+        # install. Only an explicit path (a separator, `~`, or absolute) is treated as one.
+        raw_arg = str(project)
+        looks_like_a_path = raw_arg.startswith(("/", ".", "~")) or "/" in raw_arg
+        candidate = Path(raw_arg).expanduser()
+        if not (looks_like_a_path and candidate.is_dir()):
+            return bad
+        from beeverforge.contracts.project import Project as _Project
+
+        found = _Project(name=candidate.name, repo_path=str(candidate))
+    raw_path = str(found.repo_path)
+    propose_as_pr = _said_yes(pr)
+    clone_to_discard: Path | None = None
+    if "://" in raw_path or raw_path.startswith("git@"):
+        # THE SERVER-SIDE HALF (pilot, 2026-08-12). A URL-registered project has no checkout
+        # here, and writing into the worker's cache clone would be worse than refusing: nobody
+        # reviews that tree and the next fetch replaces it. With `pr`, the factory clones,
+        # writes, and proposes the manifest as a PULL REQUEST — the same shape the product
+        # module already uses for requirements, and the only shape that keeps the human review
+        # the file exists for.
+        if not propose_as_pr:
+            return refused(
+                INVALID,
+                f"{found.name} is registered as a clone URL ({raw_path}) — there is no checkout "
+                f"here to write into. Either run this where a checkout is (`beeverforge env "
+                f"apply <path-to-your-checkout> --yes`), or let the factory propose it as a "
+                f"pull request on that repository: add `--pr`.")
+        if out:
+            return refused(
+                INVALID,
+                "`out` writes to a path on this machine and `pr` proposes a branch on the "
+                "repository — pick one; nothing was written.")
+        from beeverforge.adapters.forge.registry import build_forge, clone_url_for, repo_of
+        from beeverforge.credentials import forge_token_for
+        from beeverforge.onboarding.propose_manifest import (
+            clone_for_proposal,
+            default_branch,
+            leaves_the_repository,
+        )
+        from beeverforge.util.causes import first_message
+
+        # BEFORE THE CLONE, AND SO BEFORE THE WRITE. `destination` below is composed as
+        # `checkout / found.manifest_path`, and an absolute value wins that join outright: the
+        # manifest was written over a REAL file outside the temporary clone, the file already
+        # there was rotated to `.bak`, and the verb then reported FAILED with git's sentence
+        # about a path we had composed ("is outside repository at /tmp/beeverforge-…",
+        # GitHub issue #259).
+        # The registry row alone decides this, so it is decided here — nothing cloned, nothing
+        # written, nothing rotated.
+        if leaves_the_repository(str(found.manifest_path)):
+            return refused(
+                INVALID,
+                f"{found.name} declares manifest_path {str(found.manifest_path)!r}, which is "
+                f"outside the repository — a pull request on {raw_path} can only carry files "
+                f"that live in it, so there is nothing to propose and nothing was written. "
+                f"Either give manifest_path a path relative to the repository root, or write "
+                f"that file where it lives yourself: `beeverforge env apply "
+                f"<path-to-your-checkout> --out {found.manifest_path} --yes`.",
+                verb="apply", measured_on=where, wrote=None, project=found.name)
+
+        token = forge_token_for(found)
+        forge = build_forge(found, token=token)
+        try:
+            # THROUGH THE WRAPPER, NEVER `forge.clone_url` DIRECTLY. `build_forge` REFUSES an
+            # ambient token on the Azure row on purpose — every caller in this codebase hands
+            # the forge axis a GitHub credential — and calling the adapter's method with that
+            # same token walks straight around the refusal: a github.com secret embedded in a
+            # dev.azure.com URL and presented to Microsoft as HTTP Basic. `clone_url_for` is
+            # the one place that lets the ADAPTER's own credential win (its docstring records
+            # this exact defect being reintroduced by a convenience wrapper). Found by the
+            # pre-commit adversarial review, 2026-08-12, before it ever ran.
+            url = clone_url_for(found, repo_of(found), token=token)
+        except Exception as exc:  # noqa: BLE001 — the message IS the finding
+            return refused(UNAVAILABLE,
+                           f"could not compose a clone URL for {found.name}: "
+                           f"{first_message(exc, limit=160)}")
+        # NO `--branch`: the clone lands on the repository's OWN default, and that is what the
+        # pull request is opened against. `load_manifest_base_branch` answers `main` unless the
+        # registry says otherwise, which fails at the PR for every `master`/`develop` client —
+        # one step AFTER the push.
+        clone_to_discard, why = clone_for_proposal(clone_url=url)
+        if _clone_holder is not None and clone_to_discard is not None:
+            # the wrapper's `finally` removes it however this ends
+            _clone_holder["dir"] = clone_to_discard
+        if clone_to_discard is None:
+            return refused(
+                UNAVAILABLE,
+                f"could not clone {found.name} to propose its manifest ({why}) — check the "
+                f"forge credential this deployment holds and that the repository exists.")
+        checkout = clone_to_discard
+        base = default_branch(clone_to_discard)
+    else:
+        if propose_as_pr:
+            # NEVER ACCEPTED AND IGNORED. `pr` only means something for a project with no
+            # checkout here; on a local path the file is written directly, and reporting "wrote
+            # …" to somebody who asked for a pull request is the silent-no-op class this
+            # codebase treats as its own defect (pre-commit review, 2026-08-12).
+            return refused(
+                INVALID,
+                f"{found.name} is registered as a local checkout ({raw_path}), so `pr` has "
+                f"nothing to do: the manifest is written into that checkout for you to review "
+                f"in your own diff and commit. Drop `--pr`, or register the project by clone "
+                f"URL if you want the factory to open the pull request itself.")
+        checkout = Path(raw_path).expanduser()
+        if not checkout.is_dir():
+            return refused(
+                NOT_FOUND,
+                f"{found.name} has repo_path {raw_path!r} and there is no directory there "
+                f"(measured on {where}) — nothing was written.")
+
+    try:
+        # THE ONE READER DECIDES WHETHER THIS REPOSITORY HAS A MANIFEST — before anything is
+        # inferred, and whether the file would land in the checkout, in a clone about to become a
+        # pull request, or at `out`. The `destination.exists()` fence below sees only the current
+        # name, so a repository still on the directory's retired name read as "nothing here" and
+        # this verb wrote a second manifest beside the one it has; the loader then answered from
+        # the new file and the client's own gates were gone (review, 2026-08-25 — measured with
+        # this function on a checkout carrying only the retired file). The refusal is the
+        # loader's own sentence: what to rename, and that nothing under the old name is read.
+        namespace.resolve(checkout, str(found.manifest_path), project=found.name)
+    except namespace.RetiredNamespace as exc:
+        return refused(CONFLICT, str(exc), verb="apply", measured_on=where, wrote=None,
+                       project=found.name)
+
+    try:
+        from beeverforge.onboarding import infer
+    except ImportError as exc:
+        return refused(
+            UNAVAILABLE,
+            f"this deployment has no inference module ({first_message(exc, limit=120)}) — there "
+            f"is nothing to apply. Nothing was written.")
+    entry, exports = _entry_point(infer, "propose", "infer")
+    if entry is None:
+        return refused(
+            UNAVAILABLE,
+            f"`beeverforge.onboarding.infer` exports neither `propose(repo)` nor `infer(repo)` — "
+            f"nothing "
+            f"was written. It exports: {exports}")
+    try:
+        # RE-READ RATHER THAN REMEMBER. There is no proposal cached between `read` and `apply`, on
+        # purpose: a stored proposal would let a repository change underneath it and be written
+        # from a world that no longer exists, and the object that caches a read then writes to the
+        # same source is a defect this codebase has already paid for once.
+        proposal = await asyncio.to_thread(entry, str(checkout))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("env_apply could not re-read %s", checkout)
+        return refused(FAILED, f"could not read {checkout} ({first_message(exc, limit=200)}) — "
+                               f"nothing was written.")
+    rows, unreadable = _proposed_rows(proposal)
+    if rows is None:
+        return refused(FAILED, f"the inference produced a result this transport cannot read "
+                               f"({type(proposal).__name__}, {unreadable} unreadable) — nothing "
+                               f"was written.")
+
+    # THE PANEL SENDS JSON AND THE CLI SENDS PYTHON, and the difference is a live hazard rather
+    # than a tidiness point. `accept` arriving as the STRING "validate.test" iterates by character,
+    # so the accepted set becomes {'v','a','l',…} and every inferred field is silently dropped —
+    # a refusal that looks exactly like the rule working. One string is one field name.
+    raw_accept = [accept] if isinstance(accept, str) else list(accept or [])
+    accepted = {str(a).strip() for a in raw_accept if str(a).strip()}
+    accept_all = "all" in {a.lower() for a in accepted}
+    if answers is not None and not isinstance(answers, Mapping):
+        return refused(
+            INVALID,
+            f"`answers` has to be a mapping of field to value, not {type(answers).__name__} — "
+            f"nothing was written.")
+    said = {str(k): v for k, v in dict(answers or {}).items()}
+    how_accept, how_answer = _how_to_say_it(by)
+
+    # A NAME NOBODY PROPOSED IS REFUSED, NOT DROPPED (#110). `--accept validate.tests` matched no
+    # row, accepted nothing, and the refusal two screens down then blamed the reader for not
+    # having accepted anything — a typo answered with an accusation. This is the courtesy every
+    # adapter registry in this codebase already gives an unknown kind: say what exists.
+    #
+    # `answers` is deliberately NOT checked here: writing a field the inference never proposed is
+    # this verb's design (a person in the room outranks a reading), and a name the SCHEMA refuses
+    # is caught by `_place`/`Manifest` below with the field named.
+    known = {r["name"] for r in rows}
+    stray = sorted(a for a in accepted if a.lower() != "all" and a not in known)
+    if stray:
+        return refused(
+            INVALID,
+            f"nothing was written: {', '.join(stray)} "
+            f"{'is not a field' if len(stray) == 1 else 'are not fields'} this read proposed. "
+            f"It proposed: {', '.join(sorted(known)) or 'nothing'}. "
+            f"Accept one of those with {how_accept}, or answer a field outright with "
+            f"{how_answer}.",
+            verb="apply", measured_on=where, wrote=None, project=found.name,
+            written=[], skipped=[], unknown=stray, proposed=sorted(known))
+
+    written, skipped = [], []
+    for row in rows:
+        name = row["name"]
+        if name in said:
+            # A HUMAN'S ANSWER IS WRITTEN WHATEVER SHAPE IT HAS, including an empty one: they were
+            # in the room and they said it out loud. `_declares` judges the platform's proposals,
+            # never a person's answer. `_as_the_schema_wants` only widens what they may TYPE — a
+            # scalar for a list field — never what the schema will accept (#110).
+            written.append({**row, "value": _jsonable(_as_the_schema_wants(name, said[name])),
+                            "confidence": ANSWERED, "source": f"{by} said so"})
+            continue
+        chosen = (row["confidence"] == OBSERVED
+                  or (row["confidence"] == INFERRED and (accept_all or name in accepted)))
+        if chosen and not _declares(row["value"]):
+            # READ, AND NOTHING THERE — a real answer, and not a declaration. See `_declares`: the
+            # value equals the schema's own default, so the line would change no behaviour and
+            # would spend the one bit `declared_keys()` has for "somebody filled this in".
+            skipped.append({**row, "empty": True})
+        elif chosen:
+            written.append(row if row["confidence"] == OBSERVED
+                           else {**row, "source": row["source"] or "accepted by hand"})
+        else:
+            skipped.append(row)
+    # A field a human answered that the inference never proposed is still the human's answer, and
+    # dropping it silently would be the platform overruling the person in the room.
+    written += [{"name": k, "value": _jsonable(_as_the_schema_wants(k, v)),
+                 "confidence": ANSWERED, "source": f"{by} said so", "note": ""}
+                for k, v in said.items() if k not in known]
+
+    if not written:
+        # THE EMPTY READINGS ARE NAMED, not folded into "none was observed". A reader who just saw
+        # `components  observed  src/App.csproj` in the report and is then told nothing was
+        # observed would go looking for a bug in the read. What happened is narrower and it is the
+        # whole point: it WAS read, and what it read declares nothing.
+        empty = [s["name"] for s in skipped if s.get("empty")]
+        return refused(
+            INVALID,
+            f"nothing to write: of {len(rows)} proposed field(s), none carries a value that "
+            f"declares anything."
+            + (f" {', '.join(empty)} {'was' if len(empty) == 1 else 'were'} read and "
+               f"{'is' if len(empty) == 1 else 'are'} empty — that is an answer, but writing it "
+               f"would only repeat the schema's own default and would make the file look filled "
+               f"in." if empty else "")
+            + f" Accept an inferred field with {how_accept}, or answer one with {how_answer} — "
+              f"an empty manifest LOADS, declares nothing, and is then reported as healthy, "
+              f"which is worse than no file at all.",
+            # THE REFUSAL CARRIES ITS EVIDENCE. Refusing without showing what WAS read would trade
+            # the false green for a silence, which is the same bug facing the other way: the client
+            # in the room has to see that their repository answered, and that the answer was empty.
+            verb="apply", measured_on=where, wrote=None, project=found.name,
+            written=[], skipped=skipped)
+
+    document: dict = {"version": 1}
+    # THE SCHEMA'S OWN ORDER, not the proposal's. Two reasons, and neither is taste: the file has
+    # to be byte-identical between two runs over the same repository (a manifest that reshuffles
+    # itself is a diff nobody can review), and a client comparing it to `docs/project.yaml.example`
+    # should find the fields where that file puts them.
+    order = list(Manifest.model_fields)
+    aliases = {(f.alias or n): n for n, f in Manifest.model_fields.items()}
+    for row in sorted(written, key=lambda r: (
+            order.index(aliases.get(str(r["name"]).split(".")[0].split("[")[0], ""))
+            if aliases.get(str(r["name"]).split(".")[0].split("[")[0]) in order else len(order),
+            str(r["name"]))):
+        problem = _place(document, row["name"], row["value"])
+        if problem:
+            return refused(
+                FAILED,
+                f"cannot write {row['name']!r}: {problem}. Nothing was written — a manifest with a "
+                f"key the schema forbids is a file that fails at the client, not here.")
+    try:
+        Manifest.model_validate(document)
+    except ValidationError as exc:
+        # A SCHEMA ERROR TURNED INTO AN EXECUTABLE OPTION, which is the whole card in one branch.
+        # The commonest way to get here is real and was measured on a client's own repository: a
+        # `Component` requires BOTH `path` and `stack`, so accepting the observed path and leaving
+        # the inferred stack behind produces a manifest the schema refuses. Handing the client a
+        # pydantic traceback there is `conformance` recommending `stack: security-oss` all over
+        # again — a remedy the schema itself will not accept. So the fields the error names are
+        # cross-referenced against the ones this run LEFT OUT, and the flag that would include each
+        # one is printed.
+        wanted = {".".join(str(p) for p in (e.get("loc") or ())) for e in exc.errors()}
+        blocked = [s for s in skipped if s["name"] in wanted]
+        options = " ".join(
+            _how_to_say_this_field(by, s["name"], answer=s["confidence"] == UNKNOWN)
+            for s in blocked)
+        return refused(
+            FAILED,
+            f"the fields that were accepted do not make a valid manifest, so nothing was written: "
+            f"{first_message(exc, limit=300)}"
+            + (f" — {options} would supply what the schema is missing." if options else ""),
+            verb="apply", measured_on=where, wrote=None, project=found.name,
+            written=written, skipped=skipped, blocked_by=[s["name"] for s in blocked])
+
+    when = datetime.now(UTC).date().isoformat()
+    body = _yaml_header(written, skipped, when=when, who=str(by)) + yaml_io.dump(
+        document, sort_keys=False, allow_unicode=True, default_flow_style=False)
+    destination = (Path(str(out)).expanduser() if out else checkout / found.manifest_path)
+
+    if not consented:
+        return refused(
+            INVALID,
+            f"nothing was written — this is what it WOULD write to {destination}. "
+            f"{len(written)} field(s) in, {len(skipped)} left out. Run it again with yes=True "
+            f"(`--yes`) if that is right.",
+            verb="apply", measured_on=where, wrote=None, confirm=True, project=found.name,
+            destination=str(destination), destination_exists=destination.exists(),
+            content=body, written=written, skipped=skipped)
+    if destination.exists() and not replace:
+        return refused(
+            CONFLICT,
+            f"{destination} already exists and this will not overwrite it. If that file is theirs, "
+            f"it wins — read it first. To replace it anyway pass force=True (`--force`); the "
+            f"current file is copied to {destination.name}.bak before anything is written.",
+            verb="apply", measured_on=where, wrote=None, project=found.name,
+            destination=str(destination), destination_exists=True,
+            content=body, written=written, skipped=skipped)
+
+    backup = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            backup = destination.with_suffix(destination.suffix + ".bak")
+            shutil.copy2(destination, backup)
+        # ATOMIC: a temp file in the SAME directory (so `os.replace` stays on one filesystem),
+        # then one rename. An interrupted write must never leave a client with half a manifest —
+        # `write_text` truncates first, which is the exact durability defect `registry.py` already
+        # records having shipped once.
+        handle, temp = tempfile.mkstemp(dir=str(destination.parent), prefix=".beeverforge-apply-")
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(temp, destination)
+    except OSError as exc:
+        return refused(
+            FAILED,
+            f"could not write {destination} ({exc.strerror or exc}) — nothing changed"
+            + (f", and the previous file is still at {backup}." if backup else "."),
+            verb="apply", measured_on=where, wrote=None, project=found.name)
+
+    kept = ", ".join(w["name"] for w in written[:6]) + ("…" if len(written) > 6 else "")
+    if clone_to_discard is not None:
+        # The file exists only in a temporary clone. Committing and proposing it is what makes
+        # the write real; without this arm the whole PR path would be an elaborate no-op in a
+        # directory nobody will ever look at.
+        from beeverforge.adapters.forge.registry import repo_of
+        from beeverforge.onboarding.propose_manifest import propose
+
+        outcome = propose(
+            checkout=clone_to_discard, manifest_path=str(found.manifest_path),
+            repo=repo_of(found), clone_url=url, base=base, forge=forge,
+            project_name=found.name,
+            summary=f"{len(written)} field(s) proposed from the repository: {kept}")
+        if not outcome.ok:
+            return refused(FAILED, outcome.detail, verb="apply", measured_on=where, wrote=None,
+                           project=found.name, ref=outcome.ref, content=body)
+        return done(
+            f"{outcome.detail}"
+            + (f" — {outcome.url}" if outcome.url else "")
+            + (f". {len(skipped)} field(s) were left out on purpose."
+               if skipped else ". Nothing was left out.")
+            + f" Merge it, then: `beeverforge env check {found.name}`.",
+            verb="apply", measured_on=where, wrote=str(found.manifest_path),
+            project=found.name, pull_request=outcome.url, ref=outcome.ref,
+            existed=outcome.existed, written=written, skipped=skipped, content=body)
+
+    return done(
+        f"wrote {destination} — {len(written)} field(s): {kept}. "
+        + (f"The previous file is at {backup.name}. " if backup else "")
+        + (f"{len(skipped)} field(s) were left out on purpose; `beeverforge env read "
+           f"{found.name}` lists them." if skipped else "Nothing was left out.")
+        + f" Next: `beeverforge env check {found.name}`.",
+        verb="apply", measured_on=where, wrote=str(destination), project=found.name,
+        destination=str(destination), backup=str(backup) if backup else None,
+        written=written, skipped=skipped, content=body)
+
+
+# ── the table ───────────────────────────────────────────────────────────────────────────────────
+#
+# ORDER IS DELIBERATE and it is what `beeverforge act --list` prints: the two everyday answers to
+# a parked job first, then the things that change what the factory is doing, then the release
+# gate, then the read-only questions. Alphabetical would put `ack` above `approve_prod` and bury
+# `resume`.
+
+# ── people: an invitation from the panel (#33) ──────────────────────────────────────────────────
+
+async def _people_invite(*, person: str, by: Actor, display: str = "",
+                         product: object = "", board: object = "") -> Outcome:
+    """Issue a one-time registration link for `person`, vouched for by whoever asked.
+
+    THE VOUCHER IS THE ACTOR, and an anonymous actor cannot vouch: a shared-token caller has no
+    id, and the store refuses an invitation nobody stands behind — the audit line would otherwise
+    record a registration vouched for by "somebody with the panel token".
+
+    ONE AREA, OR BOTH (#562): `product` invites the product owner, `board` whoever runs the board
+    and nothing else, and neither an administrator of both. Asked for both at once, it refuses:
+    that is the administrator's invitation, and saying so beats guessing which was meant.
+
+    AND ONLY THE ADMINISTRATOR INVITES (#562). The row is the floor's, and a board credential is the
+    floor's too: without this, whoever holds one could invite an administrator — an invitation
+    with neither area — redeem it, and reach the product owner's area it is refused by name. A
+    scoped actor, of either area, is refused; the administrator's credential is unscoped. That
+    refusal was this body's first line and is the row's declaration now (`installation=True`,
+    #741): `perform` asks it for every row that changes the installation, so the rows that came
+    after this one cannot forget it."""
+    from beeverforge.identity import people as _people
+    from beeverforge.identity.local import BOARD_GROUP, PRODUCT_GROUP
+
+    scoped = _said_yes(product) or str(product or "").strip().lower() == "product"
+    boarded = _said_yes(board) or str(board or "").strip().lower() == "board"
+    if scoped and boarded:
+        return refused(INVALID, "an invitation is to the product owner's area or to the board; "
+                                "to both is the administrator's, which is an invitation with "
+                                "neither")
+    why = _people.sink_is_durable()
+    if why:
+        return refused(UNAVAILABLE, why)
+    from beeverforge.observability.query import StoreUnreadable
+
+    try:
+        got = _people.PeopleStore().invite(str(person or ""), display=str(display or ""),
+                                           groups=((PRODUCT_GROUP,) if scoped else
+                                                   (BOARD_GROUP,) if boarded else ()),
+                                           by=(by.id or "").strip())
+    except StoreUnreadable as exc:
+        # AN INVITATION IS CHECKED AGAINST WHO IS ALREADY REGISTERED, and a store that cannot be
+        # read cannot say: the old empty answer minted a second link for somebody who already
+        # has an account. UNAVAILABLE and not INVALID — nothing about the request is wrong.
+        return refused(UNAVAILABLE, f"the people store cannot be read, so no invitation was "
+                                    f"issued — {exc}")
+    if isinstance(got, str):
+        return refused(INVALID, got)
+    token, invitation = got
+    link = f"/auth/register?invite={token}"
+    days = _people.INVITE_TTL_SECONDS // 86400
+    return done(f"invitation for {invitation.id} issued, vouched for by {invitation.by}; send them "
+                f"the link appended to the panel's address — it registers them once and expires "
+                f"in {days} days", link=link, person=invitation.id, by=invitation.by,
+                expires_at=invitation.expires_at, product=scoped, board=boarded)
+
+
+async def _people_revoke(*, person: str, by: Actor) -> Outcome:
+    """Take a person off this deployment: their registration, every session they hold, and any
+    invitation still open for them (#741).
+
+    THERE WAS NO WAY TO DO IT. `people invite` minted a link and nothing took one back: a person
+    who left kept a password that opened the panel, and an invitation sent to the wrong address
+    stayed redeemable for its whole week. The store is append-only, so the act is a row of its own
+    (`PeopleStore.withdraw`) that the fold reads as the person's end — and a later invitation, and
+    the registration that redeems it, bring them back like anybody new.
+
+    THE LAST PERSON IS NOT REVOKED WHILE NOTHING ELSE CLOSES THE DOOR. A deployment with nobody
+    registered and no credential in its environment is open to whoever arrives
+    (`LocalIdentity.open_to_everyone`), which is how a new install lets its first operator in —
+    and is the opposite of what somebody revoking an account wants. So that one case refuses, and
+    says what to do first.
+
+    WHO DID IT IS RECORDED, as on an invitation (#759): a withdrawal nobody stands behind — the
+    shared panel token's, which is only CALLED "panel" — is refused before anything is read."""
+    from beeverforge.adapters.credential_store.registry import held, refusals
+    from beeverforge.identity import people as _people
+    from beeverforge.identity.local import CLOSING_ENVS
+    from beeverforge.observability.query import StoreUnreadable
+
+    ident = str(person or "").strip()
+    who = (by.id or "").strip()
+    if not who:
+        return refused(INVALID, _people.UNSIGNED_WITHDRAWAL, person=ident)
+    why = _people.sink_is_durable()
+    if why:
+        return refused(UNAVAILABLE, why)
+    store = _people.PeopleStore()
+    try:
+        snap = store.snapshot()
+    except StoreUnreadable as exc:
+        # "NOBODY CALLED THAT" IS AN ANSWER, and a store that cannot be read has not given one.
+        return refused(UNAVAILABLE, f"the people store cannot be read, so nobody was revoked — "
+                                    f"{exc}")
+    registered = ident in snap.people
+    invited = [i for i in snap.invitations.values() if i.id == ident]
+    if not registered and not invited:
+        return refused(NOT_FOUND, f"nobody called {ident!r} is registered or invited here — "
+                                  f"`beeverforge people list` shows who is", person=ident)
+    # THE DOOR'S CREDENTIALS ARE ASKED OF THE STORE (#742), as the door itself asks them: one
+    # held in a file closes it too, and so does one the store refuses
+    if (registered and set(snap.people) == {ident}
+            and not refusals(CLOSING_ENVS)
+            and not any(value.strip() for value in held(CLOSING_ENVS).values())):
+        return refused(
+            CONFLICT,
+            f"{ident} is the last person registered here, and with nobody registered and no "
+            f"credential configured the panel opens to whoever arrives — invite their successor, "
+            f"or configure a credential, before revoking them. Nothing was done.", person=ident)
+    sessions = sum(1 for s in snap.sessions.values() if s.person_id == ident)
+    got = store.withdraw(ident, by=who)
+    if got:
+        return refused(INVALID, got, person=ident)
+    what = ("their registration" if registered else "")
+    what += (" and " if what and invited else "") + (
+        f"{len(invited)} open invitation(s)" if invited else "")
+    return done(f"{ident} is revoked — {what} withdrawn, and {sessions} session(s) ended; "
+                f"recorded as done by {who}", person=ident, registered=registered,
+                invitations=len(invited), sessions=sessions, by=who)
+
+
+# ── the installation itself: pickup, the product's configuration, the doctor (#741) ─────────────
+#
+# EVERY VERB THAT CHANGES THE INSTALLATION IS A ROW, so that a front end of one's own can do what
+# the shell does. These were the command line's own code — `poller pause` called the engine's
+# schedule, `product name` and `product declare` wrote the registry — so the panel, a script
+# holding the panel's token and any screen built on the API could not reach them at all. Each is
+# `installation=True`: the administrator's, refused to a scoped credential by `perform`.
+
+async def _poller_hold(*, on: bool, by: Actor, note: object) -> Outcome:
+    """Pause or resume the poller — the deployment-wide hold on pickup — and say what it WAS.
+
+    THE ONE REAL HOLD (`schedule.hold_poller`): per-project `enabled` is a different lever with a
+    different blast radius, and emptying TO-DO holds nothing because auto-split refills it.
+
+    THE NOTE NAMES WHO when the caller gave none, because the note is the only record of WHY the
+    queue is held and an unexplained hold cannot be told from an outage by the next person who
+    looks. A no-op is a sentence, not an error: pausing what is paused changes nothing, and says so
+    with the note the first pause left.
+
+    A PAUSE SAYS WHAT IS STILL RUNNING. It holds NEW pickups only, and an operator pauses in order
+    to roll the deployment — so a pause that reads as "drained" is how a job is interrupted by
+    somebody who believed the opposite. `in_flight` is the running jobs, and `None` when the job
+    list could not be read (#298): an unread list is not a drained floor."""
+    from beeverforge.runtime import host
+    from beeverforge.util.causes import first_message
+
+    verb = "resume" if on else "pause"
+    if not host.the_client():
+        # NOT "THE ENGINE MAY BE UNREACHABLE" (#178): without the engine's client library the
+        # remedy is an install, and `host.CLIENT_MISSING` is the sentence every surface gives.
+        return refused(UNAVAILABLE, f"could not {verb} the poller: {host.CLIENT_MISSING}")
+    who = (by.display or by.id or "somebody") + (f" via the {by.via}" if by.via else "")
+    reason = str(note or "").strip() or f"{'resumed' if on else 'paused'} by {who}"
+    try:
+        from beeverforge.runtime.temporal.schedule import hold_poller
+
+        result = await hold_poller(on=on, note=reason)
+    except Exception as exc:  # noqa: BLE001 — one sentence, the cause, never a traceback
+        # INFO, NOT WARNING: the refusal below is the sentence, and `perform`'s audit line records
+        # it. At WARNING the shell printed this line and then the refusal — the same failure said
+        # twice, where the command used to say it once.
+        log.info("could not %s the poller for %s: %s", verb, by, exc)
+        return refused(UNAVAILABLE, f"could not {verb} the poller "
+                                    f"({first_message(exc, limit=200)}) — the engine may be "
+                                    f"unreachable. `beeverforge poller status` says whether it "
+                                    f"can be read.")
+    from beeverforge.floor import reading as floor
+
+    if on:
+        intake = (await floor.gather(want=("intake",))).intake or {
+            "known": False, "on": None, "note": ""}
+        said = ("the poller is on again — cards in TO-DO are picked up" if result["changed"]
+                else "the poller was already on. Nothing was changed")
+        return done(said, changed=result["changed"], was_on=result["was_on"],
+                    note=result["note"], intake=intake)
+    jobs = (await floor.gather(want=("jobs",))).jobs
+    running = None if jobs is None else [j for j in jobs if j.get("status") == "running"]
+    said = ("the poller is paused — no card in TO-DO will be picked up anywhere"
+            if result["changed"] else
+            f"the poller was already paused — note: \"{result['note']}\". Nothing was changed")
+    if running is None:
+        said += (". The job list could not be read, so this cannot say whether a job is still "
+                 "running: do not roll the deployment until it can")
+    elif running:
+        said += (f". The pause holds new pickups only, and {len(running)} job(s) are still "
+                 f"running: wait for them before rolling the deployment")
+    else:
+        said += ". Nothing is in flight"
+    return done(said, changed=result["changed"], was_on=result["was_on"], note=result["note"],
+                in_flight=running)
+
+
+async def _poller_pause(*, by: Actor, note: object = "") -> Outcome:
+    return await _poller_hold(on=False, by=by, note=note)
+
+
+async def _poller_resume(*, by: Actor, note: object = "") -> Outcome:
+    return await _poller_hold(on=True, by=by, note=note)
+
+
+async def _product_name(*, project: str, by: Actor, agent_name: object = None) -> Outcome:
+    """What the product role is called in this project's conversations — read, or set.
+
+    Every line the role writes is signed with it and people address it by it, so it is the
+    client's to choose. OMITTED, the row says what it is called now; GIVEN — `""` included, which
+    means no name, and the role introduces itself by function — it sets it, cleaned the way a
+    session's title is and cut at forty characters."""
+    from beeverforge.product.sessions import clean_title
+    from beeverforge.registry import ProjectRegistry
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    if agent_name is None:
+        current = getattr(getattr(found, "product", None), "agent_name", "") or ""
+        return done(f"{project}'s product role is called {current!r}" if current
+                    else f"{project}'s product role has no name — it introduces itself by "
+                         f"function", project=project, agent_name=current, changed=False)
+    chosen = clean_title(str(agent_name))[:40]
+    try:
+        ProjectRegistry().set_agent_name(project, chosen)
+    except ValueError as exc:
+        return refused(INVALID, str(exc), project=project)
+    return done(f"{project}'s product role is now called {chosen!r}" if chosen
+                else f"{project}'s product role has no name now — it introduces itself by "
+                     f"function", project=project, agent_name=chosen, changed=True)
+
+
+async def _product_declare(*, project: str, docs_repo: str, by: Actor) -> Outcome:
+    """Declare this product's EXISTING context repository — the client already has one.
+
+    The other half of creating one: an organisation arrives with both shapes, some projects with a
+    documentation repository and some without, and until a verb existed the only way to name one
+    was hand-editing the live registry inside the worker.
+
+    IT IS READ BACK, not just written down. "Declared" and "reachable" are different facts and the
+    distance between them is silent: a typo'd name, a qualifier pointing at another project, a
+    repository outside a credential's selection all record perfectly and surface hours later as the
+    product role answering "I cannot see the requirements". So both credentials that will ever read
+    it are tried here, while somebody is watching — and an unreadable one is still RECORDED
+    (`reachable: false`): fixing the access must not mean declaring it again.
+
+    THE READ LEAVES THE LOOP. `context_reachability` runs `git ls-remote` with each credential and
+    the forge's API, which take seconds, and on the panel this runs on the loop every other request
+    and stream is served from: measured on 2026-10-19 with a 3 s read, a `GET /api/v1/actions` sent
+    0.3 s into a declaration waited 3.95 s for it."""
+    import asyncio
+
+    from beeverforge import plugins
+    from beeverforge.adapters.forge.registry import forge_row
+    from beeverforge.product.onboard import context_reachability
+    from beeverforge.registry import ProjectRegistry
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    repo = str(docs_repo or "").strip().strip("/")
+    if not repo:
+        return refused(INVALID, f"name the repository: `beeverforge product declare {project} "
+                                f"<owner/repo>`", project=project)
+    if repo.startswith("-"):
+        # A VALUE THAT LOOKS LIKE AN OPTION IS REFUSED HERE, before it reaches git: the repository
+        # name is read back with `git ls-remote <url>`, and a value beginning with `-` would be
+        # read by git as a flag, not a repository. The `--` the ls-remote carries is the other
+        # half of this; a name is also just never spelled this way.
+        return refused(INVALID, f"a repository is named `owner/repo`, not {docs_repo!r} — a value "
+                                f"that begins with '-' is not {project}'s context repository",
+                       project=project)
+    ProjectRegistry().set_docs_repo(project, repo)
+    found, bad = _project(project)  # RE-READ: the object above predates the record
+    if bad:
+        return bad
+    ok, why = await asyncio.to_thread(context_reachability, found, repo)
+    if ok:
+        return done(f"{project}'s context repository is {repo} — recorded, and reachable",
+                    project=project, docs_repo=repo, reachable=True, why="", cause="")
+    # THE VENDOR'S OWN LIKELY CAUSE, said by the forge's row — the context repository is read
+    # through the forge (`product.onboard.context_forge`), and a cause chosen here by vendor name
+    # would offer one forge's reason about another's repository.
+    cause = plugins.sentence(forge_row(found), "when_unreadable", "", found)
+    return done(f"{project}'s context repository is {repo} — recorded, but not readable: {why}. "
+                f"The declaration stands; fix the access and nothing needs declaring again",
+                project=project, docs_repo=repo, reachable=False, why=why, cause=cause)
+
+
+async def _doctor(*, project: str, by: Actor) -> Outcome:
+    """Every prerequisite of running a ticket on this project, checked — the
+    `beeverforge.doctor/1` document as `data`, exactly as `beeverforge doctor --json` prints it.
+
+    `ok` IS ABOUT THE PLATFORM, NOT THE ANSWER: the doctor ran and reported, so a project that is
+    NOT ready is still a done outcome whose document says `"ok": false` and which checks failed.
+    A refusal is the doctor not running at all — an unknown project.
+
+    WHOSE OPINION IT IS rides in the document's `build`: the process that answered, which is the
+    worker's from its shell and the panel's through the panel. The two halves of a deployment can
+    disagree about the same machine, and the stamp is what says which one is speaking.
+
+    THE PROBES LEAVE THE LOOP, for the reason `_product_declare`'s read does: `docker info`, the
+    forge's API and the box gate block for up to a minute, and through the panel they would hold
+    every other request for as long — measured on 2026-10-19 with a 3 s probe, a request sent
+    0.3 s in waited 2.75 s."""
+    import asyncio
+
+    from beeverforge import doctor as doc
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    report = await asyncio.to_thread(lambda: doc.diagnose(doc.probes_for(found)))
+    document = doc.as_document(report, project=project, build=namespace.build_stamp())
+    failed = [c["id"] for c in document["checks"] if c["result"] != "ok"]
+    if not failed:
+        said = f"{project} can run a ticket"
+    elif document["verdict"] == "expected":
+        said = (f"{project} is not ready, as expected at this point — next: "
+                f"{document['next_step']}")
+    else:
+        said = f"{project} is not ready — failing: {', '.join(failed)}"
+    return done(said, **document)
+
+
+# ── a project's own settings, and its removal (#741) ────────────────────────────────────────────
+#
+# THE REGISTRY IS READ PER RUN, so each of these takes effect on the next job with no restart —
+# which is why they exist at all: the only other way to change one was editing the registry's YAML
+# inside the worker. Each answers an unknown project with the roster, as `_project` does, because
+# the commonest cause is a typo and the second is a worker baked without the project.
+
+def _no_such_project(project: str, *, so: str = "") -> Outcome:
+    """The refusal for a name this registry does not hold, with what it does hold."""
+    from beeverforge.registry import ProjectRegistry
+
+    known = ", ".join(sorted(p.name for p in ProjectRegistry().list())) or "none"
+    return refused(NOT_FOUND, f"there is no project called {project!r} on this deployment"
+                              + (f" — {so}" if so else "") + f". It knows: {known}.",
+                   project=project)
+
+
+async def _project_remove(*, project: str, by: Actor) -> Outcome:
+    """Unregister a project, or refuse — naming the roster — when the name is not registered.
+
+    THE REGISTRY REFUSES AN UNKNOWN NAME (#138), and this says so rather than reporting a removal
+    nobody made: a shell loop with a quoting mistake once removed nothing, one call per project,
+    and every call said it had. NOTHING ELSE ABOUT THE PROJECT IS TOUCHED — its board, its
+    repositories, what the product role remembers; `project forget` is the verb for the last."""
+    from beeverforge.registry import ProjectRegistry
+
+    try:
+        ProjectRegistry().remove(project)
+    except KeyError:
+        return _no_such_project(project, so="nothing was removed")
+    return done(f"removed {project!r}", project=project)
+
+
+async def _project_set_model(*, project: str, model: str, by: Actor,
+                             role: object = "") -> Outcome:
+    """Which model the coding agent runs for this project — one string for every role, or with
+    `role` the per-role shape, one call per role.
+
+    PASSED TO THE HARNESS VERBATIM: each harness names its models its own way, and policing the
+    string here would refuse exactly the routes an enterprise needs. Whether the harness
+    recognises it is asked of the harness, on the machine that will run it, by whoever set it —
+    the shell does, after this row has saved it; a name it does not recognise is a warning there,
+    never a refusal here.
+
+    AND THIS ROW SAYS IT DID NOT ASK (`checked: false`). Only the shell asks; a front end of one's
+    own reaches this row alone, and an `ok` with nothing else said is the silence the pilot read
+    as a confirmation on 2026-08-15, when a typo'd model was shown on the panel like a setting."""
+    from beeverforge.registry import ProjectRegistry
+
+    chosen = str(role or "").strip() or None
+    try:
+        ProjectRegistry().set_model(project, str(model), role=chosen)
+    except KeyError:
+        return _no_such_project(project)
+    except ValueError as exc:
+        return refused(INVALID, str(exc), project=project)
+    scope = f"role {chosen!r}" if chosen else "every role"
+    return done(f"{project}: model {model!r} for {scope} — takes effect on the next job, no "
+                f"restart needed (the registry is read per run). Not checked against the harness "
+                f"here: the first job proves it, and fails naming this model if the harness will "
+                f"not run it", project=project, model=str(model), role=chosen, checked=False)
+
+
+async def _project_set_language(*, project: str, language: str, by: Actor) -> Outcome:
+    """Which language this project SPEAKS FIRST — its park alerts, its scheduled rounds, the
+    comments nobody asked it to write. A reply is not governed by this: it follows the language of
+    whoever asked, which is the harness's own rule (`roles.language_directive`)."""
+    from beeverforge.registry import ProjectRegistry
+
+    try:
+        ProjectRegistry().set_language(project, str(language))
+    except KeyError:
+        return _no_such_project(project)
+    except ValueError as exc:
+        return refused(INVALID, str(exc), project=project)
+    chosen = str(language).strip()
+    return done(f"{project}: unprompted messages in {chosen!r} — takes effect on the next one, "
+                f"no restart needed (the registry is read per run).", project=project,
+                language=chosen)
+
+
+def _either(value: object) -> bool | None:
+    """A yes or a no a caller handed in any spelling — `None` when it handed neither, which a
+    policy reads as "keep what is there". Consent is `_said_yes`'s; this adds the no."""
+    if value is None or value == "":
+        return None
+    if _said_yes(value):
+        return True
+    if value is False or str(value).strip().lower() in {"false", "no", "n", "0"}:
+        return False
+    raise ValueError(f"{value!r} is neither yes nor no")
+
+
+async def _project_set_preview(*, project: str, by: Actor, required: object = None,
+                               hours: object = None, auto_start: object = None,
+                               env: object = None, build_arg: object = None,
+                               network: object = None, cpus: object = None,
+                               memory: object = None, clear_env: object = None) -> Outcome:
+    """What the OPERATOR decides about a project's previews (ADR-0050 D6, D8, D9): whether one is
+    required before a merge, how long it lives, which names each service may receive, egress and
+    limits. MERGED into what the registry holds — a parameter not given keeps its value.
+
+    THE ONE DOOR THAT VALIDATES WHAT IT WRITES. A name a preview may never receive — the
+    factory's own credentials, any project's `token_env`, every name a harness route requires — is
+    dropped by the registry's writer and said here, in `dropped`; it is never written to a file a
+    person trusts. That list bounds a preview however it is set, because this row reaches every
+    unscoped panel credential and a preview runs code nobody merged (ADR-0050 D8, amended)."""
+    from pydantic import ValidationError
+
+    from beeverforge.contracts.project import PreviewPolicy
+    from beeverforge.registry import ProjectRegistry
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    policy = (found.preview or PreviewPolicy()).model_dump(mode="json")
+    envs, args = _listed(env), _listed(build_arg)
+
+    def _pairs(items: list[str], table: dict) -> dict:
+        out = {k: dict(v) for k, v in table.items()}
+        for item in items:
+            svc, _, rest = item.partition("=")
+            container, _, worker = rest.partition("=")
+            if not svc or not container:
+                raise ValueError(f"{item!r} is not svc=NAME or svc=NAME=WORKER_NAME")
+            out.setdefault(svc, {})[container] = worker or container
+        return out
+
+    try:
+        if _either(clear_env):
+            policy["env"] = {}
+        policy["env"] = _pairs(envs, policy["env"])
+        policy["build_args"] = _pairs(args, policy["build_args"])
+        if hours is not None and hours != "":
+            # A NUMBER OR A REFUSAL: the policy reads anything else as its default, so `6h` from
+            # a front end's body was saved as 24 and reported as a success. The shell's
+            # `--hours` is typed as an int and never sent one.
+            try:
+                hours = int(str(hours).strip())
+            except ValueError:
+                raise ValueError(f"{hours!r} is not a number of hours, 1 to 168") from None
+        for key, value in (("required", _either(required)), ("auto_start", _either(auto_start)),
+                           ("hours", hours), ("network", network), ("cpus", cpus),
+                           ("memory", memory)):
+            if value is not None:
+                policy[key] = value
+        registry = ProjectRegistry()
+        registry.set_preview(project, policy)
+        saved = registry.get(project).preview
+    except KeyError:
+        return _no_such_project(project)
+    except (ValueError, ValidationError) as exc:
+        return refused(INVALID, f"the preview policy was not changed — "
+                                f"{' '.join(str(exc).split())[:300]}", project=project)
+    dropped = sorted({f"{s}={c}" for item in envs + args
+                      for s, _, rest in [item.partition("=")]
+                      for c in [rest.partition("=")[0]]
+                      if c not in {**saved.env.get(s, {}), **saved.build_args.get(s, {})}})
+    said = (f"{project}: previews {'required before a merge' if saved.required else 'optional'}"
+            f", {'started on their own' if saved.auto_start else 'started on demand'}"
+            f", up for {saved.hours}h, egress: {saved.network or 'none'}")
+    if dropped:
+        said += (f"; refused (a credential of the factory's own, or not a name): "
+                 f"{', '.join(dropped)}")
+    if network not in (None, "") and saved.network != str(network).strip():
+        # THE POLICY DROPS IT WITH A LOG LINE, which a front end never reads: said here, or the
+        # sentence above reads "egress: none" as what was asked for.
+        said += (f"; network {network!r} refused — a preview joins an operator network by name, "
+                 f"never bridge or host")
+    return done(said, project=project, preview=saved.model_dump(mode="json"), dropped=dropped)
+
+
+# ── registering a project, and making it ready to move a ticket (#741) ──────────────────────────
+#
+# THREE DOORS WROTE A PROJECT, AND NONE WAS A ROW. `beeverforge project add` and `project init`
+# built the registry row in the command line's own code, and the panel's `POST /api/projects` was a
+# third copy of the first, which wrote the tracker axis alone for a hosted address. So a front end
+# of one's own could not register a project at all, and the two that could disagreed. These rows
+# are the one implementation; the command and the route map onto them.
+
+def _given(value: object) -> str:
+    """A text parameter as a caller handed it — `None`, a missing value and spaces are all `""`."""
+    return str(value or "").strip()
+
+
+def _the_steps_came_to(project: str, steps: list[dict], **data: object) -> Outcome:
+    """What a several-step row answers: done when no step failed; FAILED otherwise, saying what was
+    done before the step that failed and that running it again does only what is missing. The
+    steps ride in `data["steps"]` either way, so a screen can show each one."""
+    said = "; ".join(str(s["said"]) for s in steps)
+    if not any(s["state"] == STEP_FAILED for s in steps):
+        return done(f"{project}: {said}", project=project, steps=steps, **data)
+    return refused(FAILED, f"{project}: {said}. Not finished — what was done stays done, and "
+                           f"running it again does only what is missing", project=project,
+                   steps=steps, **data)
+
+
+def _differs(held, asked) -> list[str]:
+    """The fields `asked` was given that `held` does not hold the same — `[]` when the registry
+    already says what was asked. An axis agrees when its kind and its repository are the same and
+    every option asked for is held with the same value, so a board attached since, or a credential
+    variable named since, is not a disagreement."""
+    from beeverforge.contracts.project import ProviderRef
+
+    out = []
+    for key in sorted(asked.model_fields_set - {"name"}):
+        want, have = getattr(asked, key), getattr(held, key, None)
+        if isinstance(want, ProviderRef):
+            same = (isinstance(have, ProviderRef) and want.kind == have.kind
+                    and want.repo == have.repo
+                    and all(have.options.get(k) == v for k, v in want.options.items()))
+        else:
+            same = want == have
+        if not same:
+            out.append(key)
+    return out
+
+
+async def _project_add(*, project: str, repo_path: str, by: Actor, provider: object = "",
+                       repo: object = "", board_owner: object = "", board_number: object = "",
+                       organization: object = "", ado_project: object = "",
+                       repository: object = "", work_item_type: object = "",
+                       token_env: object = "", model: object = "",
+                       language: object = "") -> Outcome:
+    """Register a project with every axis its address and its options say — one write.
+
+    DECIDED BEFORE ANYTHING IS WRITTEN (engineering-lessons §12): whose host the address is, the
+    kind it is on every axis, and, for a kind that needs coordinates, whether they were given or
+    can be read from the address. A refused address leaves the registry as it was.
+
+    SAFE TO RUN AGAIN, AND NEVER OVER WHAT IS THERE. A name already registered as asked is an
+    answer (`changed: false`), so a script that adds and then initialises can be run twice; one
+    registered differently is refused, naming what differs, and nothing is written. Adding again is
+    not how a project is changed — its own rows are (`project_set_model`, `project_set_language`),
+    and `project_remove` first is how it is replaced."""
+    from pydantic import ValidationError
+
+    from beeverforge import doors
+    from beeverforge.contracts.project import Project, model_refused
+    from beeverforge.registry import ProjectRegistry
+
+    name, where, chosen = _given(project), _given(repo_path), _given(provider)
+    # WHOSE HOST IS IT (#162, ADR-0049 D2) — a host nobody here implements is refused by name,
+    # because the row is what later hands a credential to whatever host the address names.
+    try:
+        foreign = doors.foreign_host(where, provider=chosen)
+    except ValueError as exc:
+        return refused(INVALID, str(exc), project=name)
+    if foreign:
+        return refused(INVALID, doors.foreign_refusal(foreign), project=name, foreign=foreign)
+    # THE KIND THIS ADDRESS IS, on every axis, and the axes it writes (ADR-0049 D2): the one
+    # answer this row and a product's first source share (`doors.axes_for`, #992).
+    try:
+        fields = doors.axes_for(
+            name, where, provider=chosen, repo=_given(repo), organization=_given(organization),
+            ado_project=_given(ado_project), repository=_given(repository),
+            work_item_type=_given(work_item_type), token_env=_given(token_env),
+            board_owner=_given(board_owner), board_number=_given(board_number))
+    except doors.MissingCoordinates as exc:
+        # NAMED BY THIS ROW'S PARAMETERS, which a front end fills; the command line names its
+        # flags from them.
+        missing = [flag.lstrip("-").replace("-", "_") for flag in exc.missing]
+        them = "it" if len(missing) == 1 else "them"
+        return refused(INVALID, f"{name} was not registered: {', '.join(missing)} could not be "
+                                f"read from {where!r}, and a project of this kind needs {them} — "
+                                f"pass {them}", project=name, missing=missing)
+    if _given(language):
+        fields["language"] = _given(language)
+    if model not in (None, ""):
+        # VERBATIM, as `project_set_model` saves it: the harness names its models its own way.
+        fields["model"] = str(model)
+    if why := model_refused(fields.get("model")):
+        return refused(INVALID, why, project=name)
+    try:
+        asked = Project(name=name, repo_path=where, **fields)
+    except ValidationError as exc:
+        return refused(INVALID, f"{name} was not registered — {' '.join(str(exc).split())[:300]}",
+                       project=name)
+    registry = ProjectRegistry()
+    try:
+        held = registry.get(name)
+    except KeyError:
+        held = None
+    if held is not None:
+        differs = _differs(held, asked)
+        if differs:
+            return refused(CONFLICT, f"{name} is already registered, with a different "
+                                     f"{', '.join(differs)} — nothing was changed. A project is "
+                                     f"changed by its own rows (project_set_model, "
+                                     f"project_set_language), or removed first and added again",
+                           project=name, differs=differs)
+        return done(f"{name} is already registered as asked — nothing was changed", project=name,
+                    changed=False, registered=held.model_dump(mode="json", exclude_none=True))
+    try:
+        registry.add(asked)
+    except ValueError as exc:
+        # A name another caller registered a moment ago, two projects one installation cannot
+        # hold together, two names one preview slug: the registry's own sentence, and nothing was
+        # written.
+        return refused(CONFLICT, f"{name} was not registered — {exc}", project=name)
+    return done(f"registered project {name!r}", project=name, changed=True,
+                registered=asked.model_dump(mode="json", exclude_none=True))
+
+
+# ── making a registered project ready: a row of several steps (#741) ────────────────────────────
+#
+# `project_init` registers a project, creates its board with the platform's columns, seeds the
+# product role's context repository where this installation owns it, and scaffolds the manifest.
+# The network is between those steps, so each says what it came to (`base.step`): a board refused
+# halfway leaves a person knowing the project is registered and its manifest written, and running
+# the row again creates the board — never a second project, never a second set of columns.
+
+def _project_to_initialise(name: str, *, repo_path: str, repo: str, language: str,
+                           provider: str) -> tuple[object, Outcome | None]:
+    """The project `project_init` registers when the name is not registered yet — `(project, None)`
+    or `(None, refusal)`. Nothing is written here. Moved from `beeverforge project init`."""
+    from pydantic import ValidationError
+
+    from beeverforge import doors
+    from beeverforge.contracts.product import ProductConfig
+    from beeverforge.contracts.project import Project, ProviderRef
+
+    if not repo_path:
+        return None, _no_such_project(name, so="give its repo_path to register it here")
+    if doors.ado_coordinates(repo_path)[0]:
+        # REGISTERING HERE WOULD MINT THE WRONG ROW over coordinates only `project_add` reads, so
+        # the address goes there; this row then finds it registered and does the rest.
+        return None, refused(INVALID, f"{name} was not registered: {repo_path!r} carries "
+                                      f"coordinates only project_add reads — register it with "
+                                      f"project_add, then initialise it", project=name,
+                             register_with="project_add")
+    # WHOSE HOST IS IT — asked, and refused when the answer is nobody this build implements
+    # (#162): a host that fell through to `kind="github"` was registered as GitHub and then
+    # offered a `github.com` credential by `factory._authenticated`.
+    try:
+        foreign = doors.foreign_host(repo_path, provider=provider)
+    except ValueError as exc:
+        return None, refused(INVALID, str(exc), project=name)
+    if foreign:
+        return None, refused(INVALID, doors.foreign_refusal(foreign), project=name,
+                             foreign=foreign)
+    # THE KIND THIS ADDRESS IS (ADR-0049 D2). A bare filesystem path is `local` — the person's own
+    # repository is the forge, and there is no account anywhere to infer an owner from — so the
+    # refusal below fires only where an owner really is missing: a URL nothing could be read from.
+    kind = doors.kind_for(repo_path, repo=repo, provider=provider)
+    inferred = repo or doors.infer_repo(repo_path) or (name if kind == "local" else "")
+    if not inferred:
+        return None, refused(INVALID, f"{name} was not registered: its owner/name cannot be "
+                                      f"read from {repo_path!r} — give it as repo", project=name,
+                             missing=["repo"])
+    # EVERY AXIS, SPELLED, for every kind but the GitHub default (D2): an axis left unwritten
+    # inherits `ProviderRef`'s `github`. An add-on's kind goes on both axes because its board, if
+    # it has one, is keyed by the tracker kind (`board/factory.py`).
+    fields: dict = {"tracker": ProviderRef(kind=kind, repo=inferred, options={})}
+    if kind != "github":
+        fields["forge"] = ProviderRef(kind=kind, repo=inferred, options={})
+    if kind == "local":
+        # `ci: none` is a row any forge may declare and the only honest answer for a repository
+        # with no service watching it. AND THE PRODUCT ROLE IS ON (ADR-0049 D9): its context
+        # repository is one this installation creates under the operator's own directory, so the
+        # decision costs nobody anything — on a hosted row it is an operator's, and stays off.
+        fields["ci"] = ProviderRef(kind="none", repo=inferred, options={})
+        fields["product"] = ProductConfig(docs_repo=f"{name}-context")
+    if language:
+        fields["language"] = language
+    try:
+        return Project(name=name, repo_path=repo_path, **fields), None
+    except ValidationError as exc:
+        return None, refused(INVALID, f"{name} was not registered — "
+                                      f"{' '.join(str(exc).split())[:300]}", project=name)
+
+
+def _the_board_step(project, *, board_owner: str) -> dict:
+    """The project's board with the platform's columns: created, completed, already there, or its
+    tracker's own. WHETHER THERE IS ONE TO CREATE IS THE TRACKER'S DECLARATION, asked of the
+    board-setup registry (ADR-0049 D1): on some trackers the project's own workflow is the board,
+    and setting it up is a recipe the board's row says, not a call this platform makes.
+
+    A BOARD THAT IS THERE ALREADY IS COMPLETED where its row says `create` may be called on it
+    (`completes_an_attached_board`): that is how a re-run gives a local board made before "Needs
+    Review" existed its seventh column, the opt-in `changes/753.upgrade.md` gives. The step says
+    `done` only when the board has a key it lacked before, and says a column the row declined to
+    add, with the way in (`left_out`)."""
+    from beeverforge import plugins
+    from beeverforge.adapters.board_setup.base import BoardSetupError
+    from beeverforge.adapters.board_setup.registry import board_creator
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.util.causes import first_message
+
+    try:
+        # ASKED INSIDE THE STEP: an add-on's board row that cannot be built, or a registry that
+        # cannot record the board, is this step failing, never the row raising.
+        kind = ((project.tracker.kind or "") if project.tracker else "github").strip().lower()
+        creator = board_creator(kind or "github")
+        if creator is None:
+            from beeverforge.adapters.board.factory import board_row
+
+            setup = plugins.sentence(board_row(project), "setup", "", project)
+            return _step("board", STEP_SKIPPED, f"board: the {kind} tracker brings its own — "
+                                                f"nothing to create"
+                                                + (f" ({setup})" if setup else ""))
+        attached = creator.attached(project)
+        # A ROW WHOSE `create` MINTS A SECOND BOARD does not say it completes one, and is never
+        # called on a board it already has. The local row says so: skipping its `create` here
+        # never gave a six-row board its seventh column (measured 2026-10-21 on a board written
+        # by 1be1835a's `project init`).
+        if attached and not getattr(creator, "completes_an_attached_board", False):
+            return _step("board", STEP_ALREADY, f"board already attached ({attached})")
+        from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+        # WHICH KEYS THE BOARD HAS BEFORE `create`, for a row that can say (`keys`, optional):
+        # whether it added a column is decided by them, never by `attached()`'s sentence, which
+        # lists names by position — a re-order read as an addition and `init` said "added the
+        # columns it lacked" on a hand-ordered board it added nothing to (PR #1040's review,
+        # 2026-10-22). A row with no `keys` is compared by its sentence, the only answer it gives.
+        keys_of = getattr(creator, "keys", None)
+        keys_before = keys_of(project) if callable(keys_of) and attached else None
+        # AN EMPTY OWNER IS THE ROW'S TO REFUSE: a board this platform holds itself lives under
+        # nobody, and refusing here would refuse to create a board that needs no owner. THE
+        # PROJECT'S OWN RESOLUTION (#822), which ends with the deployment's pair — so the static
+        # token still comes first, as a personal account's board needs, then what this deployment
+        # can mint for this tracker's vendor, which an organisation-only App creates boards with.
+        owner = board_owner or (project.tracker.repo or "").split("/")[0]
+        number, url = creator.create(
+            project=project, owner=owner, title=project.name,
+            token=tracker_token_for(project) or deployment_tracker_token(project))
+        # ONLY WHERE THERE IS A COORDINATE TO WRITE: a board with no second object to point at
+        # answers `""`, and an empty coordinate is one every later read would special-case.
+        if number:
+            ProjectRegistry().attach_board(project.name, board_owner=owner, board_number=number)
+        now, added = "", False
+        if attached:
+            now = creator.attached(project)
+            added = (bool(keys_of(project) - keys_before) if keys_before is not None
+                     else now != attached)
+        # A COLUMN THE ROW DECLINED TO ADD IS SAID, with the way in: a local board whose
+        # `in_review` or `needs_action` was already called "Needs Review" keeps one column of that
+        # name, and a re-run that declined the release note's opt-in in silence would read as a
+        # defect (PR #1040's review, 2026-10-22). Optional, read with `getattr`.
+        left_out = getattr(creator, "left_out", None)
+        declined = (left_out(project) or "") if callable(left_out) else ""
+    except BoardSetupError as exc:
+        # THE PROJECT STAYS REGISTERED — tickets-only is legitimate — and the steps after this one
+        # still run, so a project whose board was refused can still finish being initialised
+        # (pre-pilot review: exiting here left the manifest unreachable for ever).
+        return _step("board", STEP_FAILED, f"board: {exc}")
+    except Exception as exc:  # noqa: BLE001 — a step that raised is a failed step, said
+        # ONE LINE, NO TRACEBACK: a terminal prints a warning's traceback above the steps, and a
+        # failure speaks by name (CONTRIBUTING.md); the step carries the cause.
+        log.warning("the board step of %s raised: %s", project.name,
+                    first_message(exc, limit=300))
+        return _step("board", STEP_FAILED, f"board: {first_message(exc, limit=300)}")
+    also = f"; {declined}" if declined else ""
+    if not attached:
+        return _step("board", STEP_DONE, f"board created with the platform's columns — {url}"
+                                         f"{also}", url=url)
+    if added:
+        return _step("board", STEP_DONE, f"board: added the columns it lacked — {now}{also}",
+                     url=url)
+    return _step("board", STEP_ALREADY, f"board already attached ({attached}){also}")
+
+
+def _the_context_step(name: str) -> dict | None:
+    """The product role's context repository, created and given its first commit, where this
+    installation owns the forge it lives on — `None` where it does not.
+
+    ENABLED AND UNUSABLE IS THE STATE THIS AVOIDS, measured on a fresh install: the registry
+    gained a `product:` section, the repository behind it did not exist, and `beeverforge doctor`
+    said the product module was "enabled but unusable" on a machine where nothing was wrong except
+    that nobody had made the repository yet. The seed is `product.onboard`'s (#992), shared with a
+    product started before its code; this project has code, so its own repository is the one
+    source. IT ASKS WHETHER THE BASE HAS A COMMIT, not whether this run made the directory, so a
+    seed that failed once is finished by the next run (review of #106). A failure is said and
+    never raised: the registration before it is worth keeping. Moved from `beeverforge project
+    init` with the command (#741)."""
+    from beeverforge.adapters.forge.base import RepositoryCreatingForge
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.product.onboard import seed_context_repository
+    from beeverforge.registry import ProjectRegistry
+
+    docs = f"{name}-context"
+    try:
+        project = ProjectRegistry().get(name)
+        forge = build_forge(project)
+        if not isinstance(forge, RepositoryCreatingForge):
+            return None
+        created, where = seed_context_repository(project, docs, sources=[name])
+        there = where or forge.clone_url(docs)
+    except Exception as exc:  # noqa: BLE001 — the project is registered; the step is said
+        log.warning("could not seed the context repository for %s (%s)", name, str(exc)[:200])
+        return _step("context", STEP_FAILED, f"the product role's context repository could not "
+                                             f"be created ({exc}) — the doctor will say the "
+                                             f"product module is unusable until it is")
+    if not where:
+        return _step("context", STEP_ALREADY, f"the product role's context repository is there "
+                                              f"— {there}")
+    # WHICH OF THE TWO IT DID: "created" over a repository that was already there, because a push
+    # failed last time and this run finished the job, is a small untruth that makes a person doubt
+    # the rest of the output.
+    return _step("context", STEP_DONE, f"context repository {'created' if created else 'seeded'} "
+                                       f"for the product role — {where}")
+
+
+def _the_manifest_step(project, *, local: bool) -> tuple[dict, str]:
+    """The manifest scaffolded into the project's checkout — `(step, base_branch)`. Skipped for a
+    project registered by its clone URL, which has no checkout here to write into."""
+    import subprocess
+
+    from beeverforge.onboarding.starter import MANIFEST_TEMPLATE
+    from beeverforge.util.causes import first_message
+
+    name, where = project.name, project.repo_path
+    if "://" in where or where.startswith("git@"):
+        return _step("manifest", STEP_SKIPPED, f"{name} is registered by its clone URL — the "
+                                               f"factory fetches the code itself, so there is no "
+                                               f"checkout here to write a manifest into"), "main"
+    base_branch = "main"
+    try:
+        # WHICH BRANCH THIS CHECKOUT IS ON: the manifest names it, and `git init` still yields
+        # `master` on plenty of machines — a manifest naming a branch that does not exist made the
+        # pickup gate hold every card with nothing saying why. `symbolic-ref --short HEAD` answers
+        # on an unborn branch too, where `rev-parse --abbrev-ref HEAD` exits 128.
+        head = subprocess.run(["git", "-C", str(Path(where).expanduser()), "symbolic-ref",
+                               "--short", "HEAD"], capture_output=True, text=True, check=False)
+        named = (head.stdout or "").strip()
+        base_branch = named if head.returncode == 0 and named else "main"
+        # THE ONE READER DECIDES WHETHER THIS CHECKOUT HAS A MANIFEST: a checkout still on the
+        # directory's retired name is refused with what to rename, and nothing is written beside
+        # the manifest it has (review, 2026-08-25).
+        dest = namespace.resolve(Path(where).expanduser(), project.manifest_path, project=name)
+        if dest.exists():
+            return _step("manifest", STEP_ALREADY, f"manifest already exists: {dest}",
+                         path=str(dest)), base_branch
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        scaffold = MANIFEST_TEMPLATE.replace("base_branch: main", f"base_branch: {base_branch}")
+        if local:
+            # THE SOURCE SAYS WHOSE CONTEXT IT IS: the product module reads the pair from both
+            # ends, and on this runtime both are ours to write.
+            scaffold += "\n# The product role's context repository (created for you).\n"
+            scaffold += f"docs_repo: {name}-context\n"
+        dest.write_text(scaffold)
+    except namespace.RetiredNamespace as exc:
+        return _step("manifest", STEP_FAILED, str(exc)), base_branch
+    except Exception as exc:  # noqa: BLE001 — a checkout that cannot be written is a failed step
+        # A CHECKOUT THAT CANNOT BE WRITTEN — read-only, or a path that cannot be made — raised
+        # out of the row and took the registration and the board before it down with it: the
+        # answer named neither, and the terminal printed a traceback (review of #1085, a `git
+        # init`'d directory made `chmod 555`).
+        log.warning("the manifest step of %s raised: %s", name, first_message(exc, limit=300))
+        return _step("manifest", STEP_FAILED, f"manifest: {first_message(exc, limit=300)}"), \
+            base_branch
+    return _step("manifest", STEP_DONE, f"wrote {dest}" + (
+        f" (base_branch: {base_branch})" if base_branch != "main" else ""),
+        path=str(dest)), base_branch
+
+
+def _project_init_steps(name: str, *, repo_path: str, repo: str, board_owner: str,
+                        language: str, provider: str) -> Outcome:
+    """`project_init`'s steps, in order, off the loop that called it. NONE RAISES: each says what
+    it came to, a failure included, so the answer names every step that ran."""
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.util.causes import first_message
+
+    registry = ProjectRegistry()
+    try:
+        try:
+            found = registry.get(name)
+        except KeyError:
+            found = None
+        if found is not None:
+            # NEVER OVER WHAT IS THERE: a registered project is initialised as it is registered,
+            # and an address given beside it changes nothing — `project_add` says when one differs.
+            steps = [_step("register", STEP_ALREADY, f"{name} is already registered")]
+        else:
+            asked, bad = _project_to_initialise(name, repo_path=repo_path, repo=repo,
+                                                language=language, provider=provider)
+            if bad is not None:
+                return bad
+            try:
+                registry.add(asked)
+            except ValueError as exc:
+                return refused(CONFLICT, f"{name} was not registered — {exc}", project=name)
+            steps = [_step("register", STEP_DONE, f"registered {name} ({asked.tracker.repo})")]
+            found = registry.get(name)
+    except Exception as exc:  # noqa: BLE001 — a registry that cannot be written is a failed step
+        # A REGISTRY THAT CANNOT BE READ OR WRITTEN — its directory read-only, its file broken by
+        # hand — is the first step failing, said like any other. Nothing after it is tried: the
+        # board, the context and the manifest are all done on the registered project.
+        log.warning("the register step of %s raised: %s", name, first_message(exc, limit=300))
+        return _the_steps_came_to(name, [_step("register", STEP_FAILED,
+                                               f"register: {first_message(exc, limit=300)}")])
+    steps.append(_the_board_step(found, board_owner=board_owner))
+    # READ OFF THE ROW, never off what this run decided: the row converges, and the second run
+    # registers nothing to decide from.
+    local = (getattr(getattr(found, "forge", None), "kind", "")
+             or getattr(getattr(found, "tracker", None), "kind", "")) == "local"
+    if local and (context := _the_context_step(name)) is not None:
+        steps.append(context)
+    manifest, base_branch = _the_manifest_step(found, local=local)
+    steps.append(manifest)
+    return _the_steps_came_to(name, steps, local=local, base_branch=base_branch)
+
+
+async def _project_init(*, project: str, by: Actor, repo_path: object = "", repo: object = "",
+                        board_owner: object = "", language: object = "",
+                        provider: object = "") -> Outcome:
+    """From nothing to a project that can move a ticket — everything an API can do, done.
+
+    CONVERGES rather than performs a fixed script: each step runs only if its result is missing,
+    so a failed board creation is retried by running this again, never by hand-assembling the
+    remaining half. A project that is not registered is registered first, from `repo_path`.
+
+    THE STEPS LEAVE THE LOOP. A board's creation, a clone and a push take seconds each, and through
+    the panel this runs on the loop every other request is served from — the reason the doctor's
+    probes do (#741, measured on 2026-10-19)."""
+    import asyncio
+
+    return await asyncio.to_thread(
+        _project_init_steps, _given(project), repo_path=_given(repo_path), repo=_given(repo),
+        board_owner=_given(board_owner), language=_given(language), provider=_given(provider))
+
+
+# ── onboarding a product's context repository: a row of several steps (#741) ────────────────────
+
+def _product_sources(project, given: list[str]) -> tuple[list[str], list[str]]:
+    """`(sources, unreadable)` — the repositories implementing this product, one entry each in
+    the first spelling given, the registry's before any caller's; and what was given that is not
+    a repository reference at all.
+
+    THE REGISTRY NAMES ONE REPOSITORY; A PRODUCT MAY SPAN SEVERAL, and a member missing from
+    `sources:` is invisible to the product role — so the caller names the others. BUILT WITH THE
+    CHECK'S OWN FUNCTIONS, because the file exists to pass that check: a rule of its own (a `/`
+    in the name) once wrote `sources: []` on a forge that names repositories bare, and the link
+    refused the project that had just proposed it (#169). `_source_repo` answers WHOSE a
+    repository is — the forge's, the tracker's only where there is no forge. A product that
+    started before its code has none to answer with (#992): its axes name no code repository on a
+    hosted forge, and on this machine they carry the project's own name, which is no repository
+    yet."""
+    from beeverforge.contracts.project import before_its_code
+    from beeverforge.product.config import _source_repo, normalize_repo
+
+    unreadable = [s for s in given if not normalize_repo(s)]
+    own = [] if before_its_code(project) else [_source_repo(project)]
+    spelled: dict[str, str] = {}
+    for candidate in [*own, *given]:
+        if (key := normalize_repo(candidate)) and key not in spelled:
+            spelled[key] = candidate
+    return sorted(spelled.values()), unreadable
+
+
+#: How long the context repository's clone and push may take, in seconds.
+_A_CONTEXT_GIT_S = 180
+
+
+def _the_credential_in(address: str) -> str:
+    """The secret an authenticated address carries — its password, as GitHub's
+    `x-access-token:<token>@` and Azure's `<user>:<token>@` spell it — or `""` for an address that
+    carries none, as a path on this machine does.
+
+    READ OFF THE ADDRESS ITSELF, not off the credential this row resolved: `clone_url_for` lets
+    the forge adapter's own credential win over the caller's, so the address may carry one nobody
+    here was handed."""
+    from urllib.parse import urlsplit
+
+    try:
+        return urlsplit(address).password or ""
+    except ValueError:
+        return ""
+
+
+def _withheld(text: object, *secrets: str) -> str:
+    """`text` with every secret given withheld (`causes.scrubbed`) — the whole of it, so a caller
+    caps it after, at the end its reader looks at: truncation is not redaction."""
+    import sys
+
+    from beeverforge.util.causes import scrubbed
+
+    return scrubbed(text, *secrets, limit=sys.maxsize)
+
+
+def _the_declaration_step(project, docs_repo: str, root: Path, *, sources: list[str],
+                          write: bool, made_now: bool, shown: dict, withhold: list[str]) -> dict:
+    """The product's declaration in its context repository, as one step: already there, shown,
+    proposed for review on the platform's own branch, or why not. Fills `shown` with what a
+    terminal or a screen shows of the plan — the file, its folder, what each source still needs —
+    and `withhold` with what nothing the step says may carry, the credential the clone's address
+    carries, which the caller's guard needs too."""
+    import subprocess
+
+    from beeverforge.credentials import bot_identity
+    from beeverforge.onboarding.propose_manifest import already_proposed, open_review_request
+    from beeverforge.product.onboard import (
+        PRODUCT_YAML,
+        context_clone_url,
+        context_forge,
+        plan,
+        proposal_branch,
+    )
+
+    name = project.name
+    url = context_clone_url(project, docs_repo)
+    # THE CREDENTIAL, NOT THE ADDRESS: an address on this machine is a path a person needs to read.
+    withhold.append(_the_credential_in(url))
+    clone = ["git", "clone", "--no-local", *([] if made_now else ["--depth", "1"]), "--", url,
+             str(root)]
+    try:
+        cloned = subprocess.run(clone, capture_output=True, text=True, timeout=_A_CONTEXT_GIT_S)
+    except subprocess.TimeoutExpired:
+        # SAID IN A SENTENCE, NEVER AS THE COMMAND: `str(TimeoutExpired)` is the whole argv, and
+        # the address in it carries the forge's credential — a clone that ran out of time put
+        # `https://x-access-token:<token>@…` into the row's message and `data.steps`, which the
+        # panel, the API's JSON and the terminal all show (review of #1085, 2026-10-24).
+        return _step("declaration", STEP_FAILED,
+                     f"could not clone {docs_repo}: timed out after {_A_CONTEXT_GIT_S} s")
+    if cloned.returncode != 0:
+        # GIT NAMES THE ADDRESS IT COULD NOT REACH, credential and all, in its own words.
+        return _step("declaration", STEP_FAILED,
+                     f"could not clone {docs_repo}: {_withheld(cloned.stderr, *withhold)[-200:]}")
+    if made_now:
+        # A REPOSITORY BORN EMPTY HAS NO BRANCH: the clone lands on an unborn HEAD, and one named
+        # base is what every later step assumes.
+        subprocess.run(["git", "-C", str(root), "checkout", "-B", "main"],
+                       capture_output=True, text=True, timeout=60)
+    result = plan(project, root, sources=sources)
+    if result.refusal:
+        return _step("declaration", STEP_FAILED, result.refusal)
+    shown.update(docs_repo=result.docs_repo, requirements_dir=result.requirements_dir,
+                 product_yaml="" if result.already_correct else result.product_yaml,
+                 todo=list(result.todo), already_correct=result.already_correct)
+    if result.already_correct:
+        return _step("declaration", STEP_ALREADY,
+                     f"{result.docs_repo} already declares this product — nothing to write")
+    if not write:
+        # SHOWS BEFORE IT WRITES: it is the client's repository, and the first thing this platform
+        # does to it should be reviewable.
+        return _step("declaration", STEP_SKIPPED,
+                     f"{PRODUCT_YAML} for {result.docs_repo} is shown, not proposed — write "
+                     f"proposes it")
+    # THE BASE, READ FROM THE CLONE, and by its return code: on a repository just created HEAD is
+    # unborn, git exits 128 and prints the literal `HEAD`, which would be the review's base.
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+                          capture_output=True, text=True, timeout=60, check=False)
+    named = (head.stdout or "").strip()
+    base_branch = named if (head.returncode == 0 and named and named != "HEAD") else "main"
+    target = root / PRODUCT_YAML
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(result.product_yaml, encoding="utf-8")
+    branch = proposal_branch(name)
+    bot = bot_identity()
+    ident = ["-c", f"user.name={bot.name}", "-c", f"user.email={bot.email}"]
+    for args in (["checkout", "-b", branch], ["add", "--", PRODUCT_YAML],
+                 ["commit", "-m", f"{name}: declare this product for BeeverForge"],
+                 # --force: the bot's OWN onboarding branch, so a run after a partial failure
+                 # (pushed, then the review request did not open) overwrites rather than
+                 # dead-locking on a non-fast-forward — and an open review shows the latest
+                 ["push", "--force", "-u", "--", "origin", branch]):
+        ran = subprocess.run(["git", "-C", str(root), *ident, *args],
+                             capture_output=True, text=True, timeout=_A_CONTEXT_GIT_S)
+        if ran.returncode != 0:
+            # `origin` IS THE CLONE'S ADDRESS, and a push that cannot reach it names it.
+            return _step("declaration", STEP_FAILED,
+                         f"git {args[0]} failed: {_withheld(ran.stderr or '', *withhold)[-200:]}")
+    # THROUGH THE PORT, NOT THROUGH ONE VENDOR'S CLI (#95), and ASKED FIRST: a review already open
+    # on this branch is the one the push just updated, and opening a second is what a retry used
+    # to attempt. Unread is not "none" — then it opens, as it always did.
+    forge = context_forge(project)
+    if found := (already_proposed(forge, result.docs_repo, branch) or ""):
+        return _step("declaration", STEP_ALREADY,
+                     f"review request already open, now showing this — {found}", url=found,
+                     branch=branch)
+    opened = open_review_request(
+        forge, repo=result.docs_repo, head=branch, base=base_branch,
+        title=f"{name}: declare this product for BeeverForge",
+        body=f"Adds `{PRODUCT_YAML}` so the platform can find this product's requirements. "
+             f"Nothing else in this repository is touched.")
+    if opened:
+        return _step("declaration", STEP_DONE, f"review request open — {opened}", url=opened,
+                     branch=branch)
+    return _step("declaration", STEP_FAILED,
+                 f"the branch `{branch}` is pushed and the review request did not open — open it "
+                 f"by hand against `{base_branch}` on {result.docs_repo}", branch=branch)
+
+
+def _product_init_steps(project, *, sources: list[str], write: bool,
+                        create_context: bool) -> Outcome:
+    """`product_init`'s steps, in order, off the loop that called it: the context repository —
+    declared, or created when there is none and it was asked for — and the declaration in it.
+    NEITHER RAISES: a step that raised is a failed step, said with the one before it."""
+    import tempfile
+
+    from beeverforge.product.onboard import PRODUCT_YAML, create_context_repository
+    from beeverforge.registry import ProjectRegistry
+
+    name = project.name
+    docs_repo = (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+    if not docs_repo and not create_context:
+        # NOWHERE TO KEEP REQUIREMENTS, and creating a repository in the client's organisation is
+        # consequential, so it is asked for (the product owner, 2026-08-07: always in the client's
+        # organisation, and created when they have none). Nothing was done.
+        return refused(INVALID, f"{name} has no context repository, which is where its "
+                                f"requirements would live — create_context creates one in the "
+                                f"client's organisation, and product_declare names the one they "
+                                f"already have. Nothing was done", project=name,
+                       needs="create_context")
+    shown: dict[str, object] = {"file": PRODUCT_YAML}
+    made_now = not docs_repo
+    if made_now:
+        try:
+            docs_repo, made = create_context_repository(project, name)
+        except ValueError as exc:
+            # A FORGE THAT MAY NOT CREATE ONE says so, naming `product_declare`: the enterprise
+            # shape, where creating a repository is somebody else's process.
+            return _the_steps_came_to(name, [_step("context", STEP_FAILED, str(exc))],
+                                      docs_repo="", **shown)
+        except Exception as exc:  # noqa: BLE001 — a repository not made is a failed step, said
+            # A VENDOR'S REFUSAL, AND ANYTHING NOBODY NAMED: a directory this installation cannot
+            # write raised out of the row as a traceback, with no step said (review of #1085).
+            return _the_steps_came_to(name, [_step(
+                "context", STEP_FAILED, f"could not create the context repository: {exc}")],
+                docs_repo="", **shown)
+        context = _step("context", STEP_DONE if made else STEP_ALREADY,
+                        f"{'created' if made else 'found'} {docs_repo}", docs_repo=docs_repo)
+    else:
+        context = _step("context", STEP_ALREADY, f"{name}'s context repository is {docs_repo}",
+                        docs_repo=docs_repo)
+    withhold: list[str] = []
+    try:
+        if made_now:
+            # RE-READ WHAT WAS JUST RECORDED: the project in hand predates the record, and `plan`
+            # refused "no product: section" on the very run that created the repository
+            # (onboarding-v2 verification pass, 2026-08-10).
+            project = ProjectRegistry().get(name)
+        # A CLEAN-UP THAT FAILS never rewrites what the step came to: the review is open or not.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            declaration = _the_declaration_step(project, docs_repo, Path(tmp) / "docs",
+                                                sources=sources, write=write, made_now=made_now,
+                                                shown=shown, withhold=withhold)
+    except Exception as exc:  # noqa: BLE001 — the context step before it stands, said with it
+        # ANY STEP THAT RAISES IS A FAILED STEP: a git that could not run or ran out of time, and
+        # anything nobody named — a credential that could not be resolved for the clone took the
+        # context step's `done` down with it, a repository just created in the client's
+        # organisation said nowhere (review of #1085). WITHHELD, THEN CAPPED: what a git call
+        # raises is its whole argv, and the clone's carries the forge's credential.
+        declaration = _step("declaration", STEP_FAILED,
+                            f"the declaration could not be read or proposed: "
+                            f"{_withheld(exc, *withhold)[:300]}")
+    shown.setdefault("docs_repo", docs_repo)
+    return _the_steps_came_to(name, [context, declaration], **shown)
+
+
+async def _product_init(*, project: str, by: Actor, source: object = None,
+                        write: object = False, create_context: object = False) -> Outcome:
+    """Onboard a product's context repository — the one the client has, or a new one.
+
+    The factory requires one of every project, and a client may arrive with one written before
+    they met us. What was missing was any step that gets it to the module's gate: four files
+    across three repositories, by hand. This shows the declaration the repository needs and what
+    each source repository still needs; with `write` it proposes the declaration as a review on
+    the platform's own branch; with `create_context` it creates the repository first, in the
+    client's organisation, where the forge may.
+
+    SAFE TO RUN AGAIN: a repository already declared is used and never created twice, a
+    declaration already there is said and not written, and a review already open is the one the
+    run updates. The clone, the push and the review leave the loop."""
+    import asyncio
+
+    from beeverforge.contracts.project import before_its_code
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    given = _listed(source)
+    if given and before_its_code(found):
+        # ONE DECLARATION PER ACT (#992): a product that started before its code can vouch for no
+        # repository, and listing one here would make it a member by the same act that should
+        # register it — its first source is listed and recorded together, by its own row.
+        return refused(INVALID, f"{project} has no code repository yet, so it can vouch for no "
+                                f"source — its first source is listed and recorded together by "
+                                f"product_first_source. Nothing was done", project=project,
+                       before_its_code=True)
+    sources, unreadable = _product_sources(found, given)
+    if unreadable:
+        # REFUSED BEFORE ANYTHING IS CLONED: written, it comes back from the link as a member it
+        # cannot vouch for; dropped, nobody is told.
+        return refused(INVALID, f"{', '.join(repr(s) for s in unreadable)}: not a repository "
+                                f"reference — name a repository as this project's forge names "
+                                f"one, or by its clone URL. Nothing was done", project=project,
+                       unreadable=unreadable)
+    return await asyncio.to_thread(_product_init_steps, found, sources=sources,
+                                   write=_said_yes(write),
+                                   create_context=_said_yes(create_context))
+
+
+CATALOG: dict[str, ActionSpec] = {
+    spec.name: spec for spec in (
+        ActionSpec(
+            name="resume",
+            summary="tell a parked job to carry on — optionally picking one of the options it "
+                    "offered",
+            run=_resume,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            optional=("choice",),
+            choose_when="ONLY if a fresh run would make progress. If it would re-park on the "
+                        "same blocker — no acceptance criteria, a throwaway ticket, a human-only "
+                        "fix needed first — then resuming LOOPS and `skip` is the honest answer",
+        ),
+        ActionSpec(
+            name="skip",
+            summary="abandon a parked job and free the floor for the next ticket",
+            run=_skip,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            choose_when="for a parked job a re-run cannot advance, and for an ORPHANED one "
+                        "(ticket closed, workflow still holding the line). The ticket is left for "
+                        "its owner rather than thrown away",
+        ),
+        ActionSpec(
+            name="ack",
+            summary="record that a person has taken a review finding, closing its open loop",
+            run=_ack,
+            refuses=(NOT_FOUND, CONFLICT, FAILED),
+            required=("project", "issue"),
+        ),
+        ActionSpec(
+            name="enable",
+            summary="turn pickup on or off for a project",
+            run=_enable,
+            refuses=(NOT_FOUND,),
+            required=("project",),
+            optional=("enabled",),
+        ),
+        ActionSpec(
+            name="card_create",
+            summary="open a card on this project's board",
+            run=_card_create,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "title"),
+            optional=("body", "column"),
+        ),
+        ActionSpec(
+            name="card_move",
+            summary="move a card to another column — this is how work is queued",
+            run=_card_move,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "issue", "column"),
+        ),
+        ActionSpec(
+            name="card_comment",
+            summary="say something on a card, in your own name",
+            run=_card_comment,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project", "issue", "message"),
+        ),
+        ActionSpec(
+            name="card_check",
+            summary="say what pickup would make of a card before it is saved — writes nothing",
+            run=_card_check,
+            refuses=(NOT_FOUND,),
+            required=("project",),
+            optional=("title", "body"),
+            choose_when="while a card is being written or corrected: it runs the same spec gate a "
+                        "job runs at pickup, on the draft, so a refusal arrives while the card can "
+                        "still be fixed rather than after somebody queued it",
+        ),
+        ActionSpec(
+            name="card_edit",
+            summary="correct a card's title or description, before the factory takes it up",
+            run=_card_edit,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "issue"),
+            optional=("title", "body"),
+            choose_when="when a card is wrong and no job has it yet — the spec gate refused it, or "
+                        "the person who filed it left something out. Once the factory has taken "
+                        "the card up this refuses, and a comment is the way to reach the job",
+        ),
+        ActionSpec(
+            name="card_close",
+            summary="take a card off the board with a reason — closed, never deleted",
+            run=_card_close,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue", "reason"),
+            choose_when="when a card should not be on the board at all: a duplicate, a request "
+                        "withdrawn, a plan abandoned. It records that the work did NOT happen, so "
+                        "nothing downstream reads it as delivered — except for a card already in "
+                        "Done, which is finished work left open and is closed AS delivered. The "
+                        "card's column decides which, never the caller",
+        ),
+        ActionSpec(
+            name="card_remove",
+            summary="remove a card nobody has started from the board, with a reason",
+            run=_card_remove,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue", "reason"),
+            choose_when="when a card should never have been on the board and the factory has not "
+                        "taken it up — filed wrong, filed twice, no longer wanted. What removal "
+                        "means is the tracker's: the local board deletes it and keeps who, when "
+                        "and why; a tracker that can only close closes it and says so. Once the "
+                        "factory has the card this refuses, and `card_close` is the verb",
+        ),
+        ActionSpec(
+            name="card_reopen",
+            summary="put a closed card back on the board",
+            run=_card_reopen,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "issue"),
+            choose_when="when a card was closed by mistake, or the thing came back. Nothing is "
+                        "deleted here, so the card, its thread and its number are all still there",
+        ),
+        ActionSpec(
+            name="pr_merge",
+            summary="land a pull request no job is waiting on — this forge's own fast-forward",
+            run=_pr_merge,
+            refuses=(INVALID, NOT_FOUND, CONFLICT),
+            required=("project", "pr"),
+            choose_when="when the pull request is open, the gates passed, and no job is parked on "
+                        "it — the one a `run` or a `poll` left behind. On a hosted forge this "
+                        "refuses by name: there the merge belongs to the job's own gate",
+        ),
+        ActionSpec(
+            name="merge",
+            summary="land the PR a human-gated job is waiting on",
+            run=_merge,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            optional=("comment",),
+            choose_when="when the gates passed and the review did not reject. The DECISION is "
+                        "the human's and they have made it by asking; the execution is this "
+                        "platform's, with its own credential — so say what you are relying on",
+        ),
+        ActionSpec(
+            name="adjust",
+            summary="send the PR back for one repair pass against your own words — same PR",
+            run=_adjust,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue", "instruction"),
+            choose_when="when the work is nearly right and you can NAME the change: a review "
+                        "finding that still applies, a missed case, a wrong shape. Prefer this "
+                        "over `discard` for anything salvageable — it keeps the same pull request "
+                        "and spends one repair pass, where discarding throws the run away and the "
+                        "ticket starts again from nothing",
+        ),
+        ActionSpec(
+            name="address",
+            summary="send the PR back for one repair pass against the review comments people "
+                    "left on it — same PR",
+            run=_address,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            choose_when="when people reviewed the pull request on the forge and their comments "
+                        "say what to change: unresolved threads, a request for changes. Prefer "
+                        "it over `adjust` when the words are already written there — it carries "
+                        "them as they were written, attached to their lines, where retyping "
+                        "loses some. It spends one adjust pass and refuses when nothing stands",
+        ),
+        ActionSpec(
+            name="review",
+            summary="read the open PR again with the independent reviewer — same PR, no change "
+                    "to the code, and the verdict on the card is replaced",
+            run=_review,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            choose_when="when the reading you have is out of date or was answered — an `adjust` "
+                        "fixed what the review rejected, or a pass rewrote the diff — and "
+                        "somebody is about to decide on a verdict about code that is gone. It "
+                        "spends a model pass and writes nothing, so prefer it over sending a "
+                        "person to read the diff themselves, and never offer it as a formality "
+                        "on a verdict that is already current",
+        ),
+        ActionSpec(
+            name="discard",
+            summary="close the PR without merging and free the floor — the branch is untouched",
+            run=_discard,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            optional=("reason",),
+            choose_when="for work that should not land: the review rejected it, or the change "
+                        "is wrong at the root and no instruction would repair it. NEVER as a way "
+                        "to clear a queue, and never when `adjust` would do",
+        ),
+        ActionSpec(
+            name="stop",
+            summary="end a running job nothing else can reach and free the floor — it cannot "
+                    "resume; the ticket goes back to the board",
+            run=_stop,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            optional=("reason",),
+            choose_when="for a job nothing else can reach — wedged, holding the floor with no "
+                        "gate and no park to answer. It does NOT resume: the ticket goes back to "
+                        "the board and a fresh job starts from the beginning, losing whatever that "
+                        "run had in flight. Never for a job that is WAITING on somebody; that is "
+                        "the platform working and it has its own verb",
+        ),
+        ActionSpec(
+            name="scan",
+            summary="scan a project's TO-DO column now and start what the floor allows",
+            run=_scan,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+        ),
+        ActionSpec(
+            name="start",
+            summary="start one job for one ticket",
+            run=_start,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "issue"),
+            optional=("sandbox", "promote", "durable"),
+        ),
+        ActionSpec(
+            name="approve_prod",
+            summary="answer a job's production-release gate — the parked workflow is waiting on it",
+            run=_approve_prod,
+            refuses=(DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue", "version", "approver", "password"),
+            optional=("comment",),
+        ),
+        ActionSpec(
+            name="promote",
+            summary="run the staging→production promotion for a ticket in this process",
+            run=_promote,
+            refuses=(DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project", "issue", "version", "approver", "password"),
+            optional=("comment",),
+        ),
+        ActionSpec(
+            name="ask",
+            summary="ask the tech-lead a question about a project and get its read-only answer",
+            run=_ask,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            # what a typed instruction or a staged proposal can perform: the operator grammar and
+            # the floor's matcher, whose refusals come back as this row's own
+            relays=("resume", "skip", "review", "merge", "adjust", "discard", "stop"),
+            required=("project", "question"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="diagnose",
+            summary="ask the tech-lead why a job is parked and what it would do about it",
+            run=_diagnose,
+            refuses=(NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "issue"),
+            needs_admin=False,
+        ),
+        # ── the environment round. `read` before `check` before `apply`, which is the order they
+        # are used in and the order they are safe in: the one that proposes, the one that grades,
+        # and the one that writes. `needs_admin` splits on exactly that line — reading a repository
+        # and asking whether a project is ready are questions, and a question is not authority.
+        # ── the product role. ADR-0039's shape: these are the SAME calls the Slack package makes,
+        # so a deployment with no Slack can propose a requirement, accept it and watch the cards
+        # appear — which is the acceptance test #98 states for itself.
+        ActionSpec(
+            name="product_start",
+            summary="register a product before its code — a project with its context repository "
+                    "and no code repository; what needs code waits for its first source",
+            run=_product_start,
+            refuses=(INVALID, CONFLICT, UNAVAILABLE),
+            required=("project", "docs_repo"),
+            optional=("provider", "token_env", "language"),
+            needs_code=False,
+            # IT REGISTERS A PROJECT, which is the installation's (#741): through
+            # `product/before_code.py`, where a reading that stopped at the catalogue's edge did not
+            # see it, so a board credential could start a product until this said so
+            installation=True,
+            params={
+                "project": "the name of the project to register, e.g. `acme`",
+                "docs_repo": "its context repository, as its forge names it or by its clone "
+                             "URL — on this machine a short name, created when it does not "
+                             "exist — e.g. `acme/acme-context`",
+                "provider": "the kind of forge the context lives on, when its address does "
+                            "not say — one this deployment has, an installed add-on's included",
+                "token_env": "the name of the environment variable holding this project's "
+                             "credential — never the credential itself",
+                "language": "the language its agents speak first, e.g. `pt-BR`; English unless "
+                            "you say",
+            },
+        ),
+        ActionSpec(
+            name="product_first_source",
+            summary="give a product that started before its code its code repository — the "
+                    "first entry of `sources:` and the registry's, so the breakdown starts",
+            run=_product_first_source,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "repo_path"),
+            optional=("token_env", "board_owner", "board_number"),
+            needs_code=False,
+            # IT GIVES A PROJECT ITS CODE REPOSITORY in the registry — the installation's (#741),
+            # written through `product/before_code.py` like the start above
+            installation=True,
+            params={
+                "repo_path": "the code repository: its clone URL, or a path on this machine",
+                "token_env": "the name of the environment variable holding this project's "
+                             "credential, when it is not the one its context is read with",
+                "board_owner": "who owns its board on the tracker, when the tracker's boards "
+                               "have an owner",
+                "board_number": "its board's number, when the tracker numbers its boards",
+            },
+        ),
+        ActionSpec(
+            name="product_status",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="whether the product role can see its corpus at all, and where measured",
+            run=_product_status,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_requirements",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="every requirement in the corpus — number, title and status",
+            run=_product_requirements,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_ingest",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="read the product's documents now — one file, or whatever changed since the "
+                    "last pass",
+            run=_product_ingest,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("path",),
+            params={"path": "a file in the context repository, relative to its root (several "
+                            "separated by commas) — or nothing, for whatever changed"},
+        ),
+        ActionSpec(
+            name="product_refresh",
+            scope=PRODUCT,
+            summary="bring the product's knowledge up to date now — its documents, and its search "
+                    "index over them, its requirements and its board — answering at once while "
+                    "the pass runs on the worker; product_status says when it finished",
+            run=_product_refresh,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            # WHAT IT BRINGS UP LIVES IN THE CONTEXT (#992), like `product_ingest`'s: the documents
+            # and the requirements are there before any code is. The one source that needs the
+            # code — a project's board — is the pass's to skip, by name (`refresh._boards`)
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="product_triage",
+            scope=PRODUCT,
+            summary="read the board and report what is wrong with it — writes nothing",
+            run=_product_triage,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_baseline",
+            scope=PRODUCT,
+            summary="the brownfield first pass — reads the whole codebase and proposes what it "
+                    "observed, as a pull request",
+            run=_product_baseline,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("yes",),
+            needs_admin=True,
+        ),
+        ActionSpec(
+            name="product_needs_action",
+            scope=PRODUCT,
+            summary="what is parked and whose problem it is — reads, writes nothing, "
+                    "and spends one model call per parked ticket",
+            run=_product_needs_action,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("limit",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_announce",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="the role arrives and says where things stand",
+            run=_product_announce,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_pending",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="what the product role has staged and is waiting on a person for",
+            run=_product_pending,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_answer",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="answer a proposal the product role staged — the pair of product_pending",
+            run=_product_answer,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "token", "answer"),
+            optional=("yes", "message_id"),
+        ),
+        # ONE ROW FOR THE CONVERSATION (#266 slice 2): `product_ask` and `product_say` were two
+        # halves of it, and the panel held the half that could not hear a typed yes.
+        ActionSpec(
+            name="product_say",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="one message to the product role — it answers, remembers, and stages what "
+                    "it heard as work for a yes; it writes nothing on its own",
+            run=_product_say,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE, FAILED),
+            # `message` MAY BE EMPTY when the message is files alone (#336): the row refuses
+            # one with neither, in a sentence
+            required=("project",),
+            optional=("message", "thread", "context", "message_id", "wait", "mentioned",
+                      "attachments"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_agenda",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="what the product role owes, and to whom — its open loops as an agenda: "
+                    "yours and the room's, never anybody else's",
+            run=_product_agenda,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=(),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_cases",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="what is in progress in a conversation with the product role — the open "
+                    "intakes, typed: said, asked, drafted, landed",
+            run=_product_cases,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("thread",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_recall",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="what was said about something anywhere in this project — by whom, where, "
+                    "when; one read over every conversation and the channel",
+            run=_product_recall,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project", "query"),
+            optional=(),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_sessions",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="your conversations with the product role — the project's room and each of "
+                    "your own, newest first",
+            run=_product_sessions,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_session_rename",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="name one of your conversations with the product role, or clear its name",
+            run=_product_session_rename,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("session", "title"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_session_delete",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="delete one of your conversations with the product role — what you said in "
+                    "it is erased; what it became in the product stays",
+            run=_product_session_delete,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("session",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_file_attachment",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="file a file sent in the conversation into the product's documents — "
+                    "committed to from-chat/ in the context repository, and read",
+            run=_product_file_attachment,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project", "attachment"),
+            optional=("room", "session"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_discard_attachment",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="discard a file sent in the conversation — it can no longer be opened there",
+            run=_product_discard_attachment,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project", "attachment"),
+            optional=("room", "session"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_thread",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="the recent turns of a conversation with the product role — the "
+                    "project's room, or your own",
+            run=_product_thread,
+            refuses=(INVALID, DENIED, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("thread", "before"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_propose",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="record a drafted requirement as a pull request — the sign-off surface",
+            run=_product_propose,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("answer", "question", "yes"),
+        ),
+        ActionSpec(
+            name="product_accept",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="turn a written requirement into a promise the factory defends (ADR-0032)",
+            run=_product_accept,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_break_down",
+            scope=PRODUCT,
+            summary="turn an accepted requirement into units of work because a person asked — "
+                    "an acceptance files them on its own, except for a requirement read off the "
+                    "code, which describes what is already built",
+            run=_product_break_down,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_close_card",
+            scope=PRODUCT,
+            summary="close one card, naming the one that stays",
+            run=_product_close_card,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("in_favour_of", "reason", "yes"),
+        ),
+        ActionSpec(
+            name="product_board",
+            scope=PRODUCT,
+            summary="the open cards on the board, and one card with what its controls do",
+            run=_product_board,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("card",),
+            params={"card": "the number of the one card to open, digits only — its text and what "
+                            "its controls do come back with the list"},
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_withdraw_card",
+            scope=PRODUCT,
+            summary="close a card, or remove one nobody has started, from the card itself",
+            run=_product_withdraw_card,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number", "reason"),
+            optional=("remove",),
+            params={"remove": "`true` to remove the card instead of closing it — only before the "
+                              "factory takes it up, and what removal means is the tracker's"},
+            # THE MODULE DECIDES WHO (#384): a product admin, or the person who asked for the card
+            # — and the second is on no allowlist, so `needs_admin` would refuse them first.
+            needs_admin=False,
+            choose_when="when a person on the product view drops a card from the card itself — "
+                        "the conversation's own close is `product_close_card`, staged and "
+                        "confirmed there",
+        ),
+        ActionSpec(
+            name="product_adjust",
+            scope=PRODUCT,
+            summary="send the change waiting on a card back for another pass on the same pull "
+                    "request, correcting the card's acceptance criteria with it",
+            run=_product_adjust,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number", "instruction"),
+            optional=("criteria",),
+            # THE MODULE DECIDES WHO (#448, #384's rule): a product admin, or the person who asked
+            # for the card — and the second is on no allowlist, so `needs_admin` would refuse them
+            needs_admin=False,
+            choose_when="when the person who asked for a card has tried its change and says what "
+                        "is still wrong, from the card on the product view — the conversation "
+                        "stages the same act for its yes, and the floor's `adjust` is the "
+                        "operator's",
+        ),
+        ActionSpec(
+            name="product_accept_change",
+            scope=PRODUCT,
+            summary="record that the change waiting on a card, as its requester tried it in its "
+                    "preview, is what they asked for — and put it in when that look is all that "
+                    "holds it",
+            run=_product_accept_change,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("head",),
+            # THE MODULE DECIDES WHO (#448, #384's rule): a product admin, or the person who asked
+            # for the card — and the second is on no allowlist, so `needs_admin` would refuse them
+            needs_admin=False,
+            choose_when="when the person who asked for a card has tried its change in the preview "
+                        "and says it is right, from the card on the product view — the "
+                        "conversation stages the same act for its yes, and the floor's `merge` is "
+                        "the operator's",
+        ),
+        ActionSpec(
+            name="product_correct_card",
+            scope=PRODUCT,
+            summary="correct the text or title of a card the product role opened from a request "
+                    "or a defect",
+            run=_product_correct_card,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("text", "title", "yes"),
+            choose_when="when a card the product role opened from a request or a defect says the "
+                        "wrong thing and the factory has not taken it up — the board refuses to "
+                        "edit those cards, and this is the product owner's way to change one",
+        ),
+        ActionSpec(
+            name="product_align_card",
+            scope=PRODUCT,
+            summary="make a card execute the requirement it should — citation and criteria",
+            run=_product_align_card,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number", "requirement"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_refine_card",
+            scope=PRODUCT,
+            summary="give a backlog ticket something testable to be judged against",
+            run=_product_refine_card,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_record_decision",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="write a decision taken after acceptance into the requirement's register",
+            run=_product_record_decision,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number", "decision"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_confirm_capability",
+            scope=PRODUCT,
+            summary="confirm a business capability across the sources as the product's own",
+            run=_product_confirm_capability,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "capability"),
+            optional=("yes",),
+            params={"capability": "the capability's name — a flow as `.okf/flows/flows.yaml` "
+                                  "names it, or a file under `capabilities/` — e.g. "
+                                  "`0001-an-order-is-invoiced-the-moment-it-is-placed`"},
+        ),
+        ActionSpec(
+            name="product_note_fact",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="write down one thing somebody said about the business, attributed",
+            run=_product_note_fact,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "term", "body"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_import",
+            scope=PRODUCT,
+            # WHAT IT WRITES LIVES IN THE CONTEXT (#993, after #992): requirements, facts and
+            # documents, as `product_note_fact`'s and `product_file_attachment`'s do; a product
+            # that started before its code takes its first requirements this way
+            needs_code=False,
+            summary="import a folder of requirements, facts and documents into the product under "
+                    "its corpus's rules — shows the plan, and lands it on `yes`",
+            run=_product_import,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "source"),
+            optional=("origin", "token", "yes"),
+            params={"source": "the folder or archive (.zip, .tar, .tar.gz) to import — any path "
+                              "on the command line; from anywhere else, its name in the "
+                              "product's import inbox",
+                    "origin": "where it came from, in a few words — the folder's own "
+                              "`beeverforge-import.yaml`, or its name, when empty",
+                    "token": "the token the plan was shown with — a `yes` carrying it lands "
+                             "exactly that plan, and a product that moved since is planned "
+                             "again"},
+        ),
+        ActionSpec(
+            name="product_file_defect",
+            scope=PRODUCT,
+            summary="register a broken promise as work, citing the requirement it violates",
+            run=_product_file_defect,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "restated"),
+            optional=("violates", "severity", "yes"),
+        ),
+        ActionSpec(
+            name="product_file_ticket",
+            scope=PRODUCT,
+            summary="open a card as the person described it — no requirement behind it",
+            run=_product_file_ticket,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "title"),
+            optional=("body", "yes"),
+        ),
+        ActionSpec(
+            name="product_queue",
+            scope=PRODUCT,
+            summary="what should start next, in order — and why not the others",
+            run=_product_queue,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("limit",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="product_reorder",
+            scope=PRODUCT,
+            summary="write the backlog order, top first — the next promote follows it",
+            run=_product_reorder,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "numbers"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_promote",
+            scope=PRODUCT,
+            summary="move approved tickets into the queue — the one act here that spends money",
+            run=_product_promote,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "numbers"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_release",
+            scope=PRODUCT,
+            summary="the client's approval putting a delivery in front of their own users",
+            run=_product_release,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "issue"),
+            optional=("yes",),
+        ),
+        ActionSpec(
+            name="product_drop",
+            scope=PRODUCT,
+            needs_code=False,
+            summary="drop a proposed requirement, with the reason recorded beside it",
+            run=_product_drop,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project", "number"),
+            optional=("reason", "yes"),
+        ),
+        # ── a preview of the product, on demand (ADR-0050 D6). Product-area rows: the person who
+        # asked for the change is the one who looks at it before it merges.
+        ActionSpec(
+            name="preview_start",
+            scope=PRODUCT,
+            summary="start a preview of a card's change on this deployment — the product with the "
+                    "pull request in it, before it merges",
+            run=_preview_start,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "unit"),
+        ),
+        ActionSpec(
+            name="preview_stop",
+            scope=PRODUCT,
+            summary="take a card's preview down now — its logs are kept",
+            run=_preview_stop,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "unit"),
+        ),
+        ActionSpec(
+            name="preview_own_shape",
+            scope=PRODUCT,
+            summary="let a card's preview run its change's own shape — the compose files and "
+                    "`preview:` block its pull request edits, at the digest its card shows — and "
+                    "build it again with it",
+            run=_preview_own_shape,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "unit"),
+            choose_when="only after a person has READ the change's shape on the pull request: "
+                        "the compose files and the block it edits. A preview runs the base's "
+                        "shape because the change's is the agent's; this lets one unit run the "
+                        "change's, admitted like the base's, until a push changes it",
+        ),
+        ActionSpec(
+            name="preview_rebuild",
+            scope=PRODUCT,
+            summary="build a card's preview again from its pull request's head — a fresh checkout "
+                    "and fresh data; starts one when none is up",
+            run=_preview_rebuild,
+            refuses=(INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("project", "unit"),
+        ),
+        ActionSpec(
+            name="env_read",
+            summary=f"read a repository and propose what its {namespace.MANIFEST} should say — "
+                    f"writes nothing",
+            run=_env_read,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("target",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="preview_proposal",
+            summary="read a repository and show how a preview of it would run — the draft "
+                    "`preview propose` would open, every line tiered; writes nothing",
+            run=_preview_proposal,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("target",),
+            optional=("accept",),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="env_context",
+            summary="survey a repository and propose the context an agent will read from then on "
+                    "— writes nothing",
+            run=_env_context,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("target",),
+            optional=("ask", "write", "yes"),
+            needs_admin=False,
+        ),
+        ActionSpec(
+            name="env_check",
+            summary="one verdict on whether a project can be picked up, and where it was measured",
+            run=_env_check,
+            refuses=(NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            needs_admin=False,
+            # A QUESTION, ANSWERED FOR A PROJECT BEFORE ITS CODE TOO (#992): "not ready, it has no
+            # code yet" is this row's answer, held on one `code` line with the doctor's report
+            # beside it — refused here, the panel never saw that report (review of 9f18a788)
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="env_apply",
+            summary="write the proposed manifest — only the fields a human accepted, only with yes",
+            run=_env_apply,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("yes", "force", "accept", "answers", "out", "pr"),
+        ),
+        ActionSpec(
+            name="people_invite",
+            summary="issue a one-time link that registers a person on this deployment, vouched "
+                    "for by you",
+            run=_people_invite,
+            refuses=(INVALID, UNAVAILABLE),
+            required=("person",),
+            optional=("display", "product", "board"),
+            installation=True,
+            params={
+                "person": "the person's id — an email or a handle, spelled the way a project's "
+                          "`admins` will spell it, e.g. `ana@acme.example`",
+                "display": "how the team will see them; they may change it when they register",
+                "product": "`yes` to scope them to the product surface — a requirement-writer, "
+                           "refused the floor by name",
+                "board": "`yes` to scope them to the board — whoever runs it, refused the "
+                         "product owner's area by name",
+            },
+        ),
+        ActionSpec(
+            name="people_revoke",
+            summary="take a person off this deployment — their registration, their sessions and "
+                    "any invitation still open for them",
+            run=_people_revoke,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE),
+            required=("person",),
+            installation=True,
+            params={"person": "the person's id, as `beeverforge people list` shows it"},
+        ),
+        # ── the installation itself (#741) ──
+        ActionSpec(
+            name="poller_pause",
+            summary="hold pickup everywhere: no card in TO-DO is picked up until the poller is "
+                    "resumed — the jobs already running carry on",
+            run=_poller_pause,
+            refuses=(UNAVAILABLE,),
+            optional=("note",),
+            installation=True,
+        ),
+        ActionSpec(
+            name="poller_resume",
+            summary="take work again: the poller picks cards up from TO-DO on its schedule",
+            run=_poller_resume,
+            refuses=(UNAVAILABLE,),
+            optional=("note",),
+            installation=True,
+            params={"note": "why, if it is worth saying — it replaces the note the pause left"},
+        ),
+        # THE FLOOR'S, THOUGH NAMED `product_`. Naming the product role and declaring where its
+        # requirements live configure the installation, which is the administrator's. A product
+        # credential is refused these rows by the area check — they are the floor's — and a board
+        # credential by `installation`; the HTTP gate also reads `/api/act/product_…` as the product
+        # area and refuses a board credential there. So only an unscoped credential reaches them,
+        # by either door.
+        ActionSpec(
+            name="product_name",
+            summary="say what the product role is called in this project's conversations — or, "
+                    "with no name given, what it is called now",
+            run=_product_name,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project",),
+            optional=("agent_name",),
+            installation=True,
+            # A PRODUCT BEFORE ITS CODE IS NAMED TOO (#992): what its role is called is the product
+            # owner's, which works before the code
+            needs_code=False,
+            params={"agent_name": "what the role is called, e.g. `Nina`; `\"\"` for no name, so "
+                                  "it introduces itself by function; omitted, the row only says "
+                                  "what it is called now"},
+        ),
+        ActionSpec(
+            name="product_declare",
+            summary="record which existing repository holds this product's requirements, and "
+                    "try to read it with every credential that will",
+            run=_product_declare,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project", "docs_repo"),
+            installation=True,
+            # A PRODUCT BEFORE ITS CODE DECLARES ITS CONTEXT TOO (#992): `product start` names this
+            # row as the way to another context for one
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="project_remove",
+            summary="unregister a project — nothing else about it is touched",
+            run=_project_remove,
+            refuses=(NOT_FOUND,),
+            required=("project",),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS REMOVED TOO (#992): taking it out of the registry reads
+            # nothing of its code
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="project_set_model",
+            summary="say which model the coding agent runs for a project, for every role or one",
+            run=_project_set_model,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project", "model"),
+            optional=("role",),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS SET TOO (#992): this is the registry's row for it, and
+            # reads nothing of the code
+            needs_code=False,
+            params={
+                "model": "the harness's own model string, passed to it verbatim — whatever "
+                         "name the harness this project runs gives the model",
+                "role": "one role to set it for, by the name the roles go by (`executor`, "
+                        "`reviewer`, `techlead`, `product`, or an installed one); empty sets "
+                        "every role",
+            },
+        ),
+        ActionSpec(
+            name="project_set_language",
+            summary="say which language a project speaks first — a reply always follows whoever "
+                    "asked",
+            run=_project_set_language,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project", "language"),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS SET TOO (#992): this is the registry's row for it, and
+            # reads nothing of the code
+            needs_code=False,
+            params={"language": "a language tag, e.g. `en` or `pt-BR` — any tag the project's "
+                                "agents understand"},
+        ),
+        ActionSpec(
+            name="project_set_preview",
+            summary="decide a project's previews: whether one is required before a merge, how "
+                    "long it lives, the names each service may receive, egress and limits",
+            run=_project_set_preview,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project",),
+            optional=("required", "hours", "auto_start", "env", "build_arg", "network", "cpus",
+                      "memory", "clear_env"),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS SET TOO (#992): this is the registry's row for it, and
+            # reads nothing of the code
+            needs_code=False,
+            params={
+                "required": "`true` and the factory never merges this project on its own — a "
+                            "person looks and merges; `false` lifts it; omitted keeps it",
+                "hours": "how long a preview stays up, 1 to 168",
+                "auto_start": "`true` to start a preview when a pull request waits for a person, "
+                              "`false` to start one only when somebody presses start",
+                "env": "names a service may receive at run time, comma-separated, each "
+                       "`svc=NAME` or `svc=NAME=WORKER_NAME`, `*` for every service",
+                "build_arg": "names a BUILD of a changed service may read, the same shape",
+                "network": "an operator network the services join for egress; empty for none",
+                "cpus": "the CPU limit of each service, e.g. `2`",
+                "memory": "the memory limit of each service, e.g. `2g`",
+                "clear_env": "`true` to drop every run-time name before adding these",
+            },
+        ),
+        ActionSpec(
+            name="project_add",
+            summary="register a project — every axis its address and options say; a name "
+                    "already registered as asked changes nothing, and one registered "
+                    "differently is refused",
+            run=_project_add,
+            refuses=(INVALID, CONFLICT),
+            required=("project", "repo_path"),
+            optional=("provider", "repo", "board_owner", "board_number", "organization",
+                      "ado_project", "repository", "work_item_type", "token_env", "model",
+                      "language"),
+            installation=True,
+            params={
+                "project": "the name to register the project under in this deployment's "
+                           "registry, e.g. `podbeam`",
+                "repo_path": "where the code is: a path on the machine the factory runs on, or "
+                             "a clone URL",
+                "provider": "the kind on every axis, when the address cannot say it — a kind "
+                            "this deployment has, e.g. an installed add-on's; empty reads it "
+                            "from the address",
+                "repo": "the repository as its forge names it, e.g. `owner/name`; empty reads "
+                        "it from a clone URL",
+                "board_owner": "who owns the board the cards are on, given with `board_number`",
+                "board_number": "the board's number, given with `board_owner`",
+                "organization": "the organisation the project lives in, where its kind has "
+                                "one and the address does not carry it",
+                "ado_project": "the project inside that organisation, where the address does "
+                               "not carry it",
+                "repository": "the repository inside that project, where the address does not "
+                              "carry it",
+                "work_item_type": "the kind of card the factory writes on a board that has "
+                                  "several, spelled as the board spells it",
+                "token_env": "the NAME of the environment variable holding this project's "
+                             "credential — never the credential itself; empty uses the kind's "
+                             "default",
+                "model": "the model the coding agent runs, passed to the harness verbatim; "
+                         "empty leaves the harness's default",
+                "language": "a language tag the project speaks first in, e.g. `en` or "
+                            "`pt-BR`; empty is English",
+            },
+        ),
+        ActionSpec(
+            name="project_init",
+            summary="make a project ready to move a ticket: register it if it is not, create its "
+                    "board, seed its context repository where this installation owns it, and "
+                    "scaffold its manifest — each step only if it is missing, and each said",
+            run=_project_init,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, FAILED),
+            required=("project",),
+            optional=("repo_path", "repo", "board_owner", "language", "provider"),
+            installation=True,
+            params={
+                "project": "the project's name in this deployment's registry — or the name to "
+                           "register it under, with `repo_path`",
+                "repo_path": "where the code is, a path on the machine the factory runs on or a "
+                             "clone URL — needed only when the project is not registered yet",
+                "repo": "the repository as its forge names it, e.g. `owner/name`; empty reads "
+                        "it from a clone URL",
+                "board_owner": "where the board is created; empty is the repository's owner",
+                "language": "a language tag the project speaks first in, e.g. `en` or "
+                            "`pt-BR` — used only when this registers the project",
+                "provider": "the kind on every axis, when the address cannot say it — a kind "
+                            "this deployment has, e.g. an installed add-on's",
+            },
+        ),
+        ActionSpec(
+            name="product_init",
+            summary="onboard a product's context repository: show the declaration it needs, "
+                    "propose it for review with `write`, and create the repository first with "
+                    "`create_context` — each step only if it is missing, and each said",
+            run=_product_init,
+            refuses=(INVALID, NOT_FOUND, FAILED),
+            required=("project",),
+            optional=("source", "write", "create_context"),
+            # IT WORKS BEFORE THE CODE (#992): `product start` sends a product whose context does
+            # not declare it yet here, to propose `product:` with `sources: []` — what the link
+            # admits for a product with no code. What would need code, a source, is refused by
+            # the row itself and named as the first source's.
+            needs_code=False,
+            installation=True,
+            params={
+                "source": "the other repositories implementing this product, comma-separated, "
+                          "each named as this project's forge names one — the registry names "
+                          "one, and a product that spans several says so",
+                "write": "`true` to propose the declaration as a review on the context "
+                         "repository; without it the row shows what it would propose",
+                "create_context": "`true` to create the context repository in the client's "
+                                  "organisation when the project has none — consequential, so "
+                                  "it is asked for",
+            },
+        ),
+        ActionSpec(
+            name="doctor",
+            summary="check every prerequisite of running a ticket on a project, and say which is "
+                    "missing — the `beeverforge.doctor/1` document; changes nothing",
+            run=_doctor,
+            refuses=(NOT_FOUND,),
+            required=("project",),
+            needs_admin=False,
+            # A PROJECT BEFORE ITS CODE IS DIAGNOSED, NOT REFUSED (#992): the doctor's answer for
+            # one is its `code` line, as `env_check`'s is
+            needs_code=False,
+        ),
+    )
+}
+
+#: The rows whose implementation has not moved yet, as a literal. A test asserts this equals what
+#: the catalog actually reports, so the migration cannot quietly stall and cannot quietly finish:
+#: moving one and forgetting this list fails the suite, which is the reminder to update the card.
+#:
+#: `ask` and `diagnose` are blocked on C-24 (#52) and #53 rather than on effort — their brains do
+#: not exist as neutral code yet.
+NOT_MOVED: tuple[str, ...] = ()

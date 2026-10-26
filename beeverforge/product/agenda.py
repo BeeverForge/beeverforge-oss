@@ -1,0 +1,329 @@
+"""The product role's agenda — what it owes, and to whom (#267 slice 3, ADR-0052).
+
+THE LOOPS WERE A LEDGER NOBODY COULD READ AS ONE. ADR-0021 gave the role a memory of what it
+expects back — a delivery it will announce, a "did it work?" it asked, a decision it is waiting
+for, a question about a card — and the panel showed it only as `/api/loops`, the raw rows of every
+agent, to the operator's console. The person the role owes something to had nowhere to see it.
+This is the same ledger read as an AGENDA: the product role's open loops, each as what it owes
+(a delivery it will announce) or what it is waiting for (an answer, a decision), and to whom.
+
+WHO MAY SEE AN ITEM IS THE ROUTING OF THE CHAT, NOT A SECOND RULE. Every loop belongs to a
+conversation — the one it was asked in, or the one its announcement went to — and the product
+chat's rule decides who reads it (`api/product_chat.py::may_receive`): a room's items are the
+room's, and reach whoever may read the product area; a private conversation's items reach only
+the person whose conversation it is. So a person sees their own items and the room's, and never
+another person's private items — on the panel (`catalog.product_agenda`, filtered by who the
+credential names) and in the role's own prompt (`module._write_facts`, filtered by the
+conversation the turn is in), where a room's turn is read by everyone in the room.
+
+WHERE AN ITEM LIVES, read from what each kind already records — digests where the ledger holds
+digests (`speaker.sealed`), because the ledger is read into prompts and onto the operator's
+screen, and a digest names nobody:
+
+    delivery, acceptance   `conversation` — where it was asked, and where the announcement goes
+                           (#267 slice 3); one opened before it was recorded was announced to
+                           the room, and is the room's
+    decision               `asked_in` — a digest of the conversation it was asked in (#266 slice 4);
+                           the room's when it was asked in the room or a thread of it
+    everything else        the room: the sweep asks its questions there, and every row opened
+                           before a conversation was recorded was read by everybody anyway
+
+AN ITEM NEVER CARRIES A NAME. It says whom the role owes as "you" or "the room", from the viewer's
+side; the loop's `person` (a forge login the sweep addresses a question to) and every sealed id
+stay in the ledger.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from beeverforge.memory.ledger import (
+    ACCEPTANCE,
+    CARD_QUESTION,
+    CONTEXT,
+    DECISION,
+    DELIVERY,
+    QUESTION,
+    Loop,
+    waiting,
+)
+
+#: Whose loops are the product role's agenda. The tech-lead's are the floor's business.
+OWNER = "product"
+
+#: Which way an item points: something the role will DO for somebody, or something it is WAITING
+#: to hear from somebody. A delivery is owed; everything else is an answer the role expects.
+OWED, AWAITED = "owed", "awaited"
+
+#: How much of what the role asked an item carries — a line on a panel, not the whole question.
+_WHAT_CHARS = 200
+
+
+@dataclass(frozen=True)
+class Audience:
+    """Who may see one item: the whole room, or the one conversation it lives in — kept as a
+    digest (`speaker.sealed`), compared and never read. `person` is a digest of whom it is for,
+    where the loop recorded one, so a room's item can say "you" to that person alone."""
+
+    room: bool
+    conversation: str = ""
+    person: str = ""
+
+
+@dataclass(frozen=True)
+class Viewer:
+    """Who is looking. `own` is the conversation that is theirs — on the panel the private key the
+    credential names (`api/app.py::_conversation_of`), in a turn the conversation the turn is in;
+    "" for nobody's. `person` is the viewer's id, only ever compared as a digest.
+    `may_read_room` is whether the room's items reach them at all."""
+
+    own: str = ""
+    person: str = ""
+    may_read_room: bool = True
+
+
+@dataclass(frozen=True)
+class Item:
+    """One line of the agenda, as ONE viewer may see it — no name in it, ever."""
+
+    kind: str
+    subject: str
+    direction: str
+    said: str
+    what: str
+    since: str
+    chased: str
+    yours: bool
+    to: str
+    #: THE PERSON'S WORDS FOR THE CHIP AND THE DATE (#401) — `direction` and `to` stay the codes a
+    #: caller compares; these are what a screen draws, in the project's language.
+    chip: str = ""
+    when: str = ""
+    #: WHERE IT IS ANSWERED (ADR-0055 D11): the card it is about, `""` when it is about none, and
+    #: whether the answer is given in the `conversation` or on the `card` — what the Pending tab
+    #: opens when the person picks the item
+    card: str = ""
+    opens: str = ""
+
+    def as_dict(self) -> dict:
+        return {"kind": self.kind, "subject": self.subject, "direction": self.direction,
+                "said": self.said, "what": self.what, "since": self.since,
+                "chased": self.chased, "yours": self.yours, "to": self.to,
+                "chip": self.chip, "when": self.when, "card": self.card, "opens": self.opens}
+
+
+def _sealed(value: str) -> str:
+    from beeverforge.product.speaker import sealed
+
+    return sealed(value)
+
+
+def audience(loop: Loop, *, room: str) -> Audience:
+    """Where `loop` lives — see the module's table. `room` is the product's room key
+    (`events.room_of`), which a decision asked in the room was sealed from."""
+    from beeverforge.product.conversation import is_private, owner_of
+
+    ctx = loop.context or {}
+    where = str(ctx.get("conversation") or "")
+    requester = str(ctx.get("requester") or ctx.get("asked_of") or "")
+    if where:
+        if is_private(where):
+            # SEALED BY ITS OWNER (#335): what is owed in any of a person's sessions is on that
+            # person's agenda, the way it was when they had one conversation
+            return Audience(room=False, conversation=_sealed(owner_of(where)), person=requester)
+        return Audience(room=True, person=requester)
+    asked_in = str(ctx.get("asked_in") or "")
+    if asked_in:
+        # ASKED IN THE ROOM, OR IN A THREAD OF IT (`about` is the room a thread lives in): the
+        # room's. Anywhere else — a private conversation, a chat add-on's direct one — only that
+        # conversation's: a digest cannot say which it was, and the narrow reading is the one
+        # that never shows somebody's private question to the room.
+        if asked_in == _sealed(room) or loop.about:
+            return Audience(room=True, person=requester)
+        return Audience(room=False, conversation=asked_in, person=requester)
+    return Audience(room=True, person=requester)
+
+
+def sees(viewer: Viewer, where: Audience) -> bool:
+    """Whether `viewer` may see an item that lives `where` — the chat's rule: a room's item to
+    whoever may read the room, a private one only in the conversation it lives in."""
+    if where.room:
+        return viewer.may_read_room
+    from beeverforge.product.conversation import owner_of
+
+    # THE VIEWER'S OWNER KEY (#335): a turn in any of Ana's sessions reads what is Ana's
+    return bool(viewer.own) and _sealed(owner_of(viewer.own)) == where.conversation
+
+
+def visible(rows: list[Loop], viewer: Viewer, *, room: str) -> list[Loop]:
+    """The ledger's rows as `viewer` may read them — every row of a loop they may see, open and
+    closed alike, and none of one they may not. What the role's prompt is handed
+    (`module._write_facts`), so a room's turn never reads somebody's private delivery."""
+    return [row for row in rows if sees(viewer, audience(row, room=room))]
+
+
+def _mine(viewer: Viewer, where: Audience) -> bool:
+    if not where.room:
+        return True
+    return bool(viewer.person) and bool(where.person) and _sealed(viewer.person) == where.person
+
+
+def _said(loop: Loop, *, yours: bool, language: str | None = None) -> tuple[str, str]:
+    """What the role owes or waits for, in one line — and which way it points.
+
+    IN THE PROJECT'S LANGUAGE, FROM `voice` (#401). Every line here was an English f-string, so a
+    pt-BR product's person read "tell you when the problem reported is fixed" on the one screen
+    that lists what the role promised them. This decides WHICH line; `voice.agenda_said` says it."""
+    from beeverforge.product.voice import agenda_said
+
+    ctx = loop.context or {}
+
+    def say(key: str, **kw) -> str:
+        return agenda_said(key, yours=yours, language=language, **kw)
+
+    if loop.kind == DELIVERY:
+        # A CARD SOMEBODY ASKED FOR NAMES NO REQUIREMENT (#481) — the item's `what` is its title
+        if ctx.get("ticket"):
+            return OWED, say("delivery_ticket")
+        if ctx.get("defect"):
+            return OWED, say("delivery_defect")
+        return OWED, say("delivery", subject=loop.subject)
+    if loop.kind == ACCEPTANCE:
+        issue = str(ctx.get("release_issue") or "")
+        if issue:
+            return AWAITED, say("release", issue=issue)
+        if ctx.get("ticket"):
+            return AWAITED, say("acceptance_ticket")
+        if ctx.get("defect"):
+            return AWAITED, say("acceptance_defect")
+        return AWAITED, say("acceptance", subject=loop.subject)
+    if loop.kind == DECISION:
+        return AWAITED, say("decision")
+    if loop.kind in (QUESTION, CARD_QUESTION):
+        return AWAITED, say("question", subject=loop.subject)
+    if loop.kind == CONTEXT:
+        return AWAITED, say("context")
+    return AWAITED, f"{loop.kind} {loop.subject}".strip()
+
+
+def items(rows: list[Loop], viewer: Viewer, *, room: str,
+          language: str | None = None) -> list[Item]:
+    """The product role's agenda as `viewer` may see it: every open loop of its own, oldest first,
+    each saying what is owed or awaited and to whom — "you" or "the room", never a name — in
+    `language`, the project's (#401)."""
+    from beeverforge.product.voice import agenda_chip, agenda_when
+
+    out: list[Item] = []
+    for loop in sorted(waiting(rows, owner=OWNER), key=lambda x: x.ts):
+        where = audience(loop, room=room)
+        if not sees(viewer, where):
+            continue
+        yours = _mine(viewer, where)
+        direction, said = _said(loop, yours=yours, language=language)
+        ctx = loop.context or {}
+        what = str(ctx.get("asked") or ctx.get("title") or "").strip()[:_WHAT_CHARS]
+        card, opens = _answered_at(loop)
+        out.append(Item(kind=loop.kind, subject=loop.subject, direction=direction, said=said,
+                        what=what, since=loop.ts, chased=loop.chased_ts, yours=yours,
+                        to="you" if yours else "the room",
+                        # an owed item has no chip: the person is not shown it as theirs to act on
+                        chip=(agenda_chip(direction, yours=yours, language=language)
+                              if direction == AWAITED else ""),
+                        when=agenda_when(loop.ts, loop.chased_ts, language=language),
+                        card=card, opens=opens))
+    return out
+
+
+#: The kind of an item an import left open (#994) — not a loop of the ledger: what is open is read
+#: from the import's record and the corpus as they are now, and the corpus moving is what closes it.
+IMPORT = "import"
+_IMPORT_KEYS = {"question": "import_question", "decision": "import_decision",
+                "change": "import_change"}
+
+
+def from_the_import(review, viewer: Viewer, *, language: str | None = None) -> list[Item]:
+    """What the newest import left open, as `viewer` may see it (#994): every item is the ROOM'S —
+    an import is told there, and its review is the product's people's together — each an item to
+    ask. When the record says who should answer, the item is "yours" to that person alone; to
+    everybody else it is the room's, and the person is named to nobody.
+
+    AT MOST `importing.MAX_OPEN` ITEMS (review of PR #1000): what an import left open is the
+    folder's word, and a folder of a thousand questions is not a Pending tab of a thousand — the
+    review carries the first ones, a yes to change an agreed requirement first, and the next come
+    up as these are answered."""
+    from beeverforge.product.importing import MAX_OPEN
+    from beeverforge.product.voice import agenda_chip, agenda_said, agenda_when
+
+    if review is None or not viewer.may_read_room:
+        return []
+    out: list[Item] = []
+    for item in review.open[:MAX_OPEN]:
+        yours = bool(item.ask) and bool(viewer.person) and \
+            _sealed(viewer.person) == _sealed(item.ask)
+        number = f"{item.requirement:04d}" if item.requirement else ""
+        out.append(Item(kind=IMPORT, subject=f"REQ-{number}" if number else review.id,
+                        direction=AWAITED,
+                        said=agenda_said(_IMPORT_KEYS[item.kind], yours=yours, subject=number,
+                                         origin=review.origin, language=language),
+                        what=item.text.strip()[:_WHAT_CHARS], since=review.landed_at, chased="",
+                        yours=yours, to="you" if yours else "the room",
+                        chip=agenda_chip(AWAITED, yours=yours, language=language),
+                        when=agenda_when(review.landed_at, language=language),
+                        card="", opens="conversation"))
+    return out
+
+
+def _answered_at(loop: Loop) -> tuple[str, str]:
+    """`(the card the item is about, where it is answered)`. A question on a card is answered ON
+    the card — the requester's comment closes it (ADR-0048); everything else the role waits for is
+    said to it in the conversation: a decision, an answer, a "did it work?"."""
+    from beeverforge.contracts.refs import canonical_ref
+
+    ctx = loop.context or {}
+    if loop.kind == CARD_QUESTION:
+        return canonical_ref(loop.subject), "card"
+    if loop.kind == ACCEPTANCE:
+        named = str(ctx.get("release_issue") or "").strip() or \
+            next((n for n in str(ctx.get("issues") or "").split(",") if n.strip()), "")
+        return canonical_ref(named), "conversation"
+    return "", "conversation"
+
+
+def pending(rows: list[Loop], viewer: Viewer, *, room: str,
+            language: str | None = None) -> list[Item]:
+    """WHAT WAITS ON THE PERSON — the Pending tab (ADR-0055 D11, amending ADR-0052 D12). Only what
+    the role is waiting FOR: what it owes them is not theirs to act on, and is one line on the card
+    it is about (`owed_on`)."""
+    return [item for item in items(rows, viewer, room=room, language=language)
+            if item.direction == AWAITED]
+
+
+def owed_on(rows: list[Loop], viewer: Viewer, card: str, *, room: str) -> bool:
+    """Whether the role owes `viewer`'s side a word about `card` — a delivery that still waits on
+    it, and that `viewer` may see. A card cancelled out of a delivery is owed nothing."""
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.product.events import issues_of
+    from beeverforge.product.followup import cancelled_cards
+
+    card = canonical_ref(card)
+    return any(loop.kind == DELIVERY and card in issues_of(loop) - cancelled_cards(loop)
+               and sees(viewer, audience(loop, room=room))
+               for loop in waiting(rows, owner=OWNER))
+
+
+def render(found: list[Item], *, language: str | None = None) -> str:
+    """The agenda as text — for the CLI and for whoever reads the row's message."""
+    from beeverforge.product.voice import agenda_empty, agenda_when
+
+    if not found:
+        return agenda_empty(language)
+    lines = []
+    for item in found:
+        tail = f": {item.what}" if item.what else ""
+        when = item.when or agenda_when(item.since, item.chased, language=language)
+        lines.append(f"- {item.said} ({when}){tail}")
+    return "\n".join(lines)
+
+
+__all__ = ["AWAITED", "IMPORT", "OWED", "Audience", "Item", "Viewer", "audience",
+           "from_the_import", "items", "owed_on", "pending", "render", "sees", "visible"]

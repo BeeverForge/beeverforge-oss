@@ -1,0 +1,4642 @@
+"""`beeverforge` — the CLI. Project-first: the framework drives many projects, and every
+command takes a project handle. Adding a project is data, not code.
+
+    beeverforge project add myapp ~/Projects/myapp --repo owner/myapp
+    beeverforge project add web   ~/Projects/web   --repo owner/web
+    beeverforge project init myapp      # scaffold .beeverforge/project.yaml in the repo
+    beeverforge conformance myapp       # is it runnable?
+    beeverforge run myapp 142           # drive issue #142 (walking skeleton)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import time
+from pathlib import Path
+
+import typer
+from dotenv import load_dotenv
+
+# THE DOOR HELPERS LIVE IN `beeverforge/doors.py` (ADR-0049 D2). They moved because
+# `POST /api/projects` is a door too and the API does not import the command line: while they
+# lived here, the panel's door asked no host at all and wrote one axis, while this one refused a
+# GitLab URL by name and wrote every axis — two doors into one registry, disagreeing about what
+# the same address means.
+from beeverforge import doors, namespace
+from beeverforge.cli_refusals import speaks_plainly
+from beeverforge.contracts import JobState
+from beeverforge.factory import build_runner, resolve_box_image
+from beeverforge.listeners import PANEL as _PANEL
+from beeverforge.loader import load_manifest
+from beeverforge.policy import check
+from beeverforge.registry import ProjectRegistry
+
+log = logging.getLogger("beeverforge.cli")
+
+app = typer.Typer(help="Run software tickets autonomously with coding agents.")
+project_app = typer.Typer(help="Register and manage projects.")
+app.add_typer(project_app, name="project")
+
+
+#: The two files `init` may write, and which runtime reads each. `.env.compose` is passed to
+#: `docker compose --env-file`; the host one is read by the three processes `beeverforge up`
+#: starts, which is why it lives where a person's own configuration lives rather than in whatever
+#: directory they happened to run `init` from.
+_COMPOSE_ENV = ".env.compose"
+_HOST_ENV = "~/.beeverforge/env"
+
+
+def _load_environment() -> None:
+    """Pick up `.env` (bot credentials) — WHEN THE CLI RUNS, never when it is imported.
+
+    This used to be a bare `load_dotenv()` at module scope, and importing a module then mutated
+    the whole process's environment. The test suite is what found it: `pytest-randomly` put a test
+    that imports this module ahead of the product-module tests, and those then held live
+    `BEEVERFORGE_GH_APP_*` credentials and made a real authenticated call to GitHub. It surfaced as
+    a
+    `ReadTimeout` and passed in isolation, which is the shape of the bug that never gets fixed.
+
+    The timeout was the mild symptom. Those are write-capable credentials for a real client's
+    repository, and the same import would have armed any test that reaches a write path — on some
+    seeds and not others.
+
+    A library module must not have side effects on import. The CLI is an entry point and may load
+    its environment; it does so here, from a callback that runs before any command.
+
+    TWO FILES, IN PRECEDENCE ORDER (ADR-0049 D9). `.env` in the working directory is what somebody
+    exported for THIS shell and wins; `~/.beeverforge/env` is what `beeverforge init --runtime
+    local` wrote for this machine and fills in the rest. `load_dotenv` never overwrites a value
+    that is already set, so loading the deployment's file second is what makes it the FLOOR rather
+    than the ceiling: a person debugging with one exported variable does not have to edit a file
+    to be heard.
+    """
+    load_dotenv()
+    load_dotenv(Path(_HOST_ENV).expanduser())
+
+
+@app.callback()
+def _main() -> None:
+    """Runs before every command (including subcommands), so every entry loads the same way."""
+    _load_environment()
+
+
+@project_app.command("add")
+def project_add(
+    name: str,
+    repo_path: str = typer.Argument(..., help="Local path or clone URL of the repo"),
+    provider: str = typer.Option(None, help="Vendor for all axes: github | azure_devops | jira. "
+                                            "Inferred from a dev.azure.com clone URL; "
+                                            "otherwise github"),
+    repo: str = typer.Option(None, help="Repo/board ref, e.g. owner/name (GitHub: inferred from "
+                                        "a clone URL when omitted)"),
+    board_owner: str = typer.Option(None, help="Board owner (GitHub Projects org/user)"),
+    board_number: str = typer.Option(None, help="Board number (GitHub Projects v2)"),
+    organization: str = typer.Option(None, help="Azure DevOps organisation (read from the clone "
+                                                "URL when it is a dev.azure.com one)"),
+    ado_project: str = typer.Option(None, "--ado-project",
+                                    help="Azure DevOps project (read from the clone URL)"),
+    repository: str = typer.Option(None, help="Azure Repos repository name (read from the "
+                                              "clone URL)"),
+    work_item_type: str = typer.Option(
+        None, "--work-item-type",
+        help="Azure Boards work item type the factory writes. Basic process: Issue (the "
+             "default); Agile: 'User Story'; Scrum: 'Product Backlog Item' — the wrong one is "
+             "a 400 at the first ticket"),
+    token_env: str = typer.Option(
+        None, help="Name of the env var holding THIS project's credential — the registry names "
+                   "the variable, the environment holds the value. Unset: the vendor's default "
+                   "(AZURE_DEVOPS_PAT, JIRA_API_TOKEN, BEEVERFORGE_BOT_TOKEN)"),
+    model: str = typer.Option(
+        None, help="Which model the coding agent runs for this project, in the harness's own "
+                   "naming (e.g. claude-fable-5, a Bedrock profile ARN). Unset: the harness's "
+                   "default. Per-role values: `beeverforge project set-model`"),
+    # DEFAULTS TO UNSET, not to "pt-BR" — the same reason `beeverforge run --image` defaults to
+    # unset
+    # (ADR-0037 D4): a flag that always carries a value can never let the model's OWN default win,
+    # so passing nothing here and passing --language pt-BR would become indistinguishable.
+    language: str = typer.Option(
+        None, help="Language for the tech-lead/product role's unprompted messages — English "
+             "unless you say otherwise (e.g. `--language pt-BR`) "
+                   "(announcements, diagnoses) — a reply always mirrors what the human wrote in, "
+                   "regardless of this. Default: en."),
+) -> None:
+    """Register a project. GitHub: `--repo owner/name` (inferred from a clone URL) and a board
+    via --board-owner/--board-number — or let `beeverforge project init` create one. Azure
+    DevOps: the dev.azure.com clone URL carries the organisation, project and repository, so
+    registering with it needs no coordinate flags (docs/setup/azure-devops.md is the whole
+    walkthrough). Split setups (e.g. Jira tickets + GitHub code) are edited in the registry."""
+    # A MAPPING ONTO THE `project_add` ROW (#741), which asks whose host the address is, decides
+    # every axis (ADR-0049 D2) and writes the registry once. What stays here is a command line's
+    # own: the ways out it can offer by its flags, and its exit codes — 2 for a request that
+    # cannot be carried out as written, 1 for one the registry refused.
+    from beeverforge.actions.base import INVALID
+
+    outcome = _perform("project_add", project=name, repo_path=repo_path,
+                       provider=provider or "", repo=repo or "", board_owner=board_owner or "",
+                       board_number=board_number or "", organization=organization or "",
+                       ado_project=ado_project or "", repository=repository or "",
+                       work_item_type=work_item_type or "", token_env=token_env or "",
+                       model=model or "", language=language or "")
+    if outcome.ok:
+        typer.echo(f"registered project {name!r}" if outcome.data["changed"]
+                   else f"· {outcome.message}")
+        return
+    if outcome.data.get("foreign"):
+        typer.echo(_foreign_refusal(str(outcome.data["foreign"]), provider))
+        raise typer.Exit(2)
+    if outcome.data.get("missing"):
+        flags = ", ".join("--" + str(p).replace("_", "-") for p in outcome.data["missing"])
+        typer.echo(f"✗ an Azure DevOps project needs its coordinates and {flags} could not be "
+                   f"read from {repo_path!r}")
+        # vendor-url-ok: this is help text SHOWING A HUMAN the shape to paste, not a URL this
+        # platform builds and sends anybody to.
+        typer.echo("  the clone URL of an Azure DevOps repository carries all three: "
+                   "https://dev.azure.com/<organization>/<project>/_git/<repository>")
+        raise typer.Exit(2)
+    typer.echo(f"✗ {outcome.message}")
+    raise typer.Exit(2 if outcome.code == INVALID else 1)
+
+
+def _refuse_the_row(outcome, name: str) -> None:
+    """End a `project` verb on its row's refusal, in the words this file has always used.
+
+    THE NAME THAT IS NOT HERE gets the sentence it always got here — the roster's command and the
+    reminder that the worker keeps a registry of its own, which is CLI advice the row cannot give —
+    and every other refusal is the row's own sentence. Exit 2 either way, this file's code for
+    "that request cannot be carried out as written"."""
+    from beeverforge.actions.base import NOT_FOUND
+
+    if outcome.code == NOT_FOUND:
+        typer.echo(f"✗ no project named {name!r} — `beeverforge project list` shows what this "
+                   f"deployment drives (and remember the worker has its own registry)")
+    else:
+        typer.echo(f"✗ {outcome.message}")
+    raise typer.Exit(2)
+
+
+def _says_the_row(outcome, name: str) -> None:
+    """A row's success as this file prints one — `✓` and the row's sentence — or its refusal."""
+    if not outcome.ok:
+        _refuse_the_row(outcome, name)
+    typer.echo(f"✓ {outcome.message}")
+
+
+def _model_recognition_note(project: str, model: str) -> str:
+    """A line under `set-model` when the harness does not carry this name in its own catalogue.
+
+    A WARNING AND NEVER A REFUSAL, because the two cases are indistinguishable from here and
+    measured to be so: `claude-fiofo2` (a typo) and a real Bedrock inference-profile ARN both make
+    the CLI say it does not recognise the name, and refusing would block the enterprise routes
+    this platform exists to serve. What it buys is the typo — caught the second it is typed
+    instead of by a failed ticket an hour later, which is how this was found (pilot, 2026-08-15:
+    `set-model podbeam claude-fiofo2` was accepted in silence and the panel showed it as if it
+    were a setting).
+
+    The harness is asked through its OPTIONAL capability (`recognises_model`); a harness without
+    one, or without a CLI on this machine, simply says nothing here."""
+    try:
+        from beeverforge.adapters.agent.registry import build_executor, harness_kind
+
+        proj = ProjectRegistry().get(project)
+        kind = harness_kind(proj, "executor")
+        agent = build_executor(proj)
+        probe = getattr(agent, "recognises_model", None)
+        if not callable(probe):
+            # SILENCE IS THE ONE ANSWER THIS MAY NOT GIVE. Claude is ONE harness of several and
+            # the model string is whatever that harness names its own way — so a deployment on
+            # `codex`, `kimi` or `opencode` has no recognition capability to probe, and returning
+            # "" would hand it the same blank line that means "checked, fine" (pilot, 2026-08-15:
+            # "the claude harness is one of the options, like the anthropic models — this tool
+            # will have to serve several harnesses x models").
+            verdict, detail = "unchecked", (
+                f"the {kind!r} harness has no way to check a model name before it is used")
+        else:
+            verdict, detail = probe(model)
+    except Exception as exc:  # noqa: BLE001 — a note is never worth failing the command for
+        verdict, detail = "unchecked", str(exc)[:120]
+    if verdict == "known":
+        return ""
+    if verdict == "unchecked":
+        # NOT SILENCE. "I could not ask" and "the harness approved it" produced the same blank
+        # line in the first cut, so an operator on a machine where the probe cannot run would
+        # read the absence of a warning as confirmation (pilot, 2026-08-15).
+        return (f"· the model was not checked against the harness ({detail}) — the first job "
+                "proves it, and fails naming this model if the harness will not run it")
+    return (f"⚠ the harness does not recognise {model!r} — {detail}\n"
+            "  That is EXPECTED for a Bedrock inference-profile ARN or a gateway alias, and it "
+            "looks exactly the same as a typo.\n"
+            "  Nothing is blocked: the first job proves it, and fails naming this model if the "
+            "harness will not run it.")
+
+
+@project_app.command("set-model")
+def project_set_model(
+    name: str,
+    model: str = typer.Argument(..., help="The harness's own model string — claude-fable-5, "
+                                          "gpt-5, a Bedrock inference profile ARN…"),
+    role: str = typer.Option(None, help="Set it for ONE role (executor | reviewer | techlead | "
+                                        "product) instead of every role"),
+) -> None:
+    """Which model writes this project's code — a registry value, changed here instead of by
+    editing YAML inside the worker. One string covers every role; `--role` builds the per-role
+    shape (one call per role). The string is passed to the harness verbatim: each CLI names
+    models its own way, and policing it here would reject the exact strings the enterprise
+    routes need."""
+    # A MAPPING ONTO THE `project_set_model` ROW (#741). The row saves; what stays here is asking
+    # the harness about the name, on the machine that will run it — after the save, and never a
+    # refusal, because a typo and an inference-profile ARN look the same to it. The row's own
+    # sentence says the harness was NOT asked, which is true of a front end and not of this
+    # command — so the line printed is the one this command always printed, and the note follows.
+    outcome = _perform("project_set_model", project=name, model=model, role=role or "")
+    if not outcome.ok:
+        _refuse_the_row(outcome, name)
+    scope = f"role {role!r}" if role else "every role"
+    typer.echo(f"✓ {name}: model {model!r} for {scope} — takes effect on the next job, no "
+               f"restart needed (the registry is read per run)")
+    if note := _model_recognition_note(name, model):
+        typer.echo(note)
+
+
+@project_app.command("set-language")
+def project_set_language(
+    name: str,
+    language: str = typer.Argument(..., help="`en`, `pt-BR`, or any tag your agents understand"),
+) -> None:
+    """Which language this project SPEAKS FIRST — its park alerts, its scheduled rounds, the
+    comments it writes on a ticket nobody asked it to write.
+
+    A REPLY IS NOT GOVERNED BY THIS. When somebody asks the tech-lead or the product role a
+    question, the answer follows the language of the QUESTION — someone who writes in English
+    wants an answer in English, whatever a project is configured for. That rule is the harness's
+    own (`adapters/agent/roles.py::language_directive`) and this setting is the other half of it:
+    the default for when the factory speaks first and has no incoming language to copy.
+
+    `--language` existed on `project add` and `project init` and nowhere else, so changing it
+    later meant editing YAML inside the worker image and rebuilding.
+    """
+    _says_the_row(_perform("project_set_language", project=name, language=language), name)
+    typer.echo("  A reply still follows whoever asked: someone who writes in English gets English.")
+
+
+@project_app.command("set-preview")
+def project_set_preview(
+    name: str,
+    required: bool | None = typer.Option(
+        None, "--required/--no-required",
+        help="the factory never merges this project on its own; a person looks and merges"),
+    hours: int | None = typer.Option(None, "--hours", help="how long a preview stays up (1–168)"),
+    auto_start: bool | None = typer.Option(
+        None, "--auto-start/--no-auto-start",
+        help="start the preview on its own when a pull request waits for a person (default), "
+             "or only when somebody presses start on the card"),
+    env: list[str] = typer.Option(None, "--env",  # noqa: B008 — typer's own idiom
+                                  help="svc=NAME or svc=NAME=WORKER_NAME ('*' = every service)"),
+    build_arg: list[str] = typer.Option(None, "--build-arg",  # noqa: B008 — typer's own idiom
+                                        help="svc=NAME a BUILD of a changed service may read"),
+    network: str | None = typer.Option(
+        None, "--network", help="an operator network the services join for egress ('' = none)"),
+    cpus: str | None = typer.Option(None, "--cpus"),
+    memory: str | None = typer.Option(None, "--memory"),
+    clear_env: bool = typer.Option(False, "--clear-env", help="drop every --env name first"),
+) -> None:
+    """What the OPERATOR decides about a project's previews (ADR-0050 D6, D8, D9): whether one is
+    required before a merge, how long it lives, which names each service may receive, egress,
+    limits. Merged into what the registry already holds — a flag not given keeps its value.
+
+    Never edited through a file on a volume: the registry is baked into the worker, and this is
+    the one door that validates what it writes (a name a preview may never receive — the
+    factory's own credentials, any project's `token_env`, a name a harness route requires — is
+    refused and said)."""
+    # A MAPPING ONTO THE `project_set_preview` ROW (#741): the row merges, validates and writes;
+    # what stays here is how a terminal shows the policy it saved.
+    outcome = _perform("project_set_preview", project=name, required=required, hours=hours,
+                       auto_start=auto_start, env=list(env or []),
+                       build_arg=list(build_arg or []), network=network, cpus=cpus,
+                       memory=memory, clear_env=clear_env)
+    if not outcome.ok:
+        _refuse_the_row(outcome, name)
+    saved = outcome.data["preview"]
+    typer.echo(f"✓ {name}: previews "
+               f"{'required before a merge' if saved['required'] else 'optional'}"
+               f", {'started on their own' if saved['auto_start'] else 'started on demand'}"
+               f", up for {saved['hours']}h, egress: {saved['network'] or 'none'}")
+    for field, label in (("env", "run time"), ("build_args", "build time")):
+        for svc, names in saved[field].items():
+            if names:
+                shown = ", ".join(c if c == w else f"{c}←{w}" for c, w in names.items())
+                typer.echo(f"  {label} · {svc}: {shown}")
+    if outcome.data["dropped"]:
+        typer.echo(f"  ! refused (a credential of the factory's own, or not a name): "
+                   f"{', '.join(outcome.data['dropped'])}")
+
+
+@project_app.command("show")
+def project_show(name: str) -> None:
+    """One project as this deployment's registry holds it — every axis, the box, the preview
+    policy — without opening the file."""
+    try:
+        project = ProjectRegistry().get(name)
+    except KeyError:
+        typer.echo(f"✗ no project named {name!r} — `beeverforge project list` shows what this "
+                   f"deployment drives (and remember the worker has its own registry)")
+        raise typer.Exit(2) from None
+    import json
+
+    # JSON, not YAML: this READS the registry back and writes nothing, so it must not look like
+    # the manifest writer (`env_apply`) the action layer owns — and JSON is exactly what the model
+    # validates, with no second rendering to drift.
+    typer.echo(json.dumps(project.model_dump(mode="json", exclude_none=True), indent=2))
+
+
+@project_app.command("list")
+def project_list() -> None:
+    for p in ProjectRegistry().list():
+        flag = "" if p.enabled else " (disabled)"
+        axes = f"tracker:{p.tracker.kind} forge:{p.forge.kind} ci:{p.ci.kind}"
+        typer.echo(f"{p.name}\t{p.repo_path}\t[{axes}]{flag}")
+
+
+@project_app.command("forget-conversations")
+def project_forget_conversations(
+    name: str,
+    yes: bool = typer.Option(False, "--yes", help="skip the confirmation"),
+) -> None:
+    """Delete every recorded conversation turn for a project's product (a data-deletion request).
+
+    Irreversible and deliberately awkward: it asks first, prints the count, and touches ONLY the
+    client's conversation — what was said, what was derived from it, the files sent in it and the
+    names people gave it — never the platform's operational memory for that project (`project
+    forget` is the command for all of it). The conversations are the PRODUCT's, shared by every
+    registry project of it, so those are named before it asks and theirs go too. A name no longer
+    registered deletes what is recorded under that name alone.
+    """
+    import asyncio
+
+    from beeverforge.memory import transcript
+    from beeverforge.product import forget
+
+    # THE DELETION FOLLOWS THE KEY (ADR-0051, #266 slice 3): memory is the product's, so forgetting
+    # one registry project's conversations forgets its product's — and the rows written before the
+    # move, still under each member's own name, with them.
+    try:
+        found = forget.target(name)
+        where, members = found.where, found.members
+    except KeyError:
+        where, members = transcript.Partition(key=name), ()
+    shared = [m for m in where.members if m != name]
+    if shared:
+        typer.echo(f"'{name}' shares its product's conversations with {', '.join(shared)} — one "
+                   f"memory, so theirs are deleted too.")
+    if not yes:
+        typer.echo(f"This permanently deletes ALL recorded conversation for '{name}'.")
+        typer.confirm("Proceed?", abort=True)
+    # THE CONVERSATIONS LAYER OF `project forget` (#453), not a copy of it: the rows, and — for a
+    # product's partition — what was derived from them (#269 slice 2, ADR-0053 D6: the index's
+    # lines, the search record's queries, each member's recall index; the next turn rebuilds them
+    # from a store that no longer has the rows) and what they carried (the files sent in them and
+    # the names people gave them, which deleting ONE conversation already erased, #335). A store
+    # that cannot delete is refused by name here too; it used to end in a traceback.
+    try:
+        counts = forget.conversations(where, members)
+    except forget.Unforgettable as exc:
+        typer.echo(f"✗ {exc}")
+        raise typer.Exit(2) from None
+    typer.echo(f"deleted {counts['conversation rows']} conversation row(s) for {name}")
+    if where.marked:
+        typer.echo(f"deleted {counts['index lines']} line(s) from the product's index, its search "
+                   f"record and {len(members)} recall index(es)")
+        named = counts["people who named them"]
+        typer.echo(f"erased {counts['files sent in them']} file(s) sent in them, and the names "
+                   f"{named} person(s) gave them")
+    # AND THE RUNS THAT STILL HOLD THEM (#533): a conversation's run stays open until its next
+    # turns roll it over, which a forgotten conversation never takes, so the engine's retention
+    # never reached what was said in it. Closed here, the same way `project forget` closes them.
+    closed = asyncio.run(forget.close_runs(where))
+    typer.echo(forget.engine_went(closed).line())
+    if closed.unread or closed.at_work:
+        raise typer.Exit(1)
+
+
+@project_app.command("forget")
+def project_forget(
+    name: str,
+    yes: bool = typer.Option(False, "--yes", help="skip the confirmation"),
+    with_context: bool = typer.Option(
+        False, "--with-context", help="also remove the conversations' distillates from the "
+                                      "context repository"),
+    keep_closed_cards: bool = typer.Option(
+        False, "--keep-closed-cards", help="leave the closed cards on the board"),
+    no_backup: bool = typer.Option(
+        False, "--no-backup", help="take no backup first — for a deletion request, where a backup "
+                                   "keeps exactly what was asked to be deleted"),
+) -> None:
+    """Forget everything the product role remembers about a project, layer by layer — to run it
+    again as new, or to answer a request that it be forgotten.
+
+    The conversations (the product's — shared registry projects are named first), the loop
+    ledger, the card verdicts, preview records and panel messages, the intake cases and what the
+    role told, the closed cards, and — with --with-context — the conversations' distillates in the
+    context repository. Each through its own store's deletion; what this deployment cannot forget
+    is refused by name, never reported as done.
+
+    Refused while a job or a conversation turn runs on the project. Says what it keeps before it
+    asks, takes a backup beside the registry first (unless --no-backup), and ends with what went,
+    layer by layer — and that the worker and the panel restart."""
+    import asyncio
+
+    from beeverforge.product import forget
+
+    try:
+        found = forget.target(name)
+    except KeyError:
+        typer.echo(f"✗ no project named {name!r} — `beeverforge project list` shows what this "
+                   f"deployment drives. For a name no longer registered, `beeverforge project "
+                   f"forget-conversations {name}` deletes what is recorded under it")
+        raise typer.Exit(2) from None
+    flight = asyncio.run(forget.in_flight(found))
+    if flight.refusal():
+        typer.echo(f"✗ {flight.refusal()}")
+        raise typer.Exit(1)
+    flags = {"with_context": with_context, "keep_closed_cards": keep_closed_cards}
+    typer.echo(f"'{name}' — what the product role remembers, and what goes:")
+    for line in forget.plan(found, **flags):
+        typer.echo(f"  - {line}")
+    typer.echo("Kept, all of it:")
+    for line in forget.KEPT:
+        typer.echo(f"  - {line}")
+    if not flight.engine:
+        typer.echo("(no durable engine is declared here, so nothing can be running in one)")
+    if not yes:
+        typer.echo(f"This permanently deletes what the product role remembers about '{name}'.")
+        typer.confirm("Proceed?", abort=True)
+    if no_backup:
+        typer.echo("no backup taken (--no-backup)")
+    else:
+        try:
+            kept_at = forget.backup(found)
+        except forget.CannotBackUp as exc:
+            typer.echo(f"✗ {exc}")
+            raise typer.Exit(1) from None
+        typer.echo(f"backup: {kept_at} — it holds everything forgotten here; delete it once the "
+                   f"run is confirmed, because a request to be forgotten is not answered while "
+                   f"it exists")
+    went = forget.forget(found, **flags)
+    for one in went:
+        typer.echo(one.line())
+    if any(w.state in (forget.REFUSED, forget.FAILED) for w in went):
+        typer.echo("✗ not everything was forgotten — the layers marked ✗ above say why")
+        raise typer.Exit(1)
+
+
+@project_app.command("remove")
+def project_remove(name: str) -> None:
+    """Unregister a project. A name that is not registered is refused, with the roster."""
+    # IT PRINTED `removed '<name>'` AND EXITED 0 FOR ANY STRING (#138): the registry's `remove`
+    # was a silent no-op for an unknown name and this verb announced success without asking. A
+    # shell loop with a quoting mistake sent one argument holding every name; each call said
+    # `removed …`, nothing was, and the script reported complete success. Exit 2 is this file's
+    # code for "that name is not here" (`_get_project`, `set-model`, `set-language`). Said in a
+    # comment and not the docstring, which is the verb's `--help` screen and names no card.
+    # A MAPPING ONTO THE `project_remove` ROW (#741), which the registry's refusal reaches.
+    outcome = _perform("project_remove", project=name)
+    if not outcome.ok:
+        from beeverforge.actions.base import NOT_FOUND
+
+        if outcome.code == NOT_FOUND:
+            typer.echo(f"✗ no project named {name!r} — nothing was removed. "
+                       f"Registered here: {_registered_here(ProjectRegistry(), refusing=name)}.")
+            raise typer.Exit(2)
+        _refuse_the_row(outcome, name)
+    typer.echo(outcome.message)
+
+
+@project_app.command("init")
+def project_init(
+    name: str,
+    repo_path: str = typer.Argument(None, help="Local path or clone URL (only needed when the "
+                                               "project is not registered yet)"),
+    repo: str = typer.Option(None, help="owner/name on the forge (defaults from repo_path)"),
+    board_owner: str = typer.Option(None, help="Where the board is created (defaults to the "
+                                               "repo's owner)"),
+    language: str = typer.Option(None, help="Language for unprompted messages (default: en)"),
+    provider: str = typer.Option(None, help="The forge kind that owns this URL's host — needed "
+                                            "when the host belongs to an installed add-on, "
+                                            "which this build cannot recognise by name. A kind "
+                                            "this build ships claims nothing: its hosts are "
+                                            "known, and a URL outside them stays refused"),
+) -> None:
+    """From nothing to a project that can move a ticket — everything an API can do, done.
+
+    CONVERGES rather than performs a fixed script: each step runs only if its result is missing,
+    so a failed board creation is retried by running init again — never by hand-assembling the
+    remaining half. Registers the project (runtime state, no rebuild), CREATES the Projects v2
+    board with the platform's columns, attaches it, and scaffolds the manifest.
+
+    What stays manual is irreducible: authorising the GitHub App on the repository (an OAuth
+    grant) and authenticating the harness (it is your subscription). `beeverforge doctor` names
+    anything still missing."""
+    # A MAPPING ONTO THE `project_init` ROW (#741). The row registers, creates the board, seeds the
+    # context repository and scaffolds the manifest, each only if its result is missing, and says
+    # what each step came to; what stays here is how a terminal shows them, the ways out only this
+    # command's flags offer, the closing checklist, and the exit codes. EXIT 1 WHEN THE BOARD OR
+    # THE MANIFEST FAILED, after converging, as it always was: a script must notice those two —
+    # and when the registration did, as a registry that could not be written always exited. The
+    # context repository's seed was best-effort here before it was a step (#106's review), and a
+    # failed one still exits 0 — the row says it failed, and the line below says what it costs.
+    from beeverforge.actions import STEP_ALREADY, STEP_DONE, STEP_FAILED, STEP_SKIPPED
+    from beeverforge.actions.base import INVALID, NOT_FOUND
+
+    outcome = _perform("project_init", project=name, repo_path=repo_path or "", repo=repo or "",
+                       board_owner=board_owner or "", language=language or "",
+                       provider=provider or "")
+    steps = list(outcome.data.get("steps") or [])
+    if not outcome.ok and not steps:
+        # REFUSED BEFORE ANYTHING WAS DONE, in the words this command has always used.
+        if outcome.code == NOT_FOUND:
+            typer.echo(f"{name} is not registered — pass REPO_PATH (and --repo owner/name)")
+            raise typer.Exit(1)
+        if outcome.data.get("register_with"):
+            typer.echo(f"✗ that is an Azure DevOps URL — register with `beeverforge project add "
+                       f"{name} {repo_path}` (the URL carries the coordinates), then re-run this "
+                       f"for the manifest scaffold. The walkthrough: docs/setup/azure-devops.md")
+            raise typer.Exit(2)
+        if outcome.data.get("foreign"):
+            typer.echo(_foreign_refusal(str(outcome.data["foreign"]), provider))
+            raise typer.Exit(2)
+        if outcome.data.get("missing"):
+            typer.echo("cannot infer owner/name — pass --repo explicitly")
+            raise typer.Exit(1)
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(2 if outcome.code == INVALID else 1)
+    mark = {STEP_DONE: "✓", STEP_ALREADY: "·", STEP_SKIPPED: "·", STEP_FAILED: "✗"}
+    for one in steps:
+        typer.echo(f"{mark[one['state']]} {one['said']}")
+        if one["step"] == "board" and one["state"] == STEP_FAILED:
+            typer.echo("  the project is registered without a board — fix the above and re-run "
+                       f"`beeverforge project init {name}` (the board step is idempotent)")
+        elif one["step"] == "manifest" and one["state"] == STEP_SKIPPED:
+            # NEVER POINT AT OUR OWN SOURCE (pilot, 2026-08-12): the manifest is written for them by
+            # the environment session, and the annotated reference is a document.
+            typer.echo(f"  `beeverforge onboard {name} --yes` proposes it as a pull request, "
+                       "PROVEN in the box first (ONBOARDING §3); with a local checkout, "
+                       "`beeverforge env read <path>` is the session form. Annotated reference: "
+                       "docs/project.yaml.example")
+        elif one["step"] == "context" and one["state"] == STEP_FAILED:
+            typer.echo(f"  `beeverforge doctor {name}` will say the module is unusable until it is")
+    if any(one["step"] == "register" and one["state"] == STEP_FAILED for one in steps):
+        # NOTHING AFTER IT WAS TRIED, and the checklist below is about a project that is registered
+        raise typer.Exit(1)
+
+    typer.echo("")
+    # A CHECKLIST OF WHAT THIS COMMAND CANNOT DO — not a list of things still undone (pilot,
+    # 2026-08-12): the command cannot know whether they are done; `doctor` can, and it is the next
+    # line either way. WHAT IS LEFT DEPENDS ON WHICH ROWS THIS PROJECT GOT (ADR-0049 D2): on a local
+    # project there is no forge credential to grant, and the one thing no command can do is COMMIT
+    # the manifest on the base branch — the pickup gate hashes it there.
+    if outcome.data.get("local"):
+        base_branch = outcome.data.get("base_branch") or "main"
+        typer.echo(f"two things no command can do for you — commit `.beeverforge/project.yaml` on "
+                   f"`{base_branch}` (the gate reads it there), and authenticate the coding "
+                   f"agent (on this machine that is the login you already use):")
+    else:
+        typer.echo("two things no command can do for you — grant the forge credential access to "
+                   "this repository, and authenticate the coding agent (it is your subscription):")
+    typer.echo(f"  `beeverforge doctor {name}` says whether they are already done, and names "
+               f"anything else missing. When it is green, a card in TO-DO starts on its own.")
+    if {s["step"] for s in steps if s["state"] == STEP_FAILED} & {"board", "manifest"}:
+        raise typer.Exit(1)
+
+
+
+
+def _foreign_refusal(foreign: str, provider: str | None) -> str:
+    """Why this address was not registered, and the four ways out of it (#162).
+
+    ONE DEFINITION, THREE DOORS. `project init` printed this and `project add` printed nothing at
+    all — it did not ask the question — so the same GitLab URL was refused by one command and
+    written as a GitHub row by the other. A sentence copied into the second door is the same
+    defect deferred: they drift, and the one that drifts is the one nobody reads while it is
+    right. The CLAIM now lives in `doors.foreign_refusal` because the panel's door needs it too;
+    what stays here are the ways out that only a command line can offer."""
+    installed = doors.installed_forges()
+    named = (provider or "").strip().lower()
+    # THE CLAIM IS `doors.foreign_refusal`'s, and only the ways out are this door's — the panel
+    # has no flags to offer and used to show no reason at all (ADR-0049 slice 4c).
+    return (f"✗ {doors.foreign_refusal(foreign)}\n"
+            + (f"  · `--provider {named}` claims nothing: {named} is a kind this build "
+               f"ships, and {foreign} is not a host it answers for\n"
+               if named else "")
+            + f"  · a GitHub ENTERPRISE host: set GH_HOST={foreign} and re-run — this "
+            f"platform honours it everywhere it builds a URL\n"
+            + (f"  · an installed add-on's host: re-run with --provider "
+               f"<{'|'.join(installed)}> — the add-on claims the host by name\n"
+               if installed else "")
+            + "  · another vendor: see docs/setup/ for the ones that are supported")
+
+
+@app.command("init")
+def init_deployment(
+    runtime: str = typer.Option(None, help="Where the FACTORY runs — `local` (three processes on "
+                                           "this machine) or `compose` (Docker), plus whatever an "
+                                           "installed add-on declares; the prompt lists them"),
+    # NO LITERAL LIST IN THE HELP. These four vocabularies are the registries' — shipped rows plus
+    # whatever add-on is installed — and a list written here was a third hand copy (the generator
+    # had two) that named vendors an installed add-on had already outgrown. The prompt and the
+    # non-tty refusal print the live list; `--help` says where it comes from.
+    forge: str = typer.Option(None, help="Where the CODE lives — a forge kind this build "
+                                         "implements (shipped or installed as an add-on); the "
+                                         "prompt lists them"),
+    tracker: str = typer.Option(None, help="Where the TICKETS live — a tracker kind this build "
+                                           "implements; the prompt lists them"),
+    harness: str = typer.Option(None, help="Which coding agent writes the code — a harness kind "
+                                           "this build implements; the prompt lists them"),
+    github_auth: str = typer.Option(None, "--github-auth", help="token | app"),
+    github_account: str = typer.Option(None, "--github-account",
+                                       help="org | personal — asked on the App path only: a "
+                                            "personal account's board needs a classic PAT "
+                                            "beside the App"),
+    claude_auth: str = typer.Option(None, "--claude-auth", help="subscription | api_key"),
+    channel: str = typer.Option(None, help="Where the factory talks to your team — a channel "
+                                           "kind this build implements; the prompt lists them"),
+    panel_exposed: bool = typer.Option(
+        None, "--panel-exposed/--panel-local",
+        help="Exposed generates a panel token; local leaves it OPEN (fine on a laptop)"),
+    out: str = typer.Option(_COMPOSE_ENV, help="Where to write it (the `local` runtime writes "
+                                               f"{_HOST_ENV} unless you say otherwise)"),
+    force: bool = typer.Option(False, "--force", help="Rewrite an existing file from your "
+                                                         "answers, keeping every value it already "
+                                                         "holds (empty a line to have it "
+                                                         "generated again)"),
+) -> None:
+    """Generate this DEPLOYMENT's environment from a few answers, instead of asking you to fill
+    in a template.
+
+    THE ORDER THIS FIXES. The template asked for credentials before you had said which vendors you
+    use, so you filled blanks for systems you will never touch and left blanks whose consequence
+    you could not evaluate. Answer the questions and the file contains your rows and nothing else.
+
+    It configures the DEPLOYMENT, never a project: no repository, no board, no stack. Those are
+    `beeverforge project init` and `beeverforge env read`, which read your repository rather than
+    interrogate you — this command exists because the deployment's own environment was the last
+    thing with no such step.
+
+    THE CLOSING LINE IS A COMMAND THE READER CAN RUN. Run by the installer, `init` prints
+    none, on either runtime: the installer starts the stack or prints how to. By hand it names the
+    file from the working directory when the file lies inside it, otherwise as it was passed, and
+    adds `--build` only where the `docker-compose.yml` here builds the worker from a Dockerfile
+    here — a checkout, never an installation from published images.
+    """
+    import os
+    import stat
+
+    from beeverforge.onboarding.deployment import (
+        QUESTIONS,
+        Answers,
+        Probes,
+        UnknownAnswer,
+        UnusableHome,
+        carry_over,
+        default_work_dir,
+        render,
+        row_value,
+        still_to_do,
+    )
+
+    q = {entry.flag: entry for entry in QUESTIONS}
+
+    dest = Path(out).expanduser()
+
+    def _refuse_to_overwrite(where: Path) -> None:
+        """THE `env apply` RULE, asked of the file this run is REALLY going to write.
+
+        It used to be asked here, of the default destination, before the first question — so a
+        person standing in a directory that happens to hold a `.env.compose` (this repository's
+        own clone, say) was refused before being asked where the factory runs, about a file the
+        answer they were about to give would not have touched. The rule is right; the moment was
+        wrong (measured 2026-09-11, on the first command of a demonstration)."""
+        if where.exists() and not force:
+            typer.echo(f"✗ {where} already exists — re-run with --force to rewrite it from "
+                       f"your answers, keeping every value it holds (or --out <path> to write "
+                       f"somewhere else). Nothing was changed.")
+            raise typer.Exit(2)
+
+    interactive = sys.stdin.isatty()
+
+    #: (flag, what to pass) for every answer a scripted run owes, COLLECTED rather than refused
+    #: one at a time. Measured 2026-09-12: an install over SSM named `--runtime`, and thirty
+    #: seconds later — one whole `install.sh`, image pull and nine preflight checks per attempt —
+    #: named `--channel`, which was equally true and equally knowable when the first was printed.
+    #: The number of attempts equalled the number of unanswered questions, and neither is
+    #: knowable in advance without reading `init --help` against the answers already given.
+    missing: list[tuple[str, str]] = []
+
+    def ask(value: str | None, flag: str, default: str | None = None) -> str:
+        entry = q[flag]
+        chosen_default = default or entry.default
+        if value is not None:
+            return value
+        if not interactive:
+            # NEVER BLOCK ON A PROMPT NOBODY CAN ANSWER. Piped into a script or a CI job, a
+            # `typer.prompt` waits for input that will never come — the silent forever-wait this
+            # platform treats as its own defect class. Record the flag and WALK ON, so the
+            # questions below this one are reached and asked too; the refusal is at the end.
+            #
+            # Walking on means answering with this question's own default, and that is the honest
+            # bound on the list: the questions are conditional (the GitHub pair is skipped without
+            # GitHub, `--claude-auth` without claude_code or on the `local` runtime), so a missing
+            # answer that GATES another can only be walked past by assuming one. The refusal says
+            # so rather than claiming the list is complete. Nothing is written either way.
+            missing.append((f"--{flag}", f"one of: {', '.join(entry.options)}"))
+            return chosen_default or (entry.options[0] if entry.options else "")
+        # THE QUESTION, THEN WHAT IT CHANGES, THEN THE CHOICES. The first version asked
+        # `channel (panel/slack)` and the pilot operator had to ask what it influenced — the
+        # platform's vocabulary is not the reader's, and an option list is not an explanation.
+        typer.echo("")
+        typer.echo(entry.ask)
+        typer.echo(f"  → {entry.effect}")
+        return typer.prompt(f"  {'/'.join(entry.options)}", default=chosen_default)
+
+    typer.echo("A few questions about THIS DEPLOYMENT — not about a project. The file it writes "
+               "carries\nonly the rows your answers use; anything you skip has a flag "
+               "(--forge, --harness, …).")
+
+    answers = Answers()
+    # WHERE THE FACTORY RUNS, FIRST (ADR-0049 D9) — it decides which file this writes and, on
+    # `local`, that no vendor credential is asked for at all.
+    answers.runtime = ask(runtime, "runtime")
+    if answers.runtime == "local" and out == _COMPOSE_ENV:
+        # THE DEFAULT DESTINATION FOLLOWS THE ANSWER. `.env.compose` is the compose stack's file,
+        # read by `docker compose --env-file`; a host deployment has no compose to read it, and a
+        # file named for a stack that is not there is the shape this generator exists to refuse.
+        dest = Path(_HOST_ENV).expanduser()
+    # NOW the destination is known, and it is the one this run will write.
+    _refuse_to_overwrite(dest)
+    answers.forge = ask(forge, "forge")
+    answers.tracker = ask(tracker, "tracker",
+                          default=answers.forge if answers.forge in q["tracker"].options else None)
+    if "github" in (answers.forge, answers.tracker):
+        answers.github_auth = ask(github_auth, "github-auth")
+        if answers.github_auth == "app":
+            # only the App path forks on account type: on the token path one classic PAT
+            # already carries code AND board, whichever kind of account owns them
+            answers.github_account = ask(github_account, "github-account")
+    answers.harness = ask(harness, "harness")
+    # SKIPPED WHERE THE ANSWER IS DISCARDED (this module's own rule). Subscription-or-API-key
+    # decides which token VARIABLE the file carries, and the `local` runtime carries neither: the
+    # harness signs in with the login on this machine. Asking anyway — and refusing a scripted run
+    # for not passing `--claude-auth` — teaches the reader that the answers do not matter.
+    if answers.harness == "claude_code" and answers.runtime != "local":
+        answers.claude_auth = ask(claude_auth, "claude-auth")
+    answers.channel = ask(channel, "channel")
+    if panel_exposed is None:
+        if not interactive:
+            # The one question that silently DEFAULTED when nobody could answer — to an OPEN
+            # panel. A default is the product: a scripted install that never said whether the
+            # panel is reachable must be refused, not quietly left open (v2 verification pass,
+            # 2026-08-10 — every other question already refused through ask()).
+            #
+            # It joins the SAME list, because it is the same refusal from the reader's side: one
+            # more flag this run owes. Being a pair rather than a choice of values is this
+            # command's business, not theirs.
+            missing.append(("--panel-exposed / --panel-local",
+                            "an unstated answer would leave the panel OPEN to anyone who can "
+                            "reach the port"))
+            answers.panel_exposed = False
+        else:
+            answers.panel_exposed = (
+                ask(None, "panel-exposed").strip().lower() in ("y", "yes", "true", "1"))
+    else:
+        answers.panel_exposed = panel_exposed
+
+    # ONE REFUSAL, AFTER EVERY QUESTION HAS BEEN REACHED, and before anything is created: the
+    # work directory below is made on disk, so a run that is going to be refused must be refused
+    # above it.
+    if missing:
+        typer.echo("✗ this does not run in a terminal, so every answer must be passed as a flag:")
+        width = max(len(flag) for flag, _ in missing)
+        for flag, hint in missing:
+            typer.echo(f"    {flag:<{width}}  {hint}")
+        typer.echo("  Some questions depend on earlier answers, so passing these may reveal one "
+                   "more.\n  Nothing was written.")
+        raise typer.Exit(2)
+
+    # WHAT THE FILE BEING REPLACED ALREADY HOLDS IS KEPT (`carry_over`). Read here, before anything
+    # is created: a file that exists and cannot be read would otherwise be written over, credentials
+    # and all, which is the loss this read exists to prevent.
+    previous = None
+    if dest.exists():
+        try:
+            previous = dest.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            typer.echo(f"✗ could not read {dest} to keep the values it holds "
+                       f"({getattr(exc, 'strerror', None) or exc}), so it was not rewritten — "
+                       f"fix its permissions, or move it aside and re-run. Nothing was changed.")
+            raise typer.Exit(2) from None
+
+    from beeverforge.credentials import discover_forge_token
+
+    # RESOLVED ONCE, HERE, AND HANDED TO THE GENERATOR. The file must name the same directory this
+    # command creates: deriving it twice is how a value ends up written in one place and made in
+    # another, and the symptom of a disagreement here is a job that runs in an empty workspace.
+    # REFUSED BY NAME RATHER THAN ROOTED AT `/`. Docker gives a uid with no `/etc/passwd` entry
+    # `HOME=/`, which is exactly what `install.sh` produces with `-u "$(id -u):$(id -g)"` — so this
+    # used to compute `/.local/share/beeverforge/work` and die on `Permission denied` for a
+    # directory nobody asked for, on every Linux install (measured on beeverforge-cli:v0.1.3).
+    try:
+        work_dir = default_work_dir()
+    except UnusableHome as exc:
+        typer.echo(f"✗ {exc}")
+        raise typer.Exit(2) from None
+
+    try:
+        # THE CHOSEN FORGE'S OWN LOGIN, asked through the credential registry — a vendor with no
+        # such thing answers None and the line is left for the person. This was `gh auth token`
+        # spawned here by name, one line after asking which forge the deployment uses.
+        rendered = render(answers,
+                          Probes(forge_token=lambda: discover_forge_token(answers.forge),
+                                 work_dir=lambda: work_dir))
+    except UnknownAnswer as exc:
+        typer.echo(f"✗ {exc}")
+        raise typer.Exit(2) from None
+
+    # THE MERGE COMES BEFORE THE WORK DIRECTORY, so the directory made below is the one the file
+    # names (review of #366). A work directory the caller DECLARED (`install.sh` passes the one it
+    # resolved and mounts) is this run's to write; otherwise a previous file's own is kept, and is
+    # checked and made here like any other, or it would be written as a bind source nothing made.
+    declared = bool((os.environ.get("BEEVERFORGE_WORK_DIR") or "").strip())
+    ours = frozenset({"BEEVERFORGE_WORK_DIR"}) if declared else frozenset()
+    text, kept = ((rendered.text, []) if previous is None
+                  else carry_over(previous, rendered.text, ours=ours))
+    written = row_value(text, "BEEVERFORGE_WORK_DIR")
+    if written is not None and written != work_dir:
+        if not written.startswith("/") or "~" in written:
+            typer.echo(f"✗ {dest} sets BEEVERFORGE_WORK_DIR={written}, which compose cannot bind: "
+                       f"it must be an absolute path with no `~`. Make it one, or empty the line "
+                       f"to have it chosen again, and re-run. Nothing was changed.")
+            raise typer.Exit(2)
+        work_dir = written
+
+    # CREATED HERE RATHER THAN LEFT TO DOCKER, and that is the whole point of moving it out of
+    # /var/lib. An absent bind source is not an error to Docker: the daemon creates it, owned by
+    # ROOT, and the stack comes up looking healthy — the ownership surprises the operator later,
+    # at a `git clone` inside a box that cannot write. Under rootless Docker it cannot be created
+    # at all. Making it now, as the invoking user, is what removes the `sudo` line from the
+    # first-run path instead of merely moving it.
+    try:
+        Path(work_dir).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # ONE SENTENCE, THE CAUSE AND THE REMEDY — never the traceback. `strerror` is the
+        # operating system's own reason ("Permission denied", "Read-only file system"), which is
+        # the half a person cannot guess.
+        typer.echo(f"✗ could not create the job workspace directory {work_dir} "
+                   f"({exc.strerror or exc}) — make it yourself and re-run, or point "
+                   f"BEEVERFORGE_WORK_DIR in {dest} at a directory you own")
+        raise typer.Exit(2) from None
+
+    # A ROW KEPT FROM THE PREVIOUS FILE WAS NOT FILLED NOW, AND IS NO LONGER TO DO: both lists name
+    # this run's work, and a token the person pasted in last time is neither.
+    obtained = [name for name in rendered.obtained if name not in kept]
+    remaining = still_to_do(rendered.remaining, kept)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8")
+    # 0600 BEFORE anybody can read it. The file carries credentials; the default umask on a
+    # shared machine does not.
+    os.chmod(dest, stat.S_IRUSR | stat.S_IWUSR)
+
+    typer.echo(f"✓ wrote {dest} (0600)")
+    if kept:
+        # NAMES, NEVER VALUES, for the reason below.
+        typer.echo(f"  kept from the file it replaced: {', '.join(kept)}")
+    if obtained:
+        # NAMES, NEVER VALUES. Echoing a secret puts it in a scrollback buffer, a screen recording
+        # and a CI log — three places nobody remembers to clear.
+        typer.echo(f"  filled without asking: {', '.join(obtained)}")
+    if remaining:
+        typer.echo("\nwhat is still yours to do:")
+        for i, line in enumerate(remaining, 1):
+            typer.echo(f"  {i}. {line}")
+    # RUN BY THE INSTALLER, THE NEXT COMMAND IS THE INSTALLER'S (#652), on either runtime: it starts
+    # the stack itself, or under `--no-run` prints how to. Said here too, it was a second command,
+    # and from inside the CLI container the wrong one — through the installer v0.5.0, v0.6.0-rc.1
+    # and rc.2 all closed with `then: docker compose --env-file /out/.env.compose up -d --build`.
+    if (os.environ.get("BEEVERFORGE_INSTALLER") or "").strip():
+        return
+    if answers.runtime == "local":
+        # THE NEXT COMMAND IS THE ONE THAT STARTS IT. `docker compose --env-file …` is the other
+        # runtime's, and printing it here sent a person who had just said "this machine" to
+        # install Docker.
+        typer.echo(f"\nthen: `beeverforge up` — the engine, the worker and the panel, here. "
+                   f"({dest} is read by all three.)")
+    else:
+        build = " --build" if _builds_from_this_checkout(Path.cwd()) else ""
+        typer.echo(f"\nthen: `docker compose --env-file {_named_as_passed(out)} up -d{build}`")
+
+
+def _named_as_passed(out: str) -> str:
+    """The environment file as the person can name it: from the working directory when it lies
+    inside it — where `docker compose` reads `docker-compose.yml` — and otherwise as they typed it.
+
+    THE README's BY-HAND PATH IS WHY THE FIRST HALF EXISTS: `docker run -v "$PWD:/out" … init --out
+    /out/.env.compose` passes a container path, and the image's working directory IS the mount, so
+    relative to it the file is `.env.compose` on both sides. Both sides RESOLVED: `Path.cwd()`
+    already is, and on macOS the temporary directories sit behind `/private`."""
+    try:
+        return str(Path(out).expanduser().resolve().relative_to(Path.cwd().resolve()))
+    except ValueError:
+        return out
+
+
+def _builds_from_this_checkout(project_dir: Path) -> bool:
+    """Whether the `docker-compose.yml` here builds the worker from a Dockerfile that is here.
+
+    An installation from published images has the compose file and no `docker/` (none of the
+    three files the installer downloads is under it), so `--build` there fails on a Dockerfile it
+    cannot find — what every fresh install from v0.5.0 to v0.6.0-rc.2 was told to run (#650). A
+    checkout has both, and keeps it.
+
+    A file that cannot be read or parsed answers "no", which is not the same as "there is no
+    build", and is acceptable only because the answer decides a hint: nothing is written or
+    refused on it."""
+    import yaml
+
+    from beeverforge.util import yaml_io
+
+    try:
+        compose = yaml_io.load((project_dir / "docker-compose.yml").read_text(encoding="utf-8"),
+                               loader=yaml_io.CountingLoader)  # a compose file has anchors
+        build = compose["services"]["worker"]["build"]
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, KeyError, TypeError):
+        return False
+    if isinstance(build, str):
+        build = {"context": build}
+    if not isinstance(build, dict):
+        return False
+    context = project_dir / str(build.get("context", "."))
+    return (context / str(build.get("dockerfile", "Dockerfile"))).is_file()
+
+
+def _conformance_kinds() -> str:
+    """The published kinds, read off the table — the help text used to be a hand copy that
+    omitted `tracker` while `tracker` worked, and named nothing that was added afterwards."""
+    from beeverforge.conformance import CHECKS
+
+    return " | ".join(CHECKS)
+
+
+@app.command("conformance-adapter")
+def conformance_adapter(
+    kind: str = typer.Argument(..., help=f"one of: {_conformance_kinds()}"),
+    factory: str = typer.Argument(..., help="Import path `pkg.module:attr` — an adapter "
+                                            "INSTANCE, its CLASS, or a zero-arg FUNCTION "
+                                            "returning an instance (an object that merely "
+                                            "has __call__ is judged as the instance, never "
+                                            "called)"),
+) -> None:
+    """Run YOUR adapter against the platform's conformance suite.
+
+    Every rule in it was learned from a live incident on this platform; a green run means your
+    provider does not re-pay any of them. The checks exercise the LOCAL contract only — nothing
+    remote is created or mutated — so point board adapters at a sandbox of yours anyway."""
+    import importlib
+    import inspect
+
+    from beeverforge.conformance import CHECKS
+
+    row = CHECKS.get(kind)
+    if row is None:
+        typer.echo(f"unknown kind {kind!r} — one of: {', '.join(CHECKS)}")
+        raise typer.Exit(2)
+    check, protocol = row
+    module_name, _, attr = factory.partition(":")
+    if not attr:
+        typer.echo("factory must be `pkg.module:attr`")
+        raise typer.Exit(2)
+    try:
+        target = getattr(importlib.import_module(module_name), attr)
+    except Exception as exc:  # noqa: BLE001 — the import error IS the answer
+        typer.echo(f"could not import {factory!r}: {exc}")
+        raise typer.Exit(2) from None
+    # INSTANCE-VERSUS-FACTORY IS DECIDED BY THE PORT, AND AN INSTANCE IS NEVER CALLED. Four
+    # shapes, judged in this order:
+    #   a CLASS is constructed — its unbound methods satisfy any runtime Protocol by `hasattr`,
+    #     which is how the very first version judged every class an instance and never
+    #     constructed one;
+    #   an object that satisfies the kind's Protocol IS the adapter (every port is
+    #     `runtime_checkable`);
+    #   a plain function — or a builtin, or a bound method — is a zero-arg factory: a function
+    #     never carries a multi-method port's surface, so it is called ONCE and its result is
+    #     judged;
+    #   anything else is an INSTANCE that fails the port, handed to the check as it is, which
+    #     names the methods it lacks.
+    # The version before this one folded the last two into `not isinstance(target, protocol)`
+    # and CALLED the result, so a half-implemented channel instance — the exact input this
+    # command exists to judge, and the first form its help lists — died as `TypeError:
+    # 'HalfChannel' object is not callable` (measured 2026-08-26) and no `<kind>.protocol`
+    # finding was reachable for it. The version before THAT probed one method per kind from a
+    # hand-kept map and read a factory FUNCTION as the instance: absence read as a verdict. An
+    # instance that happens to define `__call__` is still an instance; `inspect.isroutine` is
+    # what separates a function from an object, `callable` does not.
+    if isinstance(target, type):
+        adapter = target()
+    elif isinstance(target, protocol):
+        adapter = target
+    elif inspect.isroutine(target):
+        adapter = target()
+    else:
+        adapter = target
+    findings = check(adapter)
+    for f in findings:
+        typer.echo(f"FAIL  {f.rule}")
+        typer.echo(f"      {f.detail}")
+        if f.taught_by:
+            typer.echo(f"      taught by: {f.taught_by}")
+    if findings:
+        typer.echo(f"\nNOT CONFORMANT — {len(findings)} rule(s) broken")
+        raise typer.Exit(1)
+    typer.echo(f"CONFORMANT — {kind} adapter holds every rule this platform has paid for")
+
+
+box_app = typer.Typer(help="The ephemeral environment a job runs in.")
+app.add_typer(box_app, name="box")
+
+
+@box_app.command("prove")
+def box_prove_cmd(
+    name: str,
+    image: str = typer.Option(None, help="Override the image for this proof only"),
+    sandbox: str = typer.Option(None, help="Which box to prove (default: the one this "
+                                           "deployment runs — BEEVERFORGE_SANDBOX, else the "
+                                           "container)"),
+    repo: str = typer.Option(None, help="owner/name — prove ANOTHER of this product's "
+                                        "repositories (a product may span several, and each "
+                                        "repo's box is proven on its own manifest)"),
+    ref: str = typer.Option(
+        None, "--ref", help="Prove the manifest on this branch or tag instead of the base branch "
+                            "— a pull request's, before it is merged. MEASURED, NEVER RECORDED: "
+                            "the gate that holds pickup is a fact about the base branch."),
+) -> None:
+    """Prove this project's box BEFORE a ticket runs — no agent, no tokens spent.
+
+    Resolves the image to a digest, checks the image contract by name, checks the harness toolbox
+    can execute in it, then runs the project's OWN `setup:` and `validate:` against untouched
+    `main`. Green means your tests passed inside the factory (ADR-0037 D3).
+    """
+    from beeverforge.box_prove import (
+        PROOF_DIR,
+        ProveBusy,
+        _hold_the_proof_of,
+        _let_go,
+        box_probes,
+        load,
+        prove,
+        save,
+    )
+
+    project = _with_its_code(_get_project(name), "proving its box")
+    proof_key = name
+    view = project
+    if repo:
+        # C-18: the card's-eye view of the project — forge/ci swapped to that repository, the
+        # checkout and the proof keyed so two repos never share either. THE KEY COMES FROM THE
+        # VIEW, never recomputed from the raw flag: a bare name (`--repo dsk-ui`, the natural
+        # ADO spelling) resolves to the DEFAULT repository, and hashing the raw string keyed
+        # the default repo's proof under a foreign name (adversarial review, 2026-08-13).
+        from beeverforge.runtime.card_repo import _runner_view
+
+        view, proof_key = _runner_view(project, f"{repo}#0")
+        if proof_key == name:
+            typer.echo(f"· --repo {repo} names the project's default repository — proving it "
+                       f"under its own key")
+    box_kind = _box_kind(sandbox)
+    resolved = resolve_box_image(view, explicit=image, sandbox=box_kind)
+    # NAME THE BOX, not only the image (ADR-0049 D9). A worktree proof has no image at all, and
+    # "proving myapp on beeverforge-python" over a box that runs none is the sentence a person
+    # would quote back when the proof turns out to be about something else.
+    from beeverforge.adapters.sandbox.registry import installed_box_traits
+
+    runs_an_image = installed_box_traits(box_kind).honours_image
+    typer.echo(f"proving {proof_key} in the {box_kind} box"
+               + (f" on {resolved}…\n" if runs_an_image and resolved else "…\n"))
+
+    # WHAT THE ROOM SEES WHILE IT HAPPENS. This command pulls an image, installs the client's
+    # dependencies and runs their whole suite — and until now it printed nothing until every
+    # station had finished, which on a real repository is minutes of a blank terminal in front of
+    # the people deciding whether to buy. A screen that has not moved is indistinguishable from
+    # one that has hung, and somebody reaches for Ctrl-C.
+    #
+    # PROGRESS ON STDERR, RESULTS ON STDOUT. `beeverforge box prove x > proof.txt` still captures
+    # exactly
+    # the findings and the verdict; the live half goes to the terminal, where it is for.
+    def _stage(kind: str, text: str) -> None:
+        if kind == "start":
+            typer.echo(f"  … {text}", err=True)
+        elif kind == "line":
+            typer.echo(f"      {text.rstrip()}", err=True)
+
+    # ONE box for the whole proof — setup and validate must share a container or the install is
+    # thrown away between them, which is what the first real run of this command discovered.
+    ref_root, ref_manifest = None, None
+    held = None
+    if ref:
+        # THE KEY BEFORE THE `--ref` CHECKOUT (engineering lessons §12). `resolve_repo_path` below
+        # removes and re-adds `<cache>/worktrees/<key>@<ref>`, the tree a running `--ref` proof of
+        # this key reads: taken inside `box_probes` only, the lock refused the second proof after
+        # that tree was rebuilt (review of #745, git 2.43.0, 2026-10-21: `sentinel exists: False`).
+        # The lock is re-entrant for this thread, so `box_probes` takes it again at depth 2.
+        try:
+            held = _hold_the_proof_of(proof_key)
+        except ProveBusy as exc:
+            typer.echo(exc.sentence)
+            raise typer.Exit(1) from None
+        # A KEY OF ITS OWN. Syncing a branch under the project's default key would REPLACE the
+        # base branch's checkout with it — the same hole this closes, entered from the other side
+        # — and the next proof would measure a branch while reporting the base branch.
+        import re as _re
+
+        from beeverforge.factory import resolve_repo_path
+        from beeverforge.loader import load_manifest
+
+        safe = _re.sub(r"[^A-Za-z0-9._-]", "-", ref)
+        try:
+            ref_root = resolve_repo_path(view, cache_key=f"{proof_key}@{safe}", ref=ref)
+            ref_manifest = load_manifest(view, repo_root=ref_root)
+        except Exception as exc:  # noqa: BLE001 — one sentence, the cause, never a traceback
+            typer.echo(f"✗ could not read {namespace.MANIFEST} on {ref!r} ({str(exc)[:200]}) — "
+                       f"check that the branch exists on the forge and carries the file. "
+                       f"Nothing was changed.")
+            _let_go(held)
+            raise typer.Exit(2) from None
+
+    try:
+        with box_probes(view, resolved, key=proof_key, sandbox=box_kind,
+                        repo_path=ref_root, manifest=ref_manifest) as probes:
+            proof = prove(proof_key, resolved, probes, on_stage=_stage)
+    except ProveBusy as exc:
+        # BEFORE `save`: a refused proof measured nothing, and recording it as failed would hold
+        # the pickup the running proof is about to decide
+        typer.echo(exc.sentence)
+        raise typer.Exit(1) from None
+    finally:
+        _let_go(held)
+    for f in proof.findings:
+        typer.echo(f"  {f.mark:<4}  {f.check:<9} {f.message}")
+        if not f.ok and f.remedy:
+            typer.echo(f"          → {f.remedy}")
+
+    # A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION, and this line is what keeps it one.
+    # `save` writes where the POLLER looks; a branch recorded there would satisfy the gate that
+    # holds pickup on the BASE branch, unlocking work against a manifest nobody merged. The whole
+    # value of `--ref` is reading the answer before the merge, and it survives exactly as long as
+    # the answer cannot be mistaken for permission.
+    where = None if ref else save(proof)
+    typer.echo("")
+    if ref:
+        typer.echo(f"{'WOULD PROVE' if proof.ok else 'WOULD NOT PROVE'} — measured on {ref!r}, "
+                   f"which is not the base branch. Nothing was recorded: the gate that holds "
+                   f"pickup is a fact about the base branch, and merging is what makes it one.")
+        raise typer.Exit(0 if proof.ok else 1)
+    if proof.ok:
+        if where is None:
+            # PROVEN AND NOT RECORDED IS A THIRD OUTCOME, and the one that used to read as success.
+            # The proof is real; the record is what the poller consults, so without it the very
+            # next pickup is held with "the box has never been proven" — while the person who just
+            # ran this was told it worked. Two sentences, because they need two different actions.
+            typer.echo(f"PROVEN — {name} can build and test in this box, but the proof could NOT "
+                       f"be recorded, so the next pickup will be held as if it never ran.")
+            typer.echo(f"  → the proof directory is not writable by this process ({PROOF_DIR}). "
+                       f"Run where the deployment runs, or point BEEVERFORGE_PROOFS somewhere this "
+                       f"user can write.")
+            raise typer.Exit(1)
+        typer.echo(f"PROVEN — {name} can build and test in this box (recorded at {where})")
+        # The number that makes the proof worth taking: this is what a client sees first.
+        gates = next((f for f in proof.findings if f.check == "validate"), None)
+        if gates:
+            typer.echo(f"  {gates.message}")
+        return
+    typer.echo("NOT PROVEN — fix the FAIL lines above, then re-run (nothing recorded as valid).")
+    typer.echo("  Changing a declared command is a normal step, not a detour: edit "
+               f"{namespace.MANIFEST} in your repository, commit, re-run this — the proof "
+               "notices the new commands by their hash (ONBOARDING §5, 'When the proof fails "
+               "on a command you need to CHANGE').")
+    if load(proof_key) is None:
+        typer.echo("  no previous proof exists, so this repository cannot be picked up yet")
+    raise typer.Exit(1)
+
+
+def _exit_expired():
+    """`box status` answers with its exit code too — a script asks this question."""
+    raise typer.Exit(1)
+
+
+# Provenance, kept out of the `--help` screen a client reads: this command exists because the
+# published v0.2.0 images shipped an empty extra-CA file, and nothing anywhere made a real agent
+# call, so five checks were green over a deployment where no ticket could run (issues 122 and 129).
+@box_app.command("answer")
+def box_answer_cmd(
+    name: str,
+    image: str = typer.Option(None, help="Override the image for this check only"),
+    sandbox: str = typer.Option(None, help="Which box to ask from (default: the one this "
+                                           "deployment runs)"),
+) -> None:
+    """Ask the agent one question and read the reply — THIS SPENDS a few tokens.
+
+    `box prove` proves the box and deliberately spends nothing; `doctor` reports that a credential
+    is present. Neither makes a call, and on the published v0.2.0 images both were green while no
+    ticket could run at all. This is the only check that asks.
+
+    Run it once after an install or an upgrade, not per pickup.
+    """
+    from beeverforge import agent_answer
+    from beeverforge.adapters.agent.base import smoke_command_for, smoke_reply_for
+    from beeverforge.adapters.agent.registry import build_executor
+    from beeverforge.box_prove import ProveBusy, box_probes
+    from beeverforge.observability.job_record import record_one_pass
+
+    project = _get_project(name)
+    box_kind = _box_kind(sandbox)
+    resolved = resolve_box_image(project, explicit=image, sandbox=box_kind)
+    executor = build_executor(project)
+
+    # SAID BEFORE IT HAPPENS, because it is the one command here that costs money (ADR-0048, "the
+    # factory asks before it spends"). One turn, no tools, two-digit arithmetic.
+    typer.echo(f"asking {name}'s agent one question in the {box_kind} box — this spends a few "
+               f"tokens, which is the point: nothing else here makes a real call.\n")
+
+    try:
+        with box_probes(project, resolved, key=name, sandbox=box_kind) as probes:
+            harness_path = probes.harness_name()
+            answer = agent_answer.ask(agent_answer.Probes(
+                smoke_command=lambda prompt: smoke_command_for(
+                    executor, harness=harness_path, prompt=prompt),
+                run_in_box=lambda cmd, seconds: probes.run_in_box(cmd, None, seconds),
+                credential_in_box=lambda: _credential_reached(probes),
+                # WHY THE BOX DID NOT START, asked before anything runs in it. Through a box that
+                # is not there the call "fails" with the start error as its output, and that read
+                # as the harness refusing — with a spend recorded for a call nobody made.
+                box_error=probes.box_start_error,
+                # THE HARNESS'S OWN READING of its reply. The generic one found nothing on codex or
+                # opencode, whose streams nest the reply where it does not look.
+                read_reply=lambda out: smoke_reply_for(executor, out),
+                # ON THE SAME BOOKS AS EVERY OTHER SPENDER (#109). The cost is genuinely unknown
+                # here — the call goes through the adapter's `_cli` and comes back as `(rc, out)`,
+                # not as an `AgentRunResult` — and `record_one_pass` writes None for that rather
+                # than zero, which matters: a zero cost is the exact tell that first exposed an
+                # agent call never happening at all.
+                on_pass=lambda: record_one_pass(project=name, ticket="box-answer",
+                                                role="executor", result=None),
+            ))
+    except ProveBusy as exc:
+        # nothing was asked, so nothing is spent or recorded: the sentence and a failing exit
+        typer.echo(exc.sentence)
+        raise typer.Exit(1) from None
+
+    typer.echo(f"  {'ok' if answer.ok else 'FAIL':<4}  {answer.state:<14} {answer.detail}")
+    if answer.remedy:
+        typer.echo(f"          → {answer.remedy}")
+    typer.echo("")
+    if answer.ok:
+        typer.echo(f"ANSWERED — {name}'s agent completed a real call. Nothing else in this "
+                   f"deployment proves that.")
+        return
+    typer.echo(f"NOT PROVEN ({answer.state}) — fix the line above and run this again.")
+    raise typer.Exit(1)
+
+
+def _credential_reached(probes) -> bool | None:
+    """Whether the route's credential is present INSIDE the box — asked by name, answered by
+    presence, exactly as `box prove` does it. None when this probe set cannot look, which is not
+    the same as absent and must not be reported as one."""
+    from beeverforge.box_prove import _route_names
+
+    route = probes.auth_route()
+    present = probes.env_in_box(_route_names(route))
+    if present is None:
+        return None
+    return not route.missing(present)
+
+
+@box_app.command("status")
+def box_status_cmd(
+    name: str,
+    repo: str = typer.Option(None, help="owner/name — another of this product's repositories"),
+    as_json: bool = typer.Option(
+        False, "--json",
+        help="Emit the versioned status document (beeverforge.box-status/1): the proof's digest, "
+             "the toolchain it is pinned to, and whether it is still valid."),
+) -> None:
+    """Whether this project's box has a VALID proof — and if not, exactly what moved."""
+    from beeverforge import box_prove
+
+    project = _get_project(name)
+    # `box_prove.status` judges freshness with `_freshness_reason`, THE SAME FUNCTION THE POLLER
+    # ASKS — this command used to reproduce the rules inline, and would have said EXPIRED about a
+    # proof the factory was happily picking cards up on (2026-08-15). One status, two renderings.
+    st = box_prove.status(project, repo=repo or "")
+    if as_json:
+        typer.echo(box_prove.status_json(st))
+    else:
+        for line in st.lines():
+            typer.echo(line)
+    if st.valid:
+        return
+    if st.state == "expired":
+        return _exit_expired()
+    raise typer.Exit(1)
+
+
+poller_app = typer.Typer(help="The schedule that picks cards up.")
+app.add_typer(poller_app, name="poller")
+
+
+def _poller_reading() -> tuple[dict, list[dict] | None]:
+    """The schedule's state and the jobs in flight, from ONE gather.
+
+    Both questions are asked together because the answer to either alone misleads. "Paused" reads
+    as "safe to roll" and is not — a pause holds NEW pickups and does nothing to a job already
+    running. "Nothing in flight" reads as "nothing will start" and is not, while the schedule
+    ticks.
+
+    THE JOB LIST IS `None` WHEN IT COULD NOT BE READ (#298), never `[]`. `got.jobs or []` printed
+    "in flight: nothing" for an engine that did not answer — right after a pause, the one moment
+    an operator reads that line as clear to roll the deployment."""
+    from beeverforge.floor import reading as floor
+
+    got = asyncio.run(floor.gather(want=("intake", "jobs")))
+    return (got.intake or {"known": False, "on": None, "note": ""}), got.jobs
+
+
+def _in_flight(jobs: list[dict]) -> list[dict]:
+    return [j for j in jobs if j.get("status") == "running"]
+
+
+def _say_flight(jobs: list[dict] | None, *, after_pause: bool = False) -> None:
+    if jobs is None:
+        # AN UNREAD LIST IS NOT A DRAINED FLOOR (#298): say what could not be read, and after a
+        # pause say what that means for a roll — the same caution as a job that IS running.
+        typer.echo("in flight: UNKNOWN — the job list could not be read (is the engine reachable?)")
+        if after_pause:
+            typer.echo("  the pause holds NEW pickups only, and this cannot say whether a job is "
+                       "still running. Do not roll the deployment until `beeverforge poller "
+                       "status` can read the job list.")
+        return
+    running = _in_flight(jobs)
+    if not running:
+        typer.echo("in flight: nothing")
+        return
+    typer.echo(f"in flight: {len(running)} job(s)")
+    for job in running:
+        typer.echo(f"    {job.get('project') or '?'} #{job.get('issue') or '?'}"
+                   f"  {job.get('state') or job.get('status') or ''}")
+    if after_pause:
+        # THE SENTENCE THIS COMMAND EXISTS TO PRINT. An operator pauses in order to roll the
+        # deployment, and a pause that reads as "drained" is how a job is interrupted by somebody
+        # who believed the opposite. The hold is on PICKUP; these are already past it.
+        typer.echo("  the pause holds NEW pickups only — these are already running. Wait for "
+                   "them before rolling the deployment.")
+
+
+def _describe_intake(intake: dict) -> None:
+    if not intake.get("known"):
+        typer.echo("poller: UNKNOWN — the schedule could not be read (is the engine reachable?)")
+        return
+    if intake.get("on"):
+        every = intake.get("every_s")
+        nxt = intake.get("next_in_s")
+        cadence = f", every {int(every) // 60}m" if every else ""
+        when = f", next in {int(nxt)}s" if nxt is not None else ""
+        typer.echo(f"poller: ON{cadence}{when}")
+        return
+    note = intake.get("note") or ""
+    typer.echo("poller: PAUSED — no card in TO-DO will be picked up anywhere"
+               + (f'\n  note: "{note}"' if note else
+                  "\n  note: (none — nothing records why, so the next reader cannot tell this "
+                  "from an outage)"))
+
+
+def _refuse_without_the_client(what: str, *, code: int) -> None:
+    """Refuse, in one sentence, a command that IS the durable engine's on an install without its
+    client library (#178).
+
+    `poller pause`, `poller resume` and `worker` each began with an import of a module that
+    imports `temporalio` — above their `try`, where they had one — so on an install made without
+    the `runtime` extra all three ended in a raw `ModuleNotFoundError: No module named
+    'temporalio'` (measured 2026-09-19, every command of this CLI invoked with the library made
+    unimportable: those three, and nothing else). `up` already asks `host.the_client()` before it
+    plans a worker (#171); this is the same question, and `host.CLIENT_MISSING` is the one
+    sentence every surface gives for it.
+
+    BEFORE THE `try`, NOT INSIDE IT: `typer.Exit` is a `RuntimeError`, so raised inside the
+    callers' `except Exception` it would be reworded as "the engine may be unreachable" — which
+    sends the reader to look at a process when the remedy is an install."""
+    from beeverforge.runtime import host
+
+    if not host.the_client():
+        typer.echo(f"✗ {what}: {host.CLIENT_MISSING}", err=True)
+        raise typer.Exit(code)
+
+
+@poller_app.command("status")
+def poller_status() -> None:
+    """Is the factory taking work, and is anything still running?"""
+    # NOT "IS THE ENGINE REACHABLE?" ON AN INSTALL THAT CANNOT REACH ONE (#178). Without the
+    # engine's client library this answered `UNKNOWN — … (is the engine reachable?)` and exit 0:
+    # a question about a process, for a reader whose remedy is an install, while `beeverforge
+    # floor` on the same machine named the install. Same sentence, same exit code as its siblings.
+    _refuse_without_the_client("the poller's schedule cannot be read", code=2)
+    intake, jobs = _poller_reading()
+    _describe_intake(intake)
+    _say_flight(jobs)
+
+
+@poller_app.command("pause")
+def poller_pause(
+    note: str = typer.Option(None, help="Why, and for whom. Recorded on the schedule itself and "
+                                        "read back by the panel and `poller status`."),
+) -> None:
+    """Hold the queue: no card in TO-DO is picked up anywhere until `poller resume`."""
+    # A MAPPING ONTO THE `poller_pause` ROW (#741), so the panel and a front end of one's own pull
+    # the same lever: the row holds the schedule, reads what is still in flight, and refuses an
+    # install without the engine's client in the sentence every surface gives (#178). What stays
+    # here is the note this shell signs a pause with, and how the answer prints.
+    reason = note or f"paused by {_shell_user()} via `beeverforge poller pause`"
+    outcome = _perform("poller_pause", note=reason)
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.message}", err=True)
+        raise typer.Exit(2)
+    if not outcome.data["changed"]:
+        typer.echo(f'poller: already PAUSED — note: "{outcome.data["note"]}". Nothing was changed.')
+    else:
+        typer.echo("poller: PAUSED — no card in TO-DO will be picked up anywhere")
+        typer.echo(f'  note: "{reason}"')
+    _say_flight(outcome.data["in_flight"], after_pause=True)
+
+
+@poller_app.command("resume")
+def poller_resume(
+    note: str = typer.Option(None, help="Optional. Replaces the note the pause left behind."),
+) -> None:
+    """Take work again."""
+    reason = note or f"resumed by {_shell_user()} via `beeverforge poller resume`"
+    outcome = _perform("poller_resume", note=reason)  # the `poller_resume` row, as `pause` maps
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.message}", err=True)
+        raise typer.Exit(2)
+    if not outcome.data["changed"]:
+        typer.echo("poller: already ON. Nothing was changed.")
+        return
+    _describe_intake(outcome.data["intake"])
+
+
+knowledge_app = typer.Typer(help="Build and inspect the Knowledge Layer bundle (module map).")
+app.add_typer(knowledge_app, name="knowledge")
+
+
+def _git_head(repo: Path) -> str:
+    """The repo's HEAD commit, stamped into the bundle's source links. Best-effort: a
+    non-git checkout (or missing git) yields '' — the bundle still builds, just without a
+    commit to pin (checksums still detect drift)."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+@knowledge_app.command("check-concepts")
+def knowledge_check_concepts(
+    bundle: Path = typer.Argument(..., help="the bundle directory — the one holding concepts/, "  # noqa: B008
+                                            "as published into the context repository"),
+    repo: Path = typer.Argument(..., help="the checkout the bundle claims to describe"),  # noqa: B008
+) -> None:
+    """Re-verify a published bundle's CONCEPTS against a checkout; fail if any no longer hold.
+
+    THE CHECKER AS A SEPARATE PASS (ADR-0045 §2), beside `check` — which is the MODULE MAP's own
+    freshness and lives in the source repo, where `check-concepts` is the concepts' and they live
+    in the context repository. Every concept's sources are re-derived: the file is there or it is
+    not, and its bytes hash to the recorded fingerprint or they do not. Exit 1 on any stale or
+    missing concept, so a CI hook or a publish step can refuse on it; 0 otherwise — including for
+    a bundle written before fingerprints existed, which is REPORTED as unverifiable rather than
+    pretended fresh.
+    """
+    from beeverforge.knowledge.check import FRESH, check_concepts
+
+    report = check_concepts(bundle, repo)
+    for concept in report.concepts:
+        if concept.verdict == FRESH:
+            continue
+        typer.echo(f"  {concept.verdict:<12} {concept.type}/{concept.title}")
+        for src in concept.sources:
+            if src.verdict != FRESH:
+                typer.echo(f"      {src.verdict:<12} {src.path}  {src.detail}".rstrip())
+    typer.echo(report.summary())
+    if not report.holds:
+        raise typer.Exit(code=1)
+
+
+@knowledge_app.command("build")
+def knowledge_build(
+    name: str,
+    repo_flag: str = typer.Option(None, "--repo", help="owner/name — another of this product's "
+                                                       "repositories (each repo carries its own "
+                                                       "map)"),
+    publish: bool = typer.Option(False, "--publish",
+                                 help="For a project the factory cloned itself: also push the "
+                                      "map to the repository's knowledge branch, where the next "
+                                      "job reads it. Writes to YOUR repository, hence a flag"),
+) -> None:
+    """Generate the deterministic module map into the project's `knowledge/` bundle.
+
+    Parses the repo (structure + Python AST + JS/TS imports) with NO LLM calls, writes
+    `knowledge/modules.yaml` + `knowledge/manifest.yaml`, and reports the module count.
+
+    THE REPOSITORY RESOLVES LIKE EVERYWHERE ELSE (the third sighting of the same bug,
+    2026-08-13 — the refresh activity's comment records the first two). This did
+    `Path(project.repo_path)`, which for a project the factory cloned itself (registered by its
+    clone URL) is not a directory at all: the command walked a nonexistent path and reported a
+    map of nothing. Now: a local checkout is used as before; a factory-cloned project resolves
+    through the worker's own cache, and `--publish` pushes the result to the repository's
+    knowledge branch — which is where the next job actually reads it, since the cache clone is
+    disposable."""
+    from datetime import UTC, datetime
+
+    from beeverforge.factory import resolve_repo_path
+    from beeverforge.knowledge import build_bundle, write_bundle
+    from beeverforge.runtime.card_repo import _runner_view
+
+    project = _get_project(name)
+    view, cache_key = (project, name)
+    if repo_flag:
+        # the cache key comes from the view — box prove's rule, for the same bare-name reason
+        view, cache_key = _runner_view(project, f"{repo_flag}#0")
+    raw = str(view.repo_path)
+    cloned_by_us = "://" in raw or raw.startswith("git@")
+    repo = resolve_repo_path(view, cache_key=cache_key)
+    commit = _git_head(repo)
+    generated_at = datetime.now(UTC).isoformat()
+    bundle = build_bundle(repo, commit=commit, generated_at=generated_at)
+    dest = write_bundle(bundle, repo)
+    if dest is None:
+        # Sources unchanged → the bundle on disk already describes reality. Writing anyway would
+        # only churn the provenance stamps, and in the post-merge pipeline that churn is a commit
+        # that re-triggers the pipeline forever (docs/knowledge-layer.md §22).
+        typer.echo(
+            f"unchanged — {len(bundle.module_map.modules)} modules already current; nothing "
+            "written (nothing to commit)"
+        )
+        return
+    typer.echo(
+        f"wrote {dest}/modules.yaml + manifest.yaml — {len(bundle.module_map.modules)} modules, "
+        f"{len(bundle.manifest.checksums)} sources @ {commit[:8] or '(no commit)'}"
+    )
+    if cloned_by_us and not publish:
+        # The cache clone is DISPOSABLE — the next fetch replaces it, so a map written only
+        # there quietly evaporates. Saying so beats a command that reports success into a
+        # directory nobody will ever read.
+        typer.echo("  ⚠ this map lives in the factory's own clone, which the next fetch "
+                   "replaces — re-run with --publish to push it to the repository's knowledge "
+                   "branch, where jobs read it (it also refreshes itself after every merge)")
+    if publish:
+        if not cloned_by_us:
+            typer.echo("  · --publish is for a project the factory cloned itself; this one is "
+                       "a local checkout — commit knowledge/ like any other file")
+            return
+        docs_repo = (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+        if not docs_repo:
+            typer.echo(f"  · no context repository declared for {name} (`product.docs_repo` "
+                       f"is unset) — run `beeverforge onboard {name} --yes` or `beeverforge "
+                       f"product declare {name} <owner/repo>` first")
+            return
+        from beeverforge.adapters.forge.registry import clone_url_for, repo_of
+        from beeverforge.credentials import (
+            bot_identity,
+            deployment_forge_token,
+            forge_token_for,
+        )
+        from beeverforge.knowledge.pipeline import okf_subpath, publish_bundle
+
+        bot = bot_identity()
+        # the deployment's own credential last: App-only deployments hold no static token, and a
+        # tokenless push here failed with a remedy pointing at a credential that IS configured
+        token = forge_token_for(project) or deployment_forge_token(project)
+        context_url = clone_url_for(project, docs_repo, token=token)
+        subpath = okf_subpath(repo_of(view))
+        from beeverforge.knowledge.pipeline import discard_fetched_bundle, fetch_published_bundle
+
+        # The cache clone is reset on every sync, so the freshly built bundle ALWAYS looks new
+        # here — but only its provenance stamp may differ from what is already published, and a
+        # stamp-only commit in the context repository per re-run is churn, not knowledge.
+        # The MAP decides, not the stamp.
+        published = fetch_published_bundle(context_url, subpath=subpath)
+        if published is not None:
+            try:
+                same = ((published / "modules.yaml").read_bytes()
+                        == (dest / "modules.yaml").read_bytes())
+            except OSError:
+                same = False
+            finally:
+                discard_fetched_bundle(published)
+            if same:
+                typer.echo(f"  · already published — {docs_repo}'s .okf/repos/{subpath.name}/ "
+                           "carries this exact map")
+                return
+        if publish_bundle(dest, context_url, project=project, subpath=subpath,
+                          source_commit=commit,
+                          author=(bot.name, bot.email)):
+            typer.echo(f"  ✓ published to {docs_repo}'s .okf/repos/{subpath.name}/ — the next "
+                       "job reads it from there")
+        else:
+            typer.echo("  ✗ the map was built and NOT published — check the forge credential; "
+                       "the post-merge refresh will retry after the next merge")
+            raise typer.Exit(1)
+
+
+@knowledge_app.command("system")
+def knowledge_system(
+    sources: list[str] = typer.Argument(..., help="checkouts of the product's sources, each "  # noqa: B008
+                                                  "PATH or NAME=PATH"),
+    out: Path | None = typer.Option(None, "--out",  # noqa: B008
+                                    help="write system.yaml, api.yaml, schema.yaml, "
+                                         "adr-index.yaml and index.md into this directory"),
+) -> None:
+    """The system layer of a product, derived from local checkouts of its sources (ADR-0052 D17).
+
+    No model, no network, and nothing in the checkouts is run: every file is read as text. Prints
+    what was derived and — first — what was not; `--out` writes the five files the knowledge
+    refresh publishes at `.okf/system/` in the context repository. It is how the layer is measured
+    on a real product before anybody trusts it: the not-derived count IS the measurement."""
+    from beeverforge.knowledge.system import SourceTree, derive, write_system
+
+    trees, missing = [], {}
+    for raw in sources:
+        name, _, where = raw.partition("=") if "=" in raw else ("", "", raw)
+        path = Path(where).expanduser()
+        repo = name or path.resolve().name
+        if not path.is_dir():
+            missing[repo] = f"{where} is not a directory"
+            continue
+        # A CHECKOUT'S OWN COMMIT, OR NONE: a directory inside another repository would otherwise
+        # cite that repository's HEAD, which is not the commit its files were read at.
+        commit = _git_head(path) if (path / ".git").exists() else ""
+        trees.append(SourceTree(repo=repo, root=path, commit=commit))
+    system = derive(trees, missing=missing)
+    typer.echo(f"not derived: {len(system.not_derived)}")
+    for n in system.not_derived:
+        where = f"{n.repo}:{n.path}" if n.path else n.repo
+        typer.echo(f"  {n.kind:<18} {where} — {n.detail}")
+    typer.echo(f"sources: {len(system.sources)}  components: {len(system.components)}  "
+               f"links: {len(system.links)}  http: {len(system.http)}  "
+               f"grpc: {len(system.grpc)}  events: {len(system.events)}  "
+               f"databases: {len(system.databases)}  queues: {len(system.queues)}  "
+               f"adrs: {len(system.adrs)}")
+    for link in system.links:
+        typer.echo(f"  {link.from_} → {link.to} ({link.kind}, {link.via})")
+    if out is not None:
+        written = write_system(system, out)
+        typer.echo("wrote " + ", ".join(str(w) for w in written))
+
+
+@knowledge_app.command("inventory")
+def knowledge_inventory(
+    repo: Path = typer.Argument(..., help="a checkout to walk"),  # noqa: B008
+    out: Path | None = typer.Option(None, "--out",  # noqa: B008
+                                    help="write inventory.json and inventory.md into this dir"),
+) -> None:
+    """Every file of a repository, its kind and why — the denominator a bundle's coverage is
+    measured against (OKF §6.1). No model, no network. Exits 2 when the repository could not be
+    walked at all; a directory it could not open is REPORTED, not skipped."""
+    from beeverforge.knowledge.inventory import take_inventory, write_inventory
+    inventory = take_inventory(repo)
+    if not inventory.files and inventory.unreadable:
+        typer.echo(f"could not read {repo} — " + ", ".join(inventory.unreadable[:5]))
+        raise typer.Exit(2)
+    typer.echo(f"files: {len(inventory.files)}  kinds: {len(inventory.by_kind)}  "
+               f"unclassified: {len(inventory.unclassified)}  "
+               f"credential risks: {len(inventory.secret_risks)}"
+               + ("  TRUNCATED" if inventory.truncated else ""))
+    for kind, count in sorted(inventory.by_kind.items(), key=lambda kv: (-kv[1], kv[0])):
+        typer.echo(f"  {kind:<20} {count}")
+    if inventory.unreadable:
+        typer.echo("could not open: " + ", ".join(inventory.unreadable[:10]))
+    for path in inventory.unclassified[:20]:
+        typer.echo(f"  unclassified: {path}")
+    for risk in inventory.secret_risks[:20]:
+        typer.echo(f"  risk: {risk.path}:{risk.line} `{risk.key}` ({risk.severity})")
+    if out is not None:
+        written = write_inventory(out, inventory)
+        typer.echo("wrote " + ", ".join(str(w) for w in written))
+
+
+@knowledge_app.command("gate")
+def knowledge_gate(
+    bundle: Path = typer.Argument(..., help="the published bundle (.okf/repos/<owner>--<name>)"),  # noqa: B008
+    repo: Path = typer.Argument(..., help="the checkout the bundle describes"),  # noqa: B008
+    paths: list[str] | None = typer.Argument(None, help="the changed paths"),  # noqa: B008
+    changed: bool = typer.Option(False, "--changed",  # noqa: B008
+                                 help="take the change from `git status` in REPO — staged, "
+                                      "unstaged and untracked"),
+) -> None:
+    """For each file a change touches: is there recorded knowledge to change it? (ADR-0046)
+    Verdicts per file, the change's stance, and the question when it is dark. Exit 0 green,
+    1 amber, 2 dark. No model, no network — the published bundle and a checkout."""
+    from beeverforge.knowledge.gate import (
+        AMBER,
+        DARK,
+        GitCannotSay,
+        changed_paths,
+        judge,
+        render_gate_lines,
+    )
+    files = list(paths or [])
+    if changed:
+        # A GATE THAT COULD NOT SEE THE CHANGE IS NOT A GREEN GATE (#250). This read `[]` out of
+        # an unreadable repository and returned 0 — the number a CI job branches on — printing
+        # "nothing changed". `changed_paths` names its own reason now, and it is said rather than
+        # rounded down: exit 2, the same as a dark change, because both mean nobody vouched.
+        try:
+            files += changed_paths(repo)
+        except GitCannotSay as exc:
+            typer.echo(f"✗ {exc}")
+            raise typer.Exit(2) from exc
+    if not files:
+        typer.echo("nothing changed — nothing to judge")
+        return
+    report = judge(bundle if bundle.is_dir() else None, repo, files)
+    for line in render_gate_lines(report.files, stance=report.stance(), mode="cli",
+                                  bundle_note=report.summary(), question=report.question()):
+        typer.echo(line)
+    raise typer.Exit({AMBER: 1, DARK: 2}.get(report.stance(), 0))
+
+
+@knowledge_app.command("check")
+def knowledge_check(name: str) -> None:
+    """Report whether a project's bundle is fresh and consistent (§12): staleness vs the
+    working tree + any orphan `source:` links. Exits non-zero if the bundle is missing,
+    stale, or has orphans — so CI/regeneration can gate on it."""
+    from beeverforge.factory import resolve_repo_path
+    from beeverforge.knowledge import is_stale, orphan_links, read_bundle
+
+    project = _get_project(name)
+    # the same resolution `build` uses — a factory-cloned project's repo_path is a URL,
+    # and Path(url) is a directory precisely nowhere
+    repo = resolve_repo_path(project)
+    bundle = read_bundle(repo)
+    if bundle is None:
+        typer.echo("no bundle — run `beeverforge knowledge build` first")
+        raise typer.Exit(1)
+    stale = is_stale(bundle, repo)
+    orphans = orphan_links(bundle, repo)
+    commit = bundle.manifest.source_commit[:8] or "(none)"
+    typer.echo(f"modules: {len(bundle.module_map.modules)}  commit: {commit}")
+    typer.echo(f"stale: {stale}")
+    if orphans:
+        typer.echo(f"orphan links ({len(orphans)}): " + ", ".join(orphans[:10]))
+    if stale or orphans:
+        typer.echo("NOT fresh — regenerate with `beeverforge knowledge build`")
+        raise typer.Exit(1)
+    typer.echo("OK — bundle is fresh and consistent")
+
+
+@app.command("conformance")
+def conformance(name: str) -> None:
+    """Check whether a project is runnable (required slots filled)."""
+    project = _get_project(name)
+    manifest = load_manifest(project)
+    report = check(manifest, Path(project.repo_path).expanduser())
+    for issue in report.issues:
+        typer.echo(f"[{issue.level}] {issue.message}")
+    if report.ok:
+        typer.echo(f"OK — {name!r} is runnable")
+    else:
+        typer.echo("NOT runnable — fix the errors above")
+        raise typer.Exit(1)
+
+
+def _handover_lines(name: str, *, proposed: bool) -> list[str]:
+    """THE HANDOVER, said as an instruction rather than as a closing pleasantry — when there is
+    one. Everything the onboarding writes is a PROPOSAL; the factory does not merge its own
+    declaration of what it will run against somebody's repository, so that step is deliberately
+    the operator's and has to read like one (pilot, 2026-08-14: he merged only because I said so
+    in chat, which is assistance a normal installation does not have).
+
+    AND WHEN NOTHING WAS PROPOSED, IT SAYS SO. A repository that already declared its manifest
+    opens no pull request, and a context repository born empty takes its first commit on the base;
+    "review and merge the pull request(s) above" under that run (the first live onboarding,
+    2026-09-06) sent the operator looking for a step that did not exist, and read the questions
+    printed above it as the thing to do before the factory could work. Nothing waits on them."""
+    if not proposed:
+        return ["",
+                "── nothing to merge: every repository already declares its manifest, and the "
+                "context landed on its base branch. The questions above are an offer — nothing "
+                "waits on them.",
+                f"   `beeverforge doctor {name}` says when a ticket can run."]
+    return ["",
+            "── YOUR STEP: review and merge the pull request(s) above",
+            "   Nothing here is in effect until you do: the manifest declares what this "
+            "platform will run against your code, so a person reads it before it is true.",
+            f"   Then run `beeverforge doctor {name}` — until the merge it reports the "
+            f"manifest as PROPOSED and names that pull request; after it, it is what says "
+            f"when a ticket can run."]
+
+
+def _onboard_preview(project, repo: str, outcome) -> None:
+    """`onboard --with-preview`: the preview's own pull request, through the same function
+    `beeverforge preview propose` uses (#265 slice 4). The block goes into the manifest ON THE
+    BASE BRANCH, so a repository whose manifest this run only proposed gets it once that merges —
+    said, rather than a second pull request that fights the first over one file."""
+    from beeverforge.onboarding.preview_propose import propose_preview
+
+    if not outcome.manifest_already_there:
+        typer.echo(f"  · preview: proposed once the manifest merges — then `beeverforge preview "
+                   f"propose {project.name} --source {repo} --yes`")
+        return
+    said = propose_preview(project, repo=repo)
+    if not said.ok:
+        typer.echo(f"  ✗ preview: {said.detail}")
+    elif said.nothing:
+        typer.echo(f"  · preview: {said.detail}")
+    else:
+        typer.echo(f"  ✓ preview: {said.url or said.detail}"
+                   + (" (already open)" if said.existed else ""))
+
+
+def _a_context_repository_for(name: str, project, *, stage) -> tuple[object, bool, str]:
+    """`(project, created, "")` once the project names its context repository — re-read from the
+    registry when this made one — or `(project, False, why)` when it could not be made.
+
+    CREATING ONE CHANGES THE INSTALLATION, SO IT IS A ROW'S (#741). `onboard` created the
+    repository and recorded it in the registry from the command line's own code, through the
+    onboarding module: the one verb still writing the installation outside a row once `product
+    init` became `product_init`. That row creates the repository in the client's organisation and
+    records it, as `product init --create-context` does. Without `write` it proposes nothing: the
+    declaration this verb proposes travels with the backfill, in one review. Its declaration step
+    reads the repository just made to show a plan nobody prints here — one clone of an empty
+    repository, the price of not keeping a second way to make one."""
+    from beeverforge.actions import STEP_DONE, STEP_FAILED
+
+    if (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip():
+        return project, False, ""
+    stage("start", "context: no repository declared — creating one")
+    outcome = _perform("product_init", project=name, create_context=True)
+    context = next((step for step in outcome.data.get("steps") or []
+                    if step["step"] == "context"), None)
+    if context is None or context["state"] == STEP_FAILED:
+        return project, False, context["said"] if context else outcome.message
+    return _get_project(name), context["state"] == STEP_DONE, ""
+
+
+@app.command("onboard")
+@speaks_plainly("onboard that repository")
+def onboard_cmd(
+    name: str,
+    source: list[str] = typer.Option(None, "--source",  # noqa: B008 — typer's own idiom
+                                     help="Another repository of this product, owner/name "
+                                          "(repeatable). The registry's own repo is always "
+                                          "included"),
+    sandbox: str = typer.Option("container", help="Which box proves each repository"),
+    skip_context: bool = typer.Option(False, "--skip-context",
+                                      help="Only the source repositories — leave the context "
+                                           "repository and the backfill for later (§9)"),
+    with_preview: bool = typer.Option(False, "--with-preview",
+                                      help="Also propose how each repository is previewed — its "
+                                           "own pull request, after the manifest's"),
+    yes: bool = typer.Option(False, "--yes",
+                             help="Required: this opens pull requests on YOUR repositories"),
+) -> None:
+    """First-time setup, done where the factory lives — one command, every repository.
+
+    Per repository of the product: clone, READ the manifest out of the code, PROVE it in the
+    real box (your own setup:/validate:, streamed live), generate the module map, and open ONE
+    pull request carrying all of it — the proof verdict and the questions only your team can
+    answer are in the PR body. A repository that already declares its manifest is proven as-is
+    and only what is missing is proposed.
+
+    A product that spans repositories (front + back) names them with --source; each gets its
+    own manifest, its own proof and its own pull request, which is exactly how the runtime
+    treats them (a card runs against ITS repository's box)."""
+    from beeverforge.onboarding.onboard import onboard_source_repo
+
+    project = _get_project(name)
+    # THE FORGE AXIS NAMES THE CODE, with the tracker as fallback — the same precedence
+    # _ref_repo uses everywhere. Never BOTH: an ADO tracker.repo is the ADO *project* (work
+    # items), and a GitHub deployment may track issues in a separate repository — sweeping the
+    # tracker axis in onboarded a repository that holds no code. And no `"/" in r` filter: an
+    # ADO registry row carries the BARE repository name, and the filter made the recommended
+    # path silently dead on Azure DevOps (adversarial review, 2026-08-13).
+    default_repo = (project.forge.repo if project.forge else None) or project.tracker.repo or ""
+    repos = sorted({r for r in [default_repo, *(source or [])] if r})
+    if not repos:
+        typer.echo(f"✗ {name} names no repository in its registry entry and no --source was "
+                   f"given — there is nothing to onboard")
+        raise typer.Exit(2)
+    if not yes:
+        typer.echo(f"This will open a pull request on: {', '.join(repos)} — re-run with --yes.")
+        raise typer.Exit(2)
+
+    def _stage(kind: str, text: str) -> None:
+        if kind == "start":
+            typer.echo(f"  … {text}", err=True)
+        elif kind == "line":
+            typer.echo(f"      {text.rstrip()}", err=True)
+
+    outcomes = []
+    for repo in repos:
+        typer.echo(f"\n── {repo}")
+        outcome = onboard_source_repo(project, repo, sandbox=sandbox, stream=_stage)
+        outcomes.append(outcome)
+        mark = "✓" if outcome.ok else "✗"
+        typer.echo(f"{mark} {outcome.detail or outcome.pr or outcome.proof}")
+        if with_preview:
+            _onboard_preview(project, repo, outcome)
+
+    context_outcome = None
+    if not skip_context:
+        from beeverforge.onboarding.onboard import ContextOutcome, onboard_product_context
+
+        typer.echo("\n── the context repository")
+        project, created, not_made = _a_context_repository_for(name, project, stage=_stage)
+        if not_made:
+            context_outcome = ContextOutcome(detail=not_made)
+        else:
+            context_outcome = onboard_product_context(project, sources=repos, stream=_stage)
+            context_outcome.created = created
+        mark = "✓" if context_outcome.ok else "✗"
+        made = " (created)" if context_outcome.created else ""
+        typer.echo(f"{mark} {context_outcome.docs_repo or 'context'}{made} — "
+                   f"{context_outcome.detail}")
+        if context_outcome.backfill:
+            typer.echo(f"  backfill: {context_outcome.backfill}")
+        elif context_outcome.ok:
+            typer.echo("  backfill: not reached")
+        for t in context_outcome.todo:
+            typer.echo(f"  · still yours: {t}")
+
+    typer.echo("\n── the product, repository by repository")
+    failed = False
+    for o in outcomes:
+        if o.ok and o.pr:
+            line = f"  ✓ {o.repo:<30} proof: {o.proof:<8} → {o.pr}"
+        elif o.ok:
+            # THE DETAIL, not a summary of it: ok-without-a-URL covers both "nothing new to
+            # propose" and "pushed but the review request did not open — open it by hand",
+            # and collapsing the second into the first told the operator a repository was
+            # done when a step of it still needs a hand (adversarial review, 2026-08-13)
+            line = f"  · {o.repo:<30} proof: {o.proof:<8} {o.detail}"
+        else:
+            line = f"  ✗ {o.repo:<30} {o.detail}"
+            failed = True
+        typer.echo(line)
+        for q in o.questions[:4]:
+            typer.echo(f"        ? {q}")
+    if context_outcome is not None:
+        if context_outcome.ok and context_outcome.pr:
+            typer.echo(f"  ✓ {context_outcome.docs_repo:<30} context → {context_outcome.pr}")
+        elif context_outcome.ok:
+            typer.echo(f"  · {context_outcome.docs_repo:<30} {context_outcome.detail}")
+        else:
+            typer.echo(f"  ✗ {context_outcome.docs_repo or 'context':<30} "
+                       f"{context_outcome.detail}")
+            failed = True
+    proposed = any(o.ok and o.pr for o in outcomes) or bool(
+        context_outcome is not None and context_outcome.ok and context_outcome.pr)
+    for line in _handover_lines(name, proposed=proposed):
+        typer.echo(line)
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command("floor")
+def floor_cmd(
+    project: str = typer.Argument("", help="one project, or nothing for the whole deployment"),
+    as_json: bool = typer.Option(False, "--json", help="the raw struct, for a script"),
+) -> None:
+    """Is the factory working? — the same answer the panel shows, on a terminal.
+
+    THE SECOND TRANSPORT, and that is the point rather than a convenience. The house rule is that
+    every capability is reachable from at least two front ends and implemented by none of them
+    (`beeverforge/actions/__init__.py`); a verdict that only a web page can obtain is a verdict
+    that lives in the web page. This command and `GET /api/floor` are two mappings onto one
+    module — if they ever disagree, one of them derived something, which is the defect the whole
+    ladder exists to prevent.
+    """
+    import asyncio
+    import json as _json
+
+    from beeverforge import floor
+
+    got = floor.state(asyncio.run(floor.gather(want=floor.EVERYTHING)), project)
+    if as_json:
+        typer.echo(_json.dumps(got.as_dict(), indent=2))
+        return
+    typer.echo(got.line)
+    for line in (got.meta, got.detail):
+        if line:
+            typer.echo(f"  {line}")
+    if got.cmd:
+        typer.echo(f"  → {got.cmd}")
+    for row in got.also:
+        typer.echo(f"  Also — {row['clause']}")
+    if got.also_more:
+        typer.echo(f"  +{got.also_more} more")
+    if got.census_line:
+        typer.echo(f"  {got.census_line}")
+
+
+@app.command("autonomy")
+def autonomy_cmd(
+    project: str = typer.Argument(..., help="A registered project"),
+    days: int | None = typer.Option(
+        None, "--days", min=1, help="only the cards merged, and the parks, of the last N days"),
+    as_json: bool = typer.Option(False, "--json",
+                                 help="the `autonomy` block `/api/metrics` carries, for a script"),
+) -> None:
+    """How many cards reached their merge with no repair pass and nobody stepping in — read from
+    the card's record. Measurement starts with cards promoted from 0.5.0 on: older cards are named
+    as before the record and never enter a rate, so do not quote a yield over them.
+
+    Writes nothing and spends nothing. Beside the yield: the code-writing passes per card, how
+    many repair passes each card took, and why cards parked, classified from the recorded note.
+
+    THE SECOND TRANSPORT, like `floor`: this and the cost dashboard's `autonomy` block are one
+    function's answer over the same rows (`observability/autonomy.py`), so `--json` is that block.
+    A STORE THAT WILL NOT ANSWER EXITS 2 with what failed and what to check — never read as a
+    record with nothing in it, which would say "no card measured" about cards nobody looked at."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from beeverforge.api.metrics_view import scan_all_or_raise
+    from beeverforge.observability.autonomy import autonomy, unread
+    from beeverforge.observability.query import StoreUnreadable
+
+    try:
+        language = getattr(ProjectRegistry().get(project), "language", None)
+    except KeyError:
+        typer.echo(f"✗ no project named {project!r} — `beeverforge project list` shows what this "
+                   f"deployment drives (and remember the worker has its own registry)", err=True)
+        raise typer.Exit(2) from None
+    try:
+        records = scan_all_or_raise(must_answer=True)
+    except StoreUnreadable as exc:
+        typer.echo(f"✗ {unread(project, exc, language=language)['said']['headline']}", err=True)
+        raise typer.Exit(2) from None
+    except Exception as exc:  # noqa: BLE001 — a store added from outside raises its own errors
+        # EVERY STORE, NOT ONLY THIS CORE'S (review of #545): the SQLite sink raises
+        # `StoreUnreadable`, and a sink an add-on brings raised its vendor's error past this line
+        # as a traceback, where the help promises exit 2 with what failed
+        typer.echo(f"✗ {unread(project, exc, language=language)['said']['headline']}", err=True)
+        raise typer.Exit(2) from None
+    since = datetime.now(UTC) - timedelta(days=days) if days else None
+    block = autonomy(records, project, since=since, language=language)
+    if as_json:
+        typer.echo(_json.dumps(block, indent=2, ensure_ascii=False))
+        return
+    said = block["said"]
+    typer.echo(said["title"])
+    for line in (said["headline"], said["rework"], said["before_the_record"], said["scope"]):
+        if line:
+            typer.echo(f"  {line}")
+    if block["measured"]:
+        labels = said["labels"]
+        depth = "   ".join(f"{d}: {n}" for d, n in block["repair_depth"].items())
+        typer.echo(f"  {labels['depth']} — {depth}")
+    typer.echo(f"  {said['parks']}")
+    for cause, n in block["park_reasons"].items():
+        typer.echo(f"    {said['causes'].get(cause, cause):<44} {n}")
+
+
+@app.command("preflight")
+def preflight_cmd(
+    as_json: bool = typer.Option(
+        False, "--json",
+        help="Emit the state document the agent lane reads, instead of the human report."),
+) -> None:
+    """Say what about THIS machine will stop the stack, before anything starts.
+
+    `doctor` asks whether a PROJECT can run a ticket — credentials, board, manifest, floor — and
+    needs a running deployment to ask it in. This asks the question that comes before that one,
+    and it is the only interesting question during an install: the user has typed one command,
+    nothing is up yet, and what they need is every remaining obstacle at once, each with its
+    remedy.
+
+    NO PROJECT ARGUMENT, and that is the whole difference. Every finding here is about the host.
+    """
+    from beeverforge import preflight
+
+    report = preflight.check(preflight.probes_for_this_machine())
+
+    if as_json:
+        typer.echo(preflight.as_json(report))
+    else:
+        for f in report.findings:
+            # THREE STATES, THREE MARKS. `----` is not a pass and not a failure: it is "no answer
+            # exists on this machine", and collapsing it into either is how a diagnostic reports a
+            # permissions failure as a clean bill of health (`readiness.Finding.answered`, and
+            # `doctor.BoardUnreadable` at length before it).
+            mark = "  ok  " if f.ok and f.answered else (" ---- " if not f.answered else " FAIL ")
+            typer.echo(f"{mark} {f.check:<17} {f.message}")
+            if not f.ok and f.remedy:
+                typer.echo(f"        {'':<17} → {f.remedy}")
+        typer.echo(f"\n{report.verdict}")
+
+    # NON-ZERO WHEN ANYTHING IS MISSING, because `install.sh` reads the exit code to decide whether
+    # to go on — and an UNANSWERED check must not make it non-zero, or a machine whose daemon is
+    # simply not up yet would look like a machine with a broken install. `Report.ok` counts only
+    # answered failures, which is the same rule `readiness.Report.missing` holds.
+    if not report.ok:
+        raise typer.Exit(1)
+
+
+@app.command("explain")
+def explain_cmd(
+    checkout: str = typer.Argument(..., help="A path to a checkout — the repository whose "
+                                             ".beeverforge/project.yaml is read"),
+    language: str = typer.Option("en", "--language", help="en or pt-BR"),
+    full: bool = typer.Option(False, "--full", help="Print each block's text under its line, "
+                                                    "as the prompt carries it"),
+) -> None:
+    """Why an agent is given the instructions it is given: every block a planner or executor pass
+    of this project carries, in order, where it comes from and what the project's profile did to
+    it.
+
+    THE JOB'S OWN CODE ANSWERS. The rows are the trace `build_context` writes while it
+    assembles a context for a blank card, so this cannot disagree with what a job inlines. It
+    reads a checkout and writes nothing: no harness, forge or network is called, and no card or
+    registry is touched."""
+    from beeverforge.orchestrator import explain as ex
+
+    try:
+        typer.echo(ex.explain(checkout, language=language, full=full), nl=False)
+    except ex.Refused as refused:
+        typer.echo(str(refused), err=True)
+        raise typer.Exit(1) from None
+
+
+@app.command("doctor")
+def doctor_cmd(
+    name: str,
+    as_json: bool = typer.Option(
+        False, "--json",
+        help="Emit the versioned report document (beeverforge.doctor/1) instead of the human "
+             "report."),
+) -> None:
+    """Check every prerequisite and say which one is missing.
+
+    `conformance` asks whether the MANIFEST is complete. This asks whether the machine, the
+    credentials and the board can actually run a ticket — the things whose absence otherwise looks
+    identical to a factory that is simply quiet."""
+    import logging
+
+    from beeverforge import doctor as doc
+
+    # THE FIRST HOUR'S SENTENCE, asked before the row: `doctor` before `project add` is the order
+    # a reader takes from the docs, and this names the command that fixes it (`_get_project`).
+    _get_project(name)
+    # EVERY PROBE FAILURE IS REPORTED BELOW, AS A LINE WITH A REMEDY — so the adapters' own
+    # warnings, printed to stderr by the root logger, arrive as a second copy in OUR internal
+    # vocabulary, above the table, before the reader knows there is a table. The pilot saw
+    # "the caller must treat this as UNREADABLE, never as a board without columns" as the FIRST
+    # thing doctor said (2026-08-14). Quieted for this command only; ERROR still speaks.
+    quieted = logging.getLogger("beeverforge")
+    was = quieted.level
+    quieted.setLevel(logging.ERROR)
+    try:
+        # THE `doctor` ROW (#741), so a front end of one's own reads the same document this
+        # prints: the row diagnoses and composes `beeverforge.doctor/1`, and what stays here is
+        # how a terminal shows it.
+        outcome = _perform("doctor", project=name)
+    finally:
+        quieted.setLevel(was)
+    if not outcome.ok:
+        from beeverforge.actions.base import NOT_FOUND
+
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(2 if outcome.code == NOT_FOUND else 1)
+    document = dict(outcome.data)
+
+    # WHICH CODE ANSWERED. First line, before any finding, because it is the first thing to
+    # doubt when a fix that was pulled does not appear: the worker runs a BAKED package, so a
+    # restart without `--build` re-runs the previous one and every line below is that build's
+    # opinion (measured on the pilot, three identical outputs across two fixes, 2026-08-14).
+    stamp = document.get("build") or {}
+    code, built = stamp.get("code", ""), stamp.get("built", "")
+    if as_json:
+        # THE DOCUMENT AND NOTHING ELSE ON STDOUT (#356): a reader parses the whole stream, and one
+        # line of prose above it — the build banner, the notifier line — is a document that does
+        # not parse. The build stamp travels INSIDE it instead. Same exit code as the report.
+        typer.echo(doc.as_json(document))
+        if not document["ok"]:
+            raise typer.Exit(1)
+        return
+    if code:
+        typer.echo(f"· this worker runs build {code}, from {built} — `docker compose "
+                   f"--env-file .env.compose up -d --build` is what replaces it after a pull")
+        # AND WHETHER THE OTHER HALVES AGREE (#135). This command runs INSIDE the worker, so
+        # everything above is the worker's opinion of itself — which is exactly what was true on
+        # 2026-08-17, when the worker was two minutes old, the panel was twenty-eight hours old,
+        # and the operator read a doctor report that was entirely accurate about the half he was
+        # not looking at.
+        from beeverforge.runtime.temporal.vocabulary import WORKER_ROLE
+
+        for role, (stamp, when) in sorted(namespace.build_disagreement(WORKER_ROLE).items()):
+            typer.echo(f"· WARNING the {role} runs a DIFFERENT build: {stamp}, from {when}. "
+                       f"Rebuild both — `up -d --build` with no service name after it.")
+        typer.echo("")
+    # WHERE PROJECT-LESS SPEECH GOES, as one line — because its absence was silent (2026-08-26:
+    # a fallback row's two variables set, no declaration, `NullNotifier` built and nothing in
+    # any log). Derived from the notifier registry; the doctor names no vendor.
+    typer.echo(f"· {doc.notifier_fallback_line()}")
+    # WHETHER THE WORKER WILL ACT ON AN APPROVAL MADE HERE (`gate_seal`). Two halves with
+    # different gate keys drop every answer while each looks healthy on its own.
+    typer.echo(f"· {doc.gate_key_line()}")
+    typer.echo("")
+    for line in document["checks"]:
+        # A CHECK OF THE DOCUMENT, under the document's names (`doctor.as_document`): `id`,
+        # `result`, `detail`, `remedy`, `note`. Rendered from the document rather than from the
+        # report it was made of, so this screen and `--json` are one reading and cannot disagree.
+        passed = line["result"] == "ok"
+        typer.echo(f"{'  ok  ' if passed else ' FAIL '} {line['id']:<14} {line['detail']}")
+        if not passed and line["remedy"]:
+            typer.echo(f"        {'':<14} → {line['remedy']}")
+    if document["ok"]:
+        typer.echo(f"\nOK — {name!r} can run a ticket")
+        # A PASS IS NOT ALWAYS THE END OF THE SENTENCE. "OK — can run a ticket" is true about the
+        # CODE and silent about everything a healthy-but-off half means; the operator caught it
+        # on exactly the screen that says so (2026-08-14): a project with no context repository
+        # runs tickets and has no client-facing half at all, and the verdict said neither.
+        for line in document["checks"]:
+            if line["result"] == "ok" and line["note"]:
+                typer.echo(f"  · {line['note']}")
+        return
+    # "NOT READY" AND "SOMETHING IS BROKEN" ARE DIFFERENT SENTENCES — and which one this is lives
+    # in `doctor.verdict` (#356), the one rule the closing line and `--json` both read, with the
+    # history of why it is derived from the findings rather than from a list of names. It reaches
+    # this screen as the document's `verdict` and `next_step`, which is that rule's answer.
+    if document["verdict"] == "expected":
+        typer.echo("\nNOT ready — and at this point in the sequence that is EXPECTED: "
+                   "everything the previous steps can settle is green, and the rest is what the "
+                   "steps ahead answer.\n"
+                   f"Next: {document['next_step']}. Then run this again; it is the same command "
+                   "that says when you are ready.")
+    else:
+        typer.echo("\nNOT ready — fix the FAIL lines above")
+    raise typer.Exit(1)
+
+
+certify_app = typer.Typer(help="Evidence packs for the implementation partner program.")
+app.add_typer(certify_app, name="certify")
+
+
+# The partner program's evidence pack, issue 356 — kept out of the `--help` screen a stranger
+# reads, like every other card reference.
+@certify_app.command("deployment")
+def certify_deployment_cmd(
+    partner: str = typer.Option(None, "--partner",
+                                help="The partner slug this pack is submitted under."),
+    profile: str = typer.Option(None, "--profile",
+                                help="The profile the pack claims: light, standard or enterprise."),
+    practitioner: str = typer.Option(
+        None, "--practitioner",
+        help="The partner's engineer responsible for this deployment — the one personal name the "
+             "pack keeps."),
+    window_days: int = typer.Option(90, "--window-days",
+                                    help="The window the outcome aggregates cover, in days."),
+    consent: str = typer.Option(None, "--consent",
+                                help='The customer\'s recorded consent: "<name>, <role>, <date>". '
+                                     "The name is replaced by a pseudonym like every other."),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="Print every file the pack would contain; write nothing."),
+    yes: bool = typer.Option(False, "--yes",
+                             help="Write the pack. Without it this prints the summary, writes "
+                                  "nothing, and exits 2."),
+    out: str = typer.Option(None, "--out",
+                            help="Where to write it (default: "
+                                 "beeverforge-evidence-<pack id>-<date>.tgz here)."),
+) -> None:
+    """Gather an anonymised evidence pack from THIS deployment for partner certification.
+
+    Reads what the platform already knows about itself — environment, secrets file, registry,
+    manifests, box proofs, doctor, preflight — and never a ticket, a pull request, a commit or a
+    file inside a repository beyond its manifest. Every organisation, repository, project and
+    person is replaced by a pseudonym; URLs, hosts, e-mail addresses and credentials are dropped.
+
+    The outcomes over the window are read from the job journals and the metrics store; one that
+    cannot be read is null, with the reason. The forge is asked, read-only, what protects each
+    repository's base branch, what the credential a job holds is granted, and which releases of
+    the platform are published; what it cannot answer reads `unknown`, never `pass`. This build
+    does not sign the pack, and the pack says so."""
+    from beeverforge.certify import pack as certify
+    from beeverforge.cli_refusals import certify_deployment_refusal
+
+    refused = certify_deployment_refusal(partner=partner, profile=profile,
+                                         practitioner=practitioner, window_days=window_days,
+                                         consent=consent)
+    if refused:
+        typer.echo(refused, err=True)
+        raise typer.Exit(2)
+    try:
+        reading = certify.gather()
+        built = certify.assemble(reading, profile=profile, partner=partner,
+                                 practitioner=practitioner.strip(), window_days=window_days,
+                                 consent=consent or "")
+    except certify.Unsafe as exc:
+        # OUR DEFECT, NEVER THE DEPLOYMENT'S, and said as such: the pack was assembled and the
+        # check that runs before anything is written found something it must not carry.
+        typer.echo(f"✗ no pack was written: {exc}. This is a defect in `beeverforge certify`, "
+                   f"not in this deployment — please report it with this line.", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as exc:
+        # THE REGISTRY OR THE FLOOR COULD NOT BE READ — the two things every pack is built from.
+        typer.echo(f"✗ no pack was written: {exc}", err=True)
+        raise typer.Exit(1) from None
+
+    target = Path(out) if out else Path(built.default_name)
+    if dry_run:
+        for path, text in built.files.items():
+            typer.echo(f"── {path} ──")
+            typer.echo(text.rstrip("\n"))
+            typer.echo("")
+        typer.echo(f"— --dry-run: nothing was written. With --yes this writes {target}.")
+        return
+    if not yes:
+        typer.echo(built.files["summary.md"].rstrip("\n"))
+        typer.echo(f"\nNothing was written. Re-run with --yes to write {target}, or with "
+                   f"--dry-run to read every file the pack would contain first.")
+        raise typer.Exit(2)
+    if target.exists():
+        typer.echo(f"✗ {target} already exists — nothing was replaced. Pass another --out, or "
+                   f"move that file first.", err=True)
+        raise typer.Exit(1)
+    certify.write(built, target)
+    required = [c for c in built.controls if c.required]
+    tally = ", ".join(f"{sum(1 for c in required if c.result == r)} {r}"
+                      for r in ("pass", "fail", "unknown", "info", "n/a")
+                      if any(c.result == r for c in required))
+    typer.echo(f"✓ wrote {target} — {len(built.files)} files; {len(required)} required "
+               f"control(s): {tally}. Unsigned: signing is not built yet.")
+
+
+@certify_app.command("verify")
+def certify_verify_cmd(
+    pack_file: str = typer.Argument(..., metavar="PACK.tgz",
+                                    help="The evidence pack `certify deployment` wrote."),
+    profile: str = typer.Option(None, "--profile",
+                                help="The profile to verify against (default: the one the pack "
+                                     "claims)."),
+    thresholds: str = typer.Option(None, "--thresholds",
+                                   help="A thresholds file that replaces the core's own "
+                                        "(beeverforge/certify/thresholds.yaml) whole."),
+    allow_unsigned: bool = typer.Option(
+        False, "--allow-unsigned",
+        help="Do not count an unsigned pack as a finding — for a rehearsal. The submissions bot "
+             "never passes this."),
+) -> None:
+    """Check an evidence pack offline: its schema, its checksums, its signature and every
+    threshold, each reported by id.
+
+    Exits 0 when everything holds, 1 with one finding per failure, and 2 when the pack (or the
+    thresholds file) cannot be read. The submissions bot runs exactly this, so its answer can be
+    read before submitting. Signing is not built yet: every pack is unsigned, and that is a
+    finding unless --allow-unsigned is given."""
+    from beeverforge.certify import verify as v
+    from beeverforge.cli_refusals import certify_verify_refusal
+
+    refused = certify_verify_refusal(profile=profile)
+    if refused:
+        typer.echo(refused, err=True)
+        raise typer.Exit(2)
+    try:
+        held_to = v.load_thresholds(Path(thresholds) if thresholds else None)
+    except v.ThresholdsError as exc:
+        typer.echo(f"✗ --thresholds cannot be used: {exc}. No pack was judged.", err=True)
+        raise typer.Exit(2) from None
+    try:
+        bundle = v.read(Path(pack_file))
+    except v.Unreadable as exc:
+        typer.echo(f"✗ the pack cannot be read: {exc}. Nothing was verified.", err=True)
+        raise typer.Exit(2) from None
+
+    document = bundle.document
+    claimed = str(document.get("profile") or "?")
+    judged = profile or claimed
+    typer.echo(f"{bundle.name}: {document.get('schema', '?')}, partner "
+               f"{document.get('partner', '?')}, profile {claimed}"
+               + (f" (verified as {judged})" if judged != claimed else "")
+               + f", generated {document.get('generated_at', '?')}")
+    results = v.verify(bundle, thresholds=held_to, profile=judged,
+                       allow_unsigned=allow_unsigned)
+    width = max(len(r.id) for r in results)
+    for r in results:
+        mark = "–" if r.skipped else ("✓" if r.ok else "✗")
+        typer.echo(f"{mark} {r.id.ljust(width)}  {r.message}")
+    found = v.findings(results)
+    if found:
+        typer.echo(f"\n✗ {len(found)} finding(s): this pack does not meet the thresholds.")
+        raise typer.Exit(1)
+    typer.echo("\n✓ the pack meets every threshold"
+               + (" — its signature was not checked (--allow-unsigned)." if allow_unsigned
+                  else "."))
+
+
+preview_app = typer.Typer(help="A preview of the product, before a pull request merges.")
+app.add_typer(preview_app, name="preview")
+
+
+@preview_app.command("prove")
+def preview_prove(name: str = typer.Argument(..., help="the registered project")) -> None:
+    """Bring the project's BASE product up once on this deployment's preview runtime, wait until
+    it is ready, and take it down again.
+
+    The same reader, admission and runtime a card's preview goes through, on the base branch
+    alone: nothing a change wrote is built. REFUSED where the deployment names no preview runtime
+    (`BEEVERFORGE_PREVIEW_RUNTIME`) or the runtime lacks something — a proof on a runtime that
+    cannot run one would be a proof of nothing. Run it where the runtime is: inside the worker on
+    the compose stack (`docker compose exec worker beeverforge preview prove <name>`)."""
+    import time as _time
+
+    from beeverforge.adapters.preview.compose import prove_project
+    from beeverforge.adapters.preview.registry import build_runtime
+    from beeverforge.runtime.temporal.io import default_preview_runtime
+
+    project = _get_project(name)
+    kind = default_preview_runtime()
+    try:
+        runtime = build_runtime(kind)
+    except (TypeError, ValueError) as exc:
+        typer.echo(f"✗ no proof: {exc}")
+        raise typer.Exit(2) from None
+    missing = runtime.prerequisites()
+    if missing:
+        typer.echo(f"✗ no proof: the `{kind}` preview runtime cannot run one on this deployment —")
+        for line in missing:
+            typer.echo(f"  · {line}")
+        raise typer.Exit(2)
+    started = _time.monotonic()
+    result = prove_project(project, runtime)
+    took = int(_time.monotonic() - started)
+    if result.ok:
+        typer.echo(f"✓ {name}: the base product was built, came up and was taken down again "
+                   f"({took // 60}m{took % 60:02d}s)")
+        for svc, how in sorted(result.health.items()):
+            said = "healthy" if how == "healthy" else "started, not health-checked"
+            typer.echo(f"  · {svc}: {said}")
+        for svc, image in sorted(result.images.items()):
+            typer.echo(f"  · {svc}: {image}")
+        for note in result.notes:
+            typer.echo(f"  · {note}")
+        if result.log_dir:
+            typer.echo(f"  logs: {result.log_dir}")
+        return
+    typer.echo(f"✗ {name}: the base product did not come up — {result.why}")
+    if result.log_dir:
+        typer.echo(f"  logs: {result.log_dir}")
+    raise typer.Exit(1)
+
+
+@preview_app.command("login")
+def preview_login(
+    registry: str = typer.Argument(..., help="the registry previews pull from, e.g. ghcr.io"),
+    username: str = typer.Option(..., "--username", "-u", prompt=True,
+                                 help="the account to pull as"),
+    password_stdin: bool = typer.Option(False, "--password-stdin",
+                                        help="read the password (or token) from stdin"),
+) -> None:
+    """Log in to a registry for PREVIEWS only — into `BEEVERFORGE_PREVIEW_DOCKER_CONFIG`, the
+    directory the compose CLI reads when it pulls a preview's images, never the worker's own.
+
+    A registry login is client-side: the daemon holds none, so a private base image is pullable by
+    a preview exactly when this directory holds a credential for its registry. Use a read-only
+    token; anyone the panel lets into a project can start a preview that pulls with it."""
+    import sys
+
+    from beeverforge.adapters.preview.compose import docker_config, login
+
+    password = (sys.stdin.read() if password_stdin
+                else typer.prompt("password (or token)", hide_input=True)).strip()
+    if not password:
+        typer.echo("✗ no password given — nothing was stored")
+        raise typer.Exit(2)
+    ran = login(registry, username=username, password=password)
+    if ran.rc:
+        typer.echo(f"✗ {registry} refused the login: {ran.said}")
+        raise typer.Exit(1)
+    typer.echo(f"✓ previews on this deployment can pull from {registry} as {username} — the "
+               f"credential is in {docker_config()}, read only by the compose CLI that runs a "
+               f"preview")
+
+
+# ── a preview on demand: the panel's buttons, from a shell (ADR-0050 D6) ─────────────────────────
+#
+# `start`, `stop` and `restart` ARE THE CATALOG'S ROWS (`preview_start`/`_stop`/`_rebuild`), run as
+# the shell's own user — one implementation, the panel's and this door's. `read` and `logs` read
+# what the worker recorded and kept; `ls` asks the deployment's runtime what is on its daemon, so
+# it runs where the runtime is (inside the worker on the compose stack).
+
+
+def _preview_act(row: str, name: str, unit: str) -> None:
+    outcome = _perform(row, project=name, unit=unit)
+    typer.echo(("✓ " if outcome.ok else f"✗ {outcome.code}: ") + outcome.message)
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@preview_app.command("start")
+def preview_start(name: str = typer.Argument(..., help="the registered project"),
+                  unit: str = typer.Argument(..., help="a card number, or a requirement as "
+                                                       "req0012")) -> None:
+    """Start a preview of one card's change on this deployment's runtime — the panel's start
+    button. It takes minutes; `beeverforge preview read` says when it is up."""
+    _preview_act("preview_start", name, unit)
+
+
+@preview_app.command("stop")
+def preview_stop(name: str = typer.Argument(..., help="the registered project"),
+                 unit: str = typer.Argument(..., help="a card number, or req0012")) -> None:
+    """Take a preview down now; its logs are kept."""
+    _preview_act("preview_stop", name, unit)
+
+
+@preview_app.command("restart")
+def preview_restart(name: str = typer.Argument(..., help="the registered project"),
+                    unit: str = typer.Argument(..., help="a card number, or req0012")) -> None:
+    """Build a preview again from its pull request's head — a fresh checkout and fresh data. A
+    unit with nothing up is started."""
+    _preview_act("preview_rebuild", name, unit)
+
+
+def _preview_record(name: str, unit: str):
+    from beeverforge import preview
+
+    project = _get_project(name)
+    token = (unit or "").strip().lower().lstrip("#")
+    if not preview.UNIT_RE.fullmatch(token):
+        typer.echo(f"✗ {unit!r} is neither a card number nor a requirement (req0012)")
+        raise typer.Exit(2)
+    token = preview.unit_of_card(project.name, token)
+    return project, token, preview.latest(project.name, token)
+
+
+@preview_app.command("read")
+def preview_read(name: str = typer.Argument(..., help="the registered project"),
+                 unit: str = typer.Argument(..., help="a card number, or req0012")) -> None:
+    """What the worker last recorded about one unit's preview: its state and why, each exposed
+    service and what it is made of, the notes a person should read, and where its logs are."""
+    import datetime as _dt
+
+    _project, token, was = _preview_record(name, unit)
+    if was is None:
+        typer.echo(f"{name} {token}: no preview yet")
+        return
+    typer.echo(f"{name} {token}: {was.state}" + (f" — {was.why}" if was.why else ""))
+    if was.cards:
+        typer.echo(f"  cards: {', '.join(was.cards)}")
+    for url in was.pr_urls:
+        typer.echo(f"  pull request: {url}")
+    for svc in was.ordered():
+        made = "this change" if was.from_change.get(svc) else "the current version"
+        health = was.health.get(svc, "")
+        said = {"healthy": "healthy", "started": "started, not health-checked"}.get(health, health)
+        typer.echo(f"  · {svc}: {made}" + (f", {said}" if said else ""))
+    for svc, image in sorted(was.images.items()):
+        typer.echo(f"  · {svc}: {image}")
+    for line in (*was.notes, *was.missing, *was.stale):
+        typer.echo(f"  note: {line}")
+    if was.started_by:
+        typer.echo(f"  started by {was.started_by}")
+    if was.expires_at and was.live:
+        until = _dt.datetime.fromtimestamp(was.expires_at, _dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+        typer.echo(f"  up until {until}")
+    if was.log_dir:
+        typer.echo(f"  logs: {was.log_dir}")
+
+
+@preview_app.command("logs")
+def preview_logs(name: str = typer.Argument(..., help="the registered project"),
+                 unit: str = typer.Argument(..., help="a card number, or req0012"),
+                 service: str = typer.Argument("", help="one service's log; all when omitted"),
+                 lines: int = typer.Option(200, "--lines", "-n",
+                                           help="how many of the last lines to print")) -> None:
+    """The logs a preview kept — each service's, and the build's — from the directory its card
+    links to. Kept before every down, so a preview that failed or ended still says why."""
+    from pathlib import Path as _Path
+
+    from beeverforge.adapters.preview.compose import log_dir_for
+
+    project, token, was = _preview_record(name, unit)
+    where = _Path((was.log_dir if was and was.log_dir else "") or log_dir_for(project.name, token))
+    files = sorted(where.glob("*.log")) if where.is_dir() else []
+    if service:
+        files = [f for f in files if f.stem == service]
+    if not files:
+        typer.echo(f"✗ no {'log of ' + service if service else 'logs'} kept for {name} {token} "
+                   f"under {where}")
+        raise typer.Exit(1)
+    for f in files:
+        typer.echo(f"── {f.name}")
+        text = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in text[-lines:]:
+            typer.echo(line)
+
+
+@preview_app.command("ls")
+def preview_ls() -> None:
+    """Every preview on this deployment's runtime — exited ones included — with its cards, state,
+    who started it, when it ends, its compose project, its work directory's size and its images.
+    Run where the runtime is: inside the worker on the compose stack."""
+    import datetime as _dt
+    import os as _os
+
+    from beeverforge import preview
+    from beeverforge.adapters.preview.compose import work_root
+    from beeverforge.adapters.preview.registry import build_runtime
+    from beeverforge.runtime.temporal.io import default_preview_runtime
+
+    kind = default_preview_runtime()
+    try:
+        running = build_runtime(kind).running()
+    except (TypeError, ValueError) as exc:
+        typer.echo(f"✗ {exc}")
+        raise typer.Exit(2) from None
+    if not running:
+        typer.echo(f"no preview is on this deployment's `{kind}` runtime")
+        return
+
+    def size(path: str) -> str:
+        total = 0
+        for root, _dirs, names in _os.walk(path):
+            for n in names:
+                try:
+                    total += _os.lstat(_os.path.join(root, n)).st_size
+                except OSError:
+                    continue
+        return f"{total / 1_000_000:.0f} MB"
+
+    for rp in sorted(running, key=lambda r: r.compose_project):
+        try:
+            was = preview.latest(rp.project, rp.unit) if rp.project else None
+        except Exception as exc:  # noqa: BLE001 — an unreadable record still lists what runs
+            typer.echo(f"  (the record of {rp.project} {rp.unit} could not be read: "
+                       f"{str(exc)[:120]})")
+            was = None
+        until = (_dt.datetime.fromtimestamp(rp.expires_at, _dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+                 if rp.expires_at else "no expiry")
+        workdir = _os.path.join(work_root(), rp.compose_project)
+        typer.echo(f"{rp.project} {rp.unit}: {rp.state} (record: {was.state if was else '—'}) · "
+                   f"until {until} · {rp.compose_project}")
+        if was and was.cards:
+            typer.echo(f"  cards: {', '.join(was.cards)}")
+        if was and was.started_by:
+            typer.echo(f"  started by {was.started_by}")
+        if _os.path.isdir(workdir):
+            typer.echo(f"  work directory: {workdir} ({size(workdir)})")
+        for svc, image in sorted((was.images if was else {}).items()):
+            typer.echo(f"  · {svc}: {image}")
+
+# ── the preview's proposal (#265 slice 4) ────────────────────────────────────────────────────────
+
+
+def _preview_prover(kind: str):
+    """The deployment's proof of a DRAFT, or `(None, why)`: the base branch with the drafted files
+    applied, brought up once on this deployment's preview runtime and taken down — the slice-2 row
+    `preview prove` uses, never a `docker build` of this process's own."""
+    import time as _time
+
+    from beeverforge.adapters.preview.compose import prove_project
+    from beeverforge.adapters.preview.registry import build_runtime
+    from beeverforge.contracts.manifest import PreviewConfig
+    from beeverforge.onboarding.preview_propose import proof_sentence
+
+    try:
+        runtime = build_runtime(kind)
+    except (TypeError, ValueError) as exc:
+        return None, str(exc)
+    missing = runtime.prerequisites()
+    if missing:
+        return None, (f"the `{kind}` preview runtime cannot run one on this deployment — "
+                      + "; ".join(missing))
+
+    def prove(project, files, block):
+        started = _time.monotonic()
+        up = prove_project(project, runtime, draft=files,
+                           cfg=PreviewConfig.model_validate(block))
+        return proof_sentence(up, int(_time.monotonic() - started))
+
+    return prove, ""
+
+
+def _propose_product(project, *, accept: bool, answers: dict, yes: bool, also: list[str]) -> None:
+    """`preview propose --product` (#265 slice 5, S6): the product's preview, drafted from every
+    source of its `product.yaml` into its CONTEXT repository, on a pull request of its own."""
+    from beeverforge.onboarding.preview_product import propose_product
+
+    if also:
+        typer.echo(f"✗ `--product` drafts the whole product from its `sources:`; {', '.join(also)} "
+                   f"{'is' if len(also) == 1 else 'are'} a single repository's — nothing was "
+                   f"proposed")
+        raise typer.Exit(2)
+    context = str(getattr(getattr(project, "product", None), "docs_repo", "") or "")
+    if not yes:
+        typer.echo(f"This will open a pull request on {context or 'the context repository'} — "
+                   f"re-run with --yes.")
+        raise typer.Exit(2)
+    outcome = propose_product(project, accept=accept, answers=answers)
+    where = outcome.repo or context
+    if not outcome.ok:
+        typer.echo(f"✗ {where}: {outcome.detail}")
+    elif outcome.nothing or outcome.existed:
+        typer.echo(f"· {where}: {outcome.detail}")
+    else:
+        typer.echo(f"✓ {where}: {outcome.url or outcome.detail}")
+    for question in outcome.questions[:5]:
+        typer.echo(f"    ? {question.replace('<project>', project.name)}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@preview_app.command("propose")
+def preview_propose_cmd(
+    name: str = typer.Argument(..., help="the registered project"),
+    source: list[str] = typer.Option(None, "--source",  # noqa: B008 — typer's own idiom
+                                     help="a repository of this project, owner/name "
+                                          "(repeatable); the registry's own by default"),
+    accept: bool = typer.Option(False, "--accept",
+                                help="write the INFERRED lines too; observed ones always are"),
+    answers: list[str] = typer.Option(None, "--set",  # noqa: B008 — typer's own idiom
+                                      help="answer a field of the block yourself, e.g. "
+                                           "preview.expose.app=8000 (repeatable)"),
+    as_card: bool = typer.Option(False, "--as-card",
+                                 help="file the questions as a card instead of a pull request"),
+    prove: bool = typer.Option(False, "--prove",
+                               help="build the base branch with the draft applied, once, on "
+                                    "THIS deployment's preview runtime, and say how it went in "
+                                    "the pull request"),
+    product: bool = typer.Option(False, "--product",
+                                 help="draft the whole PRODUCT's preview — every repository of "
+                                      "its product.yaml side by side — into its context "
+                                      "repository, on a pull request of its own"),
+    yes: bool = typer.Option(False, "--yes",
+                             help="Required: this opens a pull request on YOUR repository"),
+) -> None:
+    """Draft how a preview of this project runs, from what its repository says, and PROPOSE it.
+
+    One pull request on `beeverforge/preview`, of its own: a compose file drafted from the
+    repository's Dockerfiles (or a Dockerfile, when a start command anchors one), an override
+    for a compose file that cannot show a change, and the `preview:` block appended to the
+    manifest with its comments kept. Observed lines are written; inferred ones with `--accept`;
+    what nothing answers is asked in the pull request, and `--set` answers it. Nothing is built
+    or run — `--prove` builds it on the deployment's own preview runtime, never here. On the
+    one-machine kind the files are written into your checkout, for you to commit."""
+    from beeverforge.adapters.forge.registry import repo_of
+    from beeverforge.onboarding.preview_propose import dotted, propose_preview
+    from beeverforge.runtime.temporal.io import default_preview_runtime
+
+    project = _get_project(name)
+    try:
+        said = dotted(list(answers or []))
+    except ValueError as exc:
+        typer.echo(f"✗ {exc} — nothing was proposed")
+        raise typer.Exit(2) from None
+    if product:
+        _propose_product(project, accept=accept, answers=said, yes=yes,
+                         also=[flag for flag, on in (("--source", bool(source)),
+                                                     ("--as-card", as_card), ("--prove", prove))
+                               if on])
+        return
+    repos = list(dict.fromkeys(source or [])) or [repo_of(project) or project.name]
+    raw = str(project.repo_path or "")
+    local = not ("://" in raw or raw.startswith("git@"))
+    if not yes:
+        where = ("file a card on its board" if as_card else
+                 f"write the draft into {raw}" if local else
+                 f"open a pull request on {', '.join(repos)}")
+        typer.echo(f"This will {where} — re-run with --yes. `beeverforge preview draft {name}` "
+                   f"shows what it would say, and writes nothing.")
+        raise typer.Exit(2)
+    prover = None
+    if prove and not as_card:
+        kind = default_preview_runtime()
+        prover, why = _preview_prover(kind)
+        if prover is None:
+            typer.echo(f"✗ no proof: {why}. Drop --prove, or run this where the runtime is "
+                       f"(`docker compose exec worker beeverforge preview propose {name} --prove "
+                       f"--yes`) — nothing was proposed.")
+            raise typer.Exit(2)
+    failed = False
+    for repo in repos:
+        outcome = propose_preview(project, repo=repo, accept=accept, answers=said,
+                                  as_card=as_card, prove=prover)
+        if not outcome.ok:
+            failed = True
+            typer.echo(f"✗ {repo}: {outcome.detail}")
+        elif outcome.nothing:
+            typer.echo(f"· {repo}: {outcome.detail}")
+            typer.echo(f"  `beeverforge preview propose {name} --as-card --yes` files it as a "
+                       f"card.")
+        elif outcome.card:
+            typer.echo(f"✓ {repo}: {outcome.detail}" + (f" {outcome.url}" if outcome.url else ""))
+        elif outcome.wrote:
+            typer.echo(f"✓ {repo}: {outcome.detail}")
+        elif outcome.existed:
+            typer.echo(f"· {repo}: {outcome.detail}")
+        else:
+            typer.echo(f"✓ {repo}: {outcome.url or outcome.detail}")
+        for question in outcome.questions[:5]:
+            typer.echo(f"    ? {question.replace('<project>', name)}")
+    if failed:
+        raise typer.Exit(1)
+
+
+@preview_app.command("draft")
+def preview_read_cmd(
+    target: str = typer.Argument(..., help="a registered project, or a path to a checkout"),
+    accept: bool = typer.Option(False, "--accept",
+                                help="show what `propose --accept` would write"),
+) -> None:
+    """What `beeverforge preview propose` would propose — every line with its tier and the file it
+    was read from. Writes nothing, and builds nothing."""
+    outcome = _perform("preview_proposal", target=target, accept=accept)
+    data = dict(outcome.data)
+    if not outcome.ok:
+        typer.echo(f"{outcome.code}: {outcome.message}")
+        raise typer.Exit(1)
+    rows = list(data.get("fields") or [])
+    width = min(_NAME_COL, max((len(str(r.get("name", ""))) for r in rows), default=0))
+    typer.echo(f"preview draft · {data.get('project') or target}")
+    for tier in ("observed", "inferred", "unknown"):
+        mine = [r for r in rows if r.get("confidence") == tier]
+        if not mine:
+            continue
+        typer.echo("")
+        typer.echo(f"{tier.upper()} ({len(mine)})")
+        for row in mine:
+            _field_block(row, width=width)
+    typer.echo("")
+    files = list(data.get("files") or [])
+    typer.echo("WOULD WRITE" + ("" if files or data.get("block") else " nothing"))
+    for path in files:
+        typer.echo(f"  {path}")
+    if data.get("block"):
+        typer.echo(f"  `preview:` in {namespace.MANIFEST}, appended with its comments kept")
+    elif data.get("first"):
+        for line in _wrap(f"no `preview:` block: {data['first']}", indent=2):
+            typer.echo(line)
+    for key, title in (("left_out", "READ, AND NOT WRITTEN"), ("questions", "QUESTIONS"),
+                       ("registry", "FOR THE REGISTRY, NEVER A FILE"), ("flags", "FLAGGED"),
+                       ("notes", "NOTES")):
+        items = [str(x) for x in data.get(key) or []]
+        if not items:
+            continue
+        typer.echo("")
+        typer.echo(f"{title} ({len(items)})")
+        for line in items:
+            for wrapped in _wrap(line, indent=2):
+                typer.echo(wrapped)
+    typer.echo("")
+    typer.echo(outcome.message)
+
+
+approver_app = typer.Typer(help="Manage prod-release approvers (identity + password).")
+app.add_typer(approver_app, name="approver")
+
+
+@approver_app.command("add")
+def approver_add(login: str) -> None:
+    """Add/update an approver; prompts for a password (stored only as a hash)."""
+    from beeverforge import approvals
+
+    # THE STORE SAYS WHICH SOURCE IS IN FORCE, AND IT IS ASKED BEFORE THE PASSWORD (#202). This
+    # prompted, wrote the file and printed `saved` whatever the deployment reads — so with
+    # `BEEVERFORGE_APPROVERS` set the login it had just saved was not an approver, and the first
+    # person to find out was the one approving a release. Asked first because a person should not
+    # type a secret into a command that is about to refuse; `add_approver` refuses the same write
+    # on its own, for the caller that is not this verb.
+    src = approvals.source()
+    if src.variable:
+        typer.echo(f"✗ {login!r} was not saved: {src.why_the_file_is_not_written} "
+                   f"{src.how_to_add(login)}")
+        raise typer.Exit(2)
+    if src.problem:
+        # THE FILE CANNOT BE READ, SO IT IS NOT REPLACED — and the person is told before typing a
+        # secret, the same order as above. Until 2026-09-19 this was `json.loads`'s traceback; for
+        # a file holding a JSON array it was the traceback AFTER the password had been typed twice.
+        typer.echo(f"✗ {login!r} was not saved: {src.why_the_file_is_not_written} "
+                   f"{src.how_to_repair}")
+        raise typer.Exit(2)
+    pw = typer.prompt(f"password for {login}", hide_input=True, confirmation_prompt=True)
+    approvals.add_approver(login, pw)
+    typer.echo(f"approver {login!r} saved in {src.path}. Add them to a project's "
+               f"`prod_approvers` to allow.")
+    still = approvals.source().unusable  # read again: adding the login is the cure for its own
+    if still:
+        typer.echo(f"✗ {still}", err=True)
+
+
+@approver_app.command("list")
+def approver_list() -> None:
+    from beeverforge import approvals
+
+    # THE SOURCE ON STDERR, THE LOGINS ALONE ON STDOUT: a person reads which of the two stores
+    # answered, and `for a in $(beeverforge approver list)` still gets one login per line.
+    src = approvals.source()
+    if src.problem:
+        # not an empty roster with exit 0: nobody here can approve a release, and this is why
+        typer.echo(f"✗ {src.unreadable}", err=True)
+        raise typer.Exit(2)
+    if src.malformed and not src.logins:
+        # the same nobody, from a store that reads and holds no entry a password can match
+        typer.echo(f"✗ {src.unusable}", err=True)
+        raise typer.Exit(2)
+    typer.echo(f"approvers from {src.named}:" if src.logins else
+               f"no approvers yet in {src.named}. {src.how_to_add()}", err=True)
+    for x in sorted(src.logins):
+        typer.echo(x)
+    if src.unusable:
+        # AN ENTRY THAT IS NOT A HASH IS NOT LISTED AS SOMEBODY WHO CAN APPROVE — it is named, by
+        # login and kind (the value is where a hash would be). Exit 0: the roster above is the
+        # true list of who can approve, and it is somebody.
+        typer.echo(f"✗ {src.unusable}", err=True)
+
+
+@approver_app.command("remove")
+def approver_remove(login: str) -> None:
+    from beeverforge import approvals
+
+    # THE STORE ANSWERS AND THIS VERB READS IT (#138's shape, found on the sweep). It printed
+    # `removed '<login>'` for any string, so a mistyped login reported success while the person
+    # kept their say over a production release.
+    src = approvals.source()
+    listed = ", ".join(sorted(src.logins)) if src.logins else "none yet"
+    if src.variable:
+        # THE SAME QUESTION `add` ASKS, not a second look at the environment. A child process
+        # cannot edit its parent's environment, so there is nothing here this verb can remove —
+        # and it no longer takes the login out of the file on its way to saying so.
+        if login in src.entries:  # named, even by an entry no password can match
+            typer.echo(f"✗ {login!r} is still an approver: `BEEVERFORGE_APPROVERS` names them — "
+                       f"{src.why_the_file_is_not_written} Take them out of the variable where "
+                       f"this deployment sets it, then restart what reads it.")
+        else:
+            roster = src.unreadable or f"The variable names: {listed}."
+            typer.echo(f"✗ no approver named {login!r} — nothing was removed: "
+                       f"{src.why_the_file_is_not_written} {roster}")
+        raise typer.Exit(2)
+    if src.problem:
+        # a file that cannot be read cannot be said to hold the login or not — and is not rewritten
+        typer.echo(f"✗ {login!r} was not removed: {src.why_the_file_is_not_written} "
+                   f"{src.how_to_repair}")
+        raise typer.Exit(2)
+    if not approvals.remove_approver(login):
+        typer.echo(f"✗ no approver named {login!r} — nothing was removed. Approvers here: "
+                   f"{listed}.")
+        raise typer.Exit(2)
+    typer.echo(f"removed {login!r}")
+
+
+people_app = typer.Typer(help="The people this deployment names by invitation (the `local` "
+                              "identity row): a one-time link, a name and a password chosen on "
+                              "first use, who vouched for them recorded.")
+app.add_typer(people_app, name="people")
+
+
+@people_app.command("invite")
+def people_invite(
+    person: str = typer.Argument(..., help="their id — an email or a handle, spelled the way a "
+                                           "project's `admins` will spell it"),
+    display: str = typer.Option("", help="how the team will see them (they may change it)"),
+    product: bool = typer.Option(False, "--product", help="scope them to the product surface — a "
+                                                          "requirement-writer, refused the floor"),
+    board: bool = typer.Option(False, "--board", help="scope them to the board — whoever runs it, "
+                                                      "refused the product owner's area"),
+    by: str = typer.Option("", help="who vouches for them; your login on this host by default"),
+) -> None:
+    """Issue a one-time registration link. Printed ONCE; the store keeps only its hash.
+
+    A MAPPING ONTO THE `people_invite` ROW, like every other verb here (ADR-0039): the shell
+    decides who is asking — the login on this host, unless `--by` says otherwise — and the
+    action layer does the work, so the panel's button and this command cannot drift."""
+    import asyncio
+    import getpass
+
+    from beeverforge import actions as act_layer
+
+    voucher = by.strip() or getpass.getuser()
+    outcome = asyncio.run(act_layer.perform(
+        "people_invite", by=act_layer.Actor(id=voucher, display=voucher, via="cli", admin=True),
+        person=person, display=display, product="yes" if product else "",
+        board="yes" if board else ""))
+    if not outcome.ok:
+        typer.echo(f"people invite: {outcome.message}", err=True)
+        raise typer.Exit(code=1)
+    # THE PANEL'S ADDRESS IS ASKED, NOT SPELLED (#183): this said "on compose the panel is" and a
+    # literal, which was wrong for every deployment that moved the port. Where nobody declared
+    # one, the path is what there is to say.
+    from beeverforge.adapters.tracker.local import panel_url
+
+    only = " (product surface only)" if product else " (the board only)" if board else ""
+    typer.echo(f"{outcome.message}{only}"
+               f"{'' if panel_url() else ' — append this to the address your panel answers on'}:")
+    typer.echo(f"  {panel_url()}{outcome.data['link']}")
+
+
+@people_app.command("revoke")
+def people_revoke(
+    person: str = typer.Argument(..., help="their id, as `beeverforge people list` shows it"),
+) -> None:
+    """Take a person off this deployment: their registration, every session they hold, and any
+    invitation still open for them. A later invitation brings them back like anybody new.
+
+    A MAPPING ONTO THE `people_revoke` ROW, like `invite` (ADR-0039): the shell's login is who
+    did it, recorded on the row, and the last person registered is not revoked while nothing else
+    closes the panel's door."""
+    outcome = _perform("people_revoke", person=person)
+    if not outcome.ok:
+        typer.echo(f"people revoke: {outcome.message}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(outcome.message)
+
+
+@people_app.command("list")
+def people_list() -> None:
+    """Who is registered, and which invitations are still open."""
+    from beeverforge.identity import people as _people
+    from beeverforge.observability.query import StoreUnreadable
+
+    store = _people.PeopleStore()
+    try:
+        registered = store.people()
+        pending = store.pending()
+    except StoreUnreadable as exc:
+        # "NOBODY YET" IS AN ANSWER, and a store that cannot be read has not given one: an
+        # operator told nobody is registered goes and invites everybody again.
+        typer.echo(f"people list: the people store cannot be read, so this cannot say who is "
+                   f"registered — {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    if not registered and not pending:
+        typer.echo("nobody is registered by invitation, and no invitation is open — "
+                   "`beeverforge people invite <id>` issues one")
+        return
+    for p in registered:
+        scope = f" [{', '.join(p.groups)}]" if p.groups else ""
+        typer.echo(f"{p.id}  {p.display}{scope}  vouched for by {p.invited_by or '?'}  "
+                   f"since {p.registered_at[:10]}")
+    for i in pending:
+        scope = f" [{', '.join(i.groups)}]" if i.groups else ""
+        typer.echo(f"{i.id}  (invited{scope} by {i.by or '?'} on {i.issued_at[:10]}, not yet "
+                   f"registered)")
+
+
+@app.command("worker")
+def worker_cmd() -> None:
+    """Run the durable worker in the foreground — what the compose stack runs in its container.
+
+    The module has always been runnable (`python -m beeverforge.runtime.temporal.worker`) and the
+    compose file runs exactly that; a person on their own machine had to know the module path,
+    which is the kind of thing a platform should not ask anybody to remember.
+
+    Without the durable engine's client library (the `runtime` extra) it refuses in one sentence
+    that names the install, instead of starting."""
+    # THE REFUSAL COMES BEFORE THE IMPORT (#178). The import below is the worker's first line, and
+    # on an install made without the `runtime` extra it ended in a raw `ModuleNotFoundError: No
+    # module named 'temporalio'` — the leftover #174 named. The ids stay here and not in the
+    # docstring: that is this command's `--help`, and a stranger cannot open a card.
+    _refuse_without_the_client("the worker cannot start", code=1)
+    # `born`, not `main`: the same door the module's own `-m` entry uses, so an engine that never
+    # started listening is a sentence here too rather than a traceback (#135).
+    from beeverforge.runtime.temporal.worker import born as worker_born
+
+    asyncio.run(worker_born())
+
+
+@app.command("up")
+def up(
+    panel_port: int | None = typer.Option(
+        None, help=f"Where the panel listens (default: the port `{_PANEL.reach_vars[0]}` or "
+                   f"`{_PANEL.port_var}` names, else {_PANEL.default_port})"),
+    engine: bool = typer.Option(True, "--engine/--no-engine",
+                                help="Start the durable engine's dev server when `temporal` is "
+                                     "on PATH"),
+) -> None:
+    """Start the whole factory on THIS machine: the durable engine, the worker and the panel.
+
+    THE HOST'S `docker compose up` (ADR-0049 D9). The processes and their supervision live in
+    `beeverforge.runtime.host`; this command is the front end — it asks the questions a person
+    answers on the command line and prints what happened.
+
+    WITHOUT THE ENGINE IT STILL RUNS. `temporal` missing is not a failure: the attended commands
+    (`run`, `poll`) and the whole panel work without it, so this says what is off and starts what
+    it can rather than refusing."""
+    from beeverforge.runtime import host
+
+    # THE BINARY AND ITS LIBRARY ARE TWO INSTALLS (#171), and `host.durable_half` names whichever
+    # is missing — the binary alone, once, sent a reader into a crash that took the panel down.
+    binary, missing = host.durable_half(engine)
+    if missing:
+        typer.echo(f"! {missing}")
+    state = Path(_HOST_ENV).expanduser().parent
+    state.mkdir(parents=True, exist_ok=True)
+
+    # WHERE EVERYTHING GOES IS RESOLVED ONCE, and handed to everything that is started (#183): the
+    # ports the listeners start on and the addresses their consumers read come out of one call,
+    # and a declaration `up` cannot start on is a sentence here rather than a worker that dials
+    # one port while the engine listens on another.
+    from beeverforge.listeners import CannotHonour
+
+    try:
+        deployment = host.deployment(panel_port=panel_port, state=state, engine=binary)
+    except CannotHonour as exc:
+        typer.echo(f"up: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    for line in deployment.said:
+        typer.echo(f"! {line}")
+    typer.echo(f"the panel will be at {deployment.reach[_PANEL.name]}")
+    code = host.run(deployment.plan, say=typer.echo, env=deployment.env)
+    if not binary:
+        # "THE PANEL WORKS", WITH OR WITHOUT THE LIBRARY (#178). Between #174 and #178 this line
+        # left the panel out on an install without `temporalio`, because its page answered 500;
+        # the page's words no longer come from modules that import the engine's client, and
+        # `tests/test_the_panel_serves_without_the_engines_client.py` holds that.
+        typer.echo("the durable half is off: `run` and `poll` work, the panel works, and the "
+                   "human merge gate, park/resume and the deadlines wait for the engine.")
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command("serve")
+def serve(
+    host: str = typer.Option("127.0.0.1", help="Bind host"),
+    port: int = typer.Option(_PANEL.default_port, help="Bind port"),
+) -> None:
+    """Serve the web panel (observability + management) at http://host:port."""
+    import uvicorn
+
+    # The panel module no longer loads `.env` on import (a library must not mutate the process's
+    # environment), so the entry point does it — here, where a human asked for a server.
+    from beeverforge.api.app import PANEL_ROLE
+    from beeverforge.api.app import _load_environment as _panel_env
+
+    _panel_env()
+    # ONE LOG FORMAT, THE WORKER'S (#675): a time, a level and a name on every line, the platform's
+    # INFO kept, and uvicorn's own lines through the same handler (`log_config=None`) rather than a
+    # second format of uvicorn's, so a request and the warning it caused read side by side. SET UP
+    # AS SOON AS THE ENVIRONMENT IS LOADED — `.env` may be what names the format — and before
+    # anything below can log (review of #818 on 99dd77b5, measured: a build the panel could not
+    # record warned before this, through Python's last-resort handler, a bare line among JSON).
+    from beeverforge.observability import logs
+
+    logs.configure()
+    # SAY WHICH BUILD SERVES THIS PAGE, where the other halves can read it (#135). Symmetric with
+    # the worker: whichever half was not rebuilt is the stale one, and the deployment can only name
+    # it if both announce. Here rather than at import — a library that writes files when it is
+    # merely imported has bitten this project before — and before uvicorn takes the process.
+    from beeverforge import namespace
+
+    namespace.announce_build(PANEL_ROLE)
+    # Printed for a person, as it always was — or, with JSON log lines, logged, so stdout carries
+    # JSON too (#681): said once the log is set up, which is why it is no longer the first line.
+    logs.announce(log, f"panel: http://{host}:{port}")
+    # A BOUNDED SHUTDOWN (#136). The engine stream is an open response for as long as a tab is, and
+    # uvicorn otherwise waits for every open response before it exits — so a SIGTERM left the panel
+    # running with no port and no end. Five seconds is longer than any request this panel serves
+    # that is not a stream.
+    uvicorn.run("beeverforge.api.app:app", host=host, port=port, timeout_graceful_shutdown=5,
+                log_config=None)
+
+
+@app.command("bot-token")
+def bot_token(
+    app_id: str = typer.Option(None, help="GitHub App ID (default: BEEVERFORGE_GH_APP_ID)"),
+    key_path: str = typer.Option(
+        None,
+        help="Path to the App .pem; wins over the environment (default: "
+             "BEEVERFORGE_GH_APP_KEY_CONTENT, the PEM itself, else BEEVERFORGE_GH_APP_KEY, a path)",
+    ),
+    installation_id: str = typer.Option(
+        None, help="Installation ID (default: BEEVERFORGE_GH_APP_INSTALLATION_ID)"
+    ),
+) -> None:
+    """Mint a GitHub App installation token (~1h) — and, on the onboarding path, PROVE the trio.
+
+    Printing a `ghs_…` is the whole point there: it means App ID, private key and Installation
+    ID agree and GitHub accepted them. There is nothing to save — the token expires in about an
+    hour and the factory mints its own for every job. The pilot operator asked what to do with
+    it (2026-08-12), which is fair: `--help` showed only the export form below, so the command
+    read as something that produces a credential you keep.
+
+    `--app-id`, `--installation-id` and `--key-path` override the deployment's values, so a newly
+    downloaded `.pem` can be proven before it is deployed.
+
+    The export form is for a SHELL that needs a token for a one-off `gh` command:
+
+        export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)
+    """
+    from beeverforge.credentials import app_id as env_app_id
+    from beeverforge.credentials import app_installation_id, app_private_key, app_private_key_at
+
+    # THE FLAGS FALL BACK TO THE COMPOSITION ROOT rather than reading the environment themselves
+    # (#64). These carried `envvar=`, which made typer the FOURTH independent reader of
+    # `BEEVERFORGE_GH_APP_ID` / `BEEVERFORGE_GH_APP_INSTALLATION_ID` — and the one place a future
+    # per-project override could never reach, since typer resolves it before any of our code
+    # runs. The explicit flag still wins; `--help` names the variable in prose instead.
+    #
+    # `--key-path` IS THE THIRD FLAG OF THE SAME RULE (#905). It kept `envvar=` and was never read
+    # after it was bound: the key always came from `app_private_key()`. Measured 2026-10-20, empty
+    # `HOME`, no credential in the environment: `--app-id 1 --installation-id 1 --key-path <a
+    # real PEM>` exited 1 with "need BEEVERFORGE_GH_APP_ID, …", naming as missing an id that was
+    # passed. Now an explicit path is the key that signs, ahead of both variables; without it the
+    # composition root resolves the key as before, content form included (the compose worker
+    # holds the PEM itself, not a path). The file is read by `app_private_key_at`, the one reader
+    # of a key file, not here.
+    app_id = app_id or env_app_id()
+    installation_id = installation_id or app_installation_id()
+    # `is not None`, NOT TRUTHINESS: `--key-path "$NEW_PEM"` with the variable unset hands the
+    # option "", a path given and empty, not "no flag". Under `if key_path:` it took the `else`
+    # branch and proved the environment's key: measured 2026-10-21 under `env -i`, the deployment
+    # key in BEEVERFORGE_GH_APP_KEY, "✓ the App trio works", JWT signed by that key, exit 0.
+    if key_path is not None:
+        if not key_path.strip():
+            typer.echo("✗ --key-path was given an empty path — nothing was minted; pass the .pem's "
+                       "path, or leave --key-path out to use the deployment's key", err=True)
+            raise typer.Exit(1)
+        try:
+            key = app_private_key_at(key_path)
+        except OSError as exc:
+            # A REFUSAL, NEVER A FALLBACK: minting with the environment's key after the operator
+            # named another would "prove" a key nobody asked about. `strerror` is libc's, in the
+            # process's locale; the path is what the operator can act on.
+            typer.echo(f"✗ the App key at {key_path} could not be read ({exc.strerror or exc}) — "
+                       "nothing was minted; pass a readable .pem or leave --key-path out to use "
+                       "the deployment's key", err=True)
+            raise typer.Exit(1) from None
+        # AN EMPTY FILE IS A KEY GIVEN AND MISSING, not "no key": "" fell to the "need … --key-path"
+        # sentence below, asking for the flag that was given. BLANK, NOT ONLY "": a file of
+        # whitespace was truthy and reached `jwt.encode`, an `InvalidKeyError` traceback out of the
+        # mint (both measured 2026-10-21 on 7d14b39a). A PEM is never whitespace alone.
+        if not key.strip():
+            typer.echo(f"✗ the App key at {key_path} is empty — nothing was minted; pass the "
+                       ".pem GitHub gave you, or leave --key-path out to use the deployment's key",
+                       err=True)
+            raise typer.Exit(1)
+    else:
+        key = app_private_key()
+    if not (app_id and key and installation_id):
+        typer.echo(
+            "need the App id (--app-id or BEEVERFORGE_GH_APP_ID), the installation id "
+            "(--installation-id or BEEVERFORGE_GH_APP_INSTALLATION_ID), and the App key "
+            "(--key-path, or BEEVERFORGE_GH_APP_KEY as a path, or BEEVERFORGE_GH_APP_KEY_CONTENT "
+            "as the PEM itself)",
+            err=True,
+        )
+        raise typer.Exit(1)
+    from beeverforge.adapters.github_app import mint_installation_token
+
+    token, _expires = mint_installation_token(
+        app_id=app_id, private_key=key, installation_id=installation_id
+    )
+    # THE TOKEN ON STDOUT, THE MEANING ON STDERR — so `$(beeverforge bot-token)` still captures
+    # exactly the token while a human at a terminal is told what they are looking at. Without
+    # this the printed value reads as a fourth credential to paste somewhere.
+    typer.echo("✓ the App trio works — this token was minted from it just now. Nothing to "
+               "save: it expires in about an hour and the factory mints its own per job.",
+               err=True)
+    typer.echo(token)
+
+
+_DONE_STATES = {JobState.PR_OPEN, JobState.MERGED, JobState.DONE}
+
+
+def _box_kind(explicit: str | None) -> str:
+    """Which box these commands run a job in — the flag, else what the DEPLOYMENT configured.
+
+    ONE RESOLUTION FOR THE TWO COMMANDS THAT SPEND MONEY, and it exists because they both carried
+    the literal `"worktree"` as a typer default. `default_sandbox()` was written for exactly this
+    (`BEEVERFORGE_SANDBOX` wins; absent it, the local container — nothing is inferred from a
+    vendor's cluster variable) and the durable path has read it since C-13 — the CLI never did.
+
+    WHAT THAT COST, found by running a real ticket rather than by reading: the OSS compose file
+    sets `BEEVERFORGE_SANDBOX: container` under a comment calling the container "the real,
+    production
+    path", and `poll` is the command its own docstring tells you to put on a cron. So every job on
+    a compose install ran in the worker's own filesystem — the agent's arbitrary code beside the
+    scheduler that launched it — while the file said otherwise.
+
+    And it made a PROOF point at the wrong thing. `box prove` holds pickup until the CONTAINER box
+    has run the project's gates (ADR-0037 D5); the job then ran in a worktree. A proof about a box
+    nothing uses is the shape of defect this repository names most often.
+
+    `None` rather than a default string, like `--image` one line below: a flag that always carries
+    a value can never let the deployment's own answer win, because the override is indistinguishable
+    from the default.
+    """
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    return (explicit or "").strip().lower() or default_sandbox()
+
+
+def _drive_one(view, issue: str, *, sandbox: str, image: str, review: bool = True):
+    """One attended job — AND the record of what it spent.
+
+    THE ATTENDED DRIVER IS A SPENDER TOO, and it was the one that recorded nothing. A ticket run
+    from here pays for exactly the same agent passes as one the durable path runs; the rows the
+    cost dashboard, `metrics_view` and every yield measurement read were written only by the
+    workflow's `record_job_metrics` activity. On the one-machine runtime there IS no workflow
+    unless a durable engine is installed, and `poll` is that deployment's only scheduler — so the
+    door with no operations team was the door that measured nothing (measured 2026-09-11: a card
+    ran to Done and the metrics database held one row, a channel message).
+
+    Both commands below go through here so neither can forget, and the rows themselves are
+    `observability/job_record.record_job` — the same function the activity calls.
+
+    AND THE ATTENDED DRIVER IS A WORKER (ADR-0055 D7, #414): the runner hands its outcomes back —
+    the pull request, the merge, the park — and they reach the card through its door here, as
+    they do from the worker's activity, or nothing would move the card past its last progress
+    mark."""
+    from datetime import UTC, datetime
+
+    from beeverforge.lifecycle.handed_back import apply as the_outcomes_go_through_the_door
+    from beeverforge.observability.job_record import (
+        BY_THE_ATTENDED_DRIVER,
+        record_ending,
+        record_job,
+    )
+
+    started = time.monotonic()
+    result = build_runner(view, issue, sandbox=sandbox, image=image, review=review).run(issue)
+    the_outcomes_go_through_the_door(view, issue, result)
+    state = getattr(result.state, "value", str(result.state))
+    record_job(project=view.name, issue=str(issue),
+               ts=datetime.now(UTC).isoformat(), state=state,
+               wall_s=round(time.monotonic() - started, 1),
+               total_cost_usd=result.total_cost_usd, pr_url=result.pr_url or "",
+               knowledge=result.knowledge, agent_runs=result.agent_runs)
+    # AND HOW IT ENDED, IN ITS JOURNAL (#551): the line `query.outcomes` reads a job's ending
+    # from, written by the same function the workflow's `record_outcome` writes it with. Without
+    # it every job this driver ran read as never ended, and a one-machine deployment's evidence
+    # pack counted none. Never a reason to change what happened to the job.
+    try:
+        record_ending(view, str(issue), state, by=BY_THE_ATTENDED_DRIVER, note=result.note or "")
+    except Exception as exc:  # noqa: BLE001 — the job ended; the record failing must not undo it
+        log.warning("BEEVERFORGE_OUTCOME_NOT_JOURNALLED %s#%s ended as %s and its journal does "
+                    "not say so (%s)", view.name, issue, state, str(exc)[:160])
+    return result
+
+
+@app.command("run")
+@speaks_plainly("run that ticket")
+def run(
+    name: str,
+    issue: str,
+    # UNSET MEANS THE DEPLOYMENT'S BOX, not a hardcoded one — the same rule `--image` states two
+    # lines down, for the same reason. It said `"worktree"`, so `BEEVERFORGE_SANDBOX` was read by
+    # the
+    # durable path and ignored here, and the OSS compose file declares `container` out loud.
+    sandbox: str = typer.Option(None, help="Sandbox: worktree|container "
+                                           "(default: BEEVERFORGE_SANDBOX, else container)"),
+    # DEFAULTS TO UNSET, not to the framework's image. A flag that always carries a value can never
+    # let the project's own `box.image` win — the operator override would be indistinguishable from
+    # the default (ADR-0037 D4).
+    image: str = typer.Option(None, help="Base image for --sandbox container (default: the "
+                                         "project's box.image, else BEEVERFORGE_SANDBOX_IMAGE)"),
+    review: bool = typer.Option(True, help="Run the independent reviewer (D-5)"),
+) -> None:
+    """Drive one ticket through the state machine."""
+    project = _with_its_code(_get_project(name), "running a ticket")
+    # C-18 HERE TOO. This called `build_runner(project, …)` with the raw registry entry, so a card
+    # naming its own repository was edited in the DEFAULT one. The durable path applied the view;
+    # the CLI did not — and the CLI is what an operator uses to try the platform, and what an
+    # onboarding session runs in front of a client's developers.
+    #
+    # Found on the first real multi-repo ticket: `Deskline/fx-dsk-ui#15`, a card about the
+    # TypeScript UI, produced a PR against `fx-dsk-flows` editing `src/Admissao.cs` — the .NET
+    # backend. The independent review rejected it (score 10, "the diff only modifies the .NET
+    # backend but the ticket's entire premise is the UI"), which is the guard working. This is the
+    # routing that put it there.
+    from beeverforge.runtime.card_repo import _runner_view
+
+    view, _ = _runner_view(project, issue)
+    box = _box_kind(sandbox)
+    resolved = resolve_box_image(view, explicit=image, sandbox=box)
+    result = _drive_one(view, issue, sandbox=box, image=resolved, review=review)
+    typer.echo(result.model_dump_json(indent=2))
+    if result.state not in _DONE_STATES:
+        raise typer.Exit(1)
+
+
+@app.command("poll")
+@speaks_plainly("read this project's board")
+def poll(
+    name: str,
+    # UNSET MEANS THE DEPLOYMENT'S BOX. `"worktree"` here was the sharpest instance of it: this
+    # command IS the scheduler ("run this on a cron/loop"), so every job on a compose install ran
+    # in the worker's own filesystem while `BEEVERFORGE_SANDBOX: container` sat in the file two
+    # lines
+    # under a comment calling the container "the real, production path". Worse, `box prove` holds
+    # pickup until the CONTAINER box is proven (ADR-0037 D5) — so the box that was proven and the
+    # box that ran were different ones, which makes the proof an assertion about somewhere else.
+    sandbox: str = typer.Option(None, help="Sandbox: worktree|container "
+                                           "(default: BEEVERFORGE_SANDBOX, else container)"),
+    image: str = typer.Option(None, help="Base image for --sandbox container (default: the "
+                                         "project's box.image, else BEEVERFORGE_SANDBOX_IMAGE)"),
+) -> None:
+    """For an ENABLED project: resume any rate-limit-paused tickets whose reset has
+    passed, then pick up the board's TODO column — one at a time, stopping when one
+    pauses or goes on hold (no parallelism). Run this on a cron/loop as the scheduler."""
+
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+    from beeverforge.scheduler import ready_to_resume
+
+    project = _with_its_code(_get_project(name), "picking up its cards")
+    if not project.enabled:
+        typer.echo(f"{name}: framework OFF — nothing picked up")
+        return
+    from beeverforge.adapters.board import build_board
+
+    # ASK THE FACTORY WHETHER THERE IS A BOARD; do not infer it from GitHub's option names. This
+    # gated on `board_owner`/`board_number` and therefore told every JIRA project "no board
+    # configured" while `build_board` was building one perfectly well — a live defect, not one
+    # Azure introduced; ADO only made it a second victim. Both providers put the board WHERE THE
+    # WORK ITEM ALREADY IS (a status is a column), so there is no second object to name, and a
+    # caller that demands coordinates for one is demanding configuration the vendor cannot supply.
+    # `None` is build_board's own first-class answer for "no board", so it is the right question.
+    board = build_board(project, token=tracker_token_for(project)
+                        or deployment_tracker_token(project))
+    if board is None:
+        typer.echo(f"{name}: no board configured")
+        raise typer.Exit(1)
+    # THE BOARD NAMES ITS OWN PICKUP COLUMN. A literal "TO-DO" here asked an Azure board for a
+    # column it does not have and printed "0 in 'TO-DO'" — a correct-looking report of an empty
+    # queue with six cards waiting in it.
+    status = project.tracker.options.get("pickup_status") or board.pickup_column()
+
+    resume = ready_to_resume(project, time.time())
+    todo = [str(n) for n in board.items_in_status(status)]
+    queue = resume + [t for t in todo if t not in resume]
+    typer.echo(f"{name}: {len(resume)} to resume + {len(todo)} in '{status}'")
+    # Resolved ONCE, before the loop, so a fargate deployment that declares box.image refuses
+    # before any ticket is picked up rather than halfway through the queue.
+    box = _box_kind(sandbox)
+    resolved = resolve_box_image(project, explicit=image, sandbox=box)
+    # THE GATE THE UNATTENDED PATH ASKS, ASKED HERE TOO (ADR-0049 D9). `scan_todo` consults
+    # `gate_reason` before it starts anything, and this command — the one whose own docstring says
+    # to put it on a cron, and the only scheduler a one-machine deployment has — did not. So on
+    # the runtime where the proof was just made gateable, the loop a person actually runs walked
+    # straight past it: measured end to end, a card ran to Done with `doctor` reporting the last
+    # proof FAILED. One question, two schedulers, one answer.
+    #
+    # PER CARD, AND PER REPOSITORY (C-18, and the review of #107 caught this narrower). One
+    # product may span several repositories, each with its own manifest, its own toolchain and its
+    # own proof — so the default repo's verdict holds the DEFAULT repo's cards, and a qualified
+    # card is asked of its own. Asking once for the project would admit a `web` card on the `api`
+    # proof: the gate standing open while looking closed, which is exactly what the unattended
+    # path was taught not to do.
+    from beeverforge.box_prove import gate_reason
+    from beeverforge.runtime.card_repo import _is_default_repo, _ref_repo
+
+    default_held = gate_reason(project, sandbox=box)
+    held_by_repo: dict[str, str | None] = {}
+    started = 0
+    for num in queue:
+        card_repo, _bare = _ref_repo(project, str(num))
+        if _is_default_repo(project, card_repo):
+            held = default_held
+        else:
+            if card_repo not in held_by_repo:
+                held_by_repo[card_repo] = gate_reason(project, sandbox=box, repo=card_repo)
+            held = held_by_repo[card_repo]
+        if held:
+            typer.echo(f"  #{num} held — {held}")
+            continue
+        started += 1
+        typer.echo(f"→ #{num}")
+        result = _drive_one(project, str(num), sandbox=box, image=resolved)
+        typer.echo(f"  {result.state.value}")
+        if result.state is JobState.PAUSED:
+            typer.echo(f"  agent paused ({result.note}) — stopping the board.")
+            break
+        if result.state in (JobState.ON_HOLD, JobState.BLOCKED):
+            typer.echo("  impediment — stopping (no parallelism).")
+            break
+    # A HELD QUEUE IS NOT A QUIET ONE, and on the cron this command's docstring recommends they
+    # looked identical: exit 0, one printed line, nothing for a job scheduler to notice (review of
+    # #107). Cards waiting and nothing able to run is a state somebody has to learn about.
+    if queue and not started:
+        raise typer.Exit(1)
+
+
+# ── the action layer, from a shell (C-23) ────────────────────────────────────────────────────────
+#
+# THE SECOND UNIVERSAL TRANSPORT, and the cheap one. `POST /api/act/{name}` needs a running panel
+# and a token; this needs a shell on the host, which is where an operator already is when something
+# has gone wrong at 2am. Together they are what makes "every action is reachable from at least two
+# transports" true BY CONSTRUCTION rather than by somebody remembering to add a route and a verb
+# for each new action — which is the exact discipline that failed and produced #51.
+#
+# It is also how the actions blocked on other cards stay honest: `beeverforge act ask` prints the
+# sentence saying where that capability still lives, instead of the command not existing at all.
+
+def _get_project(name: str):
+    """The registered project, or the one-line refusal the first hour is owed.
+
+    `beeverforge doctor myapp` before `project add` — the literal order a reader might take from
+    the docs — used to end in a raw KeyError traceback. A stranger's first failure must name the
+    fix, not the stack (measured in the pre-pilot review, 2026-08-09)."""
+    # resolved from the MODULE at call time, not from this file's import-time binding — the
+    # onboarding tests substitute the registry at that seam, and `cmd_onboard` always honoured it
+    from beeverforge import registry as _registry_module
+
+    reg = _registry_module.ProjectRegistry()
+    try:
+        return reg.get(name)
+    except KeyError:
+        typer.echo(f"✗ project {name!r} is not registered — run "
+                   f"`beeverforge project add {name} <path-or-clone-url> --repo <org>/<repo>` "
+                   f"first. Registered here: {_registered_here(reg, refusing=name)}.")
+        raise typer.Exit(2) from None
+
+
+def _with_its_code(project, waiting: str):
+    """`project`, or the sentence a project before its code is owed and exit 1 (#992).
+
+    FOR THE VERBS THAT ARE NOT ROWS YET. A catalogue row that needs the code is refused by
+    `perform` (`ActionSpec.needs_code`); these verbs read the code without one, and on a project
+    whose product started before its code they would read `repo_path` — empty, which is the
+    current directory to `Path` — as if it were the product. `factory.resolve_repo_path` refuses
+    underneath them; this says it first, in the sentence every door says."""
+    from beeverforge.contracts.project import before_its_code, no_code_yet
+
+    if before_its_code(project):
+        typer.echo(f"✗ {no_code_yet(project.name, waiting)}")
+        raise typer.Exit(1)
+    return project
+
+
+def _registered_here(reg, *, refusing: str) -> str:
+    """The roster a "that name is not here" refusal ends with — the name that WAS meant is on it.
+
+    One definition because two verbs refuse this way (`_get_project`, and `project remove` since
+    #138), and a refusal must not fail while refusing: a registry that cannot be listed costs the
+    sentence its roster, never the sentence."""
+    try:
+        names = sorted(p.name for p in reg.list())
+    except Exception as exc:  # noqa: BLE001 — the refusal must not fail while refusing
+        log.warning("could not list the registered projects while refusing %r (%s) — the "
+                    "refusal stands, just without the roster", refusing, exc)
+        names = []
+    return ", ".join(names) if names else "none yet"
+
+
+def _parse_params(pairs: list[str], *, flag: str = "--param") -> dict[str, object]:
+    """`k=v` strings → a params dict, with `true`/`false` becoming booleans.
+
+    ONLY BOOLEANS ARE COERCED. Numbers deliberately stay strings: a ticket ref is a provider-owned
+    opaque string (`189`, `CONT-412`) and turning `189` into an int here would hand the layer a
+    type no tracker uses and reintroduce the `int(ref)` class C-04 spent a card killing.
+
+    `flag` EXISTS BECAUSE THE ERROR NAMES IT. A second caller arrived (`env apply --set`) and the
+    message still read "--param takes key=value" — a remedy pointing at an option that command does
+    not have, which is the same defect as `conformance` printing `stack: security-oss` at a schema
+    that forbids it, only smaller. The caller says which flag it is."""
+    out: dict[str, object] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            raise typer.BadParameter(f"{flag} takes key=value, got {pair!r}")
+        text = value.strip()
+        low = text.lower()
+        out[key.strip()] = True if low == "true" else False if low == "false" else text
+    return out
+
+
+@app.command("actions")
+def actions_list() -> None:
+    """List everything this deployment can be asked to DO, and what each one takes."""
+    from beeverforge import actions as act_layer
+
+    for entry in act_layer.CATALOG.values():
+        takes = " ".join(f"<{p}>" for p in entry.required)
+        takes += "".join(f" [{p}]" for p in entry.optional)
+        mark = "" if not entry.pending else "  (not moved yet)"
+        typer.echo(f"{entry.name:<14}{takes:<44}{entry.summary}{mark}")
+
+
+@app.command("act")
+def act_cmd(
+    name: str = typer.Argument(..., help="Which action — see `beeverforge actions`"),
+    project: str = typer.Option(None, "--project", "-p", help="Shorthand for --param project=…"),
+    issue: str = typer.Option(None, "--issue", "-i", help="Shorthand for --param issue=…"),
+    # noqa: B008 — every typer option in this file is a call in a default; ruff lets the scalar
+    # ones pass and flags this one only because the ANNOTATION is a list. Typer's whole surface is
+    # declarative defaults, and rewriting this one as a module singleton would make it the odd one.
+    param: list[str] = typer.Option(None, "--param", "-P", help="key=value, repeatable"),  # noqa: B008
+    as_json: bool = typer.Option(False, "--json", help="Print the whole Outcome as JSON"),
+) -> None:
+    """Run one action — `beeverforge act resume -p acme -i 412`.
+
+    Exits non-zero when the action did not do what was asked, so this composes in a script. The
+    actor is the shell's own user, recorded as an admin: somebody with a shell where the factory
+    runs already outranks every gate in this layer, and pretending otherwise would be theatre."""
+    import asyncio
+    import getpass
+    import json as _json
+
+    from beeverforge import actions as act_layer
+
+    params = _parse_params(list(param or []))
+    if project:
+        params["project"] = project
+    if issue:
+        params["issue"] = issue
+    try:
+        who = getpass.getuser()
+    except (KeyError, OSError):
+        # A container with no passwd entry and no LOGNAME/USER — the documented failure of
+        # `getpass.getuser`, and it must not stop the action: the identity here is a label for the
+        # audit line, not the authority. Named rather than a catch-all, so this stays a defined
+        # branch instead of a swallow (`tests/test_no_silent_failures.py`).
+        who = "unknown"
+    outcome = asyncio.run(act_layer.perform(
+        name, by=act_layer.Actor(id=who, display=who, via="cli", admin=True), **params))
+    if as_json:
+        typer.echo(_json.dumps({"ok": outcome.ok, "code": outcome.code,
+                                "message": outcome.message, "data": dict(outcome.data)}, indent=2))
+    else:
+        typer.echo(("" if outcome.ok else f"{outcome.code}: ") + outcome.message)
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+
+
+# ── `beeverforge env` — the environment round (#99)
+# ─────────────────────────────────────────────────────
+#
+# THE DOOR TO THE ONLY VERBS IN THIS PLATFORM THAT PROPOSE. `doctor`, `conformance` and `box prove`
+# above all VERIFY what a client already declared; on a legacy codebase the hard part is not
+# verifying the test command, it is finding it among four candidates, three of which only work on
+# one developer's laptop. These three read the repository and say what they think, with the file and
+# line they read it from and how sure they are.
+#
+# THIS SUB-APP HOLDS NO LOGIC. Every command below is a mapping onto one row of `actions/catalog.py`
+# (ADR-0039: one action, one implementation, N transports), so the panel — the reference surface,
+# ADR-0038 — gets the same three verbs on the same day rather than in a card nobody opens. What
+# lives here is the RENDERING, which is the one part that is genuinely a transport's: how the
+# proposal prints is the product, because it is read aloud in a room with the client's developers
+# and it has about ten seconds to make one of them say "no, the real test command is X".
+#
+# DELIBERATELY NO COLOUR. This is screen-shared, pasted into chat and read by `grep`; ANSI codes
+# survive none of those well, and the one place this repository scraped coloured output for a word
+# it matched nothing at all.
+
+env_app = typer.Typer(help="The environment round: propose a project's setup, then prove it.")
+app.add_typer(env_app, name="env")
+
+#: How wide the field-name column may grow before the value moves to its own line.
+_NAME_COL = 26
+#: How wide a line may be before a value is wrapped onto continuation lines.
+_WIDTH = 96
+
+
+def _shell_user() -> str:
+    """The login this shell runs as — the label every row this CLI performs is recorded under.
+
+    `getpass.getuser` fails in a container with no passwd entry and no LOGNAME/USER, which is its
+    documented failure; the identity here is a label for the audit line, not the authority, so it
+    must not stop the command. Named exceptions, so this stays a defined branch rather than a
+    swallow (`tests/test_no_silent_failures.py`)."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return "unknown"
+
+
+def _perform(name: str, **params: object):
+    """Run one catalogued action as the shell's own user. The CLI's whole job in this sub-app,
+    and in every verb that changes the installation (#741).
+
+    The actor is an admin for the same reason `beeverforge act` says so: somebody with a shell
+    where the factory runs already outranks every gate in this layer, and pretending otherwise is
+    theatre. It is UNSCOPED for the same reason, which is what lets it change the installation."""
+    import asyncio
+
+    from beeverforge import actions as act_layer
+
+    who = _shell_user()
+    return asyncio.run(act_layer.perform(
+        name, by=act_layer.Actor(id=who, display=who, via="cli", admin=True), **params))
+
+
+def _show(value: object) -> list[str]:
+    """A proposed value as the lines a human reads — the SHAPE it will have in the file.
+
+    A list of setup commands prints as one command per line and a mapping prints as `key: value`,
+    because that is what `.beeverforge/project.yaml` will look like and because a client scanning
+    this is
+    checking their commands, not admiring a data structure. `None` prints as `?`, never as an empty
+    string: the difference between *the platform could not read this* and *this is empty* is the
+    most expensive one in this codebase, and it must survive to the screen."""
+    if value is None:
+        return ["?"]
+    if isinstance(value, list | tuple):
+        return [str(v) for v in value] or ["(nothing)"]
+    if isinstance(value, dict):
+        return [f"{k}: {v}" for k, v in value.items()] or ["(nothing)"]
+    text = str(value)
+    return [text] if text.strip() == text else [repr(text)]  # padding is invisible; show it
+
+
+def _field_block(row: dict, *, width: int) -> None:
+    """One proposed field: what it is, what it says, and — indented under it — where that came
+    from. Two lines rather than a table because the provenance is the part being sold, and a
+    provenance squeezed into a fourth column is a provenance nobody reads."""
+    name = row.get("name", "?")
+    # AN `unknown` FIELD HAS NO VALUE TO SHOW, whatever happens to be sitting in `value`. A
+    # proposal may carry `{}` there and mean "we looked and found none" — but the tier already
+    # said the platform is not asserting anything, and printing `(nothing)` beside the word
+    # `unknown` invites the reader to take the empty mapping as our answer. `?` is the answer, and
+    # it is the one a developer can respond to out loud.
+    lines = ["?"] if row.get("confidence") == "unknown" else _show(row.get("value"))
+    head, rest = lines[0], lines[1:]
+    if len(name) <= width and len(name) + len(head) + 4 <= _WIDTH:
+        typer.echo(f"  {name:<{width}}  {head}")
+    else:
+        typer.echo(f"  {name}")
+        typer.echo(f"  {'':<{width}}  {head}")
+    for extra in rest:
+        typer.echo(f"  {'':<{width}}  {extra}")
+    confidence = row.get("confidence", "?")
+    # A CLAIM WITH NO CITATION IS SHOWN AS ONE. `observed` means somebody can go and look; if the
+    # inference could not say where, the reader sees `(no source recorded)` rather than a blank
+    # that reads like modesty.
+    source = row.get("source") or ("(no source recorded)" if confidence != "unknown" else "")
+    tail = f"    {confidence} · {source}" if source else f"    {confidence}"
+    typer.echo(tail)
+    for line in _wrap(str(row.get("note") or ""), indent=6):
+        typer.echo(line)
+    # THE RUNNERS-UP, because on a legacy repository there are four candidate test commands and a
+    # developer recognises theirs faster from a list of four than from one confident wrong line.
+    for alt in row.get("candidates") or []:
+        why = f"  ({alt['why']})" if alt.get("why") else ""
+        typer.echo(f"      or: {_show(alt.get('value'))[0]}   [{alt.get('source') or '?'}]{why}")
+
+
+def _preview_block(preview: dict, *, handle: str, width: int) -> None:
+    """How a preview of the repository would run, by tier (#265 slice 4). REPORTED here and
+    proposed on a pull request of its own — `env apply` never writes it, so the heading says which
+    verb does."""
+    if not preview:
+        return
+    typer.echo("")
+    if preview.get("case") == "declared":
+        typer.echo("PREVIEW — the manifest already declares `preview:`; nothing to propose")
+        return
+    typer.echo(f"PREVIEW — how a preview of it would run. Never written by `env apply`: "
+               f"`beeverforge preview propose {handle}` proposes it on a pull request of its own")
+    rows = list(preview.get("fields") or [])
+    for tier in ("observed", "inferred", "unknown"):
+        mine = [r for r in rows if r.get("confidence") == tier]
+        if not mine:
+            continue
+        typer.echo("")
+        typer.echo(f"  {tier} ({len(mine)})")
+        for row in mine:
+            _field_block(row, width=width)
+    for key, title in (("questions", "questions"), ("registry", "for the registry, never a file"),
+                       ("flags", "flagged"), ("notes", "notes")):
+        items = [str(x) for x in preview.get(key) or []]
+        if not items:
+            continue
+        typer.echo("")
+        typer.echo(f"  {title} ({len(items)})")
+        for line in items:
+            for wrapped in _wrap(line, indent=4):
+                typer.echo(wrapped)
+
+
+def _wrap(text: str, *, indent: int) -> list[str]:
+    """Prose wrapped to the terminal, or nothing at all for an empty string.
+
+    Empty in, empty out — a blank indented line under every field would double the length of the
+    report, and length is the enemy of the ten seconds this has to be read in."""
+    import textwrap
+
+    if not text.strip():
+        return []
+    pad = " " * indent
+    return textwrap.wrap(text.strip(), width=_WIDTH - indent,
+                         initial_indent=pad, subsequent_indent=pad)
+
+
+@env_app.command("read")
+def env_read_cmd(
+    target: str = typer.Argument(..., help="A path to a checkout, or a registered project name"),
+) -> None:
+    """Read a repository and PROPOSE what its `.beeverforge/project.yaml` should say. Writes
+    nothing.
+
+    Every field comes back with the value, the file and line it was read from, and how sure the
+    platform is. The `unknown` block is not the leftovers — it is the agenda: those are the
+    questions a developer answers out loud while this is on the screen.
+    """
+    outcome = _perform("env_read", target=target)
+    data = dict(outcome.data)
+    if not outcome.ok:
+        typer.echo(f"{outcome.code}: {outcome.message}")
+        raise typer.Exit(1)
+
+    rows = list(data.get("fields") or [])
+    name = data.get("project") or Path(str(data.get("repo", target))).name
+    typer.echo(f"env read · {name}")
+    typer.echo(f"  repository   {data.get('repo')}"
+               f"  ({'registered project' if data.get('read_as') == 'project' else 'a path'})")
+    # A REPOSITORY READ IS THE SAME ON ANY MACHINE, and saying so here is not padding: `env check`
+    # below is NOT, and a reader who has seen one provenance line has to be told which of the two
+    # they are looking at.
+    typer.echo(f"  measured on  {data.get('measured_on')} — a repository read is the same "
+               f"anywhere; `env check` is not.")
+    if data.get("unreadable"):
+        typer.echo(f"  ! {data['unreadable']} entr(y/ies) in the proposal carried no confidence "
+                   f"and were skipped — they are NOT in the report below.")
+
+    width = min(_NAME_COL, max((len(str(r.get('name', ''))) for r in rows), default=0))
+    for tier, title in (
+        ("observed", "PROPOSED — read out of the repository"),
+        ("inferred", "INFERRED — a guess from your CI file. Right, or what is the real one?"),
+        ("unknown", "ONLY YOUR DEVELOPERS CAN ANSWER — nothing in the repository decides these"),
+    ):
+        mine = [r for r in rows if r.get("confidence") == tier]
+        if not mine:
+            continue
+        typer.echo("")
+        typer.echo(f"{title} ({len(mine)})")
+        for row in mine:
+            typer.echo("")
+            _field_block(row, width=width)
+
+    # WHAT THE SCHEMA CANNOT SAY ABOUT THIS REPOSITORY — the block that is client 2 in its
+    # entirety. `available_stacks()` is node/python/security-oss/terraform and a `Component`
+    # requires BOTH `path` and `stack`, so a .NET 8 + SPFx client cannot declare a component at
+    # all. Emitting one anyway produces YAML `conformance` refuses; staying quiet lets a client
+    # discover it three days later. It is neither a proposal nor a failure, so it gets its own
+    # heading.
+    # …minus anything a field above already said in the same words. A question printed twice is
+    # twenty seconds of a room re-reading something it has read, and the ten seconds this report
+    # gets are the whole product.
+    already = {str(r.get("note") or "").strip() for r in rows}
+    for key, title in (
+        ("cannot_express", "THE PLATFORM CANNOT EXPRESS THIS, and that is ours, not yours"),
+        ("questions", "QUESTIONS THE REPOSITORY CANNOT ANSWER"),
+        ("unreadable_dirs", "NOT READ AT ALL — a stack living under these is invisible above"),
+    ):
+        fresh = [x for x in (data.get(key) or []) if str(x).strip() not in already]
+        for i, line in enumerate(fresh):
+            if i == 0:
+                typer.echo("")
+                typer.echo(f"{title} ({len(fresh)})")
+            for wrapped in _wrap(str(line), indent=2):
+                typer.echo(wrapped)
+
+    _preview_block(data.get("preview") or {}, handle=data.get("project") or "<project>",
+                   width=width)
+
+    if data.get("ci_files_seen"):
+        typer.echo("")
+        typer.echo(f"  ! CI files found and NOT parsed: {', '.join(data['ci_files_seen'])} — "
+                   f"'no CI' and 'a CI we could not read' have opposite remedies.")
+    if data.get("truncated"):
+        typer.echo(f"  ! the walk stopped at its own ceiling after {data.get('files_walked')} "
+                   f"paths — this proposal does not cover the whole repository.")
+
+    typer.echo("")
+    if not rows:
+        # READ, AND NOTHING THERE. Distinct from "could not read" — which is a refusal above, with
+        # a different sentence and a non-zero exit.
+        typer.echo("nothing proposed: the repository was read and no build file, CI file or "
+                   "default branch was found. The whole manifest is a question.")
+    typer.echo(outcome.message)
+    handle = data.get("project")
+    if data.get("destination_exists"):
+        typer.echo(f"  {data.get('destination')} ALREADY EXISTS — `env apply` refuses to touch it "
+                   f"without --force, and that is the right default.")
+    if not handle:
+        # EVERY REMEDY THIS PLATFORM PRINTS HAS TO BE RUNNABLE. `env apply` takes a registered
+        # project (it writes, and the file records which project accepted what), so suggesting
+        # `beeverforge env apply <a path>` here would be the same defect as `conformance`
+        # recommending
+        # `stack: security-oss` to a schema that forbids it — a remedy that cannot be typed.
+        typer.echo("  `env apply` writes for a REGISTERED project. Register this one first:")
+        typer.echo(f"    beeverforge project add <name> {data.get('repo')} --repo <owner/name>")
+        return
+    typer.echo(f"  write the observed fields:  beeverforge env apply {handle} --yes")
+    typer.echo(f"  accept an inferred one:     beeverforge env apply {handle} --yes "
+               f"--accept <field>")
+    typer.echo(f"  correct one out loud:       beeverforge env apply {handle} --yes "
+               f"--set <field>=<the real command>")
+
+
+@env_app.command("context")
+def env_context_cmd(
+    target: str = typer.Argument(..., help="A path to a checkout, or a registered project name"),
+    ask: bool = typer.Option(False, "--ask", help="ONE read-only agent pass for the semantic "
+                                                  "layer. Costs tokens. Off by default."),
+    write: str = typer.Option(None, "--write", help="A CHECKOUT of the context repository to "
+                                                    "write the documents into"),
+    yes: bool = typer.Option(False, "--yes", help="Required by --write. Nothing is written "
+                                                  "without it, and nothing is ever overwritten."),
+) -> None:
+    """Survey a repository and PROPOSE the context an agent will read from then on.
+
+    THE OTHER HALF OF `env read`, AND THE BIGGER ONE. `env read` proposes how to BUILD the project.
+    This proposes what the project IS — what it does, its vocabulary, its entry points, and the
+    questions only a developer who worked there can answer. On the legacy codebase most clients
+    actually bring, that is the real work of onboarding.
+
+    `--ask` RUNS WHEREVER YOU TYPE THIS, and the action checks that rather than assuming it: the
+    harness has to be on this machine's PATH, which is true in a terminal beside the client's
+    developers and false in the panel's own image. Without it nothing is spent.
+
+    `--write` needs `--yes`, and never overwrites a file that is already there.
+    """
+    outcome = _perform("env_context", target=target, ask=ask, write=write or "", yes=yes)
+    data = dict(outcome.data)
+    # THE REPORT TRAVELS WITH THE REFUSAL. A failed agent pass still surveyed the repository, and
+    # throwing that away because the semantic half did not land would make the room re-run a walk
+    # that already succeeded.
+    if data.get("report"):
+        typer.echo(data["report"])
+        typer.echo("")
+    for path in data.get("wrote") or []:
+        typer.echo(f"  wrote    {Path(write) / path}")
+    for path in data.get("skipped") or []:
+        typer.echo(f"  kept     {Path(write) / path} — already there, never overwritten")
+    for line in data.get("failed") or []:
+        typer.echo(f"  FAILED   {line}")
+    if not outcome.ok:
+        typer.echo(f"{outcome.code}: {outcome.message}")
+        raise typer.Exit(1)
+    typer.echo(outcome.message)
+    if not data.get("semantic"):
+        typer.echo(f"  add the semantic layer (one agent pass):  beeverforge env context {target} "
+                   f"--ask")
+    if not write:
+        typer.echo(f"  write them into a context repository:     beeverforge env context {target} "
+                   f"--write <checkout> --yes")
+
+
+@env_app.command("rehearse")
+def env_rehearse_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    yes: bool = typer.Option(False, "--yes", help="Approve the spend. Without it this prints the "
+                                                  "estimate and calls no harness at all."),
+    gates: bool = typer.Option(None, "--gates/--no-gates",
+                               help="May the client's OWN test suite run here? Unset = only if a "
+                                    "valid box proof already covers those exact commands."),
+    by: str = typer.Option(None, "--by",
+                           help="Who approved the spend (default: this shell's user)"),
+    image: str = typer.Option(None, "--image", help="Override the box image for this round only"),
+    turn_cap: int = typer.Option(None, "--turn-cap", help="Ceiling on the agent's turns"),
+) -> None:
+    """The ENVIRONMENT's first round — prove the loop before a real ticket is ever picked up.
+
+    A box, a harness pass, a diff, the project's own gates and a reviewer, on a synthetic ticket
+    the platform owns, in a throwaway clone with every git remote removed. It answers the one
+    question a client asks in the room — *does the factory work here?* — and, when it does not,
+    WHERE a real ticket would have died.
+
+    NOT A PRE-FLIGHT. A pre-flight sizes a CARD; this measures the ENVIRONMENT, and it runs before
+    there is a card at all.
+
+    NOTHING IS SPENT WITHOUT `--yes`. The default prints what the round will cost, measured from
+    what this deployment has already spent, and stops before the harness is constructed.
+
+    IT TOUCHES NO TRACKER, NO BRANCH, NO PR AND NO BOARD. That is structural, not a promise: there
+    is no tracker and no forge in the module at all.
+    """
+    import getpass
+
+    from beeverforge.onboarding.firstrun import (
+        DEFAULT_TURN_CAP,
+        Consent,
+        Rehearsal,
+        estimate_cost,
+        probes_for,
+        rehearse,
+    )
+
+    project = _get_project(name)
+    probes = probes_for(project, image=image,
+                        turn_cap=turn_cap if turn_cap is not None else DEFAULT_TURN_CAP)
+    # A CONSENT WITH NO NAME IS A CONSENT NOBODY GAVE, and this line lands in the report a client
+    # reads. The shell's own user is honest provenance and needs no flag; `--by` is for the case
+    # where the person who typed it is not the person who approved it.
+    consent = Consent(spend_approved=yes, gates_may_run=gates,
+                      by=(by or getpass.getuser()) if yes else "")
+
+    # THE HEADER BEFORE THE ROUND, not after. It carries the machine, the box and the estimate, and
+    # each of those changes what every line under it means — a room watching stages appear needs it
+    # first. `render()` prints it again at the end for whoever only keeps the tail.
+    # ONLY WHEN THE ROUND ACTUALLY RUNS. Without `--yes` nothing streams between the header and
+    # the report, so printing it here would print it twice — and a client reading two identical
+    # provenance blocks reasonably wonders whether they are two different measurements.
+    if yes:
+        preview = Rehearsal(project=name, measured_on=probes.measured_on(),
+                            sandbox_kind=probes.sandbox_kind(), estimate=estimate_cost(probes),
+                            consent=consent)
+        for line in preview.header():
+            typer.echo(line)
+        typer.echo("")
+
+    # PROGRESS GOES TO STDERR. A round with two agent passes takes minutes and a silent terminal in
+    # front of a client is the one thing this platform refuses everywhere else; keeping it off
+    # stdout means `beeverforge env rehearse x > report.txt` still captures exactly the report.
+    run = rehearse(probes, consent=consent,
+                   on_start=lambda stage: typer.echo(f"  … {stage}", err=True))
+    typer.echo("\n".join(run.render()))
+    if not yes:
+        typer.echo("")
+        typer.echo(f"  approve it and run for real:  beeverforge env rehearse {name} --yes")
+        typer.echo(f"  and if their suite must NOT run here:  beeverforge env rehearse {name} "
+                   f"--yes --no-gates")
+    raise typer.Exit(run.exit_code)
+
+
+@env_app.command("check")
+def env_check_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+) -> None:
+    """ONE verdict on whether this project can be picked up — and WHERE it was measured.
+
+    `doctor`, `conformance` and `box status` answer three different questions in three different
+    scopes and none of them knows about the others; this is the composition. Exits non-zero unless
+    pickup is genuinely unblocked — including when the verdict is one this CLI does not recognise,
+    because an unrecognised verdict must never read as a green one.
+    """
+    outcome = _perform("env_check", project=name)
+    data = dict(outcome.data)
+    if not outcome.ok:
+        typer.echo(f"{outcome.code}: {outcome.message}")
+        raise typer.Exit(1)
+
+    where = data.get("measured_on")
+    typer.echo(f"env check · {name}")
+    typer.echo(f"  measured on  {where}")
+    if where != "worker":
+        typer.echo("  ! this is the machine you typed on, not the one that runs your tickets. A "
+                   "docker, a PATH or a credential can differ there.")
+    typer.echo("")
+    findings = list(data.get("findings") or [])
+    width = min(18, max((len(str(f.get("check", ""))) for f in findings), default=0))
+    for f in findings:
+        # THREE MARKERS, NOT TWO. `----` is a check nothing on this machine could answer, and it is
+        # deliberately not a shade of `ok`: a reader must be unable to mistake "nobody asked that
+        # here" for "that is fine", which is how a report that measured nothing reads as green.
+        mark = "  ok  " if f.get("ok") else " FAIL "
+        if not f.get("answered", True):
+            mark = " ---- "
+        # `?` RATHER THAN THE RUN'S OWN PROVENANCE. Lending this line the header's `measured_on`
+        # would present a finding measured on a laptop as measured in the factory, which is the
+        # one substitution the whole field exists to prevent.
+        typer.echo(f"{mark} {str(f.get('check', '?')):<{width}}  {f.get('message', '')}"
+                   f"   [{f.get('measured_on') or '?'}]")
+        if not f.get("ok") and f.get("remedy"):
+            typer.echo(f"        {'':<{width}}  → {f['remedy']}")
+    for extra in (data.get("holds") or [])[1:]:
+        typer.echo(f"  also holding: {extra}")
+    if data.get("unattributed"):
+        typer.echo("")
+        typer.echo(f"  ! {len(data['unattributed'])} finding(s) did not say where they were "
+                   f"measured: {', '.join(data['unattributed'])}")
+    typer.echo("")
+    typer.echo(outcome.message)
+    if data.get("ready") is not True:
+        # `is not True` AND NOT `not data.get(...)`: a MISSING key must not read as ready. A
+        # negative guard cannot see an absent value, which is how absence comes to read as
+        # compliance — the exact defect this platform has shipped and written down.
+        raise typer.Exit(1)
+
+
+@env_app.command("apply")
+def env_apply_cmd(
+    name: str = typer.Argument(..., help="A path to your checkout, or a registered project name "
+                                         "— the same two forms `env read` takes"),
+    yes: bool = typer.Option(False, "--yes", help="Actually write. Without it, this only SHOWS "
+                                                  "the file it would write, and exits 2."),
+    force: bool = typer.Option(False, "--force", help="Replace an existing manifest (the current "
+                                                      "one is copied to .bak first)"),
+    accept: list[str] = typer.Option(None, "--accept",  # noqa: B008 — typer's own idiom
+                                     help="Also write this INFERRED field (repeatable, or `all`)"),
+    set_: list[str] = typer.Option(None, "--set",  # noqa: B008 — typer's own idiom
+                                   help="field=value — your own answer, which outranks anything "
+                                        "the platform inferred (repeatable)"),
+    out: str = typer.Option(None, "--out", help="Write somewhere else than the repo's manifest "
+                                                "path — for reviewing before committing"),
+    pr: bool = typer.Option(False, "--pr",
+                            help="No checkout here? Have the factory clone the repository and "
+                                 "propose the manifest as a PULL REQUEST for you to review. "
+                                 "This is how a deployment with no laptop anywhere onboards a "
+                                 "project registered by clone URL"),
+) -> None:
+    """Write the proposed `.beeverforge/project.yaml` — only what a human accepted, only with
+    `--yes`.
+
+    `observed` fields are written; `inferred` ones need `--accept <field>`; `unknown` ones are
+    never written at all unless you answer them with `--set`, because an empty value is not an
+    absence — it is a declaration that this project has no such thing, and a manifest that declares
+    nothing loads perfectly and is then reported healthy.
+
+    An existing manifest is never replaced without `--force`, and even then the previous file is
+    copied to `<name>.bak` first.
+    """
+    answers = _parse_params(list(set_ or []), flag="--set")
+    outcome = _perform("env_apply", project=name, yes=yes, force=force,
+                       accept=list(accept or []), answers=answers, out=out or "", pr=pr)
+    data = dict(outcome.data)
+
+    if data.get("content") and not data.get("wrote"):
+        typer.echo(f"— {data.get('destination')} would read:\n")
+        typer.echo(data["content"])
+    for row in data.get("written") or []:
+        if data.get("wrote"):
+            typer.echo(f"  ✓ {row.get('name')}  ({row.get('confidence')})")
+    for row in data.get("skipped") or []:
+        if row.get("empty"):
+            # READ, AND NOTHING THERE. There is no flag to offer: `--accept` only reaches an
+            # `inferred` field and would silently do nothing here, and `--set` would be inviting a
+            # human to invent a value the repository already answered. The line says what happened
+            # and stops, which is the honest end of that sentence.
+            typer.echo(f"  · left out: {row.get('name')} ({row.get('confidence')}) — read, and "
+                       f"empty. Writing it would only repeat the default and make the file look "
+                       f"filled in; `--set {row.get('name')}=…` if that reading is wrong.")
+            continue
+        # AN UNKNOWN FIELD HAS NO VALUE TO ACCEPT, so its flag is `--set … =` and not `--accept`.
+        # Printing the wrong one would be a remedy that runs and does nothing, which is worse than
+        # one that does not run.
+        flag = (f"--set {row.get('name')}=<the answer>" if row.get("confidence") == "unknown"
+                else f"--accept {row.get('name')}")
+        typer.echo(f"  · left out: {row.get('name')} ({row.get('confidence')}) — include it with "
+                   f"{flag}")
+
+    typer.echo("")
+    typer.echo(("" if outcome.ok else f"{outcome.code}: ") + outcome.message)
+    if outcome.ok:
+        return
+    # EXIT 2 FOR "YOU HAVE TO SAY YES", 1 FOR EVERYTHING ELSE. A missing confirmation is a usage
+    # answer and the operator's next move is to retype the command; a refusal is a state answer and
+    # their next move is somewhere else entirely. Collapsing them into one code makes a script
+    # unable to tell "not confirmed" from "would have destroyed their file".
+    raise typer.Exit(2 if data.get("confirm") else 1)
+
+
+product_app = typer.Typer(help="The product role's own repository: requirements and context.")
+app.add_typer(product_app, name="product")
+
+
+@product_app.command("status")
+def product_status_cmd(name: str = typer.Argument(..., help="A registered project")) -> None:
+    """Whether the product role can see its corpus at all — the first thing to ask.
+
+    Its failure is silent everywhere else: the documentation repository is private, so a missing
+    credential makes every other verb answer "I can't see the requirements" while every test in
+    this repository passes, because the tests hand it a checkout directly."""
+    outcome = _perform("product_status", project=name)
+    typer.echo(outcome.message)
+    if not outcome.ok:
+        raise typer.Exit(1)
+    typer.echo(f"  measured on  {outcome.data.get('measured_on')}")
+    if not outcome.data.get("available"):
+        raise typer.Exit(1)
+
+
+# The one row since #266 slice 2 (ADR-0051 D12): `product_ask` and `product_say` became one.
+@product_app.command("ask")
+def product_ask_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    question: str = typer.Argument(..., help="What you want to ask the product role"),
+    propose: bool = typer.Option(False, "--propose", help="Say yes to what it staged — a draft, "
+                                                          "a card, a defect: the one "
+                                                          "confirmation"),
+    yes: bool = typer.Option(False, "--yes", help="Required by --propose"),
+) -> None:
+    """Talk to the product role WITHOUT SLACK — asking, or asking for something to be built.
+
+    ONE MESSAGE TO THE ONE ROW (`product_say`): the same turn the panel and the chat
+    get. When the role hears a request it drafts it and STAGES it for one yes, and `--propose
+    --yes` is that yes — given by token through `product_answer`, the same compare-and-swap a typed
+    "sim" or a click performs, so what is written is exactly the text that was shown. Two calls
+    rather than one, and that is still the point: a second draft from the same words is a
+    different text, and re-drafting inside one command would sign off something nobody read.
+    """
+    outcome = _perform("product_say", project=name, message=question)
+    typer.echo(outcome.message)
+    if not outcome.ok:
+        raise typer.Exit(1)
+    token = str(dict(outcome.data).get("token") or "")
+    if not propose:
+        if token:
+            typer.echo("")
+            typer.echo("  say yes to it:  add --propose --yes   (or reply \"sim\" to the role)")
+        return
+    if not token:
+        typer.echo("")
+        typer.echo("  nothing was staged for a yes, so there is nothing to propose.")
+        raise typer.Exit(1)
+
+    written = _perform("product_answer", project=name, token=token, answer="approve", yes=yes)
+    typer.echo("")
+    typer.echo(written.message if written.ok else f"{written.code}: {written.message}")
+    if not written.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("accept")
+def product_accept_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    number: str = typer.Argument(..., help="A requirement — `7`, `#7` or `REQ-0007`"),
+    yes: bool = typer.Option(False, "--yes", help="Required. After this the factory argues FROM "
+                                                  "the requirement and refuses work against it."),
+) -> None:
+    """Turn a written requirement into a PROMISE the factory defends (ADR-0032)."""
+    outcome = _perform("product_accept", project=name, number=number, yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+    if outcome.data.get("nothing_to_build"):
+        # THE SENTENCE SAYS "ask for it to be broken into tasks"; on this surface that is a
+        # command, and naming it here is what keeps the way through from being folklore (#182).
+        typer.echo(f"  if its text now says more than the code does:  beeverforge product "
+                   f"break-down {name} {outcome.data.get('number') or number} --yes")
+    if outcome.data.get("waits_for_code"):
+        # …and the same for a product that started before its code (#992): the two commands
+        # the sentence describes, in the order they run
+        typer.echo(f"  when its code exists:  beeverforge product first-source {name} "
+                   f"<repository>\n  then:                 beeverforge product break-down "
+                   f"{name} {outcome.data.get('number') or number} --yes")
+
+
+@product_app.command("break-down")
+def product_break_down_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    number: str = typer.Argument(..., help="An ACCEPTED requirement — `7`, `#7` or `REQ-0007`"),
+    yes: bool = typer.Option(False, "--yes", help="Required. An agent reads the requirement and "
+                                                  "files cards into Backlog."),
+) -> None:
+    """File an accepted requirement's units of work because YOU ask for them.
+
+    An acceptance files them on its own — except for a requirement `product baseline` read off the
+    code, which describes what is already built and gets none. This is the way through when such a
+    text was edited into more than the code does, and the retry when a breakdown filed nothing."""
+    outcome = _perform("product_break_down", project=name, number=number, yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("drop")
+def product_drop_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    number: str = typer.Argument(..., help="A requirement — `7`, `#7` or `REQ-0007`"),
+    reason: str = typer.Option("", "--reason", help="Recorded beside it, for whoever reads later"),
+    yes: bool = typer.Option(False, "--yes", help="Required"),
+) -> None:
+    """Drop a proposed requirement, with the reason recorded beside it."""
+    outcome = _perform("product_drop", project=name, number=number, reason=reason, yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("requirements")
+def product_requirements_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+) -> None:
+    """Every requirement in the corpus — number, title and status.
+
+    The read `accept` and `drop` always assumed: both take a NUMBER, and before this the only
+    instruction any surface could give was "type one you got from somewhere else"."""
+    outcome = _perform("product_requirements", project=name)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    for row in (outcome.data.get("requirements") or []):
+        typer.echo(f"  {row.get('number'):>4}  {row.get('status',''):<10} {row.get('title','')}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("pending")
+def product_pending_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+) -> None:
+    """What the product role has staged and is waiting on a person for.
+
+    THE QUESTION A TERMINAL IS THE RIGHT PLACE TO ASK. Until this row existed the only surface
+    that could see a waiting proposal was the panel's inbox, so a client working from a shell had
+    one staged in their name, addressed to them, and no way to discover it."""
+    outcome = _perform("product_pending", project=name)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    for row in (outcome.data.get("pending") or []):
+        number = row.get("number")
+        typer.echo(f"  {row.get('kind',''):<10} {('#' + str(number)) if number else '':<7} "
+                   f"{row.get('text','')}")
+        # THE TOKEN IS WHAT AN ANSWER MUST CARRY, so it is printed rather than left to be guessed:
+        # it identifies the proposal that was SHOWN, and a reply naming a position in this list
+        # would land on its replacement.
+        typer.echo(f"             {row.get('token','')}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("parked")
+def product_parked_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    limit: int = typer.Option(10, "--limit", help="How many parked tickets to classify"),
+) -> None:
+    """What is parked, and whose problem each one is. Writes nothing.
+
+    A TERMINAL VERB AND NOT A BUTTON, deliberately: this spends one model call per parked ticket,
+    so it runs for minutes and an HTTP request does not live that long. The panel would show a
+    timeout while the worker kept spending and threw the answer away."""
+    outcome = _perform("product_needs_action", project=name, limit=str(limit))
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("baseline")
+def product_baseline_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    yes: bool = typer.Option(False, "--yes", help="Confirm: this spends real money and writes"),
+) -> None:
+    """The first pass over a legacy codebase — read it all, write up what it OBSERVES, open a
+    pull request on the documentation repo for a person to confirm.
+
+    It reads an entire repository through an agent, so it runs for tens of minutes. `--yes` is
+    required and the row asks again: nothing here should start by accident."""
+    outcome = _perform("product_baseline", project=name, yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if outcome.ok and outcome.data.get("url"):
+        typer.echo(f"  {outcome.data['url']}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("queue")
+def product_queue_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    limit: int = typer.Option(5, "--limit", help="How many to propose"),
+) -> None:
+    """What should start next, in order — and why not the others. Writes nothing."""
+    outcome = _perform("product_queue", project=name, limit=limit)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("promote")
+def product_promote_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    numbers: list[str] = typer.Argument(  # noqa: B008 — typer's own idiom, as `product init` uses
+        ..., help="Ticket numbers, in the order to start them"),
+    yes: bool = typer.Option(False, "--yes", help="Required. This is the one act here that "
+                                                 "spends money."),
+) -> None:
+    """Move approved tickets into the queue — the ONE act here that spends money.
+
+    Order is preserved because the poller pulls in board order: a sequence that arrives shuffled
+    is not the sequence anybody approved."""
+    outcome = _perform("product_promote", project=name, numbers=list(numbers), yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("release")
+def product_release_cmd(
+    name: str = typer.Argument(..., help="A registered project"),
+    issue: str = typer.Argument(..., help="The delivery the client approved"),
+    yes: bool = typer.Option(False, "--yes", help="Required. This puts software in front of the "
+                                                  "client's own users."),
+) -> None:
+    """The client's approval putting a delivery in front of their own users."""
+    outcome = _perform("product_release", project=name, issue=issue, yes=yes)
+    typer.echo(outcome.message if outcome.ok else f"{outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("start")
+def product_start_cmd(
+    name: str = typer.Argument(..., help="The project to register"),
+    docs_repo: str = typer.Argument(..., help="Its context repository, as its forge names it "
+                                              "or by its clone URL — on this machine a short "
+                                              "name, created when it does not exist"),
+    provider: str = typer.Option(None, help="The forge the context lives on, when its address "
+                                            "does not say"),
+    token_env: str = typer.Option(None, help="Name of the env var holding THIS project's "
+                                             "credential — the registry names the variable"),
+    language: str = typer.Option(None, help="Language for unprompted messages (default: en)"),
+) -> None:
+    """Start a product BEFORE its code: a project with its context repository and no code
+    repository.
+
+    Its product owner's conversation, its requirements and its context work at once; what needs
+    code — breaking a requirement into cards, a job, pickup, `box prove` — waits for its first
+    source and says so: `beeverforge product first-source <name> <repository>`. Safe to run
+    again: a product already started on the same context is found, not refused."""
+    outcome = _perform("product_start", project=name, docs_repo=docs_repo,
+                       **({"provider": provider} if provider else {}),
+                       **({"token_env": token_env} if token_env else {}),
+                       **({"language": language} if language else {}))
+    typer.echo(outcome.message if outcome.ok else f"✗ {outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+    if not (outcome.data.get("reachable") and outcome.data.get("active")):
+        raise typer.Exit(1)
+
+
+@product_app.command("first-source")
+def product_first_source_cmd(
+    name: str = typer.Argument(..., help="A project that started before its code"),
+    repo_path: str = typer.Argument(..., help="Its code repository: the clone URL, or a path "
+                                              "on this machine"),
+    token_env: str = typer.Option(None, help="Name of the env var holding this project's "
+                                             "credential, when it is not the context's"),
+    board_owner: str = typer.Option(None, help="Who owns its board on the tracker, when the "
+                                               "tracker's boards have an owner"),
+    board_number: str = typer.Option(None, help="Its board's number, when the tracker numbers "
+                                                "its boards"),
+) -> None:
+    """Give a product that started before its code its code repository.
+
+    One act: the repository becomes the first entry of `sources:` in the context and the
+    project's code repository in the registry, on the forge the context lives on. Breaking a
+    requirement into cards needs no other step afterwards; a board is attached the way it is for
+    any project (`beeverforge project init <name>`)."""
+    outcome = _perform("product_first_source", project=name, repo_path=repo_path,
+                       **({"token_env": token_env} if token_env else {}),
+                       **({"board_owner": board_owner} if board_owner else {}),
+                       **({"board_number": board_number} if board_number else {}))
+    typer.echo(outcome.message if outcome.ok else f"✗ {outcome.code}: {outcome.message}")
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
+@product_app.command("name")
+def product_name(name: str,
+                 agent_name: str = typer.Argument(
+                     None, help="the name; omit it to see the current one, \"\" to use none")
+                 ) -> None:
+    """What the product role is called in this project's conversations — Nina unless you say.
+
+    Every line the role writes is signed with it and people address it by it, so it is the
+    client's to choose; until this verb the only way was editing the live registry by hand."""
+    # A MAPPING ONTO THE `product_name` ROW (#741): omitted, the row reads the name; given — `""`
+    # included — it sets it. The first hour's "not registered" sentence is asked first, as every
+    # verb here that takes a project asks it.
+    _get_project(name)
+    outcome = (_perform("product_name", project=name) if agent_name is None
+               else _perform("product_name", project=name, agent_name=agent_name))
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(2)
+    typer.echo(f"✓ {outcome.message}" if outcome.data["changed"] else outcome.message)
+
+
+@product_app.command("declare")
+def product_declare(name: str, docs_repo: str) -> None:
+    """Declare this product's EXISTING context repository — the client already has one.
+
+    The other half of `product init --create-context` — an enterprise organisation has both
+    shapes at once, some projects with a documentation repository and some without. Until this
+    verb existed, the only way to name a
+    pre-existing repository was hand-editing the live registry inside the worker container —
+    the exact "file edit by hand" this platform sells the absence of (pilot, 2026-08-13).
+
+    GitHub: `owner/repo`. Azure DevOps: `repo`, or `Project/repo` when it lives in another
+    project of the same organisation — every later step follows the qualifier.
+
+    IT IS READ BACK, not just written down. "Declared" and "reachable" are different facts, and
+    the distance between them is silent: a typo'd name, a qualifier pointing at another Azure
+    project, or a repository outside a GitHub App installation's selection all record perfectly
+    and then surface hours later as the product role answering "I cannot see the requirements".
+    So both credentials that will ever read it are tried here, while somebody is watching."""
+    # A MAPPING ONTO THE `product_declare` ROW (#741): the row records the repository, reads it
+    # back with both credentials and asks the forge's row for the likely cause; this prints it.
+    _get_project(name)  # a clear "not registered" beats a registry write to a ghost
+    if not (docs_repo or "").strip().strip("/"):
+        # THE COMMAND'S OWN REMEDY for an empty name: `perform` refuses `""` as a missing
+        # parameter before the row is reached, and that sentence names a parameter, not a command.
+        typer.echo("✗ name the repository: `beeverforge product declare <project> <owner/repo>`")
+        raise typer.Exit(2)
+    outcome = _perform("product_declare", project=name, docs_repo=docs_repo)
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(2)
+    repo = outcome.data["docs_repo"]
+    typer.echo(f"✓ {name}'s context repository is {repo} — recorded")
+    if outcome.data["reachable"]:
+        typer.echo("  ✓ reachable — `beeverforge onboard " + name + "` proposes the declaration "
+                   "and the backfill INTO it as a pull request")
+        return
+    typer.echo(f"  ⚠ RECORDED, BUT NOT READABLE: {outcome.data['why']}")
+    typer.echo("    The declaration stands — fix the access and nothing needs re-declaring. "
+               "Usually the name or its qualifier is wrong, or the credential has no access "
+               "to that repository.")
+    # THE VENDOR'S OWN LIKELY CAUSE, and only to the operator who runs that vendor — said by the
+    # forge's row, in the row (`_product_declare`), because the context repository is read
+    # through the forge.
+    if outcome.data["cause"]:
+        typer.echo(f"    {outcome.data['cause']}")
+    raise typer.Exit(1)
+
+
+@product_app.command("init")
+def product_init(
+    name: str,
+    source: list[str] = typer.Option(None, "--source",  # noqa: B008 — typer's own idiom
+                                     help="Another repository implementing this product "
+                                          "(repeatable). The registry names one; a product that "
+                                          "spans several must say so."),
+    write: bool = typer.Option(False, "--write",
+                               help="Open a PR on the context repo instead of only showing it"),
+    create_context: bool = typer.Option(
+        False, "--create-context",
+        help="When this project has no context repository, CREATE one in the client's "
+             "organisation. Consequential and consented: it makes a new repository under their "
+             "name. Without it, a project with none is refused and told what to do."),
+) -> None:
+    """Onboard a product's CONTEXT REPOSITORY — the one that already exists, or a new one.
+
+    The factory requires a context repo of every project, and a client may well arrive with one —
+    written before they met us, with their own structure. The module's gate was already right
+    (it stays off, in a sentence, until the product manifest says who the product is and which
+    repositories implement it); what was missing was any step that gets them there. Four files
+    across three repositories, by hand, is where *no developer needed* leaks.
+
+    SHOWS BEFORE IT WRITES. The default prints the file it would add and what each source repo
+    still needs; `--write` opens a PR. It is the client's repository — the first thing this
+    platform does to it should be reviewable."""
+    # A MAPPING ONTO THE `product_init` ROW (#741). The row creates the context repository when
+    # asked, reads it, plans the declaration with the product link's own functions and proposes
+    # it, each step only if it is missing, and says what each came to; what stays here is how a
+    # terminal shows the plan, the refusals in this command's words and flags, and the exit codes
+    # — 2 for an argument that is not a repository, 1 for anything that did not happen.
+    from beeverforge.actions import STEP_ALREADY, STEP_DONE, STEP_FAILED, STEP_SKIPPED
+
+    _get_project(name)  # the first hour's "not registered" sentence, before the row is asked
+    outcome = _perform("product_init", project=name, source=list(source or []), write=write,
+                       create_context=create_context)
+    data, steps = outcome.data, list(outcome.data.get("steps") or [])
+    if not outcome.ok and not steps:
+        if data.get("unreadable"):
+            typer.echo(f"✗ --source {', '.join(repr(s) for s in data['unreadable'])}: not a "
+                       f"repository reference — `owner/name` on GitHub, the bare repository name "
+                       f"or `Project/repo` on Azure Repos, or a clone URL of one")
+            raise typer.Exit(2)
+        if data.get("before_its_code"):
+            typer.echo(f"✗ {outcome.message}")
+            raise typer.Exit(2)
+        if data.get("needs") == "create_context":
+            typer.echo(
+                f"✗ {name} has no context repository, and this is where its requirements "
+                f"would live.\n"
+                f"  Run again with --create-context to create one in the client's "
+                f"organisation, or declare the one they already have: "
+                f"`beeverforge product declare {name} <owner/repo>`.")
+            raise typer.Exit(1)
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(1)
+    mark = {STEP_DONE: "✓", STEP_ALREADY: "·", STEP_SKIPPED: "·", STEP_FAILED: "✗"}
+    declaration = next((one for one in steps if one["step"] == "declaration"), None)
+    for one in steps:
+        if one["step"] == "context":
+            typer.echo(f"{mark[one['state']]} {one['said']}")
+    if declaration is None or (declaration["state"] == STEP_FAILED
+                               and not data.get("product_yaml")):
+        # nothing was planned: the context step failed, or the clone or the plan refused
+        if declaration is not None:
+            typer.echo(f"✗ {declaration['said']}")
+        raise typer.Exit(1)
+    if data.get("already_correct"):
+        typer.echo(f"· {declaration['said']}")
+    else:
+        typer.echo(f"— {data['file']} in {data['docs_repo']} "
+                   f"(requirements go in `{data['requirements_dir']}/`):\n")
+        typer.echo(data["product_yaml"])
+    for line in data.get("todo") or []:
+        typer.echo(f"· {line}")
+    if not write:
+        typer.echo("\nRun again with --write to open a PR on the context repository.")
+        return
+    if data.get("already_correct"):
+        return
+    typer.echo(f"{mark[declaration['state']]} {declaration['said']}")
+    if declaration["state"] == STEP_FAILED:
+        raise typer.Exit(1)
+
+
+if __name__ == "__main__":
+    app()

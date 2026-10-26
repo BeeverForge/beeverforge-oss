@@ -1,0 +1,228 @@
+"""One all-green `doctor.Probes`, DERIVED from the dataclass's own fields.
+
+WHY THIS FILE EXISTS, and it is the same accident twice. A doctor test that means to measure ONE
+thing built its probe set with `dataclasses.replace(doctor.probes_for(project), **a_few_pins)` —
+so every member it did not name went on reading the real machine. Twice now a new member joined
+`doctor.Probes` and answered differently somewhere:
+
+  * 2026-08-21 — `agent_credential`. Green on a laptop whose `.env` carries a token, red on a
+    clean runner. Three tests went red on GitHub Actions and nowhere else, and the repair was to
+    pin that one probe in each of them, by hand, one call site at a time.
+  * 2026-08-24 — `api_budget`. Green on a laptop where `gh` is logged in (the doctor's probe
+    shells out, so the session's credential firewall — which strips environment variables —
+    cannot see it), red in any clean environment, where it answers "the API budget could not be
+    read". Three tests, the same three shapes, the same repair proposed.
+
+The repair that keeps being proposed is the one that keeps failing: pinning what today's machine
+happens to disagree about. THE MEMBER THAT BREAKS THE NEXT TEST IS ALWAYS THE ONE NOBODY HAD
+THOUGHT OF, so the default has to be inverted. Here every member of `doctor.Probes` is pinned to
+a green answer, derived from `dataclasses.fields`, and a test unpins exactly what it measures. A
+probe added tomorrow is green by default in every one of these tests, and a probe added tomorrow
+with NO green answer here fails LOUDLY at construction, naming itself — because a helper that
+quietly left a member unpinned would be the very defect it exists to end, absence read as
+compliance.
+
+WHAT THIS DELIBERATELY DOES NOT COVER. Nothing here proves that `probes_for` wires the real
+world: this is a synthetic machine. The wiring is a separate behaviour with its own guards, which
+already exist and name themselves as such (`test_the_real_probes_actually_wire_the_gate`,
+`test_the_lookup_is_wired_and_asks_both_proposal_branches`) — one asks the probe, the other
+watches the function it must reach. Mixing the two is what produced the nine call sites above:
+a test that says "the verdict at §2" and silently also measures whether this laptop has `gh`.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+from typing import Any
+
+from beeverforge import doctor
+
+
+def _a_manifest_that_meets_the_floor():
+    """A REAL `Manifest`, never a stub with two attributes on it.
+
+    `_manifest`, `_floor`, `_merge_gates`, `_post_merge` and `_ci_declared` all read this one
+    object, and three of them ask it questions a stub cannot answer (`declared_keys()`,
+    `stage_a_person_confirms()`, `model_fields`). A double that cannot exist proves nothing about
+    the code that meets the real thing.
+    """
+    from beeverforge.contracts import Manifest
+
+    return Manifest(
+        version=1,
+        base_branch="main",
+        validate={"test": "pytest -q",
+                  "security": {"command": "bandit -q -r .", "advisory": True}},
+    )
+
+
+def _no_product_module():
+    """`product_link`'s green answer: the module is OFF, which is a legitimate setup and an `ok`
+    finding carrying a note — not a failure, and not silence either."""
+    from beeverforge.product.config import ProductLink
+
+    return ProductLink(active=False, kind="off", reason="no product module")
+
+
+def _a_budget_with_room():
+    """`api_budget`'s green answer: a real `Budget` well above the ADAPTER's own floor.
+
+    `Budget` and not `NOT_REPORTED`, deliberately. Both are green findings, and only this one is
+    green for the reason a healthy GitHub deployment is: the quota was READ and there is room in
+    it. `NOT_REPORTED` is a different fact ("this vendor publishes no budget"), and a test that
+    wants it says so.
+    """
+    from beeverforge.adapters.tracker.base import Budget
+
+    return Budget(resource="graphql", remaining=4800, limit=5000, floor=200,
+                  reset_epoch=int(time.time()) + 3600, vendor="a tracker")
+
+
+#: One green answer per member of `doctor.Probes`, by field name. The KEYS are the contract: they
+#: are compared against `dataclasses.fields(doctor.Probes)` by
+#: `tests/test_a_probe_set_is_pinned_whole.py`, in both directions, so neither a new member nor a
+#: retired one can sit here unnoticed.
+#:
+#: A "green" answer is one `diagnose` renders as an `ok` finding — measured by that same guard
+#: running the real `diagnose` over this set, never asserted by the fact that it is written here.
+GREEN_ANSWERS: dict[str, Any] = {
+    "docker_running": lambda: (True, ""),
+    "harness_on_path": lambda kind: True,
+    "manifest": _a_manifest_that_meets_the_floor,
+    "forge_reachable": lambda: (True, ""),
+    # The vendor's own remedy is only asked for a forge that is NOT reachable; on this machine it
+    # is, so the row says nothing and nothing here reads a registry.
+    "forge_remedy": lambda what: "",
+    "board_columns": lambda: ["Backlog", "TO-DO", "In progress", "In review", "Needs Action",
+                              "Done"],
+    "pickup_column": lambda: "TO-DO",
+    # A card the product role files is born in the backlog, out of the queue the poller reads
+    # (#536) — the board above. A test about a board whose new card is born in the queue names it.
+    "board_intake": lambda: _born_in_the_backlog(),
+    # A worker and a panel with room to spare, and no zombie under either init (#532).
+    "pid_counts": lambda: _pid_counts_with_room(),
+    # The same six columns, each the stage the platform's own board names it (#521) — the board
+    # `board_columns` lists, read as the card's door reads it.
+    "board_stages": lambda: ({"Backlog": "backlog", "TO-DO": "todo", "In progress": "in_progress",
+                              "In review": "in_review", "Needs Action": "needs_action",
+                              "Done": "done"}, "columns"),
+    "floor_enforced": lambda: True,
+    "harness_kind": lambda: "claude_code",
+    "product_link": _no_product_module,
+    "agent_credential": lambda: (True, "an agent credential is present"),
+    # Credentials from the environment, and a project that names none of its own (#742) — what
+    # every deployment that declares no store reads. A test about a store or a reference names it.
+    "credential_store": lambda: (True, "stored credentials are read from the environment; this "
+                                       "project names no credential of its own", ""),
+    # A deployment whose jobs run in a local box: no launcher is handed anything (#903). A test
+    # about a remote box or a stored secret names it.
+    "launcher_credentials": lambda: (True, "this deployment's jobs run in the `worktree` box, "
+                                           "which has no launcher", ""),
+    # `{}` is "the CI was read and declares nothing", which compares cleanly against any manifest.
+    # `None` — "could not read it" — is also an `ok` finding, and it is a degraded machine, which
+    # is not what a baseline should describe.
+    "ci_checks": lambda: {},
+    # `[]` is "the forge was asked and nothing gates a merge". `None` — "could not be listed" — is
+    # also an `ok` finding, and it is a degraded read, which a baseline should not describe.
+    "merge_gates": lambda: [],
+    "box_gate": lambda: None,  # nothing holds pickup — the box is proven
+    "foreign_proofs": lambda: False,  # a single-repo project: no foreign proof recorded
+    "api_budget": _a_budget_with_room,
+    "open_proposal": lambda: "",  # no proposal is open; the manifest above is merged
+    # WHICH BOX. `container` is what every deployment ran before the worktree box existed, so these
+    # baselines keep describing the machine they always described: Docker is asked about, and a
+    # missing token variable is a finding. A test about the host door names `worktree` itself.
+    "sandbox": lambda: "container",
+    # The processes `beeverforge up` starts, on the runtime where they are the operator's own.
+    # Both answering is the green baseline; a test about a stopped engine names it itself.
+    # A deployment whose preview runtime has everything it asks for, and a project nothing
+    # collides with. A test about a missing prerequisite or a `required` project on `none` names
+    # the state itself.
+    "preview": lambda: doctor.PreviewState(kind="compose"),
+    # A product whose search runs by meaning on a verified model and whose documents are all read
+    # (#337) — the published worker image's answer.
+    "product_reading": lambda: doctor.ReadingState(
+        search="semantic", search_detail="a pinned model, verified", pdf_text=True, ocr=True,
+        ocr_detail="languages: por+eng"),
+    "processes": lambda: {"engine": (True, "localhost:7233"),
+                          "engine UI": (True, "http://localhost:8080"),
+                          "panel": (True, "http://localhost:8787")},
+    # No central guidelines directory configured — the ordinary case, and an `ok` finding: jobs
+    # run on the framework baseline plus each project's own. A test about a missing/empty
+    # directory names its own tier.
+    "operator_guidelines": lambda: _no_operator_guidelines(),
+    # No axis declares `identity: workload` (#373) — the ordinary case, and NOT a check skipped:
+    # `probes_for` sets this only where a declaration makes the metadata endpoint a credential,
+    # so a project that declares none has no such line. A test about a declared identity names
+    # its own answer.
+    "box_identity": None,
+    # A modest document corpus that fits the argv ceiling with room to spare, so the note is silent
+    # (#7) — an `ok` finding either way — and whose fit was not measured here (#364): the line
+    # says the bytes and no budget. A test about an overflowing corpus, or about what the budget
+    # leaves out, names its own sizes and its own fit.
+    "inlined_documents": lambda: ({"docs.constraints": 20_000, "framework baseline": 8_066,
+                                   "operator guidelines": 0, "docs.guidelines": 1_500}, "", None),
+    # No checkout at hand (#350): a checkout is a directory on this machine, and nothing in this
+    # set reads the machine. The `guidelines` line then reads the manifest's text and says so — an
+    # `ok` finding. A test about a link committed in the repository builds a real one and names it.
+    "checkout": lambda: None,
+    # An App installation on the one organisation the registry names (#743) — the line reads the
+    # account and compares. A test about no App, a spanning registry or another organisation
+    # names its own scope.
+    "installation_scope": lambda: doctor.InstallationScope(by_owner={"acme": ["demo"]},
+                                                           installed=("acme", "")),
+    # A project WITH its code (#992): no `code` line, and every line that reads the code is
+    # asked. A test about a product that started before its code names its own state.
+    "before_its_code": ("", ""),
+}
+
+
+def _born_in_the_backlog():
+    from beeverforge.adapters.board.base import Intake
+
+    return Intake(column="Backlog", queue="TO-DO", queued=False)
+
+
+def _pid_counts_with_room():
+    from beeverforge.doctor import PidCount
+
+    return [PidCount("worker", current=41, limit=17435, zombies=0),
+            PidCount("panel", current=12, limit=17435, zombies=0)]
+
+
+def _no_operator_guidelines():
+    from beeverforge.orchestrator.operator_guidelines import OperatorTier
+
+    return OperatorTier(configured=False)
+
+
+def a_fully_pinned_probe_set(**over) -> doctor.Probes:
+    """Every member of `doctor.Probes` pinned to a green answer, except the ones named in `over`.
+
+    Nothing in the returned set reads this machine: no PATH, no docker socket, no network, no
+    credential, no `gh`. That is the point — a test using it measures what it names and nothing
+    else, on any machine, in any environment.
+
+    RAISES rather than skipping when a member has no green answer here. A member left out would
+    fall back to the dataclass's own default — `None` for every optional probe, which makes
+    `diagnose` skip that check entirely — and a check that silently stops being run is exactly
+    the shape ("built, tested, reached by nothing") this suite spends most of its guards on.
+    """
+    answers = {}
+    unanswered = []
+    for member in dataclasses.fields(doctor.Probes):
+        if member.name in over:
+            continue  # the caller is measuring this one
+        if member.name not in GREEN_ANSWERS:
+            unanswered.append(member.name)
+            continue
+        answers[member.name] = GREEN_ANSWERS[member.name]
+    if unanswered:
+        raise AssertionError(
+            f"doctor.Probes has {len(unanswered)} member(s) with no green answer in "
+            f"tests/pinned_probes.py: {', '.join(unanswered)}. Add one per member — until then "
+            f"every test built on this helper is measuring an unpinned probe, which is how "
+            f"`agent_credential` (2026-08-21) and `api_budget` (2026-08-24) each turned three "
+            f"green tests red on a machine that was not the author's.")
+    return doctor.Probes(**answers, **over)

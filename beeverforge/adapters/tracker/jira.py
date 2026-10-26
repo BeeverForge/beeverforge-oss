@@ -1,0 +1,1124 @@
+"""Jira Cloud as a tracker — the second implementation the seam exists for.
+
+Written against the same `TrackerAdapter` protocol as GitHub, which is the whole point: nothing
+outside this file learns that a deployment keeps its tickets in Jira. The pilot runs Python on
+GitHub; the product is sold to clients whose tickets live here instead, and that has to be
+structurally true before the first of them arrives.
+
+REFS ARE THE PROVIDER'S OWN. GitHub says `#412`, Jira says `CONT-412` — the framework passes refs
+around opaquely and never parses them, so both work unchanged. Where a caller must render one for a
+human, it prints what the tracker gave it.
+
+STATE MAPPING IS CONFIGURED, NOT GUESSED. Every Jira project has its own workflow, and a transition
+this adapter invented would either fail or move a card somewhere nobody expects. `status_map` in the
+project's tracker options says which Jira status each JobState means; an unmapped state is a no-op
+with a warning, never a wrong transition.
+
+CLOSED IS NOT DELIVERED, AND JIRA SAYS THE DIFFERENCE WITH A RESOLUTION (#203). `Done` against
+`Won't Do` / `Duplicate` / `Cannot Reproduce` is a field set on the closing transition — and it is
+the SITE's list, named by its administrator and localised with everything else, carried only by a
+transition whose screen has the field. So it is configured exactly as the statuses are, and there is
+no default that pretends every site has one:
+
+    tracker:
+      kind: jira
+      options:
+        status_map: '{"todo": "A Fazer", "done": "Concluído"}'
+        not_delivered_resolution: "Won't Do"      # the site's own name for it; unset = none
+
+`close_ticket(delivered=False)` sends that resolution with the transition and `list_tickets` reads
+it back as `not_planned`. Unset, or refused by the site, the card is still closed, a note on it says
+the work was withdrawn, a log line names this option — and the card READS AS DELIVERED downstream,
+because nothing Jira holds says otherwise. `close_ticket` says why that is not papered over.
+
+…OR WITH A STATUS, AND THE SITE DECIDES WHICH (2026-09-19). A resolution travels only on a
+transition whose screen has the field, and Atlassian documents team-managed projects as having no
+such screen — for those the paragraph above was the ONLY path, and every withdrawn card read as
+delivered. Such a site says it with a status of its own in the Done category (`Cancelled`,
+`Won't do`, `Cancelado`), and that is declared the same way, with the same absence of a default:
+
+        not_delivered_status: "Cancelado"         # a status in the Done category; unset = none
+
+The withdrawn close is then the bare transition into that status, and a closed card sitting in it
+reads as `not_planned` whoever put it there. It is its own option and not a `status_map` key,
+because that map is keyed by the states a JOB can be in, and "not delivered" is a word of the
+close, never a state. A deployment may name both; `close_ticket` says which is tried first.
+
+AUTH: Jira Cloud basic auth with an API token (`email` + token). The token arrives the same way
+every other credential does — from the deployment, never from the client's repository.
+
+A PAIR JIRA DOES NOT ACCEPT IS NOT REFUSED, IT IS ANSWERED AS NOBODY'S (#749). Measured 2026-10-19
+on a Jira Cloud site: account A's email with account B's token, and A's email with an empty token,
+both got 404 on `issue/<KEY>` and `project/<KEY>` that exist, 200 `{"issues": [], "isLast": true}`
+on a bounded `search/jql`, and 401 only on `GET /rest/api/3/myself`. The 404's body is the one a
+missing issue gets, so every card read as missing and jobs parked on it. A revoked token was not
+measured. So `_call` asks `myself` once on a 404, and a 401 there becomes a refusal that names the
+pair (`_not_one_account`); the cost is one request per 404 and none on any other answer.
+"""
+
+from __future__ import annotations
+
+import base64
+import http.client
+import json
+import logging
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import UTC, datetime
+
+from beeverforge.adapters.credential.registry import SHIPPED_ENV
+from beeverforge.contracts import JobState, Ticket
+
+log = logging.getLogger("beeverforge.tracker.jira")
+
+
+class JiraRefused(RuntimeError):
+    """Jira answered a call with an HTTP error. The status code is KEPT, not only printed.
+
+    A `RuntimeError` still, so every caller that parks or diagnoses on one keeps working. The code
+    is what lets `close_ticket` tell a site refusing ONE FIELD (400 — the transition's screen does
+    not carry `resolution`, or the site has no resolution of that name) from a credential that
+    expired or a site that is down, which must keep raising.
+
+    THE CODE IS 401 ON A REFUSAL JIRA ITSELF ANSWERED WITH 404, when `GET myself` then answered 401
+    (#749): Jira answers a pair it does not accept as an anonymous request, so the 404 was about
+    the credential, not the card. The 404 stays the `__cause__`."""
+
+    def __init__(self, message: str, *, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: How many issues one `search/jql` page asks for. Jira's own ceiling for this endpoint is 100.
+_PAGE = 100
+
+#: How many pages `list_tickets` will walk for a single answer. `search/jql` is token-paginated and
+#: reports completeness with `isLast` — it does NOT return a total (verified: the response carries
+#: exactly `isLast`, `issues` and, when there is more, `nextPageToken`) — so "how big is this board"
+#: is a question that can only be answered by walking it. This bounds the walk; hitting it is
+#: logged, because a board read as smaller than it is is the failure this whole port guards.
+_MAX_PAGES = 20
+
+# THE lifecycle table lives in the CONTRACT now (C-14): both adapters answer the same four
+# questions, and two copies of the bucketing is how they drift. `_column_keys` is this module's
+# name for it — the vendor-neutrality test reads it here on purpose. It is the resolver's answer
+# and then the contract's fallback (#753), so this row tries them in the contract's order.
+from beeverforge.adapters.tracker.base import (  # noqa: E402
+    NOT_REPORTED,
+    BudgetAnswer,
+    TicketComment,
+    TicketSummary,
+    list_state,
+)
+from beeverforge.adapters.tracker.base import column_keys as _column_keys  # noqa: E402
+
+
+def _not_one_account(email: str, method: str, path: str, *, has_token: bool,
+                     refused: str = "") -> str:
+    """What a person reads when Jira took a call as nobody's: the 404 it answered, and `GET myself`
+    401. THE CAUSE COMES FIRST, because the job's preflight and the card's door keep only the
+    first 120 characters of it; the path, which can be long, comes after. The token is never in it.
+
+    "or the token was revoked" because nothing here tells a mismatched pair from a revoked token,
+    and a revoked one was not measured (2026-10-19: another account's token and an empty one
+    answer alike, 404 and `myself` 401). With no token at all the request was anonymous for a
+    reason of its own, and calling it "different accounts" would send a person looking for the
+    wrong mistake."""
+    seen = (f"Jira answered {method} {path} 404 as it does an anonymous request, and GET myself "
+            f"401.")
+    if refused:
+        # THE CREDENTIAL STORE REFUSED IT (#742): "set JIRA_API_TOKEN" would name a variable that
+        # is not read in its place. The refusal names the reference and why, never a value.
+        return (f"jira: the API token for {email} is refused by the credential store — "
+                f"{refused}. {seen} Nothing is used in its place; fix what the refusal names.")
+    if not has_token:
+        # The variable a project that names no `token_env` reads is the credential row's default
+        # (review round 1, 2026-10-19: the sentence named only `token_env`, which such a project
+        # does not have).
+        return (f"jira: no API token reached this tracker for {email} — {seen} Set "
+                f"{SHIPPED_ENV['jira']}, or the variable the project's tracker.options.token_env "
+                f"names.")
+    return (f"jira: the email {email} and the API token belong to different accounts, or the "
+            f"token was revoked — {seen} Pair the email with an API token created by that same "
+            f"account (id.atlassian.com → Security → API tokens), or replace a token that was "
+            f"revoked.")
+
+
+def _jql_since(stamp: str) -> str:
+    """An ISO-8601 timestamp as a JQL date literal — a RELATIVE one, `"-90m"`.
+
+    THE PROVIDER'S OWN TIMESTAMP IS POISON IN ITS OWN QUERY LANGUAGE, and it fails in the worst
+    possible way. `list_tickets` is handed back a value this adapter produced — Jira answers
+    `updated` as `2026-08-05T15:07:22.794+0100` — and JQL does not accept that shape. It does not
+    reject it either. Measured live against a production client's Jira Cloud site, same project,
+    same afternoon:
+
+        updated >= "2026-08-05 11:00"        →  200, DAR-3, DAR-2
+        updated >= "2026-08-05T11:00:00Z"    →  200, []
+        updated >= "2026-08-05T11:00"        →  200, []
+        updated >= "-3d"                     →  200, DAR-3, DAR-2, DAR-1
+
+    HTTP 200, no error message, an empty page. A board reader whose watermark went through
+    untouched would report "nothing changed" on every refresh for ever, and every caller of
+    `product/board.py` treats a clean empty answer as a fact about the board. That is this
+    codebase's signature collapse — unreadable presenting as empty — arriving through the syntax of
+    a date.
+
+    So the absolute form is never built. `'yyyy-MM-dd HH:mm'` is the shape JQL wants, but bare of a
+    zone it is read in the API USER'S timezone, which is a per-account setting nothing here can
+    see; converting a UTC instant into it is wrong by that offset, and the direction of the error
+    decides between re-reading a few cards twice and never seeing them again. A relative window
+    carries no timezone at all, so it cannot be wrong in either direction.
+
+    ROUNDED UP, WITH A MINUTE OF SLACK, because JQL's finest relative unit is the minute and an
+    over-wide window costs a few rows the caller was going to merge by ref anyway, while a
+    too-narrow one silently drops the ticket somebody just touched.
+
+    A stamp that cannot be parsed DROPS THE CLAUSE — the read becomes a full one, logged. The other
+    branch (pass it through and hope) is the silent-empty above; a full read is merely expensive.
+    """
+    text = str(stamp or "").strip()
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        log.warning("the watermark %r is not a timestamp this adapter can convert into JQL — "
+                    "reading the WHOLE board instead of the changes. That is slower and correct; "
+                    "passing it through would have matched nothing at all", stamp)
+        return ""
+    if moment.tzinfo is None:
+        # a naive stamp is treated as UTC rather than as local time: the worker's timezone is not
+        # the client's, and guessing local is how a window comes out hours short on one deployment
+        moment = moment.replace(tzinfo=UTC)
+    elapsed = (datetime.now(UTC) - moment).total_seconds()
+    if elapsed < 0:
+        # a watermark from the future means somebody's clock disagrees; the safe reading is "since
+        # right about now", never a negative window, which JQL would read as a date in the future
+        log.warning("the watermark %r is in the future — reading the last minute rather than "
+                    "trusting it", stamp)
+        return "-1m"
+    return f"-{int(elapsed // 60) + 1}m"
+
+
+def within_scope(where: str, scope: str) -> str:
+    """`where` narrowed to the project's `scope_jql` — `where AND (<scope>)` — or `where` unchanged
+    when no scope is declared.
+
+    THE PARENTHESES ARE WHAT "ANDED" MEANS. A scope such as `labels = "bf-api" OR labels =
+    "bf-web"` appended bare would read `project = "DAR" AND labels = "bf-api" OR labels = "bf-web"`,
+    and JQL binds AND tighter than OR: every `bf-web` issue on the whole site. Azure Boards wraps
+    its team area clause the same way (`AzureBoardsBoard._team_area_clause`).
+
+    ONE HELPER FOR THE BOARD AND THE TRACKER, so the reads the poller makes and the reads the panel
+    makes cannot drift into two different slices of the same project (#752).
+
+    `scope` is `JiraTracker.scope_jql`, already stripped where the tracker takes the option: one
+    normalisation, so a mutation of it cannot hide behind a second one (measured: with both, the
+    tracker's `.strip()` could be removed and every test stayed green)."""
+    return f"{where} AND ({scope})" if scope else where
+
+
+def scope_named(scope: str) -> str:
+    """` within scope_jql '<scope>'` for a "could not search" warning, `""` without a scope.
+
+    A condition Jira cannot parse answers 400, which reads as an unreadable board; without the
+    scope in the sentence the person sees "could not search DAR" and looks at the credential.
+    `scope` is the stripped `JiraTracker.scope_jql`, as for `within_scope`."""
+    return f" within scope_jql {scope!r}" if scope else ""
+
+
+class JiraTracker:
+    """Jira Cloud REST v3. Satisfies `TrackerAdapter`."""
+
+    #: WHAT THIS ROW CAN REPORT OF A CHANGE MADE ON JIRA ITSELF (ADR-0055 D8,
+    #: `tracker/base.py::observes`): a close — and why, where the deployment named its "not
+    #: delivered" resolution or status (`_closed_reason`); unnamed, a close reads as finished work —
+    #: a reopen, and a move between the operator's two columns. Not a deletion: a deleted issue
+    #: answers 404 the way one the credential cannot see does. A credential Jira did not accept is
+    #: told apart (`_call` asks `myself`, #749); a deleted card and an invisible one still are not.
+    observes = frozenset({"closed", "reopened", "promoted", "reordered"})
+
+    #: THE LONGEST DESCRIPTION JIRA CLOUD ACCEPTS, in characters (#624; read by the split through
+    #: `getattr`, and the smallest a shipped row declares, so it is also `activities.
+    #: CARD_BODY_LIMIT`). Atlassian's KB on the migration error "the entered text is too long (it
+    #: exceeds the allowed limit of 32,767 characters)": "it's not possible to bypass the 32,767
+    #: character limit for both description and comments" on Cloud (support.atlassian.com/
+    #: atlassian-cloud/kb/commentbodycharacterlimitexceededexception-…, read 2026-10-17).
+    body_limit = 32_767
+
+    def __init__(self, *, site: str, project_key: str, email: str, token: str | None = None,
+                 status_map: dict[str, str] | None = None, issue_type: str = "Task",
+                 not_delivered_resolution: str = "", not_delivered_status: str = "",
+                 intake_status: str = "", language: str | None = None,
+                 scope_jql: str = "", refused: str = "") -> None:
+        self.site = site.rstrip("/")
+        self.project_key = project_key
+        self.email = email
+        self.token = token
+        #: why the credential store refused this tracker's token, when it did (#742): the
+        #: anonymous answer it gets then says the refusal instead of naming a variable to set
+        self.refused = refused
+        self.status_map = status_map or {}
+        #: configurable because Jira localises issue types: a pt-BR site calls it "Tarefa", and a
+        #: hardcoded "Task" would 400 on every create for exactly the clients this is sold to
+        self.issue_type = issue_type or "Task"
+        #: THIS SITE's name for the resolution that means "closed, and the work was not done" —
+        #: `Won't Do`, `Não será feito`, whatever its administrator called it. `""` is the honest
+        #: default and it is not a gap: a literal here would be a name most sites do not have, sent
+        #: on every withdrawn close and refused on every one.
+        self.not_delivered_resolution = str(not_delivered_resolution or "").strip()
+        #: …and its name for the STATUS that means the same, on a site that says it with a column
+        #: of its own rather than with a field (a team-managed project has no screen to carry a
+        #: resolution). `""` for the same reason: `Cancelled` is a name most sites do not have.
+        self.not_delivered_status = str(not_delivered_status or "").strip()
+        #: THIS SITE's name for the status a new issue of `issue_type` is created in — its
+        #: workflow's initial status, which Jira publishes only to an administrator of the workflow
+        #: (#543). `""` = not declared, and the board reads it off the workflow where it can.
+        self.intake_status = str(intake_status or "").strip()
+        #: THIS PROJECT's SLICE OF A SHARED JIRA PROJECT, a JQL condition (`labels = "bf-api"`)
+        #: ANDed onto every search of its issues (#752). About nineteen repositories registered
+        #: against one Jira project each read the whole of it as their queue, and one ticket was
+        #: picked up by three of them in one night (v0.6.0-rc.2). `""` = the whole project, the
+        #: JQL unchanged; whitespace alone is `""`, so a blank YAML value cannot emit `AND ()`.
+        self.scope_jql = str(scope_jql or "").strip()
+        #: The PROJECT's language, for the one sentence this row writes to a person in its own
+        #: name — the note on a card it could not record as not delivered. Everything else it
+        #: posts was composed by its caller, already in that language.
+        self.language = language
+
+    # ---- plumbing -------------------------------------------------------------------------
+
+    def _headers(self) -> dict[str, str]:
+        raw = f"{self.email}:{self.token or ''}".encode()
+        return {
+            "Authorization": f"Basic {base64.b64encode(raw).decode()}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _call(self, method: str, path: str, payload: dict | None = None, *,
+              api: str = "api/3") -> dict:
+        """One REST call. Raises on transport failure so the caller's own park/diagnose path sees
+        it — a tracker that swallowed its errors would let a job report success having written
+        nothing.
+
+        `api` names the REST family under `/rest/` — `api/3` for everything this tracker did until
+        the board learned to rank, `agile/1.0` for the rank endpoint, which lives nowhere else.
+
+        A 404 ASKS `GET myself` ONCE (#749), under `api/3` whatever `api` was, since `myself` lives
+        nowhere else. A 401 there means Jira took the call as nobody's, and the refusal says the
+        email and the token are not one account's (or that no token reached it), with `code=401`.
+        A 2xx, any other status, and a probe that cannot be made keep the 404 exactly as it was.
+        No other answer asks anything. Measured in the tests, requests per call: a card that reads
+        1, a 404 2 (whatever `myself` says); `list_tickets` with issues 1, an empty board whose
+        project answers 2, an empty board whose project 404s 3 (was 2). A slow site can add up to
+        45 s, the probe's own timeout, to a 404 that was already going to fail."""
+        url = f"{self.site}/rest/{api.strip('/')}/{path.lstrip('/')}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:  # noqa: S310 — fixed https site
+                body = resp.read().decode() or "{}"
+            return json.loads(body) if body.strip() else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode()[:300] if hasattr(exc, "read") else ""
+            # Jira Cloud answers a Basic pair whose token is not the email's account as an
+            # ANONYMOUS request: 404 on the issue, never 401 (#749, reported 2026-10-14 against
+            # v0.6.0-rc.2, measured 2026-10-19). Only `myself` says nobody signed in (401), so a
+            # 404 asks it once.
+            if exc.code == 404 and self._who_is_asking():
+                raise JiraRefused(_not_one_account(self.email, method, path,
+                                                   has_token=bool(self.token),
+                                                   refused=self.refused),
+                                  code=401) from exc
+            raise JiraRefused(f"jira {method} {path} failed: {exc.code} {detail}",
+                              code=int(exc.code)) from exc
+
+    def _who_is_asking(self) -> bool:
+        """True only when `GET /rest/api/3/myself`, asked with this tracker's credential, answers
+        401: Jira took the request as nobody's. `api/3` always — `myself` exists under no other
+        family, and the call that 404'd may have been `agile/1.0`. Straight to `urlopen`, not
+        through `_call`, so a `myself` that itself answers 404 cannot ask again.
+
+        A 2xx, any other status, and a probe that could not be made at all are False: the caller
+        then raises the 404 it already had, so a site that cannot answer is never read as a
+        mismatched pair."""
+        req = urllib.request.Request(f"{self.site}/rest/api/3/myself", headers=self._headers(),
+                                     method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=45):  # noqa: S310 — fixed https site
+                return False
+        except urllib.error.HTTPError as exc:
+            return exc.code == 401
+        # URLError, TimeoutError, ConnectionResetError; and what `getresponse()` raises, which
+        # urllib does not wrap: BadStatusLine and LineTooLong are HTTPException, not OSError
+        # (review round 1, 2026-10-19: one replaced the 404 with a non-RuntimeError).
+        except (OSError, http.client.HTTPException) as exc:
+            log.info("jira answered a 404 and GET myself could not be asked (%s) — keeping the "
+                     "404, since nothing says the credential was not accepted", str(exc)[:200])
+            return False
+
+    @staticmethod
+    def _text(adf: dict | None) -> str:
+        """Jira stores rich text as Atlassian Document Format; the framework reads markdown.
+
+        The parser reads markdown shapes: a section is a `## ` line, a criterion a `- ` line. Jira's
+        editor stores exactly those shapes as nodes (`heading`, `bulletList`, `orderedList`), so
+        walking the tree for its text alone lost them: on 2026-10-19 a level-2 heading over a bullet
+        with a `code` run read as `'Acceptance criteria\\nthe \\nx\\n is created'`, and the parser
+        found no criterion (`[]`), so the sizing gate refused the card. This draws each block in the
+        shape the parser reads:
+
+        - a `heading` is `#` × its level (1..6) plus all of its inline text on one line; a missing
+          or out-of-range level is a plain line, never an invented heading;
+        - every list item, bulleted or numbered, nested or not, is a flat `- ` line, the rule
+          `azure_devops._HtmlToMarkdown` already follows, so the vendors agree; the `- ` goes on
+          the item's first line whatever block gives it (a paragraph, a code block, the paragraph
+          after an image); an item's further blocks sit on the lines below it, where lazy
+          continuation (#163) joins them;
+        - a list ends on a blank line, or that same lazy continuation would read the paragraph the
+          editor puts right after a list into its last criterion; the editor's own empty paragraph
+          after a list is that blank, not a second one;
+        - an empty paragraph is a blank line, because `_adf` writes a blank line as one, so a body
+          the factory wrote reads back as it wrote it; a `hardBreak` is a line break.
+
+        Anything else (panels, tables, expands, quotes, a node this walk has never seen) is walked
+        for its blocks rather than assuming a shape: a description written with tables or panels
+        must not come back empty, because that empty body is what the sizing gate would judge."""
+        out: list[str] = []
+        # Index in `out` of the blank line a finished list appended, so the empty paragraph the
+        # editor stores right after a list (KAN-4, recorded 2026-10-19) is not a second blank.
+        list_blank: list[int] = [-1]
+
+        def inline(node) -> str:
+            if isinstance(node, list):
+                return "".join(inline(child) for child in node)
+            if not isinstance(node, dict):
+                return ""
+            kind = node.get("type")
+            if kind == "text":
+                return str(node.get("text", ""))
+            if kind == "hardBreak":
+                return "\n"
+            return inline(node.get("content") or [])
+
+        def item(node) -> None:
+            # The item's first line is its `- `, whatever block gives it: the ADF schema
+            # (@atlaskit/adf-schema 57.7.18, read 2026-10-19) lets a listItem open with a codeBlock
+            # or an image, and drawing `- ` before a first paragraph only read such an item as a
+            # bare line under the one above: `["a make test passes", "c"]`. A nested list draws
+            # its own `- ` lines; an image gives no line, so the paragraph after it opens the item.
+            opened = False
+            for child in node.get("content") or []:
+                kind = child.get("type") if isinstance(child, dict) else None
+                if not opened and kind == "paragraph":
+                    out.append("- " + inline(child))
+                    opened = True
+                    continue
+                start = len(out)
+                blocks(child, nested=True)
+                if not opened and len(out) > start:
+                    if kind not in ("bulletList", "orderedList"):
+                        out[start] = "- " + out[start]
+                    opened = True
+
+        def blocks(node, nested: bool = False) -> None:
+            if isinstance(node, list):
+                for child in node:
+                    blocks(child, nested)
+                return
+            if not isinstance(node, dict):
+                return
+            kind = node.get("type")
+            if kind == "paragraph":
+                line = inline(node)
+                if line == "" and list_blank[0] == len(out) - 1:
+                    list_blank[0] = -1
+                    return
+                out.append(line)
+            elif kind == "heading":
+                level = (node.get("attrs") or {}).get("level")
+                prefix = ("#" * level + " ") if type(level) is int and 1 <= level <= 6 else ""
+                out.append(prefix + inline(node))
+            elif kind in ("bulletList", "orderedList"):
+                for child in node.get("content") or []:
+                    if isinstance(child, dict) and child.get("type") == "listItem":
+                        item(child)
+                    else:
+                        blocks(child, nested=True)
+                if not nested:
+                    out.append("")
+                    list_blank[0] = len(out) - 1
+            elif kind == "codeBlock":
+                out.extend(str(t.get("text", "")) for t in node.get("content") or []
+                           if isinstance(t, dict) and t.get("type") == "text")
+            elif kind == "text":
+                # taskItem and decisionItem content is inline (ADF 57.7.18), so their text nodes
+                # reach the block walk bare: this line is what keeps an action-item list from
+                # reading empty.
+                out.append(str(node.get("text", "")))
+            else:
+                blocks(node.get("content") or [], nested)
+
+        blocks(adf or {})
+        return "\n".join(out).strip()
+
+    @staticmethod
+    def _adf(text: str) -> dict:
+        """Markdown as ADF — one paragraph per line, which is what Jira's API accepts.
+
+        The markdown is sent as written, `## ` and `- ` included, not converted to heading or list
+        nodes; a blank line is an empty paragraph. `_text` reads an empty paragraph back as a blank
+        line and a paragraph as its text, so a body the factory writes reads back byte-identical
+        after `strip()`
+        (`tests/test_what_the_factory_writes_to_jira_reads_back_as_it_wrote_it.py`). Before
+        2026-10-19 the blank lines were dropped on the read, and a split child's last
+        out-of-scope item swallowed the auto-split line below it."""
+        return {
+            "type": "doc", "version": 1,
+            "content": [
+                {"type": "paragraph",
+                 "content": ([{"type": "text", "text": line}] if line else [])}
+                for line in (text or "").splitlines() or [""]
+            ],
+        }
+
+    # ---- the contract ---------------------------------------------------------------------
+
+    def get_ticket(self, ref: str) -> Ticket:
+        """Through `parse_ticket_body`, exactly like GitHub — because `Ticket` is not
+        `{id,title,body}`: it is the parsed contract (objective, acceptance criteria, budget…)
+        that the sizing gate and the executor read. The first version constructed `Ticket(...,
+        body=...)` directly — a field the model does not have, missing two required ones — so
+        EVERY Jira job would have died on its first step with a ValidationError, and the audit
+        found it because `runtime_checkable` checks method NAMES, never what they build."""
+        from beeverforge.adapters.tracker.parse import parse_ticket_body
+
+        data = self._call("GET", f"issue/{ref}")
+        fields = data.get("fields") or {}
+        ticket = parse_ticket_body(
+            id=str(data.get("key", ref)),
+            title=str(fields.get("summary") or ""),
+            body=self._text(fields.get("description")),
+            repo=self.project_key,
+        )
+        # Jira has no `open`/`closed` — it has a workflow status, whose CATEGORY is the vendor's
+        # own answer to "is this finished". `statusCategory.key == "done"` is that, and reading
+        # the category rather than the status NAME is what keeps this working on a board whose
+        # done column is called "Donee", "Entregue" or anything else a client chose.
+        category = (((fields.get("status") or {}).get("statusCategory")) or {}).get("key")
+        ticket.state = "closed" if str(category or "").lower() == "done" else "open"
+        # AND WHY IT CLOSED, BY THE RULE THE SUMMARY USES (#480). Only `_summary` said it, so a
+        # reader that asked for ONE card (the stale-pickup healer, the card's door) read every
+        # closed card as "this tracker does not say", and a card withdrawn on Jira's own screen was
+        # filed as finished work. The same fields answer both reads, so they cannot disagree.
+        ticket.state_reason = self._closed_reason(fields) if ticket.state == "closed" else ""
+        # `reporter` is who the card is FOR — Jira lets it be set to somebody other than the
+        # account that clicked Create, which is `creator`, and the park escalation and the
+        # requester lookup both want the former. `displayName`, for the reason `comments` gives:
+        # this field is read by a person or a model, never written back, and an accountId is
+        # legible to neither. GitHub and Azure Boards both answer None when the vendor did not
+        # say; the third vendor answered None ALWAYS until 2026-09-06 (the slice-2 critique), so
+        # a Jira card could never be routed back to whoever asked for it.
+        ticket.author = (_display(fields.get("reporter")) or _display(fields.get("creator"))
+                         or None)
+        return ticket
+
+    def set_state(self, ref: str, state: JobState, reason: str | None = None, *,
+                  needs_person: bool | None = None) -> bool | None:
+        """Transition the issue, if this deployment mapped the state.
+
+        UNMAPPED IS A NO-OP WITH A WARNING, never a guess: every Jira project has its own workflow,
+        and an invented transition either fails or moves the card somewhere nobody expects.
+
+        `reason` IS NOT WRITTEN (ADR-0055 D6, #414): a transition's comment is the card's door's,
+        the same on every row. This row wrote it for one state of all of them."""
+        match = self._transition_for(ref, state, needs_person=needs_person)
+        if match is None:
+            return False
+        self._call("POST", f"issue/{ref}/transitions", {"transition": {"id": match["id"]}})
+        return True
+
+    def _transition_for(self, ref: str, state: JobState | None = None, *,
+                        needs_person: bool | None = None, status: str = "") -> dict | None:
+        """The transition that takes `ref` to the status this deployment mapped `state` to, or
+        `None` with the warning that says which of the two things is missing. ONE lookup, because a
+        close that records the work as withdrawn posts the same transition `set_state` does with
+        one field more — and a second copy of "how a status is found" is how the two would come to
+        disagree about where Done is.
+
+        `status` IS A NAME THE DEPLOYMENT DECLARED OUTRIGHT, for the one move that is not a job's
+        state (`not_delivered_status`): it skips the map and is found by the same match, so the
+        withdrawn close and `set_state` cannot disagree about a name's case either."""
+        target = str(status or "").strip()
+        if not target:
+            # THE FIRST KEY `status_map` NAMES (#753). A map written before 0.7 names no
+            # `needs_review`, and a person-gated pull request on it goes to Needs Action, as it
+            # did. A mapped `needs_review` whose transition the workflow lacks does NOT fall back
+            # below: the deployment named that status, and the warning there says it is missing.
+            keys = _column_keys(state, needs_person=needs_person)
+            key = next((k for k in keys if self.status_map.get(k)), None)
+            target = self.status_map.get(key or "", "")
+            if not target:
+                log.warning("no jira status mapped for %s (status_map key %r) — the issue stays "
+                            "where it is; add the mapping in the project's tracker options",
+                            state, keys[-1] if keys else None)
+                return None
+        transitions = (self._call("GET", f"issue/{ref}/transitions").get("transitions") or [])
+        match = next((t for t in transitions
+                      if str((t.get("to") or {}).get("name", "")).lower() == target.lower()
+                      or str(t.get("name", "")).lower() == target.lower()), None)
+        if match is None:
+            log.warning("jira issue %s has no transition to %r from its current status — not "
+                        "forcing a workflow it does not have", ref, target)
+            return None
+        return match
+
+    def _refusal_of(self, ref: str, move: dict) -> str:
+        """Post one transition of a withdrawn close: `""` when Jira took it, Jira's OWN WORDS when
+        it answered 400. ONE PLACE, because both words a deployment can name for "not delivered"
+        meet the same rule: a 400 is the site refusing THIS move — a field its screen does not
+        carry, a name it does not have, a validator on the workflow — and the close goes on to the
+        next way of saying it. Any other failure — a credential, a 5xx, a transport error — raises
+        as it always did, and nothing is retried."""
+        try:
+            self._call("POST", f"issue/{ref}/transitions", move)
+        except JiraRefused as exc:
+            if exc.code != 400:
+                raise
+            return str(exc)[:200]
+        return ""
+
+    def comment(self, ref: str, body: str) -> None:
+        self._call("POST", f"issue/{ref}/comment", {"body": self._adf(body)})
+
+    def comments(self, ref: str, *, limit: int = 0) -> list[TicketComment] | None:
+        """`GET issue/{key}/comment`, which answers OLDEST FIRST and — unlike `search/jql` — still
+        carries a `total`, so completeness here is a comparison rather than a walk.
+
+        `limit` is served by asking Jira for `orderBy=-created` and reversing, not by fetching
+        everything and slicing: a ticket that has been argued over for a month is the exact one the
+        tech-lead asks about, and pulling its whole history to keep four comments is a page of ADF
+        per comment for nothing.
+        """
+        try:
+            if limit > 0:
+                page = self._call(
+                    "GET", f"issue/{ref}/comment?maxResults={int(limit)}&orderBy=-created")
+                # newest first on the wire, oldest first out of the port (the contract's promise)
+                rows = list(reversed(page.get("comments") or []))
+            else:
+                rows = self._all_comments(ref)
+        except Exception as exc:  # noqa: BLE001 — an unread thread is None, never []
+            log.warning("could not read the comments of %s (%s) — the caller is being told "
+                        "UNREADABLE, not empty", ref, str(exc)[:200])
+            return None
+        return [
+            TicketComment(
+                # `displayName`, deliberately — see `TicketComment.author`. Jira's writable
+                # identity is an opaque accountId, and this field is read by a model deciding
+                # whether a human already told it something.
+                author=str((c.get("author") or {}).get("displayName") or ""),
+                body=self._text(c.get("body")),
+                created_at=str(c.get("created") or ""),
+            )
+            for c in rows
+        ]
+
+    def _all_comments(self, ref: str) -> list[dict]:
+        """Every comment, paged. `total` is authoritative on this endpoint; the page-count cap is
+        the backstop for a server that keeps answering non-empty pages past it."""
+        rows: list[dict] = []
+        start = 0
+        for _page in range(_MAX_PAGES):
+            page = self._call("GET", f"issue/{ref}/comment?startAt={start}&maxResults={_PAGE}")
+            got = page.get("comments") or []
+            rows.extend(got)
+            start += len(got)
+            total = page.get("total")
+            if not got or not isinstance(total, int) or start >= total:
+                return rows
+        log.warning("stopped reading the comments of %s after %d pages — the answer is the oldest "
+                    "%d and there are more", ref, _MAX_PAGES, len(rows))
+        return rows
+
+    def ticket_url(self, ref: str) -> str:
+        """`<site>/browse/<KEY>` — Jira's own shape. The park alert used to hand a Jira operator
+        a github.com link to an issue that never existed there."""
+        key = (ref or "").strip().lstrip("#")
+        return f"{self.site}/browse/{key}" if key else ""
+
+    def budget(self) -> BudgetAnswer:
+        """Jira Cloud publishes no per-credential quota a probe could read (its throttling is
+        per-tenant and answered with a 429 at the moment it bites), so the honest answer is the
+        declared sentinel — a state the floor and the doctor render as "no budget on this vendor",
+        never a `None` that reads as fine."""
+        return NOT_REPORTED
+
+    def person(self, ref: str) -> dict:
+        """`GET user?accountId=…` — see `TrackerAdapter.person`.
+
+        AN `accountId` IS OPAQUE AND MEANS NOTHING OUTSIDE JIRA, which is exactly why this method
+        exists: the mention path used to hand one to `gh api users/<id>` and get a 404.
+
+        `emailAddress` IS OFTEN ABSENT, and that is a workspace's privacy setting rather than an
+        error — Atlassian omits the field unless the caller has the scope for it. The name alone
+        still identifies the person to a reader and still feeds a conservative match, so a partial
+        answer is returned rather than nothing.
+        """
+        account = (ref or "").strip()
+        if not account:
+            return {}
+        try:
+            data = self._call("GET", f"user?accountId={urllib.parse.quote(account)}")
+        except Exception as exc:  # noqa: BLE001 — a mention is never worth failing a message for
+            log.info("could not look up %s in Jira (%s) — they will be named, not notified",
+                     account, exc)
+            return {"id": account}
+        return {"id": account, "name": data.get("displayName") or "",
+                "email": (data.get("emailAddress") or "").lower()}
+
+    def assignees(self, ref: str) -> list[str]:
+        """Jira has ONE assignee, the protocol speaks in lists — so this is a list of at most one.
+        Callers already treat the first entry as the owner, so the semantics survive."""
+        fields = (self._call("GET", f"issue/{ref}").get("fields") or {})
+        assignee = fields.get("assignee") or {}
+        account = assignee.get("accountId")
+        return [account] if account else []
+
+    def set_assignees(self, ref: str, logins: list[str]) -> None:
+        account = logins[0] if logins else None
+        self._call("PUT", f"issue/{ref}",
+                   {"fields": {"assignee": {"accountId": account} if account else None}})
+
+    @staticmethod
+    def jira_label(label: str) -> str:
+        """The platform's label in the shape THIS provider accepts.
+
+        JIRA LABELS CANNOT CONTAIN SPACES, and the platform's marker was `🤖 sdlc-working` —
+        GitHub-shaped, because GitHub is where it was written. Jira answers 400 *"A categoria
+        '🤖 sdlc-working' não pode…"*, the caller swallows it (labelling is best-effort by
+        design), and the marker that says a ticket is being worked on simply never appears on a
+        Jira board. Found live on the first Jira ticket this platform ever ran (DAR-2, F-02,
+        2026-08-05).
+
+        The emoji is kept — Jira accepts it, and it is what makes the marker legible at a glance
+        on a board full of human labels. Only the space, which Jira treats as a separator, is
+        closed up."""
+        return "-".join((label or "").split()) or "beeverforge"
+
+    def add_label(self, ref: str, label: str) -> None:
+        self._call("PUT", f"issue/{ref}",
+                   {"update": {"labels": [{"add": self.jira_label(label)}]}})
+
+    def remove_label(self, ref: str, label: str) -> None:
+        self._call("PUT", f"issue/{ref}",
+                   {"update": {"labels": [{"remove": self.jira_label(label)}]}})
+
+    def intake_state(self) -> str:
+        """The workflow's INITIAL status as the deployment declared it (`intake_status`), or `""`:
+        a Jira issue is born there, whatever this deployment calls its backlog (#543). See
+        `board.base.intake`.
+
+        JIRA'S CREATE TAKES NO STATUS. `POST issue` has no field for one; the `transition` it also
+        accepts is applied to the issue once it exists, by an id only an existing issue's
+        transitions name (Atlassian's documentation — not tried against a live site) — a move
+        AFTER the create, which is what #536 refused on Azure: the card sits in the initial status
+        between the two, and stays there whenever the move fails. So this row cannot do what the
+        Azure row does with `state_map`, and says so: the board names the initial status
+        (`JiraProjectBoard.intake_column`), and where that is the queue the deployment gives the
+        queue a status of its own — the line `beeverforge doctor` hands over.
+
+        A DECLARATION, NOT A CHOICE: `intake_status` moves nothing Jira creates. It says which
+        status the workflow starts an issue in, because Jira publishes that only to whoever
+        administers the workflow — and a workflow with two statuses an issue could start in cannot
+        be read without it (review of #552). The board checks it against the type's statuses."""
+        return self.intake_status
+
+    def create_ticket(self, *, title: str, body: str) -> str:
+        created = self._call("POST", "issue", {
+            "fields": {
+                "project": {"key": self.project_key},
+                "summary": title,
+                "description": self._adf(body),
+                "issuetype": {"name": self.issue_type},
+            },
+        })
+        return str(created.get("key") or "")
+
+    def find_ticket(self, *, title: str) -> str | None:
+        """An OPEN issue with exactly this summary. JQL escaping matters here: a title with a
+        quote in it would otherwise break the query — or, worse, match the wrong issue.
+
+        WITHIN `scope_jql`, because this is the idempotency check of every impediment, every
+        product filing and every split child: unscoped, an open issue with the same summary
+        anywhere in a Jira project shared by several registry projects was read as this project's
+        earlier filing, and its work was attached to another project's ticket (#752). Within the
+        slice it finds only this project's — which is why the factory's new tickets must land
+        inside the scope (docs/reference/configuration.md)."""
+        escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+        # within the project's slice: unscoped, an open issue outside it with the same title was
+        # read as this project's earlier filing and reused (#752)
+        jql = (within_scope(f'project = "{self.project_key}"', self.scope_jql)
+               + f' AND statusCategory != Done AND summary ~ "\\"{escaped}\\""')
+        # `~` is PHRASE search, not equality — Jira has no exact-match operator for summary — so
+        # the page is wide and the equality check happens here. At 5 results the exact match
+        # could sit on page two whenever one title prefixes others (the split parent prefixing
+        # its children is the guaranteed case), find_ticket would answer None, and the splitter's
+        # idempotency — this method's entire reason to exist — would file a duplicate.
+        found = self._call("POST", "search/jql", {"jql": jql, "maxResults": 50,
+                                                  "fields": ["summary"]})
+        for issue in found.get("issues") or []:
+            if str((issue.get("fields") or {}).get("summary", "")).strip() == title.strip():
+                return str(issue.get("key"))
+        return None
+
+    #: The fields one board row is built from. Asked for BY NAME because `search/jql` returns only
+    #: `id`/`key`/`self` otherwise — a page of issues with no summary and no status, which parses
+    #: into a board of blank cards rather than into an error.
+    #: `resolution` is here for `_closed_reason` and for nothing else: a field that is not asked
+    #: for is not answered, and a withdrawn card would read as delivered for want of one word.
+    _LIST_FIELDS = ["summary", "description", "status", "resolution", "labels", "assignee",
+                    "updated"]
+
+    def list_tickets(self, *, state: str = "all", updated_since: str = "",
+                     limit: int = 0) -> list[TicketSummary] | None:
+        """The project's issues through `search/jql`, newest-updated first.
+
+        `/rest/api/3/search` IS GONE — 410, *"A API solicitada foi removida. Migre para
+        /rest/api/3/search/jql"* (called live, 2026-08-06). The replacement is token-paginated and
+        **returns no `total`**, so how much of the board this saw is knowable only from `isLast`,
+        and that is what the loop below reads. A page walk that stopped on a short page instead
+        would report a partial board as a whole one.
+
+        OPEN VERSUS CLOSED IS `statusCategory`, NEVER A STATUS NAME — the same rule `get_ticket`
+        follows, and the reason this deployment's Jira board can have a done column spelled
+        "Donee" (it does) without the platform reading live work as delivered.
+
+        WITHIN `scope_jql`: the panel, the product role and `forget` read this project's slice of
+        a Jira project it may share with other registry projects, not the whole of it (#752).
+        The emptiness check after the walk stays unscoped — see `_project_exists`.
+        """
+        wanted = list_state(state)
+        # the project's slice of a shared Jira project, not all of it (#752)
+        clauses = [within_scope(f'project = "{self.project_key}"', self.scope_jql)]
+        if wanted == "open":
+            clauses.append("statusCategory != Done")
+        elif wanted == "closed":
+            clauses.append("statusCategory = Done")
+        since = _jql_since(updated_since)
+        if since:
+            clauses.append(f'updated >= "{since}"')
+        jql = " AND ".join(clauses) + " ORDER BY updated DESC"
+
+        rows: list[dict] = []
+        token: str | None = None
+        try:
+            for page_number in range(_MAX_PAGES):
+                payload: dict = {"jql": jql, "fields": self._LIST_FIELDS,
+                                 "maxResults": min(limit, _PAGE) if limit > 0 else _PAGE}
+                if token:
+                    payload["nextPageToken"] = token
+                page = self._call("POST", "search/jql", payload)
+                rows.extend(page.get("issues") or [])
+                token = page.get("nextPageToken")
+                if page.get("isLast") or not token or (0 < limit <= len(rows)):
+                    break
+                if page_number == _MAX_PAGES - 1:
+                    log.warning("stopped listing %s after %d pages (%d issues) and the board says "
+                                "there is more — the caller is about to judge a partial board",
+                                self.project_key, _MAX_PAGES, len(rows))
+        except Exception as exc:  # noqa: BLE001 — an unread board is None, never []
+            # the scope is named: a condition Jira cannot parse answers 400 and lands here (#752)
+            log.warning("could not list the tickets of %s%s (%s) — the caller is being told "
+                        "UNREADABLE, not empty", self.project_key, scope_named(self.scope_jql),
+                        str(exc)[:200])
+            return None
+
+        if not rows and not self._project_exists():
+            return None
+
+        found = [self._summary(issue) for issue in rows]
+        # already ORDER BY updated DESC on the wire; sorted again so the port's promise does not
+        # depend on a clause a future edit could drop
+        found.sort(key=lambda t: t.updated_at, reverse=True)
+        return found[:limit] if limit > 0 else found
+
+    def _project_exists(self) -> bool:
+        """Whether this deployment's `project_key` names a real, visible Jira project.
+
+        ASKED ONLY WHEN THE BOARD CAME BACK EMPTY, AND THAT IS THE WHOLE POINT. Measured live
+        against a production client's Jira Cloud site:
+
+            POST search/jql  {"jql": 'project = "DAR"  ORDER BY updated DESC'}  →  200, 3 issues
+            POST search/jql  {"jql": 'project = "NOPE" ORDER BY updated DESC'}  →  200, []
+
+        A project key that does not exist is not an error on this endpoint — it is an empty page.
+        So a typo in one registry row, or a token that lost Browse Projects on the client's
+        project, arrives at `product/board.py` as *the board is empty*, and every caller there
+        treats that as a fact: "nothing is queued", "no findings", "the open questions resolved
+        themselves". All three of those sentences have already been produced by this platform from
+        a board it could not read.
+
+        The cost is one extra request per EMPTY answer and none at all otherwise: a board that
+        returned issues has proved its own existence. `GET project/{key}` answers 404 for both the
+        missing project and the invisible one, which are the same answer to the only question being
+        asked — can this deployment see the board it is configured for. A typo, or a token that
+        lost Browse Projects, is still that 404. A pair Jira does not accept arrives instead as
+        the 401 refusal `_call` raises after asking `myself` (#749; measured 2026-10-19, a
+        mismatched pair's bounded `search/jql` is 200 and empty and `project/<KEY>` is 404): the
+        log line names the pair, the board still reads as None, and the empty board costs 3
+        requests instead of 2.
+
+        UNSCOPED BY `scope_jql`, deliberately: a slice with nothing in it is an empty board of a
+        project that exists, not a missing project. Asking "does the slice exist" would read every
+        empty slice as unreadable (the review of #258 named this; #752 keeps it).
+        """
+        try:
+            self._call("GET", f"project/{self.project_key}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("jira answered no issues for %r AND cannot show the project itself (%s) — "
+                        "reporting the board as UNREADABLE rather than as empty",
+                        self.project_key, str(exc)[:200])
+            return False
+        return True
+
+    def _summary(self, issue: dict) -> TicketSummary:
+        fields = issue.get("fields") or {}
+        category = (((fields.get("status") or {}).get("statusCategory")) or {}).get("key")
+        closed = str(category or "").lower() == "done"
+        assignee = (fields.get("assignee") or {}).get("accountId")
+        return TicketSummary(
+            ref=str(issue.get("key") or ""),
+            title=str(fields.get("summary") or ""),
+            body=self._text(fields.get("description")),
+            state="closed" if closed else "open",
+            state_reason=self._closed_reason(fields) if closed else "",
+            labels=[str(x) for x in (fields.get("labels") or [])],
+            assignees=[str(assignee)] if assignee else [],
+            updated_at=str(fields.get("updated") or ""),
+        )
+
+    def _closed_reason(self, fields: dict) -> str:
+        """`"not_planned"` when the card carries the resolution, or sits in the status, THIS
+        DEPLOYMENT named as "not delivered"; `""` for every other closed card.
+
+        A RESOLUTION IS A NAME A SITE ADMINISTRATOR CHOSE ("Won't Do", "Duplicate", "Não será
+        feito"), and deciding delivery from a name this module GUESSED is the thing `statusCategory`
+        is used everywhere else to avoid. That is why this answered `""` for every card until #203,
+        and why it still does for a deployment that configured nothing. A name the deployment
+        DECLARED is a different thing — it is `status_map`'s rule, applied to the other half of a
+        close: the same option `close_ticket(delivered=False)` writes is the one read back here, so
+        the two halves cannot disagree. A person who closes a card as that resolution by hand reads
+        the same way, which is what GitHub's `not planned` has always done.
+
+        NEVER `"completed"`. Any other resolution — `Done`, and equally a `Duplicate` nobody
+        configured — is a name this module was not told the meaning of, so the answer stays the
+        port's "this tracker does not say". `""` reads as delivered downstream on purpose
+        (`triage.Ticket.delivered`): a possible false delivery is traded for never losing a real
+        one.
+
+        THE STATUS IS READ THE SAME WAY, AND EITHER ANSWERS (2026-09-19). A site that says
+        "withdrawn" with a status of its own holds the card IN it, so the read is of where the card
+        is now: moved back out, it stops reading as withdrawn with nothing for anybody to clear —
+        the stale mark `close_ticket` refused a label over cannot happen. A deployment that named
+        both words is answered by whichever the card carries, because a person closing by hand
+        picks either. This is asked only of a CLOSED card (`_summary`): a status of that name which
+        the site files outside its Done category is open work, whatever it is called."""
+        wanted = self.not_delivered_resolution.lower()
+        got = str((fields.get("resolution") or {}).get("name") or "").strip().lower()
+        withdrawn = self.not_delivered_status.lower()
+        sits_in = str((fields.get("status") or {}).get("name") or "").strip().lower()
+        said = (wanted and got == wanted) or (withdrawn and sits_in == withdrawn)
+        return "not_planned" if said else ""
+
+    def update_body(self, ref: str, body: str) -> None:
+        self._call("PUT", f"issue/{ref}", {"fields": {"description": self._adf(body)}})
+
+    def close_ticket(self, ref: str, reason: str, *, delivered: bool = True) -> None:
+        """Close the issue with a final comment: the transition into whatever this deployment
+        mapped to `done`.
+
+        CLOSED IS NOT DELIVERED, and until #203 this row could not say so: it took no `delivered`,
+        so a card an operator withdrew, a duplicate the product owner folded and work that shipped
+        all landed in Done alike — and the product owner's close did not land at all, because it
+        passes the keyword and this signature raised on it.
+
+        `delivered=True` IS UNTOUCHED: the bare transition, no fields. Which resolution the card
+        then shows is the site's workflow's business — a post-function on a company-managed
+        project, automatic on a team-managed one — and nothing here overrides it.
+
+        `delivered=False` sends the SAME transition with `fields.resolution` set to the name this
+        deployment configured (`not_delivered_resolution`). TWO THINGS CAN BE MISSING, and both
+        degrade the way the Azure Boards row does for a process with no Removed state — the card is
+        still closed, a note on it says the work was withdrawn, and a named log line says which
+        option to set:
+
+          - the deployment configured no resolution. There is no default, on purpose: the list is
+            the site's, and a literal `Won't Do` would be refused on every site that spells it
+            otherwise;
+          - Jira refused the field with a 400 — the transition's screen does not carry
+            `resolution` (Atlassian documents team-managed projects as having no such screen),
+            or the site has no resolution of that name. The transition is posted again WITHOUT the
+            field. Any other failure — a credential, a 5xx, a transport error — raises as it
+            always did.
+
+        A CARD CLOSED ON EITHER DEGRADED PATH READS AS DELIVERED DOWNSTREAM, and that is said here
+        rather than papered over. What Jira holds for it is the Done status and the resolution the
+        site's own workflow set, which is exactly what it holds for shipped work; the note is
+        prose, and deciding delivery from a sentence is what `azure_devops._summary` refuses for
+        `System.Reason`. A label written here was considered and rejected: the board adapter and
+        every person with the board open move cards without passing through this class, so nothing
+        would clear it when a withdrawn card is reopened and then really delivered — and it would
+        then hide a real delivery, the failure `TicketSummary.state_reason` ranks as the worse one.
+        Jira clears a resolution on reopen by itself; that is why the resolution is the mechanism.
+
+        SHAPES FROM ATLASSIAN'S REST v3 DOCUMENTATION, NOT FROM A LIVE SITE: `POST
+        issue/{key}/transitions` with `{"transition": {"id"}, "fields": {"resolution": {"name"}}}`,
+        refused as `400 {"errors": {"resolution": "Field 'resolution' cannot be set. It is not on
+        the appropriate screen, or unknown."}}`. A site that answers otherwise lands in the log
+        line below with Jira's own words in it, which is the thing to send back.
+
+        A SITE MAY SAY IT WITH A STATUS INSTEAD, AND THAT ONE IS TRIED FIRST (2026-09-19).
+        `not_delivered_status` names a status of the site's own in the Done category; the withdrawn
+        close is then the BARE transition into it — no field for a screen to refuse, which is why a
+        team-managed project can be told the truth at all. When a deployment names both words, the
+        status is the record and the resolution is what is left for a card whose workflow has no
+        move into that status from where it is: a status is where the site's own people look for
+        withdrawn work, it is read back from where the card IS rather than from a field a workflow
+        may overwrite, and sending the field along with it would bring the screen's refusal back
+        into the one path that has none. THREE THINGS CAN STOP THE STATUS, and each passes the close
+        on to the resolution and then to the degraded path above, saying what it met in the same
+        log line:
+
+          - the workflow offers no transition into it from the card's current status;
+          - the site files that status OUTSIDE its Done category. Moving the card there would
+            answer "closed" for a card every read then shows as open work, so it is not used —
+            asked of the transition's own `to.statusCategory`, and only a category the site
+            actually states can refuse;
+          - Jira answered 400 to the move (a workflow validator). Anything else raises."""
+        if reason:
+            self.comment(ref, reason)
+        if delivered:
+            self.set_state(ref, JobState.DONE)
+            return
+        met: list[str] = []     # what each word this deployment named ran into, for the one line
+        status = self.not_delivered_status
+        into = self._transition_for(ref, status=status) if status else None
+        if into is not None and not _closes_a_card(into):
+            log.warning("jira status %r is not in the site's Done category, so moving %s there "
+                        "would not close it — it is not used for a withdrawn close", status, ref)
+            met.append(f"the status {status!r} is not in the site's Done category, so a card moved "
+                       f"there is still open — name one that is, in `not_delivered_status`")
+        elif into is not None:
+            refused = self._refusal_of(ref, {"transition": {"id": into["id"]}})
+            if not refused:
+                return
+            met.append(f"jira refused the move into the status {status!r} ({refused}) — see what "
+                       f"its workflow asks for, or name another in `not_delivered_status`")
+        elif status:
+            met.append(f"the workflow has no transition into the status {status!r} from where the "
+                       f"issue is — add one, or name another in `not_delivered_status`")
+        match = self._transition_for(ref, JobState.DONE)
+        if match is None:
+            return  # `set_state`'s own contract, and the warning it logs has already said which
+        move = {"transition": {"id": match["id"]}}
+        wanted = self.not_delivered_resolution
+        if wanted:
+            refused = self._refusal_of(ref, {**move, "fields": {"resolution": {"name": wanted}}})
+            if not refused:
+                return
+            met.append(f"jira refused the resolution {wanted!r} on the closing transition "
+                       f"({refused}) — name one this site has, on a transition whose screen "
+                       f"carries the Resolution field, in `not_delivered_resolution`")
+        if not met:
+            met.append("this deployment names no status and no resolution that means 'not "
+                       "delivered' — set `not_delivered_status` (a status in the site's Done "
+                       "category) or `not_delivered_resolution`")
+        landed = str((match.get("to") or {}).get("name") or match.get("name") or "")
+        log.warning("BEEVERFORGE_JIRA_WITHDRAWN_READS_AS_DELIVERED issue=%s: %s (the project's "
+                    "tracker options). The card is closed into %r with a "
+                    "note saying the work was withdrawn, and everything that reads the board will "
+                    "count it as delivered", ref, "; and ".join(met), landed)
+        # IN THE PROJECT'S LANGUAGE, asked of the catalogue (#160): this is the one sentence the
+        # row says to a person in its own name, and one composed here would reach a Portuguese
+        # board in English. `product.voice` imports nothing but the standard library.
+        from beeverforge.product.voice import closed_not_delivered_note
+
+        self.comment(ref, closed_not_delivered_note(status=landed, language=self.language))
+        self._call("POST", f"issue/{ref}/transitions", move)
+
+    def update_title(self, ref: str, title: str) -> None:
+        """Jira calls it `summary`, and that is the whole of the difference."""
+        self._call("PUT", f"issue/{ref}", {"fields": {"summary": (title or "").strip()}})
+
+    def reopen_ticket(self, ref: str) -> None:
+        """The mirror of `close_ticket`: a transition back to whatever this deployment mapped to
+        `todo`. Unmapped stays a no-op with a warning — `set_state`'s own contract, and the reason
+        is the same one it gives: an invented transition either fails or moves the card somewhere
+        nobody expects."""
+        self.set_state(ref, JobState.TODO)
+
+    # ---- optional linkage (ADR-0013 D3) ---------------------------------------------------
+
+    def link_child(self, parent_ref: str, child_ref: str) -> None:
+        """Jira's native parent link. Best-effort by contract: a project whose issue types forbid
+        the link still splits correctly through the deterministic titles."""
+        try:
+            self._call("PUT", f"issue/{child_ref}", {"fields": {"parent": {"key": parent_ref}}})
+        except Exception as exc:  # noqa: BLE001 — the split works without native linkage
+            log.info("could not link %s under %s (%s) — the split still holds through titles",
+                     child_ref, parent_ref, exc)
+
+    def children_of(self, parent_ref: str) -> list[str]:
+        """The keys of `parent_ref`'s children, by `parent = "<KEY>"`.
+
+        Unscoped by `scope_jql`: it reads by the parent's key, not the board, and a child outside
+        the slice is still the parent's child — scoped, the splitter would miss it and fall back
+        to matching by title (#752)."""
+        try:
+            found = self._call("POST", "search/jql",
+                               {"jql": f'parent = "{parent_ref}"', "maxResults": 50,
+                                "fields": ["summary"]})
+            return [str(i.get("key")) for i in (found.get("issues") or []) if i.get("key")]
+        except Exception as exc:  # noqa: BLE001 — "unknown" must never read as "no children"
+            log.warning("could not list the children of %s (%s) — the splitter will fall back to "
+                        "matching by title, which is correct but slower", parent_ref, exc)
+            return []
+
+    # ---- identity, the two optional capabilities (ADR-0049 D7) --------------------------
+    def identity_of(self, subject_id: str) -> str:
+        """`""` — a Jira display name is not a platform id.
+
+        NOT A FAILURE AND NOT A GAP: the bridge between a platform id and this vendor's
+        namespace is a thing the deployment DECLARES (`Project.people`), and the caller
+        reads that map first. A row inventing an answer here would put one person's name
+        on another person's question."""
+        return ""
+
+    def mention(self, login: str) -> str:
+        """The name unchanged — today's answer, now said by the row rather than inferred from
+        the provider's name somewhere else. Jira notifies on an ACCOUNT ID carried in a
+        comment's ADF (`[~accountid:…]`), never on a bare `@name` in text, so an `@`
+        here would be decoration wearing the shape of a notification."""
+        return (login or "").strip()
+
+
+def _closes_a_card(transition: dict) -> bool:
+    """Whether the status this transition leads to is one the site files under Done — the same
+    `statusCategory` that decides open against closed on every read here, asked BEFORE the move
+    instead of after it. ONLY A CATEGORY THE SITE STATES CAN SAY NO: a transition that carries none
+    is not evidence of anything, and refusing on it would disable the option on a site whose answer
+    is merely thinner than the documented one."""
+    category = (((transition.get("to") or {}).get("statusCategory")) or {}).get("key")
+    return not category or str(category).lower() == "done"
+
+
+def _display(value: object) -> str:
+    """The `displayName` of a Jira identity blob, "" when there is none — the readable half, never
+    the accountId (see `TicketComment.author`)."""
+    if isinstance(value, dict):
+        return str(value.get("displayName") or "")
+    return ""

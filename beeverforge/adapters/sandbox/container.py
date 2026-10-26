@@ -1,0 +1,903 @@
+"""ContainerSandbox — the real ephemeral environment (Docker).
+
+Production path (ADR-0001 D-4): the container is where isolation is actually kept.
+
+Design (clone-based, self-contained):
+- On the host, make an ephemeral local clone of the repo (fast, self-contained
+  `.git` — avoids the git-worktree-in-container path problem) on a fresh branch.
+- Bind-mount that clone into a container built from a per-stack base image that
+  already has the toolchain + git + the `claude` CLI. The container sees only
+  `/workspace`, nothing else of the host.
+- A dep-cache volume can be mounted so we don't pay a full install per job
+  (`cache_volume`; unset by default, because sharing a cache across projects is a
+  deployment's decision, not this class's).
+- Auth is injected as env at run time (subscription token or API key), never baked.
+- CPU and memory limits bound the blast radius: `--cpus` and `--memory`, applied on
+  every run.
+
+WHAT THIS BOX DOES **NOT** DO, stated because it used to claim the opposite. These
+lines, and the matching ones in `base.py` and `registry.py`, said the box denied
+egress unless allowed. It does not, and it cannot: `network` defaults to `bridge`,
+which is **full outbound internet**, and it has to be — the harness dials its API and
+the manifest's `setup:` runs `pip install` / `dotnet restore` / `npm ci`. Cutting the
+box off from the internet would break every job.
+
+A false security claim is worse than no claim, because it is consumed as a control:
+somebody deciding what a client's box may touch reads a promise of egress control and
+stops thinking. The true statement is the useful one — **anything the box's network can
+reach is reachable by code the agent wrote** — and a deployment that needs that
+bounded sets `network` to its own egress-restricted network or proxy, which is now a
+knob the registry can actually pass (it constructed this class with `image=` alone,
+so all four of the others were unreachable).
+
+ADR-0037 makes the image the CLIENT's, which turns "what can this box reach?" from a
+theoretical question into one somebody will genuinely ask.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+
+from beeverforge.adapters.sandbox.base import (
+    OutputBuffer,
+    SandboxAdapter,
+    Workspace,
+    run_and_stream,
+)
+from beeverforge.adapters.sandbox.pull import PullCredential
+from beeverforge.observability import logs
+
+log = logging.getLogger("beeverforge.sandbox.container")
+
+_AUTH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+_GATE_SECRET = "BEEVERFORGE_GATE_SECRET"
+_WORKDIR = "/workspace"
+
+#: Where the framework's harness toolbox is mounted inside the box (ADR-0037 D2).
+#:
+#: Under `/opt` and namespaced, because it is grafted into an image the framework does not control
+#: and must not collide with anything a client could reasonably already have there.
+TOOLBOX_MOUNT = "/opt/beeverforge-toolbox"
+
+#: Where the OPERATOR's guidelines directory is mounted inside the box (#318, review of #328).
+#:
+#: Under `/opt` and namespaced for the same reason the toolbox is: it is grafted into an image the
+#: framework does not control. READ-ONLY, because nothing in a job has any business writing to the
+#: organisation's standards, and because the same directory is mounted into every box on the
+#: deployment — one job's edit would be the next job's rules.
+GUIDELINES_MOUNT = "/opt/beeverforge-guidelines"
+
+#: Where `stage_input` puts a file the command line must not carry (#326). UNDER `/tmp`, NOT under
+#: the workspace: the workspace is the bind-mounted clone and the job commits with `git add -A`, so
+#: a prompt staged in the tree would be committed into the ticket's own pull request.
+_INPUT_DIR = "/tmp/beeverforge-input"
+
+
+def _redact(text: str) -> str:
+    return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
+
+
+def _container_name(project: str | None, safe_branch: str) -> str:
+    """A box name that is unique per project and readable in `docker ps`.
+
+    Was `f"sdlc-{safe_branch}"` with the branch `sdlc/<issue>` — so project A's #12 and
+    project B's #12 were both `sdlc-sdlc-12`. One deployment hosts N projects, which makes that
+    a certainty the day a second client is onboarded rather than an edge case.
+
+    Docker accepts `[a-zA-Z0-9][a-zA-Z0-9_.-]*`; registry project names are free text, so anything
+    else collapses to `-`. Readable matters as much as unique: `docker ps` during an incident has
+    to say whose box this is, which is also why the branch's own prefix is dropped rather than
+    repeated — `beeverforge-acme-12`, not `beeverforge-acme-beeverforge-12`. The one thing this
+    name must stay is STABLE across every entry of the same job (a fresh run, a repair, a resume):
+    the panel and `docker ps` find a job's box by it."""
+    tail = safe_branch.removeprefix("beeverforge-") or safe_branch
+    parts = [p for p in ("beeverforge", re.sub(r"[^a-zA-Z0-9_.-]+", "-", project or "").strip("-"),
+                         tail) if p]
+    return "-".join(parts)
+
+
+def _host(cmd: list[str], timeout: int = 120, env: dict[str, str] | None = None) -> tuple[int, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+#: The link-local address a cloud machine's instance metadata — and the tokens of the identity its
+#: platform gave it — is served from, on every major cloud.
+METADATA_ADDRESS = "169.254.169.254"
+
+#: WHAT A METADATA SERVICE SAYS TO A REQUEST THAT CARRIES NO METADATA HEADER — per path, the words
+#: only the service itself answers with. Each request asks for nothing and presents no header, so
+#: no endpoint hands it a token: Azure refuses naming the header it wants, GCP names
+#: `Metadata-Flavor`, AWS lists its index (`ami-id`), or, where only session tokens are accepted,
+#: answers 401. A proxy in the path that cannot reach the address answers with its own refusal,
+#: which says none of these (#376); a proxy that CAN reach it forwards the service's own answer,
+#: which still does.
+_METADATA_ANSWERS = (
+    ("/metadata/instance?api-version=2021-02-01", ("Required metadata header not specified",)),
+    ("/computeMetadata/v1/", ("Metadata-Flavor",)),
+    ("/latest/meta-data/", ("ami-id", " 401 Unauthorized")),
+)
+
+#: THE CONTROL: a path no metadata service serves (review of #377). Asked beside the three, so an
+#: answer that is the same everywhere — something answering for every path, which is a proxy — can
+#: be told from a service answering its own paths in words this build does not know.
+_CONTROL_PATH = "/beeverforge-not-a-metadata-path"
+
+_PROBE_MARK = "@@probe "
+_PROBE_END = "@@end"
+
+
+def _answered_as_metadata(out: str, *, address: str = METADATA_ADDRESS) -> tuple[bool | None, str]:
+    """What the probe's output says about `address`: `(True, "")` a metadata service answered in
+    its own words; `(False, "")` nothing did; `(None, why)` it cannot be said.
+
+    NEVER "SAFE" BY NOT RECOGNISING (review of #377). An answer this build does not know is a
+    service it does not know, or Azure's refusal reworded, and both are a box that reaches a live
+    endpoint; so it is `None`, "could not be measured", which the doctor reports red. `False` is
+    only: no HTTP answer on any metadata path, or one answer for every path, the control included,
+    that names `address` — a proxy saying it could not connect there (Docker Desktop:
+    `403 connecting to 169.254.169.254:80: … unreachable network`, #376)."""
+    if _PROBE_END not in out:
+        return None, "the probe did not run to its end"
+    answers: dict[str, str] = {}
+    for section in out.split(_PROBE_MARK)[1:]:
+        path, _, answer = section.partition("\n")
+        answers[path.strip()] = answer.split(_PROBE_END, 1)[0].strip()
+    for path, words in _METADATA_ANSWERS:
+        if any(word in answers.get(path, "") for word in words):
+            return True, ""
+    spoken = [answers.get(path, "") for path, _ in _METADATA_ANSWERS]
+    spoken = [a for a in spoken if a.startswith("HTTP/")]
+    if not spoken:
+        return False, ""
+    control = answers.get(_CONTROL_PATH, "")
+    if (address in control and control.startswith("HTTP/")
+            and all(a == control for a in spoken)):
+        return False, ""
+    return None, (f"something on {address} answered, in words no metadata service this build knows "
+                  f"uses (`{spoken[0].splitlines()[0][:120]}`)")
+
+
+def metadata_reached(network: str, *, address: str = METADATA_ADDRESS) -> tuple[bool | None, str]:
+    """Whether a container on `network` — the box's — reaches this machine's metadata endpoint,
+    MEASURED now: `(True|False, subnet)`, or `(None, why)` when it could not be measured (#373).
+
+    WHY IT IS ASKED. A deployment that declares the machine's own identity makes that endpoint a
+    credential: whoever reaches it can mint the identity's token, and a box runs agent-written
+    code. Where it reaches, nothing in the box is bounded by the job — so the doctor measures it
+    rather than trusting a note in a setup guide.
+
+    REACHED MEANS THE SERVICE ANSWERED AS ITSELF (`_METADATA_ANSWERS`), not that something spoke
+    HTTP. This counted any status line, and behind Docker Desktop's proxy that was the proxy saying
+    `403 … unreachable network` — a red line and an `iptables` rule on a laptop with no endpoint
+    at all (#376). Plain HTTP over `nc`, because `wget` prints no body on an error status and the
+    service's refusal IS an error status. A throwaway container with no capability and no way to
+    gain one, on the box's network and nothing else.
+
+    `subnet` is the network's, for the remedy: blocking the address for that subnet, on the host,
+    closes it for boxes and leaves the worker — on its own network — its identity. `address` is
+    for the suite, which stands up a service of its own to prove the positive."""
+    # THE PREVIEW'S REACH PROBE'S IMAGE, for the same reason — `sh` and busybox, nothing else.
+    from beeverforge.adapters.preview.compose import UTILITY_IMAGE
+
+    requests = " ".join(f"'{path}'" for path in [p for p, _ in _METADATA_ANSWERS] + [_CONTROL_PATH])
+    script = (f'for p in {requests}; do echo "{_PROBE_MARK}$p"; '
+              f'printf "GET %s HTTP/1.0\\r\\nHost: {address}\\r\\n\\r\\n" "$p" '
+              f'| nc -w 3 {address} 80 2>&1 | head -c 4096; echo; done; echo {_PROBE_END}')
+    try:
+        rc, out = _host(["docker", "run", "--rm", "--network", network, "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges", UTILITY_IMAGE, "sh", "-c", script])
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"docker could not be asked ({type(exc).__name__})"
+    if rc != 0:
+        return None, f"the probe on `{network}` could not run: {out.strip()[:160]}"
+    answered, why = _answered_as_metadata(out, address=address)
+    if answered is None:
+        return None, why
+    try:
+        _, subnet = _host(["docker", "network", "inspect", network, "--format",
+                           "{{range .IPAM.Config}}{{.Subnet}} {{end}}"], timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        subnet = ""
+    return answered, (subnet.split() or [""])[0]
+
+
+def _materialize_workspace(*, repo_path: Path, host_clone: Path, base_branch: str,
+                           branch: str, checkout_existing: bool,
+                           remote_url: str | None = None) -> str | None:
+    """Clone `repo_path` into `host_clone` and put it on `branch` — the box's working tree, and
+    answer the commit the workspace's diff is measured from (`Workspace.base_commit`), or None
+    when there is nothing better to measure from than the base's name.
+
+    EVERY GIT STEP IS CHECKED. None of these exit codes was looked at once, and the failure that
+    produces is the quietest one available: a clone that fails leaves `host_clone` EMPTY, it is
+    bind-mounted as /workspace anyway, `setup:` succeeds against nothing, `pytest` collects
+    nothing and exits 5 — and an agent would be asked to implement a ticket in an empty
+    directory. Found by running `beeverforge box prove` inside the compose worker.
+
+    Module-level, docker-free, so the branch topology is testable against real git repos."""
+    def _must(args: list[str], what: str) -> None:
+        rc, out = _host(args)
+        if rc != 0:
+            raise RuntimeError(f"{what} failed ({rc}): {_redact(out).strip()[:300]}")
+
+    # A clone has its own refs, so a branch a person has out in a working tree of `repo_path` does
+    # not stop it: unlike the worktree box, this one never raises `BranchHeldElsewhere` (#623).
+    _must(["git", "clone", "--no-local", "--", str(repo_path), str(host_clone)],
+          f"cloning {repo_path} into the box's workspace")
+    if checkout_existing:
+        # FETCH THE PR BRANCH FROM THE FORGE, NOT FROM THE CACHE. This clone's `origin` is the
+        # worker's cache DIRECTORY (cloned by path above), which only ever holds the base branch its
+        # syncs check out — the PR branch lives one hop upstream. And the cache's own origin
+        # deliberately carries no credential (agents read that checkout), so reaching through it
+        # cannot work on a private repository either.
+        #
+        # `remote_url` is the forge's authenticated URL, passed as an ARGUMENT so git does not
+        # persist it — the same discipline `publish_branch` uses for the push, and the same one
+        # RepoCache uses for its fetches. It matters here specifically: this clone is
+        # bind-mounted into the box, where untrusted code runs.
+        #
+        # FOUND LIVE (fx-mono#1's adjust, 2026-08-04): "couldn't find remote ref sdlc/1" on a
+        # branch sitting right there on the forge — every container-sandbox CI repair and human
+        # adjust on a private repository failed this way, blaming the branch for a missing
+        # password.
+        source = remote_url or "origin"
+        # A failed fetch here would leave the clone on the BASE branch, so a CI repair would run
+        # against code that does not contain the change it is repairing — hence `_must`.
+        _must(["git", "-C", str(host_clone), "fetch", "--", source,
+               f"+{branch}:refs/remotes/origin/{branch}"],
+              f"fetching the existing branch {branch!r}")
+        _must(["git", "-C", str(host_clone), "checkout", "-B", branch, f"origin/{branch}"],
+              f"checking out {branch!r}")
+        # A REOPENED PULL REQUEST IS MEASURED FROM WHERE IT LEFT THE BASE, as the worktree box
+        # measures it (#168): the base as the forge holds it now, and its merge-base with the work.
+        # A card's own base is not in this clone at all, so the name alone would hand every reader
+        # of the diff a range git cannot resolve (#354).
+        from beeverforge.adapters.sandbox.worktree import _is_this_repo
+
+        if not remote_url or _is_this_repo(remote_url, repo_path):
+            return None
+        _read_the_forges_base(host_clone, base_branch, remote_url)
+        rc, out = _host(["git", "-C", str(host_clone), "merge-base", "FETCH_HEAD", "HEAD"])
+        # No common history is a branch that never came from this base — nothing to measure from,
+        # and `base_branch` is then read as it always was.
+        return out.strip() if rc == 0 else None
+    _must(["git", "-C", str(host_clone), "checkout", "-b", branch,
+           _the_base(host_clone, base_branch, remote_url, repo_path)],
+          f"creating {branch!r} from {base_branch!r}")
+    # THE COMMIT, NOT THE NAME (#354). A base read from the forge is `FETCH_HEAD`, which no ref
+    # keeps, so a diff spelled `<base_branch>..HEAD` inside the box died on "unknown revision" and
+    # a stacked job was judged on no diff at all: `diff_unreadable`, its risk and protected-path
+    # checks taken on an empty list (review of #355). Recorded for every fresh job, so what a job
+    # is measured from never depends on which refs its clone happens to carry.
+    rc, out = _host(["git", "-C", str(host_clone), "rev-parse", "HEAD"])
+    return out.strip() if rc == 0 else None
+
+
+def _the_base(host_clone: Path, base_branch: str, remote_url: str | None, repo_path: Path) -> str:
+    """What a fresh job's branch is cut from: the base it was handed, wherever it is (#354).
+
+    The clone is made from the worker's cache, which is synced to the manifest's base alone, so a
+    card's `base_branch` — stacked work, starting from a predecessor still in review — is not in
+    it, and `checkout -b` died on "is not a commit". With a forge, the base is read from the forge;
+    with none, from the clone (a branch of it, or one the cache held as `origin/<base>`). A base
+    neither has is refused BY NAME, and never replaced by another: running against a base the card
+    did not name is the defect.
+
+    THE FORGE FIRST WHEN THERE IS ONE, as the worktree box does (#168). A ref that resolves in this
+    clone came from the cache, and the cache refreshes the MANIFEST's base alone: its copy of any
+    other branch is as old as the cache's last touch of it — the old base after the manifest's
+    changed, the forge's default branch when the manifest names another. Trusting it started the
+    job from code no longer on the base, silently (review of #355). The clone's own refs are read
+    only where there is no forge to be behind."""
+    from beeverforge.adapters.sandbox.worktree import _is_this_repo, no_such_base
+
+    if not remote_url or _is_this_repo(remote_url, repo_path):
+        # THROUGH `_host`, like every other git step of this box, so there is one door to the host
+        for rev in (base_branch, f"origin/{base_branch}"):
+            rc, _ = _host(["git", "-C", str(host_clone), "rev-parse", "--verify", "--quiet",
+                           f"{rev}^{{commit}}"])
+            if rc == 0:
+                return rev
+        raise RuntimeError(no_such_base(base_branch, str(repo_path)))
+    _read_the_forges_base(host_clone, base_branch, remote_url)
+    return "FETCH_HEAD"
+
+
+def _read_the_forges_base(host_clone: Path, base_branch: str, remote_url: str) -> None:
+    """Fetch `base_branch` from the forge into the clone's `FETCH_HEAD`, or refuse the job saying
+    why: a branch the forge does not have BY NAME, anything else in git's own words. Nothing after
+    `prepare` can succeed without the forge — the job ends by pushing to it — so refusing here
+    costs nothing the job could have kept, and it refuses before an agent has spent anything."""
+    from beeverforge.adapters.sandbox.worktree import _remote_has_no_such_branch, no_such_base
+
+    rc, out = _host(["git", "-C", str(host_clone), "fetch", "--", remote_url,
+                     f"refs/heads/{base_branch}"])
+    if rc != 0:
+        if _remote_has_no_such_branch(out):
+            raise RuntimeError(no_such_base(base_branch, "the forge"))
+        raise RuntimeError(f"could not read {base_branch!r} from the forge, the base this job "
+                           f"starts from and is measured against: {_redact(out).strip()[:300]}")
+
+
+#: Said after a refused `docker run` whose daemon had no init to give the box (#532): Docker ships
+#: one, and podman's docker-compatible socket needs `catatonit` and refuses the run without it.
+_NO_INIT_BINARY = (" — the box is started with `--init` (#532), and this daemon has no init binary "
+                   "to give it: on podman, install `catatonit`")
+
+
+class ContainerSandbox(SandboxAdapter):
+    def __init__(
+        self,
+        *,
+        image: str,
+        #: WHOSE box this is. One deployment hosts N projects and issue numbers are
+        #: per-repository, so the container name needs the project or two clients' ticket #12 are
+        #: the same container. Optional because the CLI and the tests construct boxes without a
+        #: project and a required argument would be a migration for no safety gain — the exit-code
+        #: check in `prepare` is what makes a collision loud either way.
+        project: str | None = None,
+        #: The docker VOLUME (or host path) holding the framework's harness toolbox, mounted
+        #: read-only at `TOOLBOX_MOUNT`. A NAME rather than a path by default, and that is not a
+        #: preference: the compose worker is itself a container issuing `docker run` against the
+        #: HOST's daemon, so a `-v /var/lib/beeverforge-toolbox` it passes is resolved on the host,
+        #: where
+        #: that path does not exist — Docker creates an empty directory and the box gets an empty
+        #: toolbox, in silence. A named volume is the daemon's own object and behaves identically
+        #: from a containerised or a bare-metal worker.
+        toolbox: str | None = None,
+        cache_volume: str | None = None,
+        cpus: str = "2",
+        memory: str = "4g",
+        network: str = "bridge",
+        #: NAMES of extra environment variables to pass through (registry `box.env`) — the
+        #: harness-provider and scanner credentials a deployment's own auth shape needs. Values
+        #: travel by docker's `-e VAR` pass-through form, exactly like `_AUTH_ENV_VARS`: never on
+        #: a command line, never in a log. VALIDATED because each name becomes a `docker` argument
+        #: — a "name" with a space or an `=` would smuggle a value (or an option) into the
+        #: command, and this list is configuration, not code review.
+        extra_env: tuple[str, ...] = (),
+        #: The OPERATOR's guidelines directory on the HOST, mounted read-only at
+        #: `GUIDELINES_MOUNT` so the agent can open a `reference/` document the index names
+        #: (#318, review of #328). A deployment fact like `toolbox` above — read from the
+        #: environment by the composition root, never from a project, for the supply-chain reason
+        #: the setting itself is operator-only. A host PATH rather than a volume name, because it
+        #: is the operator's own checkout of their standards; on a containerised worker it has to
+        #: be a path the HOST's daemon can resolve, exactly as the workspace bind does.
+        guidelines: str | None = None,
+        #: The image's PULL CREDENTIAL (registry `box.pull_credential` / `box.pull_username`,
+        #: #742): a reference resolved through the credential store for the one pull that needs
+        #: it, and never passed into the box. None → the daemon pulls as it always did.
+        pull_credential: PullCredential | None = None,
+    ) -> None:
+        bad = [v for v in extra_env if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", v or "")]
+        if bad:
+            raise ValueError(
+                f"box.env entries must be environment variable NAMES, got {bad!r} — a value or "
+                "an option here would ride straight into the docker command line")
+        # THE GATE KEY NEVER ENTERS A BOX (`gate_seal`): job code holding it could seal its own
+        # production approval. Refused by name rather than dropped, so the list says what it does.
+        if _GATE_SECRET in extra_env:
+            raise ValueError(
+                f"box.env may not carry {_GATE_SECRET} — it is the key a production approval is "
+                "sealed with, and a job holding it could approve its own release")
+        self.image = image
+        self.project = project
+        self.toolbox = toolbox
+        self.cache_volume = cache_volume
+        self.cpus = cpus
+        self.memory = memory
+        self.network = network
+        self.extra_env = tuple(extra_env)
+        self.guidelines = (guidelines or "").strip()
+        self.pull_credential = pull_credential
+        # concurrency = 1 for now, so a single-job handle on the instance is fine.
+        self._container: str | None = None
+        self._host_clone: Path | None = None
+        self._repo_path: Path | None = None
+        #: The box's own HOME, ASKED once per container (see `_box_home`). `None` = not asked yet,
+        #: `""` = asked and unanswerable.
+        self._home: str | None = None
+        #: What the command currently running has written — the buffer `tail()` reads (C-39). One
+        #: per box for the same reason as the handle above: one job at a time.
+        self._output = OutputBuffer()
+
+
+    def guidelines_path(self, host_dir: Path) -> str | None:
+        """Where the operator's guidelines are readable FROM INSIDE THIS BOX (#318).
+
+        `GUIDELINES_MOUNT` when this box mounted THAT directory, and None otherwise — including
+        when the deployment configured one and the box was built without it, because answering
+        with a path nothing is mounted at would advertise documents the agent then cannot open.
+        The comparison is on the RESOLVED paths: a symlinked or relative spelling of the same
+        directory is the same directory, and anything else is a different one.
+        """
+        if not self.guidelines:
+            return None
+        try:
+            if Path(self.guidelines).resolve() != Path(host_dir).resolve():
+                return None
+        except OSError:
+            return None
+        return GUIDELINES_MOUNT
+
+    def stage_input(self, *, workspace: Workspace, text: str) -> str | None:
+        """Put `text` in a file inside this box, and return the path IN THE BOX (#326).
+
+        The container's half of the capability `worktree.py::stage_input` documents: a command
+        reaches a box as one shell string, an argument is capped at 128 KiB by
+        `MAX_ARG_STRLEN`, and a project with large documents therefore dies with
+        `OSError: [Errno 7] Argument list too long` before the harness starts. A caller stages the
+        text and puts a short path on the command line instead.
+
+        `docker cp` RATHER THAN A MOUNT, for `export_home_dir`'s reason: the worker may itself be a
+        container issuing commands against the HOST's daemon, so a path it invents is not a path
+        the daemon can resolve. And under `/tmp`, never under the workspace — the workspace is the
+        bind-mounted clone, and `git add -A` would carry a staged prompt into the pull request.
+
+        An OPTIONAL capability, reached by `getattr`, and deliberately NOT on the
+        `@runtime_checkable` `SandboxAdapter`: a method on the port is instantly required of every
+        box, including one from an add-on package, and of every double in the suite.
+
+        `None` when there is no box yet or the copy fails — the caller then keeps the command line
+        it has."""
+        if not self._container:
+            return None
+        target = f"{_INPUT_DIR}/prompt-{uuid.uuid4().hex}.txt"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                host = Path(tmp) / "prompt.txt"
+                host.write_text(text, encoding="utf-8")
+                self._quiet_host(["docker", "exec", self._container, "mkdir", "-p", _INPUT_DIR])
+                rc, out = self._quiet_host(
+                    ["docker", "cp", str(host), f"{self._container}:{target}"],
+                    timeout=self._TRANSFER_TIMEOUT)
+        except (OSError, ValueError) as exc:  # a box that cannot stage degrades, never crashes
+            # `ValueError` for `write_text`'s `UnicodeEncodeError` on a lone surrogate — the same
+            # promise the worktree box's half keeps, for the same reason (review of #349).
+            log.warning("could not stage %d characters into the box %s (%s)",
+                        len(text or ""), self._container, exc)
+            return None
+        if rc != 0:
+            log.warning("could not stage %d characters into the box %s (%s)",
+                        len(text or ""), self._container, (out or "").strip()[:160])
+            return None
+        return target
+
+    def _pull_if_absent(self) -> None:
+        """Pull the image with the project's pull credential when the daemon does not hold it.
+
+        ONLY WHEN IT IS ABSENT, which is exactly when `docker run` would have pulled it — so a
+        project that declares a credential runs the same image it ran before, and the tag a proof
+        was taken against does not move under it (ADR-0037 D5). RAISES naming the registry
+        reference, never the secret, before anything else is created."""
+        if self.pull_credential is None:
+            return
+        if _host(["docker", "image", "inspect", self.image])[0] == 0:
+            return
+        from beeverforge.adapters.sandbox.pull import pull
+
+        pulled, said = pull(self.image, self.pull_credential)
+        if not pulled:
+            raise RuntimeError(f"could not pull the box image {self.image!r} with the project's "
+                               f"pull credential `{self.pull_credential.reference}`: {said}")
+
+    def _passthrough(self) -> dict[str, str]:
+        """`{name: value}` of what crosses into the box right now: the harness defaults plus this
+        project's own `box.env`, deduplicated, only when one ANSWERS.
+
+        Asked again at every call on purpose — the token pool rotates os.environ between execs,
+        and a snapshot taken at prepare() would keep exec'ing with a dead credential (the audit
+        that made run() re-read _AUTH_ENV_VARS applies to these too).
+
+        THROUGH THE CREDENTIAL STORE (#742). A `box.env` name is a deployment credential, so one
+        held in a mounted file crosses as well as a variable does. A harness default is first the
+        value this process holds, because the harness adapter puts the token it chose from the
+        pool there (`claude_code._apply_token`) and a file must not undo a rotation; the store
+        answers for it only when nothing has. The values reach `docker` in its own environment,
+        for the `-e NAME` form to read: never on a command line, never in a log.
+
+        A NAME THE STORE REFUSES DOES NOT CROSS AT ALL (review of #822), whatever the variable of
+        that name holds: the refusal is the answer, and a variable in its place is the fallback a
+        refusal never is. The worktree box withholds the same names (`worktree._scrubbed_env`)."""
+        from beeverforge.adapters.credential_store.registry import ENV, look, lookup
+
+        seen: dict[str, str] = {}
+        for var in _AUTH_ENV_VARS:
+            if var in seen or (found := lookup(var)).refused:
+                continue
+            # `env:<var>` FIRST, BY ITS REFERENCE: the value this process holds, which is the token
+            # the pool rotated to — asked of the store's environment row, so the read says what it
+            # is and the sweep over the package holds every other read to the declared store.
+            if value := look(f"{ENV}:{var}").value or found.value:
+                seen[var] = value
+        for var in self.extra_env:
+            if var not in seen and (value := lookup(var).value):
+                seen[var] = value
+        return seen
+
+    def _passthrough_env(self) -> list[str]:
+        """Which variable NAMES cross into the box right now — `_passthrough`'s keys."""
+        return list(self._passthrough())
+
+    def _client_env(self, passing: dict[str, str]) -> dict[str, str] | None:
+        """The environment the `docker` client runs with, so `-e NAME` reads each value
+        `_passthrough` resolved; None — inherit as before — when every one is already there."""
+        if all(os.environ.get(k) == v for k, v in passing.items()):
+            return None
+        return {**os.environ, **passing}
+
+    def prepare(
+        self, *, repo_path: Path, base_branch: str, branch: str, checkout_existing: bool = False,
+        remote_url: str | None = None,
+    ) -> Workspace:
+        """See `_materialize_workspace` for the git steps — factored out so the branch topology
+        is testable without a docker daemon."""
+        safe = branch.replace("/", "-")
+        self._repo_path = repo_path
+        self._pull_if_absent()
+        # WHERE the clone lives decides whether the box can see it at all. `docker run -v <path>`
+        # is resolved by the DAEMON, and under docker-out-of-docker the worker is itself a
+        # container: a `mkdtemp()` path exists in the worker and NOT on the host, so Docker
+        # creates an empty directory and mounts that. Measured on the compose stack — the worker
+        # made /tmp/probe-Eguu and the box saw 0 entries — which means every job would have run
+        # against an empty workspace, with the agent asked to implement a ticket in nothing.
+        #
+        # `BEEVERFORGE_WORK_DIR` is a directory bound at the SAME absolute path on both sides, so a
+        # path
+        # the worker creates means the same thing to the daemon. Unset is today's behaviour and is
+        # correct for a bare-metal worker, which shares a filesystem with its daemon.
+        work_dir = (os.environ.get("BEEVERFORGE_WORK_DIR") or "").strip()
+        if work_dir:
+            Path(work_dir).mkdir(parents=True, exist_ok=True)
+        host_clone = Path(tempfile.mkdtemp(prefix=f"beeverforge-{safe}-", dir=work_dir or None))
+        base_commit = _materialize_workspace(repo_path=repo_path, host_clone=host_clone,
+                                             base_branch=base_branch, branch=branch,
+                                             checkout_existing=checkout_existing,
+                                             remote_url=remote_url)
+
+        cname = _container_name(self.project, safe)
+        # A LEFTOVER WEARING OUR NAME IS DEBRIS, NOT A NEIGHBOUR (#165). The worker dying under an
+        # attempt — a deploy's SIGTERM, an OOM kill — orphans the box on the host daemon
+        # (docker-out-of-docker: the supervisor dies, its child does not), and the NEXT attempt
+        # then collides with the corpse's name and refuses. The refusal below is right for every
+        # other cause; for this one it turned a self-healing resume into a second park on the
+        # pilot, with the orphan still burning an agent unsupervised. The name is derived from
+        # (project, issue) and attempts are serial by construction (single-line floor), so a
+        # container wearing it as we start CANNOT be a live sibling. A PROOF is not an attempt and
+        # no floor serializes it: its name comes from the key's own branch, and what keeps a
+        # second proof of one key off it is the per-key lock `box_probes` takes before it builds
+        # a box. Without that lock, a second proof of one key reaches this line wearing the first
+        # one's name and removes its live container (#745, read here; the worktree box's twin,
+        # its tree removed, was measured). Reattaching is not an option
+        # on a non-idempotent box (it may be mid-write on the same branch this attempt will use) —
+        # remove it, out loud.
+        probe_rc, _ = _host(["docker", "inspect", "--format", "{{.Id}}", cname])
+        if probe_rc == 0:
+            logs.announce(log, f"BEEVERFORGE: removing the leftover box {cname!r} from an "
+                               f"interrupted attempt before starting fresh", logging.WARNING)
+            rm_rc, rm_out = _host(["docker", "rm", "-f", cname])
+            if rm_rc != 0:
+                # An unremovable corpse still refuses below with the daemon's own words — this
+                # only adds WHY to the trail instead of letting the collision masquerade as new.
+                logs.announce(log, f"BEEVERFORGE: could not remove the leftover box {cname!r} "
+                                   f"({rm_out.strip()[:200]})", logging.WARNING)
+        run_cmd = [
+            "docker", "run", "-d", "--name", cname,
+            "--cpus", self.cpus, "--memory", self.memory,
+            "--network", self.network,
+            # AN INIT AS PID 1, BECAUSE `sleep` IS NOT ONE (#532). Every command the agent and the
+            # gates run arrives through `docker exec`, and what one of them orphans — git's
+            # detached auto-maintenance after a commit or a fetch, measured — is adopted by PID 1,
+            # which only an init reaps. The image is the client's (ADR-0037 D1), so the init comes
+            # from the daemon, not from anything the image might carry.
+            "--init",
+            # override any image ENTRYPOINT so the keep-alive command runs as-is
+            "--entrypoint", "sleep",
+            "-v", f"{host_clone}:{_WORKDIR}", "-w", _WORKDIR,
+        ]
+        if self.toolbox:
+            # READ-ONLY, which bounds the accident rather than the adversary: a process at uid 0
+            # inside the box can copy a binary out and run a patched copy, and ADR-0037 says so
+            # plainly instead of implying otherwise. What `:ro` buys is that the toolbox one job
+            # leaves behind is the toolbox the next job gets.
+            run_cmd += ["-v", f"{self.toolbox}:{TOOLBOX_MOUNT}:ro"]
+        if self.guidelines:
+            # READ-ONLY, and not for the reason the toolbox is: this directory is the same one
+            # for every box on the deployment, so a job that could write to it would be writing
+            # the next job's rules. What the agent needs is to OPEN a document the index named.
+            run_cmd += ["-v", f"{self.guidelines}:{GUIDELINES_MOUNT}:ro"]
+        if self.cache_volume:
+            run_cmd += ["-v", f"{self.cache_volume}:/cache"]
+        passing = self._passthrough()
+        for var in passing:
+            run_cmd += ["-e", var]  # value inherited from the daemon client env
+        run_cmd += [self.image, "infinity"]
+        client_env = self._client_env(passing)
+        rc, out = _host(run_cmd) if client_env is None else _host(run_cmd, env=client_env)
+        if rc != 0:
+            # NEVER record a handle for a container that was not created. This used to be a bare
+            # `_host(run_cmd)` with `self._container = cname` below it regardless, so a refused
+            # run — a name collision, a leftover container from a crash, an unpullable image —
+            # produced a Workspace that looked fine while every later `docker exec` landed in
+            # SOMEBODY ELSE'S container: another client's checkout, cache and network.
+            raise RuntimeError(
+                f"could not start the box {cname!r} (docker run exited {rc}): {out.strip()[:300]}"
+                + _NO_INIT_BINARY * any(w in out for w in ("init binary", "catatonit")))
+        _host(["docker", "exec", cname, "git", "config", "--global",
+               "--add", "safe.directory", _WORKDIR])
+
+        self._container, self._host_clone = cname, host_clone
+        # A NEW container is a new HOME: the image may differ from the last job's (ADR-0037 D4
+        # resolves it per project) and the answer is cached per container, so a stale one would
+        # send a session snapshot to a path that does not exist in this box.
+        self._home = None
+        # `path` is the IN-CONTAINER mount point; `host_path` is the same checkout as the
+        # orchestrator sees it (the bind-mounted clone) — what host-side readers must use.
+        return Workspace(path=Path(_WORKDIR), host_path=host_clone,
+                         branch=branch, base_branch=base_branch, base_commit=base_commit)
+
+    def harness_path(self, name: str) -> str:
+        """An absolute path into the mounted toolbox — never a bare name.
+
+        `PATH` cannot be relied on here: the image is the client's, and a login shell or a
+        `/etc/profile.d` snippet reassigns `PATH` before the command runs. An absolute path is also
+        what makes the toolbox's integrity mean anything — a checksum over bytes nobody is required
+        to execute checks nothing.
+
+        VALIDATED, because the result is executed. `name` comes from the registry's `harness:`
+        today, which is operator-owned, but the cost of being wrong is arbitrary execution inside
+        the box, so it is checked where it is used rather than trusted from where it came."""
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", name or ""):
+            raise ValueError(
+                f"{name!r} is not a harness name — expected a bare lowercase binary name like "
+                "'claude', 'codex' or 'kimi'"
+            )
+        return f"{TOOLBOX_MOUNT}/{name}"
+
+    @staticmethod
+    def _quiet_host(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
+        """`_host`, except a wall is an ANSWER. The transfer methods promise the port they never
+        raise; `_host` raises `TimeoutExpired`, and a `docker cp` of a large session is exactly
+        where that happens — turning a resumable pause into a failed job for the sake of a
+        snapshot nobody would have missed."""
+        try:
+            return _host(cmd, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log.warning("a docker step of the session transfer did not finish (%s) — the resumed "
+                        "run will start cold", str(exc)[:160])
+            return 1, str(exc)[:200]
+
+    #: `docker cp` of a harness session, and the two probes around it. Ten times `_host`'s default,
+    #: because the default was written for `docker run`/`rm` and this one moves bytes.
+    _TRANSFER_TIMEOUT = 1200
+
+    def _box_home(self) -> str:
+        """The HOME of this box — ASKED, never assumed, because the image is the client's.
+
+        `/root` is right for the images this platform ships and wrong for any image with a
+        non-root `USER`, which is what a hardened client image is. Asked once per container
+        (`prepare` clears the cache) through the same `_host` call every other docker step uses.
+
+        THE ANSWER IS TAGGED because `_host` returns stdout and stderr interleaved and `printf`
+        writes no trailing newline: a client image whose shell says anything on stderr would have
+        it glued to the end of the path, and the box would silently stop being able to carry a
+        session. The tag makes the answer findable rather than positional."""
+        if self._home is not None:
+            return self._home
+        self._home = ""
+        if not self._container:
+            return self._home
+        rc, out = self._quiet_host(
+            ["docker", "exec", self._container, "sh", "-c", 'printf "OFHOME:%s\\n" "$HOME"'])
+        answer = next((ln[len("OFHOME:"):].strip() for ln in (out or "").splitlines()
+                       if ln.startswith("OFHOME:")), "")
+        if rc == 0 and answer.startswith("/"):
+            self._home = answer
+        else:
+            log.warning("the box %s did not answer where its HOME is (%s) — anything that has to "
+                        "cross out of it will be skipped",
+                        self._container, (out or "").strip()[:120])
+        return self._home
+
+    @staticmethod
+    def _under_home(home: str, relative: str) -> str:
+        """`home/relative`, or "" when `relative` is not a plain relative path.
+
+        It becomes an argument to a copy the orchestrator issues against the client's box; `..`
+        would reach outside the harness's own state, and an absolute path would ignore the box's
+        HOME entirely. Configuration is not code review — the same rule `harness_path` applies to
+        the name it executes."""
+        rel = (relative or "").strip()
+        if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            log.warning("refusing %r as a path inside the box's HOME — it must be relative and "
+                        "must not climb out of it", relative)
+            return ""
+        return f"{home.rstrip('/')}/{rel}"
+
+    def export_home_dir(self, *, workspace: Workspace, relative: str, dest: Path) -> bool:
+        """See the port. `docker cp` rather than a mount, and that is the whole reason this works
+        under docker-out-of-docker: the CLIENT of the daemon reads and writes the local side, so
+        the bytes land in the WORKER's filesystem. A `-v` path the worker invents is resolved by
+        the HOST daemon instead, which creates an empty directory rather than failing — the same
+        trap `prepare` documents, measured again in both directions before this was written."""
+        home = self._box_home()
+        src = self._under_home(home, relative) if home else ""
+        if not (self._container and src):
+            return False
+        # `-d` follows symlinks, so ask for the directory AND that it is not a link: a box whose
+        # `projects` is `ln -s /` would otherwise copy the box's whole filesystem out.
+        rc, _ = self._quiet_host(["docker", "exec", self._container, "sh", "-c",
+                                  f'[ -d "{src}" ] && [ ! -L "{src}" ]'])
+        if rc != 0:
+            return False  # nothing to take — the harness never wrote it (a cold pass)
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        rc, out = self._quiet_host(["docker", "cp", f"{self._container}:{src}", str(dest)],
+                                   timeout=self._TRANSFER_TIMEOUT)
+        if rc != 0:
+            log.warning("could not take %s out of the box %s (%s)", src, self._container,
+                        (out or "").strip()[:160])
+            return False
+        return dest.is_dir() and not dest.is_symlink()
+
+    def import_home_dir(self, *, workspace: Workspace, src: Path, relative: str) -> bool:
+        """See the port. MERGES, via `docker cp <src>/. <box>:<target>` — the trailing `/.` is
+        what makes docker copy the CONTENTS into an existing directory instead of nesting the
+        source inside it (`projects/projects/…`, where the harness never looks). The target is
+        created first so the contents have somewhere to land, and never removed: on a box whose
+        HOME belongs to the process rather than to the job, removing it deletes somebody else's
+        work."""
+        home = self._box_home()
+        target = self._under_home(home, relative) if home else ""
+        if not (self._container and target and src.is_dir()):
+            return False
+        self._quiet_host(["docker", "exec", self._container, "mkdir", "-p", target])
+        rc, out = self._quiet_host(["docker", "cp", f"{src}/.", f"{self._container}:{target}"],
+                                   timeout=self._TRANSFER_TIMEOUT)
+        if rc != 0:
+            log.warning("could not put %s back into the box %s (%s)", relative, self._container,
+                        (out or "").strip()[:160])
+            return False
+        rc, _ = self._quiet_host(["docker", "exec", self._container, "test", "-d", target])
+        return rc == 0
+
+    def run(self, *, workspace: Workspace, command: str, timeout: int,
+            on_output: Callable[[str], None] | None = None) -> tuple[int, str]:
+        """THE PRODUCTION BOX THREW THE TRANSCRIPT AWAY AT THE WALL, and only the production box.
+
+        This used to end `except subprocess.TimeoutExpired: return timeout_result(command,
+        timeout)` — two arguments where the function has always taken three. The worktree passed
+        its partial output; the container passed none. So the four-hour wall arrived on the box
+        that matters most with the whole stream already discarded, and every reader downstream got
+        an empty one: `read_harness([])` correctly refuses to call that an idle agent, which means
+        the honest answer to "what was it doing for four hours?" was *nothing can be said* — for
+        the one run nobody can re-observe. `run_and_stream` keeps what was written, both boxes,
+        one code path.
+
+        `docker exec` IS A LOCAL SUBPROCESS AND THAT IS WHY THIS BOX CAN STREAM. Its stdout is a
+        pipe on the worker carrying the container process's output as it is produced, so the
+        `streams` trait can honestly answer True here (`registry.BOXES`).
+
+        WHAT KILLING IT DOES AND DOES NOT REACH, said out loud because a reader will assume the
+        stronger thing: killing the `docker exec` CLIENT does not stop the process inside the
+        container — the daemon owns that one. It is bounded, not leaked: `cleanup()` issues
+        `docker rm -f`, which takes the whole box with it. That was equally true of the
+        `subprocess.run(timeout=…)` this replaces; what changes is that we no longer wait on it —
+        the previous code could block past its own wall inside `communicate()`."""
+        assert self._container, "prepare() must be called first"
+        # Pass the auth vars PER EXEC (the `-e VAR` pass-through form — value comes from the
+        # client env, never the command line). The container's own env was frozen at `docker
+        # run`, so without this a token-pool ROTATION (which mutates os.environ between
+        # invocations) would silently keep exec'ing with the ORIGINAL token — the lap would
+        # burn n identical attempts on one dead credential (audit CRITICAL). Also covers a
+        # pool-only deploy where no auth var existed yet at prepare() time.
+        env_flags: list[str] = []
+        passing = self._passthrough()
+        for var in passing:
+            env_flags += ["-e", var]
+        return run_and_stream(
+            subprocess.Popen(
+                # `sh -c`, NEVER `sh -lc`. A login shell sources the CLIENT IMAGE's /etc/profile
+                # and /etc/profile.d/* before the command — arbitrary third-party code running
+                # ahead of everything the platform issues, with the harness token already in the
+                # environment from the `-e` flags above. Under ADR-0037 the image is the client's,
+                # which turns that from an oddity into a credential exposure.
+                #
+                # It also silently broke the toolbox: Debian's and Alpine's stock /etc/profile
+                # ASSIGN PATH unconditionally, so any PATH the framework sets is discarded before
+                # the command runs. That is why ADR-0037 D2 addresses the harness by absolute path
+                # and why the two land together — fixing only the paths would leave the exposure.
+                #
+                # `-l` bought nothing: setup:/validate: are client-written strings run in a
+                # container whose environment this adapter sets explicitly.
+                ["docker", "exec", *env_flags, "-w", _WORKDIR, self._container,
+                 "sh", "-c", command],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", bufsize=1, env=self._client_env(passing),
+            ),
+            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+        )
+
+    def tail(self) -> list[str] | None:
+        """Never None: `docker exec` is a local subprocess and the daemon relays the container
+        process's output through its pipe live — which is what `streams=True` claims for this box
+        in the registry, and what the docker-backed test in
+        `tests/test_the_box_transmits_while_it_runs.py` proves against a real daemon rather than
+        against a substituted `Popen`."""
+        return self._output.take()
+
+    def diff_paths(self, *, workspace: Workspace) -> list[str] | None:
+        # committed changes on the branch vs base (orchestrator commits after execute)
+        rc, out = self.run(
+            workspace=workspace,
+            command=f"git diff --name-only {workspace.diff_base}..HEAD",
+            timeout=60,
+        )
+        if rc != 0:
+            # NONE, NOT `[]` (#251). This row has one more way to fail than its sibling: the
+            # `docker exec` may not have run at all, and a container that never answered is the
+            # least safe thing to report as a change that touched no files.
+            log.warning("could not read the diff of %s against %s (exit %s): %s",
+                        workspace.branch, workspace.diff_base, rc, out.strip()[:200])
+            return None
+        return [line for line in out.splitlines() if line.strip()]
+
+    def publish_branch(self, *, workspace: Workspace, remote_url: str | None = None) -> None:
+        # commits live in the host-side ephemeral clone; push from the HOST (never the
+        # container). Prefer the authenticated bot remote; else the repo's origin URL.
+        assert self._host_clone and self._repo_path, "prepare() must be called first"
+        target = remote_url
+        if not target:
+            rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
+            if rc != 0:
+                raise RuntimeError(f"could not resolve origin remote: {url}")
+            target = url.strip()
+        # --force: the bot's dedicated beeverforge/<id> branch, unique per job, serial execution
+        # — a retry after a partial failure must overwrite, not dead-lock on non-ff.
+        rc, out = _host(
+            ["git", "-C", str(self._host_clone), "push", "--force", "--", target, workspace.branch]
+        )
+        if rc != 0:
+            raise RuntimeError(f"push failed: {_redact(out)}")
+
+    def rebase_onto_base(
+        self, *, workspace: Workspace, base: str, remote_url: str | None = None
+    ) -> str:
+        # commits live in the host-side clone; fetch + rebase there (never in the container).
+        # "up_to_date" / "rebased" / "conflict" — see the worktree adapter for the contract.
+        assert self._host_clone and self._repo_path, "prepare() must be called first"
+        hc = str(self._host_clone)
+        target = remote_url
+        if not target:
+            rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
+            if rc != 0:
+                raise RuntimeError(f"could not resolve origin remote: {url}")
+            target = url.strip()
+        rc, out = _host(["git", "-C", hc, "fetch", "--", target, base])
+        if rc != 0:
+            raise RuntimeError(f"fetch failed: {_redact(out)}")
+        rc, _ = _host(["git", "-C", hc, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"])
+        if rc == 0:
+            return "up_to_date"
+        rc, out = _host(["git", "-C", hc, "rebase", "FETCH_HEAD"])
+        if rc != 0:
+            _host(["git", "-C", hc, "rebase", "--abort"])
+            return "conflict"
+        return "rebased"
+
+    def cleanup(self, *, workspace: Workspace) -> None:
+        if self._container:
+            _host(["docker", "rm", "-f", self._container])
+        if self._host_clone and self._host_clone.exists():
+            shutil.rmtree(self._host_clone, ignore_errors=True)
+        self._container, self._host_clone = None, None

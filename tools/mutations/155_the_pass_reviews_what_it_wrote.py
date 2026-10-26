@@ -1,0 +1,67 @@
+"""#155: a repair pass reviews what it pushed, so the merge gate has a reading of the code in hand.
+
+The stale marker from #153 stays as the fallback, and the reverses check that it does: a platform
+that always looked fresh would be back where this pair of cards started.
+"""
+
+TEST = "tests/test_a_review_belongs_to_the_code_it_read.py"
+WORKFLOW = "beeverforge/runtime/temporal/workflow.py"
+MACHINE = "beeverforge/orchestrator/machine.py"
+CONV = "beeverforge/techlead/conversation.py"
+VERDICT = "beeverforge/review/verdict.py"
+
+MUTATIONS = [
+    # ── the pass reads back what it wrote ───────────────────────────────────────────────────────
+    ("the repair pass pushes and never reads it back — the original dead end", MACHINE,
+     '            if self.reviewer is not None and self.manifest.review_mode != "off":\n'
+     "                self._set_state(ticket, JobState.REVIEWING)\n"
+     "                review = self._review(",
+     "            if False:\n"
+     "                self._set_state(ticket, JobState.REVIEWING)\n"
+     "                review = self._review("),
+
+    ("the reading is taken and dropped on the floor", MACHINE,
+     # Re-pinned by #310: this result is now charged before it leaves `repair_ci`.
+     "                auto_merge=True, review=review,",
+     "                auto_merge=True,"),
+
+    # added 2026-09-07: the assertion the row above earned. Until then one substring check stood
+    # for both sites, and either could satisfy it — so this cut was invisible and so was that one.
+    ("the verdict is never republished on the pull request", MACHINE,
+     # re-pinned for #627: the call also carries the pass's line for what the agent says it did
+     "                self._republish_review(pr_url, review=review,\n"
+     "                                       account_passes=passes if pushed else ())\n",
+     "                pass\n"),
+
+    ("…and the reverse: it reviews even where the deployment turned review off", MACHINE,
+     '            if self.reviewer is not None and self.manifest.review_mode != "off":\n'
+     "                self._set_state(ticket, JobState.REVIEWING)\n"
+     "                review = self._review(",
+     "            if self.reviewer is not None:\n"
+     "                self._set_state(ticket, JobState.REVIEWING)\n"
+     "                review = self._review("),
+
+    # ── the workflow publishes it ───────────────────────────────────────────────────────────────
+    ("the adjust path keeps the stale marker instead of the fresh verdict", WORKFLOW,
+     "        self._reviewed_again(passed)\n", ""),
+
+    ("the CI-repair path keeps the stale marker instead of the fresh verdict", WORKFLOW,
+     "                self._reviewed_again(rep)  # the pass's own reading of what it pushed (#155)"
+     "\n", ""),
+
+    ("a pass with no review is published as one, so the marker is lost for nothing", WORKFLOW,
+     '        if getattr(result, "review", None) is None:\n            return False',
+     "        if False:\n            return False"),
+
+    # ── and the gates are not claimed ───────────────────────────────────────────────────────────
+    ("the fresh verdict says nothing about the gates it did not run", WORKFLOW,
+     '        if self._verdict is not None and not getattr(result, "validations", None):\n'
+     '            self._verdict = {**self._verdict,\n'
+     '                             "gates_note": "the forge\'s own CI is the live check"}',
+     "        if False:\n"
+     "            pass"),
+
+    # re-pinned 2026-09-07: the reader moved to `review/verdict.py` with the verdict's shape
+    ("…and the reader prints nothing where the gates used to be", VERDICT,
+     '    if not gates and verdict.get("gates_note"):', "    if False:"),
+]

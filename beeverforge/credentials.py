@@ -1,0 +1,853 @@
+"""Credentials, read from the process environment — the composition root's job, not the kernel's.
+
+These lived in `beeverforge/contracts/bot.py` until C-08. A domain model that reads `os.environ` is
+not
+vendor-named, so no guard catches it, but it is the same mistake: the kernel stops being a set of
+values you can construct and becomes something that behaves differently depending on the machine.
+
+Each token is per-AXIS on purpose (ADR-0022). A Jira-tracker plus GitLab-forge project needs a Jira
+API token AND a GitLab access token; a single-vendor GitHub project can reuse one for both, which
+is what `BEEVERFORGE_BOT_TOKEN` is for.
+
+EVERY SECRET HERE IS READ THROUGH THE CREDENTIAL STORE (#742). A variable name is a deployment
+credential (`credential_store.stored`), asked of the store the deployment declares and then of the
+environment, and a project's `token_env` is a reference (`credential_store.answer`): a bare name
+as it always was, or `file:<name>` and any installed store's `<kind>:<name>`. With no store
+declared, every answer below is the variable's, byte for byte.
+
+A REFUSAL ENDS THE RESOLUTION (review of #822). Every credential here is a chain — a project's
+reference, then its vendor's default, then the deployment's pair, then a mint or a login — and a
+step the store REFUSES used to read as an empty one, so the next step answered: a project whose
+`file:acme-jira` was refused was handed `JIRA_API_TOKEN`, under a log line that said "nothing is
+used in its place". Now the first refusal is the answer (`_axis_answer`), every later step is
+skipped, the mint and the provider paths included (`axis_refusal`), and the doctor says which
+reference was refused instead of "no credential is configured".
+"""
+
+from __future__ import annotations
+
+import errno
+import logging
+import os
+from collections.abc import Mapping
+from pathlib import Path
+
+from beeverforge.adapters.credential_store import registry as credential_store
+from beeverforge.adapters.credential_store.registry import stored
+from beeverforge.contracts.bot import BotIdentity
+
+log = logging.getLogger("beeverforge.credentials")
+
+
+def app_private_key_at(path: str) -> str:
+    """The PEM in the file at `path` (`~` expanded); any failure to read it is an `OSError`.
+
+    ONE READER OF A KEY FILE. `app_private_key` below reads the path a deployment names in
+    `BEEVERFORGE_GH_APP_KEY`; `beeverforge bot-token --key-path` reads the path an operator types
+    (#905: the flag was accepted and never read). Both come here, so `expanduser` and the error
+    shape live in one place, and no minting path reads a key by hand
+    (`test_no_minting_path_reads_the_key_file_by_hand`).
+
+    THE CALLER DECIDES WHAT A FAILURE MEANS. A deployment's unreadable key is a warning and no App
+    (`app_private_key`); an operator's explicit path that cannot be read is a refusal naming it,
+    never a fall back to the environment's key. So this neither logs nor swallows.
+
+    An explicit path is the operator's, not a deployment credential: it is not asked of the
+    environment here, and is not a name a credential store would be asked for.
+
+    A FILE THAT IS NOT TEXT IS AN UNREADABLE KEY. A DER key or any binary file used to raise
+    `UnicodeDecodeError` from `read_text()`; that is a `ValueError`, so it went past both callers'
+    `except OSError` as a traceback (#905's review, 2026-10-21: `bot-token --key-path` on 300
+    random bytes, and `app_private_key()` with `BEEVERFORGE_GH_APP_KEY` naming one). It is
+    raised here as `OSError(EINVAL)` naming the path, so each caller's existing handling (a
+    refusal, a warning) speaks for it. Errors from opening the file (`ENOENT`, `EISDIR`, `EACCES`)
+    still reach the caller unchanged. Reading bytes drops `read_text()`'s newline translation;
+    a CRLF PEM, traditional or PKCS8, still signs (measured 2026-10-21, cryptography 50.0.2,
+    PyJWT 2.15.1).
+    """
+    data = Path(path).expanduser().read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OSError(errno.EINVAL, "not a PEM file: it is not text", path) from None
+
+
+def app_private_key() -> str | None:
+    """The GitHub App's PEM, however this process was handed it — or None if it has no App.
+
+    TWO DELIVERY SHAPES, ONE ANSWER. A file path (`BEEVERFORGE_GH_APP_KEY`) is how a laptop and the
+    terraform-mounted task get it; raw content (`BEEVERFORGE_GH_APP_KEY_CONTENT`) is how Secrets
+    Manager,
+    an env var and a compose file get it. Every reader used to want the path, so two entry points
+    bridged the gap by writing a temp file at import time — the Fargate entrypoint and the panel —
+    and everything else silently had no credential. `beeverforge doctor` inside the compose worker
+    reported `gh auth login` on a container holding a perfectly good private key.
+
+    NO TEMP FILE. `mint_installation_token` takes the PEM as content and always did; the file only
+    existed because callers read a path before calling it. Removing that step removes a 0600
+    creation race, an import-order dependency and a private key on disk.
+
+    CONTENT FIRST. A stale `BEEVERFORGE_GH_APP_KEY` inherited from an outer environment must not
+    shadow
+    the key this process was actually given — the path is the fallback, not the authority.
+
+    BOTH ARE DEPLOYMENT CREDENTIALS (#742), so both come through the store: under a file store the
+    PEM is the mounted file `BEEVERFORGE_GH_APP_KEY_CONTENT`, read at this call and kept by
+    nobody, and a variable of either name still answers where no file does.
+    """
+    # A REFUSED CONTENT IS THE ANSWER, never the path after it (review of #822): the store said
+    # why, and a key file somewhere else is a key nobody chose for this.
+    content = credential_store.lookup("BEEVERFORGE_GH_APP_KEY_CONTENT")
+    if content.value:
+        return content.value
+    if content.refused:
+        return None
+    path = credential_store.lookup("BEEVERFORGE_GH_APP_KEY").value
+    if not path:
+        return None
+    try:
+        return app_private_key_at(path)
+    except OSError as exc:
+        # Silence would present three layers away as an unauthenticated forge, which reads as a
+        # permissions problem on GitHub's side rather than a missing file on ours.
+        log.warning("the App key at %s could not be read (%s) — this process has no App "
+                    "credential", path, exc)
+        return None
+
+
+def app_id() -> str | None:
+    """The GitHub App's id, or None when this process has no App.
+
+    HERE RATHER THAN AT EACH READER (#64, C-28). This and `app_installation_id` were read inline
+    with `os.environ.get` in four places — `factory.py` twice, `adapters/github_app.py`, and as a
+    typer `envvar=` in `cli.py` — while `app_private_key` above was already centralised. A
+    credential with four readers has four places to disagree about precedence and four places a
+    future per-project override would have to be threaded through.
+
+    Collapsing them is the enabling refactor for C-28 UNDER EITHER OPTION the card offers (refuse
+    a registry that spans installations, or make the installation per-project): both need exactly
+    one place that answers "which installation is this?". It changes no behaviour today."""
+    return os.environ.get("BEEVERFORGE_GH_APP_ID") or None
+
+
+def app_installation_id() -> str | None:
+    """Which installation of the App this process acts as, or None.
+
+    ONE PROCESS, ONE INSTALLATION — a real limit, found under #64 and documented under #743. The
+    CHANNEL credential is per-project (`factory.notifier_for_project` reads the env var the
+    registry names), so one deployment hosts N projects across N Slack workspaces; the FORGE
+    credential is process-wide, so the same deployment authenticates against exactly one GitHub
+    App installation. Two orgs need two processes. Until #743 nothing stated that anywhere a person
+    onboarding a project would look; `docs/configuration.md` now states the rule and its reason,
+    and `beeverforge doctor`'s `installation_scope` line checks it, comparing the account this
+    installation is on (`app_installation_account`) with the organisations the registry names."""
+    return os.environ.get("BEEVERFORGE_GH_APP_INSTALLATION_ID") or None
+
+
+def app_installation_account() -> tuple[str | None, str] | None:
+    """The account this deployment's App installation is on, as the reference vendor's credential
+    row reads it (`CredentialRow.installed_on`): `None` when no App is configured (or the row
+    declares no such read), `(login, "")` when read, `(None, reason)` when it could not be.
+
+    ASKED OF THE ROW, and reading no variable here: `app_id`, `app_private_key` and
+    `app_installation_id` above stay the only readers of the trio, and the row calls them."""
+    row = _row(_REFERENCE_KIND)
+    installed_on = getattr(row, "installed_on", None) if row is not None else None
+    return installed_on() if installed_on is not None else None
+
+
+def app_settings_set() -> int:
+    """How many of the App's three settings this process holds (`app_id`, `app_private_key`,
+    `app_installation_id`): 3 is an App, 0 is none, and 1 or 2 is an App that is not fully
+    configured — no App to mint on or to ask (`github_app.token_from_env`'s rule). The doctor's
+    `installation_scope` line says 1 or 2 as an App not fully configured, not as no App, and asks
+    whether a token is used instead of the App only of a full one (#743)."""
+    return sum(1 for value in (app_id(), app_private_key(), app_installation_id()) if value)
+
+
+def sources_instead_of_the_app(projects) -> list[str]:
+    """The credentials (`forge_credential_source` / `tracker_credential_source` identities) the
+    reference vendor's axes of `projects` use, when NONE of them is this deployment's own
+    (`deployment:<kind>`, the App) — `[]` when one of them is, or when none resolves at all.
+
+    WHY (#743, decided 2026-10-19). A static token wins over the App (`_axis_credential`: the
+    project's variable, then the vendor's, then the generic pair; the App only when none is set).
+    Measured on d744ba8 with the App trio and `BEEVERFORGE_BOT_TOKEN` both set: every forge read
+    went through the token, and the doctor still asked the App which organisation it was on and
+    failed a working deployment with a mismatch the forge never meets."""
+    own = f"deployment:{_REFERENCE_KIND}"
+    found: list[str] = []
+    for project in projects:
+        axes = []
+        if forge_vendor(project) == _REFERENCE_KIND:
+            axes.append(forge_credential_source(project))
+        if (getattr(project, "tracker", None) is not None
+                and _kind_of(project.tracker) == _REFERENCE_KIND):
+            axes.append(tracker_credential_source(project))
+        for source in axes:
+            if source == own:
+                return []
+            if source and source not in found:
+                found.append(source)
+    return found
+
+
+def bot_identity() -> BotIdentity:
+    """Who the factory acts as, from the environment the deployment set."""
+    return BotIdentity(
+        name=os.environ.get("BEEVERFORGE_BOT_NAME", "BeeverForge Bot"),
+        email=os.environ.get("BEEVERFORGE_BOT_EMAIL", "beeverforge-bot@localhost"),
+        login=os.environ.get("BEEVERFORGE_BOT_LOGIN") or None,
+    )
+
+
+def _row(kind: str):
+    """The vendor's credential row — shipped or installed — or None when it declares nothing.
+
+    THE TABLE THIS REPLACES WAS CLOSED. `_VENDOR_DEFAULT_ENV` was a dict literal in this module
+    naming two vendors' variables; a stranger's `forge.gitlab` add-on had no way to add a row, so
+    its projects fell through to the generic pair — the deployment's GITHUB credential — and were
+    handed it as if it were their own (measured 2026-08-24). The rows live in
+    `adapters/credential/registry.py` and an add-on declares one exactly as it declares a forge."""
+    from beeverforge.adapters.credential.registry import credential_row
+
+    return credential_row(kind)
+
+
+def vendor_default_env(ref) -> str:
+    """The variable the axis vendor's credential lives in BY DEFAULT, or `""` — the registry's
+    `token_env` always wins; this answers for a deployment that named nothing. GitHub answers
+    `""` on purpose: its default IS the generic pair, and a row naming a variable would say
+    otherwise. Derived from the vendor's own row, never from a table here."""
+    kind = (getattr(ref, "kind", "") or "").strip().lower()
+    row = _row(kind)
+    return (row.env or "") if row is not None else ""
+
+
+def vendor_needs_credential(ref) -> bool:
+    """Whether this axis vendor needs a credential at all — its row's `needs`, `True` by default.
+
+    ASKED OF THE ROW, never of the kind, so a stranger's add-on whose vendor needs nothing says so
+    the same way the shipped rows do (ADR-0049 D1)."""
+    kind = (getattr(ref, "kind", "") or "").strip().lower()
+    row = _row(kind)
+    return True if row is None else bool(getattr(row, "needs", True))
+
+
+def vendor_default(ref) -> str | None:
+    """The axis vendor's own default credential, or None.
+
+    BEFORE the generic fallback, never after — that order is the fix. `forge_token()` falls back
+    to `BEEVERFORGE_BOT_TOKEN`, which on a mixed deployment is a GITHUB credential: an Azure
+    DevOps project that reached it would present a GitHub PAT as HTTP Basic and read back a 401 —
+    a credential that LOOKS configured failing as if it were revoked. The shared ADO client
+    already read `AZURE_DEVOPS_PAT` on its own, so the adapters worked while everything that asks
+    "does this project HAVE a forge credential" — the doctor's presence probe, the repo-cache
+    fetch — answered no. Found by the pre-pilot funnel review (2026-08-09): an ADO-only
+    deployment was told "no forge credential is configured" with a GitHub remedy, over a
+    perfectly good PAT."""
+    named = vendor_default_env(ref)
+    return (stored(named) or "").strip() or None if named else None
+
+
+#: The identities of credentials no store holds — the deployment pair, a login, the machine's own
+#: identity, a mint. A store an add-on names after one of these is never read into them.
+_NOT_A_STORE = frozenset({"generic", "login", "identity", "deployment"})
+
+
+def _stored_secret(identity: str) -> bool:
+    """Whether a credential's identity names a secret a STORE holds — `env:X`, `file:x`, an
+    installed store's reference — as opposed to a login, an identity or a mint (#742). A stored
+    secret travels as a value; the others are providers, read at each use."""
+    kind = identity.partition(":")[0]
+    return bool(kind) and kind not in _NOT_A_STORE and kind in credential_store.known()
+
+
+#: Each axis's deployment-wide pair, in the order it is asked: the axis's own, then the bot's.
+_GENERIC = {
+    "tracker": ("BEEVERFORGE_TRACKER_TOKEN", "BEEVERFORGE_BOT_TOKEN"),
+    "forge": ("BEEVERFORGE_FORGE_TOKEN", "BEEVERFORGE_BOT_TOKEN"),
+}
+
+
+def tracker_token() -> str | None:
+    # A CHAIN, so a refused `BEEVERFORGE_TRACKER_TOKEN` is not answered by the bot's (#822)
+    return credential_store.chain(("BEEVERFORGE_TRACKER_TOKEN", "BEEVERFORGE_BOT_TOKEN")).value
+
+
+def _axis_credential(project, axis: str, generic, *,
+                     announce: bool = True) -> tuple[str, str | None]:
+    """`(source, value)` of `project`'s credential on `axis` — `_axis_answer`'s, `("", None)` when
+    nothing answered and when a step was refused."""
+    found = _axis_answer(project, axis, generic, announce=announce)
+    return (found.reference, found.value) if found.value else ("", None)
+
+
+def app_key_refusal() -> str:
+    """Why the GitHub App key is refused, or `""` — the content first, then the path, the order
+    `app_private_key` reads them in (#742)."""
+    for name in ("BEEVERFORGE_GH_APP_KEY_CONTENT", "BEEVERFORGE_GH_APP_KEY"):
+        found = credential_store.lookup(name, quiet=True)
+        if found.refused:
+            return f"`{found.reference}` is refused: {found.refused}"
+        if found.value:
+            return ""
+    return ""
+
+
+def github_refusal(project, axis: str) -> str:
+    """Why a GitHub adapter of `project`'s `axis`, built with no token, must not fall back to the
+    machine's own login: the axis's own credential is refused, or the App key it would mint from
+    is (#742). `""` when nothing was refused — the ambient login is then the development path it
+    always was."""
+    return axis_refusal(project, axis) or app_key_refusal()
+
+
+def pair_refusal(axis: str) -> str:
+    """Why this deployment's own pair for `axis` (`BEEVERFORGE_<AXIS>_TOKEN`, then
+    `BEEVERFORGE_BOT_TOKEN`) is refused, or `""` — for a reader that asks about the DEPLOYMENT's
+    credential, with no project to ask `axis_refusal` about, before it falls back to a mint
+    (#822)."""
+    found = credential_store.chain(_GENERIC[axis])
+    return f"`{found.reference}` is refused: {found.refused}" if found.refused else ""
+
+
+def axis_refusal(project, axis: str) -> str:
+    """Why `project`'s credential on `axis` is REFUSED — the reference the store refused, and its
+    reason — or `""` (review of #822). What every later step of a credential's resolution asks
+    before it answers (the vendor's mint, its provider), so a refusal stays final there too, and
+    what the doctor says instead of "no credential is configured", which would send the operator
+    to set a variable that is already set."""
+    generic = tracker_token if axis == "tracker" else forge_token
+    found = _axis_answer(project, axis, generic, announce=False)
+    return f"`{found.reference}` is refused: {found.refused}" if found.refused else ""
+
+
+def _refused_at(project, axis: str, found, announce: bool):
+    """`found`, a refusal, said once in the axis's words: nothing is used in its place."""
+    if announce:
+        log.warning("%s's %s credential `%s` is refused — nothing is used in its place, not this "
+                    "deployment's own and not a mint", getattr(project, "name", "?"), axis,
+                    found.reference)
+    return found
+
+
+def _axis_answer(project, axis: str, generic, *, announce: bool = True):
+    """What answers for `project`'s credential on `axis` — ONE resolution for both axes — as the
+    store's `Answer`: the reference and the value, or the reference the store REFUSED and why.
+
+    `source` is the credential's IDENTITY, never its value: `env:<NAME>` for a variable the
+    project or its vendor named — or the reference of whichever store answered for it,
+    `file:<name>` and the like (#742) — `generic:<axis>` for the deployment-wide pair (one value per
+    process, whichever of the two variables holds it), `""` when nothing answered. It exists so
+    a reader that must ask a credential ONCE can tell two credentials apart without comparing
+    their values — `floor.reading.budgets` keyed its rows by the token itself, and the App mint
+    renews the token on every call, so N projects on one installation cost N mints and N probes
+    (measured 2026-08-26). The identity is the thing that answered, which survives a renewal.
+
+    Resolution: `token_env` if named → the axis vendor's own default variable (its credential
+    row's `env`) → `generic()`, the axis's process-wide reader (`tracker_token` / `forge_token`,
+    passed as the function so the seam the harnesses patch stays the seam). `announce=False`
+    keeps the named-but-empty warning from being said twice when a caller asks for the source
+    and then the value.
+
+    A VENDOR WITH A RESOLUTION OF ITS OWN (`CredentialRow.source`) IS ANSWERED BY IT, and never by
+    the generic pair (#373): its adapters resolve their own credential and never take a caller's,
+    so a generic token counted here was a credential the doctor reported and nothing used. Only a
+    STORED secret comes back as a value; a login or the machine's own identity expires on its own,
+    so it is a provider (`deployment_*_provider`), read at each use and never frozen by a caller.
+    An axis that DECLARES an identity it cannot have gets nothing at all — no fallback.
+
+    AND A STEP THE STORE REFUSES IS THE ANSWER (review of #822): the reference the project names,
+    its vendor's default variable, the deployment's pair — the first refused one ends the walk,
+    and nothing after it is asked."""
+    Answer = credential_store.Answer
+    ref = getattr(project, axis, None)
+    options = getattr(ref, "options", None) or {}
+    named = str(options.get("token_env") or "").strip()
+    declared, problem = _declared(ref)
+    row = _row(_kind_of(ref))
+    if problem or (declared and (row is None or row.source is None)):
+        if announce:
+            log.warning("%s's %s credential: %s — no credential is used for it",
+                        getattr(project, "name", "?"), axis,
+                        problem or _no_workload_identity(_kind_of(ref)))
+        return credential_store.NOTHING
+    if row is not None and row.source is not None:
+        # THE REFERENCE THE ROW WILL READ, asked first: a vendor that resolves its own credential
+        # falls back to a login when its secret is absent, and a REFUSED secret is not absent.
+        asked = credential_store.look(named or vendor_default_env(ref) or "")
+        if asked.refused:
+            return _refused_at(project, axis, asked, announce)
+        if named and announce and not (asked.value or "").strip():
+            log.warning("%s names %s as its %s credential and it is empty — the vendor's "
+                        "other sources are asked instead",
+                        getattr(project, "name", "?"), named, axis)
+        identity, provider = row.source(dict(options))
+        value = provider() if provider is not None and _stored_secret(identity) else None
+        return Answer(reference=identity, value=value) if value else credential_store.NOTHING
+    if named:
+        # A REFERENCE (#742): a bare variable name as every registry has written it, resolved
+        # through the deployment's store; `file:<name>` or another installed kind, from there alone.
+        found = credential_store.look(named)
+        if found.refused:
+            return _refused_at(project, axis, found, announce)
+        if found.value:
+            return found
+        if announce:
+            log.warning("%s names %s as its %s credential and it is empty — falling back to "
+                        "this deployment's own, which is very likely the wrong system",
+                        getattr(project, "name", "?"), named, axis)
+    default = vendor_default_env(ref)
+    if default:
+        found = credential_store.lookup(default)
+        if found.refused:
+            return _refused_at(project, axis, found, announce)
+        if (found.value or "").strip():
+            return Answer(reference=found.reference, value=found.value.strip())
+    # A VENDOR THAT NEEDS NO CREDENTIAL NEVER REACHES THE GENERIC PAIR (ADR-0049 D1). The pair is
+    # this DEPLOYMENT's, and on a machine that also runs a hosted project it is that project's
+    # token: handing it to a row whose board is a local file would present one system's credential
+    # to another, which is the failure `vendor_default` exists to stop one step earlier.
+    if not vendor_needs_credential(ref):
+        return credential_store.NOTHING
+    value = generic() or None
+    if value:
+        return Answer(reference=f"generic:{axis}", value=value)
+    # the pair answered nothing: say whether that was a refusal, which the generic reader folds
+    found = credential_store.chain(_GENERIC[axis])
+    return _refused_at(project, axis, found, announce) if found.refused \
+        else credential_store.NOTHING
+
+
+def tracker_token_for(project) -> str | None:
+    """This PROJECT's tracker credential, falling back to the deployment's.
+
+    ONE DEPLOYMENT HOSTS N PROJECTS AND THEY DO NOT SHARE A TRACKER. `tracker_token()` is a single
+    process-wide value, so a worker serving a GitHub project and a Jira project authenticated both
+    with whichever one the environment happened to carry — and the Jira one simply came back with
+    an empty queue. Found live on fx-jira (F-02, 2026-08-05): the board resolved, the search ran,
+    the backlog had a ticket in TO-DO, and the pickup queue was `[]`.
+
+    THE REGISTRY NAMES THE VARIABLE, IT NEVER HOLDS THE SECRET — exactly the shape ADR-0015 uses
+    for the per-workspace Slack token (`channel_options.bot_token_env`). `deploy/registry.yaml` is
+    baked into the worker image; a token written there is a token in an image layer.
+
+    Resolution: `token_env` if named → the axis vendor's own default variable (its credential
+    row's `env`) → the deployment-wide generic pair. A GitHub axis is unchanged."""
+    return _axis_credential(project, "tracker", tracker_token)[1]
+
+
+def forge_token() -> str | None:
+    # A CHAIN, so a refused `BEEVERFORGE_FORGE_TOKEN` is not answered by the bot's (#822)
+    return credential_store.chain(("BEEVERFORGE_FORGE_TOKEN", "BEEVERFORGE_BOT_TOKEN")).value
+
+
+def forge_token_for(project) -> str | None:
+    """This PROJECT's forge credential, falling back to the deployment's.
+
+    THE SAME DEFECT AS `tracker_token_for`, ON THE OTHER AXIS, AND IT HAS BEEN LATENT ALL ALONG.
+    That one was found live on fx-jira: a worker serving a GitHub project and a Jira project
+    authenticated both with whichever process-wide token the environment carried, and the Jira
+    board came back with an empty queue. The forge axis had the identical hole and nothing had
+    stepped in it, for one reason only — until today `FORGES` had a single row, so every project's
+    forge really was the same vendor.
+
+    The Azure Repos row ends that. Worse than a bare failure: `forge_token()` falls back to
+    `BEEVERFORGE_BOT_TOKEN`, so an Azure project would be handed a GitHub PAT, present it as HTTP
+    Basic,
+    and read back a 401 — a credential that LOOKS configured failing as if it were revoked, which
+    is the most expensive shape a configuration error takes because it looks like something else.
+
+    A DEFAULT THAT IS ONLY SAFE WHILE ONE VENDOR EXISTS IS A DEFECT WAITING FOR THE SECOND. Written
+    with the ADO pack rather than after it, because after it means finding it in a client's logs.
+
+    Resolution: `token_env` if named → the axis vendor's own default variable (its credential
+    row's `env`) → the deployment-wide generic pair. A GitHub axis is unchanged."""
+    return _axis_credential(project, "forge", forge_token)[1]
+
+
+def deployment_tracker_token(project) -> str | None:
+    """The credential this DEPLOYMENT can mint for `project`'s TRACKER, when the project names none.
+
+    THE MIRROR OF `deployment_forge_token`, ON THE AXIS WHERE THE FAILURE IS WORSE. A forge handed
+    the wrong system's token answers 401 — wrong, but legible. Azure DevOps answers a GitHub token
+    with **HTTP 200 and a sign-in page**, so the board reads as configured-but-unreadable, and Jira
+    answers an empty search — a board with work in TO-DO produces a pickup queue of `[]` and
+    nothing anywhere says the credential was for another system.
+
+    Both of those were found by running against a real deployment rather than by reading, which is
+    why the resolution now lives in one place instead of at each call site: `… or
+    github_app_token_from_env()` was spelled at eighteen of them, inside modules that name no
+    vendor anywhere else.
+
+    THE VENDOR'S OWN ROW ANSWERS. The reference vendor's row carries the App mint; a vendor whose
+    row has no `mint` — and a stranger's add-on that declares none — gets None, because this
+    deployment has nothing of that vendor's to offer and a token from the wrong system is worse
+    than none. A project that names NO kind predates the seam and keeps the reference mint.
+
+    NOTHING AFTER A REFUSAL (#822): the mint is the last step of the project's resolution, so a
+    refused reference before it is not answered by it.
+    """
+    if axis_refusal(project, "tracker"):
+        return None
+    return _deployment_mint(getattr(project, "tracker", None))
+
+
+def deployment_forge_token(project) -> str | None:
+    """The credential this DEPLOYMENT can mint for `project`'s forge, when the project names none.
+
+    THE VENDOR DECIDES, and that is the whole point of this function existing. Twenty-three
+    call sites across the package spell the last resort as `… or github_app_token_from_env()`,
+    inside modules that are otherwise vendor-neutral. It is not wrong today — `build_forge` and
+    `clone_url_for`'s Azure row refuse a caller's ambient GitHub token outright — but it is
+    correct by the defence of the layer below rather than by what the caller asked for, and it
+    puts one vendor's name in code that claims to know none. Raised by the operator while
+    reviewing exactly these changes (2026-08-14): *"it matters that any change be aimed at
+    the PRODUCT and not at my specific case"*.
+
+    So: the vendor's OWN ROW answers (`adapters/credential/registry.py`). The reference vendor's
+    row carries the App mint; a vendor whose row declares no `mint` — and a stranger's add-on
+    that declares none — gets None, because this deployment has nothing of that vendor's to offer
+    and a token from the wrong system is worse than none. Behaviour is identical for GitHub and
+    strictly honest elsewhere. Nothing after a refusal (#822), as on the tracker."""
+    if axis_refusal(project, "forge"):
+        return None
+    return _deployment_mint(getattr(project, "forge", None))
+
+
+#: The kind a registry row that predates the seam has: none. It keeps the reference vendor's
+#: capabilities, because refusing it would turn a legacy row into a dead deployment.
+_REFERENCE_KIND = "github"
+
+
+def _kind_of(ref) -> str:
+    return str(getattr(ref, "kind", "") or "").strip().lower() or _REFERENCE_KIND
+
+
+def _declared(ref) -> tuple[bool, str]:
+    """`(declared, problem)` of the workload identity `ref`'s options declare (#373)."""
+    from beeverforge.adapters.credential.registry import declared_identity
+
+    return declared_identity(getattr(ref, "options", None) or {})
+
+
+def _no_workload_identity(kind: str) -> str:
+    return (f"it declares `identity: workload`, and the {kind} vendor's credential row takes no "
+            f"workload identity — remove the declaration and give it the credential its setup "
+            f"page names")
+
+
+def credential_problem(ref) -> str:
+    """Why the axis `ref` resolves no credential BECAUSE OF WHAT IT DECLARES — an identity nothing
+    can use, or one its vendor takes none of — in one sentence; `""` when its declaration is fine.
+    What the doctor says instead of "no credential is configured", which would send the operator
+    to configure one beside a declaration that forbids it."""
+    declared, problem = _declared(ref)
+    if problem:
+        return problem
+    row = _row(_kind_of(ref))
+    if declared and (row is None or row.source is None):
+        return _no_workload_identity(_kind_of(ref))
+    return ""
+
+
+def _deployment_mint(ref) -> str | None:
+    """One token this deployment can mint for `ref`'s vendor, or None — the row decides.
+
+    NONE for an axis that declares an identity (#373), whatever the vendor could mint otherwise:
+    the declaration is the axis's credential, and a mint beside it is a credential nobody chose."""
+    declared, problem = _declared(ref)
+    if declared or problem:
+        return None
+    row = _row(_kind_of(ref))
+    return row.mint() if row is not None and row.mint is not None else None
+
+
+def tracker_credential_source(project) -> str:
+    """WHERE `tracker_token_for(project) or deployment_tracker_token(project)` comes from — the
+    credential's IDENTITY, never its value, and never a mint.
+
+    `env:<NAME>` when a variable the project or its vendor named answers; `generic:tracker` when
+    the deployment-wide pair does (one value per process, so one identity); `deployment:<kind>`
+    when nothing is set and the vendor's row can mint one; `""` when this process has no
+    credential for it. Non-empty exactly when `tracker_token_for(p) or deployment_tracker_token(p)`
+    is.
+
+    ONE PROCESS HOLDS ONE DEPLOYMENT CREDENTIAL PER VENDOR — the App trio is read from the
+    process environment (`app_id`, `app_installation_id`), so `deployment:<kind>` IS the App's
+    identity within this process. That is what makes it a key: `floor.reading.budgets` asks a
+    budget once per credential, and the mint renews the VALUE on every call, so keying by value
+    asked N times for N projects on one installation (measured 2026-08-26). A mint that would
+    fail still has an identity — the budget row for it reads as unread once, not N times."""
+    found = _axis_answer(project, "tracker", tracker_token, announce=False)
+    if found.value:
+        return found.reference
+    if found.refused:
+        return ""
+    kind = _kind_of(getattr(project, "tracker", None))
+    row = _row(kind)
+    return f"deployment:{kind}" if row is not None and row.mint is not None else ""
+
+
+def _deployment_provider(ref):
+    """A re-minting PROVIDER for `ref`'s vendor, or None — for a job that outlives one token.
+
+    THE DOOR THE MINT CAME IN BY AFTER THE TOKEN DOOR WAS CLOSED. `factory.build_runner` spelled
+    `token_provider=None if forge_token_for(p) else prov` with `prov` the GitHub App minter for
+    EVERY kind, so an add-on forge with no credential of its own received a callable that mints
+    GitHub tokens, and nothing told the add-on to refuse it (measured 2026-08-24). The provider
+    is now the row's, so a vendor that declares none gets None through this door too.
+
+    A VENDOR WITH A RESOLUTION OF ITS OWN answers through it (#373): the provider of the source
+    that answers for these options — a login or the machine's own identity — when it answers now;
+    a stored secret is the value path's (`_axis_credential`), so it is not handed out twice."""
+    declared, problem = _declared(ref)
+    row = _row(_kind_of(ref))
+    if problem or (declared and (row is None or row.source is None)):
+        return None
+    if row is not None and row.source is not None:
+        identity, provider = row.source(dict(getattr(ref, "options", None) or {}))
+        if not identity or _stored_secret(identity) or provider is None:
+            return None
+        return provider if provider() else None
+    return row.provider() if row is not None and row.provider is not None else None
+
+
+def deployment_tracker_provider(project):
+    """The re-minting provider this deployment holds for `project`'s TRACKER vendor, or None —
+    None after a refused reference too (#822): a provider is the resolution's last step."""
+    if axis_refusal(project, "tracker"):
+        return None
+    return _deployment_provider(getattr(project, "tracker", None))
+
+
+def deployment_forge_provider(project):
+    """The re-minting provider this deployment holds for `project`'s FORGE vendor, or None — and
+    None after a refused reference (#822)."""
+    if axis_refusal(project, "forge"):
+        return None
+    return _deployment_provider(getattr(project, "forge", None))
+
+
+def forge_vendor(project) -> str:
+    """The kind whose credential row answers for `project`'s FORGE: the forge's own, the tracker's
+    when the project names no forge (the single-vendor case), and the reference kind for a row
+    that predates the seam and names neither."""
+    forge = getattr(project, "forge", None)
+    return _kind_of(forge if getattr(forge, "kind", "") else getattr(project, "tracker", None))
+
+
+def forge_credential_row(project):
+    """The credential row of `project`'s forge vendor, or None when that vendor declares nothing —
+    what `beeverforge doctor` asks for the vendor's own remedy (`when_missing`, `when_refused`)."""
+    return _row(forge_vendor(project))
+
+
+def forge_credential_source(project) -> str:
+    """WHERE the forge credential a job of `project` holds comes from — its IDENTITY, never its
+    value — or `""` when it holds none (#373).
+
+    `env:<NAME>` a stored secret; `generic:forge` the deployment-wide pair; `login:<cli>` a
+    person's CLI login on this machine; `identity:workload` the machine's own identity;
+    `deployment:<kind>` a credential this deployment mints for the vendor (GitHub's App).
+
+    WHAT THE DOCTOR REPORTS, and it is the same resolution the forge's builders take: the value
+    path (`forge_token_for`), then the provider path (`deployment_forge_provider`). A login or an
+    identity is asked once, here, so the answer is measured rather than assumed — the mint is
+    held, and the use that follows reuses it. GitHub's App is NEVER minted here: its provider is
+    built from the variables, and a diagnostic that mints spends."""
+    ref = getattr(project, "forge", None)
+    if credential_problem(ref):
+        return ""
+    found = _axis_answer(project, "forge", forge_token, announce=False)
+    if found.value:
+        return found.reference
+    if found.refused:
+        return ""
+    row = _row(_kind_of(ref))
+    if row is not None and row.source is not None:
+        identity, provider = row.source(dict(getattr(ref, "options", None) or {}))
+        return identity if (identity and provider is not None and provider()) else ""
+    return f"deployment:{_kind_of(ref)}" if _deployment_provider(ref) is not None else ""
+
+
+def describe_source(source: str) -> str:
+    """A credential's identity (`forge_credential_source` or `tracker_credential_source`) as the
+    doctor says it. `generic:tracker` is the tracker's deployment-wide pair, named as such: the
+    `installation_scope` line feeds tracker identities here too, and said as the forge's pair it
+    named two variables that were not set (review round 2 of #743, measured on b1a7d2c).
+
+    A STORED SECRET IS SAID BY ITS REFERENCE AND ITS STORE, never by its value (#742): the
+    variable it is in, or the reference another store answered for and where that store looks."""
+    kind, _, name = source.partition(":")
+    if source == "generic:tracker":
+        return ("this deployment's own tracker token (`BEEVERFORGE_TRACKER_TOKEN` / "
+                "`BEEVERFORGE_BOT_TOKEN`)")
+    if kind != "env" and _stored_secret(source):
+        return f"a stored secret (`{source}`) — {credential_store.describe(source)}"
+    return {
+        "env": f"a stored secret (`{name}`) in the environment",
+        "generic": "this deployment's own token (`BEEVERFORGE_FORGE_TOKEN` / "
+                   "`BEEVERFORGE_BOT_TOKEN`)",
+        "login": f"this machine's `{name}` login",
+        "identity": "the identity the platform gave this machine — nothing stored",
+        "deployment": f"a credential this deployment mints for the {name} vendor",
+    }.get(kind, source or "no credential")
+
+
+def _generic_reference(axis: str) -> str:
+    """The reference that answers for `axis`'s deployment-wide pair, the same chain `tracker_token`
+    and `forge_token` walk, or `""`."""
+    found = credential_store.chain(_GENERIC[axis])
+    return found.reference if found.value else ""
+
+
+#: What a remote box's launcher must declare to be handed a secret the credential store holds:
+#: that it resolves a credential reference itself, on its own side. The launcher says it with
+#: `resolves_references = True` (`adapters.sandbox.registry.RESOLVES_REFERENCES_ATTR`); one that
+#: does is handed the reference and never the value, and one that does not is refused the secret by
+#: name (#742, #903).
+RESOLVES_REFERENCES = "it resolves credential references itself"
+
+
+def _held_in_a_store(project, axis: str) -> str:
+    """The reference of `axis`'s secret when a store OTHER THAN THE ENVIRONMENT holds it — `""`
+    when the box reads its own variable, as it always did, or there is none (#742).
+
+    A REMOTE BOX CANNOT READ THE WORKER'S FILES, and it is not handed what they hold either. A
+    launcher may copy its launch environment where others can read it (a task's overrides, a pod's
+    spec), and a minted token lives an hour there while a stored secret lives as long as its
+    owner keeps it. So a secret a store holds is never put into a launch environment: a launcher
+    that declares `RESOLVES_REFERENCES` is handed this reference instead, and one that does not is
+    refused by name (`box_launch_credentials`, #903). A variable the box can read for itself is
+    handed over by name only, as before."""
+    generic = tracker_token if axis == "tracker" else forge_token
+    found, value = _axis_credential(project, axis, generic, announce=False)
+    if not value:
+        return ""
+    if found.startswith("generic:"):
+        found = _generic_reference(axis)
+    if found.startswith("env:") or not _stored_secret(found):
+        return ""
+    return found
+
+
+# ── a box is handed a value, never the declaration (#373) ─────────────────────────────────────────
+
+#: The variable a REMOTE box reads an axis's credential from: the token the worker minted for an
+#: axis that declares the machine's own identity, or the secret a declaring launcher resolved from
+#: the reference it was handed (#903). Named per axis, so a tracker and a forge on two identities
+#: stay two credentials.
+BOX_TOKEN_ENV = {"tracker": "BEEVERFORGE_BOX_TRACKER_TOKEN",
+                 "forge": "BEEVERFORGE_BOX_FORGE_TOKEN"}
+
+
+class CredentialUnavailable(RuntimeError):
+    """A credential an axis declared could not be obtained, said in one sentence naming the axis."""
+
+
+def box_options(project, axis: str, *,
+                references: Mapping[str, str] | None = None) -> dict[str, str]:
+    """`axis`'s options AS A BOX RECEIVES THEM. `references` is what `box_launch_credentials`
+    answered for the launch, so the options and the hand-over cannot disagree.
+
+    THE BOX IS HANDED A VALUE, NEVER THE DECLARATION. An axis that declares the machine's own
+    identity would, inside a box, ask the metadata endpoint of whatever machine the box runs on —
+    and a box runs agent-written code: an endpoint it can reach hands that code the identity with
+    no bound but the identity's own. So the worker mints (`box_launch_credentials`) and the box's
+    options name the variable the minted token travels in, in the declaration's place.
+
+    AN AXIS HANDED AS A REFERENCE (#903) is read from the variable the launcher fills on its side,
+    `BOX_TOKEN_ENV[axis]`: the name or reference the project wrote names a file or a store entry on
+    the worker, which the box cannot read. Every other axis's options are handed over whole,
+    exactly as before (#162)."""
+    ref = getattr(project, axis, None)
+    options = {str(k): str(v) for k, v in (getattr(ref, "options", None) or {}).items()}
+    declared, problem = _declared(ref)
+    if problem:
+        return options
+    if not declared:
+        # A SECRET A STORE HOLDS IS NOT HANDED TO A REMOTE BOX AS A VALUE (#742): a launcher that
+        # resolves references fills the box's variable, and any other is refused by name in
+        # `box_launch_credentials`, so the options stay what the project wrote.
+        if BOX_TOKEN_ENV[axis] in (references or {}):
+            options["token_env"] = BOX_TOKEN_ENV[axis]
+        return options
+    from beeverforge.adapters.credential.registry import (
+        IDENTITY_CLIENT_ID_OPTION,
+        IDENTITY_OPTION,
+    )
+
+    options.pop(IDENTITY_OPTION, None)
+    options.pop(IDENTITY_CLIENT_ID_OPTION, None)
+    options["token_env"] = BOX_TOKEN_ENV[axis]
+    return options
+
+
+def box_launch_credentials(project, kind: str,
+                           runner: object) -> tuple[dict[str, str], dict[str, str]]:
+    """What the launcher of the `kind` box, `runner`, is handed for `project`'s credentials:
+    `(extra_env, references)`, both `{variable: …}` under `BOX_TOKEN_ENV`.
+
+    `extra_env` holds VALUES, and only short-lived ones: the token minted HERE, on the worker,
+    freshly, for every axis that declares the machine's own identity, so the box starts with the
+    most life the token has. RAISES `CredentialUnavailable` when a declared identity does not
+    answer: a box launched without its credential would fail inside with a sentence about the
+    wrong thing.
+
+    `references` holds the reference (`<store>:<name>`) of every axis whose secret the credential
+    store holds, and is non-empty only for a launcher that declares `RESOLVES_REFERENCES`
+    (`adapters.sandbox.registry.resolves_references`): it resolves each one on its own machine.
+    For a launcher that declares nothing, such an axis RAISES `CredentialUnavailable` naming the
+    box kind and the declaration it lacks, rather than writing a long-lived secret into a launch
+    environment someone else may read back (an ECS task's overrides, #903). The caller asks this
+    before `launch`, so a refused job has launched nothing."""
+    from beeverforge.adapters.sandbox.registry import resolves_references
+
+    declares = resolves_references(runner)
+    out: dict[str, str] = {}
+    references: dict[str, str] = {}
+    for axis in BOX_TOKEN_ENV:
+        ref = getattr(project, axis, None)
+        declared, problem = _declared(ref)
+        if not (declared or problem):
+            if held := _held_in_a_store(project, axis):
+                if declares:
+                    references[BOX_TOKEN_ENV[axis]] = held
+                    continue
+                raise CredentialUnavailable(
+                    f"{getattr(project, 'name', '?')}'s {axis} credential `{held}` is held in the "
+                    f"credential store, and the `{kind}` box's launcher does not declare that "
+                    f"{RESOLVES_REFERENCES}, so it is handed only short-lived minted tokens and "
+                    f"the store's secret is not put into its launch environment — hold it in a "
+                    f"variable the box reads for itself, which is handed over by name, declare the "
+                    f"machine's own identity (`identity: workload`), or run on a box whose "
+                    f"launcher declares `resolves_references = True`")
+            continue
+        provider = _deployment_provider(ref)
+        token = provider() if provider is not None else None
+        if not token:
+            raise CredentialUnavailable(
+                f"{getattr(project, 'name', '?')}'s {axis} declares the machine's own identity "
+                f"and it did not answer on the worker — "
+                f"{credential_problem(ref) or 'nothing was launched'}")
+        out[BOX_TOKEN_ENV[axis]] = token
+    return out, references
+
+
+def discover_forge_token(kind: str) -> str | None:
+    """A PERSON's own login on this machine for the forge `kind`, or None — onboarding's
+    convenience, consulted through the vendor's row (`discover`), absent on vendors with none.
+
+    It was `cli.py::_gh_token_if_logged_in`, a `gh auth token` subprocess in core on a path that
+    had just asked which forge the deployment uses. Never raises: an unavailable helper (no CLI,
+    not logged in, a vendor with no such thing) is an ordinary state."""
+    row = _row((kind or "").strip().lower())
+    if row is None or row.discover is None:
+        return None
+    try:
+        return row.discover()
+    except Exception:  # noqa: BLE001 — a convenience may not break onboarding
+        log.debug("the %s login could not be discovered", kind, exc_info=True)
+        return None

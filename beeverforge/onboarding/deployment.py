@@ -1,0 +1,1040 @@
+"""`beeverforge init` — generate this deployment's environment instead of asking for it (#116).
+
+THE DEFECT THIS CLOSES, raised by the pilot operator unprompted while filling `.env.compose` in:
+*"não deveria ser o CLI da beeverforge a gerar este .env.compose com base em definições da stack?
+[…] é normal estas fases de config nos CLI, como AWS por exemplo."*
+
+He was right, and the strongest argument is not the industry's (`aws configure`, `gh auth login`,
+`terraform init`) — it is this platform's own. `env read` reads a repository and PROPOSES its
+manifest; `project init` converges the registry, the board and the scaffold. The deployment's own
+environment was the last thing still hand-written, and it is the FIRST file an adopter opens.
+
+THE ORDER WAS BACKWARDS, which is what made it feel generic: an adopter was asked to fill in
+credentials BEFORE declaring which vendors they use, so they filled blanks for systems they will
+never touch and left blanks whose consequence they could not evaluate. The cure is not a longer
+comment — it is a file that contains only the variables this deployment's answers actually use.
+
+WHAT THIS MODULE IS AND IS NOT. It is pure: answers in, file text out, plus two lists (what was
+obtained without asking, and what a human must still do). Every credential it cannot generate is
+NAMED with the exact page or command that produces it — never left as an empty line the reader
+has to interpret. The I/O — prompting, reading `gh`, writing the file at 0600 — belongs to the
+CLI, so every branch here is reachable in a test with no TTY, no network and no `gh`. (The one
+read it does make is of the installed entry points, below, and that read never raises.)
+
+WHAT IT DELIBERATELY DOES NOT ASK. Anything the registry already knows or `env read` discovers on
+its own: repositories, board coordinates, the client's stack, the box image. This step is about
+the DEPLOYMENT — the secrets and the ports — and a question whose answer already lives somewhere
+is a question that will disagree with that somewhere.
+
+THE VOCABULARY IS THE REGISTRIES', READ WHEN THE COMMAND RUNS. Four literal tuples used to sit
+here — `FORGES = ("github", "azure_devops")` and its three siblings — a hand copy of the axes'
+tables that was equal to them by luck and refused every add-on by construction: a stranger who
+had installed `forge.gitea` and could build it through the registry was told by the FIRST command
+an adopter runs that `'gitea' is not one of github, azure_devops` (measured 2026-08-26, with a
+real dist-info on the path). The choices are now `plugins.known(axis, TABLE)`, resolved when a
+question is read rather than at import, so a broken add-on cannot break `beeverforge --help`.
+
+AN ADD-ON KIND IS NEVER RENDERED SILENTLY. Widening the vocabulary alone would have produced a
+worse file than the refusal: `render(Answers(forge="gitea"))` wrote a file with no forge row at
+all and a to-do list with no line for its credential — a file that looks configured and
+authenticates nothing, the exact class `HARNESS_ENV_CREDENTIAL` refuses below. So a kind this
+generator carries no rows for gets a commented section naming it and a `remaining` line saying
+the add-on owns its credential and its package documents the variables.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import secrets
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+from beeverforge import plugins
+from beeverforge.adapters.agent.registry import HARNESS_CREDENTIALS
+from beeverforge.listeners import ENGINE, ENGINE_UI, LISTENERS, PANEL
+
+#: The fixed vocabularies — questions whose answers are this platform's, not a provider's.
+GITHUB_AUTH = ("token", "app")
+GITHUB_ACCOUNTS = ("org", "personal")
+CLAUDE_AUTH = ("subscription", "api_key")
+
+
+def _table(axis: str) -> dict[str, object]:
+    """The registry's OWN table for `axis` — the shipped rows, imported when asked so a broken
+    add-on or a heavy adapter module never sits on `beeverforge --help`."""
+    from beeverforge.adapters.agent.registry import HARNESSES
+    from beeverforge.adapters.channel.registry import CHANNELS
+    from beeverforge.adapters.forge.registry import FORGES
+    from beeverforge.adapters.tracker.registry import TRACKERS
+
+    return {"forge": FORGES, "tracker": TRACKERS, "harness": HARNESSES,
+            "channel": CHANNELS}[axis]
+
+
+def _forges() -> tuple[str, ...]:
+    return tuple(plugins.known("forge", _table("forge")))
+
+
+def _trackers() -> tuple[str, ...]:
+    return tuple(plugins.known("tracker", _table("tracker")))
+
+
+def _harnesses() -> tuple[str, ...]:
+    return tuple(plugins.known("harness", _table("harness")))
+
+
+def _channels() -> tuple[str, ...]:
+    return tuple(plugins.known("channel", _table("channel")))
+
+
+#: axis → the kinds this deployment can build, shipped plus installed, read when asked.
+CHOICES: dict[str, Callable[[], tuple[str, ...]]] = {
+    "forge": _forges,
+    "tracker": _trackers,
+    "harness": _harnesses,
+    "channel": _channels,
+}
+
+
+def choices(axis: str) -> tuple[str, ...]:
+    """Every kind `axis` can name in an answer — the registry's table plus the installed add-ons,
+    sorted. The one vocabulary the prompt, the refusal and `validate()` all read."""
+    return CHOICES[axis]()
+
+
+def shipped(axis: str) -> tuple[str, ...]:
+    """The kinds this generator carries a credential block for: the registry's OWN rows for
+    `axis`, read when asked. Anything else the registry knows arrived through an entry point and
+    is an ADD-ON to this file — rendered as a named section with no rows, plus a to-do line
+    that says whose variables go there.
+
+    NOT A LIST KEPT HERE. A literal copy of the four tables sat in this slot, equal to them by
+    luck and read by no test (measured 2026-08-26): a row added to a registry without a name in
+    the copy would have rendered as "an add-on this generator carries no rows for" — a false
+    sentence in the operator's own `.env`. The tables are the truth; what this module still owes
+    is a BLOCK for every row in them, and the guard holds that each shipped kind names itself in
+    the file rendered for it — a shipped row this module forgot would otherwise render nothing,
+    and nothing looks configured."""
+    return tuple(_table(axis))
+
+#: Harnesses whose credential is a variable this file can carry. The others authenticate through
+#: their own CLI's login state inside the box (`codex login`, `kimi login`, and OpenCode's
+#: provider registration) — MEASURED, not assumed: `_AUTH_ENV_VARS` in the container sandbox is
+#: exactly `("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")`. Inventing a variable for the other
+#: three would produce a file that looks configured and authenticates nothing.
+#:
+#: READ FROM THE REGISTRY'S ONE ANSWER (review of #584): `HARNESS_CREDENTIALS` is what every probe
+#: asks, and a kept tuple here was a second answer to the same question — a harness added to one
+#: and not the other would have the wizard ask for a token no probe reads, or the reverse.
+HARNESS_ENV_CREDENTIAL = tuple(HARNESS_CREDENTIALS)
+
+
+@dataclass(frozen=True)
+class Question:
+    """One question, in the READER's words, with what their answer changes.
+
+    THE PROMPTS INHERITED THE DEFECT THE FILE JUST LOST. `.env.compose` used "forge" and
+    "tracker" as though they were English and never said what a row was for; the fix was to
+    define them at the point of use. Then the prompts asked `channel (panel/slack)` — the same
+    mistake, one layer up — and the pilot operator asked the same question again: *"não entendi
+    essa pergunta e o que ela influenciaria"*.
+
+    So a question is a STRUCTURE, not a string: `ask` is plain language, `effect` says what
+    changes, and a guard holds both — `ask` may not contain this platform's own vocabulary,
+    because those are precisely the words the person answering does not have yet.
+
+    `options` is READ, not stored: a question about a provider axis answers with the registry's
+    vocabulary at the moment it is asked, so an add-on installed after this module was imported
+    is offered too. The fixed vocabularies are closed over the same way, for one shape.
+    """
+
+    flag: str          # what the scripted form is called: --forge, --channel…
+    ask: str           # the question, in words somebody who has never seen this product has
+    effect: str        # what their answer changes about the file this writes
+    choose: Callable[[], tuple[str, ...]]
+    default: str
+
+    @property
+    def options(self) -> tuple[str, ...]:
+        return self.choose()
+
+
+def _runtimes() -> tuple[str, ...]:
+    """Where the factory itself runs — read live, like every other vocabulary here.
+
+    `local` and `compose` are what this repository ships: the three processes on the host, or the
+    four in a compose file. Anything else is a box an add-on installed (`fargate`), and it belongs
+    on this list for the same reason a forge kind does — a deployment that installed the package
+    should be offered what it bought, and a kind nobody has is not offered at all."""
+    from beeverforge import plugins
+    from beeverforge.adapters.sandbox.registry import AXIS, BOXES
+
+    hosted = tuple(k for k in plugins.known(AXIS, BOXES) if k not in ("worktree", "container"))
+    return ("local", "compose", *hosted)
+
+
+def _fixed(values: tuple[str, ...]) -> Callable[[], tuple[str, ...]]:
+    return lambda: values
+
+
+#: Asked in this order. Each one is skipped when its answer cannot matter (the GitHub question
+#: for a deployment with no GitHub, the Claude question for another harness) — a question whose
+#: answer is discarded teaches the reader that the answers do not matter.
+QUESTIONS: tuple[Question, ...] = (
+    # WHERE THE FACTORY RUNS IS THE FIRST QUESTION (ADR-0049 D9), because it decides which of the
+    # others are worth asking: on `local` there is no vendor to authenticate to and no container
+    # runtime to install, so the file this writes owes exactly one credential — the harness's own
+    # login, which the person already has.
+    Question("runtime", "Where should the FACTORY itself run — this machine, or Docker?",
+             "`local` starts three processes on this host with `beeverforge up` and asks for no "
+             "credential at all; `compose` is today's stack in Docker, and its file asks for the "
+             "credentials your vendors need", _runtimes, "local"),
+    # `local` IS THE DEFAULT ON BOTH AXES (ADR-0049 D2). The first answer a person gives should
+    # be the machine they are sitting at: `local` needs no account anywhere, no PAT and no token
+    # — their own repository is the forge and the board is a file beside it. The hosted answers
+    # are one word away and unchanged.
+    Question("forge", "Where does your CODE live — the branches and the pull requests?",
+             "`local` is this machine: your own repository, no account and no credential. "
+             "Any other answer decides which credential this file asks you for", _forges, "local"),
+    Question("tracker", "Where do your TICKETS live — the issues and the board?",
+             "`local` keeps them in a file beside your repository, on the panel's Board. The two "
+             "can differ: tickets in Jira with code on GitHub is ordinary", _trackers, "local"),
+    Question("github-auth", "How should the factory sign in to GitHub?",
+             "`token` is fastest and every commit reads as YOU; `app` gives the factory its own "
+             "identity and audit trail — what a team should use", _fixed(GITHUB_AUTH), "token"),
+    Question("github-account", "Is that GitHub account an organisation or a personal account?",
+             "`personal` adds one extra line to fill in: a personal account's project board "
+             "cannot be driven with the App's own sign-in, so the board needs a classic token "
+             "beside it; `org` needs nothing extra", _fixed(GITHUB_ACCOUNTS), "org"),
+    Question("harness", "Which coding agent should write the code?",
+             "the platform orchestrates it; you pay for it", _harnesses, "claude_code"),
+    Question("claude-auth", "How do you pay for Claude?",
+             "`subscription` uses a token from `claude setup-token`; `api_key` bills per token",
+             _fixed(CLAUDE_AUTH), "subscription"),
+    Question("channel", "Where should the factory talk to your team?",
+             "`panel` = the web panel only (it still comments on every ticket); any other kind = "
+             "ALSO a chat channel an installed add-on package provides, which adds that package's "
+             "variables to fill in", _channels, "panel"),
+    Question("panel-exposed", "Will anyone open the panel from another machine?",
+             "`yes` generates a password for the panel; `no` leaves it OPEN to anyone who can "
+             "reach the port — fine on a laptop, wrong for anything else",
+             _fixed(("yes", "no")), "no"),
+)
+
+
+class UnusableHome(RuntimeError):
+    """No job workspace can be chosen here, because `$HOME` is not a directory.
+
+    ITS OWN TYPE BECAUSE THE CALLER DECIDES WHAT TO DO. `beeverforge init` turns it into a one-line
+    refusal naming `BEEVERFORGE_WORK_DIR`; `preflight` turns it into a Finding with the same
+    remedy. Returning `/` — which is what `$HOME/.local/share` did when Docker handed a numeric uid
+    `HOME=/` — is the one answer that must never be given, because it looks like a path and is a
+    permission error three steps later (measured on beeverforge-cli:v0.1.3, 2026-09-02)."""
+
+
+class UnusableWorkDir(UnusableHome):
+    """A declared `BEEVERFORGE_WORK_DIR` that compose cannot bind — relative, or holding a `~`.
+
+    THE SAME DECISION FOR THE CALLER, so the same type: refused by name before anything is written,
+    never expanded into a path the caller did not write (#367). Compose resolves a relative bind
+    source against the directory `up` ran in, and expands no tilde: `~/work` creates a directory
+    called `~` and mounts an empty box, which is the "box saw 0 entries" defect reached by the
+    declared road — the kept road was closed by #366, and this one was left as it always was.
+
+    IT CARRIES THE VALUE IT REFUSED, because the subtype alone did not reach the person in
+    `preflight`: caught there as its parent, a declared `~/work` was reported as "$HOME is not a
+    directory this process can write under", the wrong cause, with a remedy to set the variable
+    they had just set (measured on 34c91c7, 2026-10-01)."""
+
+    def __init__(self, message: str, declared: str) -> None:
+        super().__init__(message)
+        self.declared = declared
+
+
+class UnknownAnswer(ValueError):
+    """An answer outside the vocabulary — refused by name, with the alternatives listed."""
+
+
+@dataclass
+class Answers:
+    """The four decisions that cannot be inferred, plus how each one is authenticated."""
+
+    #: `local` ON BOTH AXES (D2), and this is the default a TEST meets as well as a person: the
+    #: prompts carry the same one, and a deployment that answers nothing runs on the machine it
+    #: was installed on rather than reaching for a vendor nobody named.
+    #: WHERE THE FACTORY RUNS (D9) — `local` (three processes on this machine), `compose`
+    #: (today's Docker stack) or a kind an add-on installed. It decides which FILE `init` writes
+    #: and which switches it carries; the axes below decide what that file must ask for.
+    runtime: str = "local"
+    forge: str = "local"
+    tracker: str = "local"
+    harness: str = "claude_code"
+    github_auth: str = "token"        # only read when github is on one of the two axes
+    github_account: str = "org"       # only read on the App path — `personal` boards need a PAT
+    claude_auth: str = "subscription"  # only read when the harness is claude_code
+    channel: str = "panel"
+    panel_exposed: bool = False
+
+    def validate(self) -> None:
+        for value, allowed, what in (
+            (self.runtime, _runtimes(), "runtime"),
+            (self.forge, choices("forge"), "forge"),
+            (self.tracker, choices("tracker"), "tracker"),
+            (self.harness, choices("harness"), "harness"),
+            (self.github_auth, GITHUB_AUTH, "github-auth"),
+            (self.github_account, GITHUB_ACCOUNTS, "github-account"),
+            (self.claude_auth, CLAUDE_AUTH, "claude-auth"),
+            (self.channel, choices("channel"), "channel"),
+        ):
+            if value not in allowed:
+                raise UnknownAnswer(
+                    f"{what}: {value!r} is not one of {', '.join(allowed)}")
+
+    @property
+    def uses_github(self) -> bool:
+        return "github" in (self.forge, self.tracker)
+
+    @property
+    def uses_azure(self) -> bool:
+        return "azure_devops" in (self.forge, self.tracker)
+
+    @property
+    def uses_jira(self) -> bool:
+        return self.tracker == "jira"
+
+    def add_ons(self) -> list[tuple[str, str]]:
+        """`(axis, kind)` for every answer this generator carries no block for — the kinds a
+        registry knows only because a package outside this repository declared them."""
+        chosen = (("forge", self.forge), ("tracker", self.tracker),
+                  ("harness", self.harness), ("channel", self.channel))
+        return [(axis, kind) for axis, kind in chosen if kind not in shipped(axis)]
+
+
+def default_work_dir() -> str:
+    """Where a job's files live while it runs, on THIS machine, owned by whoever ran this.
+
+    THE ROW THIS PRODUCES IS WHAT DELETES THE `sudo` LINE from the first-run path.
+    `docker-compose.yml` defaulted to `/var/lib/beeverforge-work`, which no ordinary user may
+    create, so every Linux install began with
+
+        sudo mkdir -p /var/lib/beeverforge-work && sudo chown $(whoami) /var/lib/beeverforge-work
+
+    — and skipping it did not fail, it let Docker auto-create the directory owned by ROOT, so the
+    ownership surprised people later; under rootless Docker it cannot be created at all. The XDG
+    data directory is the platform's own answer to "state this user owns", and it fixes a macOS
+    failure at the same time: `$HOME` is inside Docker Desktop's default file sharing and
+    `/var/lib` is not.
+
+    ABSOLUTE AND TILDE-FREE, and both are load-bearing rather than tidy. Compose resolves a bind
+    SOURCE against the directory `up` ran in, so a relative value would put every job's workspace
+    inside whatever checkout the operator happened to be in; and **compose does not expand `~` in a
+    bind source at all** — a `~`-relative value creates a literal `./~` directory on the host and
+    mounts an empty box, which is the "box saw 0 entries" defect (`container.py`, 2026-08-03)
+    reached by a new road. `expanduser` runs here, where a real `$HOME` exists, precisely so the
+    tilde never reaches the file — and A DECLARED VALUE IS CHECKED, NOT EXPANDED (#367): the
+    caller wrote it, and a path they did not write must not be the one the file names. It was
+    returned as written, so `BEEVERFORGE_WORK_DIR=~/work beeverforge init` put `~/work` in the file
+    on the very road #366 had just guarded for the kept value.
+
+    THE WORK DIRECTORY BELONGS TO THE HOST, AND THIS MAY BE RUNNING IN A CONTAINER. `install.sh`
+    runs `init` inside `beeverforge-cli` with `-u "$(id -u):$(id -g)"`, and Docker gives a uid with
+    no `/etc/passwd` entry **HOME=/** — so `$HOME/.local/share` became `/.local/share`, an absolute
+    path at the filesystem root that nobody may write. Measured against the published
+    `beeverforge-cli:v0.1.3` (2026-09-02):
+
+        HOME=[/]  cwd=/out  XDG=[]
+        FAIL  work_dir  the job workspace /.local/share/beeverforge/work cannot be created or
+                        written here: Permission denied
+
+    That is not an exotic shell — `docker run -u $(id -u)` produces it on every Linux machine, so
+    the one-line install hit it every time, and P0.4's whole point was to stop handing people a
+    root-owned path. `HOME=""` is worse still: `Path("")/".local"` is RELATIVE, so `.resolve()`
+    answers differently depending on the working directory (measured: `/` gives
+    `/.local/share/beeverforge/work`).
+
+    SO THE ENVIRONMENT IS ASKED FIRST. `BEEVERFORGE_WORK_DIR` is what a caller that knows the HOST
+    passes in — `install.sh` does — and it is the same variable `preflight` and `docker-compose.yml`
+    already read. Only when nobody has said does this fall back to the XDG convention, and a `$HOME`
+    that cannot produce a usable path is REFUSED BY NAME rather than quietly rooted at `/`.
+    """
+    import os
+    import pathlib
+
+    declared = (os.environ.get("BEEVERFORGE_WORK_DIR") or "").strip()
+    if declared:
+        if not declared.startswith("/") or "~" in declared:
+            raise UnusableWorkDir(
+                f"BEEVERFORGE_WORK_DIR={declared} is not a path compose can bind: it must be "
+                "absolute, with no `~` — compose resolves a relative source against the directory "
+                "`up` ran in, and expands no tilde, so it would create a directory called `~` and "
+                "mount an empty box. Write the whole path — for example "
+                "BEEVERFORGE_WORK_DIR=$HOME/.local/share/beeverforge/work — and run this again. "
+                "Nothing was written.", declared)
+        return declared
+
+    base = (os.environ.get("XDG_DATA_HOME") or "").strip()
+    if base:
+        root = pathlib.Path(base)
+    else:
+        # `Path.home()` READS `$HOME` AND ONLY FALLS BACK TO THE PASSWD DATABASE WHEN IT IS UNSET.
+        # An empty or `/` value is neither unset nor usable, and both are ordinary in a container.
+        home = (os.environ.get("HOME") or "").strip()
+        if not home:
+            try:
+                home = str(pathlib.Path.home())
+            except RuntimeError:
+                home = ""
+        if home in ("", "/"):
+            raise UnusableHome(
+                "cannot choose a job workspace directory: $HOME is "
+                f"{os.environ.get('HOME', '')!r}, which is not a directory anything may write to. "
+                "Set BEEVERFORGE_WORK_DIR to an absolute path you own — for example "
+                "BEEVERFORGE_WORK_DIR=$HOME/.local/share/beeverforge/work — and run this again.")
+        root = pathlib.Path(home) / ".local" / "share"
+
+    return str((root / "beeverforge" / "work").expanduser().resolve())
+
+
+@dataclass
+class Probes:
+    """What the generator can obtain WITHOUT asking a human. Injected, so a test needs no `gh`.
+
+    `forge_token` returns a token or None — never raises: an unavailable helper is an ordinary
+    state (no `gh`, not logged in, a different vendor), and the file is still generated with the
+    line left empty and the recipe beside it."""
+
+    forge_token: Callable[[], str | None] = lambda: None
+    secret: Callable[[], str] = lambda: secrets.token_hex(32)
+    #: The job workspace directory. A PROBE AND NOT AN ANSWER, and the distinction is forced rather
+    #: than chosen: `Answers`' fields are held equal to `QUESTIONS` by
+    #: `test_the_questions_cover_every_answer_the_generator_reads`, and a `Question` offers a
+    #: CLOSED tuple of options with `default in options` — a filesystem path is not a vocabulary.
+    #: It is also not a question worth asking: the default is correct for every machine that has a
+    #: `$HOME`, and `QUESTIONS`' own rule is that a question whose answer is discarded teaches the
+    #: reader that the answers do not matter. Injected all the same, because reading `$HOME` at
+    #: render time would make this module's one promise — pure, answers in and file text out —
+    #: false, and every test of it would depend on the home directory of whoever ran it.
+    work_dir: Callable[[], str] = default_work_dir
+    #: WHERE THIS OPERATOR'S OWN FILES GO. The `local` runtime writes absolute paths for the
+    #: registry and the board, because an env file is read by processes and not by a shell: a `~`
+    #: in it reaches `os.environ` as a literal tilde and the factory would create a directory
+    #: called `~` in whatever it happened to be started from.
+    home: Callable[[], str] = lambda: str(pathlib.Path.home())
+
+
+@dataclass
+class Rendered:
+    text: str
+    #: NAMES of the variables filled without asking. Never values — a generator that echoes a
+    #: secret to a terminal has put it in a scrollback buffer, a screen recording and a CI log.
+    obtained: list[str] = field(default_factory=list)
+    #: What a human must still do, in the order they should do it, each with its page or command.
+    remaining: list[str] = field(default_factory=list)
+
+
+_HEADER = """\
+# BeeverForge — this deployment's environment, generated by `beeverforge init`.
+#
+# ONLY the variables THIS deployment's answers use are here. That is the point: a file with rows
+# for vendors you do not run is a file you cannot tell apart from one you filled in wrong.
+# Re-run `beeverforge init --force` to change an answer: every value already here is kept, so
+# empty a line to have it generated again.
+#
+# What is NOT here, and where it lives instead:
+#   your code's stack ..... `.beeverforge/project.yaml` in YOUR repository (`beeverforge env read`)
+#   the box that runs it .. the registry, per project (`box.image`)
+#   which vendors ......... the registry, per project (`tracker/forge: {kind: …}`)
+#   secrets ............... this file, because one deployment serves many projects
+"""
+
+
+def _github_block(a: Answers, p: Probes, out: Rendered) -> str:
+    if a.github_auth == "app":
+        out.remaining.append(
+            "create the GitHub App and INSTALL it (two separate pages — finishing the first "
+            "looks like finishing): the whole walkthrough, permission table included, is "
+            "docs/setup/github.md. Then fill BEEVERFORGE_GH_APP_ID (the App's General page), "
+            "BEEVERFORGE_GH_APP_INSTALLATION_ID (the NUMBER AT THE END OF THE URL after "
+            "Settings → GitHub Apps → Configure — it appears nowhere on the page itself) and "
+            "BEEVERFORGE_GH_APP_KEY_CONTENT (the whole PEM in DOUBLE QUOTES, not a path — "
+            "unquoted, its line breaks corrupt the parse of this entire file)")
+        if a.github_account == "personal":
+            # The trap the first pilot funnel hit (2026-08-10): the App path on a personal
+            # account emitted only the trio, the board needs a classic PAT beside it, and that
+            # fact lived in prose nobody re-reads. Now the ANSWER writes the row.
+            out.remaining.append(
+                "fill BEEVERFORGE_TRACKER_TOKEN — a personal account's project board cannot be "
+                "driven with the App's sign-in, so the board uses this instead: "
+                "github.com/settings/tokens → classic token, scopes `repo` and `project`, "
+                "NEVER `workflow` (docs/setup/github.md §6)")
+            return """
+# ── GitHub, as an App: its own identity, its own audit trail, a token that expires ──
+# The walkthrough (both creation pages, the permission table, the traps): docs/setup/github.md
+#   APP ID ............. the "About" block at the top of the App's General settings page
+#   INSTALLATION ID .... the number at the END OF THE URL after Settings → GitHub Apps →
+#                        Configure (…/settings/installations/<id>) — it is printed nowhere on
+#                        the page itself
+#   KEY CONTENT ........ the whole -----BEGIN…END----- block, wrapped in DOUBLE QUOTES. Unquoted,
+#                        the line breaks corrupt the parse of this ENTIRE file — every other
+#                        credential in it silently stops arriving.
+# Leave BEEVERFORGE_BOT_TOKEN out of this file: a filled PAT beats the App everywhere.
+BEEVERFORGE_GH_APP_ID=
+BEEVERFORGE_GH_APP_INSTALLATION_ID=
+BEEVERFORGE_GH_APP_KEY_CONTENT=""
+
+# ── The board, because this is a PERSONAL account ──
+# A user-owned project board cannot be driven with the App's sign-in (GitHub's limitation, not
+# a permission you forgot) — the App keeps the code, this classic token carries the board:
+# github.com/settings/tokens → classic, scopes `repo` + `project`, NEVER `workflow`.
+BEEVERFORGE_TRACKER_TOKEN=
+"""
+        return """
+# ── GitHub, as an App: its own identity, its own audit trail, a token that expires ──
+# The walkthrough (both creation pages, the permission table, the traps): docs/setup/github.md
+#   APP ID ............. the "About" block at the top of the App's General settings page
+#   INSTALLATION ID .... the number at the END OF THE URL after Settings → GitHub Apps →
+#                        Configure (…/settings/installations/<id>) — it is printed nowhere on
+#                        the page itself
+#   KEY CONTENT ........ the whole -----BEGIN…END----- block, wrapped in DOUBLE QUOTES. Unquoted,
+#                        the line breaks corrupt the parse of this ENTIRE file — every other
+#                        credential in it silently stops arriving.
+# Leave BEEVERFORGE_BOT_TOKEN out of this file: a filled PAT beats the App everywhere.
+BEEVERFORGE_GH_APP_ID=
+BEEVERFORGE_GH_APP_INSTALLATION_ID=
+BEEVERFORGE_GH_APP_KEY_CONTENT=""
+"""
+    token = p.forge_token()
+    if token:
+        out.obtained.append("BEEVERFORGE_BOT_TOKEN")
+        out.remaining.append(
+            "BEEVERFORGE_BOT_TOKEN was taken from your `gh` login, so the factory will commit and "
+            "open pull requests AS YOU. Fine for trying it out; before anybody depends on it, "
+            "re-run with --github-auth app so the factory has an identity of its own")
+        return f"""
+# ── GitHub, as a personal access token ──
+# Taken from your `gh` login: this is YOUR credential, so every commit and PR reads as you.
+# For a real deployment use a GitHub App instead (`beeverforge init --github-auth app`).
+BEEVERFORGE_BOT_TOKEN={token}
+"""
+    out.remaining.append(
+        "fill BEEVERFORGE_BOT_TOKEN — github.com/settings/tokens → classic token with scopes "
+        "`repo` and `project` (plus `read:org` for an organisation board), and NEVER `workflow`: "
+        "its absence is what keeps the factory out of your CI/CD definitions")
+    return """
+# ── GitHub, as a personal access token ──
+# github.com/settings/tokens → classic token, scopes `repo` + `project` (+ `read:org` for an
+# organisation board). NEVER `workflow` — its absence is the guardrail that keeps the factory out
+# of your CI/CD definitions.
+BEEVERFORGE_BOT_TOKEN=
+"""
+
+
+def _binary(kind: str) -> str:
+    """What a person types for this harness — the registry's table, never a fourth copy."""
+    from beeverforge.adapters.agent.registry import harness_binary
+
+    return harness_binary(kind)
+
+
+def _harness_block(a: Answers, out: Rendered) -> str:
+    """The harness section's text — and, first, its to-do line (the un-postponable one)."""
+    # ON THIS MACHINE THE LOGIN IS THE CREDENTIAL (ADR-0049 D9). A token variable exists because
+    # the CLI has to authenticate INSIDE a container, with no human at a browser. The `local`
+    # runtime has no container: the harness runs on the host, as the person who started the
+    # worker, with the login they already use when they type `claude` — so asking them to run
+    # `claude setup-token` and paste a token nothing will read is the one to-do that would make a
+    # working install look unfinished.
+    # AN ADD-ON'S HARNESS IS ITS OWN, ON EVERY RUNTIME. The `local` shortcut below says the login
+    # on this machine IS the credential, which the platform knows about the harnesses it ships and
+    # cannot promise about a stranger's: its package declares what it reads, and a file that
+    # quietly dropped that section would look configured and authenticate nothing.
+    if a.harness not in shipped("harness"):
+        return _add_on_block("harness", a.harness, out)
+    if a.runtime == "local":
+        # A CHECK, NOT A PASTE. The list is "what is still yours to do", and on this runtime the
+        # honest entry is to confirm a login that probably already exists — not to fetch a token.
+        # An EMPTY list would be worse than either: it reads as "nothing is needed", and a harness
+        # nobody has signed in fails at the first card with the money already spent getting there.
+        out.remaining.append(
+            f"check that `{_binary(a.harness)}` is signed in on this machine — that login IS the "
+            f"credential on this runtime. `beeverforge doctor <project>` says whether it can see "
+            f"it, and `beeverforge box prove <project>` is what proves it with one real call")
+        return f"""
+# ── The harness: {a.harness}, signed in as YOU ──
+# No credential variable on this runtime. The factory runs the harness on this machine, as the
+# person who started it, with the login it already has — `{_binary(a.harness)}` on your PATH,
+# the way you authenticate it. `claude setup-token` is for the container box, where there is no
+# login to inherit; if you set a token variable anyway, the harness uses it.
+"""
+    if a.harness in HARNESS_ENV_CREDENTIAL:
+        if a.claude_auth == "subscription":
+            out.remaining.append(
+                "fill CLAUDE_CODE_OAUTH_TOKEN — run `claude setup-token` on this machine and "
+                "paste the result. THIS IS THE ONE CREDENTIAL YOU CANNOT POSTPONE: the stack "
+                "boots without it and no ticket can run")
+            return """
+# ── The harness: Claude Code on a subscription ──
+# Run `claude setup-token` on this machine and paste the result. The CLI has to authenticate
+# INSIDE the box, with no human at a browser — which is why a token and not a login.
+CLAUDE_CODE_OAUTH_TOKEN=
+"""
+        out.remaining.append(
+            "fill ANTHROPIC_API_KEY — console.anthropic.com → API keys. THIS IS THE ONE "
+            "CREDENTIAL YOU CANNOT POSTPONE: the stack boots without it and no ticket can run")
+        return """
+# ── The harness: Claude Code on an API key ──
+# console.anthropic.com → API keys. Billed per token rather than by subscription.
+ANTHROPIC_API_KEY=
+"""
+    out.remaining.append(
+        f"authenticate the {a.harness} CLI — it logs in through its own command rather "
+        f"than an environment variable, and it must be authenticated INSIDE the box. "
+        f"`beeverforge box prove <project>` is what proves it actually is, before any ticket "
+        f"spends money")
+    return f"""
+# ── The harness: {a.harness} ──
+# No credential variable: this harness authenticates through its own CLI's login, inside the box.
+# `beeverforge box prove <project>` is what proves that it did — before a ticket spends anything.
+"""
+
+
+def _add_on_block(axis: str, kind: str, out: Rendered) -> str:
+    """The section for a kind this generator carries no rows for, and its to-do line.
+
+    NAMED, NEVER SILENT. The alternative — a file with no mention of the kind and a to-do list
+    with no line for its credential — looks complete and authenticates nothing; that is the
+    shape this whole module exists to refuse. The add-on owns its credential: its package says
+    which variables belong here, and `beeverforge doctor` says which are still missing."""
+    out.remaining.append(
+        f"add the variables the `{kind}` {axis} add-on documents — this generator carries no rows "
+        f"for it, its package names the variables to put in this file, and `beeverforge doctor` "
+        f"reports which are still missing")
+    return f"""
+# ── {axis}: {kind} — an add-on this generator carries no rows for ──
+# The package that provides `{kind}` documents which variables belong here; add them below.
+# `beeverforge doctor` reports which of them are still missing.
+"""
+
+
+#: What a `local` axis IS, in the person's own terms — one sentence each, because the two axes
+#: mean different things and "no credential" is only half of either.
+_LOCAL_AXIS: dict[str, str] = {
+    "forge": "your own repository is the forge: job branches are pushed into it and a merge is a "
+             "fast-forward into your base, refused in git's own words when your tree is in the "
+             "way",
+    "tracker": "your tickets live in `board.db` beside the registry, and the panel's Board is "
+               "where you write and drag them",
+}
+
+
+def _local_block(axis: str, out: Rendered) -> str:
+    """The section for an axis that needs nothing — NAMED, and row-less on purpose (ADR-0049 D2).
+
+    SILENCE WAS THE ALTERNATIVE AND IT LOOKED IDENTICAL TO AN OVERSIGHT. `local` is a shipped row,
+    so it never reached `_add_on_block`, and it carries no credential, so it reached no block at
+    all: a person answering `local` twice got a file with nothing in it about where their code or
+    their tickets live. The guard that should have caught that passed by LUCK — it asks whether
+    the kind names itself anywhere in the file, and `BEEVERFORGE_BOT_EMAIL=bot@beeverforge.local`
+    contains the word. It is tightened with this.
+
+    NO TO-DO LINE, and that is the whole point of the answer: there is nothing to fill in. The
+    harness credential is the one line that remains, which is what ADR-0049 promises a person
+    who runs the factory on one machine."""
+    return f"""
+# ── {axis}: local — this machine, and no credential ──
+# {_LOCAL_AXIS[axis]}.
+# Nothing to fill in here: that is what `local` means. `beeverforge doctor` reports this axis as
+# needing no credential rather than as one that is missing.
+"""
+
+
+def _channel_block(kind: str, out: Rendered) -> str:
+    """The section for an add-on channel: the variables ITS row declares it reads
+    (`plugins.environment`), written as rows under the package's own comment — never spelled here.
+
+    THE CORE CARRIED THE CHAT PACKAGE'S TWO VARIABLES BY NAME until 2026-08-26 (`if
+    answers.channel == "slack": …` with the two rows spelled out) — reached only with that
+    package's row installed, and still the one place the core spelled a vendor's variable after
+    the chat cut. A row that declares nothing gets the generic add-on section, which says whose
+    variables go there."""
+    from beeverforge.adapters.channel.registry import AXIS, CHANNELS
+
+    builder = plugins.builder(AXIS, kind, builtin=CHANNELS)
+    names = plugins.environment(builder)
+    if not names:
+        return _add_on_block("channel", kind, out)
+    listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    out.remaining.append(
+        f"fill {listed} — the variables the `{kind}` channel add-on reads; its package says where "
+        f"each comes from, and `beeverforge doctor` reports which are still missing")
+    how_to = plugins.how_to(builder)
+    comment = ("".join(f"# {line}\n" for line in how_to.splitlines()) if how_to else
+               f"# The package that provides `{kind}` says where each of these comes from.\n")
+    rows = "".join(f"{name}=\n" for name in names)
+    return (f"\n# ── The channel: where the tech-lead speaks when nobody is watching the panel ──\n"
+            f"# `{kind}` is an add-on channel; these are the variables its rows read.\n"
+            f"{comment}{rows}")
+
+
+def _host_runtime_block(a: Answers, p: Probes) -> str:
+    """The four switches the `local` runtime turns on (ADR-0049 D9), and what it gives up.
+
+    ABSOLUTE PATHS, not `~`: this file is read by processes, not by a shell, so a tilde arrives at
+    `os.environ` as a literal character and the factory would write its registry into a directory
+    called `~` beside wherever it was started.
+
+    THE GIVE-UP IS IN THE FILE, not in a release note. What Docker provides that a worktree does
+    not is the box's isolation, and a person who chose this runtime should be able to read what
+    they chose in the thing they chose it with."""
+    from beeverforge.adapters.agent.registry import harness_binary
+
+    home = p.home().rstrip("/")
+    # THE BINARY, NOT THE KIND. `claude_code` is the registry's key and `claude` is
+    # what a person types; the table that maps one to the other is the harness
+    # registry's, and three copies of it had already drifted.
+    binary = harness_binary(a.harness)
+    return f"""
+# ── The runtime: this machine, and nothing hosted ──
+# `beeverforge up` starts three processes here: the durable engine, the worker and the panel.
+# There is no container runtime and no vendor account anywhere in this file.
+#
+# WHAT THIS RUNTIME GIVES UP, said plainly: a job runs in a git worktree on this machine rather
+# than in a container, so the agent's code runs with YOUR rights — exactly as it does when you
+# type `{binary}` yourself. `BEEVERFORGE_OWN_WORK` below is you saying so; it is what lets the
+# durable path run in a box that bounds only the code state.
+BEEVERFORGE_SANDBOX=worktree
+BEEVERFORGE_OWN_WORK=1
+
+# WHERE EACH OF THE THREE LISTENS. `beeverforge up` STARTS each one on the port named here and
+# hands the same address to everything that reaches it, so moving one is editing one line — the
+# engine UI's is the port most likely to be taken already. An address `up` cannot start on is
+# refused in a sentence rather than started somewhere its consumers are not looking.
+{ENGINE.reach_vars[0]}={ENGINE.local()}
+{ENGINE_UI.reach_vars[0]}={ENGINE_UI.local()}
+{PANEL.reach_vars[0]}={PANEL.local()}
+
+# Where this deployment keeps its own files — the projects it drives, the board with the cards and
+# the pull requests in it, and the store the panel reads the factory's own words out of.
+BEEVERFORGE_REGISTRY={home}/.beeverforge/registry.yaml
+BEEVERFORGE_BOARD_DB={home}/.beeverforge/board.db
+# THE REPOSITORY CACHE: a partial clone and a checked-out tree of every source of every product,
+# and what each turn of the product role leaves beside them. Named here so it lands beside the
+# files above and not in /tmp, which is where a machine that says nothing gets it — lost on every
+# reboot, so each source is cloned again, and on a machine whose /tmp is memory it is memory
+# (#369). Put it on a filesystem that hardlinks: without them every snapshot is a whole copy.
+BEEVERFORGE_REPO_CACHE={home}/.beeverforge/repos
+
+# THE FACTORY'S OWN VOICE HAS TO LAND SOMEWHERE. Everything it says — "PR ready for review", a
+# park, the tech-lead's diagnosis — is written through the message store, and that store writes
+# through the metrics sink, which is NULL unless a deployment names one. So on a fresh install
+# every one of those was produced and dropped, with a warning in a log nobody reads and the
+# panel's Conversation empty by construction (measured 2026-09-11). Named here, out loud, rather
+# than inferred: the compose file says `sqlite` in as many words, and a default that overrode
+# what a file says is how a deployment stops being readable.
+BEEVERFORGE_METRICS_SINK=sqlite
+BEEVERFORGE_METRICS_DB={home}/.beeverforge/metrics.db
+"""
+
+
+def _preview_block(a: Answers, p: Probes, out: Rendered) -> str:
+    """Where a preview of the product runs on THIS kind of deployment (ADR-0050 D11, #265).
+
+    THE KEY IS GENERATED ON EVERY KIND, like the panel's token, and never left commented: an empty
+    one is safe but makes every open preview send its viewer back through the panel after a
+    restart. THE RUNTIME IS PER KIND. The compose stack runs previews on its own daemon and reaches
+    them over each unit's network; one machine has no Docker by default and says so, with the four
+    lines that opt in written out, commented; a hosted runtime's worker holds no daemon at all."""
+    out.obtained.append("BEEVERFORGE_PREVIEW_SECRET")
+    head = f"""
+# ── A preview of the product, before a pull request merges ──
+# The key preview links are signed with — generated here; rotate it by emptying this line and
+# re-running with --force.
+BEEVERFORGE_PREVIEW_SECRET={p.secret()}
+"""
+    if a.runtime == "compose":
+        return head + """\
+# Run on this stack's own Docker daemon; the worker connects the panel's container to each
+# unit's own network. The pull credentials previews may use are their own
+# (`beeverforge preview login <registry>` writes them), never the worker's.
+BEEVERFORGE_PREVIEW_RUNTIME=compose
+BEEVERFORGE_PREVIEW_REACH=network
+BEEVERFORGE_PANEL_CONTAINER=beeverforge-panel
+BEEVERFORGE_PREVIEW_DOCKER_CONFIG=/var/lib/beeverforge/docker
+"""
+    if a.runtime == "local":
+        return head + """\
+# NO PREVIEW RUNS HERE BY DEFAULT: this runtime needs no Docker, and a preview is the product's
+# own compose file run on a Docker daemon. With Docker installed, these four lines opt in.
+# WHAT OPTING IN MEANS, said before you do it:
+#   - a preview's exposed services are published on 127.0.0.1 of this machine and nowhere else,
+#     each on a port derived from its name; anyone on this machine (and the job box) can open
+#     one without the key the panel hands out;
+#   - a preview's containers can reach services listening on all interfaces of this machine,
+#     and on Docker Desktop the internet and this machine's own loopback too — the panel among
+#     it (measured on Docker Desktop 29.1.3; not measured on a Linux Engine).
+#     `beeverforge doctor <project>` measures what they reach on THIS machine, and every
+#     preview's card says what it reached when it started;
+#   - Chrome and Firefox send every `*.preview.localhost` to this machine; for Safari,
+#     `beeverforge doctor <project>` says whether a line in /etc/hosts is needed, and prints it.
+BEEVERFORGE_PREVIEW_RUNTIME=none
+# BEEVERFORGE_PREVIEW_RUNTIME=compose
+# BEEVERFORGE_PREVIEW_REACH=loopback
+# BEEVERFORGE_PREVIEW_PORTS=42000-42999
+# BEEVERFORGE_PREVIEW_DOMAIN=preview.localhost
+"""
+    return head + f"""\
+# NO PREVIEW ON THIS DEPLOYMENT: the `{a.runtime}` worker holds no Docker daemon. A preview runtime
+# add-on (`preview.<kind>` in the `beeverforge.adapters` group) is how one is added.
+BEEVERFORGE_PREVIEW_RUNTIME=none
+"""
+
+
+#: The one row a re-run never carries over. The INSTALLER pins it, to the release it is installing
+#: (`install.sh`), and a copy carried from the file being replaced would hold an upgraded stack on
+#: the release it was upgrading FROM.
+_NEVER_CARRIED = frozenset({"BEEVERFORGE_VERSION"})
+
+#: `NAME=value` at the start of a line — with the `export ` prefix compose's parser also accepts —
+#: the only shape compose reads from an env file as a row.
+_ROW = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+#: A to-do sentence about ROWS, and which: `fill NAME — …` / `fill A, B, C — …`, and the notice
+#: that a discovered login filled one. Every other sentence is a step about no row.
+_FILL = re.compile(r"^fill ([A-Z0-9_, ]+?) — ")
+_TAKEN = re.compile(r"^([A-Z][A-Z0-9_]*) was taken from ")
+
+_KEPT_HEADER = """
+# ── Kept from the file this one replaced ──
+# Rows this run's answers did not produce, carried over unchanged, because a re-run must never lose
+# a value somebody set. Delete any this deployment no longer uses.
+"""
+
+
+def carry_over(previous: str, rendered: str, *,
+               ours: frozenset[str] = frozenset()) -> tuple[str, list[str]]:
+    """`rendered` with every value `previous` already held put back, and the names of what was kept.
+
+    THE FILE A RE-RUN REPLACES HOLDS WHAT NO ANSWER CAN REPRODUCE: the tokens the person pasted in,
+    a port they moved, a row they added. `init --force` wrote the answers' file over it, so the
+    upgrade both the README and the installer describe, re-running the installer with `--force`,
+    emptied every credential, put the ports back and dropped the rest, and kept no copy. Measured
+    on 2026-09-27, v0.2.1 → v0.3.0 through `install.sh`: three credentials, a published port and
+    an added row, all gone, with the stack restarted without them.
+
+    The rule, row by row:
+    - a row both files have takes the previous value when that value is not empty, because it is
+      the person's; otherwise it takes this run's, so a token generated or discovered now fills a
+      row they left blank;
+    - a row only the previous file has is kept, in a section of its own, when it holds a value: a
+      value no question asked for is still a value somebody set, and an empty placeholder is not
+      one;
+    - `BEEVERFORGE_VERSION` is never carried (`_NEVER_CARRIED`), nor any row in `ours`, which this
+      run's caller DECLARED (the work directory the installer resolved and mounts, say): there the
+      rendered value is the one that is true now.
+
+    A value is carried byte for byte, trailing spaces included, since those are what compose read
+    before. A line's end (`\n`, `\r\n`) and its indentation are not part of it, and `export NAME=`
+    is read as `NAME=`. The comments are this run's. A later duplicate of a row wins, as it does
+    for compose. What is returned names rows, never values."""
+    never = _NEVER_CARRIED | ours
+    held: dict[str, str] = {}
+    for line in previous.splitlines():
+        row = _ROW.match(line.lstrip())
+        if row and row.group(1) not in never:
+            held[row.group(1)] = row.group(2)
+
+    kept: list[str] = []
+    seen: set[str] = set()
+    lines: list[str] = []
+    for line in rendered.splitlines(keepends=True):
+        row = _ROW.match(line.rstrip("\n"))
+        if row:
+            name, value = row.group(1), row.group(2)
+            seen.add(name)
+            if held.get(name, "").strip() and held[name] != value:
+                line = f"{name}={held[name]}\n"
+                kept.append(name)
+        lines.append(line)
+
+    extra = [name for name, value in held.items() if name not in seen and value.strip()]
+    if extra:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(_KEPT_HEADER)
+        lines.extend(f"{name}={held[name]}\n" for name in extra)
+        kept.extend(extra)
+    return "".join(lines), kept
+
+
+def row_value(text: str, name: str) -> str | None:
+    """What `text` sets `name` to, read the way `carry_over` reads a row (the last one wins)."""
+    value = None
+    for line in text.splitlines():
+        row = _ROW.match(line.lstrip())
+        if row and row.group(1) == name:
+            value = row.group(2)
+    return value
+
+
+def still_to_do(remaining: list[str], kept: list[str]) -> list[str]:
+    """`remaining` without the sentences a kept row has already done.
+
+    A sentence is done only when every row it names was kept, and one that names no row is never
+    done. This used to be a substring search of each kept NAME in the English (review of #366),
+    and it dropped lines it had to keep: an add-on's `fill A, B, C — …` vanished when A alone was
+    kept, a hand-added row called `NEVER` took `fill BEEVERFORGE_BOT_TOKEN — … and NEVER workflow`
+    with it, and one called `INSTALL` took a step about no row at all. The person then fills what
+    the list shows and boots a factory with no forge token."""
+    done = set(kept)
+
+    def named(line: str) -> list[str]:
+        if match := _FILL.match(line):
+            return [name.strip() for name in match.group(1).split(",") if name.strip()]
+        if match := _TAKEN.match(line):
+            return [match.group(1)]
+        return []
+
+    return [line for line in remaining
+            if not (names := named(line)) or not all(name in done for name in names)]
+
+
+def render(answers: Answers, probes: Probes | None = None) -> Rendered:
+    """The `.env.compose` this deployment needs, and nothing else."""
+    answers.validate()
+    p = probes or Probes()
+    out = Rendered(text="")
+    parts = [_HEADER]
+
+    if answers.runtime == "local":
+        parts.append(_host_runtime_block(answers, p))
+
+    # THE HARNESS BLOCK RUNS FIRST so its to-do line is literally item 1: the docs call it "the
+    # one credential you cannot postpone", and the funnel walkers caught the list disagreeing —
+    # the forge rows landed first and the un-postponable credential read as an afterthought. Its
+    # TEXT still renders after the forge sections; only the to-do order moved.
+    harness_part = _harness_block(answers, out)
+
+    if answers.uses_github:
+        parts.append(_github_block(answers, p, out))
+
+    if answers.uses_azure:
+        out.remaining.append(
+            "fill AZURE_DEVOPS_PAT — dev.azure.com → User settings → Personal access tokens, with "
+            "the scopes docs/setup/azure-devops.md §1 lists (work items, code, builds; an "
+            "`az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798` "
+            "token works too). Then register the project with its dev.azure.com clone URL — "
+            "`beeverforge project add` reads the organisation/project/repository out of it; "
+            "docs/setup/azure-devops.md walks the whole path to the first ticket")
+        parts.append("""
+# ── Azure DevOps — work items → Azure Repos pull requests ──
+# dev.azure.com → User settings → Personal access tokens; the scope list, the board states and
+# the registration command are docs/setup/azure-devops.md. The organisation, project and
+# repository are coordinates, not secrets: `beeverforge project add` reads them out of your
+# dev.azure.com clone URL. A project may name its own variable with `options.token_env`; this
+# is the default.
+AZURE_DEVOPS_PAT=
+""")
+
+    if answers.uses_jira:
+        out.remaining.append(
+            "fill JIRA_API_TOKEN — id.atlassian.com → Security → API tokens (the email and the "
+            "site are coordinates and belong in the project's registry entry)")
+        parts.append("""
+# ── Jira — tickets and board ──
+# id.atlassian.com → Security → API tokens. The account's EMAIL and the site live in the
+# project's registry entry: they are coordinates, not secrets.
+JIRA_API_TOKEN=
+""")
+
+    # The forge and tracker add-ons, each a named section — the harness one is rendered by
+    # `_harness_block` (it owns the to-do order) and the channel one below.
+    # THE ROW-LESS SECTIONS COME BEFORE THE ADD-ONS' and after the vendors' — the file reads in
+    # the order the questions were asked, and an axis that needs nothing still has to say so.
+    for axis in ("forge", "tracker"):
+        if getattr(answers, axis) == "local":
+            parts.append(_local_block(axis, out))
+
+    for axis, kind in answers.add_ons():
+        if axis in ("forge", "tracker"):
+            parts.append(_add_on_block(axis, kind, out))
+
+    parts.append(harness_part)
+
+    if answers.channel not in shipped("channel"):
+        parts.append(_channel_block(answers.channel, out))
+
+    if answers.panel_exposed:
+        out.obtained.append("BEEVERFORGE_PANEL_TOKEN")
+        parts.append(f"""
+# ── The panel ──
+# Generated here, because a panel reachable beyond localhost with no token is open to anyone who
+# can reach the port. Rotate it by emptying this line and re-running with --force.
+BEEVERFORGE_PANEL_TOKEN={p.secret()}
+""")
+    else:
+        parts.append("""
+# ── The panel ──
+# EMPTY MEANS OPEN — every /api/* route is reachable by anyone who can reach the port. That is
+# deliberate for a laptop and wrong for anything else: re-run `beeverforge init --panel-exposed`
+# (it generates one) before this is reachable by anybody but you.
+BEEVERFORGE_PANEL_TOKEN=
+""")
+
+    # NAMED BY THE INSTALLER (#561): the default front end is a setting, and a setting nobody can
+    # see in their own file is one only somebody who read the code can change
+    parts.append("""
+# ── The default front end ──
+# The panel's page, at / and under /p/, /product/ and /logs/. `off` serves the API, its two
+# streams, the sign-in and the previews, and no page: for a deployment with screens of its own,
+# built on the same API the panel uses.
+BEEVERFORGE_DEFAULT_FRONT_END=on
+""")
+
+    parts.append(_preview_block(answers, p, out))
+
+    work_dir = p.work_dir()
+    # NAMED IN `obtained` BECAUSE IT WAS FILLED WITHOUT ASKING, which is exactly what that list
+    # means. It is not a secret, so printing the NAME costs nothing and buys the operator the one
+    # thing they need to know: the factory chose a directory on their disk, and this is which.
+    out.obtained.append("BEEVERFORGE_WORK_DIR")
+    parts.append(f"""
+# ── Where a job's files live while it runs ──
+# A REAL DIRECTORY ON THIS HOST, not a Docker volume, and bound at the same path on both sides:
+# the worker asks the HOST's daemon to launch the box as a sibling container, so a path the worker
+# invents means nothing to the thing performing the mount — Docker would create an empty directory
+# and the agent would be asked to implement a ticket in it.
+#
+# THIS PATH IS YOURS AND NEEDS NO `sudo`. The old default was /var/lib/beeverforge-work, which
+# meant one root command before the stack could start — and skipping it did not fail, it left the
+# directory owned by root and surprised you later. Move it anywhere you own; keep it ABSOLUTE and
+# free of `~`, because compose does not expand a tilde in a bind source and would create a
+# literal `./~` directory instead.
+BEEVERFORGE_WORK_DIR={work_dir}
+""")
+
+    parts.append("""
+# ── How the factory signs its work in YOUR repository ──
+# These are the git author on every commit it makes, so they appear in your history and your
+# blame view for as long as the code lives.
+BEEVERFORGE_PLATFORM_NAME=BeeverForge
+BEEVERFORGE_BOT_NAME=BeeverForge Bot
+BEEVERFORGE_BOT_EMAIL=bot@beeverforge.local
+""")
+
+    # THE PORTS COMPOSE PUBLISHES, from the one definition (#183) — three literals here were a
+    # fourth copy of the table. NOT ON THE `local` RUNTIME: there the three address lines above are
+    # what `beeverforge up` starts on, and a second set of lines about the same listeners is two
+    # places to edit and a refusal when only one of them is.
+    if answers.runtime != "local":
+        parts.append(
+            "\n# ── Published ports — override any that collide with something already running "
+            "──\n" + "".join(f"{listener.port_var}={listener.default_port}\n"
+                             for listener in LISTENERS)
+            + "# Where the panel is published. Empty is 127.0.0.1, this machine only: it speaks "
+              "plain HTTP,\n# so serve it to other machines (0.0.0.0) only behind TLS — a reverse "
+              "proxy or a VPN. The engine\n# and its UI have no sign-in and are published on "
+              "127.0.0.1 whatever this says.\nPANEL_BIND=\n")
+
+    out.text = "".join(parts)
+    return out

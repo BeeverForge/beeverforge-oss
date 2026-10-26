@@ -1,0 +1,324 @@
+"""The identity provider a deployment has before it buys one (C-26, #55).
+
+PER-PERSON TOKENS, FROM THE DEPLOYMENT'S OWN CONFIGURATION. `BEEVERFORGE_PANEL_TOKENS` names
+one secret
+per person:
+
+    BEEVERFORGE_PANEL_TOKENS="s3cret-a:alice:Alice Ferreira,s3cret-b:bob:Bob Nakamura"
+
+That is not SSO and does not pretend to be. What it does is make the panel able to answer *who
+approved that production release* using the machinery a deployment already has — an environment
+variable delivered from SSM — instead of waiting for an identity provider to be procured.
+
+THE LEGACY SHARED TOKEN STILL WORKS, AND IS REPORTED AS WHAT IT IS. `BEEVERFORGE_PANEL_TOKEN`
+remains
+valid, because breaking every existing deployment's panel to close an audit gap would close it by
+locking everyone out. But a caller who presents it resolves to `UNKNOWN` rather than to a person,
+so the gap appears in the audit line as the word `anonymous` instead of being invisible. A hole
+you can grep for is a different thing from a hole nobody can see.
+
+NO ORDERING AMBIGUITY: the per-person map is consulted first. A deployment that sets both is one
+mid-migration, and during that window a person with their own token must be recognised as
+themselves rather than as whoever also knows the shared one.
+
+AND PEOPLE REGISTERED BY INVITATION (#33). The environment map is the operator's; the tenth person
+does not get an SSM parameter changed to be able to say yes to a requirement. `people.py` keeps
+the people an operator INVITED — a one-time link, a name and a credential chosen on first use, who
+vouched for them recorded — and their sessions, in the store the worker and the panel share. A
+session token resolves here between the per-person rows and the shared ones: narrower than a
+password everybody knows, and a row the operator did not type by hand.
+
+AND WHEN THAT STORE CANNOT BE READ, THIS ROW SAYS SO — IT DOES NOT ANSWER "NOBODY". The store
+raises `StoreUnreadable`; here that becomes three honest answers and one declaration. The door
+is NOT open (`open_to_everyone` is False: "I cannot tell whether anybody is registered" is not
+"nothing is configured"), a session is NOT resolved, no login page is drawn — and `unavailable()`
+says, in one sentence, that the last answer was given WITHOUT the store, so the panel can refuse
+with "cannot check" (503) instead of "you are nobody" (401), which would send a signed-in person
+to sign in again against a store that cannot record it. A credential from the environment does
+not need the store and keeps resolving. The provider is built per request, so the next request
+reads again and recovers by itself.
+
+AND A CLOSING VARIABLE ITS CREDENTIAL STORE REFUSES CLOSES THE DOOR TO EVERYBODY (review of #822).
+The variables are read through the credential store (#742), and a refused one — a file the store
+will not trust, a store that cannot be read, a kind nobody installed — used to be simply absent,
+so `open_to_everyone` found nothing configured and the panel served every read endpoint with
+`BEEVERFORGE_PANEL_TOKEN` set. A refusal is not "nothing is configured": it is a credential this
+deployment did configure and nobody can check against. So the provider is misconfigured
+(`misconfiguration`, refused when it is built, which the panel answers 503 by name), and on its own
+it opens nothing and resolves nobody — not even a token the store did hand over, because the
+operator meant the refused one to be the way in and an answer without it would be a guess.
+"""
+
+from __future__ import annotations
+
+import hmac
+import logging
+
+from beeverforge.identity.base import LOGIN_PATH, UNKNOWN, Subject
+
+log = logging.getLogger("beeverforge.identity")
+
+#: `token:id:display` rows, comma-separated. The display name is optional.
+PEOPLE_ENV = "BEEVERFORGE_PANEL_TOKENS"
+
+#: The one shared password this replaces. Still honoured; see the module docstring.
+SHARED_ENV = "BEEVERFORGE_PANEL_TOKEN"
+
+#: THE SAME TWO SHAPES, FOR A CREDENTIAL THAT IS NOT AN OPERATOR'S (#98). A business analyst who
+#: writes requirements is not running the floor, and until these existed the only way to let them
+#: near the product role was to hand over the panel token — which also hands over merge and skip.
+#: A subject resolved from one of these carries the `product` group, and the action layer turns
+#: that into `Actor.scopes`; every row outside that area is then refused by name.
+PRODUCT_PEOPLE_ENV = "BEEVERFORGE_PRODUCT_TOKENS"
+PRODUCT_SHARED_ENV = "BEEVERFORGE_PRODUCT_TOKEN"
+
+#: The group name a product credential asserts. One string, defined once, because the identity
+#: provider and the action layer have to agree on it and a typo would silently scope somebody to
+#: an area that does not exist.
+PRODUCT_GROUP = "product"
+
+#: THE SAME TWO SHAPES, FOR A CREDENTIAL TO THE BOARD AND NOTHING ELSE (#562). The panel token is
+#: everything, the product owner's area included — its documents, its attachments, the chat — and
+#: the only credential limited to the floor came from an identity provider's group. Whoever runs
+#: the board is not the product owner, and a credential that says so is issued here and by
+#: `beeverforge people invite --board`. It asserts the floor's group, so the gate refuses it the
+#: product area by name, exactly as a product credential is refused the floor. The panel token is
+#: unchanged: it stays the administrator's.
+BOARD_PEOPLE_ENV = "BEEVERFORGE_BOARD_TOKENS"
+BOARD_SHARED_ENV = "BEEVERFORGE_BOARD_TOKEN"
+BOARD_GROUP = "floor"
+
+#: EVERY VARIABLE THAT CLOSES THE DOOR — the credentials this provider issues. One tuple, read by
+#: `open_to_everyone` and by the readiness report, so a variable added here closes both.
+CLOSING_ENVS = (PEOPLE_ENV, SHARED_ENV, PRODUCT_PEOPLE_ENV, PRODUCT_SHARED_ENV, BOARD_PEOPLE_ENV,
+                BOARD_SHARED_ENV)
+
+
+class LocalIdentity:
+    """Credentials this deployment configured for itself, with no provider anywhere."""
+
+    def __init__(self, *, env: dict[str, str] | None = None, store=None) -> None:
+        #: Read at construction, not per call: a provider whose answers change between two
+        #: requests of the same session is a provider that can grant and revoke silently.
+        #:
+        #: THE DEPLOYMENT'S OWN ARE READ THROUGH THE CREDENTIAL STORE (#742) — every variable that
+        #: closes the door, and nothing else of the environment, which this provider never read.
+        #:
+        #: AND WHICH OF THEM ITS STORE REFUSES, `{name: why}`, read at the same moment: a refused
+        #: closing variable keeps the door shut and admits nobody (see the module docstring).
+        self._refused: dict[str, str] = {}
+        if env is None:
+            from beeverforge.adapters.credential_store.registry import held, refusals
+
+            env = held(CLOSING_ENVS)
+            self._refused = refusals(CLOSING_ENVS)
+        self._env = dict(env)
+        #: The people registered by invitation (`people.py`), opened on first use: most calls
+        #: are answered by the environment map and never read the store.
+        self._store = store
+        #: Why the store could not be read, once it could not — kept for this provider's life,
+        #: which is one request: its answers then agree with each other (the reason `_env` is
+        #: read once, above), and a store that times out costs the request one timeout, not one
+        #: per question.
+        self._unreadable = ""
+
+    def people(self):
+        """The registered-people store this provider answers from."""
+        if self._store is None:
+            from beeverforge.identity.people import PeopleStore
+
+            self._store = PeopleStore()
+        return self._store
+
+    def _readable(self):
+        """`people()`, for this row's OWN questions — raising at once when an earlier question
+        of this provider already found the store unreadable."""
+        if self._unreadable:
+            from beeverforge.observability.query import StoreUnreadable
+
+            raise StoreUnreadable(self._unreadable)
+        return self.people()
+
+    def _could_not_read(self, exc: Exception) -> None:
+        self._unreadable = str(exc).strip() or "the people store could not be read"
+
+    def misconfiguration(self) -> str:
+        """One sentence naming the closing variables the credential store refuses — or `""`. The
+        registry refuses a provider that answers this (`identity.registry`), as it refuses an
+        `oidc` row with no issuer, so the panel answers "cannot check" to everybody.
+
+        NAMES ONLY, NOT THE STORE'S REASONS: the login route answers a caller nobody identified
+        with this sentence, and a reason names a path. Each reason is in the log already — the
+        store says every refusal as it reads — and `beeverforge doctor` says it with its repair."""
+        if not self._refused:
+            return ""
+        return (f"the credential store refuses {', '.join(sorted(self._refused))}, which this "
+                f"deployment configured to close the panel, so nobody can be checked and nobody "
+                f"is let in — `beeverforge doctor` says why, and the panel's log names each "
+                f"refusal")
+
+    def unavailable(self) -> str:
+        """`""`, or one sentence: an answer this provider gave was given WITHOUT the people store,
+        because it could not be read. NOT PART OF THE PORT — a door asks by `getattr` and takes
+        only a non-empty `str`, so a row that never heard of this keeps working. A row with a
+        store of its own declares the same thing the same way."""
+        return self._unreadable
+
+    @property
+    def login_path(self) -> str:
+        """Where the panel sends a browser with no credential — the login form, once anybody is
+        registered by invitation; `""` before that, so a token deployment keeps its prompt and no
+        door is drawn where there is none. `""` too while the store cannot be read: the form
+        could not sign anybody in, and `unavailable()` says why."""
+        from beeverforge.observability.query import StoreUnreadable
+
+        try:
+            return LOGIN_PATH if self._readable().has_people() else ""
+        except StoreUnreadable as exc:
+            self._could_not_read(exc)
+            return ""
+
+    def identify(self, *, credential: str, via: str = "") -> Subject | None:
+        """Who holds this token, and what they are scoped to. None when nobody does.
+
+        NARROW BEFORE BROAD. The product map is read first, so a token that a mistake put in BOTH
+        resolves to the SMALLER authority. Getting this backwards would mean a copy-paste could
+        silently widen a business analyst's credential into an operator's, and the direction a
+        configuration error fails in is the only thing that makes it survivable.
+
+        AND EVERY SCOPED CREDENTIAL BEFORE ANY UNSCOPED ONE (#562): the product's rows and shared
+        token, then the board's, then the panel's. A secret in a panel row and a scoped shared
+        token was the administrator's while the shared tokens came after the panel's rows; now it
+        is the scoped one, as a secret in a product and a board variable is the product's."""
+        try:
+            token = str(credential or "").strip()
+            if not token or self._refused:
+                return None
+            for person in _people(self._env.get(PRODUCT_PEOPLE_ENV, "")):
+                if hmac.compare_digest(token, person.token):
+                    return Subject(id=person.id, display=person.display or person.id,
+                                   via="local", groups=(PRODUCT_GROUP,))
+            product_shared = str(self._env.get(PRODUCT_SHARED_ENV, "") or "")
+            if product_shared and hmac.compare_digest(token, product_shared):
+                log.info("BEEVERFORGE_IDENTITY_ANONYMOUS a caller presented the shared PRODUCT "
+                         "token; "
+                         "set %s to record who is acting", PRODUCT_PEOPLE_ENV)
+                # Anonymous in the audit line, like its floor equivalent — but still SCOPED, which
+                # is a different question from being named. Returning `UNKNOWN` here would hand a
+                # product credential the floor.
+                return Subject(id="", display="somebody with the product token",
+                               via=UNKNOWN.via, groups=(PRODUCT_GROUP,))
+            for person in _people(self._env.get(BOARD_PEOPLE_ENV, "")):
+                if hmac.compare_digest(token, person.token):
+                    return Subject(id=person.id, display=person.display or person.id,
+                                   via="local", groups=(BOARD_GROUP,))
+            board_shared = str(self._env.get(BOARD_SHARED_ENV, "") or "")
+            if board_shared and hmac.compare_digest(token, board_shared):
+                log.info("BEEVERFORGE_IDENTITY_ANONYMOUS a caller presented the shared BOARD "
+                         "token; set %s to record who is acting", BOARD_PEOPLE_ENV)
+                # anonymous in the audit line and still SCOPED, as the product token above
+                return Subject(id="", display="somebody with the board token",
+                               via=UNKNOWN.via, groups=(BOARD_GROUP,))
+            for person in _people(self._env.get(PEOPLE_ENV, "")):
+                # CONSTANT TIME, because this compares a secret. `==` on a token leaks its prefix
+                # to anyone who can measure, and the panel is reachable from a browser.
+                if hmac.compare_digest(token, person.token):
+                    return Subject(id=person.id, display=person.display or person.id, via="local")
+            registered = self._session_of(token)
+            if registered is not None:
+                # A SESSION OF A PERSON REGISTERED BY INVITATION (#33): named, and scoped to the
+                # groups the invitation carried — a product invitation is a product credential.
+                return Subject(id=registered.id, display=registered.display or registered.id,
+                               via="local", groups=tuple(registered.groups))
+            shared = str(self._env.get(SHARED_ENV, "") or "")
+            if shared and hmac.compare_digest(token, shared):
+                # THE AUDIT GAP, SAID OUT LOUD ONCE PER USE. This is the state the card calls "a
+                # shared password, not an identity", and it stays reachable on purpose — the fix
+                # for it is configuration, and locking a deployment out is not a fix.
+                log.info("BEEVERFORGE_IDENTITY_ANONYMOUS a caller presented the shared "
+                         "panel token; "
+                         ""
+                         ""
+                         "set %s to record who is acting", PEOPLE_ENV)
+                return UNKNOWN
+            return None
+        except Exception as exc:  # noqa: BLE001 — an identity provider never takes the door down
+            log.warning("the local identity provider could not read a credential (%s)", exc)
+            return None
+
+    def _session_of(self, token: str):
+        """The registered person holding this session, or None — and None with `unavailable()`
+        set when the store could not be read: the credential was NOT found wanting, it could not
+        be looked up, and the shared rows below it are still consulted because they need no
+        store."""
+        from beeverforge.observability.query import StoreUnreadable
+
+        try:
+            return self._readable().session_of(token)
+        except StoreUnreadable as exc:
+            self._could_not_read(exc)
+            return None
+
+    def open_to_everyone(self) -> bool:
+        """Whether this deployment configured NO credential at all.
+
+        A SEPARATE QUESTION FROM `identify`, and it has to be, because the two answers point
+        opposite ways: with nothing configured every request is unauthenticated *and permitted*
+        (the local-development default this platform has always had), while with something
+        configured an unresolvable credential must be refused. Folding them together is how "unset
+        means open" becomes "unknown means open".
+
+        THE PRODUCT VARIABLES COUNT AS CONFIGURATION. They have to: a deployment that issued only
+        product credentials — the exact shape of "a BA needs to write requirements and nobody else
+        needs the panel yet" — would otherwise answer "nothing is configured" and serve every read
+        endpoint to the internet unauthenticated, which is the one direction this gate must never
+        fail in and the direction it already failed in once (C-26).
+
+        A REFUSED ONE COUNTS TOO (review of #822): what the store would not hand over is still
+        what the operator configured, and "I could not read it" is not "it is not there"."""
+        if self._refused:
+            log.error("BEEVERFORGE_IDENTITY_REFUSED the panel stays closed: %s",
+                      self.misconfiguration())
+            return False
+        if any(self._env.get(name, "").strip() for name in CLOSING_ENVS):
+            return False
+        # A REGISTERED PERSON CLOSES THE DOOR TOO (#33) — and only a registered one: an invitation
+        # nobody has redeemed yet must not lock the operator out of an open panel before the first
+        # person can get in.
+        #
+        # AND A STORE THAT CANNOT BE READ CLOSES IT. "Nobody is registered" opens this door, so it
+        # has to be an ANSWER the store gave: the store used to hand back an empty snapshot when
+        # it could not be read, and this line read that as a new install. A store that answers
+        # and is empty — a new install — is still open, and so is a deployment that declared no
+        # store at all (the `null` sink reads as `[]`, honestly: nothing was ever kept there).
+        from beeverforge.observability.query import StoreUnreadable
+
+        try:
+            return not self._readable().has_people()
+        except StoreUnreadable as exc:
+            self._could_not_read(exc)
+            return False
+
+
+class _Person:
+    __slots__ = ("token", "id", "display")
+
+    def __init__(self, token: str, ident: str, display: str) -> None:
+        self.token, self.id, self.display = token, ident, display
+
+
+def _people(raw: str) -> list[_Person]:
+    """`token:id:display` rows → people. A malformed row is SKIPPED AND LOGGED, never guessed at:
+    a half-parsed row would hand somebody an identity that is not theirs."""
+    out: list[_Person] = []
+    for row in str(raw or "").split(","):
+        row = row.strip()
+        if not row:
+            continue
+        parts = [p.strip() for p in row.split(":")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            log.warning("BEEVERFORGE_IDENTITY_BAD_ROW ignoring a %s entry that is not "
+                        "'token:id[:display]' — that person cannot be identified", PEOPLE_ENV)
+            continue
+        out.append(_Person(parts[0], parts[1], ":".join(parts[2:]).strip()))
+    return out

@@ -1,0 +1,968 @@
+"""What happened, told to the conversation it concerns — the product role's events (#267 slice 3,
+ADR-0052 "Events and the agenda").
+
+THE ROLE HEARD OF A DELIVERY A WEEK LATE, AND SAID IT IN THE WRONG PLACE. The sentence the role is
+named after — "what you asked for is ready" — came from `ProductSweepWorkflow`, every 168 hours,
+posted to the project's one channel: a card delivered on Monday was announced when the sweep came
+round, in a room the person who asked it may never read, and something asked in a private
+conversation was answered in public. The role was pulled, not present.
+
+NOW IT IS TOLD WHEN IT HAPPENS, BY WHAT MADE IT HAPPEN. Each kind has a producer in the factory,
+which calls this module the moment it observes the thing; this module decides where it is said
+and what is said, and hands it to the one door (`door.announce`), which records it and puts it in
+line on that conversation — behind the turn in progress, never inside one.
+
+    kind                producer on this branch
+    ─────────────────   ──────────────────────────────────────────────────────────────────────
+    delivered           the card's door (`lifecycle/loops.py`, `announce_what_it_completes`,
+                        #414) — a card that reaches Done, by its job's settle, the deploy watch's
+                        settle when the deploy was the card's last stage and went green (#448
+                        slice 5), the box's hand-back at its last stage, a person's close or the
+                        vendor's own screen, announces what it completes as one of its
+                        transition's effects, recorded once per card — never at a merge a stage
+                        follows; what the board or the conversation did not take, the door's
+                        converge applies again (hourly, and on the weekly sweep). Nothing else
+                        announces a delivery
+    ci_red              `activities.repair_ci` — the merge watch sends a pull request there
+                        because a check that blocks it failed on the code, and the factory is
+                        repairing it; said once per pull request, however many passes it takes
+    pr_waiting          the tech-lead's hourly round (`activities.techlead_watch`) — a pull
+                        request at the merge gate for 48 h (`pull_requests_at_the_gate`)
+    preview_up          `activities.preview_up` — the preview's own step, the moment it is live
+                        (`_the_preview_is_up`, #405); once per start
+    ready_for_you       `activities.tell_the_requester` — the job's merge watch, the moment a
+                        pull request a PERSON must decide enters it (#401); and the tech-lead's
+                        round as the catch-all, which already lists every such gate — both
+                        through the card's door as `pr_opened`, which says it (`ready_to_try`)
+    document_ingested   `documents/ingest.py::announce` (#269) — a document read into the
+                        product's memory, on the knowledge pipeline's tick or when somebody
+                        brings it; an internal one is never said in a room (`_told_where`)
+    card_moved          the card's door (`lifecycle/ports.py::tell`, ADR-0055) — a person
+                        ended the work on a card (discarded, skipped, stopped: it is back in the
+                        backlog), took it off the table (closed, withdrawn, removed: it will not
+                        be built), or put it back (reopened); once per transition (#384, #412)
+    merged              the card's door (`lifecycle/ports.py::tell`, #448 slice 6), from the
+                        job's `merged` as `activities.tell_the_requester_it_merged` hands it in —
+                        the moment its pull request merged, whoever merged it (#448 slice 3); not
+                        where the delivery says it at that same moment
+    staged              the card's door, from the round's `staged`
+                        (`activities._offer_the_release_to_the_client`) — a job parked at the last
+                        gate before the product's users, ready for its requester to try (#448
+                        slice 4); once per card and run of its job, and only after the room's own
+                        question landed
+    tried               the card's door, from `accepted` at the last gate
+                        (`engine._the_requesters_yes`) — the card's requester tried the change
+                        there and said it is right, and the project does not let their word
+                        release it, so the ROOM hears it, for a product admin (#448 slice 4); once
+                        per card and run
+    imported            the import itself (`ProductModule.import_requirements`, #994) — the
+                        moment its one commit landed: what arrived, from where, how many were
+                        added, revised or kept beside an agreed one; to the room, once per import
+
+WHERE AN EVENT IS SAID (`conversation_for`). About a card: to the conversation its REQUESTER asked
+in — recorded on the card's delivery loop when the work was filed, from what they had staged
+(`module._open_delivery`, `confirm._whose`) — and to the product's room when nobody's is known
+(`room_of`). A document: where it was brought, or the room. The sentence never names anybody
+(`voice`), so the room hears "what was asked for in requirement 7 is ready" and not who asked it;
+and nothing from one conversation is said in another — an event goes to exactly one.
+
+WHAT IS SAID IS COMPOSED HERE, NEVER BY A MODEL. A delivery says what the sweep always said
+(`followup.delivered_text` and the "did it work?" that opens the acceptance loop); the others have
+their sentences in `voice`, in the client's words and the project's language. No model call is
+spent on an event: its reaction is the sentence, the record it leaves in the conversation's memory
+(so the next turn knows what it said), and the agenda it changes.
+
+ONCE, AND NEVER TWICE. Every event has an id derived from WHAT happened, never a fresh one, so the
+conversation drops a second telling of it (`ConversationWorkflow.admit`); and before telling, it is
+checked against what was already said:
+
+    a delivery      the ledger: an open delivery loop is announced, closed and followed by its
+                    acceptance loop, under the product's lock, so two cards' transitions (or a
+                    transition and the door's converge) racing each other announce it once; a
+                    telling the door did not take leaves it open for the next
+    everything else this module's own record of what it told (`events.json` in the project's
+                    memory directory, under its lock), written only after the door took it
+
+ONLY THE FACTORY TELLS ONE. Nothing here is reachable from a transport: `receive` refuses an event
+(`door.FORGED`), and the callers of this module and of `door.announce` are a closed list, held by a
+guard (`tests/test_events_and_the_agenda.py`).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import time
+import uuid
+
+log = logging.getLogger("beeverforge.product.events")
+
+#: The kinds of event (#267 slice 3; `ready_for_you` since #401; `card_moved` since #412, in place
+#: of #384's `card_withdrawn`, which only the product role's own close could tell; `merged` since
+#: #448; `staged` and `tried` since #448 slice 4). A closed set: each has its sentence, its
+#: routing and its record of having been said, and a kind nobody knows how to say is one nobody
+#: should tell.
+DELIVERED, CI_RED, PR_WAITING, PREVIEW_UP, DOCUMENT_INGESTED, CARD_MOVED, READY_FOR_YOU = (
+    "delivered", "ci_red", "pr_waiting", "preview_up", "document_ingested", "card_moved",
+    "ready_for_you")
+MERGED = "merged"
+STAGED = "staged"
+TRIED = "tried"
+#: requirements arrived from somewhere else — an import landed (#994)
+IMPORTED = "imported"
+KINDS = (DELIVERED, CI_RED, PR_WAITING, PREVIEW_UP, DOCUMENT_INGESTED, CARD_MOVED,
+         READY_FOR_YOU, MERGED, STAGED, TRIED, IMPORTED)
+
+#: Which producer tells each kind on this branch — "" for a kind whose producer lives elsewhere.
+#: The guard reads this, so a producer claimed here is a call that exists.
+PRODUCERS = {
+    DELIVERED: "beeverforge/lifecycle/loops.py::announce_what_it_completes",
+    CI_RED: "beeverforge/runtime/temporal/activities.py::repair_ci",
+    PR_WAITING: "beeverforge/runtime/temporal/activities.py::techlead_watch",
+    PREVIEW_UP: "beeverforge/runtime/temporal/activities.py::preview_up",
+    DOCUMENT_INGESTED: "beeverforge/product/documents/ingest.py::announce",
+    CARD_MOVED: "beeverforge/lifecycle/ports.py::tell",
+    READY_FOR_YOU: "beeverforge/runtime/temporal/activities.py::tell_the_requester",
+    # #448 slice 6: the requester's loop past the pull request is told by the card's door, from
+    # the job's `merged`, the round's `staged` and `accepted` at the last gate
+    MERGED: "beeverforge/lifecycle/ports.py::tell",
+    STAGED: "beeverforge/lifecycle/ports.py::tell",
+    TRIED: "beeverforge/lifecycle/ports.py::tell",
+    # #994: the import itself, the moment its one commit landed
+    IMPORTED: "beeverforge/product/module.py::import_requirements",
+}
+
+#: Whose loops these are.
+OWNER = "product"
+
+#: How long a pull request waits on a person before the role says so (#267).
+PR_WAIT_HOURS = 48.0
+
+#: This module's record of what it told, beside the project's other memory.
+_STORE = "events.json"
+#: How many told ids, and how many sighted gates, the record keeps — far past any retry.
+_KEEP = 512
+#: How long a telling waits for another's to finish. A telling is a read, a signal and a write.
+_WAIT_SECONDS = 30.0
+
+
+# ── where ────────────────────────────────────────────────────────────────────────────────────────
+
+def room_of(project) -> str:
+    """The product's room: where its channel posts (`channel_destination`), the project's name on
+    the panel. What an event about nobody's request is said to."""
+    from beeverforge.adapters.channel.registry import channel_destination
+
+    return (channel_destination(project, product=True)
+            or str(getattr(project, "name", "") or ""))
+
+
+def issues_of(loop) -> set[str]:
+    """The cards a delivery loop waits on, as the provider wrote them (C-05)."""
+    from beeverforge.contracts.refs import canonical_ref
+
+    return {canonical_ref(n) for n in str((loop.context or {}).get("issues") or "").split(",")
+            if n.strip()}
+
+
+def _deliveries_of(rows, card: str) -> list:
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.memory.ledger import DELIVERY, waiting
+
+    card = canonical_ref(card)
+    return [x for x in waiting(rows, owner=OWNER) if x.kind == DELIVERY and card in issues_of(x)]
+
+
+def _the_request(rows, card: str):
+    """The open delivery of `card` that recorded where its requester asked — the newest, when two
+    requests share a card — or None. The ONE reading of it, for where they asked
+    (`requester_conversation`) and for who asked there (`requester_of`, #448 slice 4)."""
+    for loop in reversed(_deliveries_of(rows, card)):
+        if str((loop.context or {}).get("conversation") or ""):
+            return loop
+    return None
+
+
+def requester_conversation(project, card: str, *, rows=None) -> str:
+    """The conversation `card`'s requester asked in, as the card's open delivery loop recorded it
+    when the work was filed — the newest, when two requests share a card — or "" when nobody's
+    is known: a card filed by hand, by the sweep, or before conversations were recorded."""
+    if not str(card or "").strip():
+        return ""
+    if rows is None:
+        from beeverforge.memory import store as loop_store
+
+        rows = loop_store.read(getattr(project, "name", "") or "")
+    asked = _the_request(rows, card)
+    return str(asked.context.get("conversation") or "") if asked is not None else ""
+
+
+def conversation_for(project, card: str = "", *, rows=None) -> str:
+    """WHERE AN EVENT ABOUT `card` IS SAID: the conversation its requester asked in
+    (`requester_conversation`), else the product's room, where it is said to nobody by name."""
+    return requester_conversation(project, card, rows=rows) or room_of(project)
+
+
+def _speaks(project) -> bool:
+    """Whether this project has a product role to say anything — an event about a project with
+    none is nobody's to tell."""
+    cfg = getattr(project, "product", None)
+    return cfg is not None and bool(getattr(cfg, "enabled", True))
+
+
+# ── the one way out ──────────────────────────────────────────────────────────────────────────────
+
+def _tell(project, *, id: str, conversation: str, text: str) -> bool:
+    """THE ONE WAY A PROACTIVE MESSAGE LEAVES THE CORE (ADR-0051 D13): `door.announce` — recorded
+    in the product's memory, then in line on its conversation. Returns whether the door took it;
+    never raises. From synchronous code: every producer reaches it from a thread."""
+    from beeverforge.product import door
+
+    try:
+        return door.announce_now(project, id=id, conversation=conversation, text=text,
+                                 room=conversation if conversation == room_of(project) else "")
+    except Exception:  # noqa: BLE001 — the happening stands; only the telling failed
+        log.exception("[%s] could not tell %s what happened",
+                      getattr(project, "name", "?"), conversation)
+        return False
+
+
+def to_room(project, text: str) -> bool:
+    """Something the role says to the product's room on its own — the sweep's report, a question
+    about a card, a reminder: through the door like every proactive message, so it waits its turn
+    in the room like one. Returns whether the door took it."""
+    if not (text or "").strip():
+        return False
+    return _tell(project, id=f"room-{uuid.uuid4().hex}", conversation=room_of(project),
+                 text=text)
+
+
+def say_to(project, conversation: str, text: str) -> bool:
+    """`to_room`, to the conversation a loop lives in — a reminder about something asked there."""
+    if not (text or "").strip():
+        return False
+    return _tell(project, id=f"said-{uuid.uuid4().hex}", conversation=conversation or
+                 room_of(project), text=text)
+
+
+def _event_id(kind: str, project, *parts: str) -> str:
+    """The id of a HAPPENING: the same thing told twice is one event (see the module)."""
+    from beeverforge.product.speaker import sealed
+
+    name = getattr(project, "name", "") or ""
+    return f"{kind}-{sealed('|'.join([name, *[str(p) for p in parts]]))}"
+
+
+# ── the record of what was told ──────────────────────────────────────────────────────────────────
+
+def _store_path(project):
+    from beeverforge.paths import project_memory_dir
+
+    return project_memory_dir(project) / _STORE
+
+
+@contextlib.contextmanager
+def _held(project, *, required: bool):
+    """This project's telling lock, held — `required=False` goes on without it when the memory
+    directory cannot hold a lock at all (a delivery's own record, the ledger, still decides), and
+    `required=True` does not (what is told once has no other record)."""
+    from beeverforge.util.filelock import lock_beside
+
+    path = _store_path(project)
+    lock = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_beside(path)
+        lock.acquire(timeout=_WAIT_SECONDS)
+    except OSError as exc:
+        if required:
+            raise
+        log.warning("[%s] could not take the telling lock (%s) — going on without it; the ledger "
+                    "still says what was announced", getattr(project, "name", "?"), exc)
+        lock = None
+    try:
+        yield path
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _read(path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError) as exc:
+        log.warning("could not read what was told from %s (%s)", path, exc)
+        raw = {}
+    return {"told": dict(raw.get("told") or {}), "seen": dict(raw.get("seen") or {})}
+
+
+def _write(path, data: dict) -> None:
+    from beeverforge.util.filelock import replace_atomically
+
+    for key in ("told", "seen"):
+        kept = sorted(data[key].items(), key=lambda kv: kv[1])[-_KEEP:]
+        data[key] = dict(kept)
+    replace_atomically(path, json.dumps(data, sort_keys=True))
+
+
+def forget_record(project) -> int:
+    """This project's record of what was told, deleted — and how many entries it held (#453,
+    `beeverforge project forget`). Under the telling lock, so no telling lands in the middle;
+    RAISES when the lock or the file will not be had, because a record that could not be deleted
+    reported as an empty one is a role that goes on saying "I already noted this".
+
+    Nothing in any process holds a copy: every telling reads the file afresh under the same lock
+    (`_once`), so deleting it is the whole of forgetting it."""
+    with _held(project, required=True) as path:
+        if not path.is_file():
+            return 0
+        data = _read(path)
+        path.unlink()
+    held = len(data["told"]) + len(data["seen"])
+    log.warning("BEEVERFORGE_PRODUCT_EVENTS_FORGOTTEN project=%s entries=%d",
+                getattr(project, "name", "?"), held)
+    return held
+
+
+def _once(project, event_id: str, compose) -> bool:
+    """Tell what `compose()` says — `(conversation, text)` — unless `event_id` was told already.
+    Composed only when it will be told, so a producer that fires on every round costs a read.
+    Returns whether it was told now."""
+    try:
+        with _held(project, required=True) as path:
+            data = _read(path)
+            if event_id in data["told"]:
+                return False
+            conversation, text = compose()
+            if not text or not _tell(project, id=event_id, conversation=conversation, text=text):
+                return False
+            data["told"][event_id] = time.time()
+            _write(path, data)
+            return True
+    except (OSError, TimeoutError) as exc:
+        # NOT TOLD RATHER THAN TOLD TWICE: with no record of what was said, every round of the
+        # producer would say it again — the next round tries again once the record answers
+        log.error("BEEVERFORGE_PRODUCT_EVENT_UNRECORDED project=%s event=%s — what was told "
+                  "cannot be recorded (%s), so it is not told", getattr(project, "name", "?"),
+                  event_id, exc)
+        return False
+
+
+def _language(project):
+    return getattr(project, "language", None)
+
+
+def _agent(project) -> str:
+    return getattr(getattr(project, "product", None), "agent_name", "") or ""
+
+
+def _title_of(project, card: str) -> str:
+    """The card's title, from the board as last read — best-effort: a card named by its number
+    alone is a vaguer sentence, never a lost one."""
+    try:
+        from beeverforge.contracts.refs import canonical_ref
+        from beeverforge.product.board import read_board
+
+        tickets, error = read_board(project)
+        if error:
+            return ""
+        want = canonical_ref(card)
+        hit = next((t for t in tickets if canonical_ref(t.number) == want), None)
+        return str(getattr(hit, "title", "") or "")
+    except Exception:  # noqa: BLE001 — a title is a courtesy
+        log.info("could not read #%s's title for an event", card, exc_info=True)
+        return ""
+
+
+# ── delivered ────────────────────────────────────────────────────────────────────────────────────
+
+def _delivered_now(project) -> set[str] | None:
+    """The cards the board says were delivered, read FRESH — the transition that asks just closed
+    one — or None when it could not be read (the door's converge asks again)."""
+    from beeverforge.product.module import ProductModule
+    from beeverforge.product.triage import delivered_numbers
+
+    tickets, error = ProductModule(project)._read_board(fresh=True)
+    if error:
+        log.info("[%s] the board could not be read to see what was delivered (%s)",
+                 getattr(project, "name", "?"), error)
+        return None
+    return delivered_numbers(list(tickets or []))
+
+
+def _delivered_elsewhere(project, delivered: set[str]) -> set[str]:
+    """The cards an open delivery names in ANOTHER REPOSITORY OF THE PRODUCT that were delivered —
+    each asked of the tracker by its own ref (#492). Never raises.
+
+    THE BOARD IS THE TRACKER'S OWN REPOSITORY. What is delivered is read from the board
+    (`_delivered_now`, the sweep's `_closed_issue_numbers`), and the board is `list_tickets` of the
+    project's repository. A requirement whose breakdown filed a card in another of the product's
+    `sources:` waits on it qualified (`acme/web#1`, C-18, kept since #485) — a ref no board read
+    ever holds. So the loop never closed, and the person who asked was never told it was ready.
+
+    ASKED PER REF, NEVER LISTED PER REPOSITORY. The other choice was a tracker per source, each
+    listing its closed cards (up to a thousand issues with their bodies, per source, per telling)
+    to answer a question about the one or two cards a loop names there. This reads only those:
+    the qualified refs of a waiting delivery the board did not already answer — and only for a
+    loop whose every other card IS delivered, because a loop with work still open in its own
+    repository cannot close this round whatever the other repository says. No such loop, no read
+    and no tracker built. The refs are bounded already: only the breakdown writes them, and it
+    files only into the product's `sources:` (`module._filing_repo`). The tracker addresses the
+    repository each ref names, on the credential the card was filed with (`board.read_cards`).
+
+    DELIVERED AS THE BOARD MEANS IT (`triage.Ticket.delivered`): closed, and not as not planned. A
+    card split in another repository reads its parent's own close — not delivered, since the
+    splitter records a split as not delivered (2026-09-19), which predates filing elsewhere — so
+    such a delivery is announced late, by a person closing it, never early: following a split's
+    children in another repository is not done here.
+
+    A READ THAT FAILS IS NOT DELIVERED, AND IS SAID ONCE: one line per telling, naming every ref
+    it could not read. Never a false "it is ready", and never an exception into the round that
+    asked — the next telling asks again."""
+    from beeverforge.contracts.refs import split_repo_ref
+    from beeverforge.memory import store as loop_store
+    from beeverforge.memory.ledger import DELIVERY, waiting
+
+    name = getattr(project, "name", "") or ""
+    try:
+        ask: set[str] = set()
+        for loop in waiting(loop_store.read(name), owner=OWNER):
+            if loop.kind != DELIVERY:
+                continue
+            cards = issues_of(loop)
+            elsewhere = {c for c in cards if split_repo_ref(c)[0] and c not in delivered}
+            if elsewhere and cards - elsewhere <= delivered:
+                ask |= elsewhere
+        if not ask:
+            return set()
+        from beeverforge.product.board import read_cards
+
+        read, unread = read_cards(project, sorted(ask))
+    except Exception:  # noqa: BLE001 — not seen is not delivered; the board's answer stands
+        log.warning("[%s] could not ask another repository of the product what was delivered — "
+                    "its cards are counted as not delivered", name, exc_info=True)
+        return set()
+    if unread:
+        log.warning("BEEVERFORGE_DELIVERY_UNREAD project=%s refs=%s — these cards of another "
+                    "repository of the product could not be read, so they are counted as NOT "
+                    "delivered and nothing waiting on them is announced; the next telling asks "
+                    "again", name, ",".join(unread))
+    return {t.number for t in read if t.delivered}
+
+
+# ── the others ───────────────────────────────────────────────────────────────────────────────────
+
+def ci_went_red(project, *, card: str, pr_url: str = "") -> bool:
+    """A CHECK THAT BLOCKS THE MERGE FAILED and the factory is repairing it (`repair_ci`) —
+    said once per pull request to the card's requester, else the room. Not again on the next red
+    of the same pull request: a repair that needs three passes is one thing that happened."""
+    if not _speaks(project) or not str(card or "").strip():
+        return False
+    from beeverforge.product import voice
+
+    return _once(project, _event_id(CI_RED, project, card, pr_url), lambda: (
+        conversation_for(project, card),
+        voice.ci_went_red(ref=card, title=_title_of(project, card),
+                          language=_language(project), agent_name=_agent(project))))
+
+
+def pull_requests_at_the_gate(project, gates: list[tuple[str, str]], *,
+                              now: float | None = None) -> list[str]:
+    """THE TECH-LEAD'S ROUND SAW THESE (card, pull request) WAITING ON A PERSON at the merge gate.
+    Returns the cards told, now, that theirs has waited `PR_WAIT_HOURS`.
+
+    THE WAIT IS COUNTED FROM THE FIRST ROUND THAT SAW IT, recorded here: the gate carries no
+    timestamp of its own, and the job's age counts the hours its agent worked as waiting. So the
+    first telling is at most one round late, and never early. Told once per pull request."""
+    if not _speaks(project) or not gates:
+        return []
+    now = time.time() if now is None else now
+    waited: list[tuple[str, str, float]] = []
+    try:
+        with _held(project, required=True) as path:
+            data = _read(path)
+            for card, pr in gates:
+                first = float(data["seen"].setdefault(f"{card}|{pr}", now))
+                if now - first >= PR_WAIT_HOURS * 3600:
+                    waited.append((card, pr, now - first))
+            _write(path, data)
+    except (OSError, TimeoutError) as exc:
+        log.warning("[%s] could not record which pull requests wait on a person (%s)",
+                    getattr(project, "name", "?"), exc)
+        return []
+    from beeverforge.product import voice
+
+    told = []
+    for card, pr, seconds in waited:
+        if _once(project, _event_id(PR_WAITING, project, card, pr), lambda c=card, s=seconds: (
+                conversation_for(project, c),
+                voice.pull_request_waiting(ref=c, title=_title_of(project, c),
+                                           days=int(s // 86400), language=_language(project),
+                                           agent_name=_agent(project)))):
+            told.append(card)
+    return told
+
+
+def preview_up(project, *, card: str, url: str, key: str = "") -> bool:
+    """A PREVIEW OF A CARD'S CHANGE CAME UP (ADR-0050): where to try it, to the card's requester,
+    else the room — once per preview (`key`, the preview's own id; the address otherwise).
+
+    Its producer is the preview's own `up` step (`activities._the_preview_is_up`, #405); `url` is
+    the panel's route that opens it (`preview/live.py::route`), never the preview's keyed host."""
+    if not _speaks(project) or not str(card or "").strip() or not str(url or "").strip():
+        return False
+    from beeverforge.product import voice
+
+    return _once(project, _event_id(PREVIEW_UP, project, card, key or url), lambda: (
+        conversation_for(project, card),
+        voice.preview_up(ref=card, title=_title_of(project, card), url=url,
+                         language=_language(project), agent_name=_agent(project))))
+
+
+def document_ingested(project, *, name: str, key: str = "", conversation: str = "") -> bool:
+    """A NEW DOCUMENT WAS READ INTO THE PRODUCT'S MEMORY (#269): said to the conversation it was
+    brought to — which its producer resolves for the person who brought it, as every row resolves
+    a key (`catalog._conversation_key`) — else the room; once per document (`key`, its id).
+
+    Its producer is `documents/ingest.py::announce`, which decides WHICH documents are told and
+    never hands this an internal one for a room (#269)."""
+    if not _speaks(project) or not str(name or "").strip():
+        return False
+    from beeverforge.product import voice
+
+    return _once(project, _event_id(DOCUMENT_INGESTED, project, key or name), lambda: (
+        conversation or room_of(project),
+        voice.document_ingested(name=name, language=_language(project),
+                                agent_name=_agent(project))))
+
+
+def imported(project, *, ident: str, origin: str, counts: dict) -> bool:
+    """REQUIREMENTS ARRIVED FROM SOMEWHERE ELSE (#994): what arrived, from where, and how many were
+    added, revised or kept beside an agreed one — told ONCE to the product's room (`ident`, the
+    import's own id), in the product's language, naming the origin and never a person.
+
+    Its producer is the import itself (`ProductModule.import_requirements`), the moment its one
+    commit landed; a folder imported again the same day is the same import, and is not told
+    again."""
+    if not _speaks(project) or not str(ident or "").strip():
+        return False
+    from beeverforge.product import voice
+
+    return _once(project, _event_id(IMPORTED, project, ident), lambda: (
+        room_of(project),
+        voice.imported(origin=origin, new=int(counts.get("new") or 0),
+                       revision=int(counts.get("revision") or 0),
+                       beside=int(counts.get("beside") or 0), language=_language(project),
+                       agent_name=_agent(project))))
+
+
+def card_moved(project, *, card: str, notice: str, event_id: str, title: str = "",
+               removed: bool = False, conversation: str = "", pass_number: int = 0) -> str:
+    """THE CARD'S DOOR MOVED IT (ADR-0055 D10) — said to the conversation its requester asked in,
+    else the room, once per transition: `event_id` is the transition's own, so the door applying
+    its effects again (a retry, the sweep) never says it twice.
+
+    WHY THE CONVERSATION HEARS IT. The product role answers from what was said in it; a card that
+    disappears from the board, or stops being worked on, with nothing said there is one the role
+    goes on describing as coming (#384, #409). Its only producer is the door every person-made
+    ending goes through — never a transport.
+
+    `conversation` is where the requester asked, as the door read it BEFORE the transition's
+    effects ran — a cancellation closes the delivery loop that records it.
+
+    RETURNS THE DOOR'S OUTCOME, AND RAISES WHEN NOTHING WAS SAID: the card's record keeps what each
+    effect came to, and a telling the conversation did not take is applied again by the sweep —
+    which `_once` makes safe, and which "told already" ends."""
+    if not _speaks(project) or not str(card or "").strip():
+        return "nobody to tell"
+    from beeverforge.product import voice
+    said = _event_id(CARD_MOVED, project, card, event_id)
+    if _once(project, said, lambda: (conversation or conversation_for(project, card),
+                                     voice.card_moved(notice, ref=card, title=title,
+                                                      removed=removed,
+                                                      language=_language(project),
+                                                      agent_name=_agent(project),
+                                                      pass_number=pass_number,
+                                                      link=_where_to_try(project, card)
+                                                      if pass_number else ""))):
+        return "told"
+    if said in _read(_store_path(project))["told"]:
+        return "told already"
+    raise RuntimeError("the conversation's door did not take it")
+
+
+def _where_to_try(project, card: str) -> str:
+    """Where a person tries `card`'s change now: its preview while one is up — by the project's
+    NAME, which is what `link_for` reads (it was handed the project and answered "" for every card)
+    — else the card, where the preview is started."""
+    try:
+        from beeverforge.preview.live import link_for
+
+        return link_for(getattr(project, "name", "") or "", str(card)) or _card_url(project, card)
+    except Exception:  # noqa: BLE001 — a link is a courtesy; the sentence still names the card
+        log.info("could not tell where #%s is tried", card, exc_info=True)
+        return _card_url(project, card)
+
+
+# ── ready for you ────────────────────────────────────────────────────────────────────────────────
+
+def _card_url(project, card: str) -> str:
+    """Where a person opens the card — ASKED of the tracker (`ticket_url`), never spelled here: on
+    the local board it is the panel's card, where the preview and the approve/adjust buttons live.
+    Best-effort: "" leaves the line out, and the sentence still names the card."""
+    try:
+        from beeverforge.product.module import ProductModule
+
+        return str(ProductModule(project)._tracker().ticket_url(str(card)) or "")
+    except Exception:  # noqa: BLE001 — a link is a courtesy
+        log.info("could not ask the tracker where #%s lives", card, exc_info=True)
+        return ""
+
+
+def _preview_starts_itself(project) -> bool:
+    """Whether this deployment starts an offered preview on its own (#437) — the SAME two
+    conditions `preview/live.py::should_start` refuses on first: the project's
+    `preview.auto_start`, and a runtime named. Not the preview's record: at the moment this is
+    said the start may or may not have written `starting` yet, and the sentence must not depend
+    on which of the two got there first. False when unsure — "start it from the card" is then
+    said, which the card can always honour."""
+    try:
+        from beeverforge.contracts.project import PreviewPolicy
+        from beeverforge.runtime.temporal.io import default_preview_runtime
+
+        policy = getattr(project, "preview", None) or PreviewPolicy()
+        kind = default_preview_runtime()
+        return bool(getattr(policy, "auto_start", True)) and bool(kind) and kind != "none"
+    except Exception:  # noqa: BLE001 — the sentence falls back to "start it from the card"
+        log.info("could not read whether previews start themselves here", exc_info=True)
+        return False
+
+
+def _preview_offered(project, card: str) -> bool:
+    """Whether the card offers a preview a person can start — this deployment runs previews
+    (`preview.domain()`) and the job wrote an offer for the card's unit that is not waiting on a
+    shape to be declared. Best-effort, and False when unsure: "open the card and check the change"
+    is always true, while "start the preview" on a card with no button is a broken promise."""
+    try:
+        from beeverforge import preview
+
+        if not preview.domain():
+            return False
+        name = getattr(project, "name", "") or ""
+        # THE CARD AS THE PANEL ASKS FOR IT: its number, never a qualified `repo#N`
+        found = preview.latest(name, preview.unit_of_card(name, str(card).rsplit("#", 1)[-1]))
+        return found is not None and not found.shape
+    except Exception:  # noqa: BLE001 — the sentence falls back to "check the change"
+        log.info("could not read whether #%s offers a preview", card, exc_info=True)
+        return False
+
+
+def _stance(verdict) -> str:
+    """What the automatic review said, as `verdict.headline`'s own word — "" when the verdict is
+    not known here (None), which says nothing rather than "no review"."""
+    if verdict is None:
+        return ""
+    from beeverforge.review.verdict import headline
+
+    return str(headline(verdict if isinstance(verdict, dict) else {}).get("stance") or "")
+
+
+def ready_to_try(project, *, card: str, pr_url: str, review: str = "",
+                 preview_url: str = "") -> str:
+    """A CARD'S CHANGE WAITS ON A PERSON, AND THE PERSON WHO ASKED FOR IT HEARS IT (#401) — in the
+    conversation they asked in, once per card and pull request. The card's door says it, from
+    `pr_opened` (#414), and this returns what it came to, as the record's outcome — RAISING WHEN
+    THE CONVERSATION DID NOT TAKE IT, so the sweep applies it again (`_once` makes that safe).
+
+    THE ROLE PROMISED "EU AVISO AQUI" AND SAID NOTHING WHILE THE CARD WAITED ON THAT PERSON. With a
+    person deciding the merge, the requester's own look is the gate: the change is built, reviewed
+    and one click from a preview. The card carried the factory's comment; the role, who had said
+    it would tell them, was silent, and the person learned it was ready by opening the board. The
+    two-day reminder (`pull_requests_at_the_gate`) is not this: it says the TEAM has not looked.
+
+    ONLY WHERE SOMEBODY ASKED (`requester_conversation`): a card nobody asked for in a conversation
+    is not the role's to announce, and the room already has the card's own comment — so nothing is
+    said and nothing is recorded, and the ledger is the only read it costs.
+
+    TWO PRODUCERS, ONE EVENT, like a delivery: the job's merge watch the moment it begins
+    (`activities.tell_the_requester`, with the review's word, `review`), and the tech-lead's round,
+    which sees every gate and not the verdict (`review=""`) — for a job whose history predates the
+    watch's call, or one whose merge was handed to a person later. The id is the card and the
+    pull request, so whichever comes second finds it told.
+
+    `preview_url` IS THE SEAM FOR A PREVIEW THAT IS ALREADY UP: given one, the message carries the
+    address instead of "start the preview from the card". A preview that comes up after this was
+    said is `preview_up`'s to announce."""
+    if not _speaks(project) or not str(card or "").strip() or not str(pr_url or "").strip():
+        return "nobody to tell: no product role, card or pull request"
+    where = requester_conversation(project, card)
+    if not where:
+        return "nobody to tell: nobody asked for it in a conversation"
+    from beeverforge.product import voice
+
+    said = _event_id(READY_FOR_YOU, project, card, pr_url)
+    if _once(project, said, lambda: (
+            where,
+            voice.ready_for_you(ref=card, title=_title_of(project, card),
+                                card_url=_card_url(project, card), review=review,
+                                preview=not preview_url and _preview_offered(project, card),
+                                preview_url=preview_url, language=_language(project),
+                                agent_name=_agent(project),
+                                preview_starts_itself=_preview_starts_itself(project)))):
+        return "told"
+    if said in _read(_store_path(project))["told"]:
+        return "told already"
+    raise RuntimeError("the conversation's door did not take it")
+
+
+def ready_for_you(project, *, card: str, pr_url: str, verdict: dict | None = None,
+                  preview_url: str = "") -> bool:
+    """`ready_to_try` with the automatic review's verdict, answering only whether it was told NOW —
+    False for told already, nobody to tell, and a door that did not take it alike."""
+    try:
+        return ready_to_try(project, card=card, pr_url=pr_url, review=_stance(verdict),
+                            preview_url=preview_url) == "told"
+    except RuntimeError:
+        return False
+
+
+
+# ── the change went in ───────────────────────────────────────────────────────────────────────────
+
+def _accepted_where(project, card: str, pr_url: str) -> str:
+    """The conversation the requester accepted this pull request in (`accept.standing`), or "" —
+    the way to them when no delivery of the card names one: a card the role opened from a request
+    opens no delivery loop. Best-effort: an unread store is a vaguer route, never a raise."""
+    try:
+        from beeverforge.product.accept import standing
+
+        acc = standing(getattr(project, "name", "") or "", card, pr_url)
+        return acc.where if acc is not None else ""
+    except Exception:  # noqa: BLE001 — the delivery's conversation is still asked first
+        log.info("could not read #%s's acceptance to find its requester's conversation", card,
+                 exc_info=True)
+        return ""
+
+
+def _the_delivery_says_it(project, card: str, rows) -> bool:
+    """Whether a delivery of `card` completes with this merge, and so says "it is ready" when the
+    job settles the card through its door (`delivered`, #414) — the requester then hears THAT, not
+    a second message. The board as read now plus this card: the job has not moved it to Done yet,
+    and an unreadable board counts this card alone, so a single-card delivery is never told
+    twice."""
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.product import followup
+
+    loops = _deliveries_of(rows, card)
+    if not loops:
+        return False
+    return bool(followup.delivered(loops, (_delivered_now(project) or set())
+                                   | {canonical_ref(card)}))
+
+
+def went_in(project, *, card: str, pr_url: str, stages_follow: bool = False) -> str:
+    """THE CHANGE A CARD'S REQUESTER ASKED FOR WENT IN, and they hear it (#448 slice 3) — in the
+    conversation they asked in, once per card and pull request, WHOEVER MERGED IT: a person on the
+    floor or the forge, the factory on its own, or the requester's acceptance when the look was all
+    that held it. The card's door says it, from the job's `merged` (#448 slice 6), and this returns
+    what it came to, as the record's outcome — RAISING WHEN THE CONVERSATION DID NOT TAKE IT, or
+    the ledger could not be read, so the sweep applies it again (`_once` makes that safe).
+
+    MEASURED BEFORE IT WAS ADDED. With no stage declared, the job ends Done at the merge and the
+    card's door announces every delivery that completes (`delivered`, #414) — "what you asked for
+    is ready, did it work?" — to the same conversation, so this says nothing where that does
+    (`_the_delivery_says_it`). Everywhere else the requester heard nothing at the merge: a project
+    with stages announces its delivery only once the last one is through, a card of a requirement
+    whose other cards are still open completes no delivery, and a card the role opened from a
+    request opens none.
+
+    ONLY WHERE SOMEBODY ASKED: the delivery's conversation, else the one the requester accepted it
+    in. A card nobody asked for in a conversation is the room's card comment, as for
+    `ready_for_you`."""
+    if not _speaks(project) or not str(card or "").strip() or not str(pr_url or "").strip():
+        return "nobody to tell: no product role, card or pull request"
+    from beeverforge.memory import store as loop_store
+
+    rows = loop_store.read(getattr(project, "name", "") or "")
+    where = requester_conversation(project, card, rows=rows) or _accepted_where(
+        project, card, pr_url)
+    if not where:
+        return "nobody to tell: nobody asked for it in a conversation"
+    if not stages_follow and _the_delivery_says_it(project, card, rows):
+        return "nothing to tell: the delivery says it"
+    from beeverforge.product import voice
+
+    said = _event_id(MERGED, project, card, pr_url)
+    if _once(project, said, lambda: (
+            where,
+            voice.merged_for_you(ref=card, title=_title_of(project, card),
+                                 stages_follow=stages_follow, language=_language(project),
+                                 agent_name=_agent(project)))):
+        return "told"
+    if _said_already(project, said):
+        return "told already"
+    raise RuntimeError("the conversation's door did not take it")
+
+
+def merged_for_you(project, *, card: str, pr_url: str, stages_follow: bool = False) -> bool:
+    """`went_in`, answering only whether it was told NOW — False for told already, nobody to tell,
+    the delivery saying it, and a door or a ledger that did not answer alike. Never raises."""
+    try:
+        return went_in(project, card=card, pr_url=pr_url, stages_follow=stages_follow) == "told"
+    except Exception:  # noqa: BLE001 — the merge stands; only its telling is lost
+        log.exception("[%s] could not tell #%s's requester it went in",
+                      getattr(project, "name", "?"), card)
+        return False
+
+
+def _said_already(project, event_id: str) -> bool:
+    """Whether `event_id` is in this module's record of what it told — "told already" for the
+    card's door, which answers a telling applied again from its record (`card_moved`)."""
+    try:
+        return event_id in _read(_store_path(project))["told"]
+    except (OSError, TimeoutError):
+        return False
+
+
+# ── it is theirs to try before it reaches anyone ─────────────────────────────────────────────────
+
+def requester_of(project, card: str, *, rows=None) -> tuple[str, str]:
+    """`(conversation, person)` for `card`'s requester — where they asked, and a DIGEST of who
+    (`speaker.sealed`) — or `("", "")` when nobody's conversation is known (#448 slice 4). Never
+    raises.
+
+    THE SAME TWO WAYS TO THEM AS `merged_for_you`, IN THE SAME ORDER: the newest delivery of the
+    card that recorded a conversation (`requester_conversation`'s reading), with the person it
+    sealed when the work was filed; else the conversation they accepted the change in
+    (`accept.standing`, for any pull request of the card — at the last gate the change is merged,
+    and which pull request carried it is not the question), whose person is sealed here. The
+    person is only ever a digest: what reads it compares it (`agenda`), and nothing reads it back
+    as a name."""
+    try:
+        if rows is None:
+            from beeverforge.memory import store as loop_store
+
+            rows = loop_store.read(getattr(project, "name", "") or "")
+        asked = _the_request(rows, card)
+        if asked is not None:
+            return (str(asked.context.get("conversation") or ""),
+                    str(asked.context.get("requester") or ""))
+        from beeverforge.product.accept import standing
+        from beeverforge.product.speaker import sealed
+
+        acc = standing(getattr(project, "name", "") or "", card)
+        if acc is not None and acc.where:
+            return acc.where, sealed(acc.by)
+    except Exception:  # noqa: BLE001 — a vaguer route, never a raise: the room was asked anyway
+        log.info("could not read who asked for #%s", card, exc_info=True)
+    return "", ""
+
+
+def to_try_at_the_stage(project, *, card: str, where: str = "", run: str = "") -> str:
+    """A CARD'S CHANGE IS READY FOR THE PERSON WHO ASKED FOR IT TO TRY, BEFORE IT REACHES ANYONE
+    ELSE, and they hear it where they asked (#448 slice 4) — once per card and per run of its job.
+    The card's door says it, from the round's `staged` (#448 slice 6), and this returns what it
+    came to, as the record's outcome — RAISING WHEN THE CONVERSATION DID NOT TAKE IT.
+
+    THE ROOM WAS ASKED AND THE REQUESTER WAS NOT. A job parked at the last gate before the
+    product's users (`release.parked_for_release`) was offered, hourly, to the product's ROOM and
+    nowhere else (`followup.release_question`): the person whose request it was learned it was
+    ready to try only if they happened to read the room, and their answer, given where they had
+    asked, reached nothing. The room is still asked exactly as before; this is the requester's
+    own telling, and their own copy of the question opens beside the room's only once this says
+    they were told (`lifecycle/loops.py::release_asked`).
+
+    ONCE PER RUN, NOT ONCE PER CARD. `run` is the parked job's run: the round asks every hour,
+    and the run is what keeps the second hour silent while a LATER run of the same card — the
+    work done again, with something new to try — is told again. A job that could not say its
+    run (`""`) is told once per card.
+
+    ONLY WHERE SOMEBODY ASKED, AND NOT IN THE ROOM. A card nobody asked for in a conversation is
+    the room's question alone; and a requester whose conversation IS the room already read the
+    room's question there — the same news twice, in the same place, is noise."""
+    if not _speaks(project) or not str(card or "").strip():
+        return "nobody to tell: no product role or card"
+    to, _ = requester_of(project, card)
+    if not to:
+        return "nobody to tell: nobody asked for it in a conversation"
+    if to == room_of(project):
+        return "nobody to tell: they asked in the room, which was asked"
+    from beeverforge.product import voice
+
+    said = _event_id(STAGED, project, card, run)
+    if _once(project, said, lambda: (
+            to,
+            voice.staged_for_you(ref=card, title=_title_of(project, card), where=where,
+                                 language=_language(project), agent_name=_agent(project)))):
+        return "told"
+    if _said_already(project, said):
+        return "told already"
+    raise RuntimeError("the conversation's door did not take it")
+
+
+def staged_for_you(project, *, card: str, where: str = "", run: str = "") -> bool:
+    """`to_try_at_the_stage`, answering only whether it was told NOW. Never raises."""
+    try:
+        return to_try_at_the_stage(project, card=card, where=where, run=run) == "told"
+    except Exception:  # noqa: BLE001 — the room was asked; only their own telling is lost
+        log.info("could not tell #%s's requester it is theirs to try", card, exc_info=True)
+        return False
+
+
+def told_at_the_stage(project, *, card: str, run: str = "") -> bool:
+    """Whether the card's requester was told, for this run, that its change is theirs to try — what
+    their own copy of the question waits on (`lifecycle/loops.py::release_asked`). Never raises."""
+    return _said_already(project, _event_id(STAGED, project, card, run))
+
+
+def tried_it_right(project, *, card: str, run: str, where: str = "", who: str = "") -> str:
+    """THE CARD'S REQUESTER TRIED IT AT THE LAST GATE AND SAYS IT IS RIGHT, and the project does
+    not let their word put it in front of everyone (`Project.release_by_requester`) — so the ROOM
+    hears it, where a product admin's "it worked" does (#448 slice 4). The card's door says it,
+    from `accepted` at the last gate (#448 slice 6): "told", or "told already" for this run — the
+    room KNOWS either way — RAISING WHEN THE ROOM'S DOOR DID NOT TAKE IT.
+
+    ONCE PER CARD AND RUN OF ITS JOB, like `to_try_at_the_stage`: a second "funcionou" from the
+    same person about the same change is not news, and a later run — the work done again — is.
+    `run` is the run the question was asked for (`followup.release_of`), or the time it was asked
+    when the question predates it. `who` is a name a person reads, or "" for "the person who asked
+    for it": the room is told THAT the requester tried it, never handed an identifier."""
+    if not _speaks(project) or not str(card or "").strip():
+        return "nobody to tell: no product role or card"
+    from beeverforge.product import voice
+
+    event = _event_id(TRIED, project, card, run)
+    if _once(project, event, lambda: (
+            room_of(project),
+            voice.tried_and_right(ref=card, title=_title_of(project, card), who=who, where=where,
+                                  language=_language(project), agent_name=_agent(project)))):
+        return "told"
+    try:
+        with _held(project, required=True) as path:
+            if event in _read(path)["told"]:
+                return "told already"
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError(f"what the room was told could not be read ({exc})") from exc
+    raise RuntimeError("the room's door did not take it")
+
+
+def tried_and_right(project, *, card: str, run: str, where: str = "", who: str = "") -> bool:
+    """`tried_it_right`, answering whether the room KNOWS — told now, or told already for this
+    run. Never raises."""
+    try:
+        return tried_it_right(project, card=card, run=run, where=where, who=who) in (
+            "told", "told already")
+    except Exception:  # noqa: BLE001 — their yes is recorded; only the room's telling is lost
+        log.info("could not tell the room #%s's requester says it is right", card, exc_info=True)
+        return False
+
+
+__all__ = ["CARD_MOVED", "CI_RED", "DELIVERED", "DOCUMENT_INGESTED", "KINDS", "MERGED",
+           "PREVIEW_UP", "PRODUCERS", "PR_WAITING", "PR_WAIT_HOURS", "READY_FOR_YOU", "STAGED",
+           "TRIED", "card_moved", "ci_went_red", "conversation_for", "document_ingested",
+           "forget_record", "issues_of", "merged_for_you", "preview_up",
+           "pull_requests_at_the_gate", "ready_for_you", "ready_to_try",
+           "requester_conversation", "requester_of", "room_of", "say_to", "staged_for_you",
+           "to_room", "to_try_at_the_stage", "told_at_the_stage", "tried_and_right",
+           "tried_it_right", "went_in"]

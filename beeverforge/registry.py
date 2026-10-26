@@ -1,0 +1,891 @@
+"""ProjectRegistry — the set of projects the framework drives.
+
+A YAML file behind a small interface, so a Postgres-backed version drops in later without touching
+callers. This is what makes "add another project" a first-class, data-only operation.
+
+WHERE THE FILE LIVES IS THE WHOLE CARD (C-12). Reading was never the problem — `_load_raw` already
+reads from disk on every call. The *deployment* was: `docker/worker.Dockerfile` copied the registry
+to the very path the worker reads, so onboarding a repository meant `docker build` and a redeploy.
+For a downloadable product that is disqualifying, and it is a live hazard on file: a rebuild that
+ships without the gitignored `deploy/registry.yaml` produces a project-less worker that raises on
+every job.
+
+So the image now carries a SEED and the worker reads a writable path that outlives it:
+
+    /etc/beeverforge/registry.seed.yaml   baked, immutable, what this build was shipped knowing
+    /var/lib/beeverforge/registry.yaml    mounted, writable, what this deployment actually drives
+
+`seed_registry()` copies the first to the second when — and only when — the second holds no
+projects. That makes a fresh install never project-less AND makes a redeploy never revert a project
+added at runtime. Getting either half wrong is silent: one leaves a board unpolled, the other
+reverts it later.
+
+TWO DURABILITY BUGS FIXED HERE, both reachable without anyone rebuilding anything:
+
+    write_text TRUNCATES first  a crash between truncate and write leaves an EMPTY registry, which
+                                is the same project-less worker
+    no lock on read-modify-write two processes adding at once lose one of the two projects, and a
+                                project that silently did not land is a board nobody polls
+"""
+
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+
+import yaml
+from pydantic import ValidationError
+
+from beeverforge.contracts import aliases
+from beeverforge.contracts.project import BoxConfig, Project
+from beeverforge.util import yaml_io
+
+log = logging.getLogger("beeverforge.registry")
+
+#: The old keys already named in this process — `(registry file, project, key)` — so each is said
+#: ONCE. `list()` runs on every tick of the poller and on most requests; a deprecation said on each
+#: of them is a log nobody reads, and one said once is a line somebody acts on.
+_NAMED: set[tuple[str, str, str]] = set()
+_NAMED_LOCK = threading.Lock()
+
+
+def _first_time(*key: str) -> bool:
+    with _NAMED_LOCK:
+        if key in _NAMED:
+            return False
+        _NAMED.add(key)
+        return True
+
+#: Where a deployed worker keeps the registry it actually drives — writable and mounted, so it
+#: survives the image. Overridden by `BEEVERFORGE_REGISTRY` like everything else.
+LIVE_REGISTRY_PATH = Path("/var/lib/beeverforge/registry.yaml")
+
+#: What the image was shipped knowing. Immutable, and only ever read.
+SEED_REGISTRY_PATH = Path("/etc/beeverforge/registry.seed.yaml")
+
+
+# ── one process, one GitHub App installation (#64, C-28) ────────────────────────────────────────
+#
+# THE ASYMMETRY. The CHANNEL credential is per-project: `factory.notifier_for_project` reads the
+# env var the registry names, so one deployment hosts N projects across N Slack workspaces, and
+# `contracts/project.py` documents that as deliberate. The FORGE credential is not — the App's
+# installation id is a process-wide environment variable (`credentials.app_installation_id`), and
+# a GitHub App installation belongs to exactly ONE org. So one running process can only ever reach
+# one org's repositories, and `Project` has no field that could say otherwise. Until #743 nothing
+# said so anywhere a person onboarding a project would look; `docs/configuration.md` §5 ("One
+# deployment, one GitHub organisation") now does. The failure it produces is a 404 on a repo the
+# operator can see in their browser.
+#
+# One deployment per organisation is the shape the platform is built for, so the limit is
+# defensible — it just has to be TRUE and SAID rather than discovered. `add` refuses a second
+# organisation, `list` logs one, and `beeverforge doctor`'s `installation_scope` line fails it.
+
+
+def github_owners(project: Project) -> set[str]:
+    """Which GitHub orgs this project's work actually touches. Pure, no I/O.
+
+    ONLY the three provider axes and the board, and only when that axis is GitHub — a Jira
+    `repo` is a project key (`CONT`), not an `owner/name`, and reading it as an org would refuse
+    a perfectly valid mixed-vendor registry.
+
+    DELIBERATELY EXCLUDED, each for its own reason:
+
+        repo_path            may be a clone URL or a local path; it is where the code is FETCHED
+                             from, and `RepoCache` already handles a URL. Not an authorisation fact
+        factory_board        ADR-0027 puts the factory's OWN impediments on the factory's OWN board,
+                             which is legitimately a different org from the client's — and the
+                             shipped template does exactly that. `_warn_foreign_pointers` warns
+        product.docs_repo    same shape: a client's requirements repo may live anywhere — once
+                             the project has code. BEFORE IT (#992) the context is the one
+                             repository a GitHub project's work touches: its requirements are
+                             written there and its first source is listed there, with this
+                             deployment's credential, and no axis names a repository for it
+                             (`repo: None`). Left out then, a project with no code was invisible
+                             to the one-organisation rule at `add` (review of 9f18a788), so its
+                             context's organisation is counted in the code's place, until the code
+                             takes it back.
+    """
+    from beeverforge.contracts.project import before_its_code
+
+    owners: set[str] = set()
+    on_github = False
+    for axis in (project.tracker, project.forge, project.ci):
+        if axis is None or (axis.kind or "").strip().lower() != "github":
+            continue
+        on_github = True
+        repo = (axis.repo or "").strip()
+        if "/" in repo:
+            owners.add(repo.split("/", 1)[0])
+        board_owner = (axis.options or {}).get("board_owner", "").strip()
+        if board_owner:
+            owners.add(board_owner)
+    if on_github and before_its_code(project):
+        from beeverforge.doors import infer_repo
+
+        context = str(getattr(getattr(project, "product", None), "docs_repo", "") or "").strip()
+        if "://" in context or context.startswith("git@"):
+            context = infer_repo(context)
+        if "/" in context.strip("/"):
+            owners.add(context.strip("/").split("/", 1)[0])
+    return owners
+
+
+def owners_by_project(projects: list[Project]) -> dict[str, list[str]]:
+    """`{owner: [project names]}` over every project's `github_owners` — `{}` when no project
+    names a GitHub organisation. The one grouping: `spanning_installations` filters it, and
+    `beeverforge doctor`'s `installation_scope` line compares it with the App's account (#743)."""
+    by_owner: dict[str, list[str]] = {}
+    for project in projects:
+        for owner in github_owners(project):
+            by_owner.setdefault(owner, []).append(project.name)
+    return by_owner
+
+
+def spanning_installations(projects: list[Project]) -> dict[str, list[str]]:
+    """`{owner: [project names]}` when the set spans more than one org — otherwise empty.
+
+    Empty is the answer for the healthy case AND for a registry with no GitHub projects at all,
+    so a caller reads "falsy means fine" without a special case."""
+    by_owner = owners_by_project(projects)
+    return by_owner if len(by_owner) > 1 else {}
+
+
+def spanning_message(by_owner: dict[str, list[str]]) -> str:
+    """The sentence somebody can act on: both orgs, and which projects sit in each."""
+    parts = [f"{owner} ({', '.join(sorted(names))})" for owner, names in sorted(by_owner.items())]
+    return (
+        "this registry spans more than one GitHub organisation — " + " and ".join(parts) + ". "
+        "One running process authenticates as ONE GitHub App installation, and an installation "
+        "belongs to one org, so the projects outside it would 404 on every forge read. Run one "
+        "deployment per organisation, or remove the projects that do not belong to this one."
+    )
+
+
+def _given_its_code(raw: dict, name: str, project: Project) -> dict:
+    """The registry entry `name` becomes when `project` gives it its code (#992), or the refusal:
+    `KeyError` for a name nobody registered, `ValueError` for a project that has its code already
+    or for a registry that would span two GitHub organisations. ONE FUNCTION for
+    `ProjectRegistry.set_code`, which writes it, and `ProjectRegistry.check_code`, which asks it
+    before a first source pushes anything — so the two cannot disagree about what is refused."""
+    from beeverforge.contracts.project import before_its_code
+
+    if name not in raw:
+        raise KeyError(name)
+    if not before_its_code(Project(**raw[name])):
+        raise ValueError(f"{name} already has its code repository "
+                         f"({raw[name].get('repo_path')!r}) — a project's code is given once")
+    entry = dict(raw[name])
+    entry["repo_path"] = project.repo_path
+    for axis in ("tracker", "forge", "ci"):
+        ref = getattr(project, axis, None)
+        if ref is not None:
+            entry[axis] = ref.model_dump(mode="json")
+    docs_repo = getattr(getattr(project, "product", None), "docs_repo", "") or ""
+    if docs_repo and isinstance(entry.get("product"), dict):
+        entry["product"] = {**entry["product"], "docs_repo": docs_repo}
+    would_be = [Project(**other) for key, other in raw.items() if key != name]
+    spanning = spanning_installations([*would_be, Project(**entry)])
+    if spanning:
+        raise ValueError(spanning_message(spanning))
+    return entry
+
+
+def installation_scope_line(by_owner: dict[str, list[str]],
+                            installed: tuple[str | None, str] | None, *,
+                            used_instead: tuple[str, ...] = (),
+                            app_incomplete: bool = False) -> tuple[bool, str, str]:
+    """`(ok, message, remedy)` for `beeverforge doctor`'s `installation_scope` line (#743). Pure.
+
+    `by_owner` is `owners_by_project` over the WHOLE registry, because the installation is the
+    deployment's and not one project's. `installed` is `credentials.app_installation_account()`:
+    `None` when no App is configured, `(login, "")` when its installation was read, `(None,
+    reason)` when it could not be. `used_instead` is what the registry's GitHub projects use in
+    the App's place (`credentials.describe_source` of each), when no GitHub axis uses the App.
+    `app_incomplete` is an App with some, not all, of its three settings: not asked either.
+
+    In order: a registry that spans says `spanning_message`, the sentence the load path logs,
+    without asking the App; an App no GitHub project uses (a static token wins over it, decided
+    2026-10-19) is not applicable, naming what they use; an App not fully configured is not
+    applicable and says which settings it needs; no App is not applicable, and says so
+    first rather than passing as a verified scope (decided 2026-10-19: `beeverforge.doctor/1`
+    keeps two results, so the wording carries it); an App that could not be read is a red line
+    with GitHub's own reason, never a pass (lesson §2); then the account is compared with the one
+    organisation the registry names.
+
+    THE COMPARISON IGNORES CASE, as GitHub's logins do: `Acme/api` in the registry and an
+    installation on `acme` are one account, and a case-sensitive test would fail a correct
+    deployment. `spanning_installations` still groups by the spelling (a separate defect)."""
+    from beeverforge.doctor import NOT_APPLICABLE
+
+    if len(by_owner) > 1:
+        return (False, spanning_message(by_owner),
+                "run one deployment per organisation — each with its own App installation id, "
+                "registry and environment file — or remove the projects of the other "
+                "organisations from this one (`beeverforge project remove <name>`)")
+    if installed is None and used_instead:
+        return (True, NOT_APPLICABLE + f"this deployment's GitHub projects use "
+                f"{' and '.join(used_instead)}, not the GitHub App, so its installation is not "
+                "what reaches them and was not asked which organisation it is on", "")
+    if installed is None and app_incomplete:
+        return (True, NOT_APPLICABLE + "the GitHub App is not fully configured "
+                "(BEEVERFORGE_GH_APP_ID, the App's private key and "
+                "BEEVERFORGE_GH_APP_INSTALLATION_ID are all needed), so no installation was asked "
+                "which organisation it is on", "")
+    if installed is None:
+        return (True, NOT_APPLICABLE + "no GitHub App installation is configured for this "
+                "deployment, so no installation was asked which organisation it is on", "")
+    login, reason = installed
+    if login is None:
+        return (False, f"the GitHub App installation could not be read: {reason}",
+                "check that BEEVERFORGE_GH_APP_ID, the App's private key and "
+                "BEEVERFORGE_GH_APP_INSTALLATION_ID name one App and one of its installations, "
+                "and that this machine reaches api.github.com — docs/setup/github.md")
+    if not by_owner:
+        return (True, f"the GitHub App installation is on {login}; no project in this registry "
+                "names a GitHub organisation, so there was nothing to compare", "")
+    owner, names = next(iter(by_owner.items()))
+    projects = ", ".join(sorted(names))
+    if owner.casefold() == login.casefold():
+        return (True, f"the GitHub App installation is on {login}, the organisation the "
+                f"registry's GitHub projects name ({projects})", "")
+    return (False, f"the GitHub App installation this deployment authenticates as is on {login}, "
+            f"and the registry names {owner} ({projects}): an installation reaches only its own "
+            "organisation's repositories, so every forge read of those projects would 404",
+            f"run one deployment per organisation — each with its own App installation id, "
+            f"registry and environment file — or remove {projects} from this registry "
+            f"(`beeverforge project remove <name>`)")
+
+
+class ProjectRegistry:
+    def __init__(self, path: Path | str | None = None) -> None:
+        # env override lets the panel/tests point at an isolated registry
+        explicit = path or os.environ.get("BEEVERFORGE_REGISTRY")
+        # the default is the OPERATOR's home file, resolved in one place (`namespace.operator_path`)
+        # so the registry, the approver store and the resume handles share a home; an explicit
+        # path (argument, env) is never second-guessed
+        from beeverforge import namespace as _ns
+        self.path = Path(explicit) if explicit else _ns.operator_path("registry.yaml")
+
+    # ── plumbing ────────────────────────────────────────────────────────────────────────────────
+
+    @contextmanager
+    def _locked(self):
+        """Serialise read-modify-write across processes.
+
+        The panel and the CLI can both register a project, and an unlocked read-modify-write drops
+        one of two concurrent adds — silently, leaving a board nobody polls. The lock is on a
+        sibling file rather than the registry itself, because the registry is REPLACED on write
+        (see `_save_raw`) and a lock held on a replaced inode protects nothing.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self.path.with_suffix(self.path.suffix + ".lock")
+        with open(lock, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+    def _load_raw(self) -> dict[str, dict]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = yaml_io.load(self.path.read_text()) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"{self.path} is not valid YAML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{self.path} must be a YAML mapping, not {type(data).__name__}")
+        return data.get("projects", {}) or {}
+
+    def _normalised(self, name: str, raw: dict) -> dict:
+        """Rewrite one entry under the current field names, keeping anything unrecognised.
+
+        This is what makes the C-08 rename drain away instead of needing a flag day: every write
+        migrates every entry, so a registry nobody can see converges on its own.
+
+        UNKNOWN KEYS ARE PRESERVED. `extra="ignore"` means the model would silently drop them, and
+        a write that deleted a key somebody deliberately added is a worse failure than the stale
+        name it was fixing. An entry that will not parse at all is left verbatim: an unrelated
+        `add` must not be the thing that rewrites a broken neighbour.
+        """
+        try:
+            dumped = Project(**raw).model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001 — leave what we cannot read
+            log.warning("registry: project %r could not be normalised (%s) — left verbatim, so "
+                        "its old field names will not migrate until it parses", name, exc)
+            return raw
+        unknown = {k: v for k, v in raw.items()
+                   if k not in Project.model_fields and k not in aliases.PROJECT_KEYS}
+        return {**dumped, **unknown}
+
+    def _save_raw(self, projects: dict[str, dict]) -> None:
+        """Write atomically: a temp file in the same directory, then `os.replace`.
+
+        `write_text` truncates before it writes, so a crash, a full disk or a SIGTERM in between
+        leaves an EMPTY registry — the project-less worker, without anyone rebuilding anything.
+        `os.replace` is atomic on the same filesystem: readers see either the old file or the new
+        one, never a half-written one.
+        """
+        projects = {k: self._normalised(k, v) for k, v in projects.items()}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".registry-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                yaml_io.dump({"projects": projects}, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())  # the bytes are on disk before anything points at them
+            os.replace(tmp, self.path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)  # never leave debris beside the registry
+            raise
+
+    # ── reads ───────────────────────────────────────────────────────────────────────────────────
+
+    def _report_keys(self, name: str, raw: dict) -> None:
+        """Name every key that will not do what its author expects.
+
+        `extra="ignore"` is kept deliberately: making an unknown key fatal would turn one stale
+        line into an outage the operator could not have reviewed, since the file is invisible to
+        every test and reviewer. But silence is worse than either — a typo'd key is dropped, the
+        project goes quiet, and the first report comes from the client.
+        """
+        known = set(Project.model_fields) | set(aliases.PROJECT_KEYS)
+        for key in raw:
+            if key not in known:
+                log.warning("registry: project %r has an unknown key %r — it is IGNORED, so "
+                            "whatever it was meant to configure is not configured", name, key)
+        self._report_old_keys(name, raw)
+        # NESTED BLOCKS TOO. `box:` is the first sub-model an operator hand-edits, and a typo there
+        # is worth exactly as much noise as one at the top level: a dropped `network:` means the
+        # egress restriction somebody believed they configured is not configured, and the first
+        # report of that comes from an incident.
+        box = raw.get("box")
+        if isinstance(box, dict):
+            for key in set(box) - set(BoxConfig.model_fields):
+                log.warning("registry: project %r has an unknown key %r under `box:` — it is "
+                            "IGNORED, so whatever it was meant to configure is not configured",
+                            name, key)
+        # AND THE PER-ROLE SHAPES OF `harness:` / `model:`. `Project` types them `dict[str, str]`
+        # with no key validation, `_configured` reads only the keys it is asked for, and the CLI
+        # never writes a per-role `harness:` at all — so hand-editing the file is the ONLY path to
+        # `harness: {reviewr: codex}`, and it was the one path with neither a refusal nor a line.
+        # Measured 2026-08-24: `model: {executr: <a client's own endpoint>}` loaded clean and ran
+        # the executor on the deployment's default provider. A WARNING and never a raise: `list()`
+        # below turns one invalid entry into every project failing to load, which is the outage
+        # the `extra="ignore"` docstring above exists to prevent. The key set is `known_roles()`,
+        # so a role installed as an add-on is a legitimate key here the day it is installed.
+        from beeverforge.adapters.agent.registry import FALLBACK_KEY, known_roles
+
+        for field in ("harness", "model"):
+            per_role = raw.get(field)
+            if isinstance(per_role, dict):
+                for key in sorted(set(per_role) - {*known_roles(), FALLBACK_KEY}):
+                    log.warning("registry: project %r has an unknown role %r under `%s:` — it "
+                                "is IGNORED, so the %s that role was meant to run on is not "
+                                "configured (roles: %s, plus `%s`)", name, key, field,
+                                field, ", ".join(known_roles()), FALLBACK_KEY)
+
+    def _report_old_keys(self, name: str, raw: dict) -> None:
+        """THE KEYS A VENDOR NAMED, each said ONCE, BY NAME, as deprecated (#266 slice 6, ADR-0051
+        D16, decision 6) — at the project's top level and under `product:`.
+
+        Each is read as an alias until `aliases.READ_UNTIL` (`contracts/aliases.py` says what an
+        alias may do: move its value, never widen what the new spelling says). The line says where
+        the value now lives, and the two things a reader could not guess: an old admin list is
+        compared with the people of the platform now, and an old chat coordinate no longer decides
+        which channel carries the project."""
+        sections = [("", raw, aliases.PROJECT_KEYS)]
+        product = raw.get("product")
+        if isinstance(product, dict):
+            sections.append(("product.", product, aliases.PRODUCT_KEYS))
+        declared = str(raw.get("channel") or "").strip()
+        for prefix, section, keys in sections:
+            for folded in aliases.fold(section, keys)[1]:
+                old, new = f"{prefix}{folded.old}", f"{prefix}{folded.new}"
+                if not _first_time(str(self.path), name, old):
+                    continue
+                if folded.ignored:
+                    log.warning("BEEVERFORGE_DEPRECATED_KEY registry: project %r carries %r AND "
+                                "%r — the old spelling is IGNORED (the two are never merged); "
+                                "delete it", name, old, new)
+                    continue
+                also = ""
+                if folded.old in aliases.COORDINATES and not declared:
+                    also = (" It no longer says which channel carries the project: with no "
+                            "`channel:` declared, the project talks through the panel — add "
+                            "`channel: <kind>` (the add-on's name) to keep it on its add-on.")
+                elif folded.new == "admins":
+                    also = (" Its ids are compared with the people of the platform: a chat add-on "
+                            "maps its own users to them (docs/writing-an-addon.md).")
+                log.warning("BEEVERFORGE_DEPRECATED_KEY registry: project %r uses %r, which is "
+                            "deprecated — read as %r until %s, and ignored from then; rename it "
+                            "(the file migrates on the next write).%s",
+                            name, old, new, aliases.READ_UNTIL, also)
+
+    def list(self) -> list[Project]:
+        out: list[Project] = []
+        for key, raw in self._load_raw().items():
+            self._report_keys(key, raw)
+            try:
+                out.append(Project(**raw))
+            except ValidationError as exc:
+                # One malformed entry stops ALL projects, because every caller builds the whole
+                # list and none of them catch. That is arguably the right failure — but a bare
+                # pydantic traceback does not tell the operator which line to open.
+                raise ValueError(f"{self.path}: project {key!r} is invalid: {exc}") from exc
+        self._warn_if_spanning(out)
+        return [_without_foreign_tokens(p, out) for p in out]
+
+    def each_that_builds(self) -> dict[str, Project]:
+        """Every entry that builds, by the name it is registered under — read QUIETLY: no word
+        about its keys, and no refusal of the whole file for a neighbour that does not build.
+
+        For a reader that runs often and needs a fact about each project, and is not where an
+        operator learns what is wrong with the file: the product each JSON log line names
+        (`observability/logs.py`), read again every few seconds while lines are written. `list`
+        says what is wrong on every load, and `get` for the one project it reads; a third reader
+        saying it every five seconds would bury both."""
+        built: dict[str, Project] = {}
+        for name, raw in self._load_raw().items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                built[str(name)] = Project(**raw)
+            except (ValidationError, TypeError):
+                continue  # said by `list`, by name, on every load
+        return built
+
+    def _warn_if_spanning(self, projects: list[Project]) -> None:
+        """Say it loudly on every load — but do NOT raise (#64).
+
+        WHY THIS WARNS WHERE `add` REFUSES, which is a deliberate split. `add` has a human in
+        front of it: the mistake is being made right now, and refusing costs them one message.
+        `list` runs on the poller's every tick, inside a worker, against a file that
+        `_report_keys` two methods up already describes as "invisible to every test and reviewer"
+        because it is gitignored and baked into an image. Raising here would turn ONE stale line
+        in an unreviewable file into a total outage for EVERY project — including the ones that
+        are perfectly fine — and the failure would arrive as a retried activity error in a log
+        nobody is watching. That is a silent stall, the one thing this platform promises not to
+        produce, and it is strictly worse than the 404s it would be protecting against.
+
+        The same argument is already written down one method up for `extra="ignore"`. This obeys
+        it rather than contradicting it.
+
+        The doctor says it as a failure: `beeverforge doctor`'s `installation_scope` check fails a
+        spanning registry with this same sentence (`installation_scope_line`), and otherwise asks
+        the App which org it is ACTUALLY installed on and compares — the one place that can tell
+        an installation on another org from a correct one without guessing (#743). This load path
+        still only logs.
+        """
+        by_owner = spanning_installations(projects)
+        if by_owner:
+            log.error("BEEVERFORGE_REGISTRY_SPANS_INSTALLATIONS: %s", spanning_message(by_owner))
+
+    def get(self, name: str) -> Project:
+        raw = self._load_raw()
+        if name not in raw:
+            raise KeyError(f"project not registered: {name!r}")
+        # the old keys a vendor named, said here too — once, like everywhere — because a process
+        # that only ever asks for one project (the panel's rows, a turn on the worker) may never
+        # list them all
+        if isinstance(raw[name], dict):
+            self._report_old_keys(name, raw[name])
+        try:
+            project = Project(**raw[name])
+        except ValidationError as exc:
+            raise ValueError(f"{self.path}: project {name!r} is invalid: {exc}") from exc
+        if project.preview is None:
+            return project
+        others = []
+        for key, other in raw.items():
+            try:
+                others.append(Project(**other))
+            except ValidationError:
+                log.warning("registry: project %r is invalid and was not read for its "
+                            "credential names", key)
+        return _without_foreign_tokens(project, others)
+
+    # ── writes ──────────────────────────────────────────────────────────────────────────────────
+
+    def add(self, project: Project) -> None:
+        from beeverforge.contracts.project import model_refused
+
+        why = model_refused(getattr(project, "model", None))
+        if why:  # the same rule as `set_model`: both write a project's model
+            raise ValueError(why)
+        with self._locked():
+            raw = self._load_raw()
+            if project.name in raw:
+                raise ValueError(f"project already registered: {project.name!r}")
+            # A PROJECT BEFORE ITS CODE HAS ITS CONTEXT, OR IT IS NOTHING (#992). No code
+            # repository is a state — the product started with its product owner, and
+            # `before_its_code` names it — but a project with neither a code repository nor a
+            # context repository is one every reader would have to guess about, and none should.
+            from beeverforge.contracts.project import before_its_code
+
+            if before_its_code(project) and not str(getattr(
+                    getattr(project, "product", None), "docs_repo", "") or "").strip():
+                raise ValueError(
+                    f"project {project.name!r} names neither a code repository nor a context "
+                    "repository — register it with its code (`beeverforge project add <name> "
+                    "<repository>`) or start its product before the code with its context "
+                    "repository (`beeverforge product start <name> <context-repository>`)")
+            # REFUSED HERE BECAUSE HERE IS WHERE THE MISTAKE IS MADE (#64). A human is in front of
+            # this — `beeverforge project add` or the panel's POST /api/projects, which already
+            # renders a
+            # ValueError as a 409 carrying the message — so the cost of refusing is one sentence
+            # at the moment it can still be acted on, rather than a 404 on a repo they can see in
+            # their browser, three layers away, minutes later.
+            #
+            # ASKED OF THE WHOLE REGISTRY AS IT WOULD BE, through the SAME function `list` warns
+            # with — one rule, one implementation. An earlier version compared the incoming
+            # project's orgs against the incumbents' and missed the case a test caught: a SINGLE
+            # project whose repo is in one org and whose board is in another spans two
+            # installations by itself, and no between-project comparison can see that.
+            would_be = [Project(**other) for other in raw.values()] + [project]
+            spanning = spanning_installations(would_be)
+            if spanning:
+                raise ValueError(spanning_message(spanning))
+            # ONE SLUG, ONE PROJECT (ADR-0050 D7). A preview's compose project, host names and
+            # cookie are built from the project's slug; two projects whose names slug alike
+            # (`Acme` and `acme`) would alias each other's previews on one daemon. Refused here,
+            # where a person is naming the project; `doctor` lists any that predate this.
+            from beeverforge.preview import slug
+
+            twin = next((o.name for o in would_be[:-1] if slug(o.name) == slug(project.name)),
+                        None)
+            if twin is not None:
+                raise ValueError(f"project {project.name!r} would share its short name "
+                                 f"{slug(project.name)!r} with {twin!r} — previews, their hosts "
+                                 "and their cookies are named by it; choose another name")
+            raw[project.name] = project.model_dump(mode="json")
+            self._save_raw(raw)
+            self._warn_foreign_pointers(project)
+
+    def _warn_foreign_pointers(self, project: Project) -> None:
+        """The two pointers that may legitimately live in another org — warned, never refused.
+
+        `factory_board` is ADR-0027: the factory files its OWN impediments on its OWN board, and
+        the shipped `deploy/registry.yaml.example` points it at a fork of this platform. A fork
+        operator aiming it at the upstream repo is doing the natural thing. `product.docs_repo` is
+        the same shape — a client's requirements repository may live anywhere.
+
+        Refusing either would break a documented design to enforce an undocumented one. But both
+        DO need the same installation to read them, and both fail today by degrading quietly (a
+        logged impediment that reaches nobody), so the warning is worth its noise."""
+        mine = github_owners(project)
+        if not mine:
+            return
+        board = getattr(getattr(project, "factory_board", None), "tracker", None)
+        docs = getattr(getattr(project, "product", None), "docs_repo", None)
+        for label, repo in (("factory_board", getattr(board, "repo", None)),
+                            ("product.docs_repo", docs)):
+            owner = (repo or "").split("/", 1)[0].strip()
+            if owner and owner not in mine:
+                log.warning(
+                    "registry: project %r points %s at %r, in a different GitHub organisation "
+                    "(%s) from its own (%s). One process holds ONE App installation, so that "
+                    "pointer reads only if the App is installed on BOTH orgs — otherwise it "
+                    "degrades quietly and reaches nobody.",
+                    project.name, label, repo, owner, ", ".join(sorted(mine)))
+
+    def remove(self, name: str) -> None:
+        """Take a project out of the registry — or raise `KeyError`, like every other write here.
+
+        IT WAS `raw.pop(name, None)`, and that default is the whole of #138: a name nobody
+        registered was a silent no-op, so the verb above it printed `removed '<name>'` and exited
+        0 over an unchanged file. It was found by a shell loop whose quoting mistake handed the
+        command ONE argument holding every name — each call reported success, nothing was removed,
+        and only a later count of the registered projects said so.
+
+        REFUSED HERE, NOT IN THE VERB, because the registry is the one place that knows. The
+        sibling writes (`attach_board`, `set_model`, `set_language`) already raise for a name that
+        is not there; a caller that wants "absent, however it got that way" catches the
+        `KeyError` and says so in its own words, rather than every caller inheriting a success it
+        did not earn. Nothing is written for a name that is not held."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            del raw[name]
+            self._save_raw(raw)
+
+    def attach_board(self, name: str, *, board_owner: str, board_number: str) -> None:
+        """Point a registered project's tracker at a board — `init`'s converge step (C-16).
+
+        Written under the same lock as every other mutation. Layered onto the existing options
+        rather than replacing them: a project that already mapped its column names (C-14) must
+        not lose the mapping to the act that attaches the board."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            tracker = raw[name].setdefault("tracker", {}) or {}
+            options = tracker.setdefault("options", {}) or {}
+            options.update({"board_owner": board_owner, "board_number": str(board_number)})
+            tracker["options"] = options
+            raw[name]["tracker"] = tracker
+            self._save_raw(raw)
+
+    def set_model(self, name: str, model: str, *, role: str | None = None) -> None:
+        """Which model the harness runs for this project — the CLI's way in (funnel review 2).
+
+        The `model:` field has existed since 2026-08-05 in two shapes (one string for every
+        role, or per role), and the ONLY way to set it was editing the registry YAML inside the
+        worker — for the compose deployment, `docker compose exec worker vi`, which is exactly
+        the by-hand step the pilot operator asked where to find and could not. Same lock, same
+        layering rule as `attach_board`.
+
+        A single string and a per-role dict do not merge: narrowing `model: x` with
+        `--role executor y` would either drop x for every other role or invent an expansion this
+        method cannot know is wanted. That case REFUSES with both forms named.
+
+        The value is saved verbatim (the harness names its own models) EXCEPT one shape: it may
+        not begin with '-'. The harness is handed it as one `--model=<value>` token, so a leading
+        '-' is refused here, where every writer passes (`model_refused`)."""
+        from beeverforge.contracts.project import model_refused
+
+        why = model_refused(model)
+        if why:
+            raise ValueError(why)
+        if role:
+            from beeverforge.adapters.agent.registry import known_roles
+
+            known = known_roles()
+            if role not in known:
+                # a typo here writes a dict key NOTHING ever reads — a model that looks
+                # configured and is not, this codebase's signature defect (caught by the
+                # measurement pass before it shipped, 2026-08-10). `known_roles()` rather than
+                # the shipped table, so a role installed as an add-on is one this command can
+                # configure — and the refusal names it, or a stranger reads "not a role" about
+                # the row they just installed
+                raise ValueError(
+                    f"{role!r} is not a role — one of: {', '.join(known)}")
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            if role:
+                current = raw[name].get("model")
+                if isinstance(current, str) and current:
+                    raise ValueError(
+                        f"{name} sets model: {current!r} for EVERY role; a per-role value would "
+                        f"silently drop it for the others. Set the whole shape explicitly — "
+                        f"either `set-model {name} <model>` (every role) or one "
+                        f"`set-model {name} <model> --role <r>` per role after clearing it")
+                merged = dict(current) if isinstance(current, dict) else {}
+                merged[role] = model
+                raw[name]["model"] = merged
+            else:
+                raw[name]["model"] = model
+            self._save_raw(raw)
+
+    def set_docs_repo(self, name: str, docs_repo: str) -> None:
+        """Record which repository holds this project's requirements.
+
+        WITHOUT THIS THE CREATION IS THEATRE (#99 slice 2b). `product init --create-context` makes
+        the repository in the client's organisation, and the product module stays OFF until the
+        registry names it — `ProductConfig.docs_repo` is required, and its own contract says a
+        module with nowhere to write requirements *"is not a configuration, it is a mistake"*. So
+        an onboarding that created the repository and did not write it down would leave the client
+        with a new empty repository and a product role that still refuses to speak.
+
+        The whole `product:` block is created when absent, because a project registered before
+        this feature existed has none — and demanding an operator hand-edit YAML first is exactly
+        the "four files by hand" this slice exists to remove.
+        """
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            product = dict(raw[name].get("product") or {})
+            product["docs_repo"] = docs_repo
+            raw[name]["product"] = product
+            self._save_raw(raw)
+
+    def set_agent_name(self, name: str, agent_name: str) -> None:
+        """What the product role is called in this project's conversations (#335) — the one
+        product key a person talking to it sees on every line. Refused for a project with no
+        `product:` block: a name for a role that is not there names nothing."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            if not isinstance(raw[name].get("product"), dict):
+                raise ValueError(f"{name} has no product module — declare its context "
+                                 f"repository first (`beeverforge product declare`)")
+            product = dict(raw[name]["product"])
+            product["agent_name"] = agent_name
+            raw[name]["product"] = product
+            self._save_raw(raw)
+
+    def set_language(self, name: str, language: str) -> None:
+        """Which language this project's UNPROMPTED messages are written in (#124).
+
+        THE FIELD HAS EXISTED SINCE THE PRODUCT ROLE AND HAD NO WAY IN. `--language` is offered by
+        `project add` and `project init` — at registration, once — and after that the only way to
+        change it was editing the registry YAML *inside the worker image* and rebuilding, which is
+        the same "edit a file by hand" that `set_model` and `set_docs_repo` exist to remove. An
+        operator who onboarded in Portuguese and later wants English had no command at all.
+
+        NOT VALIDATED AGAINST A LIST, deliberately, and for the reason `set_model` gives about
+        model strings: the phrasebooks carry `en` and `pt-BR` today and fall back to English for
+        anything they have not been translated for (`product/voice.py::_pick`), while the AGENTS
+        take the value verbatim as an instruction — so a language nobody has written a catalogue
+        for still produces sensible agent output and understandable canned text. Refusing it here
+        would block the only half that already works.
+        """
+        wanted = str(language or "").strip()
+        if not wanted:
+            raise ValueError("a language with no name in it is not a setting — pass one, e.g. "
+                             "`en` or `pt-BR`")
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            raw[name]["language"] = wanted
+            self._save_raw(raw)
+
+    def set_preview(self, name: str, policy: dict) -> None:
+        """Replace one project's preview policy (`Project.preview`). The value is validated as a
+        `PreviewPolicy` before it is written, so what lands in the file is what the model reads —
+        names a preview may never receive are dropped and said, not written."""
+        from beeverforge.contracts.project import PreviewPolicy
+
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            project = Project(**{**raw[name], "preview": PreviewPolicy(**policy).model_dump()})
+            everyone = [Project(**other) for key, other in raw.items() if key != name] + [project]
+            # REFUSED AT THE WRITE, not only at the read: a credential name must never be in the
+            # file at all, where the next reader of it is a person trusting what it says.
+            clean = _without_foreign_tokens(project, everyone).preview
+            raw[name]["preview"] = clean.model_dump(mode="json")
+            self._save_raw(raw)
+
+    def set_code(self, name: str, project: Project) -> None:
+        """Give a project that started before its code its code repository (#992): `repo_path`
+        and the three axes of `project`, written over the entry's, and its context repository's
+        name as the code's forge addresses it (`product.docs_repo` — an Azure DevOps project
+        qualifies it when the code lives in another project) — everything else is kept.
+
+        ONLY THE FIRST. A project that has a code repository already is refused, under the lock,
+        because the question this answers is "where does the code go", and answering it a second
+        time would point the deployment's credential at another repository behind the back of the
+        jobs, branches and cards that live in the first. The registry is asked again as it would
+        be — one GitHub organisation per deployment (#64) — exactly as `add` asks."""
+        with self._locked():
+            raw = self._load_raw()
+            raw[name] = _given_its_code(raw, name, project)
+            self._save_raw(raw)
+
+    def check_code(self, name: str, project: Project) -> None:
+        """Every refusal `set_code` would make for `project`, asked now and written nowhere
+        (review of 9f18a788). RAISES `KeyError` and `ValueError` exactly as `set_code` does.
+
+        WHY IT IS ASKED BEFORE, AND AGAIN AFTER. A first source writes the product's context
+        before the registry (`product.before_code.first_source`), so a refusal that only `set_code`
+        made would leave a source listed in the context that every later run is refused again
+        over. Asked first with the same function, the registry's answer comes before anything is
+        pushed; `set_code` still asks under its own lock, for a registry somebody changed in the
+        seconds between."""
+        with self._locked():
+            _given_its_code(self._load_raw(), name, project)
+
+    def set_enabled(self, name: str, enabled: bool) -> None:
+        """Turn the framework on/off for a project's board — so it only starts picking up TODO
+        tickets once the board has been prioritized."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            raw[name]["enabled"] = enabled
+            self._save_raw(raw)
+
+
+def _token_envs(project) -> set[str]:
+    """Every variable NAME a project's registry entry says holds one of its credentials."""
+    names: set[str] = set()
+    for axis in ("tracker", "forge", "board", "ci", "factory_board"):
+        ref = getattr(project, axis, None)
+        opts = getattr(ref, "options", None) or getattr(getattr(ref, "tracker", None), "options",
+                                                        None) or {}
+        if isinstance(opts, dict) and opts.get("token_env"):
+            names.add(str(opts["token_env"]))
+    for field in ("bot_token_env", "app_token_env"):
+        opts = getattr(project, "channel_options", None) or {}
+        if isinstance(opts, dict) and opts.get(field):
+            names.add(str(opts[field]))
+    return names
+
+
+def _without_foreign_tokens(project, projects):
+    """`project` with every name that is ANY project's credential removed from its preview policy.
+
+    Only the registry as a whole knows every `token_env`, so this refusal lives here and not in
+    `PreviewPolicy`: a preview must never be handed a forge or tracker credential, its own project's
+    or another's, however the policy was written."""
+    policy = getattr(project, "preview", None)
+    if policy is None:
+        return project
+    tokens = set().union(*(_token_envs(p) for p in projects))
+    if not tokens:
+        return project
+    changed = False
+    tables = {}
+    for field in ("env", "build_args"):
+        table = {}
+        for svc, names in getattr(policy, field).items():
+            kept = {c: w for c, w in names.items() if c not in tokens and w not in tokens}
+            if kept != names:
+                changed = True
+                log.warning("BEEVERFORGE_PREVIEW_ENV_REFUSED project %r: %s for %r name a "
+                            "credential of this registry's — dropped", project.name,
+                            sorted(set(names) - set(kept)), svc)
+            table[svc] = kept
+        tables[field] = table
+    if not changed:
+        return project
+    return project.model_copy(update={"preview": policy.model_copy(update=tables)})
+
+
+def seed_registry(*, seed: Path | str | None = None, live: Path | str | None = None) -> bool:
+    """Populate the live registry from the image's seed, once. Returns whether it did.
+
+    Called at worker start. Two properties, and both halves are silent when wrong:
+
+        it seeds an EMPTY live registry     a freshly mounted volume is an empty file, not a
+                                            decision; treating "the file exists" as "somebody
+                                            configured this" leaves that deployment project-less
+        it NEVER overwrites real projects   otherwise every deploy reverts every project added at
+                                            runtime, and the operator finds out when a board stops
+                                            being polled
+
+    Never raises. A worker that will not boot because a seed file is malformed has turned a
+    configuration mistake into an outage; it starts project-less and says so.
+    """
+    seed_path = Path(seed or os.environ.get("BEEVERFORGE_REGISTRY_SEED") or SEED_REGISTRY_PATH)
+    live_path = Path(live or os.environ.get("BEEVERFORGE_REGISTRY") or LIVE_REGISTRY_PATH)
+    try:
+        if not seed_path.exists():
+            return False
+        existing = ProjectRegistry(live_path)._load_raw()
+        if existing:
+            return False
+        projects = (yaml_io.load(seed_path.read_text()) or {}).get("projects") or {}
+        if not projects:
+            return False
+        ProjectRegistry(live_path)._save_raw(projects)
+        log.info("seeded %s from %s with %d project(s): %s", live_path, seed_path,
+                 len(projects), ", ".join(sorted(projects)))
+        return True
+    except Exception as exc:  # noqa: BLE001 — a bad seed must not stop the worker booting
+        log.warning("could not seed the registry from %s (%s) — starting with whatever %s holds",
+                    seed_path, exc, live_path)
+        return False

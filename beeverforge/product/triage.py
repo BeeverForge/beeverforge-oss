@@ -1,0 +1,338 @@
+"""Organising the house: what the board says, and where it is lying.
+
+The first thing a person taking over a product does is not read code — it is open the board and ask
+what is actually happening. What is in flight that should not be. What has been waiting on someone
+for a month. What looks finished but was never closed. It is cheap (tracker reads, no code, no
+agent), fast, and it produces something useful in the first hour, which matters more on first
+contact than anything else this role can do.
+
+IT IS NOT A ONE-OFF. A board rots continuously. The difference between the first pass and every
+later one is not the work — it is whether there is a previous pass to compare against. Once a pass
+records what it saw, the next one is a DIFF: what is new, what is still stuck, what got worse. That
+is what makes it affordable to repeat, and it is the same shape as the knowledge bundle's
+regeneration.
+
+THE FIRST PASS WRITES NOTHING. Not to the board, not to the tickets. On first contact this role has
+the least context and the most to misread, and closing a ticket destroys information that took
+someone effort to write. Authority grows with grounding: once the corpus is confirmed, routine
+hygiene becomes its own. The first pass earns its keep by REPORTING.
+
+AND IT READS BEFORE IT JUDGES — the lesson is expensive and recent. On 2026-07-26 two tickets sat in
+"In progress" with no job running, which looks exactly like a board lying about its own state. They
+were a human-owned spike whose body says "NOT for the automated coding pipeline. Stays OUT of the
+TO-DO column", and an epic whose children were being executed. Both were correct. The reading was
+wrong, and it was wrong because it judged a column without opening the ticket. Every check here that
+could produce that mistake is required to look at labels and body first.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, field_validator
+
+from beeverforge.adapters.board.columns import WAITING_ON_A_PERSON_KEYS, key_for
+
+#: A ticket whose body or labels say a human owns it. The pipeline is not supposed to touch these,
+#: so their sitting in an active column is intended, not rot.
+HUMAN_OWNED_LABELS = frozenset({"spike", "research", "human", "manual", "wontfix", "on-hold"})
+HUMAN_OWNED_PHRASES = (
+    "not for the automated",
+    "maintainer/human-owned",
+    "human-owned",
+    "stays out of the to-do",
+    "do not promote",
+)
+
+#: An epic is a container: its children are the work, so the epic legitimately stays open while they
+#: run. Judging it as a stalled ticket is the same mistake in a different costume.
+CONTAINER_LABELS = frozenset({"epic", "milestone", "theme"})
+
+
+class Ticket(BaseModel):
+    """What triage needs about one ticket. Deliberately not the pipeline's `Ticket`: this reads the
+    BOARD, including tickets the factory has never touched and never will."""
+
+    number: str
+    title: str = ""
+    body: str = ""
+    state: str = "open"          # open | closed
+    #: WHY it was closed, verbatim from the tracker: "completed" | "not_planned" | "" (open, or a
+    #: tracker that does not say). CLOSED IS NOT DELIVERED — that conflation made the sweep announce
+    #: "o que foi pedido no requisito 7 está pronto" for work closed as a duplicate or as not
+    #: planned, which is a delivery the client never received. Eleven cards were closed as
+    #: not_planned on 2026-07-29 in one sitting, so this is not a hypothetical.
+    state_reason: str = ""
+    column: str = ""             # the board column, verbatim
+    labels: list[str] = Field(default_factory=list)
+    assignees: list[str] = Field(default_factory=list)
+    updated_days_ago: int | None = None
+    #: the raw `updatedAt`, kept so an incremental board read can ask for "everything since"
+    updated_at: str = ""
+    has_open_pr: bool = False
+    parent: str | None = None
+    children: list[str] = Field(default_factory=list)
+
+    #: A ticket ref is the PROVIDER'S OWN STRING (C-05) — `412` on GitHub/ADO/GitLab, `CONT-412`
+    #: on Jira. `mode="before"` so an int still constructs: every producer of this model reads a
+    #: tracker that may hand back either, and hundreds of call sites (and tests) pass `88`. The
+    #: value is normalised once, here, so `#88`, `88` and `"88"` are one ticket rather than three.
+    @field_validator("number", "parent", mode="before")
+    @classmethod
+    def _ref_is_a_string(cls, v):
+        from beeverforge.contracts.refs import canonical_ref
+
+        return None if v is None else canonical_ref(v)
+
+    @field_validator("children", mode="before")
+    @classmethod
+    def _child_refs_are_strings(cls, v):
+        from beeverforge.contracts.refs import canonical_ref
+
+        return [canonical_ref(c) for c in v] if isinstance(v, list) else v
+
+    @property
+    def human_owned(self) -> bool:
+        """Whether a person has claimed this ticket out of the pipeline's reach. Checked from
+        LABELS AND BODY, never from the column alone — see this module's docstring."""
+        if {label.lower() for label in self.labels} & HUMAN_OWNED_LABELS:
+            return True
+        text = f"{self.title}\n{self.body}".lower()
+        return any(phrase in text for phrase in HUMAN_OWNED_PHRASES)
+
+    @property
+    def is_container(self) -> bool:
+        return bool({label.lower() for label in self.labels} & CONTAINER_LABELS) or bool(
+            self.children)
+
+    @property
+    def delivered(self) -> bool:
+        """Whether this ticket represents work the client actually GOT.
+
+        CLOSED IS NOT DELIVERED, and this repository has already paid for the difference: eleven
+        cards were closed as `not_planned` in one sitting on 2026-07-29, and counting them as
+        delivered made the sweep announce "o que foi pedido no requisito 7 está pronto" about work
+        nobody ever did.
+
+        THE RULE LIVED IN ONE PLACE AND WAS ABOUT TO BE MISSED IN THE OTHER. It was written inside
+        `activities._closed_issue_numbers`, on the SWEEP's path, reading `module._board_tickets`.
+        The conversational surface never had it — that path receives only `{number: column}` and
+        `{number: title}` — so any answer about delivery given in the channel was ungoverned. That
+        is this codebase's second signature defect ("the lesson learned in one file and left
+        there"), and putting the predicate where `state_reason` already lives is what stops the
+        two surfaces from disagreeing about what "done" means.
+
+        `not_planned` is excluded BY NAME rather than `completed` being required, deliberately: a
+        tracker that omits the reason must not silently stop announcing real deliveries — that
+        would trade a false delivery for a lost one.
+        """
+        return self.state != "open" and self.state_reason != "not_planned"
+
+
+def delivered_numbers(tickets: list[Ticket]) -> set[str]:
+    """The cards whose work the client actually GOT — asked of the BOARD, because one card cannot
+    answer it alone once it has been split.
+
+    A CARD THAT WAS SPLIT SHIPS NOTHING ITSELF: its work lives in the cards split from it, and a
+    requirement's delivery loop holds the card the requirement BECAME, which is the parent. Until
+    2026-09-19 the splitter closed that parent with the port's default word, `delivered`, and
+    nothing here looked past it — measured: the sweep told a client "what was asked for in
+    requirement 7 is ready" the moment card #1 was split into #2 and #3, with both still open in
+    Backlog. The same sentence `Ticket.delivered` exists to prevent, by the one door it left open.
+
+    SO A SPLIT CARD IS DELIVERED EXACTLY WHEN IT IS CLOSED AND EVERY CARD SPLIT FROM IT IS
+    DELIVERED — whatever word it was closed with. The word is ignored on purpose, in both
+    directions: parents closed as delivered before this rule are on every board that ever split a
+    card and must stop counting early, and a parent closed as NOT delivered (what the splitter
+    records now) must still count once its children ship, or the false "it is ready" is traded for
+    never saying it at all. CLOSED, because a parent still open is a split that did not finish
+    (`BEEVERFORGE_SPLIT_RESUMED`), and its first children shipping says nothing about the ones
+    that were never created. ALL, not some — `followup.delivered` says why.
+
+    ONE LEVEL, because pre-flight never splits a card it split off (`SPLIT_CHILD_MARK`)."""
+    from beeverforge.contracts.refs import split_parent_of
+
+    split: dict[str, list[Ticket]] = {}
+    for t in tickets:
+        parent = split_parent_of(t.title)
+        if parent:
+            split.setdefault(parent, []).append(t)
+    got = {t.number for t in tickets if t.delivered and t.number not in split}
+    by_number = {t.number: t for t in tickets}
+    for parent, parts in split.items():
+        card = by_number.get(parent)
+        if card is not None and card.state != "open" and all(p.delivered for p in parts):
+            got.add(parent)
+    return got
+
+
+class Observation(BaseModel):
+    """One thing worth a human's attention, and what triage suggests — never what it did."""
+
+    ticket: str
+    kind: str
+    detail: str
+    #: what a person might do about it. A SUGGESTION: the first pass does not act.
+    suggestion: str = ""
+
+
+
+    @field_validator("ticket", mode="before")
+    @classmethod
+    def _ref_is_a_string(cls, v):
+        """A ticket ref is the provider's own string (C-05); an int still constructs, because
+        every producer reads a tracker that may hand back either and hundreds of call sites pass
+        a bare number."""
+        from beeverforge.contracts.refs import canonical_ref
+
+        return None if v is None else canonical_ref(v)
+
+class TriageReport(BaseModel):
+    observations: list[Observation] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    #: tickets deliberately left alone, and why — so "you ignored these" is answerable
+    skipped: dict[str, str] = Field(default_factory=dict)
+
+    def of_kind(self, kind: str) -> list[Observation]:
+        return [o for o in self.observations if o.kind == kind]
+
+    def keys(self) -> list[str]:
+        """A stable fingerprint of what this pass found, small enough to persist between passes.
+        `ticket:kind`, because the same ticket can rot in two ways at once."""
+        return sorted(f"{o.ticket}:{o.kind}" for o in self.observations)
+
+    def since(self, previous_keys: list[str] | None) -> TriageReport:
+        """What is NEW against a persisted fingerprint. Same rule as `diff`, without needing the
+        previous report itself — a scheduled pass only ever has the keys."""
+        seen = set(previous_keys or [])
+        fresh = [o for o in self.observations if f"{o.ticket}:{o.kind}" not in seen]
+        return TriageReport(observations=fresh, counts=self.counts, skipped=self.skipped)
+
+    def diff(self, previous: TriageReport | None) -> TriageReport:
+        """What is NEW since a previous pass. The reason this is affordable to repeat: a recurring
+        report that lists the same forty things every week is one nobody opens twice."""
+        if previous is None:
+            return self
+        seen = {(o.ticket, o.kind) for o in previous.observations}
+        fresh = [o for o in self.observations if (o.ticket, o.kind) not in seen]
+        return TriageReport(observations=fresh, counts=self.counts, skipped=self.skipped)
+
+
+#: A ticket untouched for longer than this in a column that means "someone is on it" is stuck. Not
+#: a hard truth — a deliberately long default, because crying wolf is how a report loses its reader.
+STALE_DAYS = 14
+
+
+def stage_of(column: str, stages: dict[str, str] | None) -> str:
+    """The neutral key a ticket's `column` is — read BY KEY, never by the platform's name (#502).
+
+    `stages` IS THE BOARD'S OWN ANSWER, `{column as the board calls it: key}`, asked once per board
+    read (`product/board.stages_of`). This module compared `t.column` with `"TO-DO"`, `"Backlog"`
+    and `"In progress"`, and only a board this platform created says those: on a Jira project whose
+    `status_map` calls the queue `A Fazer`, every queued and every filed card matched nothing, so
+    the floor read idle with work waiting and `propose_queue` proposed from an empty backlog. A
+    column the map does not name is `""` — a column nobody maps, which is what `stage_key` answers
+    for one and what every rule here already skips.
+
+    `None` IS A CALLER WITH NO BOARD TO ASK, read by the platform's own seven names — the degrade
+    `stage_key` takes for a row that says nothing, and exactly what every caller read before."""
+    if stages is None:
+        return key_for(column)
+    return stages.get(column, "")
+
+
+def triage(tickets: list[Ticket], *,
+           active_keys: tuple[str, ...] = ("in_progress",),
+           waiting_keys: tuple[str, ...] = WAITING_ON_A_PERSON_KEYS,
+           done_key: str = "done",
+           stale_days: int = STALE_DAYS,
+           stages: dict[str, str] | None = None) -> TriageReport:
+    """Read the board and report where it disagrees with reality.
+
+    Pure: it takes tickets and returns findings, so every rule here is testable without a network —
+    which matters, because the failure mode is a confident wrong reading, not a crash.
+
+    THE COLUMNS ARE KEYS (#502), and `stages` is how the board said which key each of its columns
+    is — see `stage_of`. The three arguments were the platform's names, so on a renamed board a
+    card in flight, one waiting on a person and one in Done were each read as none of them.
+
+    WAITING ON A PERSON IS TWO KEYS (#753): a park (`needs_action`) and a pull request waiting for
+    its review (`needs_review`). With only the park read, a pull request left unreviewed for 40
+    days in its own column produced no finding at all."""
+    observations: list[Observation] = []
+    skipped: dict[str, str] = {}
+    by_number = {t.number: t for t in tickets}
+
+    for t in tickets:
+        stage = stage_of(t.column, stages)
+        # ---- the checks that must read the ticket before judging the column -------------------
+        if stage in active_keys and t.state == "open":
+            if t.human_owned:
+                skipped[t.number] = ("a person owns this deliberately — it says so in the ticket, "
+                                     "so its being in an active column is intended")
+            elif t.is_container:
+                skipped[t.number] = ("this is a container for other tickets; it stays open while "
+                                     "its children run")
+            elif t.updated_days_ago is not None and t.updated_days_ago > stale_days:
+                observations.append(Observation(
+                    ticket=t.number, kind="stalled",
+                    detail=f"in {t.column!r} but untouched for {t.updated_days_ago} days",
+                    suggestion="check whether it is actually being worked on; if not, "
+                               "move it back"))
+
+        # ---- waiting on a person, for too long ------------------------------------------------
+        if stage in waiting_keys and t.state == "open":
+            if t.updated_days_ago is not None and t.updated_days_ago > stale_days:
+                observations.append(Observation(
+                    ticket=t.number, kind="waiting-too-long",
+                    detail=f"waiting on someone for {t.updated_days_ago} days",
+                    suggestion="decide it, or say out loud that it is parked on purpose"))
+
+        # ---- a ticket that cannot be sized will park later ------------------------------------
+        if t.state == "open" and stage != done_key and not has_criteria(t):
+            observations.append(Observation(
+                ticket=t.number, kind="no-criteria",
+                detail="no acceptance criteria, so nobody can say when it is done",
+                suggestion="write what must be true before this is picked up"))
+
+        # ---- finished, but not finished -------------------------------------------------------
+        if stage == done_key and t.state == "open" and not t.has_open_pr:
+            observations.append(Observation(
+                ticket=t.number, kind="done-but-open",
+                detail=f"sits in {t.column!r} but the ticket was never closed",
+                suggestion="close it, or move it back if it is not actually done"))
+
+        if t.state == "closed" and t.column and stage != done_key:
+            observations.append(Observation(
+                ticket=t.number, kind="closed-elsewhere",
+                detail=f"closed, but its card is still in {t.column!r}",
+                suggestion="move the card to Done so the board stops showing work that is over"))
+
+        # ---- a container whose work is finished ------------------------------------------------
+        if t.is_container and t.state == "open" and t.children:
+            kids = [by_number.get(c) for c in t.children]
+            known = [k for k in kids if k is not None]
+            if known and all(k.state == "closed" for k in known):
+                observations.append(Observation(
+                    ticket=t.number, kind="container-complete",
+                    detail=f"every ticket under it is closed ({len(known)} of "
+                           f"{len(t.children)} found)",
+                    suggestion="close it, or say what is still missing"))
+
+    counts: dict[str, int] = {}
+    for o in observations:
+        counts[o.kind] = counts.get(o.kind, 0) + 1
+    return TriageReport(observations=observations, counts=counts, skipped=skipped)
+
+
+def has_criteria(t: Ticket) -> bool:
+    """Whether the ticket states anything testable — asked of the PARSER, never of the text.
+
+    This was a list of substrings (`- [ ]`, `acceptance criteria`, `given `, `dado que`), once
+    copied into `queue.py` and already drifting there (#24 item 7). One list fixed the drift
+    between those two and left the third reader out: the spec gate parses the body. So a card with
+    a `Scenario:` under its criteria heading was ready to the queue and refused at pickup, and a
+    card whose criteria sat under an unrecognised heading was called fine here and refused there
+    too — the platform disagreeing with itself about one body of text (#150). Now all of them read
+    `tracker/parse.criteria`, which is what the gate reads."""
+    from beeverforge.adapters.tracker.parse import criteria
+
+    return bool(criteria(t.body or ""))

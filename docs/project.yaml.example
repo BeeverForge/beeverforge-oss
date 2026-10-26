@@ -1,0 +1,323 @@
+# .beeverforge/project.yaml — a project's plug into the platform. Copy this into the TARGET repo at
+# `.beeverforge/project.yaml`, delete what you don't need, and adapt the commands to your repo.
+# The framework knows NOTHING about the project except what's declared here.
+# `beeverforge project init` writes a minimal starter; this is the full annotated reference.
+
+version: 1
+base_branch: main                # the branch PRs target and the sandbox branches off
+
+# ── Autonomy posture ─────────────────────────────────────────────────────────
+# human  = the bot opens the PR, posts the review, requests reviewers, and STOPS (a human merges)
+# auto   = the bot merges itself when: all gates green + (advisory review, or a non-rejected
+#          blocking review) + no high-risk component touched + no hard gate-suppression added.
+merge_policy: human
+
+# ── ADR-0014 knobs (safe defaults shown — omit to accept them) ───────────────
+# planner_stage: false   # false = SINGLE agent (investigate+plan+implement in one pass). Set
+#                        # true only for a weaker model that needs a separate read-only planner.
+# review_mode: advisory  # advisory = the review runs and COMMENTS on the PR but never blocks
+#                        # or triggers a repair loop. "blocking" = old behaviour. "off" = skip.
+
+# ── Knowledge Layer (ADR-0017 · docs/knowledge-layer.md) ─────────────────────
+# knowledge_map: true    # DEFAULT true (ADR-0035, on since 2026-08-02) — declare `false` to
+#                        # switch it off. The platform regenerates a module map after every merge that
+#                        # changes sources and publishes it into your project's CONTEXT repository, at
+#                        # `.okf/repos/<owner>--<name>/` (never into THIS repo, and never `main` —
+#                        # requires `product.docs_repo`; see `beeverforge onboard`), and injects it so
+#                        # the agent locates code faster and then verifies against the real files
+#                        # (the code is ground truth). It is only injected when checksums prove it
+#                        # describes that job's exact checkout — stale/missing injects NOTHING, so
+#                        # turning this on can't make a run worse than leaving it off. Inspect by
+#                        # hand: `beeverforge knowledge build|check <project>`. Leave false unless you are
+#                        # measuring: this flag exists to be A/B'd on the cost dashboard.
+# okf_concept_budget: 5  # DEFAULT 5 — how many CONCEPTS one backfill pass may author. The module
+#                        # map above is deterministic and free; a concept costs a model call, so its
+#                        # price is bounded by THIS NUMBER rather than by how big your repository is:
+#                        # ten modules and ten thousand cost the same 5. `0` switches concept
+#                        # authoring off and leaves the map untouched; the ceiling is 50, so a typo
+#                        # of two extra zeros is refused rather than billed.
+#                        #
+#                        # WHERE THE BUDGET GOES: the modules with the most change, the widest reach
+#                        # (most depended on) and the least understood purpose — measured from your
+#                        # own git history and import graph, not guessed. Every business rule a
+#                        # concept states cites `path:line` and is CHECKED against your code before
+#                        # it is written; one that does not resolve is dropped and recorded as a gap.
+#                        #
+#                        # WHAT IT CANNOT BUY IS COVERAGE. 5 concepts on a 412-module repository
+#                        # describe 5 modules, and the bundle's own coverage table says exactly that
+#                        # rather than implying it looked at everything. Raise it when you want more.
+#                        #
+#                        # PER REPOSITORY. A product with several `sources:` is backfilled one
+#                        # repository at a time, and each one's own manifest bounds its own
+#                        # concepts: this number is what THIS repository may spend, and a product
+#                        # of four repositories spends up to four such numbers, one each.
+
+# ── Sizing gate (only relevant when planner_stage: true — ADR-0002) ──────────
+# A plan bigger than this goes back to refinement BEFORE the executor runs, keeping tickets
+# INVEST-small. With the single-agent default these are advisory; keep tickets small anyway.
+# okf_gate: advise      # DEFAULT advise — what the knowledge gate DOES with its stance on a change
+#                        # (ADR-0046). For each file a change touches the gate asks whether recorded
+#                        # knowledge covers it: described and current (clear), of a kind the coverage
+#                        # table excuses (exempt), new (new-file), described by bytes that moved
+#                        # (stale), carrying a recorded unknown such as a high credential risk
+#                        # (gap-blocked), or described by NOTHING (no-concept — the least safe file
+#                        # to change, not the freest). The worst file decides the change's stance:
+#                        # green, amber, dark.
+#                        #   advise  — the verdicts and the stance go into the pull request body;
+#                        #             nothing else moves. The default, because every project is
+#                        #             dark before its first backfill.
+#                        #   enforce — an amber change is never merged unattended; for a dark one
+#                        #             the factory first AUTHORS the missing concepts itself, under
+#                        #             okf_concept_budget, publishes them and judges again — and only
+#                        #             if it is still dark opens the pull request (the work is not
+#                        #             lost) and parks the job with the question: which files, and
+#                        #             both ways out.
+#                        #   off     — the gate does not run.
+#                        # From a shell: `beeverforge knowledge gate <bundle> <repo> --changed`.
+# max_plan_files: 10
+# max_plan_steps: 15
+# max_cost_usd: 5.00     # per-token (API) billing only; leave unset on a Claude subscription
+
+# ── Setup: how to prepare the ephemeral sandbox before the agent runs ────────
+setup:
+  - "pip install -e '.[dev]'"
+  # - "npm ci"
+  # - "cd web && npm ci && npm run build"
+
+# ── Validation: the REAL quality floor ───────────────────────────────────────
+# The platform runs these itself and reads the exit codes — it does NOT trust the agent to have
+# run them (this is what makes advisory review safe). Map them to your repo's own commands;
+# `test` is the minimum. Everything green = the change is sound.
+validate:
+  test: "pytest -q"
+  lint: "ruff check ."
+  # type: "mypy ."
+  # security: "bandit -r . -q"
+  # migrations: "alembic heads | grep -c '(head)' | grep -qx 1"
+  # web: "cd web && npm test -- --run"
+
+# ── Preview: the product, assembled for a change, before its PR merges (ADR-0050) ──
+# Default: none — no preview of this project, and nothing changes. Declared, a card whose pull
+# request waits for a person can start a preview: the WHOLE product from your own compose file,
+# the services the change touched built from the change (with your own Dockerfiles), the rest as
+# they are on the base branch, data always fresh and seeded — never a copy of production. The
+# compose file is read from the BASE branch, never from the change. What the preview may receive
+# (secret names), whether one is required before a merge, how long it lives and its egress are the
+# OPERATOR's, in the registry (`beeverforge project set-preview`), never this file. No compose file
+# that runs the product yet? `beeverforge preview propose <project>` drafts one from what the
+# repository says, with this block, on a pull request of its own (docs/ONBOARDING.md §11c).
+# preview:
+#   compose: [docker-compose.yml]      # one file or several, merged the compose way
+#   expose: {web: 3000, api: 8000}     # service -> port inside its container; each gets a host
+#   data:                              # run once the product is up, into fresh volumes
+#     api: "python manage.py migrate && python manage.py loaddata demo"
+#   exclude: [mailhog]                 # services a preview does not run
+#   entry: web                         # optional: the exposed service a person lands on
+
+# ── Test census: the one command whose STDOUT is read ────────────────────────
+# Enumerate this project's tests, ONE IDENTIFIER PER LINE. The platform runs it on the clean
+# tree and again after the change, and a drop in the count is human-gated: a suite that exits
+# 0 because forty tests stopped being COLLECTED exits 0 just as convincingly as one that
+# exits 0 because forty tests passed, and only the exit code was ever read.
+#
+# A rename does not gate — the count is what holds the merge, and the identifiers that
+# vanished are carried as the reason a person reads.
+#
+# Yours to declare, for the same reason `test:` is: there is no command that enumerates a
+# project's tests in every language and layout. Leave it out and no census runs.
+#
+# ONE IDENTIFIER PER LINE, AND NOTHING ELSE — this is a contract, not a style note, and getting
+# it wrong is SILENT. The platform cannot tell a test id from a header, a warning or a timing
+# line in a language it has never heard of, so anything else your command prints is counted as
+# a test. If that extra output moves between the two runs, the census moves with it — and it
+# can move UP while your suite shrank, which opens the gate this exists to close. Measured on
+# our own suite: plain `pytest --collect-only -q` counted 8529 where pytest reported 8524,
+# because the warnings block `-q` does not suppress was counted as five tests.
+#
+# So the quiet form of the command, not the obvious one. The census logs the number it read on
+# every run — compare it against what your runner reports, once, on the day you adopt this.
+# test_inventory: "pytest --collect-only -q -p no:warnings --no-header"
+#   vitest list --reporter=json | jq -r '.tests[].name'
+#   dotnet test -t --nologo | tail -n +2
+#   go test -list . ./... | grep -E '^(Test|Example|Benchmark|Fuzz)'   # drops the `ok  pkg 0.0s`
+
+# ── Profile: what this project IS ────────────────────────────────────────────
+# A CLASS, not an exception. A prototype does not want to *waive* TDD with a reason, an
+# approver and an expiry — that is what the project is. A profile declares it once and a
+# coherent set follows (ADR-0044).
+#
+# The set is OPEN: the core ships `prototype` and `regulated` as worked examples, and you
+# write your own in `.beeverforge/profiles/<name>.yaml`, where your layer wins. Profiles
+# compose with `extends:`.
+#
+# A profile may drop or replace GUIDELINES (prose), may only ADD gates, and may only
+# STRENGTHEN the human gate. Removing a floor gate is an exception, and an exception is a
+# waiver — with a name and an expiry on it.
+#
+# Naming a profile that does not resolve HOLDS the project rather than running it as the
+# generic case. Leaving this out is ordinary; most projects need no class.
+# profile: regulated
+
+# ── Protected paths: the verifier's own inputs ───────────────────────────────
+# Paths that cannot change WITHOUT A PERSON — not forbidden, human-gated. A ticket that
+# legitimately retunes a gate is a ticket somebody signs off, and nothing is lost.
+#
+# The deployment floor already protects `.beeverforge/**` — this file, and your profiles —
+# because the thing being measured cannot also move the ruler. What you write here is ADDED to
+# that floor; there is no way to subtract from it.
+#
+# CI/workflow files are not on the floor and do not need to be: the bot is denied the `workflows`
+# permission outright, so an agent's change to them never reaches a commit and the pull request
+# body lists it for you to apply by hand.
+# protected_paths:
+#   - "infra/**"
+
+# ── Components: only if the repo is polyglot / has risk zones ────────────────
+# Maps a diff area to a stack + risk. A HIGH-risk component always stays human-gated at merge,
+# even under merge_policy: auto.
+components: {}
+  # backend:
+  #   path: app/
+  #   stack: python
+  #   risk: normal
+  # infra:
+  #   path: terraform/
+  #   stack: terraform
+  #   risk: high          # infra changes never auto-merge
+
+# ── Post-merge deploy WATCH (optional — ADR-0005) ────────────────────────────
+# After the bot merges to main, if your repo deploys itself via its own CI workflow, the
+# platform OBSERVES that run and reports the outcome (it never blocks — the merge already freed
+# the floor). Omit if you don't deploy from CI.
+# post_merge_deploy:
+#   workflow: deploy.yml
+#   env: dev
+#   timeout_minutes: 30
+#   url: https://stg.example.com   # where a PERSON looks once it is green (#122)
+
+# ── Promotion chain (optional — D-12, #109) ──────────────────────────────────
+# The environments the platform OBSERVES after a merge, and the order it walks them. Your
+# pipeline deploys; the platform reads deploy status / probes health and reports. The LAST entry
+# of `promote:` is production: a human approves it from the panel, always, whatever you call it —
+# so your manifest can agree with your change-management document (dev/qa/prod,
+# dev/homologacao/producao...) instead of renaming a stage to satisfy ours.
+# Omit `promote:` and the two fixed names apply: `staging` observed if declared, `prod` gated if
+# declared — and environments that include NEITHER name are refused when the manifest loads:
+# that chain walks nothing, and the delivery would be announced at the merge (#501). Name yours
+# in `promote:`, or call them staging/prod. An environment declared but absent from the chain is
+# NAMED as unwatched in the log.
+# `deploy_ref` is the DEPLOYMENT ENVIRONMENT's own name at your provider — the GitHub environment
+# a Deployment is recorded against, the Azure Pipelines environment a stage deploys to. It is NOT
+# a workflow file (this example said `deploy-qa.yml` for months, and that read is a 404 dressed
+# as "nothing has deployed there"). `health_url` is a probe the platform GETs. Every stage of the
+# chain, production included, declares one or both: a stage with neither would count as reached
+# with nothing seen, so it is refused when the manifest loads (#501). A deploy still pending is
+# waited for (up to 20 min for the whole walk) and is never a reached stage.
+# A stage counts as reached ONLY on what was observed (#518): a green deploy of this change, or a
+# `health_url` that answered healthy. A `deploy_ref` nothing recorded this change against goes to
+# the `health_url`; with none, the stage is held as not reached. On a project with no CI
+# (`ci: none`, which a `forge: local` one gets by default) nothing reads a deploy, so every stage
+# of the chain needs a `health_url` there — the manifest is refused when it loads until it has one.
+# environments:
+#   dev:      {health_url: "https://dev.example.com/health", url: "https://dev.example.com"}
+#   qa:       {deploy_ref: qa, health_url: "https://qa.example.com/health", url: "https://qa.example.com"}
+#   producao: {deploy_ref: producao, health_url: "https://example.com/health"}
+# promote: [dev, qa, producao]
+# prod_approvers: [ana, rui]     # who may approve the release (panel asks their password too —
+#                                # `beeverforge approver add <login>` sets it; D-12: never automatic)
+#
+# MEASURED LIMITATION — one base branch. `base_branch` is where PRs land AND where the release
+# tag is cut. A two-branch flow (integration `develop` + release `main`) cannot be expressed:
+# with base=develop the release tag lands on the integration tip; with base=main the factory's
+# PRs bypass integration. If your shop runs two branches, point the factory at the branch your
+# releases actually cut from and let your own CI carry integration — or ask before onboarding.
+
+# ── On-demand e2e (optional — ADR-0008) ──────────────────────────────────────
+# A ticket labelled `e2e` makes the platform DISPATCH this workflow, watch it, and report
+# pass/fail on the ticket — instead of running heavy e2e on every PR. Omit if not used.
+# e2e_workflow: e2e.yml
+
+# ── Docs fed to the agent as context ─────────────────────────────────────────
+docs:
+  constraints: docs/adr/**            # the "constitution": inlined newest first under the
+                                      #   prompt budget; every record not inlined is named
+  # architecture: docs/architecture/**  # pulled on demand via a derived index
+  # guidelines: [.beeverforge/guidelines/execution.md]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# THE REST OF THE SCHEMA — every remaining field, with its default
+#
+# This file used to call itself "the full annotated reference" while covering 18 of the 32 fields
+# the code accepts (measured 2026-08-15, after a pilot asked what else his five-line manifest
+# could have said). A reference nobody can trust to be complete is a reference somebody has to
+# read the source instead of — so the rest is here, and a guard now derives the list from
+# `beeverforge/contracts/manifest.py` so this file cannot fall behind it again.
+#
+# NOTHING BELOW IS REQUIRED. Every field has a default that works; declare one only to change it.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Where the context repository lives (optional) ────────────────────────────
+# The separate repository holding what the product IS (§4's backfill). Absent → the factory reads
+# only this repository.
+# docs_repo: acme/acme-context
+
+# ── Budgets: what one ticket may cost before a human is asked ────────────────
+# Each is OFF (None) unless declared. They are not quality gates — they are the line past which
+# the factory stops and asks, instead of spending more.
+# max_cost_usd: 8.0             # agent spend for one ticket
+# max_diff_lines: 1200          # a diff bigger than this is a ticket that should have been split
+# max_touched_components: 3     # a change reaching more areas than this is a refactor, not a task
+# max_plan_files: 40            # the planner's own budget (only with planner_stage: true)
+# max_plan_steps: 25
+# effort_budget_turns: 400      # default 400 — the agent's turn budget across the whole job
+
+# ── How many times the factory retries itself before asking a human ──────────
+# repair_max_attempts: 2              # default 2 — failed GATES (your tests, your linter)
+# review_repair_max_attempts: 1       # default 1 — findings from the independent review
+# suppression_repair_max_attempts: 1  # default 1 — a gate the agent suppressed instead of fixing
+# recovery_max_attempts: 2            # default 2 — the job crashed rather than failed
+
+# ── The pipeline's shape ─────────────────────────────────────────────────────
+# planner_stage: false          # default false — ADR-0014: one agent plans AND writes. `true`
+#                               # adds a separate read-only planner pass (slower, costs more).
+# split_to_todo: true           # default true — a ticket too large is SPLIT into children in
+#                               # TO-DO rather than attempted and abandoned half-done.
+# preflight:                    # the cheap read-only pass that sizes a ticket before spending
+#   enabled: true               #   on it. Defaults are on; declare only to tune.
+#   code_check: true            #   default true — give the sizer a read-only checkout to explore
+#   gather: false               #   default false — ADR-0048: after sizing, and only under
+#                               #   `okf_gate: enforce`, author what the bundle does not know about
+#                               #   the files the change will touch, ask the product role, and ask
+#                               #   the requester on the card for what neither could establish —
+#                               #   before the plan spends a budget. The card waits in Needs Action
+#                               #   until the answer is on it.
+
+# ── The independent review ───────────────────────────────────────────────────
+# review_mode: advisory         # default advisory — it informs, it never blocks the merge.
+#                               # `blocking` makes a rejected review fail the job.
+# reviewers: []                 # extra GitHub logins to request on the PR (people, not agents)
+
+# ── Releases ─────────────────────────────────────────────────────────────────
+# prod_tag_prefix: v            # default "v" — the tag cut on a production release (v1.4.0)
+# e2e_label: e2e                # default "e2e" — the ticket label that dispatches `e2e_workflow`
+
+# ── Accepted but INERT — declared here so nobody wastes an afternoon on it ────
+# permissions:                  # reads as a security control and enforces NOTHING today: no code
+#                               # consumes it. The loader warns when it is present. The real
+#                               # boundaries are the box (what the agent can reach) and
+#                               # `merge_policy` (what reaches your main branch).
+# validation:                   # an accepted SYNONYM for `validate:` — same field, two spellings,
+#                               # because both names have shipped. Prefer `validate:`.
+
+# ── NOT here, and the reason is a boundary rather than a filing preference ───
+# `harness:` (which CLI writes the code), the model per role, and `box.image` (the container the
+# work runs in) are DEPLOYMENT settings and live in the registry, reachable only by the operator:
+#
+#   beeverforge project add <name> --harness claude_code
+#   beeverforge project set-model <name> <model> [--role executor|reviewer|techlead|product]
+#
+# This file lives in the repository the coding agent EDITS. An agent that could set `box.image`
+# would be choosing its own root filesystem; one that could set the model or the harness would be
+# choosing what runs it and who pays. Everything in this file describes the CODE — how to build
+# it, how to prove it, what it must never break — which is exactly what the agent may propose and
+# a human reviews in a pull request.

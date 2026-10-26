@@ -1,0 +1,468 @@
+"""Nothing in a process that never restarts may grow without a stated bound.
+
+TWO REAL LEAKS MOTIVATED THIS, both found by reading rather than by any test:
+
+  * `ProductModule._workspace` called `tempfile.mkdtemp()` while the module was constructed fresh
+    for every Slack message — one directory per message, removed by nothing. 33 accumulated in one
+    afternoon of local testing.
+  * `_do_coordinate` did the same per PARKED DECISION, in the Temporal worker, which never restarts.
+
+And two caps that existed in one file and not its sibling: `product_channel._PENDING` was capped at
+200 with a comment explaining exactly why; `bot._PENDING`, written for the same purpose in the same
+process, had no cap. The panel memoised one entry per terminal job and removed none.
+
+None of that is a bug a behaviour test can catch — the code is correct on every single call. It
+fails only in aggregate, on a timescale no test runs for. So the guard is STRUCTURAL: every site
+that allocates or memoises must have decided, in writing, what bounds it. A new site fails this
+test until somebody decides. That is the point — the decision is cheap, and discovering it from a
+full disk is not.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import re
+from pathlib import Path
+
+import add_ons
+import pytest
+
+from tests.the_tree_read_once import parsed
+
+SDLC = Path(__file__).resolve().parent.parent / "beeverforge"
+
+
+def _modules() -> list[tuple[Path, ast.Module]]:
+    out = []
+    for path in sorted(SDLC.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        out.append((path, parsed(path)))
+    return out
+
+
+def _rel(path: Path) -> str:
+    return str(path.relative_to(SDLC.parent))
+
+
+# ── guard 1: temporary directories ─────────────────────────────────────────────────────────────
+#: Sites where the directory outlives the call ON PURPOSE, with the reason. Everything else must
+#: remove what it made, in the same function, on every exit path.
+_LIVES_FOR_THE_PROCESS = {
+    # The worker's and the panel's copies of the App key are gone (#742): the key is read as
+    # content, through the credential store, and nothing is written to disk to hold it.
+    ("beeverforge/runtime/slack/bot.py", "main"):
+        "holds the materialised GitHub App private key for the bot's whole life",
+    ("beeverforge/testing/local_flow.py", "_tiny_repo"): "a throwaway repo in a throwaway local run",
+}
+
+#: Ownership handed to the caller. The releaser is NAMED, because "it returns the path" is not
+#: evidence — `ProductModule._workspace` returned its path too, and nothing ever released it.
+_RELEASED_BY_CALLER = {
+    ("beeverforge/adapters/sandbox/container.py", "prepare"): "ContainerSandbox.cleanup()",
+    ("beeverforge/techlead/conversation.py", "clone_repo"):
+        "conversation._answer()'s finally, via scratch.discard()",
+    ("beeverforge/techlead/diagnosis.py", "_checkout"):
+        "diagnosis.diagnose()'s finally, via scratch.discard()",
+    ("beeverforge/util/scratch.py", "make"):
+        "scratch.discard(), and the split IS the mechanism rather than a convenience: `make` "
+        "stamps the directory with the prefix that `discard` requires before it will delete "
+        "anything. Both halves are asserted, including that the two techlead call sites use "
+        "`discard` and no bare rmtree, in "
+        "tests/test_a_scratch_directory_is_the_only_thing_we_delete.py — which exists because on "
+        "2026-08-21 the bare version ran `rmtree(\"/tmp\")` three times per suite run, silently on "
+        "macOS and fatally on Linux, where it deleted pytest's own temp root and failed 898 tests.",
+    ("beeverforge/onboarding/propose_manifest.py", "clone_for_proposal"):
+        "catalog._env_apply()'s finally — the clone must outlive the function that makes it "
+        "(the caller writes the manifest into it, then commits and pushes), and every exit "
+        "between the clone and the push is a refusal that would otherwise leak it. Same shape, "
+        "same reason, as conversation.clone_repo and diagnosis._checkout above.",
+    ("beeverforge/product/workspace.py", "compose"):
+        "module._workspace(), since 2026-08-01. Flagged 2026-07-29 as 'no production caller at "
+        "all (only its own test)' — it was the right observation and the wrong conclusion: the "
+        "mechanism was correct and simply unreached, while the conversational path had invented a "
+        "third layout out of symlinks. It is called on every client message now, at a STABLE root "
+        "(idempotent), so what bounds it is one directory per project rather than one per call.",
+}
+
+_RELEASES = {"rmtree", "cleanup", "TemporaryDirectory"}
+
+
+def _enclosing(tree: ast.Module, node: ast.AST) -> str:
+    """Innermost def containing `node`, or '<module>'."""
+    best = "<module>"
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if getattr(fn, "lineno", 0) <= node.lineno <= getattr(fn, "end_lineno", 0):
+            best = fn.name
+    return best
+
+
+def _scope_body(tree: ast.Module, name: str) -> list[ast.AST]:
+    if name == "<module>":
+        return list(tree.body)
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef) and fn.name == name:
+            return list(ast.walk(fn))
+    return []
+
+
+def test_every_temporary_directory_is_released_or_declared():
+    offenders = []
+    for path, tree in _modules():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fname = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if fname != "mkdtemp":
+                continue
+            scope = _enclosing(tree, node)
+            if (_rel(path), scope) in _LIVES_FOR_THE_PROCESS:
+                continue
+            if (_rel(path), scope) in _RELEASED_BY_CALLER:
+                continue
+            names = {getattr(n, "attr", None) or getattr(n, "id", None)
+                     for n in _scope_body(tree, scope)}
+            if names & _RELEASES:
+                continue
+            offenders.append(f"{_rel(path)}:{node.lineno} in {scope}()")
+
+    assert not offenders, (
+        "these make a temporary directory and never remove it:\n  " + "\n  ".join(offenders)
+        + "\n\nEither remove it in the same function (`finally: shutil.rmtree(tmp, "
+          "ignore_errors=True)`) or, if it must outlive the call, add it to "
+          "_LIVES_FOR_THE_PROCESS in this file WITH the reason.")
+
+
+def test_the_declared_exemptions_still_exist():
+    """An exemption for a site that moved is a hole nobody can see. Sabotage-proofing the guard."""
+    seen = set()
+    for path, tree in _modules():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (
+                    getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == "mkdtemp":
+                seen.add((_rel(path), _enclosing(tree, node)))
+    stale = (set(_LIVES_FOR_THE_PROCESS) | set(_RELEASED_BY_CALLER)) - seen
+    # an exemption for a site in a module that LEAVES the public tree (docs/STATUS.md) is not
+    # stale where that module is absent — it is the add-on's, and this tree does not hold it
+    stale = {site for site in stale
+             if not (add_ons.package_for(site[0]) and not (SDLC.parent / site[0]).exists())}
+    assert not stale, f"exemptions for sites that no longer allocate anything: {sorted(stale)}"
+
+
+# ── guard 2: module-level mutable caches ───────────────────────────────────────────────────────
+#: Every module-level dict that gets written by key, and what bounds it. A cache with no bound in
+#: a process that never restarts is a slow leak; a cache bounded "by nature" must say by what.
+_CACHES = {
+    # #681 — each readiness check's last verdict, so the log says a change once, not every poll
+    ("beeverforge/observability/health.py", "_LAST"):
+        "one per check in `health.CHECKS` — the engine, the registry and the identity provider; "
+        "bounded by the code, never by traffic",
+    # review of #611 — the unreadable values of BEEVERFORGE_DEFAULT_FRONT_END this process has said,
+    # so a typo is one warning, not one per page request
+    ("beeverforge/api/app.py", "_SAID_NEITHER"):
+        "one per value the environment has held for one setting — bounded by the environment, "
+        "never by traffic",
+    # #412 — the projects this process has said run on a store that cannot keep a card's record,
+    # so the warning is one line per project
+    ("beeverforge/lifecycle/card.py", "_UNRECORDED_SAID"):
+        "one name per registered project — bounded by the registry, never by traffic",
+    # #369 — the roots this process has said cannot hardlink, so the warning is one line per root.
+    ("beeverforge/runtime/repo_cache.py", "_LINKLESS_ROOTS"):
+        "one per cache root this process serves — the deployment's `BEEVERFORGE_REPO_CACHE` and "
+        "the roots tests hand in; bounded by the environment, never by traffic",
+    # #369 — the unreadable values of the sources' two settings this process has said, so the
+    # warning is one line and not one per turn.
+    ("beeverforge/product/sources.py", "_PARALLEL_SAID"):
+        "one per unreadable value of `BEEVERFORGE_SOURCES_PARALLEL` — bounded by the environment, "
+        "never by traffic",
+    ("beeverforge/product/sources.py", "_FRESH_SAID"):
+        "one per unreadable value of `BEEVERFORGE_SOURCES_FRESH_SECONDS` — bounded by the "
+        "environment, never by traffic",
+    # #754 — the unreadable values of BEEVERFORGE_LIST_CONCURRENCY this process has said, so a job
+    # list read on every stream tick warns once and not once per tick.
+    ("beeverforge/runtime/temporal/view.py", "_LIST_CONCURRENCY_SAID"):
+        "one per unreadable value of `BEEVERFORGE_LIST_CONCURRENCY` — bounded by the environment, "
+        "never by traffic",
+    # #373 — one refresh machinery per machine identity the registry declares.
+    ("beeverforge/adapters/azure_devops.py", "_WORKLOAD"):
+        "one per identity client id a registry axis declares (the machine's own under '') — "
+        "bounded by the registry, never by traffic",
+    ("beeverforge/runtime/slack/people.py", "_RESOLVED"): "one per GitHub login in the org",
+    ("beeverforge/product/board.py", "_SNAPSHOT"): "one per project — bounded by the registry",
+    # #266 slice 2 — one lock per project's cached view, so two turns never compose it at once.
+    ("beeverforge/product/module.py", "_VIEW_LOCKS"):
+        "one lock per project's composed view root — bounded by the registry",
+    # #266 slice 3 — the in-process half of each file lock. NOT a BoundedDict on purpose: evicting
+    # the guard of a lock some thread holds would let a second thread take the same file lock.
+    ("beeverforge/util/filelock.py", "_GUARDS"):
+        "one per lock file this process has taken — each product's semaphore and write log, each "
+        "registry project's cases and recall index, each key of a repository cache (#656) — "
+        "bounded by the registry, never by traffic",
+    # GitHub issue #134 — the read side's one client, full stop. The key is
+    # `connection.fingerprint()`: the address, the namespace and a digest of the auth material this
+    # PROCESS is configured with (including the CONTENTS of the TLS files it names), so it is a
+    # deployment's environment and not traffic. THE BOUND IS ONE ENTRY, NOT ONE PER TARGET, and the
+    # review of #145 is why the difference is written here: a stale entry under the SAME key (a
+    # closed `asyncio.run` loop) is replaced, but a re-keyed target — a moved address, a rotated
+    # API key, a cert rewritten in place — used to leave the old entry and its client in the dict
+    # for the life of the process. `view.connect()` now empties the pool before inserting, so at
+    # most one entry exists at any time; `test_the_panel_holds_one_engine_client.py` drives that
+    # against this object for each of the three ways a target can change.
+    # #681 (sixth review of #818) — the one engine client the process holds, and the connect in
+    # flight for it
+    ("beeverforge/runtime/temporal/connection.py", "_HELD"):
+        "one entry in total: a target that changes replaces it (`_connect_for` clears it first)",
+    ("beeverforge/runtime/temporal/connection.py", "_IN_FLIGHT"):
+        "one connect per target in flight, removed the moment it lands or fails",
+    # #681 (review requesting changes on 3cd816ac) — the target resting after a failed attempt
+    ("beeverforge/runtime/temporal/connection.py", "_RESTING"):
+        "one entry in total: a new rest replaces it (`_rest_after` clears it first), and a client "
+        "that lands empties it",
+    ("beeverforge/runtime/temporal/view.py", "_CLIENTS"):
+        "exactly one entry — the engine target this process is configured for right now, emptied "
+        "and re-filled when that target changes; the environment, not traffic",
+    # #266 slice 6 — each old key a vendor named, said once per registry file and project
+    ("beeverforge/registry.py", "_NAMED"):
+        "one per (registry file, project, old key) — the old keys are a fixed list of nine, so "
+        "bounded by the registry, never by traffic",
+    # #383 — the card question held for the person's answer; an evicted one costs only the
+    # shortcut to the redraft
+    ("beeverforge/product/cards.py", "_OPEN"): "BoundedDict(500)",
+    ("beeverforge/runtime/temporal/view.py", "_state_cache"): "BoundedDict(2000)",
+    ("beeverforge/runtime/temporal/view.py", "_deploy_cache"): "BoundedDict(2000)",
+    ("beeverforge/runtime/slack/bot.py", "_PENDING"): "BoundedDict(200)",
+    ("beeverforge/runtime/slack/bot.py", "_ASKED"): "BoundedDict(200)",
+    ("beeverforge/product/staging.py", "_PENDING"): "_MAX_PENDING = 200, evicts oldest",
+    ("beeverforge/product/staging.py", "_EXPIRED_TOMBSTONES"):
+        "_MAX_TOMBSTONES = 64, evicts oldest",
+    ("beeverforge/product/staging.py", "_ENTRY_MODELS"):
+        "one per pydantic model class that can appear in a staged entry — a registry, not traffic",
+    ("beeverforge/adapters/agent/registry.py", "NATIVE_REVIEWERS"):
+        "one per harness kind — bounded by the HARNESSES table",
+    ("beeverforge/ops/impediment.py", "_LAST"): "BoundedDict(256)",
+    # #267 slice 1 — a card's thread, kept until the card changes: a changed card leaves its old
+    # key behind, so the bound is the cap and not the board.
+    ("beeverforge/product/model.py", "_THREADS"): "BoundedDict(5000)",
+    # #33 hole 7 — the typed intake: one bucket per project this worker serves (each capped at
+    # `_MAX_CASES`), the projects loaded, and which project a conversation key belongs to.
+    ("beeverforge/product/case.py", "_CASES"): "BoundedDict(64), each bucket _MAX_CASES = 500",
+    ("beeverforge/product/case.py", "_LOADED"): "BoundedDict(64)",
+    ("beeverforge/product/case.py", "_THREAD_PROJECT"): "BoundedDict(512)",
+    # what the forge said about a card's preview, reused for a minute (#265)
+    ("beeverforge/preview/demand.py", "_CACHE"): "BoundedDict(512)",
+    # which preview proposal is open, asked of the forge when a card is read (#265 slice 4)
+    ("beeverforge/onboarding/preview_propose.py", "_ASKED"): "BoundedDict(512)",
+    # MOVED WITH THE PROBE (#162). The panel spelled a GitHub board URL by hand, so it carried
+    # GitHub's org-vs-user asymmetry and this cache; both now live in the adapter that knows which
+    # vendor has one.
+    ("beeverforge/adapters/tracker/github_project.py", "_OWNER_KIND"):
+        "one per board owner in the registry — the key is a project's board_owner, not traffic",
+    # THE SETS THIS NET WAS BLIND TO UNTIL #158's REVIEW. All three are "say it once" or "do it
+    # once" markers keyed by something a deployment declares, never by traffic.
+    ("beeverforge/observability/sqlite_metrics.py", "_SCHEMA_ENSURED"):
+        "one per metrics file this process reads — a deployment has one, and it is the path in "
+        "BEEVERFORGE_METRICS_DB, not traffic",
+    ("beeverforge/adapters/agent/registry.py", "_REFUSED_SAID"):
+        "one per add-on role kind refused — bounded by the roles installed",
+    ("beeverforge/adapters/agent/roles.py", "_MISSING_SAID"):
+        "one per role name whose prompt is missing — bounded by the roles this build ships",
+    # #269 — each malformed `BEEVERFORGE_EXTRACT_ROWS` entry, warned about once
+    ("beeverforge/adapters/extract/registry.py", "_SAID"):
+        "one per malformed entry of BEEVERFORGE_EXTRACT_ROWS — the deployment's one variable, "
+        "never traffic",
+    # #269 slice 2 — the embedder built once per process: keyed by the deployment's embedding
+    # configuration (the row, the model's folder, the declared digest), never by a turn
+    ("beeverforge/adapters/embed/registry.py", "_BUILT"):
+        "one per embedding configuration this process has seen — the deployment's environment, "
+        "never traffic",
+    ("beeverforge/adapters/embed/local.py", "_HASHED"):
+        "one per (model weights file, size, mtime) this process has loaded — the deployment's "
+        "model, never traffic",
+    # #753 — the local board's missing review column, warned about once per board
+    ("beeverforge/adapters/board/local.py", "_FELL_BACK_SAID"):
+        "one per (board file, project, key with a fallback) this process has moved a card on — "
+        "the deployment's projects times `FALLS_BACK_TO`'s one key, never traffic",
+}
+
+
+def _module_dicts(tree: ast.Module) -> dict[str, ast.AST]:
+    """Every module-level container that starts EMPTY and can therefore only grow with what the
+    process does — a dict, a `BoundedDict`, or a set.
+
+    THE SET WAS INVISIBLE, and a review found it rather than this guard (#158): `sqlite_metrics.
+    _SCHEMA_ENSURED` is a module-level `set()` grown with `.add()`, which matched neither the
+    shapes below nor `_written_names`, so a cache this file exists to catch passed it in silence.
+    The docstring of the test below says "a dict declared empty at module level and written by key
+    IS a cache, whatever it is called"; a set written by `.add` is the same claim with a different
+    verb."""
+    out: dict[str, ast.AST] = {}
+    for node in tree.body:
+        target, value = None, None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            target, value = node.targets[0].id, node.value
+        if not target or value is None:
+            continue
+        called = (getattr(value, "func", None) is not None
+                  and (getattr(value.func, "id", None) or getattr(value.func, "attr", None)))
+        is_empty_dict = (isinstance(value, ast.Dict) and not value.keys) or (
+            isinstance(value, ast.Call) and called == "dict" and not value.args)
+        is_empty_set = isinstance(value, ast.Call) and called == "set" and not value.args
+        is_bounded = (isinstance(value, ast.Call)
+                      and (getattr(value.func, "id", None)
+                           or getattr(value.func, "attr", None)) == "BoundedDict")
+        if is_empty_dict or is_empty_set or is_bounded:
+            out[target] = node
+    return out
+
+
+def _written_names(tree: ast.Module) -> set[str]:
+    """Every name a module grows through — not only `d[k] = v`. `_locks.setdefault(...)` and
+    `d.update(...)` grow a dict without a single Subscript store, so the first version of this
+    net registered such dicts as never-written and silently stopped covering them. `.add` is here
+    for the same reason one level along: a set grows through it and through nothing else."""
+    written: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) \
+                and isinstance(n.ctx, ast.Store):
+            written.add(n.value.id)
+        elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and isinstance(n.func.value, ast.Name) \
+                and n.func.attr in {"setdefault", "update", "add"}:
+            written.add(n.func.value.id)
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+            written.add(n.target.id)
+    return written
+
+
+def test_every_module_level_cache_has_a_declared_bound():
+    """A dict declared empty at module level and written by key IS a cache, whatever it is called.
+
+    Constant lookup tables (`_ATTEMPTS`, `_STATE_KEYS`) are literals with contents and never
+    written to — they do not match, which is why this guard is quiet about them.
+    """
+    offenders = []
+    for path, tree in _modules():
+        candidates = _module_dicts(tree)
+        if not candidates:
+            continue
+        for name in sorted(set(candidates) & _written_names(tree)):
+            if (_rel(path), name) not in _CACHES:
+                offenders.append(f"{_rel(path)}:{candidates[name].lineno} — {name}")
+
+    assert not offenders, (
+        "these module-level caches grow by key with no declared bound:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nUse sdlc.util.bounded.BoundedDict, or add it to _CACHES in this file with what "
+          "bounds it (a registry, a login list — something that cannot grow with traffic).")
+
+
+def test_the_net_sees_growth_that_never_uses_a_subscript():
+    """Sabotage-proofing the net itself: a dict grown solely via `setdefault`/`update` must
+    register as written, or the guard is quiet about exactly the class it exists for."""
+    tree = ast.parse("_X = {}\n\ndef f(k, v):\n    _X.setdefault(k, []).append(v)\n"
+                     "\ndef g(d):\n    _X.update(d)\n")
+    assert "_X" in _written_names(tree)
+    assert "_X" in _module_dicts(tree)
+
+
+def test_the_net_sees_a_SET_grown_with_add():
+    """The shape the review of #158 found this guard blind to: `_SCHEMA_ENSURED = set()`, grown by
+    `.add`, is a cache with no subscript and no dict anywhere in it."""
+    tree = ast.parse("_X: set[str] = set()\n\ndef f(k):\n    _X.add(k)\n")
+
+    assert "_X" in _written_names(tree)
+    assert "_X" in _module_dicts(tree)
+
+
+def _declared_cap(site) -> int | None:
+    """The cap a `BoundedDict(N)` declaration in _CACHES promises, or None for caches bounded by
+    something structural (a registry, a login list)."""
+    m = re.search(r"BoundedDict\((\d+)\)", _CACHES[site])
+    return int(m.group(1)) if m else None
+
+
+@pytest.mark.parametrize("site", sorted(_CACHES))
+def test_declared_caches_still_exist(site):
+    """Same sabotage-proofing: a bound declared for a cache that was renamed protects nothing —
+    and a declaration saying `BoundedDict(N)` over a plain `{}` protects even less: reverting
+    `bot._PENDING = BoundedDict(200)` to `{}` used to keep every guard here green."""
+    rel, name = site
+    tree = parsed(add_ons.source(rel))
+    node = _module_dicts(tree).get(name)
+    assert node is not None, f"{rel} no longer declares {name}"
+    cap = _declared_cap(site)
+    if cap is not None:
+        value = node.value
+        assert isinstance(value, ast.Call) and value.args \
+            and isinstance(value.args[0], ast.Constant) and value.args[0].value == cap, (
+            f"{rel}:{name} is declared here as BoundedDict({cap}) but the code says "
+            f"{ast.unparse(value)} — the declared bound protects nothing")
+
+
+# ── guard 3: the bound is a BEHAVIOUR, not a declaration ───────────────────────────────────────
+# The declarations above are prose until something overfills the real object through the real
+# write path. Disabling BoundedDict's eviction wholesale used to pass the ENTIRE suite: every
+# "BoundedDict(N)" in _CACHES was an unverified claim.
+
+
+def test_BoundedDict_evicts_the_oldest_and_counts_what_it_dropped():
+    from beeverforge.util.bounded import BoundedDict
+
+    d: BoundedDict[int, int] = BoundedDict(3)
+    for i in range(5):
+        d[i] = i
+    assert len(d) == 3, "the cap did not hold"
+    assert 0 not in d and 1 not in d, "the oldest entries were not the ones evicted"
+    assert 4 in d
+    assert d.evicted == 2, "silent discarding — nobody can tell the cap is being hit"
+
+    d[4] = 99
+    assert len(d) == 3 and d.evicted == 2, "replacing an existing key must not evict anybody"
+
+    with pytest.raises(ValueError):
+        BoundedDict(0)
+
+
+_BOUNDED_SITES = sorted(site for site in _CACHES if _declared_cap(site) is not None)
+
+
+@pytest.mark.parametrize("site", _BOUNDED_SITES)
+def test_a_declared_bound_actually_holds_on_the_live_object(site):
+    """Import the real module-level object and hammer it past its declared cap through its own
+    write path. len() must never exceed the cap, the oldest entry must be the one gone, and the
+    newest must be present — whatever class the object is, today or after a refactor."""
+    rel, name = site
+    cap = _declared_cap(site)
+    add_ons.source(rel)
+    obj = getattr(importlib.import_module(rel[:-3].replace("/", ".")), name)
+    obj.clear()
+    try:
+        for i in range(cap + 50):
+            obj[f"growth-guard-{i}"] = ("growth", "guard")
+        assert len(obj) == cap, f"{rel}:{name} grew past its declared bound of {cap}"
+        assert "growth-guard-0" not in obj, "nothing was evicted — the bound is prose"
+        assert f"growth-guard-{cap + 49}" in obj, "the NEWEST entry was dropped instead"
+    finally:
+        obj.clear()
+
+
+def test_the_channel_staging_cap_holds_through_remember():
+    """product_channel's cap is hand-rolled rather than a BoundedDict, so it gets its own proof —
+    through `remember()`, the only production write path into that dict."""
+    import beeverforge.product.channel as pc
+
+    pc._PENDING.clear()
+    try:
+        for i in range(250):
+            pc.remember(f"growth-guard-T{i}", {"kind": "fact", "term": str(i)})
+        assert len(pc._PENDING) == 200, "the staging dict grew past the cap _CACHES declares"
+        assert pc.pending_for("growth-guard-T0") is None, "the oldest draft was not evicted"
+        assert pc.pending_for("growth-guard-T249") is not None
+    finally:
+        pc._PENDING.clear()

@@ -1,0 +1,1473 @@
+"""Closing a card and re-aiming one — the two everyday PO acts the channel had no words for.
+
+THE EVIDENCE, both from 2026-07-31 and both on the same client's board.
+
+Nina proposed closing `#511` as a duplicate of `#288`. The product owner confirmed. She answered
+*"Registrado o pedido junto ao time"* — and nothing existed to record it: the sentence matched no
+intent, fell
+through to the conversation, and the client was invited to check a request that had never been
+made. `#511` is still open; the next queue proposal put it first.
+
+The same day, `refine` ran in production for the first time and refused correctly — *"o #516 já
+dizia quando estaria pronto — não mexi"* — leaving the client holding a card whose criteria were
+written from REQ-0004, a text that has since been replaced by REQ-0006. The refusal was right and
+it went nowhere: there was no word for the act that fixes it.
+
+So this file pins two gestures and one refusal, and the third is the one worth stating: **a refusal
+must name what to say instead, and the sentence it names must be one this surface can actually
+match.** That round trip is asserted here rather than left as prose, because a pointer to a gesture
+nobody implemented is exactly the shape of what it is replacing.
+
+WHAT IT DEFENDS ABOUT THE MATCHING ITSELF. Every gesture that names a number is matched ANYWHERE in
+a message instead of at its start — a preamble had been killing intents ("Nina, boa observação e
+vamos … Refina o #523 …" minted a spurious requirement). Widening is paid for by requiring the thing
+to be NAMED and its number ATTACHED to the gesture, the imperative mood, and a clause that is not a
+question; each of the three is asserted, because dropping any one of them turns an ordinary sentence
+in an accounting firm's channel into a staged write against their board.
+
+AND IT DEFENDS THE FAMILY, NOT A MEMBER OF IT. The rule was first written for `close` and `align`
+and listed beside them by hand, so the intent the regression had actually happened to went on being
+anchored — one fixed, five left behind, inside the fix. Which intents scan is now read off the
+patterns, and the assertion that the two agree is here.
+"""
+
+from __future__ import annotations
+
+import ast
+import logging
+import re
+from pathlib import Path
+
+import pytest
+
+import beeverforge.product.channel as pc
+from beeverforge.product import confirm, engine
+from beeverforge.product.corpus import _KNOWN_STATUS
+from beeverforge.product.intents import match_intent
+from beeverforge.product.voice import (
+    align_confirmation,
+    align_refused,
+    align_to_dropped_replacement,
+    align_to_unagreed,
+    card_aligned,
+    card_closed,
+    card_corrected,
+    claims_a_write,
+    close_confirmation,
+    correct_confirmation,
+    correction_refused,
+    criteria_written,
+    drop_confirmation,
+    jargon_in,
+    refine_refused,
+)
+from tests.the_breakdown_runs_here import run_here
+from tests.the_chat_turn import AS_NAMED, CHAT, chat_turn
+from tests.the_tree_read_once import parsed
+
+# ── 1. the gesture: closing a card, in the words a person uses ─────────────────────────────────
+
+
+@pytest.mark.parametrize("phrase", [
+    "a gente vê isso, e quebra o requisito 8 em tarefas",
+    "vou olhar, e refina o #412",
+])
+def test_the_SAME_CONNECTIVE_never_reaches_the_two_that_write_on_the_match_alone(phrase):
+    """The other half of the same rule, and the whole reason the two groups differ. A connective is
+    exactly what carries an elided subject into the next clause — "a gente vê isso e quebra o
+    requisito 8" is one sentence about what we will do — and behind `breakdown` and `refine` there
+    is nobody to ask: the match itself spends money and edits a client's ticket.
+
+    So they are reached only where a clause actually begins. The cost is a rephrase; the cost of
+    the other choice was eight tickets nobody released.
+    """
+    assert match_intent(phrase) is None, f"{phrase!r} filed work off a plan"
+
+
+@pytest.mark.parametrize("phrase", [
+    "quando vamos aceitar o requisito 1?",
+    "pode quebrar o requisito 8 em tarefas?",
+    "cancela o requisito 2, isso ainda faz sentido?",
+    "não vamos cancelar o requisito 2",
+    "vamos quebrar o requisito 8 amanhã",
+    "pode refinar o #412?",
+])
+def test_what_a_WIDENED_gesture_still_refuses(phrase):
+    """Scanning is paid for by the three guards, and the family pays the same price the two that
+    were widened first do. `refine` and `breakdown` write on the match alone — no confirmation
+    stands between these sentences and a client's board — so the mood guard is load-bearing:
+    "vamos quebrar" is a plan, and filing eight tickets off it spends money nobody released.
+
+    The third row is why the question mark is read at the NUMBER and not at the end of the match:
+    `drop` captures the rest of the message as a reason, so looking past it found no punctuation
+    at all and an open question matched as an instruction.
+    """
+    assert match_intent(phrase) is None, f"{phrase!r} was read as an instruction"
+
+
+@pytest.mark.parametrize("phrase", [
+    "quando vamos fechar o #511?",
+    "quando fecha o #511?",
+    "podemos fechar o #511?",
+    "vamos fechar o #511 depois",
+    "não fecha o #511",
+    "nao fecha o #511",
+    "ainda não fecha o #511",
+])
+def test_what_must_NEVER_read_as_an_instruction_to_close(phrase):
+    """Three separate guards, one per row of this table.
+
+    The MOOD kills the modals: every one of them takes the infinitive in Portuguese, so refusing
+    "fechar" refuses the whole class instead of a list somebody has to keep extending. The QUESTION
+    MARK kills "quando fecha o #511?", whose verb really is the imperative form. The NEGATION kills
+    the one shape whose meaning inverts while every other signal stays identical.
+    """
+    matched = match_intent(phrase)
+
+    assert (matched or ("", {}))[0] != "close", f"{phrase!r} was read as an instruction to close"
+
+
+@pytest.mark.parametrize("phrase", [
+    "fecha o mês 10",
+    "fecha o período 3 no sistema",
+    "o fechamento do mês 2 travou",
+])
+def test_a_bare_number_is_not_a_card_in_an_accounting_firms_channel(phrase):
+    """The reason the card reference is required and a number alone is not. "fecha o mês 10" is an
+    ordinary sentence where this runs, and reading it as a card would stage a write on their
+    board — with a confirmation button underneath it."""
+    assert (match_intent(phrase) or ("", {}))[0] != "close", phrase
+
+
+def test_the_number_a_gesture_NAMES_is_the_one_attached_to_it():
+    """The other half of the same rule. A gap of "any twenty characters" is a whole clause, and a
+    clause is where the next unrelated number lives."""
+    assert match_intent("fecha isso, olha o #288") is None
+    assert match_intent("refina isso pra mim até o dia 3") is None
+
+
+# ── 2. the gesture: aligning a card to a requirement ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("phrase", [
+    "dá pra alinhar o #288 ao requisito 6?",
+    "não alinha o #288 ao requisito 6",
+    "alinha o #288 ao requisito 6?",
+])
+def test_a_question_or_a_refusal_never_re_aims_a_card(phrase):
+    assert (match_intent(phrase) or ("", {}))[0] != "align", phrase
+
+
+# ── the doubles ────────────────────────────────────────────────────────────────────────────────
+
+class _Req:
+    def __init__(self, number=6, status="accepted", superseded_by=None):
+        self.number, self.status, self.superseded_by = number, status, superseded_by
+        self.title, self.slug, self.path = "Aviso acionável", "aviso-acionavel", "0006-x.md"
+
+    @property
+    def is_live(self):
+        return self.status not in ("superseded", "dropped")
+
+    @property
+    def is_promise(self):
+        return self.status == "accepted"
+
+
+class _Result:
+    def __init__(self, ok=True, detail="", ref="", existed=False):
+        self.ok, self.detail, self.ref, self.existed = ok, detail, ref, existed
+        self.url, self.merged = "", True
+
+
+#: WHAT THE ROLE WRITES FOR EACH SENTENCE THESE CASES SAY (#565). Closing, correcting, aligning,
+#: refining and breaking down are acts the role proposes from what it understood — the sentence no
+#: longer reaches them on a pattern. The model is not in these cases, so this table stands in for
+#: its reading, sentence by sentence and never by rule: a sentence missing here is conversation.
+#: The marker alone, with no prose before it, so the reply reads as it did when the sentence did.
+_ROLE_READS = {
+    "Nina, fecha o #511 como duplicado do #288": "[[FECHAR: #511; em favor de #288]]",
+    "fecha o #511 como duplicado do #288": "[[FECHAR: #511; em favor de #288]]",
+    "fecha o #511 em favor do #288": "[[FECHAR: #511; em favor de #288]]",
+    "fecha o #511": "[[FECHAR: #511]]",
+    "fecha o #511 porque o cliente desistiu": "[[FECHAR: #511; o cliente desistiu]]",
+    "fecha o #511 porque o cliente desistiu do módulo":
+        "[[FECHAR: #511; o cliente desistiu do módulo]]",
+    "corrige o #512: um relatório semanal das vendas":
+        "[[CORRIGIR: #512; um relatório semanal das vendas]]",
+    "troca o título do #512 para Relatório semanal": "[[TITULO: #512; Relatório semanal]]",
+    "refina o #412": "[[REFINAR: #412]]",
+    **{f"alinha o #288 ao requisito {n}": f"[[ALINHAR: #288; REQ-{n:04d}]]" for n in (2, 4, 6, 7, 9)},
+    **{f"quebra o requisito {n} em tarefas": f"[[QUEBRAR: REQ-{n:04d}]]" for n in (7, 8)},
+}
+
+
+class _Module:
+    """The three calls this surface makes, and nothing else. Built to the contract rather than to
+    the implementation, so it fails loudly if a signature moves."""
+
+    def __init__(self, req=None, *, closes=None, aligns=None, refines=None, breaks=None,
+                 corpus=(), available=True, said=""):
+        # `corpus` holds the WHOLE chain when a test needs one: a supersession is a sequence, and a
+        # double that can only answer for one requirement can only ever prove a single hop.
+        self.reqs = list(corpus) or ([req] if req is not None else [])
+        self.closed_with = self.aligned_with = self.corrected_with = None
+        # the two that reach a client's board on the match alone, recorded so a sentence that must
+        # never be an instruction can be asserted against the WRITE and not against the label
+        self.broke_down = self.refined = None
+        self._closes, self._aligns = closes or _Result(), aligns or _Result()
+        self._refines = refines or _Result(detail="3 critérios")
+        # one result per card, and each one is its own outcome: filed and placed, filed and NOT
+        # placed, or found already there. The default is the happy one.
+        self._breaks = list(breaks) if breaks is not None else [_Result(ok=True, ref="#901")]
+        # AN UNREADABLE BASE STILL ANSWERS, AND ANSWERS EMPTY. `load_product_context` never raises:
+        # it hands back a context whose corpus holds nothing, which is why "I could not read it"
+        # and "there is no such requirement" were told apart by nothing.
+        self._available = available
+        # WHAT THE ROLE WRITES, when a test needs its reading (#565): read by the role's own parser
+        self._said = said
+
+    def context(self):
+        from types import SimpleNamespace
+
+        # empty when unavailable, which is the whole point: the real loader answers this way too,
+        # so "I could not read it" and "there is nothing there" look identical to `by_number`
+        reqs = self.reqs if self._available else []
+
+        class _Corpus:
+            def by_number(self, n):
+                return next((r for r in reqs if r.number == n), None)
+
+        return SimpleNamespace(available=self._available, corpus=_Corpus(),
+                               reason="" if self._available else "sem checkout")
+
+    def close_card(self, number, *, actor, in_favour_of=None, reason=""):
+        self.closed_with = (number, actor, in_favour_of, reason)
+        return self._closes
+
+    def align_card(self, number, *, requirement, actor):
+        self.aligned_with = (number, requirement, actor)
+        return self._aligns
+
+    def correct_card(self, number, *, actor, text="", title=""):
+        self.corrected_with = (number, actor, text, title)
+        return _Result(detail="2 critérios")
+
+    def break_down(self, number, *, actor, asked_for):
+        self.broke_down = (number, actor)
+        return self._breaks
+
+    def refine(self, number, *, actor=""):
+        self.refined = (number, actor)
+        return self._refines
+
+    def settle_acceptance(self, text):
+        return None
+
+    # the conversational fall-through, so a message this surface REFUSES still gets an answer
+    def answer(self, question, *, conversation="", pending="", **_):
+        from types import SimpleNamespace
+
+        from beeverforge.product.role import read_answer
+
+        if self._said:
+            return read_answer(self._said)
+        if str(question).strip() in _ROLE_READS:
+            return read_answer(_ROLE_READS[str(question).strip()])
+        return SimpleNamespace(ok=True, is_defect=False, is_request=False, decisions=[],
+                               text="não sei dizer.", violates=None)
+
+    def close_decisions_answered(self, *, channel=""):
+        return None
+
+
+class _Product:
+    enabled, slack_channel, agent_name = True, "C1", "Nina"
+
+    def __init__(self, admins):
+        self.admins = admins
+
+
+class _Project:
+    name, language = "books", "pt-BR"
+
+    def __init__(self, admins=("UADM",)):
+        self.product = _Product(list(admins))
+
+
+def _waiting():
+    """What is staged in the conversation "C1", whoever staged it — the engine's own lookup. Since
+    #266 slice 4 each person's proposal waits under a key of its own (`staging.key_for`), so the
+    conversation's name alone is no longer where it is."""
+    return pc.find_waiting("C1", "C1")[1]
+
+
+@pytest.fixture(autouse=True)
+def _clean_stage(monkeypatch):
+    # THE STATE LIVES IN `beeverforge/product/staging.py` NOW (#98 slice 3), so isolation is
+    # applied THERE. Rebinding the re-export on `product_channel` would leave the code
+    # reading the original dict: the fixture would look like it isolates and would not,
+    # which is how a staged proposal leaked into the next test when this move was first
+    # attempted — with the symptom landing far from the cause.
+    from beeverforge.product import staging as _staging
+    monkeypatch.setattr(_staging, "_PENDING", {})
+    monkeypatch.setattr(_staging, "_EXPIRED_TOMBSTONES", {})
+    from beeverforge.memory import transcript
+
+    monkeypatch.setattr(transcript, "record", lambda *a, **k: "")
+    monkeypatch.setattr(transcript, "recent", lambda *a, **k: [])
+    yield
+
+
+# ── 3. closing: the whole gesture reaches the write, and not before ────────────────────────────
+
+def test_the_whole_closing_gesture_reaches_the_write_through_the_channel():
+    """The reachability assertion, not a unit one. The capability this replaces did not exist at
+    all — the agent narrated an act nobody performed — so "the module has a method" proves nothing
+    that matters here."""
+    project, module = _Project(), _Module()
+
+    ask = chat_turn(project, text="Nina, fecha o #511 como duplicado do #288",
+                    user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "#511" in ask and "#288" in ask and "Confirma?" in ask, ask
+    assert module.closed_with is None, "it wrote before anybody confirmed"
+
+    done = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.closed_with == ("511", "UADM", "288", ""), module.closed_with
+    assert "#511" in done and "#288" in done, done
+
+
+def test_the_actor_reaching_the_module_is_the_RAW_slack_id():
+    """`may_act` is re-checked one call deeper against the configured ids; a decorated `<@U…>`
+    failed that lookup, so the gate that had just admitted the admin refused them. Decoration
+    belongs only to what gets written."""
+    project, module = _Project(), _Module()
+    chat_turn(project, text="fecha o #511", user="UADM", thread="C1", channel="C1", module=module)
+
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.closed_with[1] == "UADM", module.closed_with
+
+
+def test_an_unauthorised_yes_neither_closes_nor_consumes_the_proposal():
+    project, module = _Project(admins=["UADM"]), _Module()
+    chat_turn(project, text="fecha o #511 em favor do #288", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    refused = chat_turn(project, text="sim", user="USTRANGER", thread="C1", channel="C1",
+                        module=module)
+
+    assert module.closed_with is None, refused
+    assert _waiting() is not None, "the real approver's yes would find nothing"
+
+
+def test_the_person_who_asked_can_take_their_own_proposal_back():
+    """Refusing is gated, but not by the approval rule: the requester correcting themselves and a
+    third party destroying a draft an admin was about to approve are not the same act."""
+    project, module = _Project(admins=["UADM"]), _Module()
+    chat_turn(project, text="fecha o #511 como duplicado do #288", user="UCLIENT", thread="C1",
+              channel="C1", module=module)
+
+    chat_turn(project, text="não", user="UCLIENT", thread="C1", channel="C1", module=module)
+
+    assert _waiting() is None, "the requester could not withdraw their own proposal"
+    assert module.closed_with is None
+
+
+def test_a_question_about_closing_stages_nothing_at_all():
+    """Through the production handler, not through the matcher: the harm is not a wrong label, it
+    is a confirmation button under a question — which also evicts whatever else was pending."""
+    project, module = _Project(), _Module()
+
+    chat_turn(project, text="quando vamos fechar o #511?", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    assert _waiting() is None, "a question armed the confirmation gate"
+
+
+def test_a_machinery_failure_is_not_read_out_to_the_client():
+    """Every `WriteResult.detail` a client reads passes the sanitiser. This branch is new, and the
+    sibling that shipped raw stderr was new once too."""
+    project = _Project()
+    module = _Module(closes=_Result(ok=False, detail="fatal: could not read Username for github"))
+    chat_turn(project, text="fecha o #511", user="UADM", thread="C1", channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "fatal" not in said and "github" not in said.lower(), said
+    assert "do meu lado" in said, said
+
+
+def test_a_business_refusal_IS_read_out_to_the_client():
+    """The other half: "that card is already closed" is an explanation somebody can act on, and
+    swapping it for "the problem is on my side" would be a lie."""
+    project = _Project()
+    module = _Module(closes=_Result(ok=False, detail="o #511 já estava encerrado"))
+    chat_turn(project, text="fecha o #511", user="UADM", thread="C1", channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "já estava encerrado" in said, said
+
+
+def test_a_HALF_DONE_close_is_not_announced_as_a_finished_one():
+    """`close_card` closes the card and then writes the pointer on the survivor, and it reports the
+    second half failing as a SUCCESS carrying a sentence for the client — the close happened and
+    must not be re-offered. The reply composed its own headline and returned it, so that sentence
+    was computed, logged for us, and never said: the client read "Escrevi nos dois" about a note
+    that is not on the card the next person will pick up.
+    """
+    project = _Project()
+    unlinked = _Result(ok=True, ref="#511",
+                       detail="fechei o #511, mas não consegui deixar o registro disso no #288. "
+                              "O time foi avisado.")
+    module = _Module(closes=unlinked)
+    chat_turn(project, text="fecha o #511 como duplicado do #288", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "não consegui deixar o registro" in said, (
+        f"the module wrote a sentence for the client and the channel dropped it: {said}")
+    assert "nos dois" not in said, f"it claimed a link that does not exist: {said}"
+    assert "#288" in said, said
+
+
+def test_THE_SAME_RULE_holds_for_the_sibling_branch_that_writes_in_two_places():
+    """One branch fixed and the next one left behind is what this repository keeps paying for.
+    `file_defect` reports the identical shape — the problem was recorded and the board refused to
+    place the card, so the card is invisible to the queue until a person moves it — and that
+    sentence was dropped in exactly the same way."""
+    project = _Project()
+
+    class _Filing(_Module):
+        def file_defect(self, **_):
+            return _Result(ok=True, ref="#77",
+                           detail="registrei o problema, mas ainda não consegui posicionar o "
+                                  "cartão no quadro — o time foi avisado e posiciona.")
+
+    module = _Filing()
+    pc.remember("C1", {"kind": "defect", "restated": "o relatório sai com o mês errado",
+                       "reported_by": "<@UADM>", "channel": "C1"})
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "não consegui posicionar" in said, (
+        f"the module wrote a sentence for the client and the channel dropped it: {said}")
+
+
+def test_a_WHOLE_close_still_reads_as_one():
+    """The other side of the same branch: with nothing left to say, nothing extra is said."""
+    project, module = _Project(), _Module()
+    chat_turn(project, text="fecha o #511 como duplicado do #288", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "Escrevi nos dois" in said, said
+
+
+def test_a_HALF_DONE_alignment_is_not_announced_as_a_finished_one():
+    """THE BRANCH THAT WAS LEFT BEHIND, and the sentence it dropped is the worst of the three.
+    `align_card` rewrites the card and then comments to say what happened to it; the comment
+    failing is reported as a SUCCESS with a sentence for the client, because the criteria really
+    were replaced and the rewrite must not be re-offered.
+
+    This branch said none of it AND announced the note: the card's criteria changed underneath
+    thirteen people, nothing on the card says so, and the one who authorised it was told the
+    opposite — "escrevi nos dois", one branch over, in a different vocabulary.
+    """
+    project = _Project()
+    unexplained = _Result(ok=True, ref="#288",
+                          detail="alinhei o #288, mas não consegui deixar escrito nele que o "
+                                 "texto anterior foi substituído. O time foi avisado.")
+    module = _Module(_Req(6, "accepted"), aligns=unexplained)
+    chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "não consegui deixar escrito" in said, (
+        f"the module wrote a sentence for the client and the channel dropped it: {said}")
+    assert "Deixei registrado no item" not in said, (
+        f"it announced a note that is not on the card: {said}")
+
+
+def test_a_WHOLE_alignment_still_reads_as_one():
+    """The other side, and the reason this branch cannot simply say everything: `align_card`
+    reports its happy path in the same field, as a COUNT of what it wrote. Appending that would
+    hang a fragment off a finished sentence, so a measure is not something still to say — while
+    anything that is not one still reaches the person it was written for."""
+    project = _Project()
+    module = _Module(_Req(6, "accepted"),
+                     aligns=_Result(ok=True, ref="#288", detail="3 critérios"))
+    chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "Deixei registrado no item" in said, said
+    assert "3 critérios" not in said, f"a count was read out as a caveat: {said}"
+
+
+def test_a_HALF_DONE_refinement_is_not_announced_as_a_finished_one():
+    """THE FOURTH SIBLING, and the only one the `_still_to_say` pass did not reach. `refine` writes
+    the criteria and then comments to say who wrote them; the comment failing comes back `ok` with
+    the module's own sentence about it, because the criteria really are on the card.
+
+    This line took that sentence, put it in the parenthesis where the COUNT goes, and then said "e
+    deixei um comentário dizendo que fui eu" anyway — so the client read a denial and an assertion
+    of the same note eight words apart, in one sentence. Driven through the conversation: the role
+    proposes the refine (`[[REFINAR`, #565), and the yes writes it.
+    """
+    project = _Project()
+    unexplained = _Result(ok=True, ref="#412",
+                          detail="escrevi os critérios no #412, mas não consegui deixar o "
+                                 "comentário dizendo que fui eu — isso está escrito no próprio "
+                                 "item. O time foi avisado.")
+    module = _Module(refines=unexplained)
+
+    chat_turn(project, text="refina o #412", user="UADM", thread="C1", channel="C1",
+              module=module)
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.refined == ("412", "UADM"), "the gesture never reached the write"
+    assert "não consegui deixar o comentário" in said, (
+        f"the module wrote a sentence for the client and the channel dropped it: {said}")
+    assert "e deixei um comentário" not in said, (
+        f"it announced the comment that failed, in the same sentence that denies it: {said}")
+
+
+def test_a_WHOLE_refinement_still_reads_as_one():
+    """The other side: `refine`'s happy path reports a COUNT in the same field, and a count is not
+    something still to say. It belongs in the parenthesis, and the note it wrote may be claimed."""
+    project, module = _Project(), _Module()
+
+    chat_turn(project, text="refina o #412", user="UADM", thread="C1", channel="C1",
+              module=module)
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "(3 critérios)" in said, said
+    assert "e deixei um comentário" in said, said
+    assert said.count("comentário") == 1, f"the note is claimed and caveated at once: {said}"
+
+
+# ── 8b. the FAMILY, not the fourth member of it ────────────────────────────────────────────────
+#
+# Four branches report a module method that writes TWICE. Three learned the rule and one did not,
+# which is this repository's signature failure and the reason these two lists exist: the next
+# branch is classified deliberately or the test fails, rather than shipping as the fifth exception.
+
+#: Module methods that leave TWO marks and report the second one failing as an `ok` result carrying
+#: a sentence written for the client. Every one of them must reach `_still_to_say`.
+_WRITES_TWICE = {
+    "close_card": "closes the card, then points the surviving one at it",
+    # #156: the text (and the title) first, then the note keeping what the card said before
+    "correct_card": "corrects the card, then comments with what it said before",
+    "align_card": "rewrites the criteria, then says on the card what happened to them",
+    "file_defect": "files the problem, then places the card on the board",
+    "file_ticket": "opens the card as described, then places it on the board",
+    "refine": "writes the criteria, then comments to say who wrote them",
+    # THE FIFTH, AND THE ONE THIS HAND-WRITTEN TABLE GOT WRONG. It sat in `_WRITES_ONCE` under "one
+    # card per task, each carrying its own result" — true, and about the wrong thing: each RESULT
+    # still carries two marks, because `_file_one` creates the issue and then places it. The
+    # sentence answered "how many results?" while the column asks "how many writes per result?", so
+    # the reply announced "estão no Backlog" over a card the board had refused. A list maintained
+    # beside the fact it describes, exactly what this file already exists downstream of — hence the
+    # derived cross-check below.
+    "break_down": "files each card, then places it on the board",
+    # ADR-0047: the official card(s) of a still-proposed requirement, opened at the FIRST yes — the
+    # same `_file_one` as `break_down`, so the same two marks per card and the same residue.
+    "open_cards_for": "files each card of a proposal, then places it on the board",
+    # #448: the card's bar corrected (and the note keeping what it said), then the pass sent
+    "send_back": "corrects the card's criteria and notes the old ones, then sends the pass",
+    # #448 slice 3: the acceptance recorded, the gate answered when the look is all that holds it,
+    # then the note on the card saying so
+    "accept_change": "records the acceptance, then notes it on the card",
+}
+#: TWO-WRITE METHODS THE CONVERSATION NO LONGER CALLS ITSELF (#563 slice 18b): the worker's activity
+#: runs them, and the sentence the conversation is told about the result is composed by the
+#: function named here — held to the same one path.
+_TOLD_BY = {"break_down": "breakdown_told"}
+#: Module methods that leave ONE mark, so an `ok` result has nothing left over to say.
+_WRITES_ONCE = {
+    "accept": "one commit in the base",
+    "drop": "one commit in the base",
+    "note_fact": "one commit in the base",
+    "propose": "one proposal, whose landing is reported by `merged`",
+    "promote": "one move per card, each carrying its own result",
+    # #33 slice 9, the chat half: one placement per card, each carrying its own result — the reply
+    # reads them back in the sequence the board took, never sorted.
+    "reorder": "one placement per card, each carrying its own result",
+    "baseline": "one pass, announced by itself",
+    # One commit, like its two siblings above — clone, append the row, push. The `existed` case
+    # (the same decision already recorded today) is a prior result, not a residue: nothing was left
+    # undone, so there is nothing for `_still_to_say` to carry.
+    "record_decision": "one commit in the base",
+    # ADR-0047 §3: the acceptance written on each card — one comment per card, each carrying its
+    # own result; a comment the tracker refused is a failed result, never a residue on a success.
+    "stamp_acceptance": "one comment per card, each carrying its own result",
+}
+#: Everything else the channel asks the module: reads, judgements and bookkeeping. Listed so that a
+#: WRITE added later cannot arrive unclassified — an unknown name is a failure, not a silence.
+_ASKS_ONLY = frozenset({
+    "answer", "confirmed", "context", "draft", "introduce", "propose_queue", "record_decisions",
+    "review_needs_action", "settle_acceptance", "status_line", "triage_board",
+    "close_decisions_answered",
+})
+
+#: The one path. `_still_to_say` is what reads `WriteResult.detail` on a success and says whatever
+#: the module has left to say; a branch that composes its own headline and returns it is exactly
+#: how three sentences were computed, logged for us, and never reached the person they were for.
+_ONE_PATH = "_still_to_say"
+
+
+#: WHERE A REPLY TO A MODULE WRITE CAN BE COMPOSED — both files, because the confirmation executor
+#: moved to the core (#105) while the typed intents stayed on the channel. A guard that kept
+#: scanning only `product_channel.py` would have gone silently blind the day the branches moved:
+#: `_module_calls` would find nothing for `close_card`, and "the channel never calls it" reads as
+#: an accusation when it is really the scanner looking at the wrong file. AND IT HAPPENED AGAIN
+#: (#266 slice 2): the typed intents moved from the channel into the turn engine, and the channel
+#: kept enough functions to pass the assertion below while holding none of the branches — so the
+#: engine is the file scanned now.
+_COMPOSING_FILES = ("beeverforge/product/engine.py", "beeverforge/product/confirm.py")
+
+
+def _channel_tree() -> ast.Module:
+    """Both files as one tree, so a branch is found wherever the reply is composed."""
+    merged = ast.Module(body=[], type_ignores=[])
+    for path in _COMPOSING_FILES:
+        body = parsed(Path(path)).body
+        assert any(isinstance(n, ast.FunctionDef) for n in body), (
+            f"{path} contributed no functions to the scan — the file moved or was renamed, and "
+            f"every guard reading this tree is now looking at half the code")
+        merged.body.extend(body)
+    return merged
+
+
+def _module_calls(tree: ast.Module) -> dict[str, list[ast.Call]]:
+    """Every `module.<method>(…)` the channel makes, by method."""
+    found: dict[str, list[ast.Call]] = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and getattr(node.func.value, "id", "") == "module"):
+            found.setdefault(node.func.attr, []).append(node)
+    return found
+
+
+def _plainly_called(node: ast.AST) -> set[str]:
+    return {c.func.id for c in ast.walk(node)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+
+
+def _reporting_block(tree: ast.Module, call: ast.Call) -> ast.AST:
+    """The narrowest block that has to turn this write into the client's sentence — the branch, not
+    the whole handler: `_handle` calls `_still_to_say` three times already, so asking only whether
+    the FUNCTION mentions it is how a fourth branch inside it would pass."""
+    holds = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.If)) and any(x is call for x in ast.walk(n))]
+    return max(holds, key=lambda n: (n.lineno, n.col_offset))
+
+
+def _residue_carriers() -> set[str]:
+    """Module methods that can answer a SUCCESS with a sentence still to say — READ OFF `module.py`
+    rather than remembered here.
+
+    A residue is `WriteResult(ok=True, …, detail=…)` with no `existed=True`: the second write
+    failed, the first stands, and the module wrote a sentence for the client about the difference.
+    `existed` is excluded because it is the module saying "this was already there", which the
+    replies LEAD with; `ok=bool(...)` is excluded because a computed flag is a failure branch, not
+    a residue.
+
+    Then propagated one method to the next through `self.<name>(…)`, because that hop is precisely
+    where the fifth branch hid: `break_down` returns `file_issues`, which returns `_file_one`, and
+    only the last of the three constructs the result. A classification that stops at the method the
+    channel names cannot see the write it delegates.
+    """
+    tree = parsed(Path("beeverforge/product/module.py"))
+    functions = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    carriers = set()
+    for name, fn in functions.items():
+        for call in ast.walk(fn):
+            if not (isinstance(call, ast.Call) and getattr(call.func, "id", "") == "WriteResult"):
+                continue
+            kw = {k.arg: k.value for k in call.keywords}
+            ok, existed = kw.get("ok"), kw.get("existed")
+            if not (isinstance(ok, ast.Constant) and ok.value is True) or "detail" not in kw:
+                continue
+            if isinstance(existed, ast.Constant) and existed.value is True:
+                continue
+            carriers.add(name)
+    for _ in range(len(functions)):        # a fixpoint; the call graph here is three deep at most
+        for name, fn in functions.items():
+            if name in carriers:
+                continue
+            if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                   and getattr(c.func.value, "id", "") == "self" and c.func.attr in carriers
+                   for c in ast.walk(fn)):
+                carriers.add(name)
+    return carriers
+
+
+def test_the_hand_CLASSIFICATION_agrees_with_the_MODULE_ITSELF():
+    """WHY THE TABLE ABOVE DID NOT CATCH THE FIFTH BRANCH: it is a hand-written set, and a hand
+    written set beside the fact it describes is the defect this whole file is downstream of.
+    `break_down` was filed under "writes once" with a sentence that was true about something else,
+    the family test then skipped it by construction, and the reply it never checked told a client
+    that cards with no column were in Backlog.
+
+    So the two lists are now answerable to the module. Anything the channel calls that can hand
+    back a success carrying a residue must be in `_WRITES_TWICE` — whether or not anybody
+    remembered to move it.
+    """
+    misfiled = sorted((_residue_carriers() & set(_module_calls(_channel_tree()))) - set(
+        _WRITES_TWICE))
+
+    assert not misfiled, (
+        f"{misfiled} can return an `ok` WriteResult carrying a sentence for the client and this "
+        f"file classifies them as writing once — so whatever they could not do is computed, "
+        f"logged for us, and never said")
+
+
+def test_every_module_write_the_channel_makes_is_classified():
+    """DEFAULT DENY. A fifth two-write branch means a module method this file has never seen, and
+    an unclassified one fails here rather than being reported by a headline somebody wrote fresh."""
+    called = set(_module_calls(_channel_tree()))
+    unclassified = called - set(_WRITES_TWICE) - set(_WRITES_ONCE) - _ASKS_ONLY
+
+    assert not unclassified, (
+        f"the channel calls {sorted(unclassified)} and this file does not say whether they write "
+        f"twice — a write that reports a residue must go through {_ONE_PATH}")
+
+
+@pytest.mark.parametrize("method", sorted(_WRITES_TWICE))
+def test_every_two_write_result_is_reported_through_the_ONE_path(method):
+    """`close`, `align` and `defect` were given `_still_to_say`; `refine` was not, and its branch
+    then denied and claimed the same comment in one sentence. Read off the file so a branch added
+    later cannot be the next one left behind."""
+    tree = _channel_tree()
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    calls = _module_calls(tree).get(method) or []
+
+    if method in _TOLD_BY:
+        assert not calls, f"{method} runs on the worker, and the conversation calls it again"
+        told = functions[_TOLD_BY[method]]
+        reached = _plainly_called(told)
+        indirect = {f for f in reached if f in functions and _ONE_PATH in _plainly_called(
+            functions[f])}
+        assert _ONE_PATH in reached or indirect, (
+            f"{_TOLD_BY[method]} tells {method}'s result without {_ONE_PATH}")
+        return
+    assert calls, f"{method} writes twice and the channel never calls it"
+    for call in calls:
+        reached = _plainly_called(_reporting_block(tree, call))
+        # one hop, because the reply may be composed by a `_…_reply` helper the branch hands it to
+        indirect = {f for f in reached if f in functions and _ONE_PATH in _plainly_called(
+            functions[f])}
+        assert _ONE_PATH in reached or indirect, (
+            f"the branch at line {call.lineno} reports {method} ({_WRITES_TWICE[method]}) without "
+            f"{_ONE_PATH}: whatever it could not do is computed, logged for us, and never said")
+
+
+def test_a_card_THE_BOARD_REFUSED_is_not_announced_as_being_in_Backlog(monkeypatch):
+    """DOOR ONE of the fifth branch. `_file_one` creates the issue and then places it; the board
+    can refuse (no Backlog column, no card for the issue, no Status field, a failed `item-edit`),
+    and that comes back as `ok` carrying the module's own sentence for the client.
+
+    Every `ok` went into `landed` and only the FAILED results were ever read for a detail, so the
+    client was told "Estão no Backlog — começar a trabalhar nelas continua sendo decisão de uma
+    pessoa" about a card with no column at all: invisible to `readiness` and `propose_queue`, which
+    match the column exactly and have no else-branch, so the role can never surface that work
+    again. The sentence written for exactly this was computed, logged for us, and never said.
+    """
+    project = _Project()
+    refused = _Result(ok=True, ref="#101",
+                      detail="criado, mas o quadro recusou a colocação — o cartão está sem coluna "
+                             "e o time foi avisado.")
+    module = _Module(_Req(7), breaks=[refused])
+    ran = run_here(monkeypatch, module)
+
+    chat_turn(project, text="quebra o requisito 7 em tarefas", user="UADM", thread="C1",
+              channel="C1", module=module)
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+    said = ran.told[-1]   # what the conversation is told when the breakdown ends (#563 slice 18b)
+
+    assert module.broke_down == (7, "UADM"), "the gesture never reached the write"
+    assert "recusou a colocação" in said, (
+        f"the module wrote a sentence for the client and the channel dropped it: {said}")
+    assert "na coluna Backlog" not in said, (
+        f"a card the board refused to place was announced as being in Backlog: {said}")
+
+
+def test_a_card_that_ALREADY_EXISTED_is_not_announced_as_being_in_Backlog(monkeypatch):
+    """DOOR TWO, and the reason routing this reply through `_still_to_say` does not close it on its
+    own: `_unfinished` deliberately answers "" for `existed`, because the replies that carry it
+    lead with the fact themselves. Here nothing led with anything.
+
+    `_file_one` returns EARLY when the tracker already answers for that title — the idempotency
+    path, a retried conversation or a card filed in an earlier round — so `add_item` and
+    `set_column` are never called. #404's column is whatever it already was: Done, In progress, or
+    none. It was still announced as being in Backlog, by a turn that neither filed it nor moved it.
+    """
+    project = _Project()
+    module = _Module(_Req(7), breaks=[_Result(ok=True, ref="#404", existed=True,
+                                     detail="an issue titled 'Gerar o pacote' already exists")])
+
+    ran = run_here(monkeypatch, module)
+    chat_turn(project, text="quebra o requisito 7 em tarefas", user="UADM", thread="C1",
+              channel="C1", module=module)
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+    said = ran.told[-1]   # what the conversation is told when the breakdown ends (#563 slice 18b)
+
+    assert "na coluna Backlog" not in said, (
+        f"a card this turn never filed and never placed was announced as being in Backlog: {said}")
+    assert "#404" in said and "já estava" in said, said
+    # and never the tracker's own English explanation, which is written for us
+    assert "already exists" not in said, said
+
+
+def test_the_cards_that_DID_land_are_still_claimed_as_such(monkeypatch):
+    """The other side of both doors. A guard that only proves the retreat is indistinguishable from
+    a reply that stopped saying anything — the happy path must keep its sentence, and a mixed batch
+    must tell the three outcomes apart instead of collapsing them into the safest one."""
+    project = _Project()
+    module = _Module(_Req(7), breaks=[
+        _Result(ok=True, ref="#101"),
+        _Result(ok=True, ref="#404", existed=True, detail="an issue already exists"),
+        _Result(ok=True, ref="#102", detail="criado, mas o quadro recusou a colocação."),
+    ])
+
+    ran = run_here(monkeypatch, module)
+    chat_turn(project, text="quebra o requisito 7 em tarefas", user="UADM", thread="C1",
+              channel="C1", module=module)
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+    said = ran.told[-1]   # what the conversation is told when the breakdown ends (#563 slice 18b)
+
+    assert "#101 está na coluna Backlog" in said, f"the card that landed lost its sentence: {said}"
+    assert "#404 já existia" in said, said
+    assert "Sobre #102" in said and "recusou a colocação" in said, said
+    backlog = next(line for line in said.splitlines() if "na coluna Backlog" in line)
+    assert "#102" not in backlog and "#404" not in backlog, backlog
+
+
+def test_a_breakdown_that_produced_NOTHING_announces_no_cards():
+    """`file_issues` returns one result per draft, so no drafts is an empty list with no failure in
+    it — and the count then read as zero cards successfully filed into Backlog."""
+    said = chat_turn(_Project(), text="quebra o requisito 7 em tarefas", user="UADM", thread="C1",
+                     channel="C1", module=_Module(breaks=[]))
+
+    assert "Backlog" not in said, f"it announced a column for cards that do not exist: {said}"
+    assert "0" not in said, said
+
+
+def test_a_write_that_found_the_THING_ALREADY_THERE_says_so_ONCE():
+    """The third meaning `detail` carries on a success, and the one the fix for the first two
+    walked into. `file_defect` uses it for "I already have this" — a fact `defect_filed` already
+    LEADS with — so the reply stated it twice, the second time in the slot reserved for something
+    that went wrong. `existed` is the module's own word for it, and it is read here."""
+    project = _Project()
+
+    class _Filing(_Module):
+        def file_defect(self, **_):
+            return _Result(ok=True, ref="#77", existed=True,
+                           detail="já registrei esse problema antes")
+
+    pc.remember("C1", {"kind": "defect", "restated": "o relatório sai com o mês errado",
+                       "reported_by": "<@UADM>", "channel": "C1"})
+
+    said = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=_Filing())
+
+    assert "Eu já tinha registrado" in said, said
+    assert "já registrei esse problema antes" not in said, (
+        f"the same fact was said twice, the second time as a caveat: {said}")
+
+
+# ── 3b. the reason: promised in writing, and now actually written ──────────────────────────────
+
+def test_the_success_line_claims_a_REASON_only_when_one_was_given():
+    """The closing note holds who asked, and the reason only when somebody gave one — so the
+    sentence that promised "quem decidiu **e por quê**" over "fechado a pedido de <@U…>." told the
+    client about a record that did not exist. Whoever opened the card in six months found half of
+    what they had been told was there."""
+    project, module = _Project(), _Module()
+    chat_turn(project, text="fecha o #511", user="UADM", thread="C1", channel="C1", module=module)
+    bare = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "por quê" not in bare, f"it promised a reason nobody gave: {bare}"
+
+    project2, module2 = _Project(), _Module()
+    chat_turn(project2, text="fecha o #511 porque o cliente desistiu do módulo", user="UADM",
+              thread="C2", channel="C2", module=module2)
+    given = chat_turn(project2, text="sim", user="UADM", thread="C2", channel="C2", module=module2)
+
+    assert module2.closed_with[3] == "o cliente desistiu do módulo", module2.closed_with
+    assert "por quê" in given, given
+
+
+def test_the_reason_is_read_off_a_CONNECTIVE_and_shown_before_it_is_written():
+    """Same discipline as the surviving card, for the same reason: this gesture is matched anywhere
+    in a message, so taking the tail would write the next unrelated clause onto a client's card as
+    the reason somebody decided. And what goes onto the card in their name is shown to the person
+    who confirms it — a proposal is only a proposal for what it shows."""
+    project, module = _Project(), _Module()
+
+    ask = chat_turn(project, text="fecha o #511. Depois vamos falar do orçamento", user="UADM",
+                    thread="C1", channel="C1", module=module)
+
+    assert "orçamento" not in ask, f"an unrelated clause became the reason: {ask}"
+
+    pc.forget("C1")
+    shown = chat_turn(project, text="fecha o #511 porque o cliente desistiu", user="UADM",
+                      thread="C1", channel="C1", module=module)
+
+    assert "o cliente desistiu" in shown, shown
+
+
+def test_a_confirmed_write_says_something_BEFORE_the_slow_part():
+    """A yes is always the slow path — a checkout, the client's board, an agent. `align` runs two
+    checkouts and a model call before it returns, and the branch said nothing at all until it did:
+    the person confirmed an irreversible change to what gets built and heard silence for minutes.
+    Sent once, from the one place every confirmed write passes through, rather than by six branches
+    each remembering to."""
+    project, module = _Project(), _Module(_Req(6, "accepted"))
+    said: list[str] = []
+    chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+              channel="C1", module=module, notify=said.append)
+    said.clear()
+
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module,
+              notify=said.append)
+
+    assert said, "the person confirmed an irreversible act and heard nothing until it finished"
+
+
+def test_a_confirmation_BY_CLICK_is_acknowledged_too():
+    """The affordance we built for people who would rather not type gave them strictly less: the
+    click path could not send a receipt at all."""
+    project, module = _Project(), _Module(_Req(6, "accepted"))
+    chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+              channel="C1", module=module)
+    token = pc.proposal_token(*pc.find_waiting("C1", "C1"))
+    said: list[str] = []
+
+    pc.confirm_by_click(project, people=AS_NAMED, via=CHAT,
+                        token=token, approved=True, user="UADM", module=module,
+                        notify=said.append)
+
+    assert module.aligned_with == ("288", 6, "UADM"), module.aligned_with
+    assert said, "a click confirmed an irreversible act in silence"
+
+
+# ── 4. the fingerprint: which staged act a button is allowed to perform ────────────────────────
+
+def test_two_closures_of_one_card_in_favour_of_DIFFERENT_cards_never_share_a_button():
+    """The card that survives is half the decision. Without it in the fingerprint, a button posted
+    for "close #511 into #288" would perform "close #511 into #300" — and the closing comment
+    would name #300 in the client's own words."""
+    into_288 = pc.proposal_token("C1", {"kind": "close", "number": 511, "in_favour_of": 288})
+    into_300 = pc.proposal_token("C1", {"kind": "close", "number": 511, "in_favour_of": 300})
+
+    assert into_288 != into_300
+
+
+def test_two_alignments_of_one_card_to_DIFFERENT_requirements_never_share_a_button():
+    to_4 = pc.proposal_token("C1", {"kind": "align", "number": 288, "requirement": 4})
+    to_6 = pc.proposal_token("C1", {"kind": "align", "number": 288, "requirement": 6})
+
+    assert to_4 != to_6
+
+
+def test_every_staged_act_on_the_same_number_is_a_different_button():
+    """Closing a card, dropping a requirement and accepting one are unrelated acts that happen to
+    share a number. A stale button for any of them must never perform another."""
+    tokens = {pc.proposal_token("C1", {"kind": kind, "number": 288})
+              for kind in ("close", "align", "drop", "accept", "fact", "correct")}
+
+    assert len(tokens) == 6, tokens
+
+
+def test_two_corrections_of_one_card_to_DIFFERENT_words_never_share_a_button():
+    """The new text goes onto the client's card in their name, so a button posted for one wording
+    must never write another."""
+    weekly = pc.proposal_token("C1", {"kind": "correct", "number": 512, "text": "semanal"})
+    monthly = pc.proposal_token("C1", {"kind": "correct", "number": 512, "text": "mensal"})
+    to_weekly = pc.proposal_token("C1", {"kind": "correct", "number": 512, "new_title": "Semanal"})
+    to_monthly = pc.proposal_token("C1", {"kind": "correct", "number": 512, "new_title": "Mensal"})
+
+    assert weekly != monthly
+    assert to_weekly != to_monthly, "two renames of one card to different titles share a button"
+
+
+# ── correcting: what somebody asked for, in the words they confirm (#156) ─────────────────────
+
+def test_the_whole_correction_gesture_reaches_the_write_through_the_channel():
+    project, module = _Project(), _Module()
+
+    ask = chat_turn(project, text="corrige o #512: um relatório semanal das vendas", user="UADM",
+                    thread="C1", channel="C1", module=module)
+
+    assert "#512" in ask and "> um relatório semanal das vendas" in ask and "Confirma?" in ask, ask
+    assert module.corrected_with is None, "it corrected the card before anybody confirmed"
+
+    done = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.corrected_with == ("512", "UADM", "um relatório semanal das vendas", ""), (
+        module.corrected_with)
+    assert "Corrigi o *#512*" in done and "é só me pedir" in done, done
+
+
+def test_a_title_correction_stages_the_title_and_nothing_else():
+    project, module = _Project(), _Module()
+
+    ask = chat_turn(project, text="troca o título do #512 para Relatório semanal", user="UADM",
+                    thread="C1", channel="C1", module=module)
+    assert "“Relatório semanal”" in ask, ask
+    chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.corrected_with == ("512", "UADM", "", "Relatório semanal"), module.corrected_with
+
+
+@pytest.mark.parametrize("text", [
+    "corrige o #512 depois",                          # no text: nothing to write
+    "não corrige o #512: deixa como está",            # an instruction NOT to
+    "corrige os critérios do #512",                   # criteria are `refine`'s
+    "quando você corrige o #512: amanhã?",            # a question, not an order
+])
+def test_a_sentence_that_names_no_correction_stages_none(text):
+    assert (match_intent(text) or ("", {}))[0] != "correct", match_intent(text)
+
+
+# ── 5. aligning: the act that changes what gets BUILT ──────────────────────────────────────────
+
+def test_the_whole_alignment_gesture_reaches_the_write_through_the_channel():
+    project, module = _Project(), _Module(_Req(6, "accepted"))
+
+    ask = chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+                    channel="C1", module=module)
+
+    assert "#288" in ask and "requisito 6" in ask and "Confirma?" in ask, ask
+    assert module.aligned_with is None, "it rewrote the card before anybody confirmed"
+
+    done = chat_turn(project, text="sim", user="UADM", thread="C1", channel="C1", module=module)
+
+    assert module.aligned_with == ("288", 6, "UADM"), module.aligned_with
+    assert "#288" in done and "requisito 6" in done, done
+
+
+def test_aligning_to_a_REPLACED_requirement_is_refused_and_points_at_the_successor():
+    """This is the damage the act exists to undo, arriving from the other direction: thirteen open
+    cards already execute REQ-0004 because it was replaced and nobody re-pointed them. Writing a
+    fourteenth from the same retired text would be the platform committing the defect on purpose."""
+    project = _Project()
+    module = _Module(corpus=[_Req(4, "superseded", superseded_by=6), _Req(6, "accepted")])
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 4", user="UADM", thread="C1",
+                      channel="C1", module=module)
+
+    assert "6" in reply and "substituído" in reply, reply
+    assert _waiting() is None, "it staged a write against a retired text"
+
+
+def test_the_refusal_names_the_END_of_the_chain_and_not_the_next_link():
+    """0002 → 0004 → 0006, the shape the corpus really has. Naming 0004 hands the person an
+    instruction that walks them into this very refusal one number along, pointing at another
+    retired text — the platform performing, as advice, the defect this act exists to undo."""
+    project = _Project()
+    module = _Module(corpus=[_Req(2, "superseded", superseded_by=4),
+                             _Req(4, "superseded", superseded_by=6),
+                             _Req(6, "accepted")])
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 2", user="UADM", thread="C1",
+                      channel="C1", module=module)
+
+    named = re.search(r"Se o (\d+) é o que vale", reply)
+    assert named, reply
+    assert named.group(1) == "6", f"the refusal points at a retired requirement: {reply}"
+
+    followed = chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+                         channel="C1", module=module)
+    assert "Confirma?" in followed, f"following the instruction hit another refusal: {followed}"
+
+
+def test_a_supersession_that_leads_NOWHERE_is_said_plainly_rather_than_called_abandoned():
+    """A retired requirement whose replacement is not in the base is our inconsistency. Both other
+    answers are lies about it: one sends the person to a number nobody can open, the other tells
+    them the work was abandoned when somebody decided the opposite."""
+    project, module = _Project(), _Module(corpus=[_Req(4, "superseded", superseded_by=6)])
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 4", user="UADM", thread="C1",
+                      channel="C1", module=module)
+
+    assert "substituído" in reply, reply
+    assert "abandonado" not in reply, reply
+    assert _waiting() is None
+
+
+def test_a_requirement_nobody_wrote_is_said_plainly_rather_than_staged():
+    project, module = _Project(), _Module(_Req(6))
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 9", user="UADM", thread="C1",
+                      channel="C1", module=module)
+
+    assert "não encontrei o requisito 9" in reply, reply
+    assert _waiting() is None
+
+
+@pytest.mark.parametrize("gesture", ["alinha o #288 ao requisito 6", "aceita o requisito 6",
+                                     "cancela o requisito 6"])
+def test_an_UNREADABLE_BASE_is_never_reported_as_a_requirement_that_does_not_exist(gesture):
+    """A DEFINITIVE FALSE STATEMENT, and the honest one was computed six lines further down and
+    never reached. Loading the documentation base never raises — it hands back a context that is
+    `available=False` carrying an EMPTY corpus — so on an outage `by_number` answers None for every
+    number, and all three gestures told the client the requirement is not written in their base.
+
+    `_handle`'s `ctx.available` gate is only reached when the intent dispatcher returns nothing,
+    and each of these returns a sentence. So the gate existed, one screen below, and none of the
+    three could ever reach it. The three say the same thing, which is why one wrong sentence became
+    three: they were unified before they were correct.
+    """
+    project, module = _Project(), _Module(_Req(6, "accepted"), available=False)
+
+    reply = chat_turn(project, text=gesture, user="UADM", thread="C1", channel="C1", module=module)
+
+    assert "não encontrei o requisito" not in reply, (
+        f"an unreadable base was reported as a requirement that does not exist: {reply}")
+    assert "não estou conseguindo enxergar" in reply.lower(), reply
+    assert _waiting() is None, "it staged an act over a base it could not read"
+
+
+@pytest.mark.parametrize("status", sorted(_KNOWN_STATUS))
+def test_align_asks_for_a_confirmation_ONLY_where_the_module_would_write(status):
+    """THE GATE THE CHANNEL CHECKS IS THE ONE THE MODULE ENFORCES. `align_card` writes only from a
+    PROMISE; this branch admitted anything still live, so a proposed requirement bought a "this
+    changes what gets built — Confirma?" from a person, displaced whatever else was awaiting
+    confirmation in the thread, and was then refused one call deeper by a gate that had never
+    moved. A confirmation asked for an act that cannot happen spends the only thing this surface
+    ever asks of a human.
+
+    Parametrised over every status the corpus knows, read from the corpus: a lifecycle state added
+    later is covered on the day it is added rather than on the day somebody remembers this file.
+    """
+    project, module = _Project(), _Module(_Req(6, status))
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+                      channel="C1", module=module)
+
+    staged = _waiting() is not None
+    assert staged is _Req(6, status).is_promise, (
+        f"a {status} requirement {'was staged' if staged else 'was refused'}: {reply}")
+
+
+def test_the_refusal_for_an_UNAGREED_requirement_is_the_MODULE_S_OWN_SENTENCE():
+    """`_not_a_promise` is what `align_card` and `break_down` both answer with, and it separates a
+    proposal ("confirm it and I'll go") from a reading of the code ("this was never a promise").
+    A second sentence written here would be a person told two different things about one rule,
+    which teaches them the rule is arbitrary."""
+    from beeverforge.product.module import _not_a_promise
+
+    project = _Project()
+    req = _Req(7, "proposed")
+
+    reply = chat_turn(project, text="alinha o #288 ao requisito 7", user="UADM", thread="C1",
+                      channel="C1", module=_Module(req))
+
+    assert _not_a_promise(7, req, language=project.language) in reply, reply
+
+
+def test_a_replacement_NOBODY_HAS_AGREED_TO_YET_is_not_reported_as_a_BROKEN_BASE(caplog):
+    """`propose_requirement` retires the predecessor in the SAME commit that writes the
+    replacement as a proposal, so between that commit and somebody's yes every alignment onto the
+    old number lands here — the commonest shape there is.
+
+    Read as a broken chain it produced two harms at once: the client was told our base points at a
+    text nobody can open, about a requirement that reads perfectly well, and an operator alarm
+    fired with nothing behind it — a bug report somebody chases and finds nothing. The truth is
+    that the alignment is one confirmation away, and the message says which one, in sentences this
+    surface matches.
+    """
+    project = _Project()
+    module = _Module(corpus=[_Req(4, "superseded", superseded_by=6), _Req(6, "proposed")])
+
+    with caplog.at_level(logging.WARNING):
+        reply = chat_turn(project, text="alinha o #288 ao requisito 4", user="UADM", thread="C1",
+                          channel="C1", module=module)
+
+    assert "BEEVERFORGE_PRODUCT_CHAIN_BROKEN" not in caplog.text, "a readable corpus raised an alarm"
+    assert "não consegui achar" not in reply, f"a readable text was called unreadable: {reply}"
+    assert "requisito 6" in reply, reply
+    assert _waiting() is None, "it staged a write the module would refuse"
+
+    # BOTH STEPS ARE SAID, NEITHER QUOTED (#565): agreeing and aligning are acts the role
+    # proposes from any words, so there is no sentence to copy — and agreeing is itself staged for
+    # a yes, so the alignment comes after that answer
+    assert "«" not in reply, reply
+    agree = reply.index("está acordado")
+    assert agree < reply.index("confirme quando eu perguntar") < reply.index("alinhar o #288"), (
+        reply)
+
+
+def test_a_replacement_THE_CLIENT_KILLED_is_never_offered_as_one_confirmation_away(caplog):
+    """The other end of the same walk. `_replacement` answers which requirement the chain NAMES,
+    whatever became of it, and the branch read that as "a text waiting for a yes" — so REQ-0004
+    superseded by a REQ-0006 the client had DROPPED came back as "o 6 ainda não foi acordado …
+    me diga «aceita o requisito 6»".
+
+    That instruction is the harm, not the wording: `accept` refuses only what is already agreed, so
+    the yes it invites would write a text the client decided against back into force as a promise
+    the factory defends. Nothing here is one confirmation away, and the reply must not pretend it
+    is — nor call a readable base broken, which is the other wrong answer one line down.
+    """
+    project = _Project()
+    module = _Module(corpus=[_Req(4, "superseded", superseded_by=6), _Req(6, "dropped")])
+
+    with caplog.at_level(logging.WARNING):
+        reply = chat_turn(project, text="alinha o #288 ao requisito 4", user="UADM", thread="C1",
+                          channel="C1", module=module)
+
+    assert "ainda não foi acordado" not in reply, (
+        f"a requirement the client cancelled is described as pending a yes: {reply}")
+    assert re.findall(r"«([^»]+)»", reply) == [], (
+        f"it tells the client to type something that would reinstate a dropped text: {reply}")
+    assert "BEEVERFORGE_PRODUCT_CHAIN_BROKEN" not in caplog.text, "a readable corpus raised an alarm"
+    assert "requisito 6" in reply and "já não vale" in reply, reply
+    assert _waiting() is None, "it staged a write the module would refuse"
+
+
+def test_a_RETIRED_requirement_is_never_staged_for_acceptance():
+    """Where that instruction used to lead. This branch compared a raw status to "accepted" while
+    the module's own question is `is_promise`, and it never asked `is_live` at all — the flag
+    `drop` reads one branch below. So a superseded or dropped requirement bought a confirmation
+    from a person, and `module.accept` refuses only what is ALREADY agreed: the yes would have put
+    a retired text back into force."""
+    project = _Project()
+
+    for status in ("superseded", "dropped"):
+        module = _Module(_Req(6, status, superseded_by=8 if status == "superseded" else None),
+                         said="Entendi.\n[[ACORDO: REQ-0006]]")
+
+        said = chat_turn(project, text="aceita o requisito 6", user="UADM", thread="C1",
+                         channel="C1", module=module)
+
+        assert _waiting() is None, f"a {status} requirement was staged for acceptance"
+        assert "já não vale" in said, said
+        assert "Confirma?" not in said, said
+
+
+def test_the_two_readings_of_a_SUPERSESSION_CHAIN_agree():
+    """Two walks of one chain is how the two come to disagree — the reason `_successor` was
+    borrowed rather than re-implemented. `_replacement` answers a different question ("is there a
+    text at all"), and where both answer they must give the same node."""
+    from beeverforge.product.module import _successor
+
+    corpus = _Module(corpus=[_Req(2, "superseded", superseded_by=4),
+                             _Req(4, "superseded", superseded_by=6),
+                             _Req(6, "accepted")]).context().corpus
+
+    for number in (2, 4):
+        promise = _successor(corpus, number)
+        replacement = engine._replacement(corpus, number)
+        assert promise == replacement.number, (number, promise, replacement)
+
+
+def test_an_unauthorised_yes_neither_aligns_nor_consumes_the_proposal():
+    project, module = _Project(admins=["UADM"]), _Module(_Req(6))
+    chat_turn(project, text="alinha o #288 ao requisito 6", user="UADM", thread="C1",
+              channel="C1", module=module)
+
+    chat_turn(project, text="sim", user="USTRANGER", thread="C1", channel="C1", module=module)
+
+    assert module.aligned_with is None
+    assert _waiting() is not None
+
+
+# ── 6. a refusal that points somewhere, and the pointer is EXECUTABLE ──────────────────────────
+
+def test_the_refine_refusal_names_the_other_act():
+    """It stays a refusal — amending criteria somebody may already be working from is a different
+    risk from writing where there was nothing. What changed is that it no longer ends nowhere."""
+    from beeverforge.product.authoring import WriteResult
+
+    # the language is NAMED: this guard asserts the Portuguese refusal, and the platform's
+    # default became English in 2026-08-14
+    said = confirm._refine_reply(WriteResult(ok=True, ref="#516", existed=True, detail="x"), 516,
+                            "Nina", lang="pt-BR")
+
+    assert "já dizia quando estaria pronto" in said, said
+    assert "alinha" in said.lower(), "the refusal still leaves the person at a dead end"
+
+
+#: The token `refine_refused` writes where the person has to supply a number. It cannot know which
+#: requirement applies to the card, so its instruction is a SHAPE — and a shape has to be declared
+#: as one, here, rather than patched away inside the assertion.
+_PLACEHOLDER = "N"
+
+
+# ── 7. what the client reads ───────────────────────────────────────────────────────────────────
+
+#: The one piece of free text a CLIENT supplies to these messages. It comes back quoted in «…», the
+#: same way an instruction is, and it is the only quoted span that is not something to type — so it
+#: is written once here and read by both the sentence and the walk below, which cannot then drift.
+_A_CLIENTS_OWN_WORDS = "o cliente desistiu"
+
+
+def _every_new_sentence() -> list[str]:
+    return [
+        close_confirmation(number=511, language="pt-BR"),
+        close_confirmation(number=511, in_favour_of=288, language="pt-BR"),
+        close_confirmation(number=511, reason=_A_CLIENTS_OWN_WORDS, language="pt-BR"),
+        card_closed(number=511, language="pt-BR", agent_name="Nina"),
+        card_closed(number=511, reasoned=True, language="pt-BR", agent_name="Nina"),
+        card_closed(number=511, in_favour_of=288, language="pt-BR", agent_name="Nina"),
+        card_closed(number=511, in_favour_of=288, linked=False, language="pt-BR",
+                    agent_name="Nina"),
+        align_confirmation(number=288, requirement=6, title="Aviso acionável", language="pt-BR"),
+        card_aligned(number=288, requirement=6, language="pt-BR", agent_name="Nina"),
+        card_aligned(number=288, requirement=6, noted=False, language="pt-BR", agent_name="Nina"),
+        align_refused(number=288, requirement=4, successor=6, language="pt-BR"),
+        align_refused(number=288, requirement=5, language="pt-BR"),
+        align_refused(number=288, requirement=4, replaced=True, language="pt-BR"),
+        align_to_unagreed(number=288, requirement=4, successor=6, language="pt-BR"),
+        align_to_dropped_replacement(number=288, requirement=4, successor=6, language="pt-BR"),
+        refine_refused(number=516, language="pt-BR"),
+        correct_confirmation(number="512", text="um relatório semanal", title="Semanal",
+                             language="pt-BR"),
+        card_corrected(number="512", language="pt-BR", agent_name="Nina"),
+        card_corrected(number="512", criteria_removed=True, language="pt-BR", agent_name="Nina"),
+        card_corrected(number="512", noted=False, language="pt-BR", agent_name="Nina"),
+        *(correction_refused(reason, number="512", column="In progress", language="pt-BR")
+          for reason in ("requirement", "board", "started", "unmapped", "rename")),
+        criteria_written(number=412, measure="3 critérios", language="pt-BR"),
+        criteria_written(number=412, noted=False, language="pt-BR"),
+    ]
+
+
+def test_a_QUOTED_gesture_never_carries_its_QUOTATION_into_a_record():
+    """The other half of admitting «…» where a clause begins. A capture is free text that travels
+    onward: `drop`'s reason is written into the record in the client's name and read back to them,
+    so a stray » must not end up as the grounds on which somebody decided to retire a promise.
+
+    The drop is the role's marker now (#565), and the quotation comes off what it carries the way
+    it came off the pattern's capture."""
+    from beeverforge.product.role import read_answer
+
+    quoted = read_answer("Certo.\n[[DESCARTE: REQ-2; «porque mudou a lei»]]")
+
+    assert quoted.gesture_args == {"number": "2", "reason": "porque mudou a lei"}, quoted
+
+
+@pytest.mark.parametrize("text", _every_new_sentence(), ids=range(len(_every_new_sentence())))
+def test_no_machinery_reaches_the_client(text):
+    assert jargon_in(text) == [], text
+    for field in ("status", "superseded", "in_favour_of", "acceptance criteria"):
+        assert field not in text.lower(), f"a field name reached the client: {text}"
+
+
+def test_closing_a_DUPLICATE_never_reads_like_closing_something_abandoned():
+    """One says the work moved, the other says it will not be done. Two facts, two sentences —
+    the class this codebase has paid for four times."""
+    alone = close_confirmation(number=511, language="pt-BR")
+    duplicate = close_confirmation(number=511, in_favour_of=288, language="pt-BR")
+
+    assert alone != duplicate
+    assert "#288" in duplicate and "#288" not in alone
+    assert "não está sendo cancelado" in duplicate, (
+        "closing a duplicate reads as giving the work up")
+
+
+def test_closing_a_CARD_never_reads_like_dropping_a_REQUIREMENT():
+    """They are one sentence apart in a chat window and opposite in weight. A person who confirms
+    the wrong one of these has not made a small mistake: dropping a requirement takes back what
+    the factory defends."""
+    card = close_confirmation(number=511, in_favour_of=288, language="pt-BR")
+    promise = drop_confirmation(number=6, title="Aviso acionável", was_a_promise=True,
+                                language="pt-BR")
+
+    assert "defeito" not in card, "closing a card claims to change what the product promises"
+    assert "promete" in card or "acordado" in card, (
+        "closing a card does not say that the promises are untouched")
+    assert "defende" in promise and "defende" not in card
+
+
+def test_aligning_says_what_changes_and_that_nothing_starts_because_of_it():
+    """The only act on this surface that changes WHAT GETS BUILT without spending anything yet.
+    Both halves have to be said, or a person confirms either a formatting tidy-up or a build."""
+    text = align_confirmation(number=288, requirement=6, title="Aviso acionável", language="pt-BR")
+
+    assert "o que vai ser construído" in text, "it reads like a wording fix"
+    assert "Nada começa" in text, "nobody is told that confirming this starts no work"
+    assert "requisito 6" in text and "#288" in text
+
+
+@pytest.mark.parametrize(("fn", "kw"), [
+    (card_closed, {"number": 511}),
+    (card_closed, {"number": 511, "reasoned": True}),
+    (card_closed, {"number": 511, "in_favour_of": 288}),
+    (card_closed, {"number": 511, "in_favour_of": 288, "linked": False}),
+    (card_aligned, {"number": 288, "requirement": 6}),
+    (card_aligned, {"number": 288, "requirement": 6, "noted": False}),
+    (criteria_written, {"number": 412, "measure": "3 critérios"}),
+    (criteria_written, {"number": 412, "noted": False}),
+    (card_corrected, {"number": "512"}),
+    (card_corrected, {"number": "512", "noted": False}),
+    (card_corrected, {"number": "512", "criteria_removed": True}),
+])
+def test_every_new_success_sentence_is_visible_to_the_false_claim_detector(fn, kw):
+    """Derived from the real phrases, like the sentences before them. The detector's worst blind
+    spot has always been the platform's OWN confirmation vocabulary echoed back by the agent — the
+    first version could not see "Anotado", the word `fact_noted` uses.
+
+    THE WORD THE SENTENCE LEADS WITH, not "some claim somewhere in it". Both of these end with a
+    second, older claim verb ("escrevi", "registrado"), so a detector blind to "encerrado" and
+    "alinhado" would still fire and look covered — while the agent echoing only the headline
+    ("Encerrado o #511") passed straight through it.
+    """
+    text = fn(language="pt-BR", **kw)
+    leads_with = text.split()[0].strip(":.,*").lower()
+
+    assert claims_a_write(text).lower() == leads_with, (
+        f"{fn.__name__} announces a write with {leads_with!r} and the detector cannot see it")
+
+
+# ── 8. the two landmines this surface has already paid for ─────────────────────────────────────
+
+def _run_intent_body() -> ast.FunctionDef:
+    tree = parsed(Path("beeverforge/product/engine.py"))
+    return next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_run_intent")
+
+
+def _intent_branches() -> dict[str, ast.If]:
+    """`intent name -> the branch that carries it out`, read off the dispatcher.
+
+    What a gesture COSTS when it is matched wrongly is decided here, in the handler, and the
+    matcher has to know it. Reading it rather than restating it is what keeps the two from drifting
+    apart while both look right."""
+    return {node.test.comparators[0].value: node
+            for node in _run_intent_body().body
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+            and getattr(node.test.left, "id", "") == "intent"
+            and isinstance(node.test.comparators[0], ast.Constant)}
+
+
+def test_may_act_is_imported_ONCE_at_the_top_of_the_intent_dispatcher():
+    """Importing it inside a branch makes it a function-local name for the WHOLE function, so the
+    next branch added above that line raises UnboundLocalError on its authorisation check — which
+    the client reads as "algo quebrou do meu lado". Two branches were added above it here."""
+    fn = _run_intent_body()
+    imports = [n for n in ast.walk(fn)
+               if isinstance(n, ast.ImportFrom) and any(a.name == "may_act" for a in n.names)]
+
+    assert len(imports) == 1, f"may_act is imported {len(imports)} times inside _run_intent"
+    assert imports[0] in fn.body, "may_act is imported inside a branch — a landmine for the next one"
+
+
+@pytest.mark.parametrize("method", ["close_card", "align_card", "correct_card"])
+def test_the_channel_actually_calls_the_module(method):
+    """This repository's signature defect, fourteen times over: a capability that exists, passes
+    its tests and is reached by nothing in production."""
+    tree = _channel_tree()
+
+    assert any(isinstance(n, ast.Call) and getattr(n.func, "attr", None) == method
+               for n in ast.walk(tree)), f"{method} is written and reached by nothing"

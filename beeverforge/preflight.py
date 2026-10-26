@@ -1,0 +1,772 @@
+"""`beeverforge preflight` — what is still wrong with THIS machine, before anything starts.
+
+WHERE THIS SITS, AND WHY IT IS NOT A FOURTH OPINION. `doctor` answers *can this deployment run a
+ticket for this project* — credentials, board, manifest, floor. `readiness` composes a verdict
+across the laptop and the worker. Neither can be asked anything before Docker works, which is
+exactly the moment the one-line install needs an answer: the user has typed one command, nothing
+is running yet, and the only interesting question is what about their machine will stop this.
+
+So this module is the HOST-level sibling of those two, and it deliberately borrows their
+vocabulary rather than inventing one. `readiness.Finding` already carries `check, ok, message,
+remedy, measured_on, answered` with three states rather than two — and `readiness.py` exists
+BECAUSE `doctor`, `gate_reason` and `conformance` had three disagreeing notions of "ready". A
+fourth, installer-private notion would re-open the exact defect that module closed. The
+constructors come from there too: `_fail` makes `remedy` positional and required, so a failing
+finding without one cannot be built here any more than it can be built there.
+
+THE THIRD STATE IS THE ONE THAT EARNS ITS KEEP HERE. Almost every check below is downstream of the
+Docker daemon: with no daemon there is no answer to "is the box image present", and *inventing*
+one is worse than admitting it. `answered=False` renders as `----`, never counts toward the
+failure count, and never reads as a pass — so a preflight that could ask almost nothing says so
+instead of producing a short, cheerful, meaningless report.
+
+`--json` IS A PUBLIC CONTRACT AND IS VERSIONED FROM THE FIRST COMMIT. The agent lane (`install.md`,
+`install.sh --with-agent`) reads this document rather than inspecting the machine itself, which is
+what keeps the LLM a reader and an explainer instead of an authority: it cannot surface a problem
+the deterministic lane does not name, so it cannot invent a step. A document whose shape changes
+silently would break every reader at once, so `SCHEMA` moves when the shape does.
+
+WHY EVERY FACT IS AN INJECTED PROBE. The same reason `doctor.Probes` exists: a diagnostic that can
+only be exercised on a healthy machine is a diagnostic nobody can prove reports illness. Every
+branch below is reachable in a test with no Docker, no network and no ports.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import socket
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+# THE VOCABULARY IS BORROWED, NOT COPIED, and that is the whole point of the module docstring
+# above. `_fail`'s signature is the enforcement — you cannot construct a failing finding without
+# saying what to do about it — so importing it is importing the rule, while re-declaring three
+# one-line constructors here would be re-declaring the rule and letting it drift.
+from beeverforge.listeners import LISTENERS
+from beeverforge.onboarding.deployment import UnusableHome, UnusableWorkDir
+from beeverforge.onboarding.readiness import LOCAL, Finding, _fail, _ok, _unanswered
+
+log = logging.getLogger("beeverforge.preflight")
+
+#: The shape `--json` emits. MOVES WHEN THE SHAPE MOVES: `install.md` is a public contract the
+#: moment it is published, and a reader that cannot tell version 1 from version 2 fails in the
+#: least useful way available — by half-understanding a document it thinks it understands.
+SCHEMA = "beeverforge.preflight/1"
+
+#: What the three images and their layers actually need on disk, measured against
+#: `docs/ONBOARDING.md` §0's "budget ~8 GB": the worker carries a Node runtime and four agent CLIs,
+#: the box image carries the toolchain. Checked as a WARNING-shaped failure with a remedy rather
+#: than a refusal, because a full disk is the one prerequisite that fails halfway through a
+#: multi-gigabyte pull — after twenty minutes, with a message about a layer rather than about
+#: space.
+DISK_HEADROOM_BYTES = 12 * 1024 * 1024 * 1024
+
+#: The ports the stack publishes, and the variable each is overridden by — READ FROM THE ONE
+#: DEFINITION (`beeverforge/listeners.py`, #183), which grew out of this very table: it named the
+#: three listeners and the variable for each, and only preflight read it, while `up`, `init`, the
+#: doctor and every consumer kept a literal of their own.
+PUBLISHED_PORTS: tuple[tuple[str, str, int], ...] = tuple(
+    (listener.name, listener.port_var, listener.default_port) for listener in LISTENERS)
+
+
+@dataclass
+class Probes:
+    """Everything `check` needs to know about the world, as callables it can be handed.
+
+    Each returns a PAIR wherever the reason matters. A stopped daemon and a missing `docker` CLI
+    both make `docker info` fail and the remedies are opposite — `doctor.Probes.docker_running`
+    carries the same comment, and the compose worker once hit the second and was told the first
+    while Docker was serving the container printing the message."""
+
+    #: `(present, detail)` — the version string, or why it could not be read.
+    compose: Callable[[], tuple[bool, str]]
+    #: `(reachable, detail)` — the daemon's own `os/arch`, or why it did not answer.
+    daemon: Callable[[], tuple[bool, str]]
+    #: This machine's architecture, as Docker spells it (`amd64`, `arm64`).
+    host_arch: Callable[[], str]
+    #: Whether a TCP port can be bound here. Bound-and-released, never scanned: "something answers
+    #: on 8080" and "8080 is taken" are different questions and only the second one blocks `up`.
+    port_free: Callable[[int], bool]
+    #: Free bytes on the filesystem Docker stores images on, or None where that cannot be read.
+    free_disk: Callable[[], int | None]
+    #: The job workspace this deployment will use, and whether it can be created and written
+    #: WITHOUT root — the property P0.4 exists to deliver, checked rather than assumed. None when
+    #: `$HOME` gives no place to put it; `UnusableWorkDir` RAISED when a declared value cannot be
+    #: bound, which carries the value so the finding can name it (#367).
+    work_dir: Callable[[], str | None]
+    writable_without_root: Callable[[str], tuple[bool, str]]
+    #: `True`/`False`/`None`, and the None is the point: with no daemon there is no answer, and a
+    #: `False` here would send somebody to `docker pull` an image against a daemon that is not
+    #: running — a remedy that cannot work, which is worse than no remedy at all.
+    image_present: Callable[[str], bool | None]
+    #: The box image this deployment will launch, or None when that cannot be determined here.
+    #:
+    #: NONE IS NOT AN OVERSIGHT AND IT COST A FALSE PASS TO LEARN. The first version fell back to
+    #: `adapters/sandbox/registry.DEFAULT_BOX_IMAGE` when nothing said otherwise, and preflight —
+    #: which by design runs BEFORE the stack exists, with no `BEEVERFORGE_SANDBOX_IMAGE` in its
+    #: environment — cheerfully reported `ok  box_image  the box image beeverforge-python is on
+    #: this daemon` on a machine that had that old local tag lying around and had never seen the
+    #: published one the compose file actually names (measured 2026-08-30, running the command).
+    #: A pass about the wrong image is worse than no answer about the right one.
+    sandbox_image: Callable[[], str | None]
+    #: `(exists, mode, unreadable)` for `.env.compose`: mode is None when it is absent, and
+    #: `unreadable` says why a file that is there could not be read — `""` when it could (#583).
+    env_file: Callable[[], tuple[bool, int | None, str]]
+    #: `(visible, detail)` for the agent's credential — ONBOARDING calls it the one prerequisite
+    #: that cannot be postponed, and the stack boots happily without it.
+    #: `(visible, detail)`, and on a miss the REPAIR the harness names as a third item — its own
+    #: words for how its credential is fixed, which the finding says where the file is (#582).
+    #: Under a declared credential store other than `env`, "where" is that store, named and never
+    #: read: this check is made to run before the stack, and `beeverforge doctor` checks the
+    #: store (#904).
+    agent_credential: Callable[[], tuple[bool, str] | tuple[bool, str, str]]
+    #: The published ports this deployment will actually use, after its own overrides.
+    ports: Callable[[], tuple[tuple[str, int], ...]]
+    #: The `BEEVERFORGE_PREVIEW_*` rows `.env.compose` carries (#265) — which preview runtime this
+    #: deployment names, and how the panel reaches it. Empty = none named, previews off. A
+    #: DEFAULT, so a probe set written before previews existed still builds.
+    preview_rows: Callable[[], dict[str, str]] = lambda: {}
+
+
+@dataclass
+class Report:
+    """Everything measured, and a verdict that is computed from it rather than stored beside it."""
+
+    findings: list[Finding] = field(default_factory=list)
+    measured_on: str = LOCAL
+
+    @property
+    def missing(self) -> list[Finding]:
+        """Answered checks that are not met. An unanswered check is never one of these."""
+        return [f for f in self.findings if f.answered and not f.ok]
+
+    @property
+    def unanswered(self) -> list[Finding]:
+        return [f for f in self.findings if not f.answered]
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing
+
+    @property
+    def verdict(self) -> str:
+        """One sentence. The unanswered count is carried into it deliberately: a green report that
+        asked almost nothing is not the same as a green report, and the difference is invisible
+        unless the sentence says so."""
+        if self.missing:
+            return f"MISSING {len(self.missing)}"
+        if self.unanswered:
+            return f"OK, {len(self.unanswered)} could not be answered here"
+        return "OK"
+
+    def as_document(self) -> dict:
+        """The state document the agent lane consumes. Versioned, flat, and complete — every
+        finding, including the ones that passed, because "what is already fine" is half of what
+        stops an explainer from proposing a step that is already done."""
+        return {
+            "schema": SCHEMA,
+            "verdict": self.verdict,
+            "ok": self.ok,
+            "measured_on": self.measured_on,
+            "findings": [
+                {
+                    "check": f.check,
+                    "ok": f.ok,
+                    "answered": f.answered,
+                    "message": f.message,
+                    "remedy": f.remedy,
+                    "measured_on": f.measured_on,
+                }
+                for f in self.findings
+            ],
+        }
+
+
+def _guarded(check: str, fn: Callable[[], Finding]) -> Finding:
+    """Run one check without letting it become the thing that is broken.
+
+    `doctor._guarded`'s rule, for the same reason and one layer lower: preflight is what somebody
+    runs when nothing works, and a traceback out of the diagnostic tells them nothing about their
+    machine and rather a lot about ours. A check that RAISED stays `answered=True, ok=False` with a
+    remedy — a broken check is a defect to report, never an absence to shrug at."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001 — a failed probe is a finding, not a crash
+        return _fail(check, f"could not check {check}: {exc}",
+                     f"run the underlying command by hand to see the raw error, and please report "
+                     f"this — `{check}` failing to run is our defect, not your machine's", on=LOCAL)
+
+
+def check(probes: Probes) -> Report:
+    """Every check, every time.
+
+    STOPPING AT THE FIRST FAILURE TURNS ONE SESSION INTO SIX — `doctor.diagnose`'s rule, and it
+    matters more here: this runs during an install, and a person who has to re-run an installer
+    once per problem stops after the second."""
+    return Report(findings=[
+        _guarded("docker_daemon", lambda: _daemon(probes)),
+        _guarded("docker_compose", lambda: _compose(probes)),
+        _guarded("architecture", lambda: _architecture(probes)),
+        _guarded("ports", lambda: _ports(probes)),
+        _guarded("disk", lambda: _disk(probes)),
+        _guarded("work_dir", lambda: _work_dir(probes)),
+        _guarded("box_image", lambda: _box_image(probes)),
+        _guarded("env_file", lambda: _env_file(probes)),
+        _guarded("agent_credential", lambda: _agent_credential(probes)),
+        _guarded("preview", lambda: _preview(probes)),
+    ])
+
+
+def _daemon(p: Probes) -> Finding:
+    reachable, detail = p.daemon()
+    if reachable:
+        return _ok("docker_daemon", f"the Docker daemon answers ({detail})", on=LOCAL)
+    # A SOCKET THIS PROCESS MAY NOT USE IS NOT A STOPPED DAEMON, and the remedies are opposite
+    # (#529). On Docker Desktop the installer's container was refused the socket while the daemon
+    # was serving the very pulls of that install, and the sentence it read was "start Docker".
+    if "permission denied" in detail.lower():
+        return _fail(
+            "docker_daemon",
+            f"the Docker socket is there and this process may not use it: {detail}",
+            "give this process the group the socket has WHERE IT RUNS — in a container, "
+            "`docker run --group-add <gid>` with the gid `stat -c %g /var/run/docker.sock` prints "
+            "inside it (Docker Desktop shows the socket as 0:0 there, whatever the host file "
+            "says); on a Linux host, `sudo usermod -aG docker $USER` and log in again", on=LOCAL)
+    return _fail(
+        "docker_daemon", f"the Docker daemon did not answer: {detail}",
+        "start Docker (Docker Desktop, or `sudo systemctl start docker`) and run this again — "
+        "every other check below is downstream of it", on=LOCAL)
+
+
+def _compose(p: Probes) -> Finding:
+    present, detail = p.compose()
+    if present:
+        return _ok("docker_compose", f"docker compose v2 is present ({detail})", on=LOCAL)
+    # NAMED AS THE PLUGIN AND NOT AS `docker-compose`, deliberately. The v1 Python script is still
+    # on a great many machines and still on PATH as `docker-compose`; it cannot read `profiles:`
+    # the way this compose file uses them, so "you have compose" is true and useless.
+    return _fail(
+        "docker_compose", f"`docker compose` (v2, the plugin) is not usable here: {detail}",
+        "install the Compose v2 plugin — Docker Desktop ships it, and on Linux it is the "
+        "`docker-compose-plugin` package. The old `docker-compose` script is not the same thing "
+        "and cannot read this stack's profiles", on=LOCAL)
+
+
+def _architecture(p: Probes) -> Finding:
+    reachable, _ = p.daemon()
+    arch = p.host_arch()
+    if not reachable:
+        return _unanswered("architecture",
+                           "cannot ask which architecture the daemon runs until it answers",
+                           on=LOCAL)
+    # PUBLISHED FOR BOTH, so this is an informational pass rather than a gate — and it is still
+    # worth a line, because an image pulled for the wrong architecture RUNS, under emulation, at a
+    # speed that reads as "this product is slow" rather than as a configuration mistake.
+    if arch in ("amd64", "arm64"):
+        return _ok("architecture", f"{arch} — published images cover it natively", on=LOCAL)
+    return _fail(
+        "architecture", f"this machine is {arch}, and the published images are amd64 and arm64",
+        "build from source instead: clone the repository and run `make build`, which builds the "
+        "images for whatever architecture this machine is", on=LOCAL)
+
+
+def _ports(p: Probes) -> Finding:
+    taken = [(what, port) for what, port in p.ports() if not p.port_free(port)]
+    if not taken:
+        return _ok("ports", f"the {len(p.ports())} published ports are free", on=LOCAL)
+    listed = ", ".join(f"{port} ({what})" for what, port in taken)
+    overrides = " ".join(
+        f"{var}=<free port>" for what, var, _ in PUBLISHED_PORTS
+        if any(what == name for name, _ in taken))
+    return _fail(
+        "ports", f"already in use: {listed}",
+        f"stop whatever holds them, or put {overrides} in .env.compose — every published port is "
+        f"overridable precisely so running this does not mean stopping something else", on=LOCAL)
+
+
+def _disk(p: Probes) -> Finding:
+    free = p.free_disk()
+    if free is None:
+        return _unanswered("disk", "could not read free space where Docker stores images",
+                           on=LOCAL)
+    gigabytes = free / (1024 ** 3)
+    if free >= DISK_HEADROOM_BYTES:
+        return _ok("disk", f"{gigabytes:.1f} GB free where Docker stores images", on=LOCAL)
+    return _fail(
+        "disk", f"{gigabytes:.1f} GB free where Docker stores images, and the three images need "
+                f"about {DISK_HEADROOM_BYTES / (1024 ** 3):.0f} GB",
+        "free some space, or reclaim what Docker is already holding with `docker system prune -a` "
+        "— a pull that runs out part way reports a failed layer rather than a full disk", on=LOCAL)
+
+
+def _work_dir(p: Probes) -> Finding:
+    try:
+        where = p.work_dir()
+    except UnusableWorkDir as exc:
+        # THE VALUE SOMEBODY DECLARED IS THE CAUSE, SO THE FINDING NAMES IT (#367). The probe used
+        # to catch this as its parent and answer None, and a declared `~/work` was reported by the
+        # branch below — "$HOME is not a directory this process can write under", on a machine
+        # whose `$HOME` was fine, with a remedy to set the variable just set (measured on
+        # 34c91c7, 2026-10-01). It fails rather than going unanswered: compose would bind it, and
+        # the box would mount an empty directory.
+        return _fail(
+            "work_dir", f"BEEVERFORGE_WORK_DIR={exc.declared} is not a path compose can bind: "
+                        "compose resolves a relative bind source against the directory `up` ran "
+                        "in and expands no `~`, so the box would mount an empty directory",
+            "write the whole path — e.g. BEEVERFORGE_WORK_DIR=$HOME/.local/share/beeverforge/work "
+            "— and run this again", on=LOCAL)
+    if not where:
+        # NOT A FAILING CHECK, because nothing about this deployment is wrong: the question cannot
+        # be answered where it was asked. `$HOME` is `/` (Docker's answer for a uid with no passwd
+        # entry) or empty, so there is no user directory to put a workspace under — and the remedy
+        # is a variable, not a repair. Reporting "Permission denied" for `/.local/share/…` named
+        # the symptom of an answer that should never have been computed.
+        return _fail(
+            "work_dir", "no job workspace directory can be chosen here: $HOME is not a directory "
+                        "this process can write under",
+            "set BEEVERFORGE_WORK_DIR to an absolute path you own — e.g. "
+            "BEEVERFORGE_WORK_DIR=$HOME/.local/share/beeverforge/work — and run this again",
+            on=LOCAL)
+    fine, detail = p.writable_without_root(where)
+    if fine:
+        return _ok("work_dir", f"{where} is writable without root", on=LOCAL)
+    return _fail(
+        "work_dir", f"the job workspace {where} cannot be created or written here: {detail}",
+        "point BEEVERFORGE_WORK_DIR in .env.compose at a directory you own — an absolute path "
+        "with no `~` in it, because compose does not expand a tilde in a bind source and would "
+        "make a literal `./~` directory instead", on=LOCAL)
+
+
+def _box_image(p: Probes) -> Finding:
+    """THE failure this whole check exists for, and it is invisible until the first ticket.
+
+    The worker is told `BEEVERFORGE_SANDBOX_IMAGE` and `docker run`s it on the HOST's daemon — it
+    never builds it and compose never pulls it, because `sandbox-image` is behind the build
+    profile. If nothing pulled it there, box prepare dies on an image that the compose file names,
+    the release publishes, and this machine has never seen: three correct-looking facts and a
+    dead job."""
+    image = p.sandbox_image()
+    if image is None:
+        return _unanswered(
+            "box_image",
+            "cannot tell which box image this deployment will launch — no "
+            "BEEVERFORGE_SANDBOX_IMAGE, and no docker-compose.yml here to read it from", on=LOCAL)
+    present = p.image_present(image)
+    if present is None:
+        return _unanswered("box_image",
+                           f"cannot ask the daemon whether {image} is present until it answers",
+                           on=LOCAL)
+    if present:
+        return _ok("box_image", f"the box image {image} is on this daemon", on=LOCAL)
+    return _fail(
+        "box_image", f"the box image {image} is not on this daemon, and nothing else will pull it",
+        f"docker pull {image}   (the worker launches it as a SIBLING container on this daemon, so "
+        f"it has to be here — compose does not fetch it, and the job that needs it fails at the "
+        f"first ticket rather than at `up`)", on=LOCAL)
+
+
+def _env_file(p: Probes) -> Finding:
+    exists, mode, unreadable = p.env_file()
+    if not exists:
+        return _fail(
+            "env_file", ".env.compose has not been written yet",
+            "run `beeverforge init` — it asks a few questions and writes the file with only the "
+            "rows your answers use (by hand instead: cp .env.compose.example .env.compose)",
+            on=LOCAL)
+    # THERE AND NOT TO BE READ IS NOT "NOT WRITTEN" (#583). The installer runs this as the
+    # person's own uid, and a file a `sudo` run left root-owned at 0600 read as no file at all:
+    # the credential line below it then said nothing was set. Compose, run as the same person,
+    # cannot read it either, so nothing in it reaches the stack.
+    if unreadable:
+        return _fail(
+            "env_file", f".env.compose is there but could not be read ({unreadable}) — nothing "
+            "in it reaches this check, or the stack",
+            "make it yours and private again: `sudo chown \"$(id -u):$(id -g)\" .env.compose && "
+            "chmod 600 .env.compose`", on=LOCAL)
+    # 0600 IS NOT TIDINESS. That file holds a forge credential with write access to somebody's
+    # repositories and a harness token that costs money. `init` writes it 0600 before anything can
+    # read it; a file that arrived another way (copied from the template, restored from a backup,
+    # checked out) carries the umask of whoever made it.
+    if mode is not None and mode & 0o077:
+        return _fail(
+            "env_file", f".env.compose is mode {mode:04o} — readable beyond you",
+            "chmod 600 .env.compose — it holds a forge credential with write access to your "
+            "repositories and a harness token that bills someone", on=LOCAL)
+    return _ok("env_file", ".env.compose is present and readable only by you", on=LOCAL)
+
+
+def _agent_credential(p: Probes) -> Finding:
+    visible, detail, *repair = p.agent_credential()
+    if visible:
+        return _ok("agent_credential", f"an agent credential is visible ({detail})", on=LOCAL)
+    # A FAILURE AND NOT A WARNING, because the stack BOOTS without it and no ticket can run — the
+    # exact shape `doctor` was given this check for: a fresh install with zero credentials read
+    # "OK — can run a ticket" and failed at the first paid job. WHAT WAS READ is said (#582): a
+    # pool that cannot be used is not the same repair as no credential at all.
+    return _fail(
+        "agent_credential", f"no agent credential is visible to this deployment ({detail})",
+        (repair[0] if repair else
+         "run `claude setup-token` and put the result in CLAUDE_CODE_OAUTH_TOKEN in .env.compose "
+         "(or ANTHROPIC_API_KEY if you bill per token)")
+        + ". The stack starts without it and no ticket can run — this is the one credential that "
+          "cannot be postponed", on=LOCAL)
+
+
+def _preview(p: Probes) -> Finding:
+    """What THIS MACHINE owes the preview runtime `.env.compose` names (ADR-0050, #265).
+
+    The host half only — the worker's half (its daemon, its plugin, the panel's container) is
+    `doctor`'s, run inside the worker. What is checkable here, before anything starts: that a
+    `compose` runtime has the compose plugin it runs through, and that the reach it names is one
+    the panel can route — a loopback reach with no port range would publish nothing."""
+    rows = p.preview_rows()
+    kind = (rows.get("BEEVERFORGE_PREVIEW_RUNTIME") or "").strip().lower()
+    if not kind or kind == "none":
+        return _ok("preview", "no preview runtime is named (BEEVERFORGE_PREVIEW_RUNTIME) — "
+                              "previews are off, and every card says so", on=LOCAL)
+    if kind != "compose":
+        return _ok("preview", f"previews run on the `{kind}` runtime an add-on provides — its "
+                              f"package says what it needs", on=LOCAL)
+    problems: list[str] = []
+    present, detail = p.compose()
+    if not present:
+        problems.append(f"a `compose` preview runs through the compose plugin, and it is not "
+                        f"usable here: {detail}")
+    reach = (rows.get("BEEVERFORGE_PREVIEW_REACH") or "network").strip().lower()
+    if reach not in ("network", "loopback"):
+        problems.append(f"BEEVERFORGE_PREVIEW_REACH={reach!r} is neither `network` nor "
+                        f"`loopback`")
+    elif reach == "loopback" and not re.fullmatch(
+            r"\s*\d{2,5}\s*-\s*\d{2,5}\s*", rows.get("BEEVERFORGE_PREVIEW_PORTS") or ""):
+        problems.append("a loopback preview needs BEEVERFORGE_PREVIEW_PORTS as `lo-hi`, and it "
+                        "is not set")
+    if problems:
+        return _fail("preview", "; ".join(problems),
+                     "fix the BEEVERFORGE_PREVIEW_* rows in .env.compose (`beeverforge init "
+                     "--force` writes them for this kind of deployment), or set "
+                     "BEEVERFORGE_PREVIEW_RUNTIME=none to turn previews off", on=LOCAL)
+    return _ok("preview", f"previews run on this daemon through the compose plugin ({detail}), "
+                          f"reached over `{reach}`", on=LOCAL)
+
+
+# ── the probes a real machine answers with ──────────────────────────────────────────────────────
+#
+# EVERY ONE OF THESE IS I/O AND NONE OF THE LOGIC ABOVE IS. That split is what lets the whole
+# report be exercised in a test with no Docker, no ports and no filesystem — and it is why the
+# checks take a `Probes` rather than reaching for `subprocess` themselves.
+
+
+def _run(argv: list[str], timeout: int = 20) -> tuple[int, str]:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, f"{argv[0]}: not found on PATH"
+    except subprocess.TimeoutExpired:
+        return 124, f"{' '.join(argv)} did not answer within {timeout}s"
+    # A BLANK LINE ON STDOUT IS NO ANSWER, and it used to hide the one that was on stderr (#529).
+    # Refused the socket, `docker version --format …` prints its empty template — a lone `\n` — to
+    # stdout and the cause to stderr; `(stdout or stderr)` took the newline, stripped it to nothing,
+    # and the person read "docker gave no answer" instead of "permission denied" (measured on
+    # Docker Desktop, 2026-10-05).
+    return done.returncode, (done.stdout.strip() or done.stderr.strip())
+
+
+def _probe_daemon() -> tuple[bool, str]:
+    code, out = _run(["docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"])
+    if code == 0 and out:
+        return True, out
+    if "permission denied" in out.lower():
+        out = f"{out} ({_the_socket_as_this_process_sees_it()})"
+    return False, out or "docker gave no answer"
+
+
+def _the_socket_as_this_process_sees_it() -> str:
+    """Who owns the socket HERE, and who is asking — the two numbers a permission refusal is about.
+
+    `stat` and not `open`: it needs no access to the socket itself, so it answers exactly when the
+    connection was refused. Inside a container these are the container's numbers, which on Docker
+    Desktop are not the host file's (#529) — and the difference is the whole diagnosis."""
+    host = os.environ.get("DOCKER_HOST", "")
+    path = host.removeprefix("unix://") if host.startswith("unix://") else "/var/run/docker.sock"
+    try:
+        found = os.stat(path)
+    except OSError as exc:
+        return f"{path} cannot be read here: {exc.strerror or exc}"
+    groups = ",".join(str(g) for g in sorted({os.getgid(), *os.getgroups()}))
+    return (f"{path} is {found.st_uid}:{found.st_gid} mode {found.st_mode & 0o7777:o} here, "
+            f"and this process is uid {os.getuid()} in groups {groups}")
+
+
+def _probe_compose() -> tuple[bool, str]:
+    code, out = _run(["docker", "compose", "version", "--short"])
+    return code == 0, out or "the compose plugin gave no answer"
+
+
+def _probe_port_free(port: int) -> bool:
+    """BOUND AND RELEASED, never scanned. "Something answers on 8080" and "8080 cannot be bound"
+    are different questions, and only the second one stops `docker compose up`."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def _probe_free_disk() -> int | None:
+    code, out = _run(["docker", "info", "--format", "{{.DockerRootDir}}"])
+    root = out if code == 0 and out else "/var/lib/docker"
+    for candidate in (root, "/"):
+        try:
+            return shutil.disk_usage(candidate).free
+        except OSError:
+            continue
+    return None
+
+
+def _probe_image_present(image: str) -> bool | None:
+    reachable, _ = _probe_daemon()
+    if not reachable:
+        return None
+    code, _ = _run(["docker", "image", "inspect", image])
+    return code == 0
+
+
+def _probe_writable(where: str) -> tuple[bool, str]:
+    import pathlib
+    import tempfile
+
+    path = pathlib.Path(where)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path):
+            pass
+    except OSError as exc:
+        return False, exc.strerror or str(exc)
+    return True, "created and written as this user"
+
+
+def _probe_env_file(path: str = ".env.compose") -> tuple[bool, int | None, str]:
+    """`(it is there, its mode, why it could not be read — "" when it could)` (#583)."""
+    import pathlib
+
+    from beeverforge import envfile
+
+    read = envfile.read(path)
+    if not read.exists:
+        return False, None, ""
+    try:
+        mode = pathlib.Path(path).stat().st_mode & 0o777
+    except OSError:
+        mode = None
+    return True, mode, read.unreadable
+
+
+def _probe_agent_credential() -> tuple[bool, str] | tuple[bool, str, str]:
+    # THE HARNESS SAYS WHAT IT AUTHENTICATES WITH (#582), read by its own adapter
+    # (`registry.harness_credential`) over the deployment's settings. This kept two names of its
+    # own — the two the container sandbox forwards to the box — and failed a deployment running
+    # on the token pool alone, which the worker runs on, telling it to replace a token that worked.
+    # READ WHERE THE DEPLOYMENT KEEPS THEM (#560): `_settings`, the env file under the environment.
+    # The installer's preflight runs in a container whose environment holds nothing of
+    # `.env.compose`, and read from the environment alone, an upgrade was told to replace a token
+    # that was in the file and worked.
+    from beeverforge.adapters.agent.registry import executor_kind, harness_credential
+
+    settings = _settings()
+    kind = executor_kind(settings)
+    reading = harness_credential(kind, settings)
+    if reading is None:
+        return True, (f"{kind} signs in through its own login, which no setting shows — "
+                      f"`beeverforge box prove` exercises the real call")
+    name, said, repair = reading
+    if not name:
+        # THE REPAIR IS THE HARNESS'S (review of #584): a pool that cannot be used is fixed in the
+        # pool, and the old fixed sentence sent it to replace the pool with one token.
+        # WHERE IT GOES IS THE DEPLOYMENT'S (#904): under a declared credential store the worker
+        # asks that store first, and "— in .env.compose" sent the person past the place they chose
+        # for their secrets. Read from `settings`, never the environment alone (#560). The store
+        # is named, never built or asked: why is `_in_the_store`'s.
+        from beeverforge.adapters.credential_store.registry import ENV, deployment_store
+
+        store = deployment_store(settings)
+        if store == ENV:
+            return False, said + _unread(), f"{repair} — in .env.compose"
+        return False, said + _unread(), f"{repair} — {_in_the_store(store, kind, repair)}"
+    where = "in the environment" if os.environ.get(name) else "in .env.compose"
+    return True, f"{name} is set {where}" + (f" — {said}" if said else "")
+
+
+def _in_the_store(store: str, harness: str, repair: str) -> str:
+    """Where a missing agent credential goes under the declared credential store `store`, and why
+    this check cannot say whether it is there (#904).
+
+    NAMED, NEVER READ. The installer runs this check in the CLI image before the stack exists
+    (`install.sh:591`, `in_the_cli preflight`), with `/out` mounted and no credential directory,
+    and that image may lack the add-on a worker's store comes from, where an unknown kind refuses
+    every credential (#822). So no store is built, listed or asked here and no value is read: the
+    kind is named as declared and the doctor, which runs in the stack, is the check. The same
+    sentence is printed when the check is run inside the worker, where the store is mounted, so it
+    says the check does not read the store, not that the stack is down."""
+    from beeverforge.adapters.agent.registry import credential_names
+    from beeverforge.adapters.credential_store.file import DIR_VAR
+    from beeverforge.adapters.credential_store.registry import FILE, STORE_VAR
+
+    where = ""
+    if store == FILE:
+        # THE FILE IS NAMED AFTER THE SETTING THE REPAIR ASKS FOR: the harness's own names, in its
+        # order, the first one its repair says — never a copy of them here
+        named = next((n for n in credential_names(harness) if n in repair), "")
+        where = (f"a file named after the setting ({named}) in the directory {DIR_VAR} names, "
+                 if named else f"a file named after the setting in the directory {DIR_VAR} names, ")
+    # TRUE IN BOTH PLACES IT RUNS: the installer's last lines also send every install to `compose
+    # exec worker beeverforge preflight` (`install.sh`), where the store is declared and mounted;
+    # "this check runs before the stack" was false there (review of #904, measured on bdaa3b4f).
+    return (f"in {where}the `{store}` credential store this deployment declares ({STORE_VAR}); "
+            "this check does not read that store, because it is made to run before the stack "
+            "exists, so `beeverforge doctor` checks it once the stack is up")
+
+
+def _unread(path: str = ".env.compose") -> str:
+    """What a setting that was not found owes the person when the file was there and could not be
+    read (#583): an unreadable file read as no file at all, and this line then said a credential
+    in it was not set."""
+    from beeverforge import envfile
+
+    why = envfile.read(path).unreadable
+    return f" — and {path} is there but could not be read ({why})" if why else ""
+
+
+def _probe_ports() -> tuple[tuple[str, int], ...]:
+    # THE DEPLOYMENT'S PORTS (#560), from `_settings`: an upgrade of a deployment whose ports were
+    # moved checked the defaults, because the moved ones are in the file, not the installer's run.
+    settings = _settings()
+    out = []
+    for what, variable, default in PUBLISHED_PORTS:
+        raw = (settings.get(variable) or "").strip()
+        out.append((what, int(raw) if raw.isdigit() else default))
+    return tuple(out)
+
+
+#: `${NAME}` / `${NAME:-default}` / `${NAME-default}` — the whole of compose's interpolation
+#: syntax that `docker-compose.yml` uses.
+_INTERPOLATION = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}")
+
+
+def _interpolate(text: str, env: dict[str, str]) -> str:
+    """Compose's own rules. The colon matters: `${A:-d}` falls back when A is unset OR empty,
+    `${A-d}` only when it is unset — and `.env.compose.example` ships the version row empty."""
+    def one(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        value = env.get(name)
+        if match.group(0).startswith(f"${{{name}:-"):
+            return value if value else (default or "")
+        return default or "" if value is None else value
+    return _INTERPOLATION.sub(one, text)
+
+
+def _env_file_rows(path: str = ".env.compose") -> dict[str, str]:
+    """The rows of the env file, read by the one set of rules every reader shares
+    (`envfile.read`, #583) — `{}` when it is absent or cannot be read, which `env_file` says."""
+    from beeverforge import envfile
+
+    return envfile.read(path).rows
+
+
+def _settings() -> dict[str, str]:
+    """THE DEPLOYMENT'S SETTINGS, AS THE STACK WILL READ THEM: `.env.compose`'s rows, overridden by
+    the environment — what compose itself does (#560). The one answer for every probe of a
+    deployment setting, because in the installer's run the two disagree: `install.sh` runs this in
+    the CLI image with `.env.compose` mounted in the working directory and none of it in the
+    environment. A probe reading the environment alone then told an upgrade that no agent
+    credential was visible, in the same run whose `env_file` probe had just read the file, and
+    sent the person to replace a token that worked."""
+    return {**_env_file_rows(), **os.environ}
+
+
+def _probe_sandbox_image() -> str | None:
+    """Which box image this deployment will launch, asked in the order the truth actually lives in.
+
+    NO FALLBACK TO THE FRAMEWORK DEFAULT, deliberately — see `Probes.sandbox_image`. The framework
+    default exists for a process that is ALREADY running inside a configured deployment; preflight
+    runs before there is one, so borrowing that constant here answers a question nobody asked with
+    a name that is probably wrong. `docker-compose.yml` in the working directory is the real source
+    (it is what `install.sh` has just downloaded and what `up -d` will read), interpolated with the
+    same `.env.compose` compose itself will use."""
+    import pathlib
+
+    from_env = (os.environ.get("BEEVERFORGE_SANDBOX_IMAGE") or "").strip()
+    if from_env:
+        return from_env
+
+    compose = pathlib.Path("docker-compose.yml")
+    if not compose.is_file():
+        return None
+    try:
+        from beeverforge.util import yaml_io
+
+        services = (yaml_io.load(compose.read_text(), loader=yaml_io.CountingLoader)
+                    or {}).get("services") or {}
+        declared = ((services.get("worker") or {}).get("environment")
+                    or {}).get("BEEVERFORGE_SANDBOX_IMAGE")
+    except Exception as exc:  # noqa: BLE001 — an unreadable compose file is "cannot tell"
+        # SAID OUT LOUD, because "best effort" is the reason to log rather than the reason not to.
+        # The finding this feeds renders as `----  box_image  cannot tell which box image …`, which
+        # is honest about the CONCLUSION and silent about the cause — and the cause here is almost
+        # always a compose file that is truncated or half-downloaded, which is worth one line to
+        # whoever is looking at why their install is odd.
+        log.warning("could not read docker-compose.yml to find the box image (%s); "
+                    "preflight will report that it cannot tell", exc)
+        return None
+    if not declared:
+        return None
+    return _interpolate(str(declared), _settings()) or None
+
+
+def _probe_work_dir() -> str:
+    from beeverforge.onboarding.deployment import default_work_dir
+
+    # RETURNS None WHEN NO WORKSPACE CAN BE CHOSEN, so `_work_dir` can say WHY rather than reporting
+    # a permission error about `/.local/share/beeverforge/work` — a path that is not a mistake in
+    # the deployment but a `$HOME` of `/`, which is what Docker hands a numeric uid.
+    # A DECLARED VALUE COMPOSE CANNOT BIND IS LET THROUGH, because its cause is not `$HOME` and
+    # `_work_dir` names it (#367); it is the subtype, so it is asked first.
+    try:
+        return default_work_dir()
+    except UnusableWorkDir:
+        raise
+    except UnusableHome as exc:
+        log.warning("no job workspace can be chosen here: %s", exc)
+        return None
+
+
+def probes_for_this_machine() -> Probes:
+    """The real world, wired to the checks above. The one place `subprocess` and `socket` appear."""
+    return Probes(
+        compose=_probe_compose,
+        daemon=_probe_daemon,
+        host_arch=lambda: _probe_daemon()[1].split("/")[-1] or "unknown",
+        port_free=_probe_port_free,
+        free_disk=_probe_free_disk,
+        work_dir=_probe_work_dir,
+        writable_without_root=_probe_writable,
+        image_present=_probe_image_present,
+        sandbox_image=_probe_sandbox_image,
+        env_file=_probe_env_file,
+        agent_credential=_probe_agent_credential,
+        ports=_probe_ports,
+        preview_rows=lambda: {k: v for k, v in _settings().items()
+                              if k.startswith("BEEVERFORGE_PREVIEW_")},
+    )
+
+
+def as_json(report: Report) -> str:
+    """Stable key order, because a document a person diffs between two runs is a document whose
+    keys must not move for reasons that are not about their machine."""
+    return json.dumps(report.as_document(), indent=2, sort_keys=True)

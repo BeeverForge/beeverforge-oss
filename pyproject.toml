@@ -1,0 +1,290 @@
+[project]
+name = "beeverforge"
+version = "0.1.0-rc.1"
+description = "A framework to run software tickets autonomously with coding agents — policies authorize actions, humans evaluate results."
+# THE PAGE PyPI SHOWS, WRITTEN FOR PyPI (#368). Until 0.4.0 the project declared no long
+# description, and the index said "The author of this package has not provided a project
+# description" to everybody who arrived there. README.md cannot simply be pointed at: its links are
+# relative, which the index cannot resolve, and its one-machine door starts from `git clone` — a
+# visitor on the index already has the other door, `pip install`. So the page is its own file,
+# every link in it absolute, and `tests/test_the_pypi_page_describes_the_project.py` holds that,
+# its commands against the CLI and its extras against the table below; the wheel guard reads the
+# description back out of a built wheel's METADATA.
+readme = { file = "docs/pypi.md", content-type = "text/markdown" }
+# APACHE-2.0, and the choice has a reason rather than a preference behind it. The patent grant is
+# the point: MIT is permissive enough but gives none, so it offers a fork LESS protection while
+# gaining nothing on adoption. BSL/SSPL would contradict the positioning — they defend against a
+# hyperscaler reselling you, which is a problem this project does not yet have, at the cost of the
+# adoption it is trying to buy.
+#
+# Until this file existed the repository was legally "all rights reserved": a stranger who cloned it
+# had no right to use it, and an enterprise legal review stops at that line before reading any code.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The BeeverForge Authors" }]
+urls = { Homepage = "https://beeverforge.com", Documentation = "https://github.com/BeeverForge/beeverforge-oss/blob/main/docs/README.md", Repository = "https://github.com/BeeverForge/beeverforge-oss", Changelog = "https://github.com/BeeverForge/beeverforge-oss/releases", Issues = "https://github.com/BeeverForge/beeverforge-oss/issues", Security = "https://github.com/BeeverForge/beeverforge-oss/blob/main/SECURITY.md" }
+keywords = ["sdlc", "agents", "automation", "devops", "ai"]
+# THE OPERATING SYSTEMS ARE THE POSIX ONES, AND NOT AS A GUESS (#368): `beeverforge/registry.py`
+# imports `fcntl` at module scope, which does not exist on Windows, so the CLI cannot register a
+# project there. `Environment :: Console` because the CLI is the first thing a visitor runs.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "httpx>=0.27",
+    "pyjwt[crypto]>=2.8",
+    "python-dotenv>=1.0",
+    # service layer (foundation now; wired incrementally)
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    # THE PANEL'S LIVE SOCKET, WHICH WAS DEAD ON EVERY CONTAINERISED DEPLOYMENT (#145). uvicorn
+    # resolves `ws="auto"` to `unsupported` when no protocol implementation is importable, and
+    # answers the Upgrade with a 404 — so `/api/stream` never worked outside a developer's venv,
+    # where `websockets` happened to arrive as somebody else's transitive dependency. The whole
+    # suite stayed green because Starlette's TestClient speaks WebSocket in-process and imports
+    # none of this.
+    #
+    # BARE, NOT `uvicorn[standard]`: that extra also pulls uvloop, httptools and watchfiles into
+    # the panel image, none of which this needs.
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+# The durable-execution runtime (ADR-0001 D-16). Kept as an extra so the core
+# package (contracts, adapters, orchestrator, CLI) stays importable without it;
+# only the worker host needs `pip install -e '.[runtime]'`.
+runtime = [
+    # 1.29 OR LATER (#681): a process holds ONE engine client and hands it to every caller, on
+    # any loop and any thread (`runtime/temporal/connection.py::connect`). Up to 1.28 every call
+    # took an `asyncio.Lock` bound to the first loop that contended for it; 1.29 skips it once
+    # the client is connected (sdk-python #1606).
+    "temporalio>=1.29",
+]
+# READING A PRODUCT'S PDFS (#269 slice 1). One library, pure Python, no dependencies of its own,
+# BSD-licensed and maintained by the py-pdf organisation: it reads a PDF's text layer and never
+# interprets a script, a form action or a launch. PINNED EXACTLY, because it parses the most
+# hostile format a context repository holds, so a new version is a change somebody reads the
+# changelog of before it reaches a worker — the same reason it runs in a child process with a
+# clock (`adapters/extract/pdf.py`). An extra, not a core dependency: without it every PDF is
+# recorded as unreadable with the sentence that names this extra, and everything else is read.
+# OCR is NOT a Python dependency — `tesseract` and `pdftoppm` are binaries a deployment installs
+# if it wants scanned PDFs read, and their absence is a reason on the panel, never a crash.
+ingest = [
+    "pypdf==6.19.0",
+]
+# THE PRODUCT INDEX'S LOCAL EMBEDDINGS (#269 slice 2, decision 14: a local model by default). One
+# library, MIT, maintained by MinishLab: a STATIC embedding model — a table of token vectors and a
+# mean — so no neural network runs and neither torch nor an ONNX runtime is installed. It brings
+# numpy and Hugging Face's `tokenizers` and `safetensors` readers (the weights are a safetensors
+# file: numbers, nothing that executes), with their small dependencies; the hub client among them
+# is switched off by the row before it loads anything (`adapters/embed/local.py`). PINNED EXACTLY,
+# for the reason the PDF reader is. The MODEL is not a dependency: an operator puts it in a folder
+# and names it, and the row loads only a model whose weights' digest is pinned or declared. An
+# extra, not a core dependency and not in `dev`: without it the index answers by exact words,
+# metadata and time, and says so on every search — the suite proves that path, and the semantic
+# stage with a deterministic stand-in.
+embed = [
+    "model2vec==0.9.0",
+]
+# NO `sandbox` AND NO `slack` EXTRA ANY MORE (2026-08-26). Both were the vendor SDKs of code
+# that is not the core's: boto3 for the S3 session snapshot inside the cloud box, slack_sdk for
+# the chat listener. A vendor's SDK is a dependency of the package that ships the vendor's rows —
+# `addons/beeverforge-aws` declares boto3, `addons/beeverforge-slack` declares slack_sdk — and an
+# extra here would have made the core's metadata claim a face the core does not have. The images
+# install the packages (`docker/worker.Dockerfile`, `docker/sandbox.Dockerfile`).
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "bandit>=1.7",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "types-pyyaml",
+    # `dev` means "able to run the SUITE" — THIS tree's suite. No vendor SDK here (2026-08-26):
+    # the tests that import one live beside the package that declares it (`addons/<package>/
+    # tests/`, collected only where that package's SDK imports — `addons/suite.py` says so with
+    # one warning naming `make install` otherwise), and nothing under `tests/` imports an SDK;
+    # the core's guards name them only to prove no core module reaches them. A stranger's
+    # `pip install -e '.[dev]'` on the public tree must download nothing the public tree uses
+    # nowhere.
+    #
+    # A fresh `pip install -e '.[dev]'` once collected the suite with 20
+    # ModuleNotFoundError(temporalio) errors (found live 2026-08-09) — the durable runtime's
+    # tests are in `tests/`, so its SDK stays. And without pytest-randomly, "run the suite in
+    # both orders" was a silent no-op on a fresh install: no plugin, no random order,
+    # `-p no:randomly` disabling nothing.
+    # 1.29 or later, as `runtime` says why: the one engine client is shared across loops.
+    "temporalio>=1.29",
+    "pytest-randomly>=3.15",
+    # The suite runs 6,300 tests in ~85s with `-n auto` and 5:15 without it (measured 2026-08-17,
+    # 8 cores). Every gate run uses it; a fresh install without the plugin silently pays 3.7x the
+    # wall clock on every commit, which is how a whole session was spent waiting on idle cores.
+    "pytest-xdist>=3.6",
+    # The suite reads real PDFs through the `ingest` extra's library (#269), at the same pin: a
+    # PDF test that skipped where the library is absent would be green over nothing.
+    "pypdf==6.19.0",
+    # renders docs/pypi.md as the index does (tests/test_the_pypi_page_describes_the_project.py)
+    "readme-renderer[md]>=43",
+]
+
+# WHERE AN ADD-ON REGISTERS ITSELF (#106). `docs/core/07` states the rule this group exists to
+# satisfy — *"a platform is extensible when a stranger can add the third WITHOUT EDITING OUR
+# FILES"* — and the same document admitted the platform failed it: seven registries, seven dict
+# literals, all inside this repository.
+#
+# A package declares one entry per axis+kind and its rows join the tables at lookup:
+#
+#     [project.entry-points."beeverforge.adapters"]
+#     "forge.gitlab" = "beeverforge_gitlab:build_forge"
+#
+# An unknown kind still RAISES, naming what IS supported — the house rule. What changed is only
+# that the list it names can grow from outside. A built-in WINS a collision: an add-on that could
+# redefine `github` for every project on the deployment is a supply chain, not an extension point.
+#
+# THE PLATFORM'S OWN CONNECTORS REGISTER THROUGH THE SAME DOOR — FROM THEIR OWN PACKAGES. The
+# core declares NO row in the group: the `fargate` runner, the DynamoDB metrics sink, the S3
+# session store and the SSM token-pool source are declared by `addons/beeverforge-aws/pyproject.toml`,
+# and the chat channel, its notifier and the Telegram fallback by `addons/beeverforge-slack/`.
+# The four cloud rows lived in this file from 2026-08-24 to 2026-08-26, which made the cloud a
+# directory delete for the CODE and not for the METADATA: the public tree would have shipped four
+# entry points naming modules it does not contain, and every `beeverforge --help` would have
+# logged four "add-on could not be loaded" warnings. The core DESCRIBES the `fargate` box (its
+# traits are a pure row in `adapters/sandbox/registry.py`, so a job in flight can ask about it
+# with no I/O); the package supplies its runner. `plugins.SHIPS_IN` says which package ships
+# which row, so a refusal can name it.
+#
+# AN EDITABLE INSTALL READS ITS TABLE AT INSTALL TIME. `importlib.metadata` serves the
+# `entry_points.txt` written by `pip install -e <package>`, so a checkout that adds a row to an
+# add-on's pyproject must reinstall that add-on before the running process can see it
+# (`make install` does both); the tests install the declared rows through the packaging
+# mechanism from those files (`tests/vendor_addons.py`), so the wiring is proven even on a
+# stale install.
+
+[project.scripts]
+# ONE NAME, AND IT IS THE PRODUCT'S. `beeverforge` is what the project is called and what a
+# stranger will type; the wheel guard (`tests/test_the_wheel_ships_what_the_platform_needs.py`)
+# asserts this is the only console script a `pip install` delivers, so an alias cannot come back
+# as a courtesy nobody measured.
+beeverforge = "beeverforge.cli:app"
+
+[build-system]
+# 77, NOT 68, AND THE NUMBER IS MEASURED. `license = "Apache-2.0"` above is a PEP 639 licence
+# EXPRESSION, and setuptools only learned to read one in 77.0.0. Built from a pristine `git archive`
+# with one scratch venv per version, `pip wheel --no-build-isolation --no-deps` (2026-08-24):
+# 68.2.2, 75.8.0 and 76.1.0 — every one of them satisfying the old `>=68` — exit 1 with
+# "configuration error: `project.license` must be valid exactly by one definition (2 matches
+# found)" → metadata-generation-failed; 77.0.1 (the first 77 on PyPI) and 77.0.3 build green with
+# `Metadata-Version: 2.4`, `License-Expression: Apache-2.0` and LICENSE/NOTICE under
+# dist-info/licenses/. An isolated build hid this for weeks because the resolver fetches the
+# newest setuptools regardless of the floor — so the floor was a published fact that was false
+# for every offline, mirrored, constraint-pinned or distro-packaged build. `requires-python`
+# (>=3.12) already exceeds 77's own floor, so nothing else moves. The wheel test asserts this
+# number against this file.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["beeverforge*"]
+
+[tool.setuptools.package-data]
+# `**` SO THE INTENT IS EXPLICIT, NOT BECAUSE A ONE-LEVEL GLOB WAS LOSING FILES. An audit reported
+# that `org_defaults/*.md` dropped the seven role prompts from the wheel — the glob really does
+# match only engineering.md and tdd.md — and building the wheel BOTH ways disproved it: all seven
+# ship either way, because `include-package-data` defaults to true under pyproject.toml and every
+# git-tracked file inside the package comes along.
+#
+# THAT LAST SENTENCE IS FALSE, AND IT COST A FILE. `include-package-data` includes what MANIFEST.in
+# and these globs select, not what git tracks — there is no setuptools-scm here to ask git. It
+# looked true only because everything then in `org_defaults/` was a `.md` and therefore matched.
+# `org_defaults/floor.yaml` (the deployment's default gates, #99) was added, tracked by git, and
+# measured ABSENT from a freshly built wheel: `SDLC_FLOOR_UNREADABLE` in every pip install, with
+# the source tree passing every test. So a new extension under an existing directory needs a line
+# here, and this list is load-bearing rather than documentary.
+#
+# `tests/test_the_wheel_ships_what_the_platform_needs.py` is the part that actually holds the line:
+# it builds a wheel and reads what is inside it, which is the only place this was knowable.
+# `org_defaults/**/*.yaml`, WIDENED FROM ONE LEVEL. Profiles live in `org_defaults/profiles/`, one
+# directory deeper than floor.yaml, so `org_defaults/*.yaml` missed them: the mechanism would have
+# shipped with no worked example, resolvable on the tree that wrote it and a `ProfileError` on
+# every pip install.
+#
+# `**` COVERS BOTH DEPTHS — setuptools expands these with `recursive=True`, so it matches zero or
+# more directories. A first draft of this line kept the one-level entry too, on the belief that
+# `**` skipped the zero-directory case; that belief was wrong, and the evidence was already in the
+# line above it: `org_defaults/**/*.md` is the only `.md` pattern and top-level `tdd.md` and
+# `engineering.md` do ship. What produced the wrong belief was
+# `test_the_package_DATA_declaration_selects_the_default_file`, whose fnmatch approximation of
+# setuptools' globbing gave a FALSE NEGATIVE; that matcher is fixed rather than worked around.
+#
+# `tests/test_the_wheel_ships_what_the_platform_needs.py` is what actually holds this line — it
+# builds a wheel and reads what is inside it, which is the only place the answer was ever knowable.
+# `certify/*.json` IS THE EVIDENCE PACK'S PUBLISHED SCHEMA (#356): `certify deployment` validates
+# every pack against it before writing, and a wheel without it could not write one at all.
+# `certify/*.yaml` IS THE THRESHOLDS `certify verify` HOLDS A PACK TO (#356): without it, no pip
+# install could verify a pack against the numbers the submissions bot uses.
+beeverforge = ["presets/*.yaml", "org_defaults/**/*.md", "org_defaults/**/*.yaml", "api/*.html",
+               "certify/*.json", "certify/*.yaml"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"beeverforge/api/app.py" = ["E501"]  # the inlined self-contained HTML/JS panel has long lines
+"tests/*" = ["E501"]  # test fixtures (json blobs, activity lists) read better on one line
+"addons/*/tests/*" = ["E501"]  # the add-on packages' tests, moved out of tests/ as they were
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# THE ADD-ON PACKAGES' OWN TESTS RUN WITH THE SUITE. The tests that exist only for the paths that
+# leave the public tree live beside their package (`addons/<package>/tests/`, 2026-08-26); a
+# glob, so the public tree — which has no `addons/` — collects `tests/` alone with no warning.
+testpaths = ["tests", "addons/*/tests"]
+# THE REPO ROOT ON sys.path, FOR EVERY INVOCATION. `tests/test_a_failing_setup_is_not_silent.py`
+# declares `pytest_plugins = ["tests.test_walking_skeleton"]`, which pytest imports by NAME — so
+# the `tests` package has to be importable. `python -m pytest` prepends the CWD and it was; the
+# bare `pytest` console script does not, and that is exactly what CI runs.
+#
+# So the suite was green on every developer's machine and RED in CI on every push — a guard that
+# looked like a guard. Found 2026-08-05, after five commits had landed on a red main. Setting it
+# here (rather than switching CI to `python -m pytest`) makes both invocations identical, so the
+# divergence cannot come back through a contributor's habit.
+pythonpath = ["."]
+markers = [
+    # A test that STARTS its own durable engine and throws it away — `WorkflowEnvironment` picks a
+    # free port and owns the server's whole life. It is the one legitimate reason to open a real
+    # connection, and it is declared rather than inferred: `tests/conftest.py` blocks
+    # `Client.connect` for everything else, because a suite run on a machine with the OSS compose
+    # stack up created real workflows on the developer's engine (#107).
+    "owns_its_engine: starts and disposes of its own ephemeral Temporal server",
+    # Long-running; excluded by `-m 'not slow'`. Declared so the run stops warning about it.
+    "slow: minutes rather than seconds",
+    # A test whose assertion is its own CPU time. CI runs the suite with xdist, and neighbours on
+    # the same cores inflate a process's CPU time: the map test below measured 7.6–8.0 s alone and
+    # 13.1 s beside three workers on a four-core runner (2026-10-12). `make test-alone` runs these
+    # in a process of their own, after the rest.
+    "alone: asserts its own CPU time, so it runs with no neighbours on its cores",
+]

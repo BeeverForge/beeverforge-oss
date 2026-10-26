@@ -1,0 +1,433 @@
+"""Everything the card's door reads and writes, behind one object (ADR-0055 D3).
+
+THE EXISTING PORTS, NOT NEW ONES: the tracker writes the card, the ledger keeps the promises,
+`events.py` tells the conversation, the engine takes the preview down, the board's snapshot is
+forgotten, and the metrics store keeps the record. `Ports` holds them for one project, so the
+door asks one object — and the test derived from the table hands it a double of every port and
+asserts that exactly the table's effects happened.
+
+EACH EFFECT RETURNS WHAT IT CAME TO, as the record's outcome, and RAISES WHEN IT FAILED: the
+executor records the failure and the sweep applies the effect again (D5). An effect with nothing
+to do — no preview running, nothing promised about the card — is an outcome, not a failure.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from beeverforge.lifecycle.table import BY_COLUMN, State
+
+log = logging.getLogger("beeverforge.lifecycle.ports")
+
+
+@dataclass(frozen=True)
+class Seen:
+    """A card as the door found it: its state, or why nobody can tell; and its title."""
+
+    state: State | None = None
+    cannot_tell: str = ""
+    title: str = ""
+    #: which of the product role's writers opened the card — `""` for a card written on the board
+    opened_by: str = ""
+    #: whether the tracker says the card is open — a finished card can be either (`delivered`)
+    open: bool = True
+    #: the column the card sits in AS ITS BOARD CALLS IT, `""` when no board places it — what a
+    #: refusal names, so the person looks for `A Fazer` on their board rather than `TO-DO` (#502)
+    column: str = ""
+    #: the repository the card's change belongs to, when it was filed outside it (#665)
+    belongs_to: str = ""
+    #: `cannot_tell` because the tracker or the board could not be READ — a failure, said as one
+    #: (#908): measured on 3a996b0a, a forge answering 503 here reached a person as 409 `conflict`
+    #: with no reference. False for a column nobody maps (`card_unmapped`), which is a refusal
+    unread: bool = False
+
+
+#: How a tracker says a card was closed as NOT delivered, in its own word (`Ticket.state_reason`).
+NOT_DELIVERED = frozenset({"not_planned", "not planned", "duplicate"})
+
+
+def withdrawn(ticket) -> bool:
+    """Whether the tracker SAYS `ticket` was closed as not delivered — False when it says it was
+    finished, and False when it cannot say."""
+    return str(getattr(ticket, "state_reason", "") or "").lower() in NOT_DELIVERED
+
+
+class Unreadable(RuntimeError):
+    """The tracker or the board could not be read — a state, not "the card is not there"."""
+
+
+class Ports:
+    """The real ports of one project. `tracker` and `board` are the caller's when it holds them,
+    so a row that read the board for its own gate and the door read the same row; `columns` is the
+    board as that row already READ it — one read for the gate and the door, which could otherwise
+    disagree about a card that moved between them (#162)."""
+
+    def __init__(self, project, *, tracker=None, board=None,
+                 columns: dict[str, str] | None = None) -> None:
+        self.project = project
+        self.name = getattr(project, "name", "") or ""
+        self._tracker = tracker
+        self._board = board
+        # A CALLER THAT HANDS ONLY ITS TRACKER STILL GETS ITS BOARD READ. The product module holds
+        # a tracker and no board; built only alongside a missing tracker, the board stayed None for
+        # it, every open card read as one no board places, and the table's permissive row for
+        # that answered instead of the card's own column (found building #413).
+        #
+        # A CALLER THAT HANDS `columns` HAS READ ITS BOARD ALREADY — the board it holds, or none:
+        # the product role files with `board=None` to mean "do not place" (`_board_or_default`),
+        # and a card it has just written is on no column it put it in (`columns={}`). Building a
+        # board here would read a hosted one for an answer the caller already gave (#414).
+        self._board_known = board is not None or columns is not None
+        self._columns = columns
+
+    def _where(self) -> dict[str, str] | None:
+        if self._columns is None:
+            self._columns = self.board.columns() if self.board is not None else {}
+        return self._columns
+
+    # ── what the door reads ─────────────────────────────────────────────────────────────────────
+
+    @property
+    def tracker(self):
+        if self._tracker is None:
+            from beeverforge.adapters.tracker.registry import build_tracker
+
+            self._tracker = build_tracker(self.project, token=self._token())
+        return self._tracker
+
+    @property
+    def board(self):
+        if not self._board_known:
+            self._board_known = True
+            from beeverforge.adapters.board import build_board
+
+            try:
+                self._board = build_board(self.project, token=self._token())
+            except Exception:  # noqa: BLE001 — no board read is "no board places it", said
+                log.warning("BEEVERFORGE_CARD_BOARD_UNBUILT project=%s — the card is judged "
+                            "without its column", self.name, exc_info=True)
+                self._board = None
+        return self._board
+
+    def _token(self) -> str | None:
+        from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+        try:
+            return tracker_token_for(self.project) or deployment_tracker_token(self.project)
+        except Exception:  # noqa: BLE001 — a row that needs none builds without one
+            log.info("no tracker credential resolved for %s", self.name, exc_info=True)
+            return None
+
+    def sink(self):
+        from beeverforge.lifecycle.record import keyed_sink
+
+        return keyed_sink()
+
+    def seen(self, card: str) -> Seen:
+        """Where `card` is. Absent from its tracker: `removed`. Closed: `closed`. Open: what its
+        board's column says — `None` when no board places it, and a sentence when a board cannot be
+        read or names a column this platform does not map, which refuses rather than guesses.
+
+        A REFUSAL NAMES THE CARD AS ITS TRACKER DOES (#497): `promote` answers a person with it
+        since it queues through the door (#414), and nobody on Jira writes `#DAR-9`."""
+        from beeverforge.adapters.board.base import stage_key, stage_option
+        from beeverforge.contracts.refs import canonical_ref, ref_label
+        from beeverforge.product.voice import card_unmapped
+
+        try:
+            ticket = self.tracker.get_ticket(card)
+        except KeyError:
+            return Seen(state=State.REMOVED)
+        except Exception as exc:  # noqa: BLE001 — an unreadable card is an answer, and it refuses
+            log.warning("BEEVERFORGE_CARD_UNREAD card=%s: %s", card, exc)
+            return Seen(unread=True, cannot_tell=(
+                f"{ref_label(card)} could not be read ({str(exc)[:120]}), so there is no way to "
+                f"tell where it is. Nothing was changed — try again."))
+        from beeverforge.product.authoring import filed_by_the_product_role
+
+        title = str(getattr(ticket, "title", "") or "")
+        opened_by = filed_by_the_product_role(getattr(ticket, "raw", "") or "")
+        belongs_to = str(getattr(ticket, "belongs_to", "") or "")
+        if (getattr(ticket, "state", "") or "open") != "open":
+            return Seen(state=self._closed_as(card, ticket), title=title, opened_by=opened_by,
+                        open=False)
+        board = self.board
+        if board is None:
+            return Seen(state=None, title=title, opened_by=opened_by, belongs_to=belongs_to)
+        where = self._where()
+        if where is None:
+            return Seen(title=title, unread=True, cannot_tell=(
+                f"{self.name}'s board could not be read, so there is no way to tell where "
+                f"{ref_label(card)} is. Nothing was changed — try again."))
+        column = where.get(canonical_ref(card)) or where.get(str(card))
+        if not column:
+            return Seen(state=None, title=title, opened_by=opened_by, belongs_to=belongs_to)
+        state = BY_COLUMN.get(stage_key(board, column))
+        if state is None:
+            # REFUSED, NEVER READ AS THE BACKLOG (#521). An Azure board on a stock process files
+            # every card in `New`, which no stage is, so a queueing from there is refused here —
+            # and reading the column as the backlog would let it through. It would also let an
+            # edit, a withdrawal or a removal through, on every row, for a card in ANY column
+            # nobody maps: one a person dragged out from under its job reads as unstarted. The
+            # table says what a state allows; a column that is no state has none to allow. What
+            # changed is the sentence, which names the one line that maps it, in the project's
+            # language and by the option THIS board reads.
+            return Seen(title=title, cannot_tell=card_unmapped(
+                ref=card, column=column, option=stage_option(board),
+                language=getattr(self.project, "language", None)))
+        return Seen(state=state, title=title, opened_by=opened_by, column=column,
+                    belongs_to=belongs_to)
+
+    def _closed_as(self, card: str, ticket) -> State:
+        """A closed card is `delivered` when it was closed as finished work — the tracker's own
+        reason says so, or its board still shows it in Done (Jira closes a card BY moving it to a
+        status in the done category) — and `closed` otherwise: withdrawn, a duplicate, not
+        planned. Unsure is `closed`: a reopen is allowed from both, and only a finished card may
+        be closed again as delivered."""
+        from beeverforge.adapters.board.base import stage_key
+        from beeverforge.contracts.refs import canonical_ref
+
+        if withdrawn(ticket):
+            return State.CLOSED
+        reason = str(getattr(ticket, "state_reason", "") or "").lower()
+        if reason == "completed":
+            return State.DELIVERED
+        try:
+            where = self._where() or {}
+        except Exception:  # noqa: BLE001 — unsure, and unsure is `closed`
+            log.info("could not read where closed #%s sits on its board", card, exc_info=True)
+            where = {}
+        column = where.get(canonical_ref(card)) or where.get(str(card))
+        if column and BY_COLUMN.get(stage_key(self.board, column)) is State.DELIVERED:
+            return State.DELIVERED
+        return State.CLOSED
+
+    def asked_in(self, card: str) -> str:
+        """The conversation `card`'s requester asked in — `""` when nobody's is known."""
+        from beeverforge.memory import store as loop_store
+        from beeverforge.memory.ledger import DELIVERY, fold
+        from beeverforge.product import events
+
+        try:
+            rows = loop_store.read(self.name)
+            found = events.requester_conversation(self.project, card, rows=rows)
+            if found:
+                return found
+            # A CARD COMING BACK: the delivery that waited on it was closed as cancelled when it
+            # left, and that closed loop is still where its requester asked
+            closed = [x for x in fold(rows) if x.kind == DELIVERY and card in events.issues_of(x)
+                      and (x.context or {}).get("conversation")]
+            return str(max(closed, key=lambda x: x.ts).context["conversation"]) if closed else ""
+        except Exception:  # noqa: BLE001 — unknown is "", and the room is told for a card the
+            log.info("could not read where #%s was asked for", card, exc_info=True)  # role opened
+            return ""
+
+    # ── the card ────────────────────────────────────────────────────────────────────────────────
+
+    def column(self, card: str, key: str, *, needs_person: bool | None = None) -> str:
+        from beeverforge.contracts import JobState
+
+        # THE ONE COLUMN A PERSON'S ENDING WRITES, through the port's one writer of a card's state.
+        # No `reason`: the door's comment is its own effect, and `set_state` writing it too is the
+        # double comment D6 ends (two rows write `reason`, the local board drops it). A job state
+        # (`pr_open`, `merged`, a park's) is written as itself, with who the blocker is (#166).
+        states = {"backlog": JobState.SKIPPED, "todo": JobState.TODO, "done": JobState.DONE}
+        state = states.get(key) or JobState(key)
+        moved = (self.tracker.set_state(card, state) if needs_person is None else
+                 self.tracker.set_state(card, state, needs_person=needs_person))
+        if moved is False:
+            raise RuntimeError(f"the tracker did not move the card to {key}")
+        return "moved"
+
+    def place(self, card: str, key: str, *, name: str = "") -> str:
+        """Put `card` on the board in the column `key` — by `name`, the board's own name for it,
+        when the caller holds one (what a person named on the board, the product role's constant),
+        else through the board's own map of a state to its column (C-14: a board whose columns
+        were renamed has no column called by the platform's name). Added first: on a hosted board
+        an issue is a card only once it is put on it, and adding is idempotent everywhere."""
+        from beeverforge.contracts import JobState
+
+        board = self.board
+        if board is None:
+            return "nowhere to place it: this project keeps no board"
+        url = self._url(card)
+        board.add_item(issue_url=url)
+        if name:
+            moved = board.set_column(issue=card, issue_url=url, name=name)
+        else:
+            state = {"backlog": JobState.SKIPPED, "todo": JobState.TODO}.get(key) or JobState(key)
+            moved = board.set_status(issue=card, issue_url=url, state=state)
+        if not moved:
+            raise RuntimeError(f"the board did not place the card in {name or key!r}")
+        return f"placed in {name or key}"
+
+    def _url(self, card: str) -> str:
+        """Where a person opens `card` — asked of the tracker; `""` when it cannot say, which every
+        board's `add_item` and `set_column` already tolerate. STRIPPED: a row composes it from
+        configuration a person typed, and a padded URL resolves to no card on a hosted board."""
+        try:
+            return str(self.tracker.ticket_url(card) or "").strip()
+        except Exception:  # noqa: BLE001 — a link is a courtesy; the placement is not
+            log.info("the tracker could not name a URL for #%s", card, exc_info=True)
+            return ""
+
+    def close(self, card: str, *, delivered: bool, note: str) -> str:
+        from beeverforge.adapters.tracker.base import close_ticket
+
+        close_ticket(self.tracker, card, note, delivered=delivered)
+        return "closed as delivered" if delivered else "closed as not delivered"
+
+    def remove(self, card: str, *, note: str, by: str, why: str) -> str:
+        from beeverforge.adapters.tracker.base import remove_ticket
+
+        if remove_ticket(self.tracker, card, why, by=by, note=note):
+            return "removed"
+        return "closed as not delivered: this tracker cannot remove a card"
+
+    def reopen(self, card: str) -> str:
+        self.tracker.reopen_ticket(card)
+        return "reopened"
+
+    def comment(self, card: str, text: str) -> str:
+        self.tracker.comment(card, text)
+        return "said"
+
+    # ── the promise, the conversation, the preview, the snapshot ───────────────────────────────
+
+    def loops(self, card: str, action: str, *, about: str = "", context: dict | None = None,
+              title: str = "", owed: dict | None = None, release: dict | None = None) -> str:
+        from beeverforge.lifecycle import loops
+        from beeverforge.lifecycle.table import RELEASE_ASKS, RELEASE_CLOSES
+
+        if action == "open":
+            return loops.owe(self.project, card, owed or {})
+        if action in RELEASE_ASKS:
+            # THE RELEASE QUESTION THE ROUND ASKED (#448 slice 6): the room's copy, and the
+            # requester's once they were told
+            return loops.release_asked(self.project, card, release or {},
+                                       theirs=action != "release:ask")
+        if action in RELEASE_CLOSES:
+            return loops.release_answered(self.project, card, action.split(":", 1)[1])
+        if action in ("answer", "moot"):
+            return loops.question(self.project, card, about=about, answered=action == "answer")
+        if action == "ask":
+            return loops.ask(self.project, card, about=about, context=context or {})
+        if action == "deliver":
+            return loops.announce_what_it_completes(self.project, card, title=title)
+        if action != "cancel":
+            return loops.restore(self.project, card)
+        said, _still = loops.cancel(self.project, card)
+        return said
+
+    def deliver_what_remains(self) -> None:
+        """A delivery whose remaining cards were all delivered before one of its cards was cancelled
+        is due — announced through the delivery's own path, which reads the board and the ledger
+        again under the telling lock (`loops.announce`). The door's sweep asks it (`converge`),
+        never a person's turn: a turn reaching the delivery path is a second way into it."""
+        from beeverforge.lifecycle import loops
+        from beeverforge.product import events
+
+        try:
+            delivered = events._delivered_now(self.project)
+            # AN EMPTY BOARD ANSWER STILL ASKS: what a delivery names in another repository of the
+            # product is read by the announcement itself (#492), whatever this board holds
+            if delivered is not None:
+                loops.announce(self.project, delivered=delivered)
+        except Exception:  # noqa: BLE001 — the next round asks again, for a day (`NARROWED_FOR`)
+            log.exception("[%s] could not see whether what remains of a delivery is delivered",
+                          self.name)
+
+    def tell(self, card: str, *, notice: str, event_id: str, title: str, removed: bool,
+             opened_by: str, conversation: str, pass_number: int = 0, pr_url: str = "",
+             review: str = "", preview_url: str = "", stages_follow: bool = False,
+             where: str = "", run: str = "", who: str = "") -> str:
+        """Tell the conversation the card was asked in. A card nobody asked for in a conversation —
+        written on the board, with no delivery recording where — has no requester to tell, and the
+        product's room is not told what an operator did on the board; one the product role opened
+        is said to the room when nobody's conversation is known, as #384 said it.
+
+        A CHANGE READY TO TRY (`READY_FOR_YOU`, #401) is its own sentence and its own rule: only to
+        the conversation somebody asked in — the room already has the card's own comment — and
+        once per card and pull request, whichever of the watch and the round hands it over first
+        (`events.ready_to_try`).
+
+        THE REQUESTER'S LOOP PAST THE PULL REQUEST (#448 slice 6), each its own sentence and its
+        own rule, as the events module keeps them: the change went in (`MERGED_FOR_YOU`, once per
+        card and pull request, never where the delivery says it), it is theirs to try at a stage
+        (`STAGED_FOR_YOU`, once per card and run, never in the room), and — to the ROOM — they
+        tried it and say it is right (`TRIED`, once per card and run)."""
+        from beeverforge.lifecycle.table import (
+            MERGED_FOR_YOU,
+            READY_FOR_YOU,
+            STAGED_FOR_YOU,
+            TRIED,
+        )
+        from beeverforge.product import events
+
+        if not events._speaks(self.project):
+            return "nobody to tell: the project has no product role"
+        if notice == READY_FOR_YOU:
+            return events.ready_to_try(self.project, card=card, pr_url=pr_url, review=review,
+                                       preview_url=preview_url)
+        if notice == MERGED_FOR_YOU:
+            return events.went_in(self.project, card=card, pr_url=pr_url,
+                                  stages_follow=stages_follow)
+        if notice == STAGED_FOR_YOU:
+            return events.to_try_at_the_stage(self.project, card=card, where=where, run=run)
+        if notice == TRIED:
+            return events.tried_it_right(self.project, card=card, run=run, where=where, who=who)
+        if not opened_by and not conversation:
+            return "nobody to tell: nobody asked for it in a conversation"
+        return events.card_moved(self.project, card=card, notice=notice, event_id=event_id,
+                                 title=title, removed=removed, conversation=conversation,
+                                 pass_number=pass_number)
+
+    def preview(self, card: str, *, action: str, by: str) -> str:
+        """Take down the preview of `card`'s unit — unless the unit also shows another card that is
+        still open, whose requester may be trying it right now."""
+        from beeverforge import preview
+
+        bare = card.rsplit("#", 1)[-1]
+        if not preview.UNIT_RE.fullmatch(bare):
+            return "none: the card is not a unit a preview is addressed by"
+        unit = preview.unit_of_card(self.name, bare)
+        found = preview.latest(self.name, unit)
+        if found is None or not found.live:
+            return "none running"
+        others = [c for c in (found.cards or ()) if str(c).rsplit("#", 1)[-1] != bare]
+        still = [c for c in others if self._open(str(c))] if action == "stop" else []
+        if still:
+            return f"kept: it also shows #{str(still[0]).lstrip('#')}, which is still open"
+        try:
+            # THE ENGINE'S OWN MODULES, ASKED FOR INSIDE THE `try`: an install without the
+            # `runtime` extra has no engine and no preview workflow to take down
+            from beeverforge.runtime.temporal import connection
+            from beeverforge.runtime.temporal import view as tv
+        except ImportError:
+            return "none: this install runs no engine"
+        try:
+            connection.address()
+        except connection.EngineNotDeclared:
+            return "none: this deployment runs no engine"
+        from beeverforge.product.door import _run
+
+        async def _stop() -> bool:
+            client = await connection.connect()
+            return await tv.signal_preview(client, self.name, unit, action, by)
+
+        return "stopping" if _run(_stop()) else "none running"
+
+    def _open(self, card: str) -> bool:
+        try:
+            return (getattr(self.tracker.get_ticket(card), "state", "") or "open") == "open"
+        except Exception:  # noqa: BLE001 — a card nobody can read keeps its preview: the safe side
+            log.info("could not read #%s to tell whether a preview still shows it", card,
+                     exc_info=True)
+            return True
+
+    def forget(self) -> str:
+        from beeverforge.product.board import forget_board
+
+        forget_board(self.name)
+        return "forgotten"

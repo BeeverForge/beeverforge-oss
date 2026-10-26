@@ -1,0 +1,732 @@
+"""GitHubIssuesTracker — tickets as GitHub Issues + a Projects v2 board (v1).
+
+The board must move: when a project is registered with a GitHub Projects board
+(owner + number), each state transition moves the card's Status column. Without a
+board configured, the state falls back to a single transitioning `beeverforge:<state>`
+label. Runs as the bot when a token is provided (GH_TOKEN), else ambient auth.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import time
+
+from beeverforge.adapters.github_cli import credential_of, nothing_named, refused
+from beeverforge.adapters.tracker.base import (
+    Budget,
+    TicketComment,
+    TicketSummary,
+    TrackerAdapter,
+    list_state,
+)
+from beeverforge.adapters.tracker.github_project import GitHubProjectBoard
+from beeverforge.adapters.tracker.parse import parse_ticket_body
+from beeverforge.contracts import JobState, Ticket
+from beeverforge.contracts.refs import canonical_ref, split_repo_ref
+
+log = logging.getLogger("beeverforge.tracker.github")
+
+#: The state label this tracker writes when a board refuses a move (or there is no board) — the
+#: fallback carrier of truth, on the CLIENT's own issue. It carries the product's name for the
+#: same reason the branches do (#106 item 5): it is the name a client reads.
+_STATE_LABEL_PREFIX = "beeverforge:"
+
+#: The fields a `TicketSummary` is built from, in `gh`'s spelling. One string because the sweep and
+#: the incremental refresh must ask for exactly the same shape — two lists is how a field arrives on
+#: one path and is missing on the other, which reads downstream as a card that changed.
+_LIST_FIELDS = "number,title,body,state,stateReason,labels,assignees,updatedAt"
+
+#: What `limit=0` ("everything") costs at most. `gh issue list` defaults to 30 and has no "all", so
+#: some number has to go on the wire; this one is high enough that no board this platform runs comes
+#: near it and low enough to bound a single read. Reaching it is LOGGED, because a silently
+#: truncated board is a board that reads as smaller than it is.
+_LIST_CEILING = 1000
+
+
+def _summary(row: dict, *, ref: str) -> TicketSummary:
+    """One issue as `gh` answered it (`_LIST_FIELDS`), in the port's vocabulary — the one fold for
+    the board's list and for a card read by itself (#492), so the two never disagree on a field."""
+    return TicketSummary(
+        ref=ref,
+        title=str(row.get("title") or ""),
+        body=str(row.get("body") or ""),
+        # GitHub's GraphQL enums arrive SHOUTING — `"CLOSED"`, `"NOT_PLANNED"` (verified live). The
+        # port's vocabulary is lowercase, and `triage.Ticket.delivered` compares against the
+        # literal `"not_planned"`, so the fold happens here rather than in each of the readers that
+        # would otherwise each have to remember.
+        state=str(row.get("state") or "open").lower(),
+        state_reason=str(row.get("stateReason") or "").lower(),
+        labels=[str(x.get("name") or "") for x in (row.get("labels") or [])],
+        assignees=[str(x.get("login") or "") for x in (row.get("assignees") or [])],
+        updated_at=str(row.get("updatedAt") or ""),
+    )
+
+
+class GitHubIssuesTracker(TrackerAdapter):
+    #: WHAT THIS ROW CAN REPORT OF A CHANGE MADE ON GITHUB ITSELF (ADR-0055 D8,
+    #: `tracker/base.py::observes`): a close and why (`stateReason`, on every summary), a reopen,
+    #: and a move between the board's Backlog and TO-DO. Not a deletion: a deleted or transferred
+    #: issue answers `gh` the way an unreachable one does, and an absence is not a failed read.
+    observes = frozenset({"closed", "reopened", "promoted", "reordered"})
+
+    #: THE LONGEST BODY GITHUB ACCEPTS, in characters (#624; read by the split through `getattr`,
+    #: `activities.CARD_BODY_LIMIT`). GitHub does not document it; its API refuses a longer issue,
+    #: pull request or comment body with "body is too long (maximum is 65536 characters)", as
+    #: reported in golang/go#45998 (2021) and w3c/webref#245. Not measured here: no scratch
+    #: repository was at hand on 2026-10-17.
+    body_limit = 65_536
+
+    def __init__(
+        self,
+        repo: str,
+        *,
+        board_owner: str | None = None,
+        board_number: str | None = None,
+        token: str | None = None,
+        token_provider=None,
+        board_columns: dict[str, str] | None = None,
+        refused: str = "",
+    ) -> None:
+        self.repo = repo  # "owner/name"
+        self._static_token = token
+        self._token_provider = token_provider  # re-mints a fresh token at use (long jobs)
+        #: why the credential store refused the credential this tracker was meant to use (#742)
+        #: — then it, and its board, run nothing on the machine's own login
+        self.refused = refused
+        # The PROVIDER goes in, never `self.token`: evaluating the property here would bake a
+        # ~1h App token string into the board, and every board move after expiry would fail
+        # silently while the issue ops (which resolve per call) kept working.
+        self.board = (
+            GitHubProjectBoard(board_owner, board_number, token=token,
+                               token_provider=token_provider, columns=board_columns,
+                               default_repo=repo, refused=refused)
+            if board_owner and board_number
+            else None
+        )
+
+    @property
+    def token(self) -> str | None:
+        return credential_of(self)
+
+    def _env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if self.token:
+            env["GH_TOKEN"] = self.token
+        return env
+
+    _RATE_MARKERS = ("rate limit", "abuse detection", "submitted too quickly", "retry your request")
+
+    def _gh(self, args: list[str], timeout: int = 60, *,
+            stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+        # A LONG TEXT GOES ON STDIN (`stdin=`, with `--body-file -`), never as one argv element:
+        # Linux refuses an element of 131,072 bytes or more (MAX_ARG_STRLEN, the terminating NUL
+        # counted) with E2BIG, raised by `subprocess.run` as
+        # `OSError: [Errno 7] Argument list too long: 'gh'` before gh starts.
+        # GitHub's limit is in characters (65,536), so a 3-byte script crossed the byte ceiling at
+        # about 43,690 characters (#807). Stdin has no per-element ceiling; both runs below send it.
+        #
+        # NEVER A GUESSED REPOSITORY, OWNER OR BRANCH (`adapters/github_cli.py`): an empty flag is
+        # answered as a failed call before `gh` can fill it in by guessing
+        why = nothing_named(args)
+        if why:
+            log.warning("BEEVERFORGE_GH_NOTHING_NAMED %s", why)
+            return refused(args, why)
+        try:
+            p = subprocess.run(
+                ["gh", *args], input=stdin, capture_output=True, text=True, timeout=timeout,
+                env=self._env(),
+            )
+        except FileNotFoundError:
+            # A stranger's first hour must not end in a stack trace about a binary the docs never
+            # named (pre-pilot review, 2026-08-09). One refusal, one remedy, greppable.
+            raise RuntimeError(
+                "the `gh` CLI is not installed — the GitHub tracker/board speak through it. "
+                "Install it (https://cli.github.com) and run `gh auth login` (or set "
+                "BEEVERFORGE_BOT_TOKEN / the GitHub App variables).") from None
+        # RESILIENCE: GitHub's SECONDARY / abuse-detection limits clear in seconds — one brief
+        # backoff + retry rides them out instead of failing the whole ticket. (A primary limit,
+        # minutes away, still fails here and the caller degrades; the poller's own budget check
+        # keeps us from spending into it in the first place.)
+        if p.returncode != 0 and any(m in (p.stderr or "").lower() for m in self._RATE_MARKERS):
+            time.sleep(8)
+            p = subprocess.run(
+                ["gh", *args], input=stdin, capture_output=True, text=True, timeout=timeout,
+                env=self._env(),
+            )
+        return p
+
+    def _write(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+        """Run a mutating `gh` call and RAISE when the forge refused it.
+
+        `gh` reports failure only in its exit code, and this adapter had no one place that read it —
+        so each method decided for itself and three forgot. What that bought, in this repository's
+        own history: a client told a card was closed while it was still open, and the impediment a
+        real failure opened CLOSED by the write that never happened.
+
+        The contract lives in `adapters/tracker/base.py`: returning is this adapter saying the
+        change is on the ticket, and best-effort is the CALLER's decision, written as a `try` where
+        the next reader can see it.
+        """
+        p = self._gh(args, timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"gh {' '.join(args[:2])} failed ({p.returncode}): "
+                f"{(p.stderr or p.stdout or '')[-300:]}")
+        return p
+
+    def _locate(self, ref: str) -> tuple[str, str]:
+        """(the repository this ref lives in, the bare number) — C-18.
+
+        A ref may carry its own repository (`owner/name#12`): one board routes cards to several
+        source repos, and every per-ticket op below must act on the CARD's repo, not this
+        adapter's default. A bare ref resolves to `self.repo`, byte-for-byte today's behaviour."""
+        repo, bare = split_repo_ref(ref, self.repo)
+        return repo, bare.lstrip("#")
+
+    def get_ticket(self, ref: str) -> Ticket:
+        repo, num = self._locate(ref)
+        p = self._gh(
+            ["issue", "view", num, "--repo", repo,
+             # `state` because `scan_todo` refuses to re-run a delivered ticket and cannot know
+             # without asking — it was never in this list, so the guard read a default forever.
+             # `stateReason` FOR THE SAME REASON, ONE FIELD LATER (#414): the stale-pickup healer
+             # and the card's door read WHY a card was closed (`lifecycle.ports.withdrawn`), and a
+             # field never asked for read as "cannot say" — finished work — on every card here
+             "--json", "number,title,body,labels,author,state,stateReason"]
+        )
+        if p.returncode != 0:
+            raise RuntimeError(f"gh issue view failed: {p.stderr}")
+        data = json.loads(p.stdout)
+        ticket = parse_ticket_body(
+            id=f"#{data['number']}", title=data["title"],
+            body=data.get("body") or "", repo=repo,
+        )
+        ticket.labels = [(lbl.get("name") or "").lower() for lbl in data.get("labels", [])]
+        ticket.author = (data.get("author") or {}).get("login") or None
+        ticket.state = str(data.get("state") or "").lower() or None
+        ticket.state_reason = str(data.get("stateReason") or "").lower()
+        return ticket
+
+    def set_state(self, ref: str, state: JobState, reason: str | None = None, *,
+                  needs_person: bool | None = None) -> bool | None:
+        # `needs_person` carries what the state cannot (#166): an armed auto-merge and a
+        # human merge gate are both `pr_open`, and only the caller knows which.
+        repo, bare = self._locate(ref)
+        num = int(bare)
+        moved = True
+        if self.board is not None:
+            # the possibly-qualified ref goes THROUGH: the board splits it against its own
+            # default, and on a multi-repo board the (number, repo) pair is what finds the card
+            moved = self.board.set_status(
+                needs_person=needs_person,
+                issue=str(ref).strip().lstrip("#"),
+                issue_url=self.ticket_url(ref),
+                state=state,
+            )
+        if self.board is None or not moved:
+            # The board refused/failed the move (the board logs the why). The beeverforge:<state>
+            # label is the fallback carrier of truth: a card stuck in its old column with the
+            # platform recording the transition as done is a silent forever-wait for whoever
+            # watches the board.
+            if self.board is not None:
+                log.error("BEEVERFORGE_BOARD_MOVE_FAILED %s#%s -> %s — falling back to the "
+                          "beeverforge:<state> label", repo, num, state.value)
+            self._transition_label(str(num), state, repo=repo)
+        # `reason` IS NOT WRITTEN (ADR-0055 D6, #414): a transition's comment is the card's door's,
+        # the same on every row. Written here it existed on two rows of four and was doubled where
+        # the caller also commented — which every caller that passes one does.
+        if state is JobState.DONE:
+            # AFTER the move: if the close is the write that fails, the card is already where the
+            # work got to.
+            self._close_as_delivered(ref)
+        # without a board the label IS the state, and it was written; with one, the board decides
+        return True if self.board is None else bool(moved)
+
+    def _close_as_delivered(self, ref: str) -> None:
+        """DONE closes the issue, as completed — this row is the one writer of its card's state
+        (#180).
+
+        NOTHING ELSE ON THE DELIVERY PATH EVER CLOSED A GITHUB ISSUE. Done moved the board column
+        (or wrote the `beeverforge:done` label) and left the issue open; what closed it was the
+        pull request's `Closes #N`, a line the FORGE writes. Since #179 that line is written only
+        where the forge owns the card, which is right — `Closes #12` in `acme/api` named issue 12
+        of `acme/api`, not the card routed from `acme/issues` — and it left every other pairing
+        (another repository, a local forge, Azure Repos, an add-on) with a delivered issue that
+        stayed open in Done for ever: the state triage reports as `done-but-open`, produced by the
+        factory itself on every card.
+
+        THE TRACKER, NOT THE FORGE, because the state of a card is this row's to write whatever it
+        is paired with — the rule #179 applies to Azure Repos, which refuses to transition work
+        items from the forge side. It needs no cross-repository closing keyword, whose behaviour
+        under this deployment's token nobody has measured, and it holds for a forge this core has
+        never heard of. On the owned pairing the closing line stays: it is the native link.
+
+        IT DOES NOT DO WHAT THE FORGE'S CLOSING WORD ALREADY DID. On the owned pairing `Closes #N`
+        closes the issue at the merge, before Done is written, so this reads the issue FIRST and
+        writes nothing to one that is closed — one writer per close. Where the word did not act
+        (another repository, another forge, or a merge into a branch that is not the repository's
+        default, which GitHub's keywords ignore) the issue reads open and this closes it.
+
+        BEST-EFFORT, AND SAID BY NAME. The change is merged and the card has moved; nothing about
+        recording that may undo it, so this never raises. But it is not swallowed either: a token
+        that may comment and may not close is exactly how this fails in the field, so the log names
+        the card under a marker — the way the refused board move above does — and triage's
+        `done-but-open` is what puts it in front of a person. NOT A COMMENT ON THE CARD: this row
+        was never told the project's language, and a sentence to a person is the caller's to say
+        (#160).
+
+        AN ISSUE THAT IS ALREADY CLOSED IS NOT A FAILURE, whatever `gh` answered — and it is read
+        again after a refused close, because the keyword can land between the first read and the
+        close. A card that is closed must never be reported as one that could not be."""
+        repo, num = self._locate(ref)
+        if self._reads_closed(repo, num):
+            return
+        try:
+            self._write(["issue", "close", num, "--repo", repo, "--reason", "completed"])
+            return
+        except Exception as exc:  # noqa: BLE001 — a delivery is never failed by its record
+            why = str(exc) or type(exc).__name__
+        if self._reads_closed(repo, num):
+            return
+        log.error("BEEVERFORGE_DELIVERED_CARD_NOT_CLOSED %s#%s was delivered and moved to Done, "
+                  "but the issue could not be closed — it stays open until a person closes it as "
+                  "completed, or the factory's credential is given the right to close issues in "
+                  "%s (triage reports it as done-but-open): %s", repo, num, repo, why)
+
+    def _reads_closed(self, repo: str, num: str) -> bool:
+        """Whether the issue reads CLOSED. Never raises: an issue that cannot be read is one still
+        to close, which is the side that leaves no delivered card open."""
+        try:
+            seen = self._gh(["issue", "view", num, "--repo", repo, "--json", "state",
+                             "--jq", ".state"])
+            return seen.returncode == 0 and (seen.stdout or "").strip().upper() == "CLOSED"
+        except Exception as exc:  # noqa: BLE001 — an unread state is one still to close
+            log.debug("could not read the state of %s#%s: %s", repo, num, exc)
+            return False
+
+    def comment(self, ref: str, body: str) -> None:
+        repo, num = self._locate(ref)
+        self._write(["issue", "comment", num, "--repo", repo, "--body", body])
+
+    def comments(self, ref: str, *, limit: int = 0) -> list[TicketComment] | None:
+        """`gh issue view --json comments`, which answers OLDEST FIRST (verified live on #81 of
+        this repository: 16:42 → 18:01 → 21:33). So the port's promised order is what GitHub
+        already gives, and `limit` slices off the FRONT.
+
+        `None` on any failure — a missing issue exits 1 with *"Could not resolve to an issue"*, and
+        a rate limit exits 1 too. Both mean the same thing to the caller: it did not get to look.
+        """
+        repo, num = self._locate(ref)
+        p = self._gh(["issue", "view", num, "--repo", repo, "--json", "comments"])
+        if p.returncode != 0:
+            log.warning("could not read the comments of %s#%s (%s) — the caller is being told "
+                        "UNREADABLE, not empty", repo, num, (p.stderr or "")[-200:])
+            return None
+        try:
+            payload = json.loads(p.stdout or "{}")
+        except ValueError:
+            log.warning("gh answered unparseable JSON for the comments of %s#%s", repo, num)
+            return None
+        raw = payload.get("comments")
+        if not isinstance(raw, list):
+            # A 200 without the field is not a ticket with no comments — it is a shape this
+            # adapter does not recognise, and the whole reason the method returns an option type.
+            log.warning("gh returned no `comments` field for %s#%s (%r) — reading as UNREADABLE",
+                        repo, num, sorted(payload))
+            return None
+        found = [
+            TicketComment(
+                # `login`, not `name`: the display name is optional on GitHub and empty for most
+                # accounts, and a bot posts under `<app>[bot]`, which is the one spelling that lets
+                # a reader tell the platform's own note from a person's.
+                author=str((c.get("author") or {}).get("login") or ""),
+                body=str(c.get("body") or ""),
+                created_at=str(c.get("createdAt") or ""),
+            )
+            for c in raw
+        ]
+        return found[-limit:] if limit > 0 else found
+
+    def list_tickets(self, *, state: str = "all", updated_since: str = "",
+                     limit: int = 0) -> list[TicketSummary] | None:
+        """`gh issue list`, ordered by last update.
+
+        THE SORT IS NOT FREE AND THE BRANCH SAYS WHY. `gh issue list` has no `--sort`; ordering by
+        update means `--search "sort:updated-desc"`, which routes the read through GitHub's SEARCH
+        rather than the plain issue list — a narrower quota on the credential the poller and every
+        job share, and one this deployment has already exhausted once. The plain path orders by
+        CREATION (verified: #96 came back before #95, created-desc, while their update times run
+        the other way), so it is only usable when nothing is being dropped. Hence: search when the
+        answer is truncated or filtered, plain list when everything comes back anyway, and a local
+        sort in both cases so the port's promise holds whichever route ran.
+        """
+        # `gh --state` happens to spell these exactly as the port does, so the shared validator IS
+        # the translation here. It still goes through it: the next provider's does not.
+        wanted = list_state(state)
+        ceiling = limit if limit > 0 else _LIST_CEILING
+        args = ["issue", "list", "--repo", self.repo, "--state", wanted,
+                "--limit", str(ceiling), "--json", _LIST_FIELDS]
+        terms = []
+        if updated_since:
+            terms.append(f"updated:>={updated_since}")
+        if terms or limit > 0:
+            terms.append("sort:updated-desc")
+        if terms:
+            args += ["--search", " ".join(terms)]
+
+        # 120s rather than the 60 every other call here uses: a full sweep is up to `_LIST_CEILING`
+        # issues WITH their bodies, which is pages of GraphQL, not one request.
+        p = self._gh(args, timeout=120)
+        if p.returncode != 0:
+            log.warning("could not list the tickets of %s (%s) — the caller is being told "
+                        "UNREADABLE, not empty", self.repo, (p.stderr or "")[-200:])
+            return None
+        try:
+            rows = json.loads(p.stdout or "[]")
+        except ValueError:
+            log.warning("gh answered unparseable JSON listing the tickets of %s", self.repo)
+            return None
+        if not isinstance(rows, list):
+            return None
+        # ONLY WHEN THE CEILING WAS OURS. A caller that asked for three and got three learned
+        # nothing; a caller that asked for EVERYTHING and got exactly `_LIST_CEILING` is holding a
+        # partial board and has no way to know it, because the ceiling is this module's own number.
+        if limit <= 0 and len(rows) >= ceiling:
+            log.warning("%s answered with %d tickets, which is this adapter's own ceiling — the "
+                        "board is larger than what the caller is about to judge",
+                        self.repo, ceiling)
+
+        # `canonical_ref`, so `142` and `#142` are one ticket and not two. `get_ticket` renders
+        # `#142` for a human; a key does not get to be decorated.
+        found = [_summary(row, ref=canonical_ref(row.get("number"))) for row in rows]
+        found.sort(key=lambda t: t.updated_at, reverse=True)
+        return found
+
+    def ticket_summary(self, ref: str) -> TicketSummary | None:
+        """ONE card as `list_tickets` answers it — the same fields, folded the same way — read by
+        its ref, in the repository the ref names (C-18); `None` when it could not be read (#492).
+
+        WHY A CARD IS READ BY ITSELF. `list_tickets` lists THIS adapter's repository, and the board
+        the product role reads is that list: a card filed in another repository of the product
+        (`acme/web#1`, `create_ticket(repo=…)`) is on no list this row makes, so a delivery that
+        waits on one never saw it delivered. This reads the cards a waiting delivery names there,
+        one `gh issue view` each, instead of listing the whole other repository to find them
+        (`product/events.py::_delivered_elsewhere`).
+
+        `stateReason` IS THE POINT: `get_ticket` reads `state` alone, and closed is not delivered
+        (`triage.Ticket.delivered`) — a card in another repository closed as not planned must not
+        be the one that tells somebody their requirement is ready.
+
+        The ref answered is the one asked, qualified as C-18 spells it (`qualify_ref`), so the
+        caller compares it with the loop that named it."""
+        from beeverforge.contracts.refs import qualify_ref
+
+        repo, num = self._locate(ref)
+        p = self._gh(["issue", "view", num, "--repo", repo, "--json", _LIST_FIELDS])
+        if p.returncode != 0:
+            log.warning("could not read %s#%s (%s) — the caller is being told UNREADABLE, not "
+                        "open", repo, num, (p.stderr or "")[-200:])
+            return None
+        try:
+            row = json.loads(p.stdout or "{}")
+        except ValueError:
+            log.warning("gh answered unparseable JSON reading %s#%s", repo, num)
+            return None
+        if not isinstance(row, dict) or not row.get("state"):
+            # a 200 without the field is a shape this adapter does not know — never an open card
+            return None
+        return _summary(row, ref=qualify_ref(repo, row.get("number") or num, self.repo))
+
+    def ticket_url(self, ref: str) -> str:
+        """The web URL for this issue, honouring the ref's own repository (C-18) and the host.
+
+        `GH_HOST` because a GitHub Enterprise deployment is not on github.com, and a link there is
+        not merely dead: a same-named repository on the public site may belong to somebody else."""
+        import os
+
+        repo, num = self._locate(ref)
+        host = (os.environ.get("GH_HOST") or os.environ.get("GITHUB_HOST") or "github.com").strip()
+        return f"https://{host}/{repo}/issues/{num}"
+
+    def item_space(self, ticket: Ticket) -> tuple[str, str] | None:
+        """Where this card's `#N` is unique: the CARD's repository on this host (#167).
+
+        The card's own repository, not this adapter's default, because one board routes cards to
+        several repositories (C-18) and `#12` in `acme/issues` is not `#12` in `acme/api`. The
+        forge row answers the same tuple for the repository it opens pull requests in, so the two
+        agree exactly when a pull request's `#12` would name this card. Lower-cased because GitHub
+        names are case-insensitive and a spelling difference must not read as another repository.
+        See `contracts/item_space.py`."""
+        from beeverforge.adapters.tracker.github_project import _gh_host
+
+        repo = (str(getattr(ticket, "repo", "") or "") or self.repo or "").strip().strip("/")
+        return ("github", f"{_gh_host()}/{repo}".lower()) if repo else None
+
+    def budget(self) -> Budget:
+        """The rate limit of the credential this tracker holds — the worst of graphql/core.
+
+        THE ONE VENDOR THAT REPORTS ONE, through the port. Before this method the core reached
+        `github_rate` by module name from four places, so every deployment paid for a `gh`
+        subprocess whether or not it had a GitHub tracker. `BudgetUnreadable` propagates: the
+        caller decides what an unread budget means on its surface."""
+        from beeverforge.adapters.tracker.github_project import github_rate
+
+        return github_rate(self.token)
+
+    def person(self, ref: str) -> dict:
+        """`gh api users/<login>` — see `TrackerAdapter.person`.
+
+        MOVED HERE FROM `runtime/slack/people.py`, where it was the only person resolution the
+        mention path had and ran for every tracker's refs."""
+        login = (ref or "").strip().lstrip("@")
+        if not login:
+            return {}
+        try:
+            p = self._gh(["api", f"users/{login}"])
+        except Exception as exc:  # noqa: BLE001 — the contract says NEVER RAISES, and it means it
+            # `_gh` raises when the `gh` binary is absent, and lets a timeout out. Both are
+            # ordinary on a machine composing a Slack message, and this method's caller is
+            # mid-sentence: an exception here loses the whole message rather than one mention.
+            log.info("could not look up %s on GitHub (%s) — they will be named, not notified",
+                     login, exc)
+            return {"id": login}
+        if p.returncode != 0:
+            # THE LOGIN ALONE STILL NAMES THEM in text. A private profile, a rate-limited quota
+            # and a login that does not exist are the same answer here, and all three are better
+            # served by a plain name than by nothing.
+            return {"id": login}
+        try:
+            data = json.loads(p.stdout or "{}")
+        except ValueError:
+            return {"id": login}
+        return {"id": login, "name": data.get("name") or "",
+                "email": (data.get("email") or "").lower()}
+
+    def assignees(self, ref: str) -> list[str]:
+        repo, num = self._locate(ref)
+        p = self._gh(["issue", "view", num, "--repo", repo, "--json", "assignees"])
+        if p.returncode != 0:
+            # "nobody is assigned" is an ANSWER, and it decides who a parked ticket goes back to.
+            raise RuntimeError(f"gh issue view (assignees) failed: {(p.stderr or '')[-200:]}")
+        return [a["login"] for a in json.loads(p.stdout).get("assignees", [])]
+
+    def set_assignees(self, ref: str, logins: list[str]) -> None:
+        # gh only adds/removes; diff current vs desired. (GitHub App bot users can't be
+        # assignees — use a real bot-account login.)
+        repo, num = self._locate(ref)
+        current = self.assignees(ref)
+        add = [x for x in logins if x not in current]
+        remove = [x for x in current if x not in logins]
+        if not (add or remove):
+            return
+        args = ["issue", "edit", num, "--repo", repo]
+        for x in add:
+            args += ["--add-assignee", x]
+        for x in remove:
+            args += ["--remove-assignee", x]
+        self._write(args)
+
+    def add_label(self, ref: str, label: str) -> None:
+        """Add a label to the ticket, creating it in the repo first if it doesn't exist yet
+        (`gh issue edit --add-label` fails on a missing label). Best-effort — a labelling
+        failure must never derail a job. Used to mark 'the bot is working this' on pickup."""
+        repo, num = self._locate(ref)
+        # idempotent create (a label the repo already has is left as-is)
+        self._ensure_label(label, repo=repo)
+        self._write(["issue", "edit", num, "--repo", repo, "--add-label", label])
+
+    def remove_label(self, ref: str, label: str) -> None:
+        """Remove a label from the ticket (best-effort; a missing label is a no-op)."""
+        repo, num = self._locate(ref)
+        self._write(["issue", "edit", num, "--repo", repo, "--remove-label", label])
+
+    def create_ticket(self, *, title: str, body: str, repo: str = "") -> str:
+        """Create an issue and (when a board is configured) add it to the board — it lands in
+        the board's default intake column (Backlog): sequencing to TO-DO stays a human
+        decision by default (ADR-0013 D3).
+
+        In `repo` when one is named (#265 §6.2) — the issue IS in that repository, so its ref is
+        qualified (`owner/name#14`, C-18) unless that is this adapter's own.
+
+        The body goes to `gh` over STDIN (`--body-file -`), like `update_body`'s, and never as an
+        argument: GitHub's limit is in characters (65,536) while one argv element's is in bytes
+        (131,072), so a body in a 3-byte script crossed the second at about 43,690 characters and
+        the create died as `OSError: [Errno 7] Argument list too long` (#807's table). It still
+        runs through `_gh`, so it keeps the empty-`--repo` refusal and the rate-limit retry."""
+        target = (repo or "").strip().strip("/") or self.repo
+        p = self._gh(["issue", "create", "--repo", target,
+                      "--title", title, "--body-file", "-"], stdin=body)
+        if p.returncode != 0:
+            raise RuntimeError(f"gh issue create failed: {p.stderr[:300]}")
+        url = (p.stdout or "").strip().splitlines()[-1].strip()
+        num = url.rstrip("/").rsplit("/", 1)[-1]
+        if self.board is not None:
+            try:
+                self.board.add_item(issue_url=url)
+            except Exception as exc:  # noqa: BLE001 — the issue exists either way
+                # An issue with no card is invisible to everyone who works from the board, which
+                # for this factory is everyone.
+                log.error("BEEVERFORGE_BOARD_ADD_FAILED #%s created but never added to the board "
+                          "(%s)",
+                          num, str(exc)[:200])
+        return f"#{num}" if target == self.repo else f"{target}#{num}"
+
+    def find_ticket(self, *, title: str) -> str | None:
+        """Ref of an OPEN issue with exactly this title (splitter idempotency)."""
+        p = self._gh(["issue", "list", "--repo", self.repo, "--state", "open",
+                      "--search", f'in:title "{title}"', "--json", "number,title",
+                      "--limit", "20"])
+        if p.returncode != 0:
+            # "I could not ask" is not "there is none" — and this is the gate in front of a create,
+            # so conflating them files the duplicate it exists to prevent. GitHub's search carries
+            # a far lower limit than issue creation, so it failing while `create` still works is
+            # the ordinary case, not the exotic one.
+            raise RuntimeError(f"gh issue list (search) failed: {(p.stderr or '')[-200:]}")
+        for it in json.loads(p.stdout or "[]"):
+            if (it.get("title") or "").strip() == title.strip():
+                return f"#{it['number']}"
+        return None
+
+    def update_body(self, ref: str, body: str) -> None:
+        """`gh issue edit --body-file -`: the body goes over STDIN, never as an argument.
+
+        A requirement runs to thousands of characters and contains quotes, backticks and newlines;
+        passing that on a command line is how a body gets truncated at the first surprising byte,
+        or worse, how part of it is read as a flag. And, like `create_ticket`'s, a body GitHub
+        accepts in characters (65,536) can exceed one argv element in bytes (131,072) once it is
+        multi-byte, which the kernel refuses before `gh` starts (#807)."""
+        repo, num = self._locate(ref)
+        p = subprocess.run(
+            ["gh", "issue", "edit", num, "--repo", repo, "--body-file", "-"],
+            input=body, text=True, capture_output=True, timeout=60, check=False, env=self._env(),
+        )
+        if p.returncode != 0:
+            # The only write here that replaces rather than appends: reporting it as landed when it
+            # did not is how a card keeps criteria written against a retired requirement while
+            # everybody is told it was realigned.
+            raise RuntimeError(f"gh issue edit (body) failed: {(p.stderr or '')[-300:]}")
+
+    def close_ticket(self, ref: str, reason: str, *, delivered: bool = True) -> None:
+        # `--reason` AND `--comment` ARE DIFFERENT FIELDS, and only the comment was ever set. The
+        # prose went into a comment and GitHub defaulted `stateReason` to COMPLETED — so a card
+        # closed as a duplicate was indistinguishable, to every reader downstream, from one that
+        # shipped. `not_planned` is what `Ticket.delivered` reads.
+        repo, num = self._locate(ref)
+        self._write(["issue", "close", num, "--repo", repo,
+                     "--reason", "completed" if delivered else "not planned",
+                     "--comment", reason])
+        self._off_the_queue(ref, delivered=delivered)
+
+    def _off_the_queue(self, ref: str, *, delivered: bool) -> None:
+        """A CLOSED CARD LEAVES ITS COLUMN WITH ITS CLOSE (#414), as the local row's close moves it
+        and as a Jira or Azure close IS a move. An issue's state and its project column are two
+        objects here, so a card closed from the panel stayed in TO-DO until the stale-pickup
+        healer met it — and that healer now hands the card's door a close the platform did not
+        make (ADR-0055 D8), which a close the platform DID make must not look like.
+
+        Done for finished work, Backlog otherwise — where `_close_as_delivered` and a withdrawn
+        close put it on every other row. BEST-EFFORT AND SAID BY NAME, like that close: the card
+        IS closed, and a column that did not follow is the healer's to find."""
+        if self.board is None:
+            return
+        try:
+            self.board.set_status(issue=str(ref).strip().lstrip("#"),
+                                  issue_url=self.ticket_url(ref),
+                                  state=JobState.DONE if delivered else JobState.SKIPPED)
+        except Exception as exc:  # noqa: BLE001 — the close stands; only its column lags
+            log.error("BEEVERFORGE_CLOSED_CARD_NOT_MOVED %s was closed, and its board column did "
+                      "not follow — the stale-pickup healer moves it if it sits in TO-DO: %s",
+                      ref, str(exc)[:160])
+
+    def update_title(self, ref: str, title: str) -> None:
+        """`gh issue edit --title`, through `_write` so a refusal raises."""
+        repo, num = self._locate(ref)
+        self._write(["issue", "edit", num, "--repo", repo, "--title", (title or "").strip()])
+
+    def reopen_ticket(self, ref: str) -> None:
+        """`gh issue reopen`. Through `_write`, so a refusal raises rather than reading as done —
+        the whole reason that helper exists (a client was once told a card was closed while it was
+        still open)."""
+        repo, num = self._locate(ref)
+        self._write(["issue", "reopen", num, "--repo", repo])
+
+    # --- native parent/child linkage via GitHub sub-issues --------------------------------
+    def _issue_rest_id(self, ref: str) -> int | None:
+        """The issue's numeric REST id (NOT its #number) — the sub-issues API links by id."""
+        repo, num = self._locate(ref)
+        p = self._gh(["api", f"repos/{repo}/issues/{num}", "--jq", ".id"])
+        if p.returncode != 0:
+            return None
+        try:
+            return int((p.stdout or "").strip())
+        except ValueError:
+            return None
+
+    def link_child(self, parent_ref: str, child_ref: str) -> None:
+        """Attach `child_ref` as a native sub-issue of `parent_ref` so the split lineage shows
+        on the board and children_of can answer 'already split?'. Best-effort + idempotent:
+        an already-linked child (or a repo without sub-issues) just fails quietly — the split
+        never depends on it."""
+        cid = self._issue_rest_id(child_ref)
+        if cid is None:
+            return
+        prepo, pnum = self._locate(parent_ref)
+        self._gh(["api", "--method", "POST",
+                  f"repos/{prepo}/issues/{pnum}/sub_issues",
+                  "-F", f"sub_issue_id={cid}"])
+
+    def children_of(self, parent_ref: str) -> list[str]:
+        """The parent's native sub-issues as refs ('#378', …). Empty on none, error, or a repo
+        without the sub-issues API — so the caller degrades to title-level idempotency."""
+        prepo, pnum = self._locate(parent_ref)
+        p = self._gh(["api", "--paginate",
+                      f"repos/{prepo}/issues/{pnum}/sub_issues",
+                      "--jq", ".[].number"])
+        if p.returncode != 0:
+            return []
+        return [f"#{n.strip()}" for n in (p.stdout or "").splitlines() if n.strip()]
+
+    # ---- identity, the two optional capabilities (ADR-0049 D7) --------------------------
+    def identity_of(self, subject_id: str) -> str:
+        """`""` — a GitHub login is not a platform id.
+
+        NOT A FAILURE AND NOT A GAP: the bridge between a platform id and this vendor's
+        namespace is a thing the deployment DECLARES (`Project.people`), and the caller
+        reads that map first. A row inventing an answer here would put one person's name
+        on another person's question."""
+        return ""
+
+    def mention(self, login: str) -> str:
+        """`@login` — GitHub resolves it in a comment body and notifies the person. The one
+        rendering that is not the login unchanged, and the reason the lifecycle used to
+        ask which vendor it was talking to (ADR-0048 §5: a mention nobody is notified
+        by is decoration)."""
+        return f"@{login}" if (login or "").strip() else ""
+
+    def _ensure_label(self, label: str, repo: str | None = None) -> None:
+        """Create the label if the repo lacks it — `gh issue edit --add-label` fails on a missing
+        one, and a fallback that cannot work on a fresh repository is not a fallback."""
+        self._gh(["label", "create", label, "--repo", repo or self.repo, "--color", "5319e7",
+                  "--description", "worked by the BeeverForge bot", "--force"])
+
+    def _transition_label(self, num: str, state: JobState, repo: str | None = None) -> None:
+        """Fallback when no board: keep exactly one state label on the issue.
+
+        THIS IS THE CARRIER OF TRUTH when the board refused the move, so it is the last thing that
+        may fail quietly: a card stuck in its old column while the platform records the transition
+        as done is the silent forever-wait the whole state machine exists to prevent."""
+        repo = repo or self.repo
+        want = f"{_STATE_LABEL_PREFIX}{state.value}"
+        self._ensure_label(want, repo=repo)
+        view = self._gh(["issue", "view", num, "--repo", repo, "--json", "labels"])
+        stale = []
+        if view.returncode == 0:
+            labels = [lbl["name"] for lbl in json.loads(view.stdout).get("labels", [])]
+            stale = [lbl for lbl in labels if lbl.startswith(_STATE_LABEL_PREFIX) and lbl != want]
+        args = ["issue", "edit", num, "--repo", repo, "--add-label", want]
+        for lbl in stale:
+            args += ["--remove-label", lbl]
+        self._write(args)

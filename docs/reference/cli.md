@@ -1,0 +1,252 @@
+# The CLI
+
+`beeverforge` is the whole control surface. The panel is the other one — the reference surface,
+always present — and a chat bot is a third where a deployment installed that connector as an
+add-on package. All of them are views onto the same thing; anything you can do from them you can
+do here, and a few things only exist here.
+
+Everything takes a **project handle** — the name you registered. The framework drives many projects
+and adding one is data, not code.
+
+In a compose deployment the same commands run inside the worker:
+
+```bash
+docker compose --env-file .env.compose exec worker python -m beeverforge.cli <command>
+```
+
+---
+
+## Running work
+
+### `beeverforge run <project> <issue>`
+
+Drive one ticket through the state machine, right now, in this process. This is the direct path —
+no durable engine, no queue.
+
+| option | default | |
+|---|---|---|
+| `--sandbox` | `worktree` | `worktree` \| `container` |
+| `--image` | *unset* | the box image; unset → the project's `box.image`, then `BEEVERFORGE_SANDBOX_IMAGE`, then the framework's |
+| `--review` / `--no-review` | on | the independent reviewer |
+
+Exits non-zero unless the job ends in `PR_OPEN`, `MERGED` or `DONE`, so it composes in a script.
+
+### `beeverforge poll <project>`
+
+Resume any rate-limit-paused tickets whose reset has passed, then take the board's TO-DO column —
+**one at a time**, stopping when one pauses or parks. This is the scheduler's shape; run it on a
+cron or a loop. There is no parallelism by design: the floor frees at merge, so the next ticket
+builds on a base containing the last one.
+
+---
+
+## Finding out what is wrong
+
+### `beeverforge doctor <project>`
+
+One line per check, each **distinct and actionable**, among them: Docker, the harness on PATH, the
+manifest, forge access, the deployment's installation scope (`installation_scope`: the registry
+names one GitHub organisation, and the configured App installation is on it — see
+[one deployment, one GitHub organisation](../configuration.md#one-deployment-one-github-organisation)),
+the board's columns, the repository's merge gates only a person settles (a required review among
+them — a failure under `merge_policy: auto`, which can then never land a pull request on its own),
+and the product-module link.
+
+Run this first. Before the first ticket there is no invariant protecting you — a mis-named board
+column, an App without Projects permission and a missing harness all produce the same symptom,
+which is nothing happening.
+
+`--json` prints the same report as a versioned document (`beeverforge.doctor/1`): one object per
+check with its `id`, `result` (`ok` or `fail`), `detail` and `remedy`, the closing `verdict`
+(`ok`, `expected`, `not_ready`) and the build that answered. Nothing else is printed, and the exit
+code is the report's. A check that does not apply to this deployment reads `result: ok` with a
+`detail` that begins `not applicable — `: `installation_scope` with no GitHub App configured, or
+with an App that no GitHub project uses because a static token wins over it, for one, verifies
+nothing and says so. The document is the `doctor` action's, so `POST /api/act/doctor` answers the
+same one to a front end of one's own — about the process that answered it, which its `build` names.
+
+### `beeverforge explain <checkout> [--language en|pt-BR] [--full]`
+
+Why an agent is given the instructions it is given: every block a planner or executor pass of the
+project at that checkout carries, one line each, in the order the job inlines them — the role
+prompt and the file it comes from, the constraints, each framework guideline with what the
+project's profile did to it (kept, waived, replaced), the operator's directory when
+`BEEVERFORGE_GUIDELINES_DIR` is set, the project's own guidelines by the key that names them, and
+the index. A path the job refuses or cannot find is a row too. `--full` prints each block's text
+under its line, as the prompt carries it; `--language pt-BR` writes every label and refusal in
+Portuguese.
+
+The rows are the record the job's own `build_context` keeps while it assembles a context, so this
+cannot disagree with what a job inlines. It reads and writes nothing: no harness, forge or network
+is called, no card or registry is touched, and the card's own words are never printed. A missing
+manifest, a profile that does not resolve and an address instead of a path are each refused in one
+sentence, exit 1. Walked in [the developer's guide](../developer-guide.md).
+
+### `beeverforge conformance <project>`
+
+Whether the **manifest** is complete: the floor requires `validate.test` and `validate.security`.
+
+> Note: this is a command somebody runs, **not a gate on the job path**. A project that skips it and
+> declares no `validate:` block will run and pass every gate vacuously. That is a known gap, not a
+> feature.
+
+---
+
+## Projects
+
+| | |
+|---|---|
+| `beeverforge project add <name> <path-or-url>` | register one. **A bare filesystem path registers as itself** — `local` on every axis, no owner to name and no board to number; give it `--repo owner/name` and it stays a checkout of that hosted repository. GitHub: `--repo owner/name` (inferred from a clone URL), `--board-owner`, `--board-number`. Azure DevOps: a `dev.azure.com` clone URL carries the coordinates ([the guide](../setup/azure-devops.md)); `--work-item-type`, `--token-env`. Safe to run again: a name already registered as asked changes nothing, and one registered differently is refused (exit 1), naming what differs — a project is changed by its own verbs, or removed first. The same act is the `project_add` action, which the panel's `POST /api/projects` maps onto too ([the front-end API](the-front-end-api.md)) |
+| `beeverforge project list` | what this deployment drives |
+| `beeverforge project init <name> <path-or-url>` | register + create the board with the platform's columns + scaffold `.beeverforge/project.yaml` (converges; each half runs only if missing). On a **path** the board is created in the file beside the registry and the closing lines name the one thing left to do: commit that manifest on your base branch. On a hosted row the board half is GitHub-only — other trackers bring their own board. The same act is the `project_init` action, whose `data.steps` says what each step came to: a step that fails leaves the ones before it done, the command exits 1 when the board or the manifest failed, and running it again does only what is missing |
+| `beeverforge project set-model <name> <model> [--role r]` | which model the coding agent runs, per project — no YAML editing inside the worker. Passed to the harness verbatim; the command asks it about the name and WARNS when it does not recognise it, never refuses ([ONBOARDING §11](../ONBOARDING.md)) |
+| `beeverforge project remove <name>` | unregister; a name that is not registered is refused (exit 2) with the roster |
+| `beeverforge project forget-conversations <name>` | delete every recorded conversation turn — a data-deletion request. Irreversible, asks first, and touches only the client's conversation, never the platform's operational memory. Conversations belong to the PRODUCT, so the other registry projects of the same product are named before it asks, and theirs go too — the rows recorded before memory was keyed by product included. What was derived from them goes with them (the product's index lines, its search record, each recall index), and so do the files sent in them and the names people gave them. It is the `conversations` layer of `project forget`, through the same function — and, like its `engine` layer, it closes the product's conversation runs in the durable engine that no turn is at work in, so the engine's retention expires the messages and replies they held (an open run's history is never retained away) |
+| `beeverforge project forget <name> [--yes] [--with-context] [--keep-closed-cards] [--no-backup]` | forget EVERYTHING the product role remembers about a project — to run it again as new, or to answer a request that it be forgotten. Layer by layer, each through its own store's deletion: `conversations` (as above), `engine` (the product's conversation runs and the project's tech-lead run in the durable engine, closed — a run with a turn at work is left open and said — so the engine's retention, which the line names, expires what they held; the next message starts a new run), `loops` (the project's loop ledger), `records` (card verdicts, preview records, the panel's messages, the card's record of its transitions, and who allowed a change to preview with its own shape), `intake` (the intake cases and the record of what the role told), `closed cards` (removed from a board that removes cards — refused by name on one that has no removal of its own; `--keep-closed-cards` keeps them), `context` (only with `--with-context`: the conversations' distillates leave the context repository in one commit; the requirements the role wrote are named and kept — a requirement is retired with `product_drop`, not deleted) and `processes` (this process's copies; restart the worker and the panel after). Refused while a job or a conversation turn runs on the project, or while the engine that would say cannot be read. Says what it keeps before it asks; backs up the metrics store and the board through SQLite's own backup, the memory directories and the product's files into `backups/` beside the registry first (`--no-backup` for a deletion request, where a backup keeps what was asked to be deleted); ends with one line per layer — forgotten, kept, refused or failed — and exits 1 when any was refused or failed. The deployment's people, the cost rows, the rounds' marks and every other project's rows are never touched |
+
+The registry is **operator-owned**; the agent cannot reach it. That is why the harness choice, the
+credentials and the box configuration live there rather than in the manifest inside the repository
+the agent edits.
+
+**First-time setup** — `beeverforge onboard <name> --yes` (worker) does the whole of it,
+measured: per repository it reads the manifest out of the code, **proves it in the real box**,
+generates the module map, and opens one pull request carrying all three with the proof's
+verdict in the body; then creates-or-uses the context repository and proposes the backfill the
+same way (a context repository born empty gets the declaration as its first commit instead —
+no pull request can target a commitless base). Creating one is the `product_init` action, as
+`product init --create-context` is: like every command that changes the installation, `onboard`
+changes it only through an action. `--source owner/repo` (repeatable) names the repositories of a multi-repo product —
+N repositories, N proofs, N pull requests; `--skip-context` leaves the context half out. A
+failing proof does not withhold the pull request — it is quoted in it. Walked in [ONBOARDING §3](../ONBOARDING.md).
+
+**The environment session** — `env read <path-or-name>` proposes the manifest and writes
+nothing; `env apply <path-or-name> --yes` writes it into that checkout (`--accept`, `--set`,
+`--force`, `--out`). With **no checkout anywhere**, `env apply <name> --yes --pr` has the worker
+clone the repository and propose the manifest as a pull request instead — the whole session is
+walked in [ONBOARDING §3](../ONBOARDING.md).
+
+**The context repository** — `product declare <name> <repo>` names one the client ALREADY has
+(GitHub `owner/repo`; Azure `repo`, or `Project/repo` across projects) and reads it back with
+both credentials that will open it. `product init <name> --create-context --write` creates one
+where the credential may. `product init` is the `product_init` action: its `data.steps` say what
+the context and the declaration came to, and running it again creates nothing twice and finds a
+review it already opened. A credential that may NOT create says so and names `declare` — the
+enterprise shape where repository creation is somebody else's process.
+
+**A product before its code** — `product start <name> <context-repository>` registers a project
+with its context repository and NO code repository (GitHub `owner/repo`, the Azure DevOps clone
+URL, or on one machine a short name, created when it does not exist), and reads the context back.
+Its product owner's conversation, its requirements and its context work at once; everything that
+needs code refuses it by name — the action rows that do (`no_code_yet`), pickup, `box prove`,
+`run`, `poll`, `project init` — and the doctor says the state in one `code` line, which `env
+check` holds on. A context that already lists sources leaves its product role off until its first
+source is one of them. `product first-source <name> <path-or-url>` gives it its code repository,
+on the forge its context is on: the registry's checks first, then the first entry of `sources:` in
+the context, then the registry — and the breakdown needs no other step. A context that lists other
+repositories and not this one is refused, with nothing written. Both are action rows (`product_start`, `product_first_source`), the same on
+`POST /api/act/{name}`. Walked in [ONBOARDING §9b](../ONBOARDING.md).
+
+**The box proof** — `box prove <name>` runs the project's own `setup:` and `validate:` inside
+the real box and saves the verdict; `box status <name>` says whether it still holds, what moved
+if not, and **what the proof is pinned to** (the box's toolchain — a rebuild that leaves it
+unchanged does not expire the proof). Both take `--repo owner/repo` for a multi-repo product's
+other repositories — the proof and the pickup gate are per repository
+([ONBOARDING §5](../ONBOARDING.md)). `box status --json` prints the same answer as a versioned
+document (`beeverforge.box-status/1`): the proof's `digest`, its `toolchain` pins one per entry,
+its `state` (`valid`, `expired`, `failed`, `unproven`) and the remedy, with the same exit code.
+The proof is pinned to the commands — `setup:`, `validate:`, the toolchain — and records that
+they ran green when it was taken; it is not re-run per ticket. A suite that goes red afterwards
+(a machine that lost its registry, a test added since) fails in the job's gate, not in the proof:
+a valid proof is not a green suite, and `box prove` again is how to find out.
+Each project is proven on a branch and in a working tree of its own, so two projects proved at
+once never meet. A second `box prove` or `box answer` of a project while a proof of it is running
+(onboarding's included, from this process or any other on the machine) is refused with one
+sentence and exit 1 before it touches the checkout or the box (a `--ref` proof's own checkout
+included), and records nothing: run it again when that one ends.
+
+---
+
+## Previews
+
+A change running as the whole product before its pull request merges. Walked in [ONBOARDING
+§11c](../ONBOARDING.md); what the deployment needs is [setup/previews.md](../setup/previews.md). On
+the compose stack every one of these runs inside the worker, where the daemon, the registry and
+the records are.
+
+| | |
+|---|---|
+| `beeverforge preview draft <project-or-path>` | what a proposal would contain, every line with its tier and the file it was read from. Writes nothing, builds nothing |
+| `beeverforge preview propose <project> --yes` | draft how the project runs and open it as a pull request of its own, on `beeverforge/preview` (on a local path: write it into the checkout). `--accept` writes inferred lines, `--set preview.<field>=<value>` answers one, `--as-card` files the questions as a card, `--prove` builds the base with the draft applied once on the deployment's runtime, `--source` names another repository, `--product` drafts a product's shape into its context repository |
+| `beeverforge onboard <project> --with-preview --yes` | §3's onboarding, and the preview proposal after each manifest |
+| `beeverforge preview prove <project>` | bring the base product up once on this deployment's runtime, wait until it is ready, take it down. Refused where no runtime is named |
+| `beeverforge preview login <registry> -u <user>` | store a registry login for previews only, in `BEEVERFORGE_PREVIEW_DOCKER_CONFIG` |
+| `beeverforge preview start \| stop \| restart <project> <unit>` | the card's buttons: `<unit>` is a card number, or a requirement as `req0012`. `restart` rebuilds from the pull request's head |
+| `beeverforge preview read <project> <unit>` | what the worker last recorded: state and why, each service and what it is built from, notes, where the logs are |
+| `beeverforge preview logs <project> <unit> [service]` | the logs a preview kept — each service's and the build's, kept before every stop |
+| `beeverforge preview ls` | every preview on this deployment's runtime, exited ones included, with who started it, when it ends and its disk |
+| `beeverforge project set-preview <name>` | the operator's policy: `--required/--no-required`, `--hours`, `--env svc=NAME[=WORKER_NAME]`, `--build-arg`, `--network`, `--cpus`, `--memory`, `--clear-env`. `project show <name>` reads it back |
+
+---
+
+## Partner certification
+
+`beeverforge certify deployment --partner <slug> --profile <light|standard|enterprise>
+--practitioner "<name>"` gathers an evidence pack from the deployment it runs on, for the
+implementation partner program: one entry per control (pass, fail, `n/a` where the profile does
+not require it, `unknown` where it could not be read), the box proof of every repository, the
+sanitised `preflight`, `doctor` and `box status` diagnostics, and `redactions.json`. Every
+organisation, repository, project and person is a pseudonym from a per-pack salt; URLs, hosts,
+e-mail addresses, paths and credentials are dropped; the practitioner is the one name kept.
+`--dry-run` prints every file and writes nothing; without `--yes` nothing is written. `pack.json`
+validates against `beeverforge/certify/pack.schema.json` (`beeverforge.certify/1`).
+
+The pack's `outcomes` cover `--window-days` (90 by default): jobs run and how each ended (read
+from the line the workflow writes in the job's journal when it ends, never from the job's last
+progress), parks by the tech-lead's classes, the median and p90 cost per merged ticket, the median
+time from pickup to `pr_open`, review rejections and repair passes per job, the oldest card in
+Needs Action, the platform versions the jobs ran on, and the `box prove` runs. Counts and medians
+only; a measure that cannot be read (no metrics store, no journals where certify ran, a card
+record that began inside the window) is `null`, and `outcomes.not_measured` says why.
+
+Three controls ask the forge, read-only, through the project's own forge row: C-BRANCH (the base
+branch requires a pull request, keeps history linear, blocks force pushes and allows auto-merge),
+C-WORKFLOWS (the credential a job holds cannot write the CI definitions) and C-VERSION (the running
+version is the latest published release or the one before). What the forge cannot answer — a
+credential without the scope to ask, a vendor that does not publish it, no network — reads
+`unknown`, never `pass`.
+
+`beeverforge certify verify <pack.tgz> [--profile <p>] [--thresholds <file>]` checks a pack
+offline, the way the submissions bot does: every member a regular file, `pack.json` against its
+schema, `SHA256SUMS` and `pack.json`'s own checksums against the files, the signature, and every
+threshold in `beeverforge/certify/thresholds.yaml` (or the `--thresholds` file, which replaces it
+whole), each reported by id. Exit 0 when everything holds, 1 with one finding per failure, 2 when
+the pack or the thresholds file cannot be read. An `unknown` control is never a pass, and an
+outcome the pack did not measure fails its threshold as "not measured", never as zero.
+`--allow-unsigned` stops an unsigned pack being a finding, for a rehearsal; the submissions bot
+never passes it.
+
+Not built yet, and said in every pack: the signature, so every pack is a `signature` finding
+without `--allow-unsigned`.
+
+---
+
+## The rest
+
+| | |
+|---|---|
+| `beeverforge autonomy <project> [--days N] [--json]` | how many of the project's cards reached their merge with no repair pass and nobody stepping in, read from the card's record — beside it the code-writing passes per card, how many repair passes each card took (0, 1, 2, 3+) and why cards parked, classified from the recorded note. **Measurement starts with cards promoted from 0.5.0 on**: older cards are listed as *before the record* and never enter a rate, so do not quote a yield over them. Writes nothing. `--json` is the `autonomy` block of `GET /api/metrics`, which the cost dashboard shows; a store that cannot be read exits 2 with the cause and what to check |
+| `beeverforge serve` | the panel, `--host`/`--port`. An unset `BEEVERFORGE_PANEL_TOKEN` means **open** — fine on a laptop, wrong for anything reachable |
+| `beeverforge bot-token` | mint a GitHub App installation token (~1h). On the onboarding path this is **the App smoke test** and nothing else: a printed `ghs_…` proves App ID, key and Installation ID agree, and there is nothing to save — the factory mints its own per job ([the guide](../setup/github.md) §5). The `export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)` form is for a shell that needs a token for a one-off `gh` command. Reads the key from `BEEVERFORGE_GH_APP_KEY` (a path) or `BEEVERFORGE_GH_APP_KEY_CONTENT` (the PEM itself); `--key-path <file>`, with `--app-id` and `--installation-id`, wins over both, so a newly downloaded key can be proven before it is deployed. A `--key-path` that is empty or cannot be read is refused by name (exit 1) and the environment's key is not used instead |
+| `beeverforge knowledge build \| check` | build and inspect the Knowledge Layer bundle — a module map the agents are handed. On by default ([ADR-0035](../adr/0035-knowledge-layer-on-by-default.md)). For a project the factory cloned itself, `build --publish` pushes the map to the repository's knowledge branch — without it the map lands in a disposable clone and the command says so. `--repo owner/repo` targets a multi-repo product's other repositories |
+| `beeverforge knowledge system PATH…` | the system layer of a product, derived from local checkouts of its sources (`NAME=PATH` names one): its components, the APIs, events and databases between them, and — first — what could not be derived. No model, no network, and nothing in the checkouts is run. `--out DIR` writes the five files the knowledge refresh publishes at `.okf/system/` in the context repository ([the knowledge layer](../knowledge-layer.md) §9; ADR-0052 D17, #268) |
+| `beeverforge approver add \| list \| remove` | manage who may authorise a production release. Identity plus password; production is never released from chat ([ADR-0016](../adr/0016-slack-actions-authorization.md)). `list` says on stderr which store it read. While `BEEVERFORGE_APPROVERS` is set it is the store, so `add` and `remove` refuse (exit 2) instead of editing a file nothing reads |
+| `beeverforge people invite \| revoke \| list` | the people this deployment names by invitation (the `local` identity row). `invite <id> [--display] [--product] [--by]` prints a one-time link — once; the store keeps its hash — that registers the person with a name and a password of their choosing and records who vouched for them; `revoke <id>` takes them off the deployment — their registration, every session they hold and any link still open for them — and records who did it, refusing the last person registered while no credential is configured, since the panel would then open to whoever arrives; `list` shows who is registered and which links are still open. The same acts are the `people_invite` and `people_revoke` actions on the panel ([configuration](../configuration.md)) |
+
+---
+
+## One thing that is not obvious
+
+`beeverforge` is not on your `PATH` after a plain clone — it lives in the virtualenv
+(`.venv/bin/beeverforge`). Every document, including this one, writes `beeverforge <command>` as though it were
+installed. It is the first command a new adopter runs and the first one that fails, and it is
+listed here because saying so costs a line and discovering it costs an evening.

@@ -1,0 +1,261 @@
+"""The platform's own column vocabulary — seven names, seven neutral keys, one board order.
+
+WHY THIS FILE EXISTS, AND WHY IT IS NOT IN A VENDOR'S MODULE. The six names were written down
+three times and compared in four more, and every copy lived at a GitHub address:
+`github_board_setup.CANONICAL_COLUMNS` (creation, in board order), `github_project.DEFAULT_COLUMNS`
+(the runtime map, unordered), and four literals in neutral code — the product role's `FILING_COLUMN`
+and `QUEUE_COLUMN`, the triage's three column arguments and the poller's `"TO-DO"` fallback. Any
+reader of those four could only conclude the platform's queue is a GitHub concept, and the next row
+on any axis would have had to import a vendor's module to learn the platform's own words.
+
+`STATE_KEYS` (`adapters/tracker/base.py`) already answers *which key does this job state belong to*
+for every tracker and every board. This answers the other half — *what does the platform call that
+key* — and the two together are the whole vocabulary. A client whose board says `A Fazer` maps the
+KEYS in the registry (`columns:`, C-14, ADR-0022 §4); the states stay closed and only the labels
+open. This file is what the mapping starts as, never what it must stay.
+
+NOT A PORT AND NOT A REGISTRY. Nothing dispatches here: it is a table two adapters and three
+neutral callers read, so it takes no import beyond the standard library and can be read from
+anywhere without dragging a vendor, a token or pydantic in behind it.
+"""
+
+from __future__ import annotations
+
+#: The platform's own name for each neutral column key. A board CREATED by the platform uses
+#: these verbatim, which is why the mapping starts as the identity; a board that already existed
+#: keeps its own names and maps them per key in the registry.
+#:
+#: `backlog` IS A COLUMN, NOT AN ABSENCE. A ticket a person took off the floor belongs with the
+#: work nobody is working on — the reasoning is written where the states are bound
+#: (`tracker/base.py::_PARKED_BY_A_PERSON`), and the two tables have to agree on the key or a
+#: state resolves to a column nothing declares.
+CANONICAL_COLUMNS: dict[str, str] = {
+    "backlog": "Backlog",
+    "todo": "TO-DO",
+    "in_progress": "In progress",
+    "in_review": "In review",
+    # A pull request waiting on a PERSON'S REVIEW: a column of its own, apart from the parks (#753).
+    # It shared `needs_action` with a failing gate and a card with no criteria, so the triager
+    # could not tell a reviewer's wait from a stuck card. A deployment that maps nothing for it
+    # falls back to `needs_action`'s column (`tracker/base.py::FALLS_BACK_TO`).
+    "needs_review": "Needs Review",
+    # Parked waiting on a HUMAN → a column of its own, never Backlog: a ticket that needs you must
+    # not hide among the ones nobody has started.
+    "needs_action": "Needs Action",
+    "done": "Done",
+}
+
+#: The keys in BOARD ORDER — left to right as a person reads the board, which is the order a
+#: creating act writes its columns in and is NOT the order a dict literal happens to carry.
+#: Kept as its own tuple, and asserted to cover the map exactly, because the two answers rotted
+#: apart once already: the creating act listed six names in order and the runtime map five plus a
+#: sixth appended after it, so a reader comparing them saw two different vocabularies.
+#: `needs_review` sits between the factory's review and the parks (#753): a pull request a person
+#: must review is past the factory's own review, which may have rejected it; the wait is that
+#: person's.
+BOARD_ORDER: tuple[str, ...] = (
+    "backlog", "todo", "in_progress", "in_review", "needs_review", "needs_action", "done",
+)
+
+
+def column_names() -> tuple[str, ...]:
+    """The seven names in board order — what a creating act writes onto a new board.
+
+    A FUNCTION RATHER THAN A SECOND CONSTANT, so there is exactly one place the order and the
+    names meet and no copy of the answer can drift from the map above."""
+    return tuple(CANONICAL_COLUMNS[key] for key in BOARD_ORDER)
+
+
+#: The keys a card sits in BEFORE the factory has taken it up, and the ones that mean it has.
+#:
+#: THE WRITE SIDE OF THIS HAS ALWAYS EXISTED AND THE READ SIDE DID NOT (#150). A job's state is
+#: resolved to a key by `STATE_KEYS` and the row moves the card, so the column IS where a card got
+#: to — but nothing answered the question back in the platform's own words. Every caller that
+#: wanted it re-derived it from the column NAME, and two gave up and searched the card's body text
+#: instead (`product/queue.py`, `product/triage.py`), which is how the queue came to call ready
+#: what the spec gate refuses.
+#:
+#: `todo` AND `backlog` ARE THE OPERATOR'S; the other five are the factory's own writing. A card in
+#: `in_progress`, `in_review`, `needs_review`, `needs_action` or `done` is there because `set_state`
+#: put it there.
+BEFORE_THE_FACTORY: tuple[str, ...] = ("backlog", "todo")
+
+#: The keys a card sits in once the factory has FINISHED with it (#162).
+#:
+#: "TAKEN UP" WAS READ AS "A JOB MAY BE RUNNING", AND FOR ONE COLUMN THAT IS NOT TRUE. The stage
+#: gate refused a close in every column `has_started` answers for, with the sentence *"a job may
+#: be working on it right now … Stop the job first"* — said of a card in Done, where the job ended
+#: and there is nothing to stop. It is also the card triage reports as `done-but-open` and asks a
+#: person to close, so the platform asked for a close it then refused.
+#:
+#: A NAMED SET BESIDE THE OTHER ONE, so the question is asked of the vocabulary and no caller
+#: compares a key to `"done"`. It stays a subset of what `has_started` answers for: the factory DID
+#: take a finished card up, which is why editing one is still refused.
+#:
+#: AND IT IS `done` ALONE ON PURPOSE, NOT BY ACCIDENT (review of #191, evidence 2026-09-20). The
+#: obvious next candidate is `needs_action` — a card the factory handed back, which can sit there
+#: for ever — and it does NOT belong here, because `has_finished` decides one thing only: whether a
+#: close is recorded as DELIVERED. A parked card never shipped. Recording one as delivered would be
+#: the eleven-duplicates incident in reverse, and `triage.Ticket.delivered` reads that word
+#: downstream. Whether such a card may be closed AT ALL is a different question, and the column is
+#: the wrong thing to ask: `needs_action` covers both a job parked alive on `wait_condition`
+#: (`workflow.py::_wait_operator`) and no job at all — the gather's question parks the card and
+#: RETURNS `SKIPPED` (`_lifecycle`), and an elapsed impediment deadline returns the park untouched
+#: and completes. So the close asks the ENGINE whether a job is really on the card
+#: (`actions/catalog.py::_job_on_the_card`), and this table keeps answering only what it can know.
+#:
+#: `needs_review` IS NOT HERE EITHER (#753), and `may_be_running` must answer True for it: the
+#: pull request is open and `runtime/temporal/workflow.py::_watch_to_merge` holds the floor until
+#: it merges or `merge_deadline_days` runs out, so a close from that column takes the card from
+#: under a live job. Nothing shipped yet, so a close there is never DELIVERED.
+AFTER_THE_FACTORY: tuple[str, ...] = ("done",)
+
+#: The keys a card sits in while the factory waits on a PERSON: a park (`needs_action`) and a pull
+#: request waiting for its review (`needs_review`, #753). `card_move` asks the engine whether a job
+#: still waits before it queues a card from either (`actions/catalog.py::_card_move`); with only
+#: `needs_action` named there, a card in "Needs Review" went back to TO-DO under a live merge
+#: watch. A NAMED SET, so no caller compares a key to a literal, the rule `AFTER_THE_FACTORY`
+#: states.
+WAITING_ON_A_PERSON_KEYS: tuple[str, ...] = ("needs_review", "needs_action")
+
+#: The keys whose DEFAULT name yields to any other key that carries it (#753): `needs_review` is
+#: optional, and its default "Needs Review" may already be a deployment's park. Only these: a
+#: rule that let every renamed key beat a default read a wait pointed at the review column's
+#: default spelling as the wait, not the factory's review (#753's re-review, 2026-10-21).
+YIELDS_ITS_DEFAULT_NAME: tuple[str, ...] = ("needs_review",)
+
+
+def key_for(name: str, *, renamed: dict[str, str] | None = None) -> str:
+    """The neutral key a board's own column NAME means, or `""` when nothing maps it.
+
+    THE INVERSE OF `name_for`, and it takes the deployment's map because only that can answer: a
+    client whose board says `A Fazer` declares `columns: {"todo": "A Fazer"}` in the project's
+    tracker options (C-14, ADR-0022 §4), and the hosted rows already merge exactly that map over
+    their defaults. Falling back to the canonical names is right for a board the platform created,
+    which uses them verbatim.
+
+    `""` RATHER THAN A GUESS, for the same reason `name_for` answers `""`: a column this platform
+    does not know is a legitimate thing for a client's board to have, and a caller deciding what
+    may be done to a card must be able to tell *I know this column* from *I do not*.
+
+    THE FIRST KEY IN `CANONICAL_COLUMNS` ORDER THAT SPELLS THE NAME ANSWERS, except that a key in
+    `YIELDS_ITS_DEFAULT_NAME` gives up its DEFAULT name to any other key carrying it. So a status
+    a deployment gives both `in_review` and `needs_review` reads as `in_review`, in any spelling,
+    and a park a deployment already called "Needs Review" (`needs_action`) stays a park. Every
+    other collision answers as it did before `needs_review` existed.
+    """
+    wanted = (name or "").strip().casefold()
+    if not wanted:
+        return ""
+    merged = {**CANONICAL_COLUMNS, **(renamed or {})}
+    hits = [str(key) for key, spelled in merged.items()
+            if str(spelled).strip().casefold() == wanted]
+    # A board whose park was already called "Needs Review" before 0.7 (`needs_action` mapped to
+    # it) read its parked cards as `needs_review` once that key's default name was the same word,
+    # and the product role's parked review went empty (#753's review, measured 2026-10-21: `main`
+    # 1be1835a answered `needs_action`, the branch at 79087790 `needs_review`). Letting EVERY
+    # renamed key beat a default (22f1cc53) read `{"needs_review": "In review"}` as `needs_review`
+    # on GitHub, whose map merges the defaults, so the factory's own review read as a person's
+    # wait (#753's re-review, measured 2026-10-21). Only the optional key's default name yields.
+    return next((key for key in hits if not yields_its_name(key, name, renamed=renamed)),
+                hits[0] if hits else "")
+
+
+def yields_its_name(key: str, name: str, *, renamed: dict[str, str] | None = None) -> bool:
+    """Whether `key` gives up the column `name` to another key that carries it — the ONE rule
+    `key_for` reads by and a board's write takes, so a card is never moved by `needs_review`'s
+    default name to a column it then reads back as another key's. A name the deployment WROTE never
+    yields: `columns: {needs_review: "In review"}` sends the card to "In review", which reads back
+    as `in_review` (two keys, one status), as on Jira.
+
+    True only for a key in `YIELDS_ITS_DEFAULT_NAME` whose `name` is its DEFAULT spelling while
+    another key of the deployment's map (merged over the defaults, as `key_for` merges it) spells
+    it too. A GitHub board with `columns: {in_review: "Needs Review"}` carries "Needs Review" as its
+    review column; `needs_review`'s default claimed that option on the write, and the card a person
+    must review landed in the factory's review (PR #1040's review, 2026-10-21; `main` sent it to
+    Needs Action)."""
+    wanted = (name or "").strip().casefold()
+    if not wanted or key not in YIELDS_ITS_DEFAULT_NAME:
+        return False
+    if CANONICAL_COLUMNS.get(key, "").casefold() != wanted:
+        return False
+    merged = {**CANONICAL_COLUMNS, **(renamed or {})}
+    return any(other != key and str(spelled).strip().casefold() == wanted
+               for other, spelled in merged.items())
+
+
+def carried_by(key: str, declared: str | None, had: dict[str, str],
+               named: dict[str, str]) -> str:
+    """The other key whose column already carries the name `key` would be written under, when
+    `key` yields that name to it (`yields_its_name`); `""` when it does not.
+
+    ONE RULE FOR THE WRITER AND THE WARNING. The local setup reads it to write no second column of
+    one name (`LocalBoardSetup.create`, and `left_out`'s sentence to `init`), and the local board
+    reads it to say which remedy works when it falls back from a column it lacks: on a board that
+    already has a column called "Needs Review", a re-run of `init` adds nothing (PR #1040's round
+    5). `had` is the board's rows, `{key: name}`; `named` the deployment's `columns:` map.
+
+    The rows already on the board win over the deployment's map, as `INSERT OR IGNORE` keeps them;
+    the map counts too, so a FIRST `init` with `columns: {in_review: "Needs Review"}` does not
+    write two rows of one name either (measured on 374ef5cd by PR #1040's review, 2026-10-21)."""
+    carriers = {**named, **had}
+    candidate = declared or CANONICAL_COLUMNS[key]
+    if not yields_its_name(key, candidate, renamed=carriers):
+        return ""
+    wanted = candidate.strip().casefold()
+    return next((other for other, spelled in carriers.items()
+                 if other != key and str(spelled).strip().casefold() == wanted), "")
+
+
+def has_started(key: str) -> bool:
+    """Whether a card in this column is one the factory has taken up.
+
+    ASKED OF A KEY THE CALLER HAS ALREADY RESOLVED. An unmapped column answers `""` from
+    `key_for`, which is *I cannot tell* and not *it has not started* — folding the two here would
+    quietly answer the safe-sounding one, and the caller that must refuse cannot see the
+    difference."""
+    return bool(key) and key not in BEFORE_THE_FACTORY
+
+
+def has_finished(key: str) -> bool:
+    """Whether a card in this column is one the factory has finished with — delivered work.
+
+    `""` ANSWERS FALSE, for the reason `has_started` gives: an unmapped column is *I cannot tell*,
+    and a caller about to record a card as delivered must not get there on a guess."""
+    return bool(key) and key in AFTER_THE_FACTORY
+
+
+def may_be_running(key: str) -> bool:
+    """Whether a job may be working on a card in this column right now.
+
+    Taken up and not finished. This is the question a CLOSE asks — taking a card off the board
+    from under its job is what that gate prevents — and it is narrower than `has_started`, which
+    is the question an EDIT asks (#162).
+
+    `MAY` IS THE WHOLE WORD, AND IT IS NOT THE LAST WORD (review of #191). A column is where the
+    factory last put the card, never proof that a job is still on it: `in_review` holds a card
+    whose merge watch is alive, and `needs_action` holds both a job parked on a signal and a card
+    whose workflow ended hours ago. This answers the board's half; `_job_on_the_card` asks the
+    engine for the other half before a close is refused."""
+    return has_started(key) and not has_finished(key)
+
+
+def name_for(key: str, *, renamed: dict[str, str] | None = None) -> str:
+    """The name for one key — the deployment's when it renamed it, the platform's otherwise — or
+    `""` for a key neither knows.
+
+    `""` RATHER THAN A RAISE, because every caller of this is naming a column to look for on a
+    board, and a board that does not have it is an ordinary answer this platform already handles
+    (`set_column` returns False, `set_status` no-ops). A traceback here would turn a board's
+    missing column into a crashed job.
+
+    `renamed` MAKES THIS THE TRUE INVERSE OF `key_for` (#496), and for the same reason that one
+    takes it: a client whose board says `A Fazer` declared `{"todo": "A Fazer"}`, and the product
+    role then asked its board for `TO-DO` by name — on Jira the site's workflow offers no such
+    transition, so every queueing and every filing was refused. The deployment's word wins and the
+    platform's seven still answer under it, exactly as `key_for` merges them, so a row that declared
+    only half its workflow is read the same way in both directions."""
+    said = str((renamed or {}).get((key or "").strip().lower()) or "").strip()
+    if said:
+        return said
+    return CANONICAL_COLUMNS.get((key or "").strip().lower(), "")

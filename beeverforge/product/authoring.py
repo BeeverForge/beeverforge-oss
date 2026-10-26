@@ -1,0 +1,2727 @@
+"""Writing: a requirement becomes a pull request; a requirement becomes issues.
+
+TWO SURFACES, TWO AUTHORITIES (ADR-0019 §5).
+
+    a requirement change   →  a PR in the documentation repo   →  a human merges it
+    an issue               →  filed straight into Backlog      →  a human promotes it to TO-DO
+
+The line is drawn at COST, not at content. Rewriting an ambiguous criterion is the role's job and
+requiring a human for every wording decision would put a person back in the loop the factory exists
+to remove. Starting work is not: TO-DO is what the poller pulls, so a promotion spends real money.
+
+WHY A PULL REQUEST RATHER THAN A DIRECT COMMIT. It is the sign-off — auditable, versioned, familiar,
+and no CI to pay for since a documentation repo has no gates to run. It also settles who wins when a
+person and an agent edit the same paragraph: git does.
+
+IDEMPOTENT BY CONSTRUCTION. Slack retries, a worker replaced mid-operation, a signal delivered
+twice — each would otherwise leave a second PR proposing the same requirement, or a duplicate issue
+on the board. Every write here derives a deterministic key and checks for its own prior result
+first, the same discipline the Fargate launcher uses to re-attach to a job it already started.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+# the private regexes on purpose: reader and writers must share the ONE pattern object (see the
+# note on `_STATUS_RE` in corpus.py) — a copy here is how the two drifted the first time
+from beeverforge.product.corpus import (
+    _ASKED_RE,
+    _DATE_RE,
+    _STATUS_RE,
+    ACCEPTED,
+    DECISIONS_HEADING,
+    DROPPED,
+    OBSERVED,
+    PROPOSED,
+    SUPERSEDED,
+    UNRECORDED,
+    Corpus,
+    find_decisions_table,
+)
+from beeverforge.product.role import IssueDraft, RequirementDraft
+from beeverforge.product.template import EMPTY, RequirementTemplate, load_template
+
+log = logging.getLogger("beeverforge.product")
+
+_GIT_TIMEOUT = 120
+
+#: The forge kind this module used to assume. KEPT AS A NAME AND NOT AS A BEHAVIOUR: nothing here
+#: branches on a vendor any more (#95) — every pull-request operation goes through `ForgeAdapter`,
+#: which is one interface over GitHub, Azure Repos and whatever comes next. It survives because it
+#: is still the default of two parameters this module accepts and ignores, and those exist only
+#: until their call sites drop them (see `propose_requirement`).
+GITHUB = "github"
+
+#: How long a merge may take to become VISIBLE before this module stops waiting for it, and why
+#: waiting at all is not paranoia. MEASURED through the real adapters on 2026-08-06:
+#:
+#:     Azure Repos    `merge_pr` returned in 0.8s; the PR read `open`, and `merged` at +2.4s
+#:     GitHub         `merged` on the first read back
+#:
+#: Completion is ASYNCHRONOUS on Azure DevOps by design — the arming PATCH answers `active` — so a
+#: single read straight after the merge reports an honest merge as a failure, and this module's
+#: answer to that is client-visible: `merged=False` is what makes the channel say the requirement
+#: is not yet where the role can read it. One vendor's timing must not become another vendor's
+#: wrong sentence. Six attempts two seconds apart is ~10s of patience for the case that is really
+#: still open, and one round trip for the common case that is not.
+_MERGE_ATTEMPTS = 6
+_MERGE_DELAY = 2.0
+
+
+#: WHY A WRITE DID NOT HAPPEN, WHEN SOMEBODY DECIDED IT DID NOT (#908). The closed vocabulary of
+#: `WriteResult.refusal`: the module looked and declined, on purpose, with a sentence of its own.
+#: Before it existed `_write_outcome` (`actions/catalog.py`) could not tell "this card is not yours"
+#: from "the forge is down", and answered both as an internal error: measured on 620bb577
+#: (2026-10-20), `product_withdraw_card` by a product-scoped stranger answered HTTP 500 / `failed`
+#: with the module's own "only the person who asked for #1 … can close or remove it".
+#:
+#: the person asking may not do this to this thing (not theirs, no permission to approve)
+NOT_YOURS = "not_yours"
+#: what the write names does not exist (the card, the requirement, the survivor of a merge)
+NOT_FOUND = "not_found"
+#: it exists, and its state does not admit this now (retired, held, not at the gate it needs)
+NOT_WAITING = "not_waiting"
+#: the card is already closed
+ALREADY_CLOSED = "already_closed"
+#: what the write would create is already there (`existed=True`: a fact known, a question asked)
+ALREADY_THERE = "already_there"
+#: what was asked is not a thing this write takes (not a promise, not a capability, empty, too long)
+NOT_VALID = "not_valid"
+
+#: Every word `WriteResult.refusal` may carry other than `NOT_REFUSED`.
+REFUSALS = frozenset({NOT_YOURS, NOT_FOUND, NOT_WAITING, ALREADY_CLOSED, ALREADY_THERE, NOT_VALID})
+
+#: NOBODY DECIDED THIS: the write was tried and did not happen — a failure, never a refusal. It is
+#: the default, and what a result from a worker older than this field decodes to, so a rolling
+#: deploy degrades to "failed" and never to a refusal nobody made.
+NOT_REFUSED = ""
+
+
+@dataclass
+class WriteResult:
+    """What a write produced, or why it produced nothing. `ok=False` is always accompanied by a
+    sentence a human can act on — a write that failed silently is how a requirement discussed at
+    length turns out never to have been recorded — and by why it did not happen: `refusal` names
+    the decision when the module declined on purpose, and is `NOT_REFUSED` (`""`) when nobody
+    decided it, which is a failure."""
+
+    ok: bool
+    url: str = ""
+    ref: str = ""
+    detail: str = ""
+    existed: bool = False
+    #: whether the proposal reached the branch everyone reads. MERGING IS NOT ACCEPTING (ADR-0032):
+    #: the requirement lands as `proposed`, and only a human's confirmation in the channel turns it
+    #: into a promise the factory defends. Left unmerged it was invisible to the product role
+    #: itself — it reads the docs branch, so its own requirement did not exist from where it stands.
+    merged: bool = False
+
+    #: The requirement number this write actually MINTED — 0 when the write minted none.
+    #:
+    #: The channel used to tell the client the number it had PREDICTED before the write, computed
+    #: from the base corpus alone. `propose_requirement` mints against the base AND the unlanded
+    #: `req/*` branches, so a pushed-but-unmerged proposal makes the two disagree — and the client
+    #: was then told "o requisito 7 está registrado" about a file called `0008-…md`. Their next
+    #: sentence is `aceita o requisito 7`, which finds nothing.
+    #:
+    #: So the act reports its own outcome, like every other write here. A prediction is a fine
+    #: thing to compute and a terrible thing to state as fact.
+    number: int = 0
+
+    #: The requirement this act was about describes what the code ALREADY DOES — a reading of the
+    #: code (`Requirement.came_from_the_code`) — so no work follows from it (#182).
+    #:
+    #: SAID BY THE ACT, NOT RE-DERIVED BY ITS CALLERS. An acceptance has two doors that used to
+    #: chain straight into the breakdown — the catalog row starts a workflow on the worker, the
+    #: conversation calls the module in-process — and they cannot share a call, because only one of
+    #: them runs where an agent can. What they can share is the verdict: `ProductModule.accept` has
+    #: the requirement in its hand when it writes, and each door reads this one field instead of
+    #: asking the corpus a second question of its own. `break_down` answers with it too, when it is
+    #: reached for such an entry by anything other than a person asking.
+    nothing_to_build: bool = False
+
+    #: THE PRODUCT STARTED BEFORE ITS CODE (#992), so a breakdown of this requirement files
+    #: nothing: the cards would be worked in a code repository the product does not have yet.
+    #: Not `ok` and not a failure, like `nothing_to_build`, and read the same way by every door —
+    #: `detail` says why and what to do, and no front is counted as left out (`unfiled`).
+    waits_for_code: bool = False
+
+    #: WHAT THIS IS WAS SAVED MOMENTS AGO, in another conversation — found among what arrived
+    #: after this proposal's own check, under the product's semaphore (ADR-0051 D7–D9, #266
+    #: slice 3). Nothing was written; `ref`/`url` are the existing record's. The reply says the
+    #: work exists and links it, and never says who asked: the act carries no person to say.
+    just_asked: bool = False
+
+    #: WHERE A CARD `promote` QUEUED STANDS IN THE ORDER A PERSON APPROVED (#512), and `""` for
+    #: every other write. `kept`: the board ranked it in its place; `unrankable`: the board keeps
+    #: no order this platform can write (`Rankable`), so the factory takes it in the board's own;
+    #: `not_kept`: the board ranks, and refused or failed this card's place. The reply promises
+    #: "a fábrica começa pelo primeiro" only when every card it names was `kept`
+    #: (`voice.queued`): the poller pulls in board order, and a sentence about an order nothing
+    #: wrote is a promise with nothing behind it.
+    ranked: str = ""
+
+    #: WHY THE MODULE DECLINED, one of `REFUSALS` — or `NOT_REFUSED` (`""`): nobody decided this,
+    #: the write was tried and did not happen, a failure. `""` is also what a result rebuilt from
+    #: an older worker's dict, which never carried the key, decodes to. Always `""` when `ok`.
+    refusal: str = NOT_REFUSED
+
+    def __post_init__(self) -> None:
+        # the same shape as `actions.base.refused`'s check: a word outside the vocabulary is a
+        # typo at a refusal site, and would otherwise travel as a failure nobody can trace
+        if self.refusal != NOT_REFUSED and self.refusal not in REFUSALS:
+            raise ValueError(
+                f"unknown refusal {self.refusal!r} — one of {sorted(REFUSALS)}, or empty")
+
+
+def next_number(corpus: Corpus) -> int:
+    """One past the highest number ever used — INCLUDING superseded ones.
+
+    Reusing a retired number would silently re-point every citation of the old requirement at a new
+    and unrelated one, which is the sort of corruption nobody notices until a decision is argued
+    from the wrong document."""
+    return max((r.number for r in corpus.requirements), default=0) + 1
+
+
+def slugify(title: str, *, limit: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return (slug[:limit].rstrip("-") or "requirement")
+
+
+#: WHAT A DRAFT SAYS IS WRITTEN AS TEXT, NEVER AS THE DOCUMENT'S STRUCTURE (review of #1014). The
+#: reader finds a requirement's parts by their lines: a section ends at the next line that begins
+#: `## `, and the decision register is the first `## Decisions taken during execution`. A draft is
+#: a model's words over a person's, and a line break in any of its texts wrote such a line: a
+#: template section holding that heading wrote a register above the real one, `find_decisions_table`
+#: picked it, `has_decisions` read True with nothing decided, and write-back went to the wrong
+#: table. Measured on d863fdfe: the title, *Why*, every list, a conflict and a template section did
+#: it alike. A slot the reader reads by the line is written on one line, as a template field's value
+#: already was; a section's text keeps its paragraphs, and a line in it that would open a heading
+#: is escaped. ESCAPED, NOT REFUSED, for the reason a register cell's `|` is (`_CELL_UNSAFE`):
+#: refusing a requirement because its text holds a `#` would be the platform's own format leaking
+#: into what a client may say.
+#:
+#: A heading line: `#`s after any indentation, then whitespace or nothing. The core's readers match
+#: `^##\s` at the margin; Markdown also takes an indented one, and a heading a person sees in the
+#: file is one they believe. Inside a code fence too: the readers do not know fences, so a shell
+#: comment `## setup` in a fenced block ends a section as surely as a heading does.
+_OPENS_A_HEADING = re.compile(r"^([ \t]*)(?=#+(?:\s|$))")
+
+
+def _one_line(text: str) -> str:
+    """`text` on one line — for a slot the reader reads by the line: the title, a header field, a
+    bullet. Every line break a reader could see is whitespace to `str.split`."""
+    return " ".join((text or "").split())
+
+
+def _as_text(text: str) -> str:
+    """`text` as paragraphs that open no heading — for a section the draft writes. Every line break
+    a reader could see becomes `\\n` (`read_text` turns a lone `\\r` into one, `_bullets` splits at
+    `\\u2028`), and a line that would open a heading opens with `\\#`, which Markdown shows as the
+    `#` the text said."""
+    return "\n".join(_OPENS_A_HEADING.sub(r"\1\\", line)
+                     for line in (text or "").strip().splitlines())
+
+
+def render_requirement(
+    draft: RequirementDraft, *, number: int, asked_by: str = "", date: str = "",
+    source: str = "", template: RequirementTemplate | None = None,
+) -> str:
+    """The requirement as it will live in the repository — the same shape as the template, because
+    a document a human cannot edit by hand is not a document, it is a database with extra steps.
+
+    With the product's own `template` (ADR-0058) its fields are written as header lines after the
+    core's own, and its sections after the core's, before the decision register. A field the draft
+    has no value for is written as `—` and a section as `(not stated)`, so the file says what is
+    missing and the reader reports it; nothing is invented. No text of the draft, nor `asked_by`,
+    `date` or `source` beside it, can open a line the reader takes for the document's own
+    (`_one_line`, `_as_text`)."""
+    status = "proposed"
+    lines = [
+        f"# REQ-{number:04d} — {_one_line(draft.title)}",
+        "",
+        f"- **Status:** {status}",
+        f"- **Asked by:** {_one_line(asked_by) or UNRECORDED}",
+        f"- **Date:** {_one_line(date) or UNRECORDED}",
+        f"- **Supersedes:** {', '.join(f'REQ-{n:04d}' for n in draft.supersedes) or '—'}",
+    ]
+    if source := _one_line(source):
+        lines.append(f"- **Source:** {source}")
+    if template is not None:
+        for f in template.fields:
+            value = _one_line(draft.fields.get(f.name, "")) or EMPTY
+            lines.append(f"- **{f.name}:** {value}")
+    lines += ["", "## Why", "", _as_text(draft.why) or "(not stated)", ""]
+
+    lines += ["## What must be true", ""]
+    lines += [f"- [ ] {_one_line(c)}" for c in draft.must_be_true] or ["- [ ] (nothing stated)"]
+    lines += [""]
+
+    lines += ["## Out of scope", ""]
+    lines += [f"- {_one_line(c)}" for c in draft.out_of_scope] or ["- (nothing stated)"]
+    lines += [""]
+
+    lines += ["## Affects", ""]
+    lines += [f"- `{_one_line(c)}`" for c in draft.affects] or ["- (not stated)"]
+    lines += [""]
+
+    if draft.conflicts:
+        # Conflicts are recorded IN the document, not just reported in chat. A contradiction found
+        # while drafting and then lost in a Slack scrollback is a contradiction that gets
+        # rediscovered the expensive way.
+        lines += ["## Conflicts raised while drafting", ""]
+        for c in draft.conflicts:
+            ref = f"REQ-{c.requirement:04d}" if c.requirement else "an existing requirement"
+            lines.append(f"- **{_one_line(c.kind)}** {ref} — {_one_line(c.explanation)}")
+        lines += [""]
+
+    if draft.questions:
+        lines += ["## Open questions", ""]
+        lines += [f"- {_one_line(q)}" for q in draft.questions]
+        lines += [""]
+
+    if template is not None:
+        for sec in template.sections:
+            text = _as_text(draft.sections.get(sec.name, "")) or "(not stated)"
+            lines += [f"## {sec.name}", "", text, ""]
+
+    lines += [
+        f"## {DECISIONS_HEADING}",
+        "",
+        # THREE COLUMNS, and the person goes in the third with the channel. A fourth column would
+        # have been cleaner to read and would have HIDDEN the answer: every requirement already
+        # written for the live client has this three-column header, and GitHub's renderer silently
+        # drops cells past the header's width. A row carrying the person as a fourth cell would
+        # render without them — a provenance field that looks recorded and shows nothing.
+        "| date | decision | who decided, and where |",
+        "|---|---|---|",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _git(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
+    """One git call, AUTHORED AS THE BOT.
+
+    THE IDENTITY IS CARRIED, NEVER ASSUMED. This module ran `git commit` on the ambient config,
+    which is a bet that whoever built the worker image happened to run `git config --global
+    user.email`. Where that bet loses, git refuses the commit with *"Please tell me who you
+    are"* — and every requirement the product role writes fails, on a container that is
+    otherwise perfectly healthy.
+
+    Found by the platform's own CI (2026-08-05), which is a clean machine with no git identity —
+    and a clean machine is exactly what a fresh deployment's container is. `machine.py::_commit`
+    had carried the identity since the beginning; this file simply never learned the same lesson.
+
+    `-c` rather than env vars: it applies to commits and leaves every other git call unchanged,
+    and it cannot be lost by a subprocess that rebuilds its environment."""
+    from beeverforge.credentials import bot_identity
+
+    bot = bot_identity()
+    ident = ["-c", f"user.name={bot.name}", "-c", f"user.email={bot.email}"]
+    p = subprocess.run(["git", *ident, *args], cwd=cwd, capture_output=True, text=True,
+                       timeout=_GIT_TIMEOUT, check=False)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def _scrub(text: str) -> str:
+    return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text or "")
+
+
+def branch_for(number: int, title: str) -> str:
+    """Deterministic, so a retry lands on the branch it already created instead of a second one."""
+    return f"req/{number:04d}-{slugify(title, limit=32)}"
+
+
+def _fold_replacement_conflicts(draft: RequirementDraft) -> RequirementDraft:
+    """A `duplicates` conflict naming a requirement IS the replace instruction — fold it in.
+
+    THE LIVE 0001/0002 CORRUPTION CAME THROUGH THIS GAP. The drafter returned `supersedes=[]` plus
+    a machine-readable conflict `{kind: "duplicates", requirement: 1, "Ele deve substituir o texto
+    do Requisito 1, não passar a existir ao lado dele"}` — and the propose acted only on
+    `supersedes`, rendered the conflict to prose, and landed 0002 beside a still-live 0001: two
+    `proposed` texts for one promise, the exact state the drafter had just said must not happen.
+    The replace intent and the commit have to travel together; prose in the file is a record,
+    never an act.
+
+    Only `duplicates` folds. A `contradicts`/`narrows`/`depends_on` conflict is a tension for a
+    person to resolve — retiring the old text on one of those would put a decision in their mouth.
+    """
+    dup = {c.requirement for c in draft.conflicts if c.kind == "duplicates" and c.requirement}
+    if not dup.difference(draft.supersedes):
+        return draft
+    merged = sorted(set(draft.supersedes) | dup)
+    log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_FOLDED the draft's duplicates conflict(s) name %s — "
+                "folded into supersedes=%s so the replacement is acted on, not narrated",
+                sorted(dup), merged)
+    return draft.model_copy(update={"supersedes": merged})
+
+
+def _live_twins(root: Path, requirements_dir: str, *, slug: str,
+                number: int) -> list[tuple[int, str]]:
+    """`(number, status)` of every LIVE requirement already carrying the slug being written — one
+    promise wearing two numbers, read off the clone before anything is committed.
+
+    The STATUS travels because the two cases are not the same act. Retiring a text nobody agreed to
+    loses no decision; retiring an ACCEPTED one revokes a promise, and that is a person's to make.
+
+    THE THIRD DOOR ONTO THE TWO-LIVE-VERSIONS STATE, and the only one a drafter cannot be asked to
+    close. The first two — a revision, and a `duplicates` conflict — are cases where the model
+    KNOWS it is replacing something and says so. This one is the case where it does not: on
+    2026-07-30 the conversation called the new text "the final version of requirement 2", the
+    drafter therefore named only requirement 1 as replaced (which was true, and incomplete), and
+    since this platform has no update-in-place the rewrite minted 0003 and left 0002 standing
+    beside it. Two `proposed` texts for one promise, one turn after the second door was shut.
+
+    Deterministic, because the tell is arithmetic and not judgment: the slug comes from the title,
+    so an identical slug is an identical title. Read with the corpus's own parser rather than a
+    private one — the pair that drifted apart is exactly how the status line was missed before.
+    """
+    from beeverforge.product.corpus import load_corpus
+
+    folder = root / requirements_dir.strip("/")
+    if not folder.is_dir():
+        return []
+    return sorted((r.number, r.status) for r in load_corpus(folder).requirements
+                  if r.slug == slug and r.number != number and r.is_live)
+
+
+#: `req/0007-relatorio-mensal` → (7, "relatorio-mensal")
+_REQ_BRANCH_RE = re.compile(r"^req/(?P<num>\d{4})-(?P<slug>.*)$")
+
+#: The branch prefix every proposal lives under, and the filter the port narrows on SERVER-side.
+#: A documentation repository with a thousand branches must not be paged through a client that
+#: wants nine of them — and it is a string prefix, so the trailing slash is load-bearing: `req`
+#: would also match `requirements-cleanup`.
+REQ_PREFIX = "req/"
+
+
+def _requirement_branches(forge, docs_repo: str) -> list[tuple[int, str]] | None:
+    """`(number, slug)` for every `req/*` branch on the remote — the proposals pushed but not yet
+    landed, which the base corpus cannot see. **`None` when they could not be listed at all.**
+
+    THROUGH THE PORT (#97), which is what makes the number minting work off GitHub. This shelled
+    out to `gh api repos/{docs_repo}/branches`, so on an Azure Repos deployment the runner refused
+    (correctly — it would have exported that project's Microsoft credential to github.com) and the
+    answer was an empty list. Empty is not a harmless degrade here: it is the input to the decision
+    that mints a requirement's NUMBER, and minting from the base alone is how two files come to
+    claim NNNN, which is the citation corruption `next_number`'s own docstring warns about.
+
+    SO A FAILED READ IS `None` AND NOT `[]`, and the caller refuses instead of minting. The old
+    docstring argued the opposite — "minting from the base alone is exactly what happened before,
+    not something worse" — and that was true only while the two answers were indistinguishable. The
+    port distinguishes them, so the caller can act on the difference, and this is the one place in
+    this module where a wrong empty is not recoverable by a later sweep: a number, once written into
+    a filename and cited by a card, is what the whole corpus keys on.
+
+    `forge is None` is that same answer: a caller that offered no forge cannot have read anything.
+    """
+    if forge is None:
+        return None
+    names = forge.list_branches(docs_repo, prefix=REQ_PREFIX)
+    if names is None:
+        return None
+    out: list[tuple[int, str]] = []
+    for name in names:
+        m = _REQ_BRANCH_RE.match(str(name).strip())
+        if m:
+            out.append((int(m.group("num")), m.group("slug")))
+    return out
+
+
+def _already_proposed(forge, docs_repo: str, branch: str) -> str | None:
+    """The pull request this branch was already proposed as — `""` when there is none, `None` when
+    the question could not be asked.
+
+    ANY STATE, which is the question idempotency actually asks. A closed or merged pull request is
+    still an answer of `yes, this was proposed`, and opening a second one for the same work is what
+    this check exists to prevent. `pr_for_head` is deliberately wider than the `open_pr`
+    implementations' own private lookup for exactly that reason.
+
+    THE `None` ARM IS THE WHOLE POINT OF ASKING THROUGH THE PORT. `gh pr list … --jq .[0].url`
+    answers "" both for a branch nobody ever proposed and for a repository it could not reach, and
+    a caller writing `if not found: propose()` files the duplicate on the transient failure. The
+    check is `is None`.
+    """
+    if forge is None:
+        return None
+    return forge.pr_for_head(branch, repo=docs_repo)
+
+
+def propose_requirement(
+    *,
+    docs_repo: str,
+    clone_url: str,
+    draft: RequirementDraft,
+    number: int,
+    requirements_dir: str = "requirements",
+    #: THE FORGE ADAPTER — every read and every pull-request act below goes through it, on every
+    #: vendor. Not optional in production (`ProductModule.propose` builds it from the registry),
+    #: and `None` here is not a default that quietly falls back to something else: it means the
+    #: branch state could not be read, and this function refuses rather than minting a number
+    #: against a board it never saw. A fallback would be a second path that only tests ever take,
+    #: which is how this codebase's signature defect gets in.
+    forge=None,
+    asked_by: str = "",
+    date: str = "",
+    source: str = "",
+    base: str = "main",
+    #: ACCEPTED AND IGNORED, both of them, and named here rather than deleted. They fed the `gh`
+    #: subprocess this module used to run; the forge adapter carries its own credential and its own
+    #: vendor, so neither is read any more. They stay because
+    #: `beeverforge/product/module.py:1003,1006`
+    #: still passes them and that file belongs to another pass: removing the parameters would raise
+    #: TypeError inside the `except Exception` that wraps the call, and the client would be told
+    #: "não consegui registrar esse requisito agora" for every requirement, on a path that works.
+    #: Delete the argument and the parameter in the same commit, never one of the two.
+    token: str = "",
+    forge_kind: str = GITHUB,
+    #: the project's language: what a person reads, and the commit and pull request, are in it
+    language: str | None = None,
+) -> WriteResult:
+    """Write one requirement to the base — directly — and, only when the base refuses, propose it
+    on a branch with a review request and land that.
+
+    THE FIRST YES WRITES THE DOCUMENT (ADR-0047, the product owner's call, 2026-09-06). ADR-0032 had
+    this function open a review request on a `req/*` branch and merge it herself — mechanism that
+    cost an hourly rescue for orphaned branches, a role that could not read her own requirement
+    while it sat on the branch, and a merge to explain when the base was protected. The text was
+    approved by an authorised person in the conversation before this runs, and the file lands as
+    `proposed`, which promises nothing; so it is committed on the base and pushed there. The
+    branch, the review request and the merge stay as the ONE fallback, for a base that refuses the
+    push: the requirement still exists somewhere, the rescue still finds it, and the client hears
+    ADR-0032's sentence for it.
+
+    A fresh clone rather than the read cache: the cache is `reset --hard` on every use by design, so
+    committing into it would race every reader. Writes are rare enough that a clone is the cheap
+    option, and it keeps the read path exactly as it was.
+
+    ONE MECHANISM NOW, AND IT IS THE PORT (#95). Listing the proposal branches, asking whether this
+    one was ever proposed, opening the review request, merging it, reading the state back and
+    deleting the landed branch are all `ForgeAdapter` calls — so this works on Azure Repos exactly
+    as it works on GitHub, proven live on both (an Azure Repos `org/project/fx-dsk-context` and a
+    GitHub `org/fx-dsk-context`, 2026-08-06). Until `open_pr`, `merge_pr` and `pr_status`
+    took a repository, they could only speak about the repository the adapter was built for — the
+    CODE — while every call here is about the DOCUMENTATION repository, so this half shelled out to
+    `gh` and simply refused on any other vendor.
+
+    WHAT SURVIVED FROM THAT REFUSAL IS ITS HONESTY. A pull request that does not open still returns
+    `ok=False` with the branch and the number it minted, and says the text is safe and the review
+    request is not open. Nothing here can answer "PR opened" without a URL the forge handed back."""
+    # A "duplicates" conflict naming a requirement IS the replace instruction — folded into
+    # `supersedes` BEFORE anything is rendered, so the file, the PR body and the retire stamp all
+    # agree. The live corpus corruption came through this exact gap (see the helper).
+    draft = _fold_replacement_conflicts(draft)
+    # THE NUMBER IS MINTED AGAINST THE BASE *AND* THE UNLANDED BRANCHES. `number` arrives derived
+    # from the base corpus, which cannot see a proposal pushed but never landed (a pr-create
+    # failure leaves exactly that, until the weekly sweep rescues it). Re-minting such a number
+    # files a SECOND requirement under one identity: two files claiming NNNN, `by_number` and the
+    # supersede stamp then acting on whichever sorts first — the citation corruption
+    # `next_number`'s own docstring warns about. A branch carrying THIS draft's slug is prior
+    # work, and its number is adopted so a retry converges on itself instead of stepping past it.
+    own_slug = slugify(draft.title, limit=32)
+    branches = _requirement_branches(forge, docs_repo)
+    if branches is None:
+        # I COULD NOT READ, WHICH IS NOT THE SAME AS THERE IS NOTHING. Minting a number against a
+        # board this call never saw is how two requirements come to share one identity — and unlike
+        # an unopened pull request, that one is not repairable by a later sweep: the number is in
+        # the filename, in the card that cites it and in the supersede stamp.
+        log.error("BEEVERFORGE_PRODUCT_BRANCHES_UNREADABLE repo=%s — the proposal branches could "
+                  "not be "
+                  "listed, so %04d was NOT minted and nothing was written", docs_repo, number)
+        return WriteResult(ok=False, refusal=NOT_REFUSED,
+                           detail=_w(language, "branches_unreadable"))
+    own = [n for n, s in branches if s == own_slug]
+    rivals = [n for n, s in branches if s != own_slug]
+    if own:
+        # OUR OWN PRIOR BRANCH WINS OVER EVERY RIVAL, AND THE `if` IS ON `own` ALONE. It used to be
+        # `if own and max(own + [number]) != number`, which is only true when the prior attempt was
+        # itself bumped — so in the ORDINARY retry, where nothing landed and the base still mints
+        # the same number the prior attempt used, the adoption arm was a no-op and control fell
+        # through to the rival bump below. FOUND LIVE on an Azure Repos `org/project/fx-ado`
+        # (2026-08-06): with `req/0001-prova-viva…` (ours) and `req/0002-segunda-prova…` (a rival)
+        # already pushed, re-proposing the FIRST draft minted `req/0003-prova-viva…` — a third
+        # branch and a third number for a text that already had one.
+        #
+        # That is the corruption the whole paragraph above exists to prevent, produced by the
+        # retry it exists to make idempotent, and it compounds: 0001, 0003, 0005… one per attempt,
+        # each a live file with the same title. It was invisible on GitHub only because the
+        # pull-request lookup a few lines down returns first — and the one state where it does not
+        # is a branch pushed with NO pull request, which is exactly what a `pr create` failure
+        # leaves behind (it left production in that state for weeks) and what a forge whose PR
+        # ceremony the port cannot reach yet is in permanently.
+        adopted = max(own + [number])
+        if adopted != number:
+            log.warning("BEEVERFORGE_PRODUCT_NUMBER_ADOPTED repo=%s: a prior attempt "
+                        "already pushed "
+                        ""
+                        "this "
+                        "draft as %04d — adopting it instead of minting %04d",
+                        docs_repo, max(own), number)
+        number = adopted
+    elif rivals and max(rivals) >= number:
+        log.warning("BEEVERFORGE_PRODUCT_NUMBER_BUMPED repo=%s: the base mints %04d but "
+                    "an unlanded "
+                    ""
+                    ""
+                    "req/* branch already claims up to %04d — minting %04d so two requirements "
+                    "never share a number", docs_repo, number, max(rivals), max(rivals) + 1)
+        number = max(rivals) + 1
+    body_text = render_requirement(draft, number=number, asked_by=asked_by, date=date,
+                                   source=source)
+    branch = branch_for(number, draft.title)
+    path = f"{requirements_dir.rstrip('/')}/{number:04d}-{slugify(draft.title)}.md"
+
+    # already proposed? A retry must find its own PR, not open a second one.
+    found = _already_proposed(forge, docs_repo, branch)
+    if found is None:
+        log.error("BEEVERFORGE_PRODUCT_PRIOR_PROPOSAL_UNREADABLE repo=%s branch=%s — could not ask "
+                  "whether this requirement was already proposed; nothing was written", docs_repo,
+                  branch)
+        return WriteResult(ok=False, refusal=NOT_REFUSED,
+                           detail=_w(language, "prior_unreadable"))
+    if found.strip():
+        return WriteResult(ok=True, url=found.strip(), ref=branch, existed=True, number=number,
+                           detail="a pull request for this requirement already exists")
+    if number in own:
+        # THE TEXT IS ALREADY ON THE REMOTE AND THE REVIEW REQUEST IS WHAT IS MISSING. `number in
+        # own` says our own branch for this exact draft exists (that is how `own` was built), and
+        # the two answers above say no pull request was ever opened from it — the state a failed
+        # `open_pr` leaves behind.
+        #
+        # Cloning on to fail is what happened before, and it failed in the worst possible place:
+        # the push is rejected as a non-fast-forward, and the client's whole reply becomes
+        # `could not push req/0003-…: ! [rejected]`. Measured on `fx-ado` (2026-08-06). Two things
+        # are wrong with that and only one is cosmetic — the other is that `ref` and `number` come
+        # back EMPTY, so the act that did write requirement 3 reports having minted nothing.
+        #
+        # Nothing is re-pushed on purpose: the branch already carries this draft, committed by the
+        # attempt that created it with the same supersession and twin decisions this one would
+        # take. A retry converges by recognising its own work, not by rewriting it.
+        # AND IT MUST NOT CLAIM AN ALERT NOBODY SENDS. The sentence this returned was copied from
+        # the `open_pr` failure below — *"o time foi avisado e conclui isso"* — and neither is
+        # true from here. Nothing on this path opens an impediment:
+        # `BEEVERFORGE_PRODUCT_ALREADY_PUSHED`
+        # is a log line, and `_could_not`/`_tell_the_factory`, the seams that DO reach a person,
+        # are never on it. The completion half used to be worse still, because it was false exactly
+        # where this branch was PERMANENT: `land_open_proposals` is the sweep that finishes a stuck
+        # proposal, it ran on `gh`, and on any other forge it refused — so on those deployments the
+        # promise that somebody was finishing it repeated forever. That half is fixed (#95): the
+        # sweep now runs through the port on every vendor, so this state is a retry away from
+        # resolving itself and no longer a dead end. The sentence still does not claim a person was
+        # told, because none is. This module's own board reader carries the line about what the
+        # other way costs: *"the client was told a colleague had been alerted who did not exist."*
+        #
+        # So it says what is true and leaves the person with something to do (the standing rule:
+        # never a silent wait — self-heal, or offer a human an option). Retrying is real: the
+        # branch is recognised rather than rewritten, so a later attempt converges on this same
+        # number the moment the review request can be opened.
+        log.warning("BEEVERFORGE_PRODUCT_ALREADY_PUSHED repo=%s branch=%s — the requirement is on "
+                    "the "
+                    "remote with no pull request; not re-pushing it", docs_repo, branch)
+        return WriteResult(ok=False, refusal=NOT_REFUSED, ref=branch, number=number,
+                           detail=_w(language, "already_pushed"))
+
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-req-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+
+        # THE PRODUCT'S OWN TEMPLATE IS READ FROM THE CLONE, the base this write lands on
+        # (ADR-0058): what is written is what the corpus will read back. One that cannot be used
+        # was already reported by the corpus read, and the core's own shape is written.
+        template, _ = load_template(tmp / requirements_dir)
+        body_text = render_requirement(draft, number=number, asked_by=asked_by, date=date,
+                                       source=source, template=template)
+
+        # THE NUMBER IS MINTED FROM THE BASE THIS CLONE HOLDS (#266 slice 3). `number` arrives from
+        # the corpus the caller read, and the caller read it before the product's semaphore was
+        # its: a requirement written by another conversation in between is in this clone and not
+        # in that corpus, and writing under the stale number files a second REQ-N BESIDE it — the
+        # push does not refuse that, the two files have different names. Under the semaphore this
+        # clone IS the latest base, so what it mints nobody else is minting. A number that is our
+        # own prior branch's stays adopted, exactly as above.
+        fresh = _next_in(tmp, requirements_dir)
+        if fresh > number and number not in own:
+            minted = first_free(fresh, rivals)
+            log.warning("BEEVERFORGE_PRODUCT_NUMBER_REMINTED repo=%s: the corpus read before the "
+                        "write minted %04d, and the base now holds up to %04d — minting %04d",
+                        docs_repo, number, fresh - 1, minted)
+            number = minted
+            body_text = render_requirement(draft, number=number, asked_by=asked_by, date=date,
+                                           source=source, template=template)
+            branch = branch_for(number, draft.title)
+            path = f"{requirements_dir.rstrip('/')}/{number:04d}-{slugify(draft.title)}.md"
+
+        # COMMITTED ON THE BASE ITSELF — the branch is created only if the base refuses (below).
+
+        # READ THE BASE BEFORE WRITING INTO IT. A live requirement already carrying this slug is
+        # the same promise under an older number, whether or not the drafter noticed — and it is
+        # only visible here, in the clone. Folded now so the FILE, the pull request body and the
+        # retire stamp are rendered from one list; discovering it after `render_requirement` and
+        # patching only the stamp would ship a file whose own `Supersedes:` line disagrees with
+        # what the commit did.
+        # A DRAFTER MAY NAME SOMETHING ALREADY DEAD, and on 2026-07-31 one did: REQ-0005 had been
+        # dropped hours earlier and the new text claimed to supersede it. Left in, the FILE would
+        # claim a supersession the commit deliberately does not perform (`_mark_superseded` skips
+        # a dropped requirement), and `_cross_check` would rightly call that an error. The claim
+        # and the act travel together or neither goes.
+        dead = _already_dead(tmp, requirements_dir, draft.supersedes)
+        if dead:
+            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_ALREADY_DEAD repo=%s: the draft names %s, "
+                        "which "
+                        "is already off the table — dropped from the claim so the file does not "
+                        "assert a replacement nobody performed", docs_repo,
+                        ", ".join(f"{n:04d}" for n in dead))
+            draft = draft.model_copy(update={
+                "supersedes": [n for n in draft.supersedes if n not in dead]})
+
+        twins = [(n, st) for n, st in _live_twins(tmp, requirements_dir,
+                                                  slug=slugify(draft.title), number=number)
+                 if n not in draft.supersedes]
+        # AN ACCEPTED TWIN IS A PROMISE, AND REVOKING ONE IS NOT A TIDY-UP. The unagreed twin is
+        # folded because retiring a text nobody accepted loses no decision. An accepted one is a
+        # commitment the factory currently defends, and replacing it silently — on nothing but a
+        # matching title — would put a decision in somebody's mouth, the same reason a
+        # `contradicts` conflict is never folded. So: refuse, and say what would make it legal.
+        # The person makes it explicit, the drafter records it in `supersedes`, and this passes.
+        promised = [n for n, st in twins if st == ACCEPTED]
+        if promised:
+            listed = ", ".join(str(n) for n in promised)
+            log.error("BEEVERFORGE_PRODUCT_TWIN_IS_A_PROMISE repo=%s: %s is accepted and carries "
+                      "this "
+                      "exact title; the draft does not say it replaces it — nothing committed",
+                      docs_repo, listed)
+            return WriteResult(
+                ok=False, refusal=ALREADY_THERE,
+                detail=_w(language, "twin_agreed", listed=listed))
+        unagreed = sorted(n for n, _ in twins)
+        if unagreed or dead:
+            merged = sorted(set(draft.supersedes) | set(unagreed))
+            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_TWIN repo=%s: %s already live under this "
+                        "exact "
+                        "title and never agreed — folded into supersedes=%s so one promise keeps "
+                        "one number", docs_repo,
+                        ", ".join(f"{n:04d}" for n in unagreed), merged)
+            draft = draft.model_copy(update={"supersedes": merged})
+            body_text = render_requirement(draft, number=number, asked_by=asked_by, date=date,
+                                           source=source, template=template)
+
+        target = tmp / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body_text, encoding="utf-8")
+        # BOTH SIDES OF A SUPERSESSION, IN THE SAME COMMIT. The new file declaring "Supersedes:
+        # REQ-0001" is only half of it — `corpus.live()` decides what is current by reading each
+        # requirement's OWN status, so an old file that never learns it was replaced stays live.
+        # The result is two `proposed` texts for one promise, and a factory that would defend
+        # whichever it read first. Written together so the two can never disagree — and when the
+        # old side CANNOT be stamped, nothing lands: half a supersession is exactly the two-live-
+        # versions state, committed on purpose.
+        retired, failed = _mark_superseded(tmp, requirements_dir, draft.supersedes, by=number)
+        if failed:
+            log.error("BEEVERFORGE_PRODUCT_SUPERSEDE_FAILED repo=%s could not retire %s in favour "
+                      "of "
+                      "%04d — nothing was committed", docs_repo,
+                      ", ".join(f"{n:04d}" for n in failed), number)
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "supersede_failed"))
+        for path_of_retired in retired:
+            _git(["add", "--", path_of_retired], cwd=tmp)
+
+        _git(["add", "--", path], cwd=tmp)
+        # THE PRODUCT ROLE WRITES REQUIREMENTS AND NOTHING ELSE (#265 §6.4) — straight to the
+        # base when it may, so what it staged is checked here, not only when a sweep lands it
+        refused = _refused_staging(tmp, [requirements_dir or "requirements"],
+                                   docs_repo=docs_repo, writer="propose_requirement",
+                                   language=language)
+        if refused:
+            return refused
+        message = (f"REQ-{number:04d}: {draft.title}\n\n"
+                   f"Proposed from a product conversation"
+                   + (f" with {asked_by}" if asked_by else "") + ".\n"
+                   + (f"Source: {source}\n" if source else ""))
+        rc, out = _git(["commit", "-m", message], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc == 0:
+            log.info("BEEVERFORGE_PRODUCT_WRITTEN repo=%s base=%s req=%04d — written directly, as "
+                     "proposed", docs_repo, base, number)
+            return WriteResult(ok=True, url="", ref=base, merged=True, number=number)
+        # THE BASE REFUSED — protected, or moved under us. The commit exists locally; it goes out
+        # on the proposal branch with a review request, exactly the ADR-0032 path, and the client
+        # hears that path's sentence: written, safe, not in the base yet.
+        log.warning("BEEVERFORGE_PRODUCT_BASE_REFUSED repo=%s base=%s — the base refused the write "
+                    "(%s); proposing it on %s with a review request instead", docs_repo, base,
+                    _scrub(out)[-160:], branch)
+        rc, out = _git(["checkout", "-b", branch], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"could not create {branch}: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "-u", "--", clone_url, branch], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"could not push {branch}: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+
+        pr_body = _pr_body(draft, number=number, asked_by=asked_by, source=source)
+        url = _open_review_request(forge, docs_repo=docs_repo, head=branch, base=base,
+                                   title=f"REQ-{number:04d}: {draft.title}", body=pr_body)
+        if not url:
+            # the branch is pushed, so the work is not lost — say exactly that
+            # THE WORK IS SAFE AND THE CLIENT IS NOT ASKED TO DO GIT. The previous text named the
+            # branch, was in English, and told the person to "open it by hand against main" — three
+            # things ADR-0026 forbids in one sentence, to somebody who runs an accounting firm and
+            # cannot open a pull request. What they need to know is that nothing was lost and that
+            # it is the team's to finish.
+            # THE NUMBER TRAVELS EVEN THOUGH THE WRITE FAILED, because this write DID mint one: the
+            # file is committed and pushed under it, and `number`'s own contract is what this act
+            # produced rather than whether it finished. It matters more now than when this branch
+            # was only a `gh` outage — on a forge whose pull-request half the port cannot reach
+            # yet, this WAS the ordinary outcome of a successful proposal — and reporting 0 would
+            # have the channel tell a client about requirement zero. It is an exception again now
+            # that the port opens the pull request on every vendor (#95), which is the whole point,
+            # and the number still travels because that has never depended on the vendor.
+            log.error("BEEVERFORGE_PRODUCT_PR_FAILED branch=%s base=%s repo=%s — pushed, no PR",
+                      branch, base, docs_repo)
+            return WriteResult(ok=False, refusal=NOT_REFUSED, ref=branch, number=number,
+                               detail=_w(language, "pr_failed"))
+        # MERGE IT. The content was approved by an authorised person in the channel, in business
+        # language; the pull request is mechanism. Leaving it open costs three things: a person must
+        # perform a git operation on a business artefact, the client gets a GitHub link they cannot
+        # act on, and THE ROLE CANNOT SEE ITS OWN WORK — it reads the docs branch, so an unmerged
+        # requirement does not exist from where it stands. Asked about a requirement she had just
+        # written, she answered "do meu lado ela está vazia", and she was right.
+        #
+        # Merging still does NOT accept: the file lands with `status: proposed`, and the promise the
+        # factory defends is created by a separate human confirmation in the channel (ADR-0032).
+        merged = _merge_and_confirm(forge, docs_repo=docs_repo, pr=url)
+        if merged:
+            _delete_landed_branch(forge, docs_repo, branch)
+        elif merged is None:
+            log.error("BEEVERFORGE_PRODUCT_MERGE_UNCONFIRMED repo=%s pr=%s — the merge was "
+                      "requested and "
+                      "its outcome could not be read back. Reported as NOT landed: announcing a "
+                      "merge on no evidence is the one thing this read-back exists to prevent, and "
+                      "the hourly sweep converges on whichever it turns out to be", docs_repo, url)
+        else:
+            log.warning("BEEVERFORGE_PRODUCT_PR_UNMERGED repo=%s branch=%s — the proposal stays "
+                        "open and "
+                        "the role cannot see it", docs_repo, branch)
+        # THE NUMBER THIS WRITE MINTED, carried back so the client is told what happened rather
+        # than what was predicted. `number` above may have been adopted from a prior attempt or
+        # bumped past an unlanded rival; either way it is what the file is called.
+        return WriteResult(ok=True, url=url, ref=branch, merged=merged is True, number=number)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _next_in(root: Path, requirements_dir: str) -> int:
+    """`next_number` of the requirements a clone holds — read with the corpus's own parser, so
+    the number minted here and the one the corpus would mint cannot disagree about a file."""
+    from beeverforge.product.corpus import load_corpus
+
+    folder = root / requirements_dir.strip("/")
+    return next_number(load_corpus(folder)) if folder.is_dir() else 1
+
+
+def first_free(base_next: int, unlanded: list[int]) -> int:
+    """The first number nobody holds: `base_next` — one past the highest the base ever used,
+    superseded and dropped included (`next_number`) — or one past every number a proposal
+    branch not yet landed already claims, whichever is higher.
+
+    ONE FORMULA FOR EVERY WRITER THAT MINTS. A proposal from a conversation re-mints with it under
+    the semaphore (`propose_requirement`), and an import mints every requirement it lands from it
+    (`product/importing.py`, #993). Two copies of this line would be two numberings, and the one
+    that forgets the unlanded branches files a second REQ-N beside a proposal still on its way."""
+    return max(int(base_next), max(unlanded, default=0) + 1)
+
+
+def _pr_body(draft: RequirementDraft, *, number: int, asked_by: str, source: str) -> str:
+    parts = [f"Proposes **REQ-{number:04d} — {draft.title}**.", ""]
+    if asked_by:
+        parts += [f"Asked by {asked_by}.", ""]
+    if draft.conflicts:
+        # first, because it is the reason a reviewer might reject this outright
+        parts += ["## ⚠ Conflicts with what the product already promises", ""]
+        for c in draft.conflicts:
+            ref = f"REQ-{c.requirement:04d}" if c.requirement else "an existing requirement"
+            parts.append(f"- **{c.kind}** {ref} — {c.explanation}")
+        parts += [""]
+    if draft.questions:
+        parts += ["## Open questions", ""] + [f"- {q}" for q in draft.questions] + [""]
+    parts += ["## What must be true", ""] + [f"- {c}" for c in draft.must_be_true] + [""]
+    parts += ["---", "",
+              "Merging this is the sign-off on the requirement. It does **not** start any work: "
+              "issues are filed into Backlog and a human promotes them to TO-DO."]
+    if source:
+        parts += ["", f"Source: {source}"]
+    return "\n".join(parts)
+
+
+def requirement_file(requirement, *, requirements_dir: str = "") -> str:
+    """Where a requirement's file actually IS in the documentation repository — THE renderer.
+
+    THE CORPUS STORES THE FILENAME. `parse_requirement` keeps `path.name`, because the corpus is
+    loaded from the requirements folder and knows nothing above it; the file lives under the
+    manifest's `requirements_dir`. So the raw field names no location, and every citation this
+    platform writes is FOLLOWED — by a person opening it, and by the executor told not to go
+    beyond it.
+
+    ONE FUNCTION BECAUSE THE LESSON COST FOUR REPAIRS. `accept` learned it (every acceptance
+    answered "não encontrei o requisito" about a requirement it had just listed), then the issue
+    filer, then the alignment, then the orphan repair — and `defect_body` was still printing the
+    bare field, so a defect card sent whoever picked it up to a path that does not exist. A fifth
+    writer inherits the fix instead of rediscovering the trap.
+
+    Callers pass the RESULT, never the requirement: `issue_body` and `defect_body` both take a
+    resolved `requirement_path`, so there is nowhere left for a renderer to reach for `.path`.
+    """
+    directory = (requirements_dir or "").strip("/")
+    name = getattr(requirement, "path", "") or ""
+    return f"{directory}/{name}" if directory and name else name
+
+
+def _requester_front_matter(who: str, forge: str = "", belongs_to: str = "") -> list[str]:
+    """`requester:` (and `requester_forge:`) as YAML front matter — the machine-readable half of
+    `Pedido por`.
+
+    The prose line stays for the person reading the card; these keys are for the factory reading it
+    back (`parse_ticket_body`), on every vendor, without a regex over a sentence that will one day
+    be translated. Empty when nobody was recorded: a key naming nobody would be read as somebody.
+    QUOTED, ALWAYS: `requester: @octocat` is not YAML (`@` cannot start a token) and would have
+    crashed every read of the card on three vendors (ADR-0048, refutation 10) — a JSON string is a
+    YAML string, whatever it starts with. `forge` is the same person in the tracker's namespace,
+    written only when the deployment could resolve one (`Project.people`, read backwards).
+    `belongs_to` is the repository a card filed outside it belongs to (#665), read back by the
+    queue, the pickup and the pre-flight so that it is never run in another one."""
+    who = (who or "").strip()
+    forge = (forge or "").strip()
+    belongs_to = (belongs_to or "").strip()
+    if not who and not forge and not belongs_to:
+        return []
+    keys = ([f"requester: {json.dumps(who, ensure_ascii=False)}"] if who else []) + (
+        [f"requester_forge: {json.dumps(forge, ensure_ascii=False)}"] if forge else []) + (
+        [f"belongs_to: {json.dumps(belongs_to, ensure_ascii=False)}"] if belongs_to else [])
+    return ["---\n" + "\n".join(keys) + "\n---"]
+
+
+def _named(who: str, forge: str = "", language: str | None = None) -> str:
+    """The prose spelling of a requester: the chat identity, with the tracker identity in a
+    parenthesis when there is one — the body's own copy of `requester_forge`, which is what a card
+    keeps after a person's rich-editor edit has flattened the fence away."""
+    who = (who or "").strip() or _said(language)["nobody"]
+    forge = (forge or "").strip()
+    return f"{who} ({forge})" if forge and forge != who else who
+
+
+#: The line each card this role writes leaves on its face — WRITTEN from these constants and READ
+#: back from them by `filed_by_the_product_role`, so the writer and the reader cannot drift apart.
+#:
+#: ONE MARKER PER LANGUAGE, EVERY ONE READ BACK (#429). `ticket_body` and `defect_body` now write
+#: in the conversation's language, as this note said they one day would: the reader accepts the
+#: marker in every language, or a translated card would stop matching and a card the product owner
+#: owns would become editable from the board — silently, and in the unsafe direction.
+_FROM_A_REQUIREMENT = "Nothing in this issue may go beyond that requirement."
+_FROM_A_REQUEST = {"pt-BR": "**Tipo:** tarefa pedida", "en": "**Type:** requested task"}
+_FROM_A_DEFECT = {"pt-BR": "**Tipo:** defeito", "en": "**Type:** defect"}
+
+#: THE CODE'S OWN LINES ON A REQUESTED OR DEFECT CARD, per language (#429). The card above them is
+#: the drafter's, in the conversation's language; these said Portuguese under an English card.
+_CARD_LINES = {
+    "pt-BR": {
+        "nobody": "não registrado",
+        "request_kind": "aberta como foi descrita, sem requisito por trás",
+        "requested_by": "**Pedido por:**", "asked_where": "**Onde foi pedido:**",
+        "what_was_asked": "O que foi pedido", "nothing_more": "(nada além do título)",
+        "before_starting": "Antes de começar",
+        "before_starting_text": ("Este cartão nasceu de um pedido direto, não de um requisito "
+                                 "aceito. Quem pegar isto deve confirmar o critério de pronto com "
+                                 "quem pediu"),
+        "requirements_live": " — o registro de requisitos vive em `{docs_repo}`.",
+        "defect_breaks": "o produto está violando uma promessa já aceita",
+        "defect_broken": "o produto não está funcionando como deveria",
+        "severity": "**Gravidade:**", "reported_by": "**Reportado por:**",
+        "reported_where": "**Onde foi reportado:**",
+        "after_delivery": ("**Depois da entrega de:** {cards} — quem pediu disse que não "
+                           "funcionou."),
+        "defect_after_delivery": ("Defeito registrado depois da entrega deste cartão, com o que "
+                                  "quem pediu disse: {ref}"),
+        "what_is_happening": "O que está acontecendo",
+        "broken_promise": "A promessa violada — REQ-{number:04d}",
+        "read_at": " (lido no commit `{commit}`)", "in_repo": "`{path}` em `{repo}`",
+        "broken_promise_text": ("O comportamento descrito acima contradiz o que este requisito "
+                                "promete. A correção deve restaurar a promessa — se a promessa é "
+                                "que está errada, isso é uma DECISÃO de produto e deve voltar como "
+                                "alteração do requisito, não como código."),
+        "no_requirement": "Sem requisito escrito",
+        "no_requirement_text": ("Nenhum requisito escrito cobre este comportamento: o que está "
+                                "quebrado é o funcionamento esperado do produto, descrito acima. "
+                                "Os critérios de aceite deste cartão são o contrato da correção — "
+                                "não é preciso encontrar um requisito antes de corrigir. Se a "
+                                "correção exigir uma decisão de produto (mudar como a tela foi "
+                                "pensada, e não só consertá-la), devolva essa pergunta ao produto "
+                                "em vez de decidir sozinho."),
+    },
+    "en": {
+        "nobody": "not recorded",
+        "request_kind": "opened as described, with no requirement behind it",
+        "requested_by": "**Requested by:**", "asked_where": "**Where it was asked:**",
+        "what_was_asked": "What was asked", "nothing_more": "(nothing beyond the title)",
+        "before_starting": "Before starting",
+        "before_starting_text": ("This card came from a direct request, not from an accepted "
+                                 "requirement. Whoever picks it up should confirm what done means "
+                                 "with the person who asked"),
+        "requirements_live": " — the requirements record lives in `{docs_repo}`.",
+        "defect_breaks": "the product is breaking a promise already accepted",
+        "defect_broken": "the product is not working as it should",
+        "severity": "**Severity:**", "reported_by": "**Reported by:**",
+        "reported_where": "**Where it was reported:**",
+        "after_delivery": ("**After the delivery of:** {cards} — the person who asked said it "
+                           "did not work."),
+        "defect_after_delivery": ("A defect was filed after this card's delivery, with what the "
+                                  "person who asked said: {ref}"),
+        "what_is_happening": "What is happening",
+        "broken_promise": "The broken promise — REQ-{number:04d}",
+        "read_at": " (read at commit `{commit}`)", "in_repo": "`{path}` in `{repo}`",
+        "broken_promise_text": ("The behaviour described above contradicts what this requirement "
+                                "promises. The fix must restore the promise — if the promise is "
+                                "what is wrong, that is a product DECISION and must come back as "
+                                "a change to the requirement, not as code."),
+        "no_requirement": "No written requirement",
+        "no_requirement_text": ("No written requirement covers this behaviour: what is broken is "
+                                "the product's expected behaviour, described above. The acceptance "
+                                "criteria of this card are the contract of the fix — there is no "
+                                "need to find a requirement before fixing it. If the fix needs a "
+                                "product decision (changing how the screen was designed, not only "
+                                "repairing it), hand that question back to the product instead of "
+                                "deciding it alone."),
+    },
+}
+
+
+def _said(language: str | None) -> dict[str, str]:
+    from beeverforge.product.voice import _pick
+
+    return _pick(_CARD_LINES, language)
+
+
+def defect_after_delivery_note(ref: str, *, language: str | None = None) -> str:
+    """What a delivered card says when a defect was filed after its delivery (#448 slice 5): the
+    other half of the link, naming the defect as its tracker spells it (`ref_label`: `#12`, or
+    `CONT-412` on Jira — never `#CONT-412`)."""
+    from beeverforge.contracts.refs import ref_label
+
+    return _said(language)["defect_after_delivery"].format(ref=ref_label(ref))
+
+
+def _marker(markers: dict[str, str], language: str | None) -> str:
+    from beeverforge.product.voice import _pick
+
+    return _pick(markers, language)
+
+
+#: WHAT THE DOCS REPOSITORY'S WRITES SAY, IN THE PROJECT'S LANGUAGE (#535). Each was a Portuguese
+#: literal welded into the write that said it: an `en` project read "não encontrei o requisito 7"
+#: when a requirement was missing, and its docs repository took commits and pull requests titled
+#: "requisito 0007: acordado por …". The sentence a person reads when a write did not happen (or
+#: happened already), the commit message the docs repository keeps, and the pull request a reviewer
+#: opens — each in the language the project speaks.
+_WRITES = {
+    "pt-BR": {
+        "branches_unreadable": (
+            "não consegui conferir o que já foi escrito antes, então não registrei nada. Sem essa "
+            "conferência eu poderia gravar este texto com o número de outro requisito. Nada se "
+            "perdeu — me peça de novo daqui a pouco."),
+        "prior_unreadable": (
+            "não consegui verificar se esse requisito já tinha sido escrito antes, então não "
+            "registrei nada — assim não fico com dois pedidos para a mesma coisa. Nada se perdeu; "
+            "me peça de novo daqui a pouco."),
+        "already_pushed": (
+            "esse requisito já está escrito e guardado em segurança; o que falta é abrir o pedido "
+            "de revisão, e isso eu não consigo fazer daqui. Nada se perdeu e nada precisa ser "
+            "reescrito: me peça de novo mais tarde, ou peçam ao time para dar esse último passo."),
+        "twin_agreed": (
+            "já existe um requisito acordado com esse mesmo título (o {listed}), e este texto não "
+            "diz que veio no lugar dele. Não registrei nada: deixar os dois valendo faria a "
+            "fábrica defender um ou outro conforme lesse primeiro, e aposentar uma promessa "
+            "sozinha não é minha decisão. Me diga que este texto substitui o {listed} e eu "
+            "registro."),
+        "supersede_failed": (
+            "esse texto substitui um requisito que já existe, mas não consegui marcar a versão "
+            "antiga como substituída. Não registrei nada — assim não ficam duas versões valendo ao "
+            "mesmo tempo. O time foi avisado e resolve."),
+        "pr_failed": (
+            "escrevi o requisito e guardei em segurança, mas não consegui abrir o pedido de "
+            "revisão. Nada se perdeu — o time foi avisado e conclui isso."),
+        "rescued_title": "Requisito proposto: {slug}",
+        "rescued_body": (
+            "Aberto pela varredura de propostas que ficaram fora da base: o texto tinha sido "
+            "escrito e enviado, mas o pedido de revisão não chegou a abrir. Nada foi reescrito — "
+            "este pedido é sobre exatamente o que já estava salvo."),
+        "staged_outside": "não gravei nada: {staged} ficaria fora do que este registro escreve",
+        "fact_outside": "não registrei: o fato iria para `{path}`, fora de `domain/`",
+        "fact_title": "Fato: {term}",
+        "fact_intro": "Anotado numa conversa com {said_by}.",
+        "fact_commit": "fato: {term}\n\nDito por {said_by}{where}.",
+        "fact_where": " em {where}",
+        "not_direct": "o repositório não aceita registro direto ({out})",
+        "not_direct_by_hand": "o repositório não aceita registro direto ({out}); anote à mão em "
+                              "{path}",
+        "undeclared": "(não declarado)",
+        "no_decision": "não entendi qual foi a decisão para registrar",
+        "decision_not_found": "não encontrei o requisito {number} para registrar a decisão",
+        "decision_duplicate": "essa decisão já estava registrada hoje",
+        "decision_no_section": (
+            "o requisito {number} não tem a tabela de decisões no documento, então não consegui "
+            "gravar lá. Avisei o time."),
+        "decision_commit": "requisito {number:04d}: decisão registrada por {by}",
+        "accept_not_found": "não encontrei o requisito {number} para aceitar",
+        "accept_already": "esse requisito já estava acordado",
+        "accept_commit": "requisito {number:04d}: acordado por {by}",
+        "drop_not_found": "não encontrei o requisito {number} para dar como abandonado",
+        "drop_already": "o requisito {number} já estava dado como abandonado",
+        "drop_commit": "requisito {number:04d}: abandonado por {by}",
+        "accept_refused_dropped": (
+            "o requisito {number} tinha sido dado como abandonado, então não há promessa a "
+            "registrar — não mexi em nada. Se ele voltou a valer, me peça de novo e eu escrevo o "
+            "texto outra vez para vocês confirmarem."),
+        "accept_refused_superseded": (
+            "o requisito {number} já tinha sido substituído por outro, então acordar com ele seria "
+            "assumir um texto que já não vale — não mexi em nada. Me diga o número do que ficou no "
+            "lugar dele e eu registro esse."),
+        "accept_refused_unknown": (
+            "não consegui registrar o acordo do requisito {number}: o texto dele está num formato "
+            "que não reconheço com segurança. Não mudei nada — o time foi avisado e resolve."),
+        "drop_refused_superseded": (
+            "o requisito {number} já tinha sido substituído por outro, então ele já não valia — "
+            "não mexi em nada. Se o que você quer é abandonar o texto que ficou no lugar dele, me "
+            "diga o número dele."),
+        "drop_refused_unknown": (
+            "não consegui dar o requisito {number} como abandonado: o texto dele está num formato "
+            "que não reconheço com segurança. Não mudei nada — o time foi avisado e resolve."),
+        "baseline_unreadable": (
+            "não consegui verificar se esse levantamento já tinha sido feito antes, então não "
+            "escrevi nada — assim não fico com dois levantamentos iguais para vocês revisarem. Me "
+            "peça de novo daqui a pouco."),
+        "baseline_already": "o levantamento já tinha sido proposto",
+        "baseline_rescued_title": "Levantamento inicial sobre {product}",
+        "baseline_rescued_body": (
+            "A branch deste levantamento já tinha sido enviada numa tentativa anterior que não "
+            "chegou a abrir o pull request. Este PR abre o que ficou faltando — o conteúdo é o "
+            "daquela passagem, e continua tudo como `observed`."),
+        "baseline_opened_now": ("o levantamento já estava enviado; só faltava abrir o pedido de "
+                                "revisão, e abri agora"),
+        "baseline_stuck": ("a branch {branch} já está enviada de uma tentativa anterior e o pull "
+                           "request não abriu; abra à mão contra {base}"),
+        "baseline_commit": (
+            "baseline: {observations} observações sobre {product}\n\nLeitura do código como ele "
+            "está hoje. Tudo entra como `observed` — nada aqui é promessa até alguém confirmar."),
+        "baseline_body_reading": (
+            "**Isto é uma LEITURA do código, não um conjunto de requisitos.** {observations} "
+            "observações sobre o que o sistema parece fazer hoje — cada uma entra como "
+            "`observed`, com a evidência que a sustenta."),
+        "baseline_body_promise": (
+            "Uma observação vira promessa quando uma pessoa a confirma e muda o status para "
+            "`accepted`. Até lá a fábrica NÃO defende nada disto: um bug lido do código é "
+            "indistinguível de uma funcionalidade."),
+        "baseline_body_areas": "Áreas cobertas nesta passagem: {areas}",
+        "baseline_whole_repo": "(o repositório)",
+        "baseline_body_not": (
+            "O que este PR **não** garante: que a cobertura seja completa, nem que cada "
+            "comportamento observado seja intencional. As duas coisas são decisão de quem revisa."),
+        "baseline_title": "Levantamento inicial: {observations} observações sobre {product}",
+        "baseline_pr_failed": ("a branch {branch} foi enviada mas o pull request não abriu; abra à "
+                               "mão contra {base}"),
+    },
+    "en": {
+        "branches_unreadable": (
+            "I could not check what was already written, so I recorded nothing. Without that check "
+            "I could have saved this text under another requirement's number. Nothing was lost — "
+            "ask me again in a moment."),
+        "prior_unreadable": (
+            "I could not check whether this requirement had already been written, so I recorded "
+            "nothing — that way there are not two requests for the same thing. Nothing was lost; "
+            "ask me again in a moment."),
+        "already_pushed": (
+            "this requirement is already written and safely kept; what is missing is opening the "
+            "review request, and I cannot do that from here. Nothing was lost and nothing needs "
+            "rewriting: ask me again later, or ask the team to take that last step."),
+        "twin_agreed": (
+            "an agreed requirement with this same title already exists ({listed}), and this text "
+            "does not say it takes its place. I recorded nothing: keeping both in force would have "
+            "the factory defend one or the other depending on which it read first, and retiring a "
+            "promise on my own is not my decision. Tell me this text replaces {listed} and I will "
+            "record it."),
+        "supersede_failed": (
+            "this text replaces an existing requirement, but I could not mark the old version as "
+            "replaced. I recorded nothing — that way two versions are not in force at once. The "
+            "team has been told and will sort it out."),
+        "pr_failed": (
+            "I wrote the requirement and kept it safe, but I could not open the review request. "
+            "Nothing was lost — the team has been told and will finish it."),
+        "rescued_title": "Proposed requirement: {slug}",
+        "rescued_body": (
+            "Opened by the sweep of proposals left outside the base: the text had been written and "
+            "pushed, but its review request never opened. Nothing was rewritten — this request is "
+            "about exactly what was already saved."),
+        "staged_outside": "I wrote nothing: {staged} would fall outside what this record writes",
+        "fact_outside": "I did not record it: the fact would go to `{path}`, outside `domain/`",
+        "fact_title": "Fact: {term}",
+        "fact_intro": "Noted in a conversation with {said_by}.",
+        "fact_commit": "fact: {term}\n\nSaid by {said_by}{where}.",
+        "fact_where": " in {where}",
+        "not_direct": "the repository does not accept a direct write ({out})",
+        "not_direct_by_hand": "the repository does not accept a direct write ({out}); note it by "
+                              "hand in {path}",
+        "undeclared": "(not stated)",
+        "no_decision": "I did not understand which decision to record",
+        "decision_not_found": "I did not find requirement {number} to record the decision in",
+        "decision_duplicate": "that decision was already recorded today",
+        "decision_no_section": (
+            "requirement {number} has no decision table in its document, so I could not record it "
+            "there. I told the team."),
+        "decision_commit": "requirement {number:04d}: decision recorded by {by}",
+        "accept_not_found": "I did not find requirement {number} to accept",
+        "accept_already": "this requirement was already agreed",
+        "accept_commit": "requirement {number:04d}: agreed by {by}",
+        "drop_not_found": "I did not find requirement {number} to drop",
+        "drop_already": "requirement {number} was already dropped",
+        "drop_commit": "requirement {number:04d}: dropped by {by}",
+        "accept_refused_dropped": (
+            "requirement {number} had been dropped, so there is no promise to record — I changed "
+            "nothing. If it holds again, ask me and I will write the text again for you to "
+            "confirm."),
+        "accept_refused_superseded": (
+            "requirement {number} had already been replaced by another, so agreeing to it would "
+            "take on a text that no longer holds — I changed nothing. Tell me the number of the "
+            "one that took its place and I will record that one."),
+        "accept_refused_unknown": (
+            "I could not record the agreement of requirement {number}: its text is in a format I "
+            "do not recognise safely. I changed nothing — the team has been told and will sort it "
+            "out."),
+        "drop_refused_superseded": (
+            "requirement {number} had already been replaced by another, so it no longer held — I "
+            "changed nothing. If what you want is to drop the text that took its place, tell me "
+            "its number."),
+        "drop_refused_unknown": (
+            "I could not drop requirement {number}: its text is in a format I do not recognise "
+            "safely. I changed nothing — the team has been told and will sort it out."),
+        "baseline_unreadable": (
+            "I could not check whether this survey had already been made, so I wrote nothing — "
+            "that way you do not get two identical surveys to review. Ask me again in a moment."),
+        "baseline_already": "the survey had already been proposed",
+        "baseline_rescued_title": "First survey of {product}",
+        "baseline_rescued_body": (
+            "This survey's branch had already been pushed by an earlier attempt that never opened "
+            "the pull request. This PR opens what was missing — the content is that pass's, and "
+            "everything is still `observed`."),
+        "baseline_opened_now": ("the survey was already pushed; only its review request was "
+                                "missing, and I opened it now"),
+        "baseline_stuck": ("the branch {branch} was already pushed by an earlier attempt and the "
+                           "pull request did not open; open it by hand against {base}"),
+        "baseline_commit": (
+            "baseline: {observations} observations about {product}\n\nA reading of the code as it "
+            "is today. Everything comes in as `observed` — nothing here is a promise until "
+            "somebody confirms it."),
+        "baseline_body_reading": (
+            "**This is a READING of the code, not a set of requirements.** {observations} "
+            "observations about what the system appears to do today — each comes in as "
+            "`observed`, with the evidence behind it."),
+        "baseline_body_promise": (
+            "An observation becomes a promise when a person confirms it and changes its status to "
+            "`accepted`. Until then the factory defends NONE of this: a bug read off the code is "
+            "indistinguishable from a feature."),
+        "baseline_body_areas": "Areas this pass covered: {areas}",
+        "baseline_whole_repo": "(the repository)",
+        "baseline_body_not": (
+            "What this PR does **not** guarantee: that the coverage is complete, or that every "
+            "observed behaviour is intended. Both are for whoever reviews it to decide."),
+        "baseline_title": "First survey: {observations} observations about {product}",
+        "baseline_pr_failed": ("the branch {branch} was pushed but the pull request did not open; "
+                               "open it by hand against {base}"),
+    },
+}
+
+
+def _w(language: str | None, key: str, **values) -> str:
+    """One of `_WRITES`'s sentences, in `language` (the default and then English when it has no
+    catalogue), with `values` put in."""
+    from beeverforge.product.voice import _pick
+
+    text = _pick(_WRITES, language)[key]
+    return text.format(**values) if values else text
+
+
+def filed_by_the_product_role(body: str) -> str:
+    """Which of this role's writers opened a card — `requirement`, `request` or `defect` — or `""`
+    when none did, which on a board means somebody wrote it there.
+
+    WHERE A CARD WAS BORN DECIDES WHO MAY CHANGE IT (#150). A card this role opened is the product
+    owner's: from a requirement it is a copy of a promise that lives in the context repository, and
+    from a request or a defect it is what somebody asked for, in their words. Rewriting either from
+    the board would change what was asked with nobody who asked seeing it — so the board's edit,
+    close and reopen refuse these, and a card written on the board stays correctable until pickup.
+
+    READ FROM THE BODY, because nothing else carries it on every tracker: the author of a card is
+    the bot on a hosted row whoever pressed the button, and a label is something a person removes.
+    The marker is a whole line the writer composed, never a word a person might type in prose."""
+    lines = [line.strip() for line in (body or "").splitlines()]
+    if any(line.startswith(_FROM_A_REQUIREMENT) for line in lines):
+        return "requirement"
+    if any(line.startswith(tuple(_FROM_A_REQUEST.values())) for line in lines):
+        return "request"
+    if any(line.startswith(tuple(_FROM_A_DEFECT.values())) for line in lines):
+        return "defect"
+    return ""
+
+
+def issue_body(draft: IssueDraft, *, requirement_path: str, docs_repo: str,
+               commit: str = "", docs_url: str = "", awaiting: str = "",
+               requester: str = "", requester_forge: str = "", belongs_to: str = "") -> str:
+    """An issue that cites the requirement it executes — path, and the commit it was read from.
+
+    The citation is what makes the issue a unit of EXECUTION rather than a second, drifting copy of
+    the requirement. Same source-linking discipline the code map uses, for the same reason.
+
+    `requirement_path` is the resolved location (`requirement_file`), never the corpus's bare
+    filename.
+
+    `docs_url` IS PASSED IN AND NOT COMPUTED, and "" renders the repository as plain text with no
+    link at all. This function used to call a `_repo_url` helper that read `GH_HOST` and was
+    therefore provider-aware in APPEARANCE and wrong in fact: on an Azure Repos deployment it
+    produced `https://dev.azure.com/<repo>`, which addresses nothing, and with the variable unset a
+    `github.com` link to a repository that may belong to somebody else. The provenance line is the
+    one thing that makes an authored issue auditable, so a wrong link there is strictly worse than
+    none — and only the caller, which can reach the project's forge, knows the right one
+    (`ProductModule._docs_url`)."""
+    parts = [*_requester_front_matter(requester, requester_forge, belongs_to),
+             f"## Objective\n\n{draft.objective.strip()}", ""]
+    if draft.acceptance_criteria:
+        parts += ["## Acceptance criteria", ""]
+        parts += [f"- [ ] {c}" for c in draft.acceptance_criteria]
+        parts += [""]
+    if draft.out_of_scope:
+        parts += ["## Out of scope", ""] + [f"- {c}" for c in draft.out_of_scope] + [""]
+    cite = f"REQ-{draft.cites:04d}" if draft.cites else "a requirement"
+    ref = f"`{requirement_path}`" + (f" @ `{commit[:12]}`" if commit else "")
+    where = f"[{docs_repo}]({docs_url})" if docs_url else f"`{docs_repo}`"
+    if awaiting:
+        # THE CARD BEFORE THE PROMISE (ADR-0047 §2). Opened from a requirement that is still
+        # `proposed`, so the requester can say yes to the thing that will be worked; it says so on
+        # its face, and the acceptance is written here — the comment in the requester's name is
+        # what turns this section from a warning into a record.
+        parts += ["## Acceptance", "",
+                  f"Awaiting the acceptance of {awaiting} (ADR-0047). Until then this card is a "
+                  f"proposal, not a promise of the product; the acceptance is recorded here, as a "
+                  f"comment in the name of whoever gives it.", ""]
+    parts += [
+        "## Source",
+        "",
+        f"Executes **{cite}** in {where} — {ref}.",
+        "",
+        *([f"Its change belongs to `{belongs_to.strip()}`. This board keeps every card in one "
+           f"place, and a card of another repository is not run in this project's.", ""]
+          if (belongs_to or "").strip() else []),
+        f"{_FROM_A_REQUIREMENT} If the work needs a decision that is not written there, the "
+        "decision belongs in the document first.",
+    ]
+    return "\n".join(parts)
+
+
+#: How much of a proposal's diff the sweep reads to see which files it touches. A diff longer than
+#: this is not read whole, so the sweep cannot vouch for it — and leaves it for a person.
+_SWEEP_DIFF_CHARS = 400_000
+
+
+def outside_requirements(forge, docs_repo: str, pr: str, requirements_dir: str) -> str:
+    """Why the sweep must NOT merge `pr` — or "" when every file it touches is a requirement
+    (#265 §6.4). Read from the pull request's own diff: a `req/*` branch is written by the product
+    role, and the context repository's base now holds what a preview BUILDS (`product.yaml`'s
+    `preview:`, the compose file it names), so a branch that reaches past `requirements/` is not
+    a requirement the sweep may land on its own. Every doubt is a refusal: a diff that could not
+    be read, or not whole, is one a person merges."""
+    from beeverforge.policy.context_writes import diff_paths, outside
+
+    try:
+        diff = forge.pr_diff(pr=pr, repo=docs_repo, max_chars=_SWEEP_DIFF_CHARS)
+    except Exception as exc:  # noqa: BLE001 — could not look is never "nothing to look at"
+        return f"its changes could not be read ({_scrub(str(exc))[:120]})"
+    if diff is None:
+        return "its changes could not be read"
+    if len(diff) > _SWEEP_DIFF_CHARS:
+        return "its diff is too long to be read whole"
+    paths = diff_paths(diff)
+    if paths is None:
+        return "which files it changes could not be read from its diff"
+    stray = outside(paths, [requirements_dir or "requirements"])
+    if stray:
+        return (f"it changes {', '.join(f'`{p}`' for p in stray[:5])}"
+                + (f" and {len(stray) - 5} more" if len(stray) > 5 else "")
+                + f" — outside `{(requirements_dir or 'requirements').strip('/')}/`, which a "
+                  f"person merges")
+    return ""
+
+
+def land_open_proposals(*, docs_repo: str, forge=None, base: str = "main",
+                        token: str = "", requirements_dir: str = "requirements",
+                        language: str | None = None) -> list[str] | None:
+    """Get every `req/*` branch INTO THE BASE — opening its review request if missing, then merging.
+
+    `[]` = swept, nothing needed landing. `None` = THE SWEEP DID NOT RUN, which is a different fact
+    and used to be spelled the same way. A caller that reads them alike reports "no proposals are
+    stuck" about a repository it never managed to look at, which is this codebase's most expensive
+    defect class wearing the sweep's clothes.
+
+    THE RECOVERY USED TO STOP HALFWAY. Its first version opened the pull request and left it open,
+    which recreates the very state it exists to clear: the requirement is on a branch, the base does
+    not have it, and THE ROLE CANNOT READ ITS OWN WORK. Nina found that within one message —
+    "Quantos requisitos existem: zero" — and reasoned to the cause herself: "ou o texto foi gravado
+    num lugar que ainda não chegou até a versão que eu leio". She was right, and the half-recovery
+    was mine.
+
+    Merging is safe here for the same reason it is safe on the happy path (ADR-0032): the file lands
+    as `proposed`, and only a person's confirmation in the channel makes it a promise. Landing it
+    changes who can READ it, not what it means.
+
+    Idempotent by construction: a merged branch is deleted, so the next sweep does not see it —
+    and when that invariant breaks anyway (it did: `req/0002` outlived its squash-merged PR in the
+    live client repo), the merged pull request is RECOGNISED and the leftover branch deleted,
+    instead of re-proposing a requirement already in the base on every sweep forever.
+
+    THIS WAS THE LAST FUNCTION HERE THE PORT COULD NOT CARRY, AND THE REASON WAS ITS SHAPE RATHER
+    THAN ITS PLUMBING (#97, closed by #95). Every branch it looks at leads to exactly one of four
+    acts, and three of them needed a method that could name a repository:
+
+        no pull request ever          →  open one           `open_pr(…, repo=)`
+        one exists, MERGED            →  delete the branch  `delete_branch(…, repo=)`
+        one exists, CLOSED            →  leave it alone     (a person said no)
+        one exists, still open        →  merge it           `merge_pr(…, repo=)`
+
+    and telling those rows apart needs `pr_status(pr=…, repo=)`, because `pr_for_head` answers
+    WHETHER a branch was ever proposed and deliberately not which state it is in. Porting the
+    branch listing alone would have bought a sweep that can see every stuck proposal on an Azure
+    deployment and do nothing about any of them. All four are here now, and `delete_branch` — built
+    and, until this, consumed by nothing — finally has the caller its own docstring names.
+
+    THE CLOSED ROW IS NEW AND IT IS A DELIBERATE CHANGE OF BEHAVIOUR. The `gh` version asked for
+    MERGED pull requests, then for OPEN ones, and opened a fresh one when it saw neither — so a
+    proposal a human had closed was re-proposed on the next pass, and the one after that, for ever.
+    A closed pull request is somebody's answer of no; re-asking hourly is the loop this platform
+    exists not to build. It is left alone, and said out loud in the log, because a `req/*` branch
+    nobody wants is a person's to delete, not ours.
+
+    `token` IS ACCEPTED AND IGNORED, exactly as in `propose_requirement`, and for the same reason:
+    `runtime/temporal/activities.py::_land_product_proposals` still passes it. THAT CALL SITE NOW
+    PASSES A FORGE AS WELL — `forge=ProductModule(project)._forge()`, the fix this docstring used
+    to name as the one gap left, made after a live deployment logged that gap's ERROR once an hour
+    for a day. `forge=None` stays the default and the refusal below stays its answer: a sweep that
+    cannot name a provider must not guess one.
+    """
+    if forge is None:
+        # NOT `[]`. A sweep with no forge read nothing, decided nothing and landed nothing, and the
+        # caller's `if rescued:` cannot tell that from a clean repository unless the two answers
+        # differ. The ERROR is what a person greps for; the None is what a caller can branch on.
+        log.error("BEEVERFORGE_PRODUCT_SWEEP_NO_FORGE repo=%s — the proposal sweep was given no "
+                  "forge "
+                  "adapter, so it could not look at a single branch. Nothing is stuck BECAUSE OF "
+                  "this, and nothing has been checked either: any requirement whose review request "
+                  "failed stays out of the base, and the product role goes on denying it.",
+                  docs_repo)
+        return None
+    names = forge.list_branches(docs_repo, prefix=REQ_PREFIX)
+    if names is None:
+        log.error("BEEVERFORGE_PRODUCT_SWEEP_UNREADABLE repo=%s — the proposal branches could not "
+                  "be "
+                  "listed, so nothing was swept. Reported as 'could not', never as 'nothing to do'",
+                  docs_repo)
+        return None
+    landed: list[str] = []
+    for branch in sorted(names):
+        # ANY STATE, and that is the fix that stopped the sweep re-proposing landed work. Asking
+        # only for OPEN pull requests (while `propose_requirement`'s own idempotency check asks for
+        # all of them) is what made this open a fresh client-visible "Requisito proposto" PR for a
+        # branch whose content was already squash-merged — on every pass, forever.
+        pr = _already_proposed(forge, docs_repo, branch)
+        if pr is None:
+            log.warning("BEEVERFORGE_PRODUCT_SWEEP_BRANCH_UNREADABLE repo=%s branch=%s — could not "
+                        "ask "
+                        "whether it was ever proposed; left exactly as it is", docs_repo, branch)
+            continue
+        state = _pr_state(forge, docs_repo, pr) if pr else ""
+        if state is None:
+            log.warning("BEEVERFORGE_PRODUCT_SWEEP_STATE_UNREADABLE repo=%s branch=%s pr=%s "
+                        "— could "
+                        ""
+                        "not "
+                        "read whether it is merged, closed or open; left alone rather than acted "
+                        "on with a guess", docs_repo, branch, pr)
+            continue
+        if state == "merged":
+            log.warning("BEEVERFORGE_PRODUCT_PROPOSAL_ALREADY_LANDED repo=%s branch=%s — its pull "
+                        "request is merged; deleting the leftover branch so the sweep converges",
+                        docs_repo, branch)
+            _delete_landed_branch(forge, docs_repo, branch)
+            continue
+        if state == "closed":
+            log.warning("BEEVERFORGE_PRODUCT_PROPOSAL_DISCARDED repo=%s branch=%s pr=%s — a person "
+                        "closed "
+                        "it without merging, so it is not stuck, it is refused. Not re-proposed "
+                        "and not deleted: the text stays on the branch for whoever wants it back",
+                        docs_repo, branch, pr)
+            continue
+        if not pr:
+            pr = _open_review_request(
+                forge, docs_repo=docs_repo, head=branch, base=base,
+                title=_w(language, "rescued_title", slug=branch.split('/', 1)[-1]),
+                body=_w(language, "rescued_body"))
+            if not pr:
+                log.warning("BEEVERFORGE_PRODUCT_ORPHAN_STUCK repo=%s branch=%s — could not open a "
+                            "review "
+                            "request; the text is safe on the branch", docs_repo, branch)
+                continue
+        # ONLY REQUIREMENTS LAND UNATTENDED (#265 §6.4): a branch that reaches anything else —
+        # the preview's shape above all — is left open for a person, and the line says why
+        why = outside_requirements(forge, docs_repo, pr, requirements_dir)
+        if why:
+            log.warning("BEEVERFORGE_PRODUCT_PROPOSAL_LEFT_OPEN repo=%s branch=%s pr=%s — %s; "
+                        "it is left open for a person to merge or close", docs_repo, branch, pr,
+                        why)
+            continue
+        merged = _merge_and_confirm(forge, docs_repo=docs_repo, pr=pr)
+        if merged:
+            log.warning("BEEVERFORGE_PRODUCT_PROPOSAL_LANDED repo=%s branch=%s", docs_repo, branch)
+            _delete_landed_branch(forge, docs_repo, branch)
+            landed.append(branch)
+        elif merged is None:
+            log.error("BEEVERFORGE_PRODUCT_PROPOSAL_UNCONFIRMED repo=%s branch=%s pr=%s — "
+                      "the merge "
+                      ""
+                      "was "
+                      "requested and its outcome could not be read back; NOT counted as landed, "
+                      "and the next pass settles it", docs_repo, branch, pr)
+        else:
+            log.warning("BEEVERFORGE_PRODUCT_PROPOSAL_STILL_OPEN repo=%s branch=%s — the base does "
+                        "not "
+                        "have it and the product role cannot read it", docs_repo, branch)
+    return landed
+
+
+def _mark_superseded(root: Path, requirements_dir: str, numbers: list[int], *,
+                     by: int) -> tuple[list[str], list[int]]:
+    """Stamp `superseded-by` on each retired requirement — `(paths changed, numbers that FAILED)`.
+
+    Finds the file by NUMBER PREFIX rather than by slug: the retired requirement's title is not
+    knowable from here, and guessing it would silently retire nothing.
+
+    THE STATUS LINE IS FOUND WITH THE READER'S OWN REGEX (`corpus._STATUS_RE`). This used to
+    require exactly `- **status:**` while the parser deliberately tolerates hand-edited variants
+    ("a human editing by hand should not lose a requirement's status to a missing asterisk") — so
+    a parser-valid file silently kept both versions of one promise live, with only a log line to
+    show for it. A number that cannot be retired (no file, no readable status line) comes back in
+    `failed`, and the caller must refuse to land half a supersession.
+
+    A requirement that already carries a `superseded-by` is left alone — the first supersession is
+    the one that happened, and overwriting it would rewrite history to point at the newest text
+    rather than the one that actually replaced it.
+    """
+    changed: list[str] = []
+    failed: list[int] = []
+    folder = root / requirements_dir.strip("/")
+    for n in numbers or []:
+        matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
+        if not matches:
+            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_MISSING requirement %04d does not exist", n)
+            failed.append(n)
+            continue
+        file = matches[0]
+        text = file.read_text(encoding="utf-8")
+        if re.search(r"superseded[-\s]?by", text, re.IGNORECASE):
+            continue
+        if _is_dropped(text):
+            # ALREADY OFF THE TABLE, AND FOR A REASON SOMEBODY GAVE. Stamping `superseded-by` over
+            # a `dropped` status replaces "we decided against this, here is who and why" with
+            # "read that one instead" — and leaves the `Dropped by:` line underneath contradicting
+            # the status above it. Exactly that happened to REQ-0005 on 2026-07-31, hours after
+            # `dropped` was introduced: `is_live`, the status reader and the acceptance writer all
+            # learned about the new dead state and this writer did not.
+            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_SKIPPED_DROPPED requirement %04d was "
+                        "already dropped by somebody's decision — the record of who decided and "
+                        "why is worth more than a pointer to %04d", n, by)
+            continue
+        lines = text.splitlines()
+        idx = next((i for i, line in enumerate(lines) if _STATUS_RE.match(line)), None)
+        if idx is None:
+            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_NO_STATUS %s tem formato "
+                        "inesperado", file.name)
+            failed.append(n)
+            continue
+        lines[idx] = f"- **Status:** superseded-by {by:04d}"
+        file.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+        changed.append(f"{requirements_dir.strip('/')}/{file.name}")
+    return changed, failed
+
+
+def _already_dead(root: Path, requirements_dir: str, numbers: list[int]) -> list[int]:
+    """Of `numbers`, those whose requirement is already superseded or dropped.
+
+    Read from the clone with the corpus's own parser, because a claim about the base has to be
+    checked against the base and not against what a model believed when it drafted."""
+    from beeverforge.product.corpus import load_corpus
+
+    folder = root / requirements_dir.strip("/")
+    if not folder.is_dir() or not numbers:
+        return []
+    corpus = load_corpus(folder)
+    return sorted(n for n in numbers
+                  if (req := corpus.by_number(n)) is not None and not req.is_live)
+
+
+def _is_dropped(text: str) -> bool:
+    """Whether this file records a decision AGAINST — read with the corpus's own status regex, so
+    a hand-edited variant the parser tolerates is not silently overwritten by a writer that is
+    stricter than the reader."""
+    m = _STATUS_RE.search(text)
+    value = re.sub(r"<!--.*?-->", "", m.group("value") if m else "").strip().lower()
+    return value.split()[0] == DROPPED if value else False
+
+
+def _open_review_request(forge, *, docs_repo: str, head: str, base: str, title: str,
+                         body: str) -> str:
+    """Open the pull request that proposes `head` in the DOCUMENTATION repository — the URL, or
+    `""` when none was opened.
+
+    THE PORT'S `open_pr` RAISES AND THIS ONE DOES NOT, and the reason is where each of them sits.
+    The port is right to raise: for a job, a pull request that could not be opened must stop the
+    job, and there is no return value that could mean "I could not tell" without a caller reading
+    it as success. Here the requirement is ALREADY committed and pushed — the write that mattered
+    happened — so throwing that away to report the ceremony's failure would lose the half that
+    worked. Every caller in this module already treats `""` as "the review request did not open"
+    and says so to the person, with the branch and the number the write minted.
+
+    `""` IS NEVER "IT WORKED", which is the only property that has to survive whatever else changes
+    here. This used to be a `gh` subprocess that returned "" on a non-GitHub deployment — an honest
+    refusal, and the honesty is what had to be kept when the refusal stopped being necessary (#95).
+    """
+    try:
+        return (forge.open_pr(head=head, base=base, title=title, body=body,
+                              repo=docs_repo) or "").strip()
+    except Exception as exc:  # noqa: BLE001 — every provider's failure means the same thing here
+        log.error("BEEVERFORGE_PRODUCT_PR_CREATE_FAILED repo=%s head=%s base=%s — the "
+                  "forge refused "
+                  ""
+                  "to "
+                  "open the review request (%s). The text is committed and pushed; only the pull "
+                  "request is missing", docs_repo, head, base, _scrub(str(exc))[:300])
+        return ""
+
+
+def _pr_state(forge, docs_repo: str, pr: str) -> str | None:
+    """`"merged"` | `"closed"` | `"open"` for a pull request in the docs repository — `None` when it
+    could not be read.
+
+    THE THIRD ANSWER IS THE POINT, as everywhere else on this seam. The port's `pr_status` raises
+    rather than guessing, which is right for a durable merge-watch that will be retried; here the
+    caller is an hourly sweep and a proposal it cannot classify must simply be left alone until the
+    next pass. Turning the raise into `None` is what lets it skip ONE branch instead of abandoning
+    the whole sweep — and `None` can never be mistaken for a state, which `"open"` could."""
+    try:
+        return forge.pr_status(pr=pr, repo=docs_repo)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the state of %s in %s (%s)", pr, docs_repo,
+                    _scrub(str(exc))[:200])
+        return None
+
+
+def _merged_now(forge, docs_repo: str, pr: str, *, attempts: int | None = None,
+                delay: float | None = None) -> bool | None:
+    """Whether that pull request is actually merged — ASKED, never assumed, and WAITED FOR.
+
+    `True` = merged. `False` = read, and not merged. `None` = could not be read at all, which the
+    caller must not report as either.
+
+    ASKED, because `merge_pr` returns None on success and on an armed-but-unfired auto-merge alike:
+    its return is no evidence whatsoever. Reading the state back is the difference between "we
+    merged it" and "we ran a command", and announcing a merge that did not happen is the same
+    defect class as announcing a write that did not happen (ADR-0028) — ours, not the agent's.
+
+    WAITED FOR, because on one vendor the merge is not instant and a single read would call an
+    honest merge a failure. Azure DevOps completes asynchronously by design: measured live through
+    the adapter, `merge_pr` returned in 0.8s and the pull request read `open` at +1.0s and `merged`
+    at +2.4s. GitHub answered on the first read. The wait costs one round trip in the common case,
+    because it stops the moment the answer is not `open`.
+
+    A `closed` answer stops the wait immediately and is False: somebody abandoned the pull request
+    while we were watching, and no amount of patience turns that into a merge.
+
+    THE TWO BOUNDS ARE READ AT CALL TIME AND NOT TAKEN AS DEFAULT ARGUMENTS. A default is evaluated
+    when the `def` runs, so `_MERGE_DELAY = 0` set by a test — or by anything else — would be bound
+    to the module constant's ORIGINAL value and change nothing, which is the trap the `GITHUB`
+    constant at the top of this file already carries a note about. Here it would cost ten real
+    seconds per unmerged proposal in every suite run.
+    """
+    tries = max(1, _MERGE_ATTEMPTS if attempts is None else attempts)
+    pause = _MERGE_DELAY if delay is None else delay
+    unreadable = False
+    for attempt in range(tries):
+        state = _pr_state(forge, docs_repo, pr)
+        if state == "merged":
+            return True
+        if state == "closed":
+            return False
+        if state is None:
+            unreadable = True
+        if attempt + 1 < tries:
+            time.sleep(pause)
+    # Every read said "open" → False, an answer. Any read failed and none said merged → None, the
+    # absence of one. Collapsing these is how a merge that silently did not happen gets announced.
+    return None if unreadable else False
+
+
+def _merge_and_confirm(forge, *, docs_repo: str, pr: str, attempts: int | None = None,
+                       delay: float | None = None) -> bool | None:
+    """Merge, then read the outcome back. `True`/`False`/`None` — see `_merged_now`.
+
+    A REFUSED MERGE IS STILL READ BACK, ON PURPOSE AND WITH ONE ATTEMPT. The commonest reason a
+    merge is refused is that the pull request is already merged — a retried activity, a sweep
+    passing over work the propose path just landed — and treating that as a failure would have the
+    sweep re-open and re-merge for ever. But there is nothing in flight to wait for once the call
+    was refused, so the read-back is a single question rather than ten seconds of patience."""
+    try:
+        forge.merge_pr(pr=pr, repo=docs_repo)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("BEEVERFORGE_PRODUCT_MERGE_REFUSED repo=%s pr=%s (%s) — asking once whether it "
+                    "is "
+                    "already merged, which is the commonest reason a merge is refused", docs_repo,
+                    pr, _scrub(str(exc))[:200])
+        return _merged_now(forge, docs_repo, pr, attempts=1, delay=delay)
+    return _merged_now(forge, docs_repo, pr, attempts=attempts, delay=delay)
+
+
+def _delete_landed_branch(forge, docs_repo: str, branch: str) -> None:
+    """Remove a `req/*` branch whose pull request is IN THE BASE — the `--delete-branch` half of
+    the `gh pr merge` this module used to run, through the port.
+
+    NOT TIDINESS. `_requirement_branches` reads every surviving `req/*` branch as a proposal in
+    flight, and that list is an input to the NUMBER the next requirement gets; `land_open_proposals`
+    re-examines the branch on every hourly pass for ever. A leftover branch is therefore a permanent
+    fact about a requirement that has already landed — the exact state `req/0002` was found in on
+    the live client repository, outliving its squash-merged pull request.
+
+    ONLY EVER CALLED ON A CONFIRMED MERGE. Deleting on an assumed one would delete work.
+
+    `delete_branch` never raises and answers False when the branch may still be there, so a failure
+    here is one log line and nothing more: the requirement landed, and the next sweep sees the
+    branch again."""
+    if not forge.delete_branch(branch, repo=docs_repo):
+        log.warning("BEEVERFORGE_PRODUCT_BRANCH_NOT_DELETED repo=%s branch=%s — it landed and the "
+                    "branch "
+                    "is still on the remote; the next sweep will recognise it as merged and try "
+                    "again", docs_repo, branch)
+
+
+def ticket_body(*, described: str, reported_by: str, source: str, docs_repo: str = "",
+                requester_forge: str = "", card: str = "", language: str | None = None) -> str:
+    """The card a person asked for, as they described it — filed as described, not derived.
+
+    NO REQUIREMENT IS CITED, BECAUSE NONE WAS ARGUED. `issue_body` cites the promise it executes and
+    `defect_body` the promise it breaks; this one has neither, and saying so is the point — a card
+    that pretended to cite a promise it does not have would be a defect body wearing a request. The
+    executor reads what the person said, attributed, and where; the criterion of done is theirs to
+    confirm before the work starts."""
+    said = _said(language)
+    lines = [*_requester_front_matter(reported_by, requester_forge),
+             f"{_marker(_FROM_A_REQUEST, language)} — {said['request_kind']}",
+             f"{said['requested_by']} {_named(reported_by, requester_forge, language)}"]
+    if source:
+        lines.append(f"{said['asked_where']} {source}")
+    if card.strip():
+        # THE CARD THE PERSON CONFIRMED, WRITTEN AS THEY READ IT (#383): drafted from the
+        # conversation, checked, judged and shown whole before the yes (`product/cards.py`). The
+        # lines above stay the code's — who asked, where, and the marker `correct_card` reads —
+        # because they are facts about the card, not text a model or a template may reword.
+        return "\n".join([*lines, "", card.strip()]).rstrip() + "\n"
+    lines += ["", f"## {said['what_was_asked']}", "",
+              described.strip() or said["nothing_more"], "",
+              f"## {said['before_starting']}", "",
+              said["before_starting_text"]
+              + (said["requirements_live"].format(docs_repo=docs_repo) if docs_repo else ".")]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def defect_body(*, restated: str, reported_by: str, severity: str, source: str,
+                requirement, requirement_path: str, docs_repo: str, commit: str = "",
+                requester_forge: str = "", card: str = "", language: str | None = None,
+                linked: str = "") -> str:
+    """The issue body for a broken promise — classified, and citing what it breaks.
+
+    The executor reads this cold, so everything it needs is HERE: what reality is doing, which
+    promise says otherwise (verbatim quote, not just a number — the docs checkout may move), and
+    how bad it is for the person who reported it. A defect that cites nothing is indistinguishable
+    from a feature request wearing an angry tone, and it would be built as one.
+
+    `requirement_path` is REQUIRED and comes from `requirement_file`, exactly like `issue_body`'s.
+    This function used to render `requirement.path` itself — the corpus's bare filename — so the
+    one card that names a promise pointed at a file nobody can open. Taking the resolved path is
+    what makes the two bodies share one answer to "where does that requirement live"."""
+    # WHAT THE CARD SAYS IT IS FOLLOWS WHAT IT CITES (#399): "violando uma promessa já aceita" on a
+    # defect that cites none told the coding agent a requirement exists that nobody can find
+    said = _said(language)
+    kind = said["defect_breaks"] if requirement is not None else said["defect_broken"]
+    lines = [*_requester_front_matter(reported_by, requester_forge),
+             f"{_marker(_FROM_A_DEFECT, language)} — {kind}"]
+    if severity:
+        # only when somebody actually judged one. The first version printed "Gravidade: média"
+        # from a hardcoded default — a fabricated classification the fix queue would sort by.
+        lines.append(f"{said['severity']} {severity}")
+    lines.append(f"{said['reported_by']} {_named(reported_by, requester_forge, language)}")
+    if source:
+        lines.append(f"{said['reported_where']} {source}")
+    refs = [r.strip().lstrip("#") for r in str(linked or "").split(",") if r.strip()]
+    if refs:
+        # THE DELIVERY IT CAME FROM (#448 slice 5): the cards a person was told were ready and said
+        # did not work, as the tracker's own mentions — so whoever picks this up starts from what
+        # was delivered, and the delivered card's history shows this report
+        lines.append(said["after_delivery"].format(cards=", ".join(f"#{r}" for r in refs)))
+    if card.strip():
+        # THE CARD THE PERSON CONFIRMED (#392), drafted from the conversation and judged like a
+        # requested card; its "O que está acontecendo" is the section a correction rewrites. The
+        # promise below stays the code's: which requirement it breaks is a citation, never prose.
+        lines += ["", card.strip(), ""]
+    else:
+        lines += ["", f"## {said['what_is_happening']}", "", restated.strip(), ""]
+    if requirement is not None:
+        lines += [
+            f"## {said['broken_promise'].format(number=requirement.number)}",
+            "",
+            said["in_repo"].format(path=requirement_path, repo=docs_repo)
+            + (said["read_at"].format(commit=commit[:12]) if commit else ""),
+            "",
+            said["broken_promise_text"],
+            "",
+            # THE CITATION EVERY CARD OF A REQUIREMENT CARRIES (#265 §6.1), in the section and the
+            # words the card readers look for — so a defect is found among its requirement's
+            # siblings when the requirement is previewed, like the cards filed from it. It carries
+            # no "filed from a requirement" marker: WHO filed it stays the defect line above.
+            "## Source",
+            "",
+            f"Restores **REQ-{requirement.number:04d}** in `{docs_repo}` — `{requirement_path}`"
+            + (f" @ `{commit[:12]}`" if commit else "") + ".",
+        ]
+    else:
+        lines += [
+            # A MALFUNCTION NEEDS NO WRITTEN PROMISE (#399). This paragraph told whoever picked the
+            # card up to find the broken requirement BEFORE fixing and to hand the card back when
+            # none existed — on a product whose code predates its requirements, an instruction to
+            # the coding agent to return almost every bug unfixed.
+            f"## {said['no_requirement']}",
+            "",
+            said["no_requirement_text"],
+        ]
+    return "\n".join(lines)
+
+
+def _staged_outside(checkout: Path, allowed, *, import_id: str = "") -> list[str]:
+    """What is STAGED in `checkout` that a writer allowed `allowed` may not commit — asked of git
+    itself, after the add, so a path that reached the index by any route is caught. An index git
+    cannot list is refused whole: a commit nobody could inspect is not one to push.
+
+    `import_id` is the import's own (#993): its record directory, and only that one, is admitted
+    under `.beeverforge/` (`context_writes.outside_an_import`)."""
+    from beeverforge.policy.context_writes import outside, outside_an_import
+
+    rc, out = _git(["diff", "--cached", "--name-only", "-z"], cwd=checkout)
+    if rc != 0:
+        return ["(the staged files could not be listed)"]
+    staged = [p for p in out.split("\0") if p.strip()]
+    if import_id:
+        return outside_an_import(staged, allowed, import_id=import_id)
+    return outside(staged, allowed)
+
+
+def _refused_staging(checkout: Path, allowed, *, docs_repo: str, writer: str,
+                     language: str | None = None) -> WriteResult | None:
+    """The refusal a DIRECT writer answers when what it staged reaches past what it exists to
+    write — or None, and it commits (#265 §6.4). Every writer here that lands on the context
+    repository's base with no person between asks this before its commit: the base holds what a
+    preview builds, and `.beeverforge/` is never any writer's."""
+    staged = _staged_outside(checkout, allowed)
+    if not staged:
+        return None
+    log.error("BEEVERFORGE_PRODUCT_WRITE_OUTSIDE repo=%s writer=%s staged=%s — nothing was "
+              "committed", docs_repo, writer, staged)
+    return WriteResult(ok=False, refusal=NOT_VALID, detail=_w(language, "staged_outside",
+                                           staged=", ".join(staged[:3])))
+
+
+def fact_file(fact, *, said_by: str, language: str | None = None) -> tuple[str, str]:
+    """`(path, text)` of one learned fact's own file — `domain/<day>-<term>.md`, the shape a
+    person edits by hand, in the project's language.
+
+    THE ONE SHAPE A FACT IS WRITTEN IN, by the two writers that write one: a fact said in a
+    conversation (`record_fact`) and a fact brought in an import (`product/importing.py`, #993).
+    `said_by` is who the file's note says it came from."""
+    from beeverforge.product.domain import render_file
+
+    path = f"domain/{fact.learned_on}-{slugify(fact.term, limit=40)}.md"
+    return path, render_file([fact], title=_w(language, "fact_title", term=fact.term),
+                             intro=_w(language, "fact_intro", said_by=said_by),
+                             language=language)
+
+
+def record_fact(*, docs_repo: str, clone_url: str, term: str, body: str, said_by: str,
+                where: str = "", base: str = "main", today: str | None = None,
+                language: str | None = None) -> WriteResult:
+    """Commit one `aprendido` fact straight to the docs branch — deliberately NOT a pull request.
+
+    Requirements go through a PR because the factory DEFENDS them once accepted; a fact enters as
+    `aprendido` — attributed, dated, and explicitly non-authoritative (domain.py's discipline) —
+    so the review ceremony would add friction exactly where the goal is that people bother to say
+    things out loud. The audit trail is the git history plus the attribution inside the file, and
+    promotion to `confirmado` is a deliberate, human edit."""
+    from datetime import UTC, datetime
+
+    from beeverforge.policy.context_writes import FACTS, outside
+    from beeverforge.product.domain import Fact
+
+    day = today or datetime.now(UTC).date().isoformat()
+    fact = Fact(term=term.strip(), body=body.strip(), status="aprendido",
+                source=said_by.strip(), where=where.strip(), learned_on=day)
+    path, text = fact_file(fact, said_by=said_by, language=language)
+    # A FACT IS A FILE UNDER `domain/` AND NOTHING ELSE (#265 §6.4): this commits to the base with
+    # no person in between, and the base holds what a preview builds
+    if outside([path], FACTS):
+        log.error("BEEVERFORGE_PRODUCT_FACT_OUTSIDE repo=%s path=%r — a fact lands under domain/ "
+                  "only; nothing was written", docs_repo, path)
+        return WriteResult(ok=False, detail=_w(language, "fact_outside", path=path),
+                           refusal=NOT_VALID)
+
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-fact-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        target = tmp / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        _git(["add", "--", path], cwd=tmp)
+        refused = _refused_staging(tmp, FACTS, docs_repo=docs_repo, writer="record_fact",
+                                   language=language)
+        if refused:
+            return refused
+        rc, out = _git(["commit", "-m",
+                        _w(language, "fact_commit", term=fact.term, said_by=said_by,
+                           where=_w(language, "fact_where", where=where) if where else "")],
+                       cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            # a protected branch is the docs repo owner's right — say exactly what to do instead
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "not_direct_by_hand", out=_scrub(out)[-120:],
+                                         path=path))
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def distilled_until(folder: Path) -> str:
+    """The latest `until` of the distillates in one conversation's folder — "" for none. Read off
+    each file's front matter, which the distillate writes (`product/distil.py::render`)."""
+    from beeverforge.adapters.extract.text import front_matter
+
+    latest = ""
+    for one in sorted(Path(folder).glob("*.md")) if Path(folder).is_dir() else ():
+        try:
+            fields, _body, _problem = front_matter(one.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        until = str(fields.get("until") or "")
+        latest = max(latest, until)
+    return latest
+
+
+def _distilled_until_across_trees(checkout: Path, path: str) -> str:
+    """The latest `until` a conversation already holds in `checkout`, ACROSS BOTH TREES — the
+    distillates under `conversations/` AND whatever marks an empty span under `.distilled/` (#457).
+
+    ONCE PER SPAN, WHATEVER THE OUTCOME. The model's reading runs outside the lock and is not
+    deterministic: one process can read a span as nothing-to-keep (a mark in `.distilled/`) while
+    another reads the same span as worth keeping (a distillate in `conversations/`). A compare-and-
+    swap that looked only in the tree it is about to write would let both land. So it reads the
+    conversation's folder in each tree, as `distilled_in` does, and takes the latest — the position
+    the span's `after` is checked against. `path` names the file about to be written; its kind and
+    digest name the conversation, and the folders are read in both trees."""
+    from pathlib import PurePosixPath
+
+    from beeverforge.product.documents.record import DISTILLATES, MARKED
+
+    parts = PurePosixPath(path).parts
+    if len(parts) < 4:
+        return distilled_until((Path(checkout) / path).parent)
+    _tree, kind, digest = parts[0], parts[1], parts[2]
+    latest = ""
+    for tree in (DISTILLATES, MARKED):
+        latest = max(latest, distilled_until(Path(checkout) / tree / kind / digest))
+    return latest
+
+
+def record_distillate(*, docs_repo: str, clone_url: str, path: str, text: str, after: str,
+                      base: str = "main") -> WriteResult:
+    """Commit one conversation's distillate straight to the docs branch — ONCE PER SPAN
+    (#269 slice 3, ADR-0053 D4).
+
+    The span was read as starting after `after`, the latest `until` its conversation held when the
+    pass looked. This clone is the base as it is NOW, under the product's semaphore, so the
+    conversation is read again here — ACROSS BOTH TREES (`_distilled_until_across_trees`): a
+    distillate under `conversations/` OR a mark of an empty span under `.distilled/` whose `until`
+    is past `after` means this span, or part of it, was read since by somebody else — and nothing
+    is written. Both trees, because the model's reading is not deterministic (#457): one process
+    marking a span empty and another distilling the same span would each miss the other's write if
+    the swap looked only in the tree it is about to touch. That is the compare-and-swap that keeps a
+    conversation from being read twice for one span, across passes, processes and registry projects
+    of the product alike.
+
+    NAMES NOBODY, the commit included: the text was scrubbed before it came here, and the message
+    says what the file is, never whose conversation it was."""
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-distillate-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        target = tmp / path
+        latest = _distilled_until_across_trees(tmp, path)
+        if target.exists() or (latest and latest > after):
+            return WriteResult(ok=True, existed=True, ref=path,
+                               detail="this span of the conversation is distilled already")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        _git(["add", "--", path], cwd=tmp)
+        rc, out = _git(["commit", "-m", "a conversation, distilled\n\nA model's reading of one "
+                                         "span of a conversation that went quiet — evidence, "
+                                         "never a decision."], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"the repository does not take a direct commit "
+                                      f"({_scrub(out)[-120:]})")
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+#: How a requirement the product role wrote from a conversation is told from one somebody else
+#: wrote — the subject and the line `propose_requirement` commits it with, and no other writer
+#: does. Read off the history, because the file itself cannot say who wrote it.
+_ROLE_REQUIREMENT = re.compile(r"^REQ-(\d{4,}): ")
+_ROLE_REQUIREMENT_LINE = "Proposed from a product conversation"
+
+
+@dataclass(frozen=True)
+class ContextForgotten:
+    """What `forget_distillates` removed from the context repository, and what it found and left.
+
+    `requirements` are the ones the role wrote from conversations, still on the base, each as
+    `REQ-NNNN path` — REPORTED, never removed (see `forget_distillates`)."""
+
+    ok: bool
+    distillates: tuple[str, ...] = ()
+    requirements: tuple[str, ...] = ()
+    detail: str = ""
+
+
+def _role_requirements(checkout: Path) -> list[str]:
+    """`REQ-NNNN path` for every requirement the role wrote from a conversation that is still in
+    `checkout` — the files each such commit ADDED, read off the history. [] for a history that
+    cannot be read: this is a report, and an empty one says nothing was found, not that none
+    exist — the caller's sentence says which."""
+    rc, out = _git(["log", "--format=%H%x1f%s%x1f%b%x1e"], cwd=checkout)
+    if rc != 0:
+        return []
+    found: list[str] = []
+    for record in out.split("\x1e"):
+        sha, _, rest = record.strip().partition("\x1f")
+        subject, _, body = rest.partition("\x1f")
+        number = _ROLE_REQUIREMENT.match(subject)
+        if not sha or not number or _ROLE_REQUIREMENT_LINE not in body:
+            continue
+        rc, added = _git(["show", "--diff-filter=A", "--name-only", "--format=", sha],
+                         cwd=checkout)
+        for path in (added.splitlines() if rc == 0 else []):
+            if path.strip() and (checkout / path.strip()).is_file():
+                found.append(f"REQ-{int(number.group(1)):04d} {path.strip()}")
+    return sorted(dict.fromkeys(found))
+
+
+def forget_distillates(*, docs_repo: str, clone_url: str, base: str = "main") -> ContextForgotten:
+    """The conversations' distillates removed from the context repository's base in one commit —
+    and the requirements the role wrote from conversations FOUND AND LEFT (#453).
+
+    WHAT GOES IS WHAT THE PLATFORM READ OUT OF THE CONVERSATIONS: every file at a distillate's own
+    path (`documents/record.py::distillate_of` — `conversations/<room|direct>/<digest>/…`), the
+    model's reading of a span, "evidence, never a decision" (`distil.py`). It is derived from the
+    lines `forget` deletes, written by no person's yes and cited by nothing, so it goes with them.
+    A file merely under `conversations/` at another path is somebody's, and stays.
+
+    WHAT STAYS IS WHAT A PERSON'S YES MADE THE PRODUCT'S (`sessions.py`: "what the conversation
+    already became stays"). A requirement the role wrote is a numbered promise an open card may
+    cite — `project forget` keeps the open cards — and one that superseded another stamped that one
+    retired IN THE SAME COMMIT (`_mark_superseded`), so removing the file alone leaves a requirement
+    retired by one that no longer exists. They are listed, by number and path, for a person to
+    retire the way requirements are retired: dropped, with a yes.
+
+    Straight to the base like every distillate write (`record_distillate`), through the project's
+    own clone URL and credential; a base that refuses a direct commit is said, and nothing changed.
+    """
+    import shutil
+
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-forget-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--branch", base, "--", clone_url, str(tmp)])
+        if rc != 0:
+            return ContextForgotten(ok=False,
+                                    detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        from beeverforge.product.documents.record import DISTILLATES, distillate_of
+
+        rc, listed = _git(["ls-files", "-z", "--", DISTILLATES], cwd=tmp)
+        if rc != 0:
+            return ContextForgotten(ok=False, detail=f"could not list {DISTILLATES}/ in "
+                                                     f"{docs_repo}: {_scrub(listed)[-200:]}")
+        distillates = tuple(p for p in listed.split("\0") if p and distillate_of(p) is not None)
+        requirements = tuple(_role_requirements(tmp))
+        if not distillates:
+            return ContextForgotten(ok=True, requirements=requirements)
+        rc, out = _git(["rm", "-q", "--", *distillates], cwd=tmp)
+        if rc != 0:
+            return ContextForgotten(ok=False, requirements=requirements,
+                                    detail=f"could not remove the distillates: "
+                                           f"{_scrub(out)[-200:]}")
+        refused = _refused_staging(tmp, [DISTILLATES], docs_repo=docs_repo,
+                                   writer="forget_distillates")
+        if refused:
+            return ContextForgotten(ok=False, requirements=requirements, detail=refused.detail)
+        rc, out = _git(["commit", "-m", f"the conversations' distillates, forgotten\n\n"
+                                        f"{len(distillates)} file(s) the platform read out of "
+                                        f"conversations an operator asked it to forget."],
+                       cwd=tmp)
+        if rc != 0:
+            return ContextForgotten(ok=False, requirements=requirements,
+                                    detail=f"nothing to commit: {_scrub(out)[-200:]}")
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return ContextForgotten(ok=False, requirements=requirements,
+                                    detail=f"the repository does not take a direct commit on "
+                                           f"{base} ({_scrub(out)[-120:]}) — nothing there changed")
+        log.warning("BEEVERFORGE_PRODUCT_DISTILLATES_FORGOTTEN repo=%s files=%d", docs_repo,
+                    len(distillates))
+        return ContextForgotten(ok=True, distillates=distillates, requirements=requirements)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+#: The one folder a file filed from a conversation goes to (#336): the platform's, like
+#: `requirements/` and `domain/`. Every company arranges its context repository its own way, and a
+#: file brought in a conversation has no place in that arrangement the platform could know — the
+#: company moves it where it belongs, and the product page follows it there.
+FILED_FOLDER = "from-chat"
+
+
+def file_document(*, docs_repo: str, clone_url: str, name: str, data: bytes, message: str,
+                  day: str, base: str = "main") -> WriteResult:
+    """Commit one file a person filed from a conversation into `from-chat/`, as
+    `<day>-<name>` — a name already taken there gets `-2`, `-3`, … rather than overwriting. The
+    bytes are written as they came; the message says who brought it, when and from which
+    conversation (a digest), since a PDF has no front matter to say it in. `ref` is the path."""
+    stem, dot, suffix = name.rpartition(".")
+    stem, suffix = (stem, f".{suffix}") if dot and stem else (name, "")
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-filed-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        folder = tmp / FILED_FOLDER
+        folder.mkdir(parents=True, exist_ok=True)
+        path, n = f"{FILED_FOLDER}/{day}-{stem}{suffix}", 1
+        while (tmp / path).exists():
+            n += 1
+            path = f"{FILED_FOLDER}/{day}-{stem}-{n}{suffix}"
+        (tmp / path).write_bytes(data)
+        _git(["add", "--", path], cwd=tmp)
+        rc, out = _git(["commit", "-m", message], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"the repository does not take a direct commit "
+                                      f"({_scrub(out)[-120:]})")
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+#: What a decision cell may never contain unescaped: a pipe would split one decision into two
+#: cells and shift every later column, so the row renders as a different sentence than the person
+#: approved. Escaped rather than rejected — refusing a decision because it contains a "|" would be
+#: the platform's own table format leaking into what a client is allowed to decide.
+_CELL_UNSAFE = str.maketrans({"|": "\\|", "\n": " ", "\r": " "})
+
+
+def _cell(value: str, limit: int = 400, language: str | None = None) -> str:
+    return (value or "").translate(_CELL_UNSAFE).strip()[:limit] or _w(language, "undeclared")
+
+
+def add_decision_row(text: str, *, day: str, decision: str, who: str,
+                     where: str = "", language: str | None = None) -> tuple[str, str]:
+    """`(updated_text, outcome)` — append one row to the decision register.
+
+    `outcome` is "written", "no-section" (the file predates the template, or somebody removed it)
+    or "duplicate" (this exact decision is already recorded on this day).
+
+    APPENDED AT THE END OF THE SECTION, NEVER AFTER THE LAST `|` LINE IN THE FILE. The naive
+    version finds the last table row and writes under it — and a requirement whose "Affects" or
+    "Conflicts" section happens to hold a table gets the decision written into THAT one, where
+    `has_decisions` will never see it and `no-write-back` goes on complaining about a decision the
+    client watched being recorded.
+    """
+    span = find_decisions_table(text)
+    if span is None:
+        return text, "no-section"
+    start, end = span
+    body = text[start:end]
+    row = (f"| {day} | {_cell(decision, language=language)} | "
+           f"{_cell(who + (f' — {where}' if where else ''), 200, language=language)} |")
+    if row.strip() in {line.strip() for line in body.splitlines()}:
+        # the same decision, the same day, the same person: a retried confirmation, not a second
+        # decision. Writing it twice would make one act look like two in the only record that
+        # answers "how often did this change?"
+        return text, "duplicate"
+    lines = body.rstrip().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return text[:start] + "\n".join([*lines, row]) + "\n" + text[end:], "written"
+
+
+def record_decision(*, docs_repo: str, clone_url: str, path: str, number: int,
+                    decision: str, decided_by: str, where: str = "", base: str = "main",
+                    today: str | None = None,
+                    language: str | None = None) -> WriteResult:
+    """Write one decision into a requirement's register — THE WRITER THAT DID NOT EXIST.
+
+    The register was rendered by `render_requirement`, read by `corpus._decision_rows`, and
+    `_cross_check` even emitted `no-write-back` when an agreed requirement recorded no decision.
+    Nothing anywhere wrote a row. So the role proposed recording a dated, attributed decision, a
+    client would have confirmed it, and the answer would have been narration over an empty table —
+    the third instance of that class in one day.
+
+    IT MATTERS MORE THAN IT LOOKS. This is where the provenance of a decision taken AFTER the
+    acceptance lives. Without it the decision exists on a card nobody opens in three months, or in
+a conversation that scrolls. The role said it better than anybody: *"if this only goes on the
+    card, in three months nobody knows where it came from or that you
+    were the one who decided."*
+
+    Committed straight to the docs branch, exactly like `accept_requirement` and for the same
+    reason: an authorised person said so in the channel, and a pull request reviewing a sentence
+    nobody is arguing about is the ceremony that teaches people to click through.
+    """
+    import datetime
+
+    day = today or datetime.datetime.now(datetime.UTC).date().isoformat()
+    if not (decision or "").strip():
+        return WriteResult(ok=False, refusal=NOT_VALID, detail=_w(language, "no_decision"))
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-decision-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        target = tmp / path
+        if not target.is_file():
+            return WriteResult(ok=False, refusal=NOT_FOUND,
+                               detail=_w(language, "decision_not_found", number=number))
+        text = target.read_text(encoding="utf-8")
+        updated, outcome = add_decision_row(text, day=day, decision=decision,
+                                            who=decided_by, where=where, language=language)
+        if outcome == "duplicate":
+            return WriteResult(ok=True, ref=path, existed=True,
+                               detail=_w(language, "decision_duplicate"))
+        if outcome == "no-section":
+            # SAID, not silently appended. A requirement written before the template had this
+            # section is a real state in the live client's base, and inventing the heading here
+            # would put a table in a file whose shape nobody chose — the repair belongs to a
+            # person who can look at the document.
+            log.warning("BEEVERFORGE_PRODUCT_NO_DECISION_SECTION repo=%s path=%s — the requirement "
+                        "has "
+                        "no '%s' section, so there is nowhere to record a decision",
+                        docs_repo, path, DECISIONS_HEADING)
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "decision_no_section", number=number))
+        target.write_text(updated, encoding="utf-8")
+        _git(["add", "--", path], cwd=tmp)
+        refused = _refused_staging(tmp, [path], docs_repo=docs_repo, writer="record_decision",
+                                   language=language)
+        if refused:
+            return refused
+        rc, out = _git(["commit", "-m",
+                        _w(language, "decision_commit", number=number, by=decided_by)], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "not_direct", out=_scrub(out)[-120:]))
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def accept_requirement(*, docs_repo: str, clone_url: str, path: str, number: int,
+                       accepted_by: str, base: str = "main",
+                       today: str | None = None,
+                       language: str | None = None) -> WriteResult:
+    """Flip one requirement from `proposed` to `accepted` — THE ONLY ACT THAT CREATES A PROMISE.
+
+    THIS STEP DID NOT EXIST. `accepted` was read in four places — it is what makes the factory
+    DEFEND a statement — and written by nothing. A requirement was born `proposed` and stayed
+    `proposed` unless somebody edited the markdown by hand. So a product sold as needing no
+    developer required two developer operations per requirement: merge a pull request, then edit a
+    field in a file.
+
+    Committed straight to the docs branch rather than through a pull request, deliberately: the TEXT
+    was already reviewed and merged; what changes here is one field, and it changes because an
+    authorised person said so in the channel. A second review of a word nobody is arguing about is
+    ceremony, and ceremony is what teaches people to click through.
+
+    The date and the person are recorded in the same edit — `corpus.py` flags an accepted
+    requirement missing either, and an acceptance nobody can attribute is not one.
+    """
+    import datetime
+
+    day = today or datetime.datetime.now(datetime.UTC).date().isoformat()
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-accept-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        target = tmp / path
+        if not target.is_file():
+            return WriteResult(ok=False, detail=_w(language, "accept_not_found", number=number),
+                               refusal=NOT_FOUND)
+        text = target.read_text(encoding="utf-8")
+        updated, outcome = _set_status_accepted(text, accepted_by=accepted_by, day=day)
+        if outcome == "already":
+            return WriteResult(ok=True, ref=path, existed=True,
+                               detail=_w(language, "accept_already"))
+        if outcome != "flipped":
+            # NEVER "already agreed", whatever the reason. Reporting a status that did not flip as
+            # a prior agreement is exactly how the live client was told "já estava acordado" while
+            # the file stayed `proposed`, no promise existed, and "quebra o requisito N" kept
+            # answering "ainda não foi acordado" in the same channel. Which refusal this is —
+            # theirs to act on, or ours to repair — belongs to `_accept_refusal`.
+            _say_unflippable("BEEVERFORGE_PRODUCT_ACCEPT_UNFLIPPABLE", docs_repo=docs_repo,
+                             path=path,
+                             outcome=outcome)
+            if outcome in _SETTLED:
+                # the client's own decision, or one written over: a state with a next step (#908)
+                return WriteResult(ok=False, refusal=NOT_WAITING, ref=path,
+                                   detail=_accept_refusal(number, outcome, language))
+            # a status this module does not recognise safely: ours to repair, a failure
+            return WriteResult(ok=False, refusal=NOT_REFUSED, ref=path,
+                               detail=_accept_refusal(number, outcome, language))
+        target.write_text(updated, encoding="utf-8")
+        _git(["add", "--", path], cwd=tmp)
+        refused = _refused_staging(tmp, [path], docs_repo=docs_repo, writer="accept_requirement",
+                                   language=language)
+        if refused:
+            return refused
+        rc, out = _git(["commit", "-m",
+                        _w(language, "accept_commit", number=number, by=accepted_by)],
+                       cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "not_direct", out=_scrub(out)[-120:]))
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def drop_requirement(*, docs_repo: str, clone_url: str, path: str, number: int,
+                     dropped_by: str, reason: str = "", base: str = "main",
+                     today: str | None = None,
+                     language: str | None = None) -> WriteResult:
+    """Mark one requirement as decided against — the act with no replacement.
+
+    THE LIFECYCLE HAD NO WAY TO SAY "NOT THIS". A requirement could be written, agreed and replaced,
+    and every one of those needs somebody to author a NEW text; there was no way to say a thing
+    simply will not be done. The product owner named it in one line — *"something that will no
+    longer be done — isn't that very common in a conversation with a PO?"* — and it is: it is the
+    second most common thing that happens to a requirement after being written.
+
+    Retiring by writing a replacement is what the platform could already do, and it is the wrong
+    shape for this: it forces an invention (a text nobody wants) to record an absence.
+
+    Committed straight to the docs branch, like the acceptance and for the same reason: one field
+    changes, and it changes because an authorised person said so in the channel. A pull request
+    reviewing the removal of something nobody is building is ceremony.
+
+    WHO AND WHY ARE THE POINT. A requirement that quietly stops being current is indistinguishable
+    from one that was lost; six months later "why aren't we doing this?" has to have an answer in
+    the file rather than in somebody's memory of a chat.
+    """
+    import datetime
+
+    day = today or datetime.datetime.now(datetime.UTC).date().isoformat()
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-drop-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        target = tmp / path
+        if not target.is_file():
+            return WriteResult(ok=False, refusal=NOT_FOUND,
+                               detail=_w(language, "drop_not_found", number=number))
+        text = target.read_text(encoding="utf-8")
+        updated, outcome = _set_status_dropped(text, dropped_by=dropped_by, day=day, reason=reason)
+        if outcome == "already":
+            return WriteResult(ok=True, ref=path, existed=True,
+                               detail=_w(language, "drop_already", number=number))
+        if outcome != "flipped":
+            _say_unflippable("BEEVERFORGE_PRODUCT_DROP_UNFLIPPABLE", docs_repo=docs_repo, path=path,
+                             outcome=outcome)
+            if outcome == "superseded":
+                # already off the table: a state with a next step, as `_drop_refusal` says (#908)
+                return WriteResult(ok=False, refusal=NOT_WAITING, ref=path,
+                                   detail=_drop_refusal(number, outcome, language))
+            # a status this module does not recognise safely: ours to repair, a failure
+            return WriteResult(ok=False, refusal=NOT_REFUSED, ref=path,
+                               detail=_drop_refusal(number, outcome, language))
+        target.write_text(updated, encoding="utf-8")
+        _git(["add", "--", path], cwd=tmp)
+        refused = _refused_staging(tmp, [path], docs_repo=docs_repo, writer="drop_requirement",
+                                   language=language)
+        if refused:
+            return refused
+        message = _w(language, "drop_commit", number=number, by=dropped_by)
+        rc, out = _git(["commit", "-m", message + (f"\n\n{reason}" if reason else "")], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=_w(language, "not_direct", out=_scrub(out)[-120:]))
+        return WriteResult(ok=True, ref=path)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+#: Refusals that are a STATE OF THE LIFECYCLE, not a damaged file. Both status writers refuse on
+#: them and neither may report them as breakage: an `error` marker raised because somebody
+#: deliberately retired a requirement is the noise that teaches a supervisor to skim the one that
+#: means a file nobody can parse is sitting in the corpus.
+_SETTLED = ("dropped", "superseded")
+
+
+def _say_unflippable(marker: str, *, docs_repo: str, path: str, outcome: str) -> None:
+    """The operator's half of a refused status change — one line, one severity rule, two writers."""
+    log.log(logging.INFO if outcome in _SETTLED else logging.ERROR,
+            "%s repo=%s path=%s — %s; nothing was changed", marker, docs_repo, path, outcome)
+
+
+def _accept_refusal(number: int, outcome: str, language: str | None = None) -> str:
+    """Why the acceptance did not happen, in words the person can act on — `_drop_refusal`'s
+    sibling, drawing the same distinction on the other side of the lifecycle.
+
+    A requirement the client THEMSELVES abandoned, and one that was written over, are business
+    answers with a next step each; only the third is ours to fix. One sentence for all three tells
+    somebody who dropped a requirement yesterday that their own decision is a text nobody can read
+    and that a team is on its way to repair it — an apology for a file that is perfectly healthy,
+    and an invented fix nobody will perform.
+    """
+    if outcome == "dropped":
+        return (_w(language, "accept_refused_dropped", number=number))
+    if outcome == "superseded":
+        return (_w(language, "accept_refused_superseded", number=number))
+    return (_w(language, "accept_refused_unknown", number=number))
+
+
+def _drop_refusal(number: int, outcome: str, language: str | None = None) -> str:
+    """Why the drop did not happen, in words the person can act on.
+
+    A requirement already REPLACED is a different answer from one whose file we cannot read: the
+    first is "there is nothing to abandon, it is already off the table", the second is ours to fix.
+    One sentence for both would send the reader hunting the wrong thing.
+    """
+    if outcome == "superseded":
+        return (_w(language, "drop_refused_superseded", number=number))
+    return (_w(language, "drop_refused_unknown", number=number))
+
+
+def _set_status_dropped(text: str, *, dropped_by: str, day: str,
+                        reason: str = "") -> tuple[str, str]:
+    """`(new text, outcome)` — `"flipped"`, `"already"`, or what is wrong.
+
+    Shares `corpus._STATUS_RE` with the reader and with every other writer here, which is the
+    discipline that stopped the acceptance silently flipping nothing for weeks.
+
+    ANY LIVE STATE CAN BE ABANDONED, including `accepted`. That is deliberate and it is the whole
+    point: deciding not to do something you had promised is a normal business event, and a
+    lifecycle that only lets you drop things nobody agreed to would force the one case that most
+    needs a record to happen by hand. What it must never be is quiet — the caller gates it behind
+    an explicit confirmation, and the file keeps who and why.
+    """
+    lines = text.splitlines()
+    idx = next((i for i, line in enumerate(lines) if _STATUS_RE.match(line)), None)
+    if idx is None:
+        return text, "no status line the corpus parser could read either"
+    raw = _STATUS_RE.match(lines[idx]).group("value")
+    value = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    word = value.split()[0] if value else ""
+    if word == DROPPED:
+        return text, "already"
+    if word.startswith(SUPERSEDED):
+        # already off the table, and pointing at a replacement. Overwriting that would erase the
+        # pointer a reader follows to find what took its place.
+        return text, "superseded"
+    if word not in (PROPOSED, OBSERVED, ACCEPTED):
+        return text, f"status is {value!r}, which is not a state anything can be dropped from"
+
+    lines[idx] = f"- **Status:** {DROPPED}"
+    stamp = f"- **Dropped by:** {dropped_by} on {day}"
+    if reason:
+        stamp += f" — {reason.strip()}"
+    lines.insert(idx + 1, stamp)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), "flipped"
+
+
+def _set_status_accepted(text: str, *, accepted_by: str, day: str) -> tuple[str, str]:
+    """`(new text, outcome)` — `"flipped"`, `"already"`, or what is wrong (operator English).
+
+    THE STATUS LINE IS FOUND WITH THE READER'S OWN REGEX (`corpus._STATUS_RE`), never a private
+    pattern. This function used to match only a bare `status:` — a shape no producer of
+    requirement files has ever written (`render_requirement`, the brownfield writer and the
+    template all emit `- **Status:** …`), so on every real file it changed nothing and the caller
+    announced "já estava acordado" over a requirement still `proposed`. One pattern shared with
+    the parser is what makes that drift structurally impossible; `_mark_superseded` follows the
+    same discipline.
+
+    Only the two pre-promise states flip: `proposed`, and `observed` — a reverse-engineered
+    reading whose confirmation by a person is, by brownfield.py's own contract, the one event that
+    turns it into a commitment. Everything else is a problem for the caller to REFUSE on, never an
+    "already agreed". A requirement already `accepted` returns `"already"` unchanged, so a second
+    confirmation cannot quietly rewrite who agreed to it — and `unrecorded`, render's placeholder
+    for provenance nobody supplied, is treated as absence and filled; a real name never is.
+    """
+    lines = text.splitlines()
+    idx = next((i for i, line in enumerate(lines) if _STATUS_RE.match(line)), None)
+    if idx is None:
+        return text, "no status line the corpus parser could read either"
+    raw = _STATUS_RE.match(lines[idx]).group("value")
+    value = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    word = value.split()[0] if value else ""
+    if word.startswith("accepted"):
+        return text, "already"
+    if word == DROPPED:
+        # named apart from the generic refusal: "we decided against this" is a thing the person
+        # can act on (ask for it again, and it is drafted fresh), while "unrecognised format" is
+        # a thing only the team can
+        return text, "dropped"
+    if word.startswith(SUPERSEDED):
+        # and so is this one, for the same reason and with a different next step: a replacement
+        # exists, so the person has a number to accept instead. `_set_status_dropped` names it
+        # apart already; a bare "not a pre-promise state" here is the caller's only input.
+        return text, "superseded"
+    if word not in ("proposed", "observed"):
+        return text, f"status is {value!r}, which is not a pre-promise state"
+    lines[idx] = re.sub(word, "accepted", lines[idx], count=1, flags=re.IGNORECASE)
+
+    # who and when, IN THE BULLET SHAPE THE PARSER READS BACK. The bare `asked_by:` lines the old
+    # version inserted were invisible to corpus._field_re, so even a successful accept would have
+    # tripped the no-asker/no-date warnings it exists to satisfy.
+    extra: list[str] = []
+    for pattern, label, fresh in ((_ASKED_RE, "Asked by", accepted_by), (_DATE_RE, "Date", day)):
+        j = next((i for i, line in enumerate(lines) if pattern.match(line)), None)
+        if j is None:
+            extra.append(f"- **{label}:** {fresh}")
+            continue
+        existing = re.sub(r"<!--.*?-->", "", pattern.match(lines[j]).group("value")).strip()
+        if not existing or existing.lower() == UNRECORDED:
+            lines[j] = f"- **{label}:** {fresh}"
+    if extra:
+        lines[idx + 1:idx + 1] = extra
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), "flipped"
+
+
+def propose_baseline(*, docs_repo: str, clone_url: str, files: dict[str, str],
+                     product: str, observations: int, covered: list[str],
+                     base: str = "main", forge=None,
+                     #: accepted and ignored — see `propose_requirement`. `module.py:1371,1372`
+                     #: still passes both.
+                     token: str = "", forge_kind: str = GITHUB,
+                     language: str | None = None) -> WriteResult:
+    """The brownfield first pass as ONE pull request — inventory plus every candidate.
+
+    One PR, not forty: a team asked to review forty requirement PRs reviews none, and the exercise
+    dies in its first week (brownfield.py's opening argument). The branch is deterministic, so a
+    retry finds its own PR instead of opening a second.
+
+    Everything inside lands as `observed` — a reading of the code, never a promise. The PR body
+    says so in the first line, because this is the one moment where somebody could mistake a
+    reverse-engineered description for something the product agreed to.
+
+    `forge` is the same contract as `propose_requirement`'s: the idempotency question goes through
+    the port, and a caller that hands no forge could not have asked it. Getting that arm wrong here
+    is the most expensive duplicate this module can file — a second baseline is forty candidate
+    requirements proposed twice, at a moment whose whole design argument is that a team asked to
+    review forty pull requests reviews none.
+
+    NOT MERGED, unlike a requirement proposal, and that difference is the point of the whole
+    exercise: everything inside is `observed`, and a human reading it and deciding what is really a
+    promise IS the deliverable. Landing it unread would turn a reverse-engineered description into
+    the base the factory answers from."""
+    branch = "product/baseline"
+
+    found = _already_proposed(forge, docs_repo, branch)
+    if found is None:
+        log.error("BEEVERFORGE_PRODUCT_PRIOR_PROPOSAL_UNREADABLE repo=%s branch=%s — could not ask "
+                  "whether the baseline was already proposed; nothing was written",
+                  docs_repo, branch)
+        return WriteResult(ok=False, refusal=NOT_REFUSED,
+                           detail=_w(language, "baseline_unreadable"))
+    if found.strip():
+        return WriteResult(ok=True, url=found.strip(), ref=branch, existed=True,
+                           detail=_w(language, "baseline_already"))
+
+    # OUR OWN BRANCH, PUSHED, WITH NO PULL REQUEST ON IT — the window between the push below and
+    # `_open_review_request`, which a rate limit, an expired token or a worker dying lands in.
+    # Without this arm the verb WEDGES PERMANENTLY: the next run finds no pull request, clones
+    # fresh, commits, and its `push -u` is rejected as non-fast-forward against the branch the
+    # first attempt left behind. Every subsequent first pass fails the same way, on a repository
+    # where nothing is wrong except that a PR was never opened.
+    #
+    # This is also why the workflow no longer retries. The docstring there argued the verb was
+    # idempotent — true of the happy path, asserted of all of them, and this is the path it
+    # skipped.
+    #
+    # ASKED OF `docs_repo`, WHERE THE BRANCH WAS PUSHED. It asked `list_branches()` — the forge's
+    # OWN repository, the project's code — so the branch was never found, this arm never ran, and
+    # the wedge above happened anyway. Measured on the local row (#140): a baseline stranded by
+    # the old pull-request row could not be proposed again, `could not push product/baseline …
+    # behind`, which is the one remedy a deployment has for it.
+    try:
+        pushed = branch in {str(b) for b in (forge.list_branches(docs_repo) or ())}
+    except Exception:  # noqa: BLE001 — an unreadable branch list is not a reason to write twice
+        log.info("could not list %s's branches before proposing a baseline", docs_repo,
+                 exc_info=True)
+        pushed = False
+    if pushed:
+        url = _open_review_request(
+            forge, docs_repo=docs_repo, head=branch, base=base,
+            title=_w(language, "baseline_rescued_title", product=product),
+            body=_w(language, "baseline_rescued_body"))
+        if url:
+            return WriteResult(ok=True, url=url, ref=branch, existed=True,
+                               detail=_w(language, "baseline_opened_now"))
+        return WriteResult(ok=False, refusal=NOT_REFUSED, ref=branch,
+                           detail=_w(language, "baseline_stuck", branch=branch, base=base))
+
+    tmp = Path(tempfile.mkdtemp(prefix="beeverforge-baseline-"))
+    try:
+        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
+                        str(tmp)])
+        if rc != 0:
+            return WriteResult(ok=False, refusal=NOT_REFUSED,
+                               detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
+        rc, out = _git(["checkout", "-b", branch], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"could not create {branch}: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+
+        for path, body in sorted(files.items()):
+            target = tmp / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            _git(["add", "--", path], cwd=tmp)
+
+        rc, out = _git(["commit", "-m",
+                        _w(language, "baseline_commit", observations=observations,
+                           product=product)], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"nothing to commit: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+        rc, out = _git(["push", "-u", "--", clone_url, branch], cwd=tmp)
+        if rc != 0:
+            return WriteResult(ok=False, detail=f"could not push {branch}: {_scrub(out)[-200:]}",
+                               refusal=NOT_REFUSED)
+
+        body = "\n".join([
+            _w(language, "baseline_body_reading", observations=observations),
+            "",
+            _w(language, "baseline_body_promise"),
+            "",
+            _w(language, "baseline_body_areas",
+               areas=", ".join(covered) if covered else _w(language, "baseline_whole_repo")),
+            "",
+            _w(language, "baseline_body_not"),
+        ])
+        url = _open_review_request(
+            forge, docs_repo=docs_repo, head=branch, base=base,
+            title=_w(language, "baseline_title", observations=observations, product=product),
+            body=body)
+        if not url:
+            return WriteResult(ok=False, refusal=NOT_REFUSED, ref=branch,
+                               detail=_w(language, "baseline_pr_failed", branch=branch, base=base))
+        return WriteResult(ok=True, url=url, ref=branch)
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+

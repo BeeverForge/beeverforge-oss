@@ -1,0 +1,59 @@
+"""The worked example: #127's `stop` row, re-proven through the shared runner.
+
+A plan is a point-in-time proof. This one is committed as the template for the shape — one
+sentence per cut naming the PROPERTY it breaks, the exact anchor, and what it becomes. Re-running
+it later is optional; if the anchors rotted, the runner refuses loudly, which is the correct
+answer for a proof about code that has since moved.
+"""
+
+TEST = "tests/test_a_wedged_job_has_an_exit.py"
+
+MUTATIONS = [
+    # RE-PINNED 2026-09-20 (review of #191): `_card_close` asks the engine the same two questions
+    # `_stop` asks — is a job running on this card, and is it waiting on a person — so both cuts
+    # matched twice. Each now carries the line that is only in `_stop`.
+    ("a job at a gate is terminated anyway",
+     "beeverforge/actions/catalog.py",
+     "    # surface uses, so a gate added later is refused here without this function being "
+     "edited.\n    waiting = await _what_it_is_waiting_on(handle)\n    if waiting:",
+     "    # surface uses, so a gate added later is refused here without this function being "
+     "edited.\n    if False:\n        waiting = None"),
+
+    ("a job that is not running is terminated",
+     "beeverforge/actions/catalog.py",
+     '    if str(tv.status_label(described.status)) != "running":\n        return refused(',
+     "    if False:\n        return refused("),
+
+    # RE-PINNED 2026-10-01 (#412): the settle is `stopped`'s row of the card's door now, and what
+    # the row reports is the outcome the door recorded for the column
+    ("a tracker that refused is reported as success",
+     "beeverforge/actions/catalog.py",
+     '    settled = not moved.outcome("column").startswith("failed")\n',
+     "    settled = True\n"),
+
+    ("the browser decides what wedged means",
+     "beeverforge/runtime/temporal/view.py",
+     '    row["wedged"] = is_wedged(row, live=live)',
+     '    row["wedged"] = False'),
+
+    ("the wedged rule stops excluding a gated job",
+     "beeverforge/runtime/temporal/view.py",
+     '            and (row.get("action") or None) is None',
+     "            and True"),
+
+    ("an unreadable start time reads as for ever",
+     "beeverforge/runtime/temporal/view.py",
+     "    if not when:\n        return 0.0",
+     "    if not when:\n        return 9999.0"),
+
+    # re-pinned 2026-09-07: the table grew rows after `stop`, so the closing brace moved
+    ("the typed sentence stops reaching the row",
+     "beeverforge/actions/floor_intents.py",
+     '    "stop": "stop",\n',
+     ""),
+
+    ("the tech-lead sends people back to the engine",
+     "beeverforge/techlead/voice.py",
+     '"nothing else here reaches it. `stop #{ticket}` ends it and frees the queue — it "',
+     '"nothing else here reaches it. Open Temporal and terminate the workflow — it "'),
+]

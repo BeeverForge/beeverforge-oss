@@ -1,0 +1,315 @@
+"""No Portuguese string is welded into the core outside a place that says which language it is (#429).
+
+Found live: an English conversation got a Portuguese card and a Portuguese line under its English
+proposal. The card layouts shipped in one language, and ten admin notes in `product/engine.py`
+lived outside every catalogue. Measured across `beeverforge/`: about four hundred Portuguese
+string constants outside any `pt-BR` catalogue.
+
+Every Portuguese literal in the core is one of three kinds, each with its own rule:
+
+- WRITTEN TO A PERSON (a frame, a heading, a note): it lives in a catalogue — a dict whose keys
+  are languages — beside its English. Its `pt-BR` value is allowed here, its `en` value is checked;
+- RECOGNISING WHAT A PERSON WROTE (assent, intents, heading aliases): it stays, in a table declared
+  in `RECOGNISERS`, which must carry English too — a recogniser that knows one language is the
+  same defect on the way in;
+- EVERYTHING ELSE that is still Portuguese is named in `EXEMPT`, fragment by fragment.
+
+KEYED ON THE PORTUGUESE FRAGMENT, NOT THE WHOLE LITERAL. A prompt is one long string with a
+Portuguese example inside English prose; keyed whole, every edit of the English around it killed
+the entry and made the unchanged example look new. A literal is cut into fragments at sentence and
+quote boundaries (`fragments`), and only the Portuguese ones are keyed: an edit elsewhere in the
+prompt changes nothing, and a new Portuguese phrase in it is a new fragment.
+
+`EXEMPT` ONLY SHRINKS. It is the sweep's remaining work, not a place to put new literals: a new
+Portuguese literal fails here, and so does an entry that no longer matches anything — a dead entry
+is room for a new literal to hide behind an old one. Move a literal into a catalogue, and delete
+its entry in the same commit.
+"""
+
+from __future__ import annotations
+
+import ast
+import collections
+import json
+import re
+from pathlib import Path
+
+from tests.the_tree_read_once import parsed
+
+ROOT = Path(__file__).resolve().parent.parent
+PACKAGE = ROOT / "beeverforge"
+EXEMPT_FILE = Path(__file__).with_name("portuguese_literals_not_yet_in_a_catalogue.json")
+
+#: The letters Portuguese writes and English does not.
+_PT_LETTERS = re.compile(r"[ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ]")
+#: Words of Portuguese no English sentence uses, for text written without accents.
+_PT_WORDS = re.compile(
+    r"(?i)\b(nao|voce|isso|este|esta|cartao|pedido|requisito|quando|porque|ainda|nada|foi|ja"
+    r"|tambem|precisa|confirma|registro|preciso|aqui|agora|sobre|pelo|pela|seu|sua|uma|um|para"
+    r"|com|que|mais|dos|das|nos|nas|ao|aos|pode|deve|isto|ele|ela|eles|quem|onde|como)\b")
+_EN_WORDS = re.compile(r"(?i)\b(the|and|is|to|of|with|when|this|that|you|it|for|are)\b")
+#: WORDS ONLY PORTUGUESE WRITES, which say it ALONE in a literal with no English word in it
+#: (#535). The two-word floor above missed the short phrases the role writes on a card — "
+#: fechado a pedido de ", "**Produto:**", "capacidade {slug}: confirmada por {who}" — so the
+#: exemption list understated what was left and a new phrase of the same shape passed. None of
+#: these is an English word or a word this code uses as an identifier; `por` and `em` are what a
+#: Portuguese preposition looks like before its noun.
+_PT_ALONE = re.compile(
+    r"(?i)\b(fechado|fechada|fechados|aberto|aberta|pedido|produto|requisito|capacidade"
+    r"|confirmada|confirmado|cartao|nao|voce|tambem|porque|ainda|nada|agora|aqui|isso|isto"
+    r"|quem|onde|pelo|pela|por|em|uma|mais|dos|das|aos|registrado|registrada|feito|feita"
+    r"|entregue|tarefa|tarefas|equipe)\b")
+
+#: The keys of a catalogue: a dict with an `en` key and one of these is one.
+_PT_KEYS = {"pt-BR", "pt-PT", "pt"}
+
+#: TABLES THAT READ WHAT A PERSON (OR THE ROLE) WROTE, as `(path, name)` → an English entry the
+#: table must carry: every literal inside the assignment of that name is allowed, and the English
+#: sample is checked to be in it — a recogniser that knows one language is the defect on the way in.
+RECOGNISERS = {
+    ("beeverforge/adapters/tracker/parse.py", "_ALIASES"): "acceptance criteria",
+    ("beeverforge/adapters/tracker/parse.py", "_GIVEN"): "Given",
+    ("beeverforge/adapters/tracker/parse.py", "_STEP"): "Then",
+    ("beeverforge/adapters/tracker/parse.py", "_EXAMPLES"): "examples",
+    ("beeverforge/adapters/tracker/parse.py", "_REQUESTER_LABELS"): "requested by",
+    ("beeverforge/product/module.py", "_ALSO_CALLED"): "what was asked",
+    ("beeverforge/language/written.py", "FUNCTION_WORDS"): "the",
+    ("beeverforge/product/engine.py", "_STOPWORDS"): "the of in",
+    ("beeverforge/product/staging.py", "NO_OPENERS"): "not right",
+    ("beeverforge/product/voice.py", "CLIENT_JARGON"): "pull request",
+    ("beeverforge/product/voice.py", "_CLAIMED_DONE"): "recorded",
+    ("beeverforge/product/voice.py", "_RETRACTS_WRITE"): "nothing was",
+    ("beeverforge/product/voice.py", "_CANNOT_OBSERVE"): "see the",
+    # DECLARED 2026-10-10 (review of #579): what reads a person's gestures, assent and refusals —
+    # they were counted as the sweep's debt, and no sweep will ever move what the platform READS.
+    # The negators, the bridge, the attached-text and duplicate-noun readers, the survivor's
+    # connective and `_BECAUSE` left `intents.py` with the gestures that named a card or a
+    # requirement (#565 slices b and c): the role proposes those acts now.
+    ("beeverforge/product/intents.py", "_PATTERNS"): "introduce yourself",
+    ("beeverforge/actions/floor_intents.py", "_LEADER_WORDS"): "please",
+    ("beeverforge/actions/floor_intents.py", "_PATTERNS"): "rework",
+    ("beeverforge/actions/floor_intents.py", "_NEGATORS"): "never",
+    ("beeverforge/actions/floor_intents.py", "_BARE_HOLD"): "wait",
+    ("beeverforge/actions/floor_intents.py", "_BARE_REFUSAL"): "never",
+    ("beeverforge/language/assent.py", "CORE"): "yes",
+    ("beeverforge/language/assent.py", "CORE_PHRASES"): "go ahead",
+    ("beeverforge/language/assent.py", "FILLER"): "please",
+    # DECLARED 2026-10-11 (#535): what reads a person's answer to "did it work?" — denials, the
+    # words that assert it works, the tokens that cannot decide, and the letters a word is made of
+    ("beeverforge/product/followup.py", "_DID_NOT_WORK"): "still",
+    ("beeverforge/product/followup.py", "_WORKED_CORE"): "works",
+    ("beeverforge/product/followup.py", "_CANNOT_DECIDE"): "no",
+    ("beeverforge/product/followup.py", "_WORD"): "a-z",
+    # DECLARED 2026-10-11 (#535): the names a board gives its finished column, read off the board
+    ("beeverforge/product/role.py", "_DONE_COLUMNS"): "done",
+    # DECLARED 2026-10-11 (#535): the rest of what reads words a person, a board or a file wrote —
+    # the inline ones named first.
+    ("beeverforge/adapters/tracker/azure_devops.py", "_NEEDS_ACTION_ALIASES"): "needs action",
+    ("beeverforge/contracts/commands.py", "DECISION_RE"): "|ion)",
+    ("beeverforge/contracts/ticket.py", "NOBODY"): "not recorded",
+    ("beeverforge/language/assent.py", "_WORD_LETTERS"): "a-z",
+    ("beeverforge/memory/recall.py", "_STOP"): "the and for",
+    ("beeverforge/product/asked.py", "STOPWORDS"): "the a an of",
+    ("beeverforge/product/board.py", "_DIAGNOSIS_MARKERS"): "diagnosis",
+    ("beeverforge/product/documents/record.py", "CLIENT_FOLDERS"): "public",
+    ("beeverforge/product/documents/record.py", "_DECLARED"): "public",
+    ("beeverforge/product/documents/record.py", "_REQUIREMENTS"): "requirement",
+    ("beeverforge/product/documents/record.py", "_CARDS"): "card",
+    ("beeverforge/product/domain.py", "_FIELD_LABELS"): "Where",
+    ("beeverforge/product/domain.py", "_METADATA_BULLET"): "source",
+    ("beeverforge/product/evaluation/score.py", "_ABSTENTION"): "could not",
+    ("beeverforge/product/evaluation/score.py", "_REQUIREMENT_WORD"): "requirement",
+    ("beeverforge/product/index/search.py", "_CAPITALISED"): "A-Z",
+    ("beeverforge/product/index/search.py", "_NOT_NAMES"): "what when where",
+    ("beeverforge/product/index/search.py", "_ASKING"): "hold holds",
+}
+
+
+#: Not prose: an OCR engine's list of language codes (`por+eng`, `tesseract -l`).
+_LANGUAGE_CODES = re.compile(r"[a-z]{3}(\+[a-z]{3})+")
+
+
+def is_portuguese(text: str) -> bool:
+    if _PT_LETTERS.search(text):
+        return True
+    if _LANGUAGE_CODES.fullmatch(text.strip()):
+        return False
+    hits = _PT_WORDS.findall(text)
+    english = len(_EN_WORDS.findall(text))
+    if len(hits) >= 2 and len(hits) > english:
+        return True
+    # A SHORT PHRASE (#535): one word only Portuguese writes, and no English word beside it
+    return bool(_PT_ALONE.search(text)) and english == 0
+
+
+def _docstrings(tree: ast.AST) -> set[int]:
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                out.add(id(first.value))
+    return out
+
+
+def _subtree(node: ast.AST) -> set[int]:
+    return {id(n) for n in ast.walk(node)}
+
+
+def _in_a_catalogue(tree: ast.AST) -> set[int]:
+    allowed = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        if "en" not in keys or not keys & _PT_KEYS:
+            continue
+        for key, value in zip(node.keys, node.values, strict=True):
+            if isinstance(key, ast.Constant) and key.value in _PT_KEYS:
+                allowed |= _subtree(value)
+    return allowed
+
+
+def _recognisers(tree: ast.AST, rel: str) -> dict[str, ast.AST]:
+    names = {name for path, name in RECOGNISERS if path == rel}
+    found = {}
+    for node in ast.walk(tree):
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) and node.value else [])
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                found[target.id] = node.value
+    return found
+
+
+def _strings(node: ast.AST) -> list[ast.Constant]:
+    return [n for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+#: Where a literal is cut into fragments: sentence and clause punctuation, quotes, brackets, and a
+#: spaced dash.
+_BREAKS = re.compile(r"[.;:!?\n\"«»“”()\[\]{}|]+|\s[—–-]\s")
+
+
+def fragments(text: str) -> list[str]:
+    """The Portuguese pieces of `text`, whitespace-normalised — the whole literal when no piece is
+    Portuguese on its own (a literal Portuguese only as a whole is keyed whole)."""
+    found = [" ".join(piece.split()) for piece in _BREAKS.split(text)]
+    found = [piece for piece in found if piece and is_portuguese(piece)]
+    return found or [" ".join(text.split())]
+
+
+def welded() -> dict[str, list[str]]:
+    """Every Portuguese fragment of a string constant of the package that no rule above allows, by
+    file."""
+    out: dict[str, list[str]] = collections.defaultdict(list)
+    for path in sorted(PACKAGE.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        tree = parsed(path)
+        allowed = _docstrings(tree) | _in_a_catalogue(tree)
+        for table in _recognisers(tree, rel).values():
+            allowed |= _subtree(table)
+        for node in _strings(tree):
+            if id(node) not in allowed and is_portuguese(node.value):
+                out[rel].extend(fragments(node.value))
+    return {rel: sorted(found) for rel, found in out.items()}
+
+
+def _exempt() -> dict[str, list[str]]:
+    return json.loads(EXEMPT_FILE.read_text(encoding="utf-8"))
+
+
+def compare(found: dict[str, list[str]],
+            exempt: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    """`(new, dead)`: literals no entry covers, and entries no literal matches — counted, so two
+    copies of one literal need two entries.
+
+    COMPARED CASE-FOLDED: a sentence that gains its capital (`"{sig}ótimo"` → `"{sig}Ótimo"`,
+    #436) is the same Portuguese it was, and the list must not read it as a new phrase that
+    killed an old entry."""
+    new, dead = [], []
+    for rel in sorted(set(found) | set(exempt)):
+        have = collections.Counter(text.casefold() for text in found.get(rel, []))
+        listed = collections.Counter(text.casefold() for text in exempt.get(rel, []))
+        new += [f"{rel}: {text!r}" for text in (have - listed).elements()]
+        dead += [f"{rel}: {text!r}" for text in (listed - have).elements()]
+    return new, dead
+
+
+def test_no_new_portuguese_literal_and_no_dead_exemption():
+    new, dead = compare(welded(), _exempt())
+    assert not new, (
+        "a Portuguese literal outside any catalogue — put it in a voice catalogue beside its "
+        "English (or in a declared recogniser, with English beside it):\n" + "\n".join(new[:20]))
+    assert not dead, (
+        f"entries of {EXEMPT_FILE.name} that match nothing any more — delete them, the list only "
+        "shrinks:\n" + "\n".join(dead[:20]))
+
+
+def test_every_recogniser_is_declared_where_it_lives_and_carries_english():
+    for (rel, name), english in sorted(RECOGNISERS.items()):
+        tree = parsed(ROOT / rel)
+        table = _recognisers(tree, rel).get(name)
+        assert table is not None, f"{rel} declares no {name} — the recogniser moved or was renamed"
+        assert any(english in n.value for n in _strings(table)), (
+            f"{rel}::{name} does not carry {english!r} — a recogniser that reads one language "
+            f"only is the same defect on the way in")
+
+
+def test_a_catalogues_english_is_english():
+    """The half a catalogue is FOR: a Portuguese sentence filed under `en` is the defect itself."""
+    wrong = []
+    for path in sorted(PACKAGE.rglob("*.py")):
+        tree = parsed(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            pairs = {k.value: v for k, v in zip(node.keys, node.values, strict=True)
+                     if isinstance(k, ast.Constant)}
+            if "en" in pairs and set(pairs) & _PT_KEYS:
+                wrong += [f"{path.relative_to(ROOT)}: {n.value!r}"
+                          for n in _strings(pairs["en"]) if _PT_LETTERS.search(n.value)]
+    assert not wrong, "\n".join(wrong[:20])
+
+
+def test_a_capital_is_not_a_new_phrase():
+    assert compare({"a.py": ["Ótimo"]}, {"a.py": ["ótimo"]}) == ([], [])
+    assert compare({"a.py": ["Ótimo", "ótimo"]}, {"a.py": ["ótimo"]})[0], (
+        "folding the case must still count the copies")
+
+
+def test_the_detector_sees_what_it_guards():
+    """The self-test calls the rule, so a detector gone blind fails here and not in silence."""
+    assert is_portuguese("({admins}: o registro precisa da sua confirmação.)")
+    assert is_portuguese("preciso de um titulo para abrir o cartao")
+    assert is_portuguese("confirmação")
+    assert not is_portuguese("({admins}: registering this needs your confirmation.)")
+    assert not is_portuguese("a card for the Studio")
+    # THE SHORT PHRASES THE TWO-WORD FLOOR MISSED (#535), each written on a card or in a log, and
+    # none with an accent
+    for missed in (" fechado a pedido de ", "**Produto:**", " (produto):**",
+                   "capacidade {slug}: confirmada por {confirmed_by}"):
+        assert is_portuguese(missed), missed
+    # …while an English sentence carrying one such word, an identifier and a language code are not
+    assert not is_portuguese("the card was closed in favor of the request")
+    assert not is_portuguese("the em dash is wider than the hyphen")
+    assert not is_portuguese("capability {slug}: confirmed by {confirmed_by}")
+    assert not is_portuguese("por+eng")
+    tree = ast.parse('X = {"pt-BR": "não", "en": "no"}\nY = "não"\nZ = {"pt-BR": "sim"}\n')
+    allowed = _in_a_catalogue(tree)
+    [in_x, bare, lone] = sorted((n for n in _strings(tree) if n.value in ("não", "sim")),
+                                key=lambda n: (n.lineno, n.col_offset))
+    assert id(in_x) in allowed, "a catalogue's Portuguese is allowed"
+    assert id(bare) not in allowed, "a bare literal is not"
+    assert id(lone) not in allowed, "nor is a 'catalogue' with no English beside it"
+    # AND THE LIST ONLY SHRINKS: an entry that matches nothing is reported, and so is a literal
+    # with no entry — counted, so a second copy of an exempt literal is new
+    assert compare({"a.py": ["x", "x"]}, {"a.py": ["x"]}) == (["a.py: 'x'"], [])
+    assert compare({"a.py": ["x"]}, {"a.py": ["x", "y"]}) == ([], ["a.py: 'y'"])
+    # AN EDIT OF THE ENGLISH AROUND AN EXAMPLE KEEPS ITS KEY; a new Portuguese phrase is new
+    before = fragments('say "vamos começar a discutir o relatório" and end with the marker')
+    after = fragments('when they write "vamos começar a discutir o relatório", add the marker')
+    assert before == after == ["vamos começar a discutir o relatório"]
+    assert fragments('e.g. "podemos avançar", "pode começar"') == ["podemos avançar",
+                                                                   "pode começar"]

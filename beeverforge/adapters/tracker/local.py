@@ -1,0 +1,578 @@
+"""`tracker.local` — the board the platform itself holds, in `board.db` (ADR-0049 D1, D5, D7).
+
+THE ROW A DEPLOYMENT WHOSE WORLD IS ITS OWN MACHINE HAS ALWAYS NEEDED. Every other row on this
+axis reaches a service somebody rents; this one reaches a file beside the registry, so a person
+with a repository and a coding agent can put a card in and get a pull request out without opening
+an account anywhere.
+
+IT IS NOT A TEST DOUBLE. `beeverforge/testing/local_flow.py` holds an in-memory tracker that drives
+the real poller offline, and it is a fixture: it lives in `testing/`, it is built by hand, and
+nothing persists. This is a registry row — built by kind through `build_tracker`, conformant, and
+durable across the three processes that share the file.
+
+WHAT IT DOES NOT INVENT. A budget it cannot report, a person it was not told about, an assignee
+nobody set: each answers the port's own word for *I cannot say* rather than a plausible value. The
+one place it answers where every hosted vendor cannot is `identity_of` (D7) — its namespace IS the
+platform's, so the id it is handed is the id it returns.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from beeverforge.adapters.board_db import connect, next_ref, now_iso
+from beeverforge.adapters.tracker.base import (
+    NOT_REPORTED,
+    STATE_KEYS,
+    TicketComment,
+    TicketSummary,
+    column_keys,
+    list_state,
+)
+from beeverforge.adapters.tracker.parse import parse_ticket_body
+from beeverforge.contracts import JobState, Ticket
+from beeverforge.contracts.refs import canonical_ref
+from beeverforge.listeners import PANEL
+
+log = logging.getLogger("beeverforge.tracker.local")
+
+#: How long a removal's audit line is kept (#384, review of #389): who removed a card, when and
+#: why is a question a person asks within the year, not forever. The project's HIGHEST removed ref
+#: is kept past this, always — `board_db.next_ref` reads it so the number is never reused.
+_REMOVED_KEPT_DAYS = 365
+
+
+def _removed_kept_since() -> str:
+    """The stamp before which a removal's audit line may be pruned, in `now_iso`'s own format so
+    the comparison with `removed_at` is a string comparison that orders correctly."""
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=_REMOVED_KEPT_DAYS)).isoformat()
+
+#: What the factory signs its own comments with. THE SPELLING IS GITHUB'S, deliberately: it is the
+#: convention a reader already knows for "the platform wrote this, not a person", and the ADR-0048
+#: sweep's whole job is telling those two apart. Written by the row on `comment()` rather than read
+#: from `bot_identity().login`, because setting `BEEVERFORGE_BOT_LOGIN` switches on three hosted-row
+#: paths in the same process and this row must not need it.
+BOT_AUTHOR = "beeverforge[bot]"
+
+
+def panel_url() -> str:
+    """The panel's base address without a trailing slash, or `""` when nobody said where it is.
+
+    A ROW ASKS FOR THIS RATHER THAN COMPOSING A VENDOR'S URL, which is the property
+    `test_the_board_says_where_it_lives.py` holds for the whole package: `ticket_url` is a port
+    question and this row's answer is a route on the surface the person is already looking at.
+
+    IT GUESSED `http://localhost:8787` WHEN NOBODY SAID (#183) — a literal that agreed with the
+    port `beeverforge up` starts the panel on only while nobody passed `--panel-port`. With
+    `--panel-port 9000` the panel served on 9000 and every card link the factory wrote, in
+    comments, pull request bodies and notifications, pointed at 8787. `up` now hands the address
+    it started the panel on to everything it starts, and the compose file declares its own. With
+    nobody to say it the answer is `""`, so a row's link is THE ROUTE ALONE (`/p/acme/card/7`):
+    inside the panel that is a link that works on whatever address the panel was opened at, and
+    anywhere else it reads as the path it is rather than as a host nobody started."""
+    return PANEL.declared().rstrip("/")
+
+
+class LocalTracker:
+    """Cards, comments and labels in `board.db`, for one project.
+
+    `token` and `token_provider` are accepted and IGNORED, which is the port's shape rather than
+    laziness: `activities.py` hands any tracker without a credential of its own the GitHub App
+    minter, and a row that refused the argument would fail on a deployment that has one."""
+
+    #: A WHOLE READ OF THIS BOARD IS A SQLITE QUERY ON THIS MACHINE (#393), so no reader keeps a
+    #: copy of it: `product/board.py` reads it whole every time (`tracker/base.py::
+    #: whole_read_is_cheap`). The worker, the panel and a CLI verb all write this one file, and a
+    #: reader that trusted its own sweep for hours went on describing a card a person had removed
+    #: from the panel. The board row declares the same fact on its axis (`LocalBoard.poll_seconds`),
+    #: and a test holds the two declarations together.
+    whole_read_is_cheap = True
+
+    #: WHAT THIS ROW CAN REPORT OF A CHANGE NOBODY MADE THROUGH THE PLATFORM (ADR-0055 D8,
+    #: `tracker/base.py::observes`): everything — its store is read whole, a card gone from it is
+    #: gone (`get_ticket` raises `KeyError`), and a close keeps its reason (`closed_reason`).
+    observes = frozenset({"closed", "reopened", "removed", "promoted", "reordered"})
+
+    # NO `body_limit` (#624): SQLite stores a `TEXT` of any length this board will meet, so this
+    # row declares none and a split bounds its children by `activities.CARD_BODY_LIMIT`, the most
+    # cautious limit a shipped row declares.
+
+    def __init__(self, project: str, *, db_path=None, token=None, token_provider=None) -> None:
+        self.project = (project or "").strip()
+        self._db = db_path
+        #: Kept so `build_tracker`'s contract holds; see the class docstring.
+        self.token = token
+
+    # ---- reads ---------------------------------------------------------------------------
+
+    def get_ticket(self, ref: str) -> Ticket:
+        """The parsed card. Raises when there is no such card — the port's own shape for a read
+        that could not happen, and what `conformance` probes with a ref that cannot exist."""
+        bare = _number(ref)
+        with connect(self._db) as conn:
+            row = conn.execute(
+                "SELECT * FROM cards WHERE project = ? AND ref = ?", (self.project, bare)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no card {canonical_ref(ref)} on {self.project!r}'s board")
+            labels = [r["label"] for r in conn.execute(
+                "SELECT label FROM labels WHERE project = ? AND ref = ? ORDER BY label",
+                (self.project, bare))]
+
+        # `#N` HERE AND BARE `N` ON THE SUMMARY, because that is what the port says
+        # (`contracts/ticket.py` vs `tracker/base.py`) and both spellings reach `canonical_ref`
+        # before anything compares them.
+        ticket = parse_ticket_body(id=f"#{bare}", title=row["title"], body=row["body"] or "",
+                                   repo=self.project)
+        ticket.labels = [lbl.lower() for lbl in labels]
+        ticket.author = row["author"] or None
+        ticket.state = row["state"] or "open"
+        ticket.state_reason = row["closed_reason"] or ""
+        # The card's own record wins over anything the body's prose says: the requester is written
+        # when the card is opened and a person editing the description must not silently reassign
+        # who the factory asks (ADR-0048 §5).
+        if row["requester"]:
+            ticket.requester = row["requester"]
+            ticket.requester_forge = row["requester"]
+        return ticket
+
+    def comments(self, ref: str, *, limit: int = 0) -> list[TicketComment] | None:
+        """Oldest-first; `[]` for a card with none; `None` when the read could not happen.
+
+        THE THREE ANSWERS ARE THE POINT AND THE PORT SAYS SO. The consumer is a language model, and
+        an un-commented card and an unreadable thread produce the same silence in a prompt — it
+        concludes nobody has looked and repeats an answer that already failed. So a card this file
+        does not hold answers `None`, never `[]`."""
+        bare = _number(ref)
+        try:
+            with connect(self._db) as conn:
+                if conn.execute("SELECT 1 FROM cards WHERE project = ? AND ref = ?",
+                                (self.project, bare)).fetchone() is None:
+                    return None
+                rows = conn.execute(
+                    "SELECT author, body, created_at FROM comments "
+                    "WHERE project = ? AND ref = ? ORDER BY seq ASC", (self.project, bare)
+                ).fetchall()
+        except Exception:  # noqa: BLE001 — a file that cannot be opened is "could not look"
+            log.warning("could not read the comments on %s — answering 'could not look' rather "
+                        "than 'there are none'", canonical_ref(ref), exc_info=True)
+            return None
+        out = [TicketComment(author=r["author"], body=r["body"], created_at=r["created_at"])
+               for r in rows]
+        # AFTER the read, and the most recent ones: `limit` on this port means "the tail I can
+        # afford to put in a prompt", and the oldest-first order is preserved within it.
+        return out[-limit:] if limit and limit > 0 else out
+
+    def list_tickets(self, *, state: str = "all", updated_since: str = "",
+                     limit: int = 0) -> list[TicketSummary] | None:
+        """Newest-updated first. `state` through the port's own vocabulary, which RAISES on a
+        misspelling — that failure is the caller's, and the two quiet alternatives both hide half
+        a board from whoever asked."""
+        want = list_state(state)
+        try:
+            with connect(self._db) as conn:
+                rows = conn.execute(
+                    "SELECT ref, title, body, state, closed_reason, updated_at FROM cards "
+                    "WHERE project = ? ORDER BY updated_at DESC", (self.project,)).fetchall()
+                held = {r["ref"]: [] for r in rows}
+                for lab in conn.execute(
+                        "SELECT ref, label FROM labels WHERE project = ? ORDER BY label",
+                        (self.project,)):
+                    held.setdefault(lab["ref"], []).append(lab["label"])
+        except Exception:  # noqa: BLE001 — see `comments`
+            log.warning("could not read %s's board", self.project, exc_info=True)
+            return None
+
+        kept = [r for r in rows
+                if (want == "all" or r["state"] == want)
+                and (not updated_since or (r["updated_at"] or "") >= updated_since)]
+        # THE FILTER FIRST, THEN THE LIMIT. A limit applied to the read would answer "the newest
+        # N cards, of which these few are open", which is a different question from the one asked.
+        if limit and limit > 0:
+            kept = kept[:limit]
+        return [TicketSummary(ref=str(r["ref"]), title=r["title"], body=r["body"] or "",
+                              state=r["state"], state_reason=r["closed_reason"] or "",
+                              labels=[lbl.lower() for lbl in held.get(r["ref"], [])],
+                              updated_at=r["updated_at"] or "")
+                for r in kept]
+
+    def find_ticket(self, *, title: str) -> str | None:
+        """The newest card with exactly this title, or `None`. Used for split idempotency, where
+        a false match would silently reuse somebody else's card."""
+        wanted = (title or "").strip()
+        if not wanted:
+            return None
+        with connect(self._db) as conn:
+            row = conn.execute(
+                "SELECT ref FROM cards WHERE project = ? AND title = ? "
+                "ORDER BY ref DESC LIMIT 1", (self.project, wanted)).fetchone()
+        return f"#{row['ref']}" if row else None
+
+    def ticket_url(self, ref: str) -> str:
+        """The panel's own card route — this deployment's board is a page on the panel."""
+        return f"{panel_url()}/p/{self.project}/card/{_number(ref)}"
+
+    def budget(self) -> object:
+        """`NOT_REPORTED` — there is no quota on a local file, and the port has a word for a
+        provider that has nothing to report rather than a number it made up."""
+        return NOT_REPORTED
+
+    def person(self, ref: str) -> dict:
+        """A registered panel person, or `{}`. Never raises — its caller is composing a message
+        somebody is waiting for."""
+        who = (ref or "").strip()
+        if not who:
+            return {}
+        try:
+            from beeverforge.identity.people import PeopleStore
+
+            for person in PeopleStore().people():
+                if getattr(person, "id", "") == who:
+                    return {"id": person.id, "name": getattr(person, "display", "") or "",
+                            "email": getattr(person, "email", "") or ""}
+        except Exception:  # noqa: BLE001 — "I cannot say" beats a wrong name
+            log.info("could not read the registered people for %r", who, exc_info=True)
+        return {}
+
+    def assignees(self, ref: str) -> list[str]:
+        """`[]` — one machine has one person and nobody is assigned to anybody. The method exists
+        because the port declares it and a caller must not have to ask which rows have it."""
+        return []
+
+    def children_of(self, parent_ref: str) -> list[str]:
+        with connect(self._db) as conn:
+            rows = conn.execute(
+                "SELECT child_ref FROM links WHERE project = ? AND parent_ref = ? "
+                "ORDER BY child_ref", (self.project, _number(parent_ref))).fetchall()
+        return [f"#{r['child_ref']}" for r in rows]
+
+    # ---- identity, where this row can answer and the hosted ones cannot (D7) ---------------
+
+    def identity_of(self, subject_id: str) -> str:
+        """The id itself — THIS ROW'S NAMESPACE IS THE PLATFORM'S.
+
+        Every hosted vendor answers `""` here because a GitHub login is not a platform id and no
+        row can invent the bridge. There is no bridge to invent on this one: the person who filed
+        the card through the panel or the shell is written on it in the platform's own spelling,
+        and that is the spelling a comment's author carries back. So the factory ASKS on a
+        deployment where nobody is registered — which, on one machine, is every deployment — and
+        `""` still means nobody (`identity/base.py`: the anonymous subject's id is `""`)."""
+        return (subject_id or "").strip()
+
+    def mention(self, login: str) -> str:
+        """The plain id. There is no `@` this board resolves, and a mention nobody is notified by
+        is decoration (ADR-0048 §5) — the panel renders the name beside the comment."""
+        return (login or "").strip()
+
+    # ---- writes --------------------------------------------------------------------------
+
+    def create_ticket(self, *, title: str, body: str, author: str = "",
+                      requester: str = "", column: str = "") -> str:
+        """Open a card and return `#N`. The number is per project and taken under the write lock.
+
+        `author`, `requester` and `column` are this row's own arguments and are absent from the
+        port on purpose: every caller of `create_ticket` passes exactly title and body, and a
+        keyword with a default is how a row offers more without making the port carry it."""
+        when = now_iso()
+        key = (column or "").strip() or "backlog"
+        with connect(self._db, write=True) as conn:
+            ref = next_ref(conn, self.project)
+            conn.execute(
+                "INSERT INTO cards(project, ref, title, body, state, column_key, author, "
+                "requester, created_at, updated_at) VALUES (?,?,?,?,'open',?,?,?,?,?)",
+                (self.project, ref, (title or "").strip(), body or "", key,
+                 (author or "").strip(), (requester or "").strip(), when, when))
+        return f"#{ref}"
+
+    def update_body(self, ref: str, body: str) -> None:
+        """Rewrite the description. A SEPARATE METHOD from `comment` because the port made it one:
+        a caller here is overwriting what somebody else wrote, and that has to be visible at the
+        call site rather than hidden behind an edit."""
+        self._touch(ref, "body", body or "")
+
+    def comment(self, ref: str, body: str) -> None:
+        """Append. The row signs it, so a reader — and the ADR-0048 sweep — can tell the platform's
+        own note from a person's answer without a fourth field on the comment."""
+        bare = _number(ref)
+        when = now_iso()
+        with connect(self._db, write=True) as conn:
+            row = conn.execute("SELECT MAX(seq) AS top FROM comments WHERE project = ? AND ref = ?",
+                               (self.project, bare)).fetchone()
+            conn.execute(
+                "INSERT INTO comments(project, ref, seq, author, body, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.project, bare, int(row["top"] or 0) + 1, BOT_AUTHOR, body or "", when))
+            conn.execute("UPDATE cards SET updated_at = ? WHERE project = ? AND ref = ?",
+                         (when, self.project, bare))
+
+    def say(self, ref: str, body: str, *, author: str) -> None:
+        """A PERSON's comment, in their own name — what the panel and `beeverforge act` write.
+
+        Separate from `comment()` rather than a parameter on it, because the difference is the one
+        the answer sweep turns on: an answer counts only when its author is the requester and is
+        not the platform's own posting identity, and a single method with an optional author is a
+        method somebody will call without one."""
+        bare = _number(ref)
+        when = now_iso()
+        with connect(self._db, write=True) as conn:
+            row = conn.execute("SELECT MAX(seq) AS top FROM comments WHERE project = ? AND ref = ?",
+                               (self.project, bare)).fetchone()
+            conn.execute(
+                "INSERT INTO comments(project, ref, seq, author, body, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.project, bare, int(row["top"] or 0) + 1, (author or "").strip(),
+                 body or "", when))
+            conn.execute("UPDATE cards SET updated_at = ? WHERE project = ? AND ref = ?",
+                         (when, self.project, bare))
+
+    def set_state(self, ref: str, state: JobState, reason: str | None = None, *,
+                  needs_person: bool | None = None) -> bool | None:
+        """Move the card to the column this state belongs in — or, when this board has no row for
+        that key, to its `FALLS_BACK_TO` column (#753). `False` when it declares neither — never a
+        raise, which is what every other row on this axis promises and what the gather's park path
+        reads to decide whether to say the park did not land.
+
+        DONE CLOSES THE CARD AS DELIVERED, AND LEAVING DONE OPENS IT AGAIN (#500). The column and
+        the card's state are two fields of one row here, and only the column moved: a card the
+        factory finished sat OPEN in Done, `triage.Ticket.delivered` (closed, and not as
+        `not_planned`) never counted it, and both readers of that — the job's own exit
+        (`events.card_finished`) and the sweep's catch-all (`_closed_issue_numbers`) — announced
+        nothing. Every requester of a card finished on this row heard nothing from either; triage's
+        own rule reads each such card as `done-but-open`; and the door refused to reopen it,
+        because a reopen is of a closed card only. Every hosted row closes there: GitHub closes the
+        issue as completed on DONE (#180), and Jira and Azure DevOps close by moving the card,
+        because a status in the done category IS closed.
+
+        IN BOTH DIRECTIONS, AS ON JIRA AND AZURE DEVOPS, NOT ONLY GITHUB'S HALF. GitHub's issue and
+        its project item are two objects, and its `set_state` leaves a closed issue closed whatever
+        column the item is moved to. This board is Jira's shape (`board/local.py` says why it wraps
+        this row): the column IS the status, and there is no second object to leave behind. A card
+        closed as delivered and moved to TO-DO would sit in a column it claims while `LocalBoard.
+        columns` and the pickup queue read open cards only, and the panel draws a delivered card in
+        Done: work the factory queued that nothing picks up. So a delivered card the factory moves
+        out of Done is open work again, in that column — the rule `move_card` keeps for this and
+        for a person's move on the board alike.
+
+        WHAT IS WRITTEN IS WHAT `close_ticket(delivered=True)` WRITES — `closed`, `completed`, in
+        Done — so a card finished by its job and one a person closed from Done are one kind of card
+        downstream, and `reopen_ticket` undoes either. NO COMMENT: `reason` is not written on this
+        row (ADR-0055 D6 — the door's comment is its own), so the close adds none, and the door's
+        close, which goes through `close_ticket`, is never followed by a second one from here.
+
+        A CARD CLOSED AS NOT DELIVERED STAYS THAT. Done never turns it into shipped work — the
+        eleven duplicates that came back downstream as completed are why the word exists — and no
+        move reopens it: only a person does, through the door. A card already closed as delivered
+        is not closed again (one writer per close, GitHub's `_close_as_delivered`). Its column
+        moves as it always did; a card closed as not delivered is on nobody's board."""
+        # THE FIRST KEY THIS BOARD HAS A ROW FOR (#753). A `board.db` written by 0.6's setup has
+        # six rows and no `needs_review`; a person-gated pull request on it must still land in
+        # Needs Action, as it did, so the contract's fallback is tried before giving up.
+        keys = column_keys(state, needs_person=needs_person)
+        if not keys:
+            return False
+        with connect(self._db, write=True) as conn:
+            for key in keys:
+                if conn.execute("SELECT 1 FROM columns WHERE project = ? AND key = ?",
+                                (self.project, key)).fetchone() is not None:
+                    return move_card(conn, self.project, _number(ref), key, closes_at_done=True)
+            return False
+
+    def set_assignees(self, ref: str, logins: list[str]) -> None:
+        """A no-op with a record in the log rather than a silent one: a caller that assigned
+        somebody and saw nothing happen should be able to find out why."""
+        if logins:
+            log.info("this board has no assignees; %s stays unassigned", canonical_ref(ref))
+
+    def add_label(self, ref: str, label: str) -> None:
+        name = (label or "").strip()
+        if not name:
+            return
+        with connect(self._db, write=True) as conn:
+            conn.execute("INSERT OR IGNORE INTO labels(project, ref, label) VALUES (?,?,?)",
+                         (self.project, _number(ref), name))
+            conn.execute("UPDATE cards SET updated_at = ? WHERE project = ? AND ref = ?",
+                         (now_iso(), self.project, _number(ref)))
+
+    def remove_label(self, ref: str, label: str) -> None:
+        with connect(self._db, write=True) as conn:
+            conn.execute("DELETE FROM labels WHERE project = ? AND ref = ? AND label = ?",
+                         (self.project, _number(ref), (label or "").strip()))
+
+    def close_ticket(self, ref: str, reason: str, *, delivered: bool = True) -> None:
+        """CLOSED IS NOT DELIVERED. `delivered=False` records a duplicate or an abandoned plan, and
+        the word is what `triage.Ticket.delivered` reads — eleven cards closed as duplicates once
+        came back from a tracker looking like completed work."""
+        when = now_iso()
+        with connect(self._db, write=True) as conn:
+            conn.execute(
+                "UPDATE cards SET state = 'closed', closed_reason = ?, column_key = ?, "
+                "updated_at = ? WHERE project = ? AND ref = ?",
+                ("completed" if delivered else "not_planned",
+                 STATE_KEYS.get(JobState.DONE, "done") if delivered else "backlog",
+                 when, self.project, _number(ref)))
+            if reason:
+                conn.execute(
+                    "INSERT INTO comments(project, ref, seq, author, body, created_at) "
+                    "SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ? FROM comments "
+                    "WHERE project = ? AND ref = ?",
+                    (self.project, _number(ref), BOT_AUTHOR, reason, when,
+                     self.project, _number(ref)))
+
+    def update_title(self, ref: str, title: str) -> None:
+        """Rewrite the title.
+
+        NOT ON THE PORT, AND ASKED THROUGH `getattr` (#150) — the same shape as `say` on this axis
+        and `forge.pr_events` one along (ADR-0049 D4/D6). Measured before it was decided: adding
+        this and `reopen_ticket` to `TrackerAdapter` made `_FaithfulTracker` answer
+        `isinstance=False`, and `check_tracker` then reported `tracker.protocol` INSTEAD of the
+        read-side findings it exists for — so a stranger's shipped adapter would fail at upgrade
+        and the report that should have told them why would have lost its voice. The action layer
+        refuses by name where a row cannot do this.
+
+        `_touch` already accepts this column and names it as a literal, which is what keeps a
+        caller's string out of the SQL."""
+        self._touch(ref, "title", (title or "").strip())
+
+    def reopen_ticket(self, ref: str) -> None:
+        """Back on the board, in `backlog`, with the closing reason cleared. Off the port for the
+        reason `update_title` above gives.
+
+        `backlog` AND NOT WHERE IT WAS CLOSED FROM, because that column is not recorded and
+        inventing one would put a card back into `in_progress` with nothing working on it.
+        Backlog is the honest place: on the board, and nobody is on it (`tracker/base.py`'s
+        `_PARKED_BY_A_PERSON` says why that column exists)."""
+        with connect(self._db, write=True) as conn:
+            conn.execute(
+                "UPDATE cards SET state = 'open', closed_reason = '', column_key = ?, "
+                "updated_at = ? WHERE project = ? AND ref = ?",
+                ("backlog", now_iso(), self.project, _number(ref)))
+
+    def remove_ticket(self, ref: str, reason: str, *, by: str = "") -> None:
+        """Take the card off this board FOR GOOD — the row, its thread, its labels and its links —
+        leaving the audit line `removed_cards` keeps: who, when, why, and the title it had (#384).
+
+        WHAT "REMOVE" MEANS IS THIS ROW'S TO SAY, and on a board the platform holds it means the
+        row is gone. Off the port for the reason `update_title` gives; generic code reaches it
+        through `tracker/base.py::remove_ticket`, which closes on a row that has no removal of its
+        own and says so.
+
+        THE NUMBER IS NEVER HANDED OUT AGAIN: `next_ref` counts the audit table too, so a comment,
+        a link or a conversation that named this card cannot come to name the next one. ONE
+        TRANSACTION for the audit line and the delete, so a card is never gone without the record
+        of who took it, nor recorded as gone while it is still there.
+
+        RAISES on a card this board does not hold — a removal that removed nothing must not read as
+        one that did (the port's rule for every write)."""
+        bare = _number(ref)
+        with connect(self._db, write=True) as conn:
+            row = conn.execute("SELECT title FROM cards WHERE project = ? AND ref = ?",
+                               (self.project, bare)).fetchone()
+            if row is None:
+                raise KeyError(f"no card {canonical_ref(ref)} on {self.project!r}'s board")
+            conn.execute(
+                "INSERT OR REPLACE INTO removed_cards(project, ref, title, removed_by, reason, "
+                "removed_at) VALUES (?,?,?,?,?,?)",
+                (self.project, bare, row["title"] or "", (by or "").strip(),
+                 (reason or "").strip(), now_iso()))
+            for statement in ("DELETE FROM comments WHERE project = ? AND ref = ?",
+                              "DELETE FROM labels WHERE project = ? AND ref = ?",
+                              "DELETE FROM cards WHERE project = ? AND ref = ?"):
+                conn.execute(statement, (self.project, bare))
+            conn.execute("DELETE FROM links WHERE project = ? "
+                         "AND (parent_ref = ? OR child_ref = ?)", (self.project, bare, bare))
+            # THE AUDIT TABLE IS BOUNDED, AND THE BOUND NEVER TOUCHES THE NUMBER (review of #389).
+            # `removed_cards` gains one row per removal and nothing else pruned it, so it grew for
+            # the life of the file. Its rows serve three readers: a person asking who removed a
+            # card and why (worth a year, `_REMOVED_KEPT_DAYS`), the product role's incremental
+            # refresh (`removed_refs(since=…)`, whose `since` is at most `_FULL_AFTER` — six hours
+            # — old), and `board_db.next_ref`, which takes `MAX(ref)` over this table so a removed
+            # number is never handed out again (#384). Only the HIGHEST removed ref matters to that
+            # third reader — a lower one is below the sequence already — so the prune keeps it
+            # whatever its age: `ref < MAX(ref)` is the clause that holds the guarantee, and
+            # pruning a year-old removal from the top of the board would otherwise hand its number
+            # to the next card. Here, inside the removal's own write lock, so the prune costs no
+            # second transaction and cannot race another removal.
+            conn.execute(
+                "DELETE FROM removed_cards WHERE project = ? AND removed_at < ? "
+                "AND ref < (SELECT MAX(ref) FROM removed_cards WHERE project = ?)",
+                (self.project, _removed_kept_since(), self.project))
+
+    def removed_refs(self, *, since: str = "") -> list[str] | None:
+        """The cards removed from this board at or after `since`, bare refs — `None` when the file
+        could not be read (#384). What `tracker/base.py::removed_since` asks, so an incremental
+        read of the board learns of a card that will never be updated again."""
+        try:
+            with connect(self._db) as conn:
+                rows = conn.execute(
+                    "SELECT ref FROM removed_cards WHERE project = ? AND removed_at >= ? "
+                    "ORDER BY ref", (self.project, since or "")).fetchall()
+        except Exception:  # noqa: BLE001 — see `comments`
+            log.warning("could not read which cards were removed from %s's board", self.project,
+                        exc_info=True)
+            return None
+        return [str(r["ref"]) for r in rows]
+
+    def link_child(self, parent_ref: str, child_ref: str) -> None:
+        with connect(self._db, write=True) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO links(project, parent_ref, child_ref) VALUES (?,?,?)",
+                (self.project, _number(parent_ref), _number(child_ref)))
+
+    # ---- internals -----------------------------------------------------------------------
+
+    def _touch(self, ref: str, field: str, value: str) -> None:
+        """One column and `updated_at`, together. `field` is never a caller's string — the two
+        call sites name it as a literal, and an interpolated column name that came from outside
+        would be this file's own injection."""
+        assert field in {"body", "title"}, field
+        with connect(self._db, write=True) as conn:
+            conn.execute(
+                f"UPDATE cards SET {field} = ?, updated_at = ? WHERE project = ? AND ref = ?",
+                (value, now_iso(), self.project, _number(ref)))
+
+
+def move_card(conn, project: str, bare: int, key: str, *, closes_at_done: bool) -> bool:
+    """Put card `bare` in the column `key`, with the state that column means on this board —
+    inside the caller's write transaction. `False` when the board holds no such card.
+
+    ONE RULE FOR BOTH WRITERS OF A COLUMN ON THIS BOARD (#500): the tracker's `set_state`, which is
+    the factory's move, and the board's `set_column`, which is a person's. The board row holds its
+    tracker for exactly this reason — a second source for one fact is a board moving cards by rules
+    the tracker has abandoned — and a delivered card a person drags out of Done on the panel is the
+    same card the factory moves out of it.
+
+    LEAVING DONE OPENS A CARD CLOSED AS DELIVERED, for either writer: it is work again, in the
+    column it was moved to. A card closed as NOT delivered is never opened by a move.
+
+    ARRIVING IN DONE CLOSES ONLY FOR THE FACTORY (`closes_at_done`). The job that settles Done has
+    finished the work, and that is the close `set_state` documents. A person dragging an open card
+    into Done is saying where the card is, not recording a delivery: that is the close from Done,
+    `card_close`, which the door records as delivered and comments on — and a card dragged there
+    and left open is triage's `done-but-open`, which asks exactly that person to decide."""
+    card = conn.execute("SELECT state, closed_reason FROM cards WHERE project = ? AND ref = ?",
+                        (project, bare)).fetchone()
+    if card is None:
+        return False
+    done = STATE_KEYS.get(JobState.DONE, "done")
+    is_open = (card["state"] or "open") == "open"
+    # THE SAME WORD `triage.Ticket.delivered` EXCLUDES, BY NAME — a closed card that says nothing
+    # else is delivered work there, so it is delivered work here too
+    withdrawn = not is_open and card["closed_reason"] == "not_planned"
+    if key == done and is_open and closes_at_done:
+        now, word = "closed", "completed"
+    elif key != done and not is_open and not withdrawn:
+        now, word = "open", ""
+    else:
+        now, word = card["state"], card["closed_reason"]
+    conn.execute("UPDATE cards SET column_key = ?, state = ?, closed_reason = ?, updated_at = ? "
+                 "WHERE project = ? AND ref = ?", (key, now, word, now_iso(), project, bare))
+    return True
+
+
+def _number(ref: object) -> int:
+    """The card's number from either spelling. `0` for anything that is not one — which matches
+    no row, so a malformed ref reads as *no such card* instead of raising inside a poll tick."""
+    bare = canonical_ref(ref)
+    return int(bare) if bare.isdigit() else 0

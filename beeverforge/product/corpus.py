@@ -1,0 +1,624 @@
+"""The requirements themselves — parsed, indexed, and checked for the ways a corpus rots.
+
+ADR-0019 names the failure mode of this whole design: if execution outcomes stop reaching the
+documents, the repository becomes a wish-list describing a product nobody built, contradicting the
+code with total confidence. That failure is silent by nature — nothing crashes, a file simply stops
+being true — so it has to be *detected* rather than waited for. This module is that detector, and
+the reason it exists before the agent that writes into the corpus does.
+
+TWO RULES THROUGHOUT
+
+1. **Parsing never raises.** A malformed requirement is a finding, not a crash. A single bad file
+   must not make the whole corpus unreadable — that would take the product role offline over one
+   typo, which is a far worse outcome than one requirement being flagged.
+2. **Every finding names the file.** A validator that reports "3 problems" without saying where is
+   a validator nobody runs twice.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from beeverforge.product.template import (
+    EMPTY,
+    TEMPLATE_FILE,
+    RequirementTemplate,
+    load_template,
+)
+
+#: `0001-slug.md` — the number is the identity, and it comes from the FILENAME rather than the
+#: heading so that two files can never claim the same id while looking different on disk.
+_FILE_RE = re.compile(r"^(?P<num>\d{4})-(?P<slug>[a-z0-9][a-z0-9-]*)\.md$")
+
+#: `# REQ-0001 — title`
+_TITLE_RE = re.compile(r"^#\s+REQ-(?P<num>\d{4})\s*[—–-]\s*(?P<title>.+?)\s*$", re.MULTILINE)
+
+#: `- **Status:** accepted` — tolerant of the bold markers being dropped, because a human editing
+#: a markdown file by hand should not lose a requirement's status to a missing asterisk.
+def _field_re(name: str) -> re.Pattern[str]:
+    # THE NAME ENDS WHERE THE LABEL ENDS (#1001): at a colon, or at the bold marker that closes it.
+    # It used to end nowhere, so `- **Date of go-live:** 2027-03-01` above `- **Date:**` was read as
+    # the date "of go-live:** 2027-03-01" — the first line that BEGAN with the word won. A label
+    # with no colon and no bold is no label.
+    return re.compile(rf"^\s*[-*]\s*\**{re.escape(name)}(?:\**\s*:|\*\*)\**\s*(?P<value>.*?)\s*$",
+                      re.MULTILINE | re.IGNORECASE)
+
+
+#: THE status-line pattern — one regex for reading AND rewriting. The writers in `authoring.py`
+#: (`_set_status_accepted`, `_mark_superseded`) locate the line with this exact object: each once
+#: carried its own stricter pattern, so a file this parser read perfectly well was one the writers
+#: silently failed to flip — and an accept was answered "já estava acordado" over a requirement
+#: still `proposed`. Sharing the object, not a copy, is what makes that drift impossible.
+_STATUS_RE = _field_re("Status")
+_ASKED_RE = _field_re("Asked by")
+_DATE_RE = _field_re("Date")
+_SUPERSEDES_RE = _field_re("Supersedes")
+#: The two lines only a reverse-engineering pass writes (`brownfield.render_candidate`). ANCHORED
+#: ON THE BULLET like every field above, which is what keeps the baseline document's own
+#: `### Evidence: tested` headings from being read as a requirement's evidence.
+#:
+#: AND SEARCHED IN THE HEADER ALONE (`_header`), unlike the four above. Those are in every file's
+#: header, so a search finds them there first; these two are in a reading's header and in no
+#: request's, so on a request the search went on into the body and took the first bullet that began
+#: with the word — "- Evidence of payment is not checked here", under Out of scope, was read as
+#: `evidence == "of"`, and accepting what a person asked for filed nothing (#182).
+_EVIDENCE_RE = _field_re("Evidence")
+_OBSERVED_AT_RE = _field_re("Observed at commit")
+
+#: The first section heading. Everything above it is where a requirement states its own fields —
+#: the writers', the template's and a hand-edited file's alike — and everything below is its text.
+_FIRST_SECTION_RE = re.compile(r"^#{2,}\s", re.MULTILINE)
+_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+#: the number in `superseded-by 0007`
+_SUPERSEDED_BY_RE = re.compile(r"superseded[-\s]?by\s*:?\s*(?:REQ-)?(\d{4})", re.IGNORECASE)
+
+#: `observed` is NOT a weaker `proposed`, and the difference is the whole reason it exists.
+#:
+#: `proposed` means a PERSON asked for this. `observed` means the code currently behaves this way
+#: and somebody reverse-engineered it — nobody has said it is intended. Collapsing the two would
+#: freeze bugs into promises: once a behaviour is an accepted requirement the factory DEFENDS it,
+#: so a future fix reads as a violation. Anything reverse-engineered therefore lands as `observed`
+#: and stays there until a human confirms it, which is the only event that turns behaviour into a
+#: commitment.
+PROPOSED, ACCEPTED, SUPERSEDED = "proposed", "accepted", "superseded"
+OBSERVED = "observed"
+
+#: The writers' word for provenance nobody supplied — `- **Asked by:** unrecorded`. ONE SPELLING,
+#: written by both requirement writers (`authoring.render_requirement`,
+#: `brownfield.render_candidate`) and read back by everything that asks whose a requirement is:
+#: the acceptance writer fills it, the second-yes gate defers to nobody over it. It used to be one
+#: spelling per writer — brownfield's was "nobody — reverse-engineered from the code" — and a gate
+#: that enumerated the spellings it had seen refused every brownfield requirement to everybody
+#: (#70, found in review): the list was asserted against itself, never against the writers.
+UNRECORDED = "unrecorded"
+
+#: How strongly a reverse-engineered behaviour is evidenced, strongest first. DEFINED HERE, where
+#: the reader is, and imported by the writer (`brownfield.py`): the tiers used to live beside the
+#: writer alone, which is how the reader came to have a field for them and no way to check one.
+EVIDENCE_ASKED, EVIDENCE_TESTED, EVIDENCE_CODE = "asked", "tested", "code"
+EVIDENCE_TIERS = (EVIDENCE_ASKED, EVIDENCE_TESTED, EVIDENCE_CODE)
+
+
+def requester_identity(asked_by: str) -> str:
+    """The identity a requirement's `Asked by:` names, bare — or "" when it names nobody the
+    factory could compare an actor against.
+
+    Nobody is: nothing; the placeholder; or PROSE — anything that is not a single token
+    ("nobody — reverse-engineered from the code", "não registrado", whatever sentence a writer
+    invents next, in any language). Decided by SHAPE rather than by a list of phrases, because a
+    list is only ever as long as the phrases its author had seen. A bare name IS somebody:
+    `admins: [ana]` is how a panel identity is spelled, and `ana` asked."""
+    who = (asked_by or "").strip().strip("<@>").strip()
+    if not who or who.lower() == UNRECORDED or any(ch.isspace() for ch in who):
+        return ""
+    return who
+
+#: Abandoned — decided against, with nothing taking its place. A SEPARATE STATUS FROM `superseded`,
+#: and the distinction is the record's honesty rather than taxonomy: `superseded-by NNNN` says "read
+#: that one instead", so using it for a requirement nobody replaced would point the reader at a
+#: document that does not exist, and `_cross_check`'s own dangling-pointer rule would (rightly)
+#: call it an error.
+#:
+#: This status exists because the product owner asked the obvious product question the platform had
+#: no answer to: *"something that will no longer be done — isn't that very common in a conversation
+#: with a PO?"* It is, and until now the only way to retire anything was to WRITE SOMETHING ELSE,
+#: which is the exact opposite of what "we are not doing this" means.
+DROPPED = "dropped"
+_KNOWN_STATUS = {PROPOSED, ACCEPTED, SUPERSEDED, OBSERVED, DROPPED}
+
+#: the scaffold shipped with a new documentation repo. It is not a requirement and must never be
+#: counted as one, or every corpus starts life with a permanently unfinished entry.
+TEMPLATE_NUMBER = 0
+
+
+class Finding(BaseModel):
+    """One problem with the corpus. `level` is `error` (this requirement cannot be trusted) or
+    `warn` (it can, but something is decaying)."""
+
+    level: str
+    code: str
+    path: str
+    message: str
+
+
+class Requirement(BaseModel):
+    number: int
+    slug: str
+    path: str
+    title: str = ""
+    status: str = PROPOSED
+    superseded_by: int | None = None
+    asked_by: str = ""
+    date: str = ""
+    supersedes: list[int] = Field(default_factory=list)
+    #: source repos / areas the requirement says it affects, verbatim — never resolved here. A
+    #: citation that no longer resolves is a flag for a human to review the requirement, never an
+    #: error and never silently repaired (ADR-0019: requirement↔code drift cannot be checksummed).
+    affects: list[str] = Field(default_factory=list)
+    #: whether the file records anything under "Decisions taken during execution" — the write-back
+    #: loop, and the single measurable signal that the corpus is still alive
+    has_decisions: bool = False
+    body: str = ""
+    #: the product's own header fields (`requirements/template.yaml`, ADR-0058), by name, as
+    #: written — `""` for a field the file does not carry. Empty when the product has no template.
+    fields: dict[str, str] = Field(default_factory=dict)
+    #: the product's own sections, by name, with their text — only those the file carries
+    sections: dict[str, str] = Field(default_factory=dict)
+
+    #: how strongly the behaviour is evidenced, for a reverse-engineered entry: `asked` (a human
+    #: asked for it in an issue or PR — real provenance), `tested` (a test asserts it, so somebody
+    #: made it a promise on purpose), `code` (the code does it, with nothing asserting it — the
+    #: most likely to be accidental). Empty for an authored requirement, which needs no tier.
+    #:
+    #: DECLARED FOR A YEAR AND NEVER SET (#182). `parse_requirement` built the model without it, so
+    #: on `1512d0a` a file the baseline wrote with `Evidence: tested` read back as `""` and nothing
+    #: downstream could tell a reading of the code from a request — which is how accepting one
+    #: came to ask the role to invent work for behaviour that is already built.
+    evidence: str = ""
+    #: the commit of the SOURCE the behaviour was read at — `Observed at commit:`, written by the
+    #: baseline and until #182 read by nothing. It stays in the file through the acceptance, so an
+    #: accepted reading records which code it was confirmed against. "" when nobody recorded one.
+    observed_at: str = ""
+    #: whether the header carries EITHER of those two lines at all, whatever it says. Not the same
+    #: as either value: the survey's commit is the model's own answer, so a baseline can write
+    #: `Observed at commit: unrecorded`, which is no commit and is still the file saying where it
+    #: came from. With the Evidence line tidied away, that line was the entry's only provenance and
+    #: it read as none — so accepting it broke built behaviour into cards (#182).
+    provenance_line: bool = False
+
+    @property
+    def is_promise(self) -> bool:
+        """Whether the factory should DEFEND this. Only an accepted requirement is a commitment;
+        an observed one is a reading of the code that nobody has confirmed."""
+        return self.status == ACCEPTED
+
+    @property
+    def came_from_the_code(self) -> bool:
+        """Whether this entry was READ OFF THE CODE rather than asked for — it describes something
+        the system already does, so there is nothing to build from it (#182).
+
+        ABOUT WHERE THE TEXT CAME FROM, NOT ABOUT ITS STATUS, and that is the point: `observed`
+        stops being the status at the moment a person confirms the entry, which is exactly the
+        moment the question matters. The two provenance lines survive the flip, so the answer is
+        the same before the acceptance and after it.
+
+        EITHER LINE IS ENOUGH, AND IT IS THE LINE THAT COUNTS, NOT ITS VALUE. A person tidying the
+        header who deletes one of them has not made the behaviour unbuilt, and the one left may be
+        the `unrecorded` placeholder (`provenance_line`). Deleting BOTH is the file's own way of
+        saying "this is a request now": the entry then reads as authored everywhere, and accepting
+        it files work like any other. Only the HEADER's lines count: the same words in the body are
+        the text, and a request that mentions evidence is still a request.
+        What this cannot see is a body edited into something the code does not do while the lines
+        stay — nothing in the file says so, and the honest way through is a person asking for the
+        breakdown, which `break_down(asked_for=True)` always performs."""
+        return bool(self.evidence or self.observed_at or self.provenance_line)
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this requirement still describes what the product should do. Superseded and
+        dropped ones are kept deliberately — the history of what was decided and then reversed is
+        what stops the same question being asked a third time — but they must never be handed to an
+        agent as current truth.
+
+        The two dead states are one predicate here and two facts everywhere else: `superseded`
+        sends the reader to a replacement, `dropped` says there is none."""
+        return self.status not in (SUPERSEDED, DROPPED)
+
+
+class Corpus(BaseModel):
+    """Every requirement in a documentation repo, plus what is wrong with it."""
+
+    requirements: list[Requirement] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=list)
+    #: the product's own template, when it has one that could be used (ADR-0058)
+    template: RequirementTemplate | None = None
+
+    def by_number(self, number: int) -> Requirement | None:
+        return next((r for r in self.requirements if r.number == number), None)
+
+    def live(self) -> list[Requirement]:
+        return [r for r in self.requirements if r.is_live]
+
+    @property
+    def errors(self) -> list[Finding]:
+        return [f for f in self.findings if f.level == "error"]
+
+    def observed(self) -> list[Requirement]:
+        """Reverse-engineered readings awaiting confirmation."""
+        return [r for r in self.requirements if r.status == OBSERVED]
+
+    def promises(self) -> list[Requirement]:
+        return [r for r in self.requirements if r.is_promise]
+
+    def summary(self) -> str:
+        """Counted so that "we have 40 requirements" cannot quietly mean "40 readings of the code
+        and no decisions" — the distinction the `observed` status exists to preserve."""
+        obs = len(self.observed())
+        parts = [f"{len(self.requirements)} requirements",
+                 f"{len(self.promises())} accepted"]
+        if obs:
+            parts.append(f"{obs} observed (unconfirmed)")
+        return (f"{', '.join(parts)} — {len(self.errors)} errors, "
+                f"{len(self.findings) - len(self.errors)} warnings")
+
+
+def _status_of(text: str, path: str) -> tuple[str, int | None, list[Finding]]:
+    """The status, plus the requirement that replaced it. Unknown text does NOT become `accepted`:
+    an unreadable status must never promote a draft into something the factory will build."""
+    m = _STATUS_RE.search(text)
+    raw = (m.group("value") if m else "").strip()
+    # strip a trailing markdown comment, which the template uses to list the allowed values
+    raw = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    if not raw:
+        return PROPOSED, None, [Finding(
+            level="warn", code="status-missing", path=path,
+            message="no `Status:` line; treated as `proposed` (never as accepted — an unreadable "
+                    "status must not promote a draft into something the factory will build)")]
+    sup = _SUPERSEDED_BY_RE.search(raw)
+    if sup:
+        return SUPERSEDED, int(sup.group(1)), []
+    if raw.startswith(SUPERSEDED):
+        return SUPERSEDED, None, [Finding(
+            level="error", code="superseded-without-target", path=path,
+            message="status is `superseded` but names no replacement; write "
+                    "`superseded-by NNNN` so the reader can follow the decision")]
+    word = raw.split()[0]
+    if word in _KNOWN_STATUS:
+        return word, None, []
+    return PROPOSED, None, [Finding(
+        level="error", code="status-unknown", path=path,
+        message=f"unknown status {raw!r}; expected `proposed`, `accepted`, `dropped` or "
+                f"`superseded-by NNNN`. Treated as `proposed`.")]
+
+
+def _numbers(value: str) -> list[int]:
+    return [int(n) for n in re.findall(r"\b(\d{4})\b", value or "")]
+
+
+def _section(text: str, heading: str) -> str:
+    """The body of one `## Heading` section, or "" — used to read the parts of a requirement whose
+    presence is itself information."""
+    m = re.search(rf"^##\s+{re.escape(heading)}\s*$(?P<body>.*?)(?=^##\s|\Z)",
+                  text, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+    return (m.group("body") if m else "").strip()
+
+
+def _bullets(block: str) -> list[str]:
+    out = []
+    for line in block.splitlines():
+        s = line.strip()
+        if s.startswith(("-", "*")) and len(s) > 2:
+            item = s[1:].strip().strip("`")
+            if item and not item.startswith("["):  # skip checkbox criteria
+                out.append(item)
+    return out
+
+
+def parse_requirement(
+    path: Path, text: str, template: RequirementTemplate | None = None
+) -> tuple[Requirement | None, list[Finding]]:
+    """One requirement file. Returns `(None, findings)` only when the FILENAME is unusable — the
+    number is the identity, so without it there is nothing to record the problem against.
+
+    With the product's `template` (ADR-0058), the file's own fields and sections are read as well,
+    and what it does not meet is a `warn` finding — never an error: a requirement that predates the
+    template is still a requirement."""
+    name = path.name
+    fm = _FILE_RE.match(name)
+    if not fm:
+        return None, [Finding(
+            level="error", code="filename", path=name,
+            message="expected `NNNN-slug.md` (lowercase slug). The number is the requirement's "
+                    "identity and is read from the filename, so two files can never claim the "
+                    "same id while looking different on disk.")]
+
+    number, slug = int(fm.group("num")), fm.group("slug")
+    findings: list[Finding] = []
+
+    tm = _TITLE_RE.search(text)
+    title = tm.group("title").strip() if tm else ""
+    if not tm:
+        findings.append(Finding(level="warn", code="title-missing", path=name,
+                                message="no `# REQ-NNNN — title` heading"))
+    elif int(tm.group("num")) != number:
+        findings.append(Finding(
+            level="error", code="number-mismatch", path=name,
+            message=f"the heading says REQ-{tm.group('num')} but the filename says "
+                    f"{number:04d}; the filename wins, and one of the two is a copy-paste"))
+
+    status, superseded_by, status_findings = _status_of(text, name)
+    findings += status_findings
+
+    asked = _ASKED_RE.search(text)
+    date = _DATE_RE.search(text)
+    supersedes = _SUPERSEDES_RE.search(text)
+    head = _header(text)
+    evidence, evidence_findings = _evidence_of(head, name)
+    findings += evidence_findings
+    observed_at = _OBSERVED_AT_RE.search(head)
+
+    req = Requirement(
+        number=number, slug=slug, path=name, title=title, status=status,
+        superseded_by=superseded_by,
+        asked_by=_clean(asked.group("value") if asked else ""),
+        date=_clean(date.group("value") if date else ""),
+        supersedes=_numbers(supersedes.group("value") if supersedes else ""),
+        affects=_bullets(_section(text, "Affects")),
+        has_decisions=bool(_decision_rows(text)),
+        body=text,
+        evidence=evidence,
+        observed_at=_recorded(observed_at.group("value") if observed_at else ""),
+        provenance_line=bool(observed_at or _EVIDENCE_RE.search(head)),
+    )
+    if template is not None:
+        for f in template.fields:
+            m = _field_re(f.name).search(head)
+            req.fields[f.name] = _clean(m.group("value") if m else "")
+            if req.fields[f.name] == EMPTY:
+                req.fields[f.name] = ""
+        for sec in template.sections:
+            if (body := _section(text, sec.name)):
+                req.sections[sec.name] = body
+        present = {m.group(1).strip().lower() for m in _HEADING_RE.finditer(text)}
+        for code, sentence in template.problems_of(req.fields, present):
+            findings.append(Finding(level="warn", code=code, path=name, message=sentence))
+
+    # Provenance is not decoration: a requirement nobody can trace back to a person and a date is
+    # one nobody can question later. Only warn — a requirement without it is still a requirement.
+    if status == ACCEPTED and not req.asked_by:
+        findings.append(Finding(level="warn", code="no-asker", path=name,
+                                message="accepted, but records no `Asked by:` — the trace back to "
+                                        "whoever wanted it is gone"))
+    if status == ACCEPTED and not req.date:
+        findings.append(Finding(level="warn", code="no-date", path=name,
+                                message="accepted, but records no `Date:`"))
+    return req, findings
+
+
+def _clean(value: str) -> str:
+    return re.sub(r"<!--.*?-->", "", value or "").strip().strip("<>").strip()
+
+
+def _header(text: str) -> str:
+    """The part of a requirement above its first section heading — where it states its own fields.
+    The whole text when it has no section at all, which is how a file with no sections was read
+    before."""
+    first = _FIRST_SECTION_RE.search(text)
+    return text[:first.start()] if first else text
+
+
+def _recorded(value: str) -> str:
+    """A field's value with its code ticks off — or "" for the writers' placeholder, so
+    `unrecorded` is read as the absence it stands for and never as a commit called that."""
+    text = _clean(value).strip("`").strip()
+    return "" if text.lower() == UNRECORDED else text
+
+
+def _evidence_of(text: str, path: str) -> tuple[str, list[Finding]]:
+    """The tier on an `Evidence:` line — its first word, because the writer follows it with the
+    tier's note (`tested — a test asserts this, …`).
+
+    A WORD THIS BUILD DOES NOT KNOW IS KEPT, WITH A FINDING, NEVER DROPPED. The line's presence is
+    the information: somebody recorded that this behaviour was read off the code. Dropping an
+    unrecognised tier would turn the entry into an authored requirement, and accepting it would
+    then ask the role to build what is built — the expensive direction, and silent. Keeping it
+    files nothing and says so, which a person can see and undo."""
+    found = _EVIDENCE_RE.search(text)
+    raw = _recorded(found.group("value") if found else "")
+    tier = re.split(r"[\s—–:,;(-]", raw, maxsplit=1)[0].lower() if raw else ""
+    if not tier or tier in EVIDENCE_TIERS:
+        return tier, []
+    return tier, [Finding(
+        level="warn", code="evidence-unknown", path=path,
+        message=f"unknown evidence tier {tier!r}; expected one of "
+                f"{', '.join(f'`{t}`' for t in EVIDENCE_TIERS)}. The entry is still read as "
+                f"reverse-engineered from the code — delete the line if a person asked for this.")]
+
+
+#: The heading of the decision register, WRITTEN ONCE. The renderer creates this section, this
+#: module reads it, `_cross_check` complains when an agreed requirement has nothing in it, and
+#: `authoring.record_decision` appends to it. Four places agreeing on a string by having all been
+#: typed the same way is three chances for the fourth to drift — and the one that drifts is the
+#: WRITER, whose rows then land in a section nothing reads while the file looks correct.
+DECISIONS_HEADING = "Decisions taken during execution"
+
+
+def find_decisions_table(text: str) -> tuple[int, int] | None:
+    """`(start, end)` of the decision table's byte range inside `text`, or None.
+
+    THE WRITER'S HALF OF THE READER BELOW, and it is here rather than in `authoring` so the two
+    cannot disagree about what the table is. A writer with its own idea of where the section ends
+    appends rows outside it: `has_decisions` stays False, `no-write-back` keeps firing, and the
+    client is looking at a decision the corpus swears was never recorded.
+    """
+    m = re.search(rf"^##\s+{re.escape(DECISIONS_HEADING)}\s*$(?P<body>.*?)(?=^##\s|\Z)",
+                  text, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+    return (m.start("body"), m.end("body")) if m else None
+
+
+def _decision_rows(text: str) -> list[str]:
+    """Rows written back under "Decisions taken during execution" — the write-back loop. The
+    template's header and separator rows are not decisions."""
+    block = _section(text, DECISIONS_HEADING)
+    rows = []
+    for line in block.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if not any(cells):
+            continue
+        joined = " ".join(cells).lower()
+        if set(joined) <= set("-: ") or joined.startswith("date "):
+            continue  # separator / header
+        rows.append(s)
+    return rows
+
+
+#: A cell boundary in a register row: a `|` the writer did not escape (`authoring._cell`).
+_CELL_BOUNDARY = re.compile(r"(?<!\\)\|")
+
+
+def decision_cells(text: str) -> list[tuple[str, str, str]]:
+    """Every row of the decision register as its three cells — `(day, decision, who decided and
+    where)` — with the writer's escapes undone, so a decision that holds a `|` reads back as the
+    sentence it was. THE READER'S HALF of `authoring.add_decision_row`, built on the rows the
+    corpus already reads (`_decision_rows`): an import that joins a register compares by day and
+    text against exactly what `has_decisions` counts (#993)."""
+    out: list[tuple[str, str, str]] = []
+    for row in _decision_rows(text):
+        cells = [c.strip().replace("\\|", "|")
+                 for c in _CELL_BOUNDARY.split(row.strip().removeprefix("|").removesuffix("|"))]
+        cells += [""] * (3 - len(cells))
+        out.append((cells[0], cells[1], " | ".join(cells[2:]).strip(" |")))
+    return out
+
+
+def load_corpus(requirements_dir: str | Path) -> Corpus:
+    """Every `NNNN-slug.md` under a directory, parsed and cross-checked.
+
+    A missing directory is a finding, not an exception: the product module must be able to report
+    "your requirements repo has no requirements yet" rather than fail to start."""
+    root = Path(requirements_dir)
+    if not root.is_dir():
+        return Corpus(findings=[Finding(
+            level="error", code="no-directory", path=str(root),
+            message="the requirements directory does not exist")])
+
+    reqs: list[Requirement] = []
+    findings: list[Finding] = []
+    seen: dict[int, str] = {}
+    # THE PRODUCT'S OWN TEMPLATE sits beside the requirements it describes (ADR-0058). One that
+    # cannot be used is a finding naming why, and the core's own shape applies.
+    template, why = load_template(root)
+    if why:
+        findings.append(Finding(level="warn", code="template-refused", path=TEMPLATE_FILE,
+                                message=why))
+
+    for path in sorted(root.iterdir()):
+        if not path.is_file() or path.suffix != ".md":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:  # unreadable file — a finding, never a crash
+            findings.append(Finding(level="error", code="unreadable", path=path.name,
+                                    message=f"could not be read: {exc}"))
+            continue
+        req, file_findings = parse_requirement(path, text, template)
+        findings += file_findings
+        if req is None:
+            continue
+        if req.number == TEMPLATE_NUMBER:
+            continue  # the scaffold, not a requirement
+        if req.number in seen:
+            findings.append(Finding(
+                level="error", code="duplicate-number", path=path.name,
+                message=f"REQ-{req.number:04d} is already defined by {seen[req.number]}; "
+                        f"a requirement's number is its identity and two files cannot share one"))
+            continue
+        seen[req.number] = path.name
+        reqs.append(req)
+
+    findings += _cross_check(reqs)
+    return Corpus(requirements=reqs, findings=findings, template=template)
+
+
+def _by_slug(reqs: list[Requirement]) -> dict[str, list[Requirement]]:
+    """Requirements grouped by the slug in their filename, oldest number first.
+
+    The slug is derived from the title by the same `slugify` the writer uses, so it is the one
+    identity two files can share without sharing a number."""
+    groups: dict[str, list[Requirement]] = {}
+    for r in sorted(reqs, key=lambda x: x.number):
+        if r.slug:
+            groups.setdefault(r.slug, []).append(r)
+    return groups
+
+
+def _cross_check(reqs: list[Requirement]) -> list[Finding]:
+    """The checks no single file can make on its own — dangling links between requirements, and the
+    decay this whole module exists to catch."""
+    out: list[Finding] = []
+    known = {r.number for r in reqs}
+
+    # TWO LIVE FILES CARRYING ONE SLUG ARE ONE PROMISE WEARING TWO NUMBERS, and the corpus can say
+    # so without anybody's judgment: the slug comes from the title, so an identical slug is an
+    # identical title. Observed in production on 2026-07-30 — `0002-totais-de-iva-…` and
+    # `0003-totais-de-iva-…`, both live, one of them accepted. The two supersede paths that
+    # existed both require the DRAFTER to know it is replacing something; here it did not, because
+    # the conversation called the new text "the final version of requirement 2" and this platform
+    # has no update-in-place, so the rewrite minted a new number and left its own predecessor
+    # standing. An error rather than a warning: the factory picks whichever it reads first.
+    for slug, group in _by_slug(reqs).items():
+        live = [r for r in group if r.is_live]
+        if len(live) < 2:
+            continue
+        listed = ", ".join(f"REQ-{r.number:04d} ({r.status})" for r in live)
+        out.append(Finding(
+            level="error", code="same-promise-twice", path=live[-1].path,
+            message=f"{listed} are all live and share one title ({slug!r}) — that is one promise "
+                    f"under several numbers, and the factory will defend whichever it reads "
+                    f"first. Exactly one of them may stay live; the rest belong "
+                    f"`superseded-by` it."))
+
+    for r in reqs:
+        if r.superseded_by is not None:
+            if r.superseded_by not in known:
+                out.append(Finding(
+                    level="error", code="dangling-superseded-by", path=r.path,
+                    message=f"says it was superseded by REQ-{r.superseded_by:04d}, which does not "
+                            f"exist. The reader is sent to a dead end, which is worse than no "
+                            f"pointer at all."))
+            elif r.superseded_by == r.number:
+                out.append(Finding(level="error", code="self-superseded", path=r.path,
+                                   message="says it was superseded by itself"))
+        for target in r.supersedes:
+            replaced = next((x for x in reqs if x.number == target), None)
+            if replaced is None:
+                out.append(Finding(
+                    level="error", code="dangling-supersedes", path=r.path,
+                    message=f"claims to supersede REQ-{target:04d}, which does not exist"))
+            elif replaced.status != SUPERSEDED:
+                # the two halves of one decision must agree, or the corpus asserts both that a
+                # requirement was replaced and that it is still current
+                out.append(Finding(
+                    level="error", code="supersede-not-mutual", path=r.path,
+                    message=f"claims to supersede REQ-{target:04d}, but that file's status is "
+                            f"{replaced.status!r}. Set it to `superseded-by {r.number:04d}`: as it "
+                            f"stands the corpus says one requirement is replaced AND current."))
+
+        # THE ROT SIGNAL. An accepted requirement that has been built but records nothing learned
+        # is how this repository turns into a wish-list. A warning, deliberately: it is a prompt to
+        # write back, not a claim that the requirement is wrong.
+        if r.status == ACCEPTED and not r.has_decisions:  # observed entries are exempt: nothing
+            # has been executed against a reading of the code that nobody has confirmed yet
+            out.append(Finding(
+                level="warn", code="no-write-back", path=r.path,
+                message="accepted, but records no decisions taken during execution. If work has "
+                        "happened against it, what was learned has not reached the document — the "
+                        "way this corpus decays into a wish-list nobody trusts."))
+    return out

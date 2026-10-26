@@ -1,0 +1,398 @@
+"""The factory as three processes on this machine — the host's `docker compose up` (ADR-0049 D9).
+
+Compose is four processes in a file: the durable engine and its database, the worker and the
+panel. Unpacked, three of them run here as they are — the engine's dev server is one binary with a
+SQLite file behind it, the worker is a module this package ships, and the panel is `beeverforge
+serve`, the very command compose runs in its container. What Docker adds is the box's isolation,
+which the `local` runtime gives up out loud.
+
+IT LIVES HERE AND NOT IN `cli.py` because a front end may not do the work: the action layer's own
+guard refuses `Popen` and `terminate` in a command module by name, and it is right to — a surface
+that supervises processes itself is a second implementation of something, and the two drift
+without either side noticing. `beeverforge up` is the front end; this is the thing it drives.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from beeverforge import listeners
+from beeverforge.listeners import ENGINE, ENGINE_UI, PANEL
+
+#: The durable engine's own dev server: one binary, a SQLite file behind it, no database service.
+#: NAMED RATHER THAN INSTALLED — a platform that fetches binaries onto somebody's machine is a
+#: different product from one that says which command to run.
+TEMPORAL_HINT = ("the durable engine is off: `temporal` is not on your PATH. Install it — "
+                 "`brew install temporal`, or https://temporal.io/setup/install-temporal-cli — "
+                 "and re-run. Everything attended (`run`, `poll`, the panel) works without it; "
+                 "what waits for it is the human merge gate, park/resume and every deadline.")
+
+
+#: The other half of the durable engine: the library the worker runs on. It is the `runtime`
+#: extra, so an install that followed the older one-machine page (`pip install -e .`) does not
+#: have it — and `TEMPORAL_HINT` told that same reader to put `temporal` on the PATH (#171).
+#:
+#: IT SAYS THE PANEL WORKS WITHOUT IT, SINCE #178 — and from #174 until then it could not. Measured
+#: 2026-09-18 on an interpreter with `temporalio` blocked, the panel process served but its page
+#: (`/`) and `/api/floor` answered 500: both reached `runtime.temporal.view` for words and an
+#: import that sat outside its `try`. Those now come from `runtime/temporal/vocabulary.py`, and
+#: `tests/test_the_panel_serves_without_the_engines_client.py` asks every GET route of the panel
+#: in an interpreter where the library cannot be found.
+#:
+#: BOTH DOORS, SINCE #368. It named only the checkout's install, which a person who installed from
+#: an index or a wheel has no checkout to run — and that is the door the PyPI page documents. It
+#: does not spell the index's command with the package's name in it: while the publish is gated
+#: on a repository variable, `tests/test_the_remedy_a_refusal_hands_you_can_be_followed.py` reads
+#: the core as served by no index and forbids that command in every refusal. Repeating one's own
+#: `pip install` with the extra is right for an index install and for a wheel file alike.
+RUNTIME_INSTALL = ("`pip install -e '.[runtime]'` in the checkout you installed from, or, for an "
+                   "install from a package index or a wheel, the same `pip install` with "
+                   "`[runtime]` after the package's name")
+
+RUNTIME_HINT = ("the durable engine is off: `temporal` is on your PATH, but this install has no "
+                "`temporalio` — the `runtime` extra, which the worker runs on. Install it — "
+                f"{RUNTIME_INSTALL} — and re-run. Everything attended (`run`, `poll`, the panel) "
+                "works without it; what waits for it is the human merge gate, park/resume and "
+                "every deadline.")
+
+#: Said after `TEMPORAL_HINT` when the library is missing as well, so that installing the binary
+#: as told is not the step that takes the factory down (#171).
+RUNTIME_TOO = ("This install has no `temporalio` either — the `runtime` extra, which the engine's "
+               f"worker runs on — so install it beside the binary: {RUNTIME_INSTALL}.")
+
+#: What ANY surface says when it is asked for the engine on an install without its client library
+#: (#178): `beeverforge worker`, the floor, and the panel's engine routes. One sentence, because
+#: before it there were three answers to one condition — this module's hint (only `up` said it),
+#: `runtime extra not installed (…)` in the panel, and a raw `ModuleNotFoundError: No module named
+#: 'temporalio'` from `beeverforge worker`, which is the one a person actually met.
+#:
+#: NOT "THE ENGINE DID NOT ANSWER". That sentence sends its reader to look at a process and a
+#: port; this one's remedy is an install, and no amount of restarting fixes it.
+CLIENT_MISSING = ("this install has no `temporalio` — the `runtime` extra, the durable engine's "
+                  f"client library. Install it — {RUNTIME_INSTALL} — and restart. Everything "
+                  "attended (`run`, `poll`, the panel) works without it.")
+
+
+def the_client_is_what_is_missing(exc: BaseException) -> bool:
+    """Whether `exc` is this interpreter failing to import the engine's client library.
+
+    THE EXCEPTION'S OWN `name` DECIDES, never its text: `ModuleNotFoundError.name` is the module
+    that could not be found, so a `temporalio` that IS installed and breaks while importing
+    something else of its own is not mistaken for an install without the extra."""
+    return (isinstance(exc, ImportError)
+            and (getattr(exc, "name", "") or "").split(".")[0] == "temporalio")
+
+
+def why_the_engine_cannot_be_read(exc: ImportError) -> str:
+    """What to tell a reader when importing one of the engine's modules failed (#178).
+
+    `CLIENT_MISSING` ONLY WHEN THAT IS WHAT IS MISSING. An `except ImportError` around
+    `runtime.temporal.view` also catches anything else that breaks inside it, and answering all of
+    those with "install the runtime extra" sends somebody to reinstall a library they already
+    have. So the exception's own `name` decides, and any other failure is reported as itself."""
+    if the_client_is_what_is_missing(exc):
+        return CLIENT_MISSING
+    return f"the engine's reader could not be imported ({str(exc)[:160]})"
+
+
+def durable_half(asked: bool) -> tuple[str | None, str]:
+    """The engine binary to start, or None — and the sentence that says what is missing, or "".
+
+    BOTH HALVES, ONE ANSWER. The binary and the library are two separate installs, and saying only
+    the first one sent a reader straight into the crash #171 reported: they put `temporal` on the
+    PATH as `TEMPORAL_HINT` told them, and the next `up` died on the missing library."""
+    if not asked:
+        return None, ""
+    binary, client = the_engine(), the_client()
+    if binary and client:
+        return binary, ""
+    if binary:
+        return None, RUNTIME_HINT
+    return None, TEMPORAL_HINT if client else f"{TEMPORAL_HINT} {RUNTIME_TOO}"
+
+
+def the_engine() -> str | None:
+    """The `temporal` binary, or None — the one thing this runtime cannot ship."""
+    return shutil.which("temporal")
+
+
+def the_client() -> bool:
+    """Whether the worker's library is installed in the interpreter the worker would run in.
+
+    ASKED OF THE SPEC, NOT BY IMPORTING IT. The worker is `sys.executable -m …`, this very
+    interpreter, so a spec found here is the one the child finds. Importing `temporalio.worker` to
+    be sure cost 2.9 s cold, measured 2026-09-18 on a WSL machine (2.2 s even for `find_spec` of
+    the submodule, which imports the package); the top-level spec took 7 ms and answers the only
+    question an install without the extra raises."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("temporalio") is not None
+    except (ImportError, ValueError):   # a module blocked or half-removed in sys.modules
+        return False
+
+
+def processes(*, panel_port: int, state: Path, engine: str | None,
+              engine_port: int = ENGINE.default_port, ui_port: int = ENGINE_UI.default_port,
+              ) -> list[tuple[str, list[str]]]:
+    """What to start, in order, and what each one is called.
+
+    THE PORTS ARE ARGUMENTS, NOT LITERALS (#183). This spelled `--port 7233 --ui-port 8080` while
+    the panel linked to the UI on another port and the worker dialled whatever `TEMPORAL_ADDRESS`
+    said — three numbers in three files that agreed only while nobody changed one. `deployment`,
+    below, resolves them together with the addresses the children are handed.
+
+    THE WORKER ONLY WHERE THERE IS AN ENGINE TO WORK FOR. It connects at startup and exits when
+    nothing answers, and one dying process ends the set — so on a machine with no `temporal`
+    binary, starting it would take the panel down with it and deliver NOTHING from a command whose
+    whole promise is that the attended half still works.
+
+    AND ONLY WHERE IT CAN START AT ALL (#171). `temporalio` is the `runtime` extra, the one-machine
+    page installed without it, and `up` told that reader to put `temporal` on the PATH. Doing
+    exactly that ended the whole set: `✓ engine, worker, panel`, then `ModuleNotFoundError:
+    No module named 'temporalio'`, `✗ worker exited (1) — stopping the rest`, and the panel went
+    down with it. The ENGINE stays out too, not only the worker: an engine with no worker is the
+    half-state the doctor cannot see — its `processes` check reads the engine's port as the durable
+    half answering, and the worker holds no port to be missed by. So the durable half is off, as it
+    is without the binary, and `durable_half` says which of the two is missing.
+    """
+    plan: list[tuple[str, list[str]]] = []
+    if engine and the_client():
+        plan.append(("engine", [engine, "server", "start-dev", "--db-filename",
+                                str(state / "temporal.db"), "--port", str(engine_port),
+                                "--ui-port", str(ui_port)]))
+        plan.append(("worker", [sys.executable, "-m", "beeverforge.runtime.temporal.worker"]))
+    plan.append(("panel", [sys.executable, "-m", "beeverforge.cli", "serve",
+                           "--port", str(panel_port)]))
+    return plan
+
+
+@dataclass(frozen=True)
+class Deployment:
+    """What `up` starts, and what it tells everything it starts."""
+
+    plan: list[tuple[str, list[str]]]
+    #: The children's whole environment: this process's, plus the addresses just resolved.
+    env: dict[str, str]
+    #: How each started listener is reached, by name — what `up` prints.
+    reach: dict[str, str]
+    #: Sentences for the person: a declaration this run was asked not to follow.
+    said: tuple[str, ...] = ()
+
+
+def deployment(*, panel_port: int | None, state: Path, engine: str | None,
+               env: Mapping[str, str] | None = None) -> Deployment:
+    """The processes AND the addresses they are handed, resolved together (#183).
+
+    THE STARTER SAYS WHAT IT STARTED. `up` started its children with a bare `Popen(argv)`, so each
+    inherited whatever the shell happened to hold and nothing about what had just been started:
+    the UI came up on one port and the panel linked to another; `--panel-port 9000` served the
+    panel on 9000 while every card link the factory wrote said 8787; and a declared
+    `TEMPORAL_ADDRESS=localhost:7300` was honoured by the worker and ignored by the engine, which
+    started on 7233 — so the worker found nothing, exited, and took the set down with it.
+
+    Raises `listeners.CannotHonour` for a declaration it cannot start on; the front end says it.
+    """
+    durable = bool(engine) and the_client()
+    started = listeners.started_by_up(env, panel_port=panel_port, durable=durable)
+    plan = processes(panel_port=started.ports[PANEL.name], state=state, engine=engine,
+                     engine_port=started.ports.get(ENGINE.name, ENGINE.default_port),
+                     ui_port=started.ports.get(ENGINE_UI.name, ENGINE_UI.default_port))
+    return Deployment(plan=plan, env=started.child_env(env), reach=dict(started.reach),
+                      said=started.said)
+
+
+#: How long a child is given to stop after it is asked, before it is made to.
+GRACE_S = 10.0
+
+
+def run(plan: list[tuple[str, list[str]]], *, say, grace: float = GRACE_S,
+        env: Mapping[str, str] | None = None) -> int:
+    """Start them, wait, and stop them together. Returns the exit code for the caller.
+
+    `env` is what every child is started with — `deployment`'s, carrying where each listener was
+    just put (#183). None inherits this process's, as it always did.
+
+    IN THE FOREGROUND, ON PURPOSE. A person starting their own factory wants one window they can
+    read and one Ctrl-C that ends it — not three terminals and a stale pid file. Each child keeps
+    its own stdout, which is why nothing here captures it.
+
+    "TOGETHER" HELD ONLY FOR CTRL-C (#136). Measured on this machine: a SIGTERM to the supervisor
+    (`kill`, a service manager, a closed terminal's SIGHUP) ended it on the spot and left the
+    engine, the worker and the panel running as orphans; a SIGKILL did the same; and a child that
+    did not exit within the wait was simply left there. The panel then held its port with nothing
+    behind it, and a fresh `up` could not bind. So SIGTERM and SIGHUP stop the set exactly as
+    Ctrl-C does, a child that outlives its grace is killed, and a small reaper outlives a
+    supervisor that was killed outright, for exactly as long as it takes to stop what that
+    supervisor started.
+    """
+    started: list[tuple[str, subprocess.Popen]] = []
+    reaper: subprocess.Popen | None = None
+    previous = _stop_on_signals()
+    try:
+        for name, argv in plan:
+            try:
+                started.append((name, subprocess.Popen(argv, env=env)))
+            except OSError as exc:
+                say(f"✗ {name} could not start: {exc}")
+        if not started:
+            return 1
+        reaper = _start_reaper(started, grace=grace, say=say)
+        # CHECKED AFTER IT IS BOUND, NEVER INSIDE THE START. A signal arriving while this waits
+        # raises here, and `reaper` is already the name the `finally` kills. Done inside
+        # `_start_reaper` it was not: a SIGTERM during the wait left the watcher running after an
+        # orderly stop — measured, on a widened window, and it is the very thing the reaper's own
+        # docstring says must not happen, since it then signals pids the set no longer owns.
+        if reaper is not None and not _reaper_is_there(reaper, say=say):
+            reaper = None   # it is gone; there is nothing for the stop path to kill
+        say(f"✓ {', '.join(name for name, _ in started)} — Ctrl-C stops them together.")
+        while True:
+            for name, child in started:
+                if child.poll() is not None:
+                    # ONE DYING ENDS THE SET. A worker that exited while the panel keeps serving
+                    # is a factory that looks up and takes no cards — the silent half-state this
+                    # platform exists to refuse.
+                    say(f"✗ {name} exited ({child.returncode}) — stopping the rest")
+                    raise KeyboardInterrupt
+            time.sleep(0.4)
+    except KeyboardInterrupt:
+        say("stopping…")
+    finally:
+        # THE REAPER FIRST: it exists for a supervisor that died without getting here, and a reaper
+        # left running after an orderly stop would be a process acting on pids that are not ours.
+        if reaper is not None:
+            with contextlib.suppress(Exception):
+                reaper.kill()
+                reaper.wait(timeout=grace)
+        _stop(started, grace=grace)
+        _restore(previous)
+    return 0
+
+
+def _stop_on_signals() -> dict:
+    """SIGTERM and SIGHUP end the set the way Ctrl-C does. The handlers it replaced, to restore."""
+
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous: dict = {}
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):   # not the main thread: nothing to install
+            previous[sig] = signal.signal(sig, interrupt)
+    return previous
+
+
+def _restore(previous: dict) -> None:
+    for sig, handler in previous.items():
+        with contextlib.suppress(ValueError, OSError, TypeError):
+            signal.signal(sig, handler)
+
+
+def _stop(started: list[tuple[str, subprocess.Popen]], *, grace: float) -> None:
+    """Ask every child to stop, give them `grace` together, then make the rest.
+
+    A CHILD THAT DID NOT STOP WAS LEFT RUNNING. `wait(timeout=10)` inside a suppressed block gave up
+    and moved on, so a panel whose shutdown was held by an open stream outlived the set that
+    started it — holding the port a fresh `up` needs."""
+    for _, child in started:
+        with contextlib.suppress(Exception):
+            child.terminate()
+    deadline = time.monotonic() + grace
+    for _, child in started:
+        with contextlib.suppress(Exception):
+            child.wait(timeout=max(0.0, deadline - time.monotonic()))
+    for _, child in started:
+        if child.poll() is None:
+            with contextlib.suppress(Exception):
+                child.kill()
+                child.wait(timeout=grace)
+
+
+#: How long to wait before asking whether the reaper is still there. An import error, a `sys.path`
+#: this process has and the child does not, a missing interpreter — all of them happen at once.
+_REAPER_STARTS_IN_S = 0.3
+
+
+def _start_reaper(started: list[tuple[str, subprocess.Popen]], *, grace: float, say):
+    """The process that stops the children if this one is killed before it can.
+
+    AND IT SAYS SO IF IT DID NOT START. `Popen` raising was the only failure this reported, so a
+    reaper that started and exited at once — the module failing to import on a deployment whose
+    `sys.path` differs from this process's — left the operator believing a SIGKILL was covered,
+    and finding out when a port was held (review of #160)."""
+    argv = [sys.executable, "-m", "beeverforge.runtime.host", "--reap", str(os.getpid()),
+            str(grace), *(str(child.pid) for _, child in started)]
+    try:
+        return subprocess.Popen(argv)
+    except OSError as exc:
+        say(f"! the reaper could not start ({exc}) — if this supervisor is killed outright, its "
+            f"children will outlive it")
+        return None
+
+
+def _reaper_is_there(watcher: subprocess.Popen, *, say) -> bool:
+    """Whether the reaper is still running a beat after it was started.
+
+    SEPARATE FROM STARTING IT, so the caller holds the process while this waits: an interrupt here
+    must leave the watcher in a name the stop path can kill, and inside `_start_reaper` it did
+    not."""
+    time.sleep(_REAPER_STARTS_IN_S)
+    if watcher.poll() is None:
+        return True
+    say(f"! the reaper exited at once ({watcher.returncode}) — if this supervisor is killed "
+        f"outright, its children will outlive it")
+    return False
+
+
+def reap(supervisor: int, pids: list[int], *, grace: float, every: float = 0.5) -> None:
+    """Wait for `supervisor` to die, then stop `pids` — SIGTERM, `grace`, SIGKILL.
+
+    A SUPERVISOR KILLED OUTRIGHT RUNS NO `finally`, and nothing else on a Mac would stop what it
+    started: there is no parent-death signal to ask for. This process is its child, so the moment
+    it is reparented the supervisor is gone. It ignores the terminal's Ctrl-C and hang-up — those
+    reach the supervisor, which stops the set itself and then kills this.
+
+    IT ACTS ON RAW PIDS, AND THAT IS THE ONE WAY IT CAN REACH OUTSIDE THE SET IT OWNS (review of
+    #160). A child that had already exited leaves a pid the system may reuse, and a signal sent
+    here would then reach a stranger's process. The window is narrow — these children are
+    long-lived, and a child that dies normally ends the set through the supervisor, which kills
+    this first — so nothing is restructured for it, but it is why this list is never widened
+    beyond the children of one supervisor and never re-read from anywhere."""
+    while os.getppid() == supervisor:
+        time.sleep(every)
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.2)
+    for pid in pids:
+        if _alive(pid):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+if __name__ == "__main__" and len(sys.argv) >= 4 and sys.argv[1] == "--reap":
+    for _ignored in (signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if _ignored is not None:
+            signal.signal(_ignored, signal.SIG_IGN)
+    reap(int(sys.argv[2]), [int(pid) for pid in sys.argv[4:]], grace=float(sys.argv[3]))

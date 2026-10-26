@@ -1,0 +1,217 @@
+"""Reading a ticket reference without assuming whose it is (C-04).
+
+`contracts/ticket.py` documents a ref as the PROVIDER's own opaque string — `#142` on GitHub,
+`PROJ-31` on Jira, `1234` on Azure DevOps — and `tracker/jira.py` honours that. `product/` did not:
+five sites called `int(str(ref).lstrip("#"))`, and `int("CONT-412")` is a `ValueError`.
+
+WHY THIS IS ITS OWN CARD, SEPARATE FROM THE WIDER REF WORK. The `lstrip("#")` sites elsewhere
+produce a wrong string and a 404 — bad, visible, recoverable. These *raise*, inside the product
+role's write path, AFTER the issues have already been filed. The delivery lands and the client is
+never told, which is exactly the failure ADR-0025 exists to prevent.
+
+WHAT THIS IS NOT. It does not make `product/` provider-neutral. `number: int` is that module's
+domain type across some fifty signatures, and `BoardAdapter.set_column` is itself typed with an
+integer issue id. That is C-05, and it needs a migration of shapes already persisted as dict keys
+and set members (issue #33). What lives here is the narrower promise: a non-numeric ref DEGRADES —
+the work is reported, the courtesy that needs a number is skipped and says so — rather than taking
+the pass down with it.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterable
+
+log = logging.getLogger("beeverforge.refs")
+
+
+def ref_number(ref: object) -> int | None:
+    """The integer a provider's ref carries, or `None` when it does not carry one.
+
+    **`None`, never `0`.** The function this replaces returned `0` on failure, which reads as a
+    number all the way down: a comment addressed to issue #0, or a lookup that silently matches
+    nothing and looks like an empty result. A value that cannot be distinguished from a real one
+    is worse than an absent one.
+
+    **Never raises.** Its callers are mid-write, after work has been filed. Anything that escapes
+    here abandons a delivery somebody was about to be told about.
+    """
+    try:
+        text = str(ref).strip().lstrip("#").strip()
+    except Exception as exc:  # noqa: BLE001 — an object whose __str__ raises is still not a ref
+        log.debug("a value that cannot even be stringified is not a ref (%r): %s", type(ref), exc)
+        return None
+    if not text.isdigit():  # rejects "", "CONT-412", "12a", "1.5", "-5" and "  "
+        return None
+    value = int(text)
+    return value if value > 0 else None  # no tracker issues a zero
+
+
+def ref_numbers(refs: Iterable[object]) -> list[int]:
+    """The numeric refs in a collection, deduplicated and sorted — skipping what is not numeric.
+
+    Sorted and unique because callers render the result to a client as "#3, #12"; losing either
+    property changes what somebody reads. Skipping rather than failing because the alternative is
+    what this card exists to fix: one Jira ref in a set of results taking the whole notification
+    down after the work had already been done.
+    """
+    return sorted({n for n in (ref_number(r) for r in refs) if n is not None})
+
+
+def canonical_ref(ref: object) -> str:
+    """The provider's own ref, without the decoration a human types: `#189` → `189`.
+
+    ONE SPELLING, because `#189` and `189` must never be two tickets. This is the form the ledger
+    has always persisted and the form `beeverforge.actions._clean_ref` produces, so nothing
+    migrates."""
+    return str(ref or "").strip().lstrip("#").strip()
+
+
+def canonical_refs(refs: Iterable[object]) -> list[str]:
+    """The refs in a collection in their one spelling (`canonical_ref`), deduplicated and in board
+    order (`ref_sort_key`) — EVERY provider's, where `ref_numbers` keeps only the numbers (#485).
+
+    WHAT A LEDGER KEYS ON. A requirement's delivery loop was keyed on `ref_numbers`, which drops
+    `CONT-412` and `owner/web#3`: on Jira no requirement's delivery was ever tracked, and on a
+    product of several repositories a card filed in another one was not waited for — or, sharing
+    its number with a card of the tracker's own repository, was mistaken for it. These are the
+    refs the loop's readers compare (`events._deliveries_of`), spelled as they compare them.
+
+    BOARD ORDER, so a numeric collection comes out exactly as `ref_numbers` sorts it: what a
+    GitHub project of one repository writes does not change by a byte."""
+    unique = {canonical_ref(r) for r in refs} - {""}
+    return sorted(unique, key=ref_sort_key)
+
+
+#: The tag the pre-flight splitter writes into the title of every card it creates —
+#: `Plan 92a — Guest hardening [auto-split of #37]`. ONE SPELLING, HERE, because it has two
+#: readers on opposite sides of the package: pre-flight, which recognises its own children and
+#: never re-sizes them, and the delivery sweep, which has to know that #37's work now lives in
+#: other cards (`product/triage.py::delivered_numbers`). It lived in the runtime alone until
+#: 2026-09-19, where the product side could not reach it without importing the whole engine.
+SPLIT_CHILD_MARK = "[auto-split of #"
+
+
+def split_parent_of(title: object) -> str:
+    """The canonical ref of the card this one was SPLIT FROM, or `""` for a card nobody split off.
+
+    Read from the title because that is where the splitter wrote it, deterministically, on every
+    tracker: native parent links are best-effort by contract (`link_child`), and a board already
+    read carries every title — so following a split costs no second read and no vendor call."""
+    _, found, tail = str(title or "").partition(SPLIT_CHILD_MARK)
+    return canonical_ref(tail.partition("]")[0]) if found else ""
+
+
+def split_repo_ref(ref: object, default_repo: str = "") -> tuple[str, str]:
+    """`('owner/name', bare ref)` — a ref may carry its own repository (C-18).
+
+    THE PRODUCT IS NOT A REPOSITORY. One board routes cards to several source repositories, and a
+    bare number is ambiguous the moment a second repo joins: `#3` on `fx-multirepo` names one
+    issue in `…-api` and a different one in `…-web`. The wire form `owner/name#3` carries the
+    repository WITH the ticket, so every consumer — the tracker call, the clone, the board move,
+    the issue URL — acts on the card's own repo instead of the project's default.
+
+    A bare ref (`'12'`, `'#12'`, `'CONT-412'`) resolves to `default_repo` — the single-repo case
+    stays byte-for-byte what it always was, which is what keeps workflow ids, journal names and
+    dedup stable for every project that exists today. The `#` split takes the LAST `#` and demands
+    a `/` on its left, so a Jira ref containing a dash and a human-typed `#189` both stay bare."""
+    # the human decoration comes off FIRST: '#owner/name#3' must never read '#owner/name' as a
+    # repository. No forge allows '#' in an owner or repo name, so this is always safe.
+    text = str(ref or "").strip().lstrip("#").strip()
+    repo, sep, tail = text.rpartition("#")
+    if sep and "/" in repo and tail:
+        return repo, tail
+    return default_repo, canonical_ref(text)
+
+
+def qualify_ref(repo: str, ref: object, default_repo: str = "") -> str:
+    """The wire form of a ref that lives in `repo`: bare when that IS the default repo,
+    `owner/name#<ref>` otherwise (C-18).
+
+    Qualified ONLY when it must be: the bare spelling is what every persisted key, workflow id
+    and journal stem already uses, so qualifying the common case would split one ticket into two
+    identities — the exact defect `canonical_ref` exists to prevent, one level up."""
+    bare = canonical_ref(ref)
+    if not repo or repo == default_repo:
+        return bare
+    return f"{repo}#{bare}"
+
+
+#: A CARD REF AS A PERSON WRITES ONE (#515) — `#12` or `12` on a numbered tracker, `CONT-412` on
+#: Jira, `acme/web#1` on a product of several repositories (`split_repo_ref`). A pattern for TEXT a
+#: model or a person wrote, never for a ref already in hand: that is `canonical_ref`'s. The order
+#: marker read `[#\d]` and nothing else, so on Jira — where no card has a number — an order said in
+#: the conversation matched nothing, nothing was staged, and the marker reached the person as
+#: written.
+REF_AS_WRITTEN = (r"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d{1,12}"    # acme/web#1
+                  r"|[A-Za-z][A-Za-z0-9_]*-\d{1,12}"               # CONT-412
+                  r"|#?\d{1,12})")                                  # #12, 12
+
+
+def refs_written(text: object) -> list[str]:
+    """Every card ref in `text`, IN THE ORDER WRITTEN, each once, in its one spelling
+    (`canonical_ref`) — `"DAR-7, #3, acme/web#1, 3"` is `["DAR-7", "3", "acme/web#1"]`.
+
+    NEVER SORTED, which is the difference from `canonical_refs`: what reads this is an order a
+    person gave, and the order is the whole content. A ref said twice keeps its first place."""
+    found = (canonical_ref(m) for m in re.findall(REF_AS_WRITTEN, str(text or "")))
+    return list(dict.fromkeys(ref for ref in found if ref))
+
+
+def ref_label(ref: object) -> str:
+    """A ref as a PERSON reads it — `#510` on GitHub, `CONT-412` on Jira, `""` for nothing.
+
+    `#` IS GITHUB'S PUNCTUATION, not the platform's, and the sites that render one wrote `f"#{c}"`
+    because every ref they had ever seen was a number. On a Jira board that produces `#CONT-412`,
+    which is not how anybody there writes a ticket and not what a reader can paste back.
+
+    One home, because the question — how do I show this ref to somebody — recurs at every sentence
+    a client reads, and the answer is provider-shaped.
+
+    THE DECORATION COMES OFF A KEY TOO (#497). `promote` answers each card `#{number}`, and a person
+    types `#CONT-412` as readily as `#412`: either is the same ticket, and `#CONT-412` is the
+    spelling this function exists to never show. Stripped like `canonical_ref` strips it, so a
+    label is the same whether its caller held the ref bare or decorated.
+    """
+    text = str(ref or "").strip().lstrip("#").strip()
+    if not text:
+        return ""
+    return f"#{text}" if text.isdigit() else text
+
+
+def ref_sort_key(ref: object) -> tuple[str, int, str]:
+    """Order refs the way a person expects, without making the ref itself a number (C-05).
+
+    THIS IS WHAT THE `int` TYPING WAS ACTUALLY BUYING. Nothing in this codebase does arithmetic on
+    a ticket ref — there is no site that adds, averages or subtracts one. What the `int` bought was
+    ORDERING: `sorted([2, 10])` is `[2, 10]` while `sorted(["2", "10"])` is `["10", "2"]`, so a
+    board sorted as strings comes back shuffled. Board order is what an operator reads.
+
+    So identity and ordering are separated. The ref stays the provider's own string — because it is
+    what goes BACK to the provider, and a comment on `CONT-412` needs `CONT-412`, not `412`. The
+    number is extracted only here, only to sort.
+
+    THE PREFIX SORTS FIRST, and that is the part a plain `int(...)` would get wrong. A Jira board
+    routinely spans several projects, so `CONT-412` and `PROJ-412` sit on it together. Reducing
+    both to `412` would not merely mis-order them — it would make them EQUAL, and a platform that
+    thinks two tickets are one moves the wrong card and comments on the wrong ticket, silently.
+    That is the same shape as the `int(...) or 0` collapse that made the tech-lead's memory report
+    every failure as one ticket (#69).
+
+        CONT-2, CONT-10, PROJ-1  →  ('CONT', 2, …), ('CONT', 10, …), ('PROJ', 1, …)
+
+    The raw ref is the last element so the ordering is TOTAL: two refs that share a prefix and a
+    number (which no tracker issues, but a malformed registry might) still order deterministically
+    instead of depending on the sort's stability.
+    """
+    raw = canonical_ref(ref)
+    number = ref_number(raw)
+    if number is not None:
+        return ("", number, raw)  # a plain numeric ref: GitHub, Azure DevOps, GitLab
+    prefix, _, tail = raw.rpartition("-")
+    digits = ref_number(tail)
+    if prefix and digits is not None:  # the Jira / Linear shape: PROJ-123
+        return (prefix.upper(), digits, raw)
+    # Anything else keeps a stable, if arbitrary, place rather than raising mid-render.
+    return (raw.upper(), 0, raw)
