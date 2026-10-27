@@ -257,10 +257,13 @@ def test_the_panel_only_cli_prints_none_declared_without_a_remedy(panel_only, mo
 # ── the behaviour change is written where a reader checks it ────────────────────────────────────
 
 def test_the_status_page_records_the_behaviour_change_by_the_variable_to_declare():
-    """A deployment that set the old switch must learn from STATUS what to declare now."""
+    """A deployment that set the two Telegram variables must learn from STATUS that they switch
+    nothing on, and what to declare instead. Written in the present tense since 0.1.0: the page
+    states the rule, not the day it changed in a history the public repository does not carry."""
     text = add_ons.STATUS.read_text()
-    assert "Behaviour change (2026-08-26)" in text
-    paragraph = text[text.index("Behaviour change (2026-08-26)"):].split("\n\n", 1)[0]
+    lead = "The deployment-wide fallback notifier is declared, never inferred"
+    assert lead in text
+    paragraph = text[text.index(lead):].split("\n\n", 1)[0]
     assert FALLBACK_ENV in paragraph and "doctor" in paragraph
 
 

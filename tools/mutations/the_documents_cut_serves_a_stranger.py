@@ -93,8 +93,9 @@ MUTATIONS = [
      "repository", SERVE),
 
     ("…and in the prose of the page every reader is told to read first", STATUS,
-     "*installation* belongs to one org. One deployment serves one organisation, and that is now",
-     "*installation* belongs to one org. This is the model docs/core/04 sells, and it is now",
+     "and the forge credential is process-wide. `beeverforge project add` refuses a",
+     "and the forge credential is process-wide. This is the model docs/core/04 sells. "
+     "`beeverforge project add` refuses a",
      SERVE),
 
     ("HOSTILE: the `.gitignore` exemption keeps its `rules` and stops asking WHICH one — one "
@@ -205,24 +206,23 @@ MUTATIONS = [
     # `cut from <sha>` and `is written in` became `was written in`; the binding is the same one
     ("the status line keeps the words `the source tree this page is written in` and drops the "
      "binding — attribution as prose, unresolvable for a reader of the export", STATUS,
-     "Status as of **2026-08-26**, cut from `cb3013d` of `beeverforge`, the source tree this page "
-     "was\nwritten in",
-     "Status as of **2026-08-26**, cut from `cb3013d`, in the source tree this page was\nwritten in",
+     "code at main at `171de5f` of `beeverforge-oss`, where CI ran",
+     "code at main at `171de5f`, in the repository this page is written in, where CI ran",
      SERVE),
 
     ("the version tag loses its binding, and a tag rots exactly like a sha", STATUS,
-     "`v1.1.0` tag of `beeverforge`.", "`v1.1.0` tag.", SERVE),
+     "`v0.1.0` tag of `beeverforge-oss`.", "`v0.1.0` tag.", SERVE),
 
     # re-pinned 2026-09-07: same status line, re-cut — see the row above
     ("the binding names a repository nothing publishes — the shape is right and the answer is "
      "invented", STATUS,
-     "cut from `cb3013d` of `beeverforge`,", "cut from `cb3013d` of `the-old-tree`,", SERVE),
+     "main at `171de5f` of `beeverforge-oss`,", "main at `171de5f` of `the-old-tree`,", SERVE),
 
     ("HOSTILE: the published names become every word on the page, so any binding satisfies the "
      "check", SERVE,
-     '    names = {name, f"{name}-core"}\n    for cell in _cells().values():\n'
+     '    names = {name, f"{name}-oss"}\n    for cell in _cells().values():\n'
      '        names |= set(re.findall(r"beeverforge-[a-z]+", cell))\n    return names',
-     '    names = {name, f"{name}-core"}\n'
+     '    names = {name, f"{name}-oss"}\n'
      '    names |= set(re.findall(r"[\\w.-]+", STATUS.read_text()))\n    return names', SERVE),
 
     ("HOSTILE: the binding may sit in any sentence on the page rather than the ref's own — one "

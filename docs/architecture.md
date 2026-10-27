@@ -1,7 +1,8 @@
 # BeeverForge — Architecture (the big picture)
 
-A presentation-level walkthrough of the whole system. For depth, see [`adr/`](adr/) — 41
-decision records, which are where the *why* actually lives. The durable engine realised on one
+A walkthrough of the whole system as it stands at 0.1.0. For depth, see the decision records in
+[`adr/`](adr/), which are where the *why* lives; for what is measured and what is not yet true,
+see [`STATUS.md`](STATUS.md). The durable engine realised on one
 cloud is drawn in the runtime document that ships with the `beeverforge-aws` add-on package,
 outside this tree.
 
@@ -10,8 +11,8 @@ outside this tree.
 ## 1. What it is, in one idea
 
 An **autonomous software factory**. You drop a ticket on a board; it gets picked up,
-implemented, validated, reviewed, merged, and deployed — with no human pressing "yes" at
-each step. The control model is inverted:
+implemented, validated, reviewed and merged, and its deploy is watched — with no human pressing
+"yes" at each step. The control model is inverted:
 
 ```
    Interactive AI coding          BeeverForge
@@ -27,30 +28,43 @@ It is provider-neutral and multi-project by design.
 
 ---
 
-## 2. The three layers (where we are, where we're going)
+## 2. The three layers
 
 ```
    ┌─────────────────────────────────────────────┐
-   │  KNOWLEDGE LAYER      what EXISTS (reality)   │   ← roadmap
+   │  KNOWLEDGE LAYER      what EXISTS (reality)   │   ← module map built
    │  a generated, source-linked map of the repo  │
    └─────────────────────────────────────────────┘
                         ▲ consumes
    ┌─────────────────────────────────────────────┐
-   │  WORK DEFINITION     what we WANT (intent)    │   ← roadmap
-   │  product / BA / architect agents · RFC→Task  │
+   │  WORK DEFINITION     what we WANT (intent)    │   ← product role built
+   │  requirements · breakdown into cards         │
    └─────────────────────────────────────────────┘
                         ▲ feeds
    ┌─────────────────────────────────────────────┐
-   │  EXECUTION LAYER     build it (TODAY, v1.0)   │   ← shipped
+   │  EXECUTION LAYER     build it                 │   ← built
    │  planner · executor · gates · merge · deploy │
    │  + the tech-lead                             │
    └─────────────────────────────────────────────┘
 ```
 
-**Today we have the Execution Layer, proven.** The **Knowledge Layer's first two phases are
-built** (`knowledge-layer.md`, ADR-0017) but deliberately dormant — every project has them off
-until an A/B shows they lower cost/ticket. The Work layer is still roadmap. Each phase is gated
-on measured value, not on being finished.
+**The Execution Layer** is the whole flow in §3, and it is what [`STATUS.md`](STATUS.md)
+measures.
+
+**The Knowledge Layer** is built as far as its deterministic parts ([`knowledge-layer.md`](knowledge-layer.md)
+§20, ADR-0017): a module map (Phase 1), regenerated on every merge and published to the project's
+context repository (Phase 2a), and the API, schema and decision-record indexes (Phase 2b). It is
+**on by default** (`knowledge_map: true`, [ADR-0035](adr/0035-knowledge-layer-on-by-default.md)):
+the map is handed to the agent only when its checksums prove it describes the job's own checkout,
+and otherwise nothing is handed. The measurement behind that decision is not published here.
+
+**The Work Definition Layer** is the product role ([ADR-0019](adr/0019-product-role-and-requirements-repo.md),
+`beeverforge/product/`, [`reference/product-role.md`](reference/product-role.md)), opt-in per
+project. One agent acts as product owner and business analyst: requirements are reviewed documents
+in a context repository, a requirement is broken down into cards, each card is drafted, checked
+and judged before a person confirms it, and production sits behind a human release gate. There is
+no separate architect role, and ordering across repositories is designed, not built
+([ADR-0036](adr/0036-cross-repo-ordering.md)).
 
 ---
 
@@ -64,7 +78,7 @@ on measured value, not on being finished.
   │   (INVEST)     │   Unclear? → ask a human. Fit? → go.
   └──────┬─────────┘
          ▼
-     IMPLEMENT  ── a single agent, test-driven, in an isolated ephemeral box
+     IMPLEMENT  ── a single agent, test-driven, in a box (a throwaway container or a worktree)
          │
          ▼
      VALIDATE   ── the platform runs the project's OWN gates (test/lint/type/security…)
@@ -186,9 +200,8 @@ Three consequences follow, and they are better read here than discovered in prod
   restricted network or a proxy is configuration rather than a code change — but the harness
   endpoint must be reachable through it, and a TLS-intercepting corporate CA has to be trusted by
   the client's own image, which is one more reason that image is theirs.
-- **The box has full outbound internet by default** (`network: bridge`). `ContainerSandbox`'s
-  docstring once claimed a deny-by-default policy it did not have; the true statement is in its
-  place — anything the box's network can reach is reachable by code the agent wrote.
+- **The box has full outbound internet by default** (`network: bridge`). Anything the box's
+  network can reach is reachable by code the agent wrote.
 
 ---
 
@@ -196,7 +209,8 @@ Three consequences follow, and they are better read here than discovered in prod
 
 Every external dependency is behind an **adapter**, and every adapter is chosen by a **registry**
 from the project's configuration — `kind → builder`, unknown kind raises. No module outside a
-provider's own package names a concrete class; an AST test enforces it (ADR-0022).
+provider's own package names a concrete class; an AST test enforces it (ADR-0022,
+`tests/test_provider_seams.py`).
 
 ```
    axis        protocol              ships in the core                                          a third one
@@ -220,10 +234,11 @@ chat channel arrive exactly that way (`beeverforge-aws`, `beeverforge-slack`);
 [`STATUS.md`](STATUS.md) lists which paths of this tree leave with them.
 
 **The bar is "born with two", not "has an interface".** An axis with one implementation and a
-Protocol is agnostic on paper and single-vendor in the composition root — which is exactly what an
-audit on 2026-07-28 found: `GitHubIssuesTracker` constructed by name in twelve places, `GitHubForge`
-in eleven, and the board not existing as a concept at all. Protocols are `@runtime_checkable` and
-the tests use `isinstance`, because a protocol nobody checks is documentation.
+Protocol is agnostic on paper and single-vendor in the composition root. The axes above meet the
+bar; `channel`, `notifier`, `session_store`, `token_pool` and `box_runner` do not yet, and no test
+enforces the rule ([`STATUS.md`](STATUS.md), known gaps). `tests/test_provider_seams.py` holds the
+part that is enforced: every axis dispatches through its registry, an unknown kind raises, and no
+call site names a concrete class.
 
 **The STACK needs no adapter and never did.** The platform names no build command — no `mvn`,
 `dotnet`, `composer`, `npm`. The client's manifest declares `validate:` and the framework runs what
@@ -253,12 +268,17 @@ repository, its own board, and its own channel where one is connected.
   nothing and never duplicates (no double PRs/merges).
 - **The floor frees at merge, not at agent-done** — the next ticket builds on a base that
   includes this one (dependency safety).
-- **Quality is a floor, not goodwill** — a project cannot switch off the gates the
-  framework requires.
+- **Quality is a floor, not goodwill** — a project with no `test` command is held before any
+  agent runs, and there is no switch that turns the floor off. The floor checks that the `test`
+  and `security` gates exist, not what they run, and the inherited `security` gate is advisory
+  ([`STATUS.md`](STATUS.md), known gaps).
 - **The code is the source of truth** — agents verify against real files; the knowledge map
   accelerates finding code and never replaces reading it. A map that cannot be proven fresh
   against the agent's own checkout is not served at all.
-- **Everything is attributed to the bot**, never a human. Least privilege throughout.
+- **Everything is attributed to the bot**, never a human. The bot is denied the `workflows`
+  permission, so an agent cannot rewrite the CI that gates it. Per-project permission tightening is
+  not implemented: the manifest's `permissions` field is accepted and has no effect
+  (`beeverforge/loader.py::_INERT`).
 
 **What "asks a human" looks like from the outside.** These six are what a self-hosting operator
 meets in the first week; each is the factory working, not the factory broken.
@@ -270,7 +290,7 @@ meets in the first week; each is the factory working, not the factory broken.
 | a **"pre-flight sizing did not run"** comment | the sizing gate DEGRADED: it could not judge (harness token missing on the worker, a clone or sizer error, a garbage verdict), so the ticket ran UNSIZED | the gate is broken, not the ticket. The worker's log carries `BEEVERFORGE_PREFLIGHT: DEGRADED` and the cause — usually the worker's own harness token. The ticket still ran (degrade-safe); do not read its size as clean |
 | a ticket **split into `Plan Na` / `Nb`**, parent closed | pre-flight judged it too large to be one INVEST ticket | nothing. The children are already in TO-DO and run in order, each carrying the parent's scope and other sections under **From the parent card (#N)**; when those did not fit in the card, a line says so and links the parent, where the rest is. Reopen or merge back only if the split was wrong |
 | **ON_HOLD, "effort budget exhausted"** | the ticket out-ran `effort_budget_turns` even after recovery (ADR-0013) | the partial work is on the branch and is resumable. **Decide:** split the remainder into a follow-up, or raise `effort_budget_turns` and Resume. Never "go read the code" |
-| **`.okf/repos/<owner>--<name>/`** appears in the project's CONTEXT repository (never the driven repo itself) | the knowledge pipeline (ADR-0017) publishing the generated module map — `modules.yaml` + `manifest.yaml`, never product code, one commit per merge that changes sources | nothing. It requires `product.docs_repo` to be set (`beeverforge onboard`); with none, the refresh is a no-op. To stop it, set `knowledge_map: false` in that project's `.beeverforge/project.yaml`. It never touches the driven repo and never triggers its deploy |
+| **`.okf/repos/<owner>--<name>/`** appears in the project's CONTEXT repository (never the driven repo itself) | the knowledge pipeline (ADR-0017, on by default since ADR-0035) publishing the generated module map — `modules.yaml` + `manifest.yaml`, never product code, one commit per merge that changes sources | nothing. It requires `product.docs_repo` to be set (`beeverforge onboard`); with none, the refresh is a no-op. To stop it, set `knowledge_map: false` in that project's `.beeverforge/project.yaml`. It never touches the driven repo and never triggers its deploy |
 
 ---
 
@@ -284,24 +304,23 @@ meets in the first week; each is the factory working, not the factory broken.
   Q&A the panel already carries, delivered where a team already talks. The chat connector is an
   add-on package (`beeverforge-slack`), not part of the core; nothing in the platform depends on
   it, and no capability lives only there.
-- **The durable engine's own UI** (internal): deep workflow debugging, for free.
+- **The durable engine's own UI** (internal): workflow-level debugging.
 
 ---
 
-## 9. Where it's going
+## 9. What is not built
 
-The dashboard isn't just reporting — it's the **instrument** that gates the next tier. The
-**Knowledge Layer** is built as far as a deterministic module map (Phase 1) regenerated on every
-merge and persisted in the client repo (Phase 2a) — and it is **off everywhere** until it
-**measurably lowers cost/ticket**. Building it was cheap; turning it on is the decision the
-numbers make. Then APIs/schema/ADRs → business rules → the Work Definition Layer with product
-agents. The cathedral gets built one proven stone at a time.
+- **The non-deterministic knowledge phases.** Business-rule summaries (Phase 3 of
+  [`knowledge-layer.md`](knowledge-layer.md) §20) and separate knowledge agents (Phase 4) are not
+  built.
+- **Ordering across repositories** ([ADR-0036](adr/0036-cross-repo-ordering.md)): two repositories
+  are two floors.
+- **A transition table for `JobState`** (`contracts/state.py`): some states are declared and never
+  assigned ([`STATUS.md`](STATUS.md), known gaps).
 
 ---
 
 ## 10. Status
 
-**v1.0.0** — proven in production: hundreds of tickets shipped autonomously, multi-ticket
-plans decomposed + built + merged + deployed, the tech-lead diagnosing live, real per-task cost
-telemetry flowing. The Knowledge Layer's first two phases sit on
-top of this base, opt-in and unproven — awaiting their A/B.
+**0.1.0.** What has been measured, on which deployments, and every known gap are in
+[`STATUS.md`](STATUS.md), which is the one place those numbers live.
