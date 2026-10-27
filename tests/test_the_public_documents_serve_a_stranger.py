@@ -660,7 +660,7 @@ def _published_names() -> set[str]:
     the distribution's with the suffix the export carries."""
     meta = tomllib.loads((ROOT / "pyproject.toml").read_text())
     name = meta["project"]["name"]
-    names = {name, f"{name}-core"}
+    names = {name, f"{name}-oss"}
     for cell in _cells().values():
         names |= set(re.findall(r"beeverforge-[a-z]+", cell))
     return names
@@ -723,8 +723,8 @@ def test_the_published_names_include_the_export_and_the_packages():
     meta = tomllib.loads((ROOT / "pyproject.toml").read_text())
     known = _published_names()
     assert meta["project"]["name"] in known
-    assert f"{meta['project']['name']}-core" in known
-    assert {p for p in known if p.startswith("beeverforge-") and not p.endswith("-core")}, (
+    assert f"{meta['project']['name']}-oss" in known
+    assert {p for p in known if p.startswith("beeverforge-") and not p.endswith("-oss")}, (
         "the add-on packages docs/STATUS.md lists are not in the published names")
     assert "main" not in known and "tag" not in known, (
         "the derivation is admitting ordinary words — the binding would then accept anything")
