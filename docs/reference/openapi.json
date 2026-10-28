@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BeeverForge",
-    "version": "0.1.0-rc.1"
+    "version": "0.2.0.dev0"
   },
   "paths": {
     "/api/preview/{project}/{unit}": {
