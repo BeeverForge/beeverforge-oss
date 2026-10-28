@@ -432,6 +432,10 @@ and what the workaround is.
    - The pull request carries the label `no-release-note`: its notes are the fragments'.
    - The check `release-note` refuses a final version whose notes are not in `CHANGELOG.md`, or
      whose pull request leaves a fragment behind.
+   - No test and no mutation plan reads a fragment: this commit removes the ones it uses, so a
+     reader of one fails on the final's pull request, as a guard of OpenFactory 0.7.0 did
+     ([openfactory-core#1149](https://github.com/BeeverForge/openfactory-core/pull/1149)). A guard
+     reads the document a text lives in for good.
 2. **Rehearse the upgrade on that commit**, as rule 2 says: when only the version line and the
    notes changed since the last verified candidate, record that candidate's rehearsal for the
    final.

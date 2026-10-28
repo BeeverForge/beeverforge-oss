@@ -8,7 +8,7 @@ code at main at `171de5f` of `beeverforge-oss`, where CI ran 24,161 tests green 
 2026-10-26.
 
 BeeverForge 0.1.0 is OpenFactory 0.7.0 under a new name; its earlier history is at
-<https://github.com/Open-Factory-Digital/openfactory-core>.
+<https://github.com/BeeverForge/openfactory-core>.
 
 > **This is the one page that carries a count.** Other documents link here rather than type a
 > number (`tests/test_the_docs_do_not_drift.py` holds that rule), so a stale count can only be
