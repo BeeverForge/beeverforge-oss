@@ -234,6 +234,10 @@ The suite runs in both orders on every change and new guards are proven by mutat
 count — the current size, the commit it was measured at, and everything that is NOT settled are
 in [`docs/STATUS.md`](docs/STATUS.md), which is the one place any of those numbers live.
 
+BeeverForge was previously released as OpenFactory, up to 0.7.0 (`openfactory` on PyPI).
+BeeverForge 0.1.0 is OpenFactory 0.7.0 under a new name; its earlier history is at
+<https://github.com/Open-Factory-Digital/openfactory-core>.
+
 ## Taking part
 
 Issues and pull requests are welcome, and the bar is written down rather than implied:

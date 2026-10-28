@@ -10,8 +10,8 @@ TEST = "tests/test_the_operator_path_names_what_the_code_mints.py"
 MUTATIONS = [
     ("the page cites the tag with no owner beside it",
      "docs/STATUS.md",
-     "`v1.1.0` tag of `beeverforge`.",
-     "`v1.1.0` tag."),
+     "`v0.1.0` tag of `beeverforge-oss`.",
+     "`v0.1.0` tag."),
     ("the owner is read as a literal instead of from the status line",
      "tests/test_the_operator_path_names_what_the_code_mints.py",
      '    attribution = f"of `{owner.group(1)}`"',
@@ -28,6 +28,6 @@ MUTATIONS = [
     # `cut from <sha>`, and the sha with it; the binding this row deletes is the same one
     ("the status line stops naming whose history its commit is",
      "docs/STATUS.md",
-     "cut from `cb3013d` of `beeverforge`, the source tree this page was",
-     "cut from `cb3013d`, the source tree this page was"),
+     "main at `171de5f` of `beeverforge-oss`, where CI ran",
+     "main at `171de5f`, where CI ran"),
 ]
