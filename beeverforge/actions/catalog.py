@@ -7887,9 +7887,9 @@ def _the_board_step(project, *, board_owner: str) -> dict:
 
     A BOARD THAT IS THERE ALREADY IS COMPLETED where its row says `create` may be called on it
     (`completes_an_attached_board`): that is how a re-run gives a local board made before "Needs
-    Review" existed its seventh column, the opt-in that OpenFactory 0.7.0's upgrade notes describe
-    (openfactory-core#753). The step says `done` only when the board has a key it lacked before, and
-    says a column the row declined to add, with the way in (`left_out`)."""
+    Review" existed its seventh column, an opt-in for the boards made before it. The step says
+    `done` only when the board has a key it lacked before, and says a column the row declined to
+    add, with the way in (`left_out`)."""
     from beeverforge import plugins
     from beeverforge.adapters.board_setup.base import BoardSetupError
     from beeverforge.adapters.board_setup.registry import board_creator

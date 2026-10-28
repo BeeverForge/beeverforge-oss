@@ -1,11 +1,9 @@
-"""No test and no mutation plan reads a release-note fragment, proven by adding a reader back
-(ported from openfactory-core#1151).
+"""No test and no mutation plan reads a release-note fragment, proven by adding a reader back.
 
 Run:  .venv/bin/python tools/mutate.py tools/mutations/1149_no_test_reads_a_release_note_fragment.py
 
-The final's commit removes every fragment it assembles, so a reader turned red on OpenFactory
-0.7.0's final pull request and nowhere before it (openfactory-core#1149). Each row puts back one of
-the two readers that change retired:
+The final's commit removes every fragment it assembles, so a reader turns red on the final's pull
+request and nowhere before it. Each row puts back one of the two readers the guard retired:
 
   1. The Kimi documents' guard reads `changes/362.limitation.md` again, as a `DOCUMENTS` row.
      Held by `test_no_test_or_plan_names_a_fragment_in_its_code`, while the fragment is in the

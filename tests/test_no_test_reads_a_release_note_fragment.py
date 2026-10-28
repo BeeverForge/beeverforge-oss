@@ -1,13 +1,12 @@
 """No test and no mutation plan reads a release-note fragment (docs/RELEASING.md §5).
 
 The final's commit removes every fragment it assembles, so a reader of one turns red on the final's
-pull request and nowhere before it: OpenFactory 0.7.0's did (openfactory-core#1149, 5 failed across
-unit 1, 3 and 4). This finds the reader on the pull request that adds it. Parsed, not grepped: a
-docstring or a comment that NAMES a fragment is history and reads nothing, so only string values the
-code evaluates count, and only those naming a fragment that is in the tree (the release-note tests
-build their fragments in `tmp_path`, under names no real one carries). Right after a final
-`changes/` is empty, so the first test checks nothing until the next fragment lands; the second
-always applies.
+pull request and nowhere before it. This finds the reader on the pull request that adds it. Parsed,
+not grepped: a docstring or a comment that NAMES a fragment is history and reads nothing, so only
+string values the code evaluates count, and only those naming a fragment that is in the tree (the
+release-note tests build their fragments in `tmp_path`, under names no real one carries). Right
+after a final `changes/` is empty, so the first test checks nothing until the next fragment lands;
+the second always applies.
 """
 
 from __future__ import annotations
