@@ -59,8 +59,8 @@ MUTATIONS = [
      '    pass'),
     ("STATUS's behaviour-change paragraph stops naming the variable to declare",
      "docs/STATUS.md",
-     "`BEEVERFORGE_NOTIFIER_FALLBACK=telegram` declares it (with `beeverforge-slack` installed). A",
-     "the fallback declaration names it (with `beeverforge-slack` installed). A"),
+     "`BEEVERFORGE_NOTIFIER_FALLBACK=telegram` declares it (with `beeverforge-slack` installed). Without",
+     "the fallback declaration names it (with `beeverforge-slack` installed). Without"),
     # ── the dev extra is this tree's suite, not a vendor's ──────────────────────────────────────
     # RE-PINNED 2026-10-19 (#681): the durable runtime's floor is 1.29 now. Same cut.
     ("the core's dev extra carries a cloud SDK again",
@@ -71,7 +71,7 @@ MUTATIONS = [
     # ── finding 2: the signal is a row ──────────────────────────────────────────────────────────
     ("STATUS loses the addons/ row while four guards test for that path",
      "docs/STATUS.md",
-     "| `addons/` | the add-on packages themselves — each is built from this tree into its own wheel and installed beside the core; private, and the documents of the deployment a package carries live under its own `docs/` |\n",
+     "| `addons/` | the add-on packages, each installed beside the core as its own wheel; the documents of the deployment a package carries are in that package |\n",
      "", CUT),
     # ── finding 3: CI lints what the gate lints ─────────────────────────────────────────────────
     ("the Makefile's lint line drops the add-on packages",
