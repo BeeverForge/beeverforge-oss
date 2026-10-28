@@ -236,7 +236,7 @@ in [`docs/STATUS.md`](docs/STATUS.md), which is the one place any of those numbe
 
 BeeverForge was previously released as OpenFactory, up to 0.7.0 (`openfactory` on PyPI).
 BeeverForge 0.1.0 is OpenFactory 0.7.0 under a new name; its earlier history is at
-<https://github.com/Open-Factory-Digital/openfactory-core>.
+<https://github.com/BeeverForge/openfactory-core>.
 
 ## Taking part
 
