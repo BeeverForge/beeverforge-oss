@@ -7887,7 +7887,7 @@ def _the_board_step(project, *, board_owner: str) -> dict:
 
     A BOARD THAT IS THERE ALREADY IS COMPLETED where its row says `create` may be called on it
     (`completes_an_attached_board`): that is how a re-run gives a local board made before "Needs
-    Review" existed its seventh column, the opt-in `changes/753.upgrade.md` gives. The step says
+    Review" existed its seventh column, an opt-in for the boards made before it. The step says
     `done` only when the board has a key it lacked before, and says a column the row declined to
     add, with the way in (`left_out`)."""
     from beeverforge import plugins
