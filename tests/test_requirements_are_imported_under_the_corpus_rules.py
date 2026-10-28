@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from beeverforge import actions
+from beeverforge import actions, gitpin
 from beeverforge.product import importing
 from beeverforge.product.authoring import add_decision_row, render_requirement, slugify
 from beeverforge.product.corpus import (
@@ -967,7 +967,7 @@ def test_the_push_happens_under_the_products_semaphore(deployment, monkeypatch):
     real = authoring._git
 
     def _watched(args, cwd=None):
-        if args[:1] == ["push"]:
+        if gitpin.subcommand(args) == "push":
             held.append(semaphore.held_here(deployment.project))
         return real(args, cwd=cwd)
 
