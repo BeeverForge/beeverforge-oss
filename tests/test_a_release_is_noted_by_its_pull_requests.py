@@ -525,9 +525,9 @@ def test_the_changelog_is_in_the_tree_from_the_first_release_made_this_way():
     assert tracked.returncode == 0, "CHANGELOG.md is not tracked"
 
     versions = re.findall(r"^## (\d+)\.(\d+)\.(\d+)", (ROOT / "CHANGELOG.md").read_text(), re.M)
-    assert all((int(a), int(b)) >= (0, 6) for a, b, _ in versions), (
-        "CHANGELOG.md starts from 0.6.0, the first release whose notes were assembled; the "
-        "notes of the earlier ones are on their release pages")
+    assert all((int(a), int(b)) >= (0, 1) for a, b, _ in versions), (
+        "CHANGELOG.md starts from 0.1.0, BeeverForge's first release; OpenFactory's notes, up to "
+        "0.7.0, are in BeeverForge/openfactory-core's CHANGELOG.md")
 
 
 def _subcommands() -> set[str]:
