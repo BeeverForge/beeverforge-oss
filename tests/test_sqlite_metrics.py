@@ -20,6 +20,9 @@ deployment quietly keeps client messages for ever while its own ADR says it does
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import stat
 import subprocess
 import sys
 import textwrap
@@ -312,3 +315,42 @@ def test_the_json_payload_is_not_a_second_source_of_truth(tmp_path):
     blob = json.loads(data)
     assert (pk, kind, ticket) == (row["pk"], row["kind"], row["ticket"])
     assert blob["kind"] == kind and blob["ticket"] == ticket
+
+
+# ── the store's mode (#228) ─────────────────────────────────────────────────────────────────────
+# The store holds clients' messages and the audit trail. Created by `sqlite3.connect` it took the
+# process's umask — `0644` under the usual `022`, readable by every user on the machine.
+
+
+@pytest.mark.parametrize("umask", [0o000, 0o022, 0o277])
+def test_a_new_store_is_private_whatever_the_umask(tmp_path, umask):
+    db = tmp_path / "m.db"
+    old = os.umask(umask)
+    try:
+        SqliteMetricsSink(db).record(_rec())
+    finally:
+        os.umask(old)
+    assert db.exists()
+    assert stat.S_IMODE(db.stat().st_mode) == 0o600
+    wal = tmp_path / "m.db-wal"
+    if wal.exists():
+        assert stat.S_IMODE(wal.stat().st_mode) == 0o600
+    assert len(SqliteMetricsSink(db).scan()) == 1   # still writable, even under umask 0o277
+
+
+def test_a_store_first_created_by_a_read_is_private_too(tmp_path):
+    db = tmp_path / "fresh" / "m.db"
+    old = os.umask(0o022)
+    try:
+        assert SqliteMetricsSink(db).scan() == []
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(db.stat().st_mode) == 0o600
+
+
+def test_an_existing_store_keeps_its_mode(tmp_path):
+    db = tmp_path / "m.db"
+    sqlite3.connect(db).close()
+    db.chmod(0o640)
+    SqliteMetricsSink(db).record(_rec())
+    assert stat.S_IMODE(db.stat().st_mode) == 0o640
