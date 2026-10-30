@@ -61,3 +61,49 @@ def test_a_list_project_answers_400_naming_it_and_logs_no_traceback(caplog):
     assert "project" in r.json()["detail"]
     assert r.json()["data"]["reason"] == "bad_parameters"
     assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR or rec.exc_info]
+
+
+@pytest.mark.parametrize(("row", "params", "bad"), [
+    ("enable", {"project": "demo", "enabled": ["a"]}, "enabled"),
+    ("enable", {"project": "demo", "enabled": "no"}, "enabled"),
+    ("start", {"project": "demo", "issue": "12", "promote": {"x": 1}}, "promote"),
+    ("start", {"project": "demo", "issue": "12", "durable": 1}, "durable"),
+])
+async def test_a_value_that_is_not_a_boolean_where_one_is_declared_is_refused(row, params, bad,
+                                                                               monkeypatch):
+    from beeverforge.actions import catalog
+
+    async def runner(**_: object) -> actions.Outcome:
+        raise AssertionError("the row ran")
+
+    original = catalog.CATALOG[row]
+    stub = dataclasses.replace(original, run=runner)
+    monkeypatch.setitem(catalog.CATALOG, row, stub)
+    # The stub carries the original runner's declared types, so the check reads those.
+    monkeypatch.setattr(actions, "_declared_types",
+                        lambda found, _real=actions._declared_types: _real(original))
+
+    out = await actions.perform(row, by=actions.Actor(id="U9", via="cli", admin=True), **params)
+
+    assert out.ok is False
+    assert out.code == actions.INVALID
+    assert out.data["reason"] == "bad_parameters"
+    assert bad in out.message and "true or false" in out.message
+    assert "\n" not in out.message and out.message.count(". ") == 0
+
+
+def test_a_boolean_or_nothing_passes_where_a_boolean_is_declared():
+    assert _check_params(actions.spec("enable"), {"project": "demo", "enabled": False}) == ""
+    assert _check_params(actions.spec("enable"), {"project": "demo", "enabled": None}) == ""
+
+
+def test_every_type_a_row_declares_is_one_the_check_knows():
+    """A row that declares a type the check does not know would let any value through it again."""
+    from beeverforge.actions import _ACCEPTS, _declared_types, catalog
+
+    unknown = sorted(f"{key}.{p}: {_declared_types(row).get(p)!r}"
+                     for key, row in catalog.CATALOG.items()
+                     for p in row.parameters
+                     if p in _declared_types(row)
+                     and _declared_types(row)[p] not in _ACCEPTS)
+    assert unknown == []

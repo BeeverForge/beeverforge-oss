@@ -463,15 +463,30 @@ def _check_params(found: ActionSpec, params: dict[str, object]) -> str:
                 + (", ".join(found.parameters) or "no parameters") + ".")
     declared = _declared_types(found)
     for p in found.parameters:
-        if p in params and declared.get(p) in ("str", str) and not isinstance(params[p], _SCALARS):
-            return (f"'{found.name}' takes {p} as a string, not a "
+        if p not in params or declared.get(p) not in _ACCEPTS:
+            continue
+        word, accepted = _ACCEPTS[declared[p]]
+        if accepted and not isinstance(params[p], accepted):
+            return (f"'{found.name}' takes {p} as {word}, not a "
                     f"{type(params[p]).__name__} — nothing was done.")
     return ""
 
 
-#: What a `str` parameter accepts. Not only `str`: the CLI turns `true`/`false` into booleans and
-#: ticket numbers arrive as ints, and the layer already passes those through `str()`.
-_SCALARS = (str, int, float, bool, type(None))
+#: Every type a row's runner declares, with what a value for it must be: `(how the refusal names
+#: the type, the classes it accepts)`. An empty tuple accepts anything (`object`).
+#:
+#: A `str` parameter accepts any scalar, not only `str`: the CLI turns `true`/`false` into
+#: booleans and ticket numbers arrive as ints, and the rows pass those through `str()`. A `bool`
+#: parameter accepts only a boolean: the CLI already sends `true`/`false` as one, and a string
+#: such as "no" would reach `bool()` and mean yes. `None` stays what an optional value may be.
+#: `tests/test_a_parameter_of_the_wrong_type_is_refused.py` fails when a row declares a type
+#: missing here.
+_STR = ("a string", (str, int, float, bool, type(None)))
+_BOOL = ("true or false", (bool, type(None)))
+_ANY = ("anything", ())
+_ACCEPTS: dict[object, tuple[str, tuple[type, ...]]] = {
+    "str": _STR, str: _STR, "bool": _BOOL, bool: _BOOL, "object": _ANY, object: _ANY,
+}
 
 
 def _declared_types(found: ActionSpec) -> dict[str, object]:
@@ -485,7 +500,8 @@ def _declared_types(found: ActionSpec) -> dict[str, object]:
         sig = inspect.signature(found.run)
     except (TypeError, ValueError):
         return {}
-    return {name: prm.annotation for name, prm in sig.parameters.items()}
+    return {name: prm.annotation for name, prm in sig.parameters.items()
+            if isinstance(prm.annotation, (str, type))}
 
 
 #: What a tracker actually calls a ticket: `189` (GitHub, optionally `#`-prefixed), `CONT-412`
