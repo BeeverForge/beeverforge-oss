@@ -63,14 +63,15 @@ def test_a_list_project_answers_400_naming_it_and_logs_no_traceback(caplog):
     assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR or rec.exc_info]
 
 
-@pytest.mark.parametrize(("row", "params", "bad"), [
-    ("enable", {"project": "demo", "enabled": ["a"]}, "enabled"),
-    ("enable", {"project": "demo", "enabled": "no"}, "enabled"),
-    ("start", {"project": "demo", "issue": "12", "promote": {"x": 1}}, "promote"),
-    ("start", {"project": "demo", "issue": "12", "durable": 1}, "durable"),
+@pytest.mark.parametrize(("row", "params", "bad", "said"), [
+    ("enable", {"project": "demo", "enabled": ["a"]}, "enabled", "not a list"),
+    ("enable", {"project": "demo", "enabled": "no"}, "enabled", "not a string"),
+    ("start", {"project": "demo", "issue": "12", "promote": {"x": 1}}, "promote", "not an object"),
+    ("start", {"project": "demo", "issue": "12", "durable": 1}, "durable",
+     "'start' takes durable as true or false, not a number — nothing was done."),
 ])
 async def test_a_value_that_is_not_a_boolean_where_one_is_declared_is_refused(row, params, bad,
-                                                                               monkeypatch):
+                                                                               said, monkeypatch):
     from beeverforge.actions import catalog
 
     async def runner(**_: object) -> actions.Outcome:
@@ -89,7 +90,19 @@ async def test_a_value_that_is_not_a_boolean_where_one_is_declared_is_refused(ro
     assert out.code == actions.INVALID
     assert out.data["reason"] == "bad_parameters"
     assert bad in out.message and "true or false" in out.message
+    assert said in out.message
     assert "\n" not in out.message and out.message.count(". ") == 0
+
+
+def test_the_refusal_names_the_value_in_the_callers_terms():
+    """The panel's caller sends JSON, not Python: no class names, and the article is in the word."""
+    assert _check_params(actions.spec("product_status"), {"project": {"x": 1}}) == (
+        "'product_status' takes project as a string, not an object — nothing was done.")
+    assert _check_params(actions.spec("product_status"), {"project": ["a"]}) == (
+        "'product_status' takes project as a string, not a list — nothing was done.")
+    assert _check_params(actions.spec("product_status"), {"project": {"a"}}) == (
+        "'product_status' takes project as a string, not a value of another kind"
+        " — nothing was done.")
 
 
 def test_a_boolean_or_nothing_passes_where_a_boolean_is_declared():

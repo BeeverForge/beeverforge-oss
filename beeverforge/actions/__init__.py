@@ -467,9 +467,18 @@ def _check_params(found: ActionSpec, params: dict[str, object]) -> str:
             continue
         word, accepted = _ACCEPTS[declared[p]]
         if accepted and not isinstance(params[p], accepted):
-            return (f"'{found.name}' takes {p} as {word}, not a "
-                    f"{type(params[p]).__name__} — nothing was done.")
+            return (f"'{found.name}' takes {p} as {word}, not "
+                    f"{_KIND.get(type(params[p]), 'a value of another kind')} — nothing was done.")
     return ""
+
+
+#: How a refusal names the value it was given: in the caller's terms (the panel sends JSON, not
+#: Python), with the article in the word, never a Python class name. Looked up by exact type, so a
+#: `bool` is never read as the `int` it subclasses.
+_KIND: dict[type, str] = {
+    list: "a list", dict: "an object", int: "a number", float: "a number",
+    str: "a string", bool: "true or false",
+}
 
 
 #: Every type a row's runner declares, with what a value for it must be: `(how the refusal names
