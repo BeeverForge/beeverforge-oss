@@ -83,7 +83,13 @@ from pathlib import Path
 
 from beeverforge.adapters.board.base import stage_column
 from beeverforge.contracts.document import INTERNAL
-from beeverforge.contracts.refs import canonical_ref, ref_label, ref_sort_key, split_repo_ref
+from beeverforge.contracts.refs import (
+    board_key,
+    canonical_ref,
+    ref_label,
+    ref_sort_key,
+    split_repo_ref,
+)
 from beeverforge.ops.impediment import PRODUCT_BOARD_UNREADABLE as _IMP_BOARD
 from beeverforge.ops.impediment import PRODUCT_CANNOT_WRITE as _IMP_WRITE
 from beeverforge.ops.impediment import PRODUCT_CORPUS_UNREADABLE as _IMP_CORPUS
@@ -4724,10 +4730,11 @@ class ProductModule:
         for number in numbers:
             # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): `dar-2` is resolved to the read's
             # own spelling, `DAR-2`, so the lookup, `holds` and the door all see the card the board
-            # placed. Only a key the read returned is taken; any other ref stays as it was given
+            # placed. Only a key the read returned is taken; any other ref stays as it was given.
+            # An unread batch resolves nothing here: the door reads the board again and looks the
+            # card up through the same `board_key` (`lifecycle/ports.py::Ports.seen`)
             if where is not None and not where.get(str(number)):
-                folded = canonical_ref(number).upper()
-                number = next((k for k in where if str(k).upper() == folded), number)
+                number = board_key(where, number) or number
             # ANOTHER PROJECT'S CARD (review round 2 of #752): `where` is this project's slice of a
             # shared tracker, and the move below reaches the card by key — as `_stage` asks.
             # AN UNREAD BATCH ASKS TOO (PR #884 review, 2026-10-19): with `where is None` skipped,
