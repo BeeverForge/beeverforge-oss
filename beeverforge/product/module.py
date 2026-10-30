@@ -4722,6 +4722,12 @@ class ProductModule:
             where = None
         out: list[WriteResult] = []
         for number in numbers:
+            # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): `dar-2` is resolved to the read's
+            # own spelling, `DAR-2`, so the lookup, `holds` and the door all see the card the board
+            # placed. Only a key the read returned is taken; any other ref stays as it was given
+            if where is not None and not where.get(str(number)):
+                folded = canonical_ref(number).upper()
+                number = next((k for k in where if str(k).upper() == folded), number)
             # ANOTHER PROJECT'S CARD (review round 2 of #752): `where` is this project's slice of a
             # shared tracker, and the move below reaches the card by key — as `_stage` asks.
             # AN UNREAD BATCH ASKS TOO (PR #884 review, 2026-10-19): with `where is None` skipped,

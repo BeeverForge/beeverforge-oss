@@ -5171,7 +5171,12 @@ def _stage(proj, board, issue: str) -> _Stage:
     where = board.columns()
     if where is None:
         return unreadable
-    column = where.get(canonical_ref(issue)) or where.get(str(issue))
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): Jira spells its keys in capitals, and
+    # `dar-1` missing from the read went through as a card nobody moved. Only the board's own keys
+    # are folded, so a GitHub `owner/repo#3` ref is never rewritten
+    column = (where.get(canonical_ref(issue)) or where.get(str(issue))
+              or next((c for k, c in where.items()
+                       if k.upper() == canonical_ref(issue).upper()), ""))
     if not column:
         holds = getattr(board, "holds", None)
         inside = holds(issue) if callable(holds) else True
