@@ -183,6 +183,7 @@ def parse_concept(text: str) -> Concept | None:
     time. Only the frontmatter is parsed: the body is the human half, and a renderer that tried to
     round-trip prose would start owning wording it did not write.
     """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")     # a CRLF file keeps its front matter
     match = _FRONTMATTER.match(text)
     if match is None:
         return None
