@@ -328,14 +328,22 @@ def test_a_new_store_is_private_whatever_the_umask(tmp_path, umask):
     old = os.umask(umask)
     try:
         SqliteMetricsSink(db).record(_rec())
+        # The last connection to close removes `-wal` and `-shm`; hold one open across a second
+        # write so both exist when their mode is read.
+        held = sqlite3.connect(db)
+        try:
+            held.execute("select count(*) from metrics").fetchone()
+            SqliteMetricsSink(db).record(_rec(ticket="#8"))
+            for side in ("m.db-wal", "m.db-shm"):
+                assert (tmp_path / side).exists(), side
+                assert stat.S_IMODE((tmp_path / side).stat().st_mode) == 0o600, side
+        finally:
+            held.close()
     finally:
         os.umask(old)
     assert db.exists()
     assert stat.S_IMODE(db.stat().st_mode) == 0o600
-    wal = tmp_path / "m.db-wal"
-    if wal.exists():
-        assert stat.S_IMODE(wal.stat().st_mode) == 0o600
-    assert len(SqliteMetricsSink(db).scan()) == 1   # still writable, even under umask 0o277
+    assert len(SqliteMetricsSink(db).scan()) == 2   # still writable, even under umask 0o277
 
 
 def test_a_store_first_created_by_a_read_is_private_too(tmp_path):
