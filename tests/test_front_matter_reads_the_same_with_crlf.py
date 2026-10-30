@@ -1,8 +1,8 @@
 """A file written with Windows line endings keeps its front matter (#67).
 
 Every reader that matches a YAML front-matter block turns `\\r\\n` and a lone `\\r` into `\\n`
-before it matches: a capability, a concept, a decision record, a document and a ticket body read
-the same with CRLF as with LF. The CRLF fixtures on disk are written as bytes, so the `\\r`
+before it matches: a capability, a concept, a decision record, a document, a ticket body and a
+card's opening read the same with CRLF as with LF. The CRLF fixtures on disk are written as bytes, so the `\\r`
 reaches the reader the way `tree.read_text` and `decode()` hand it over.
 """
 from __future__ import annotations
@@ -20,6 +20,7 @@ from beeverforge.product.capabilities import (
     render_capability,
 )
 from beeverforge.product.documents.record import declared
+from beeverforge.product.queue import _opening
 
 
 def _crlf(text: str) -> str:
@@ -105,3 +106,12 @@ def test_a_lone_carriage_return_reads_as_a_line_end():
 
     assert parse_capability(lf.replace("\n", "\r"), path="capabilities/checkout.md") == (
         parse_capability(lf, path="capabilities/checkout.md"))
+
+
+def test_a_cards_opening_reads_the_same_with_crlf():
+    lf = "---\ndepends_on: [3]\n---\nBuilding on the per-version storage.\n\n## Goal\n\nShip it.\n"
+
+    from_lf = _opening(lf)
+
+    assert from_lf == "Building on the per-version storage."
+    assert _opening(_crlf(lf)) == from_lf
