@@ -74,7 +74,16 @@ CREATE INDEX IF NOT EXISTS metrics_expiry  ON metrics (expires_at);
 _SCHEMA_ENSURED: set[str] = set()
 
 
-def _create_private(path: Path) -> None:
+class LinkedPath(Exception):
+    """A symbolic link where the store or its backup is to be created (#228) — refused, not
+    followed. Not an `OSError`, so a read's "could not create it" logging does not swallow it."""
+
+
+_STORE_REMEDY = "remove the link, or point BEEVERFORGE_METRICS_DB at a regular file"
+
+
+def _create_private(path: Path, *, what: str = "metrics store",
+                    remedy: str = _STORE_REMEDY) -> None:
     """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched.
 
     THE STORE HOLDS CLIENTS' MESSAGES AND THE AUDIT TRAIL. Left to `sqlite3.connect`, the file
@@ -83,11 +92,18 @@ def _create_private(path: Path) -> None:
     SQLite then opens a private file, and gives its `-wal` and `-shm` files the same mode.
 
     `O_EXCL` is what leaves an existing store alone: its mode is the operator's, not ours.
-    `O_NOFOLLOW` keeps a planted symlink from becoming the file we make private."""
+
+    A SYMBOLIC LINK AT THE PATH IS REFUSED, dangling or not, with `LinkedPath`. `O_EXCL` fails on
+    a link without following it, but `sqlite3.connect` would then follow it — to a file made under
+    the umask, wherever the link points. What this does not close: a link planted between this
+    check and SQLite's own open, by somebody who can already write the store's directory."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
+        if path.is_symlink():
+            raise LinkedPath(f"the {what} at {path} is a symbolic link, which is refused rather "
+                             f"than followed — {remedy}") from None
         return
     try:
         os.fchmod(fd, 0o600)
@@ -263,9 +279,16 @@ class SqliteMetricsSink:
         alone is a backup missing exactly what was written last, and a copy taken mid-checkpoint
         is a file that may not open. `Connection.backup` copies pages under SQLite's own locks and
         restarts when a writer changes one underneath it, so what lands is one moment of the
-        store, whole."""
+        store, whole.
+
+        PRIVATE LIKE THE STORE (#228): the copy is the same clients' messages and audit trail, so
+        it is created by `_create_private` before SQLite opens it, and its `-journal`, `-wal` and
+        `-shm` take its `0600`. Left to `sqlite3.connect`, every copy `forget` takes followed the
+        umask — `0644` under the usual `022`."""
         target = Path(to)
         target.parent.mkdir(parents=True, exist_ok=True)
+        _create_private(target, what="metrics backup",
+                        remedy="remove the link, or back up to another path")
         with self._connect(write=False) as conn:
             copy = sqlite3.connect(target)
             try:
