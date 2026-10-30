@@ -41,6 +41,7 @@ implemented by none of them.**
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 
@@ -460,7 +461,31 @@ def _check_params(found: ActionSpec, params: dict[str, object]) -> str:
     if unexpected:
         return (f"'{found.name}' does not take {', '.join(sorted(unexpected))} — it takes "
                 + (", ".join(found.parameters) or "no parameters") + ".")
+    declared = _declared_types(found)
+    for p in found.parameters:
+        if p in params and declared.get(p) in ("str", str) and not isinstance(params[p], _SCALARS):
+            return (f"'{found.name}' takes {p} as a string, not a "
+                    f"{type(params[p]).__name__} — nothing was done.")
     return ""
+
+
+#: What a `str` parameter accepts. Not only `str`: the CLI turns `true`/`false` into booleans and
+#: ticket numbers arrive as ints, and the layer already passes those through `str()`.
+_SCALARS = (str, int, float, bool, type(None))
+
+
+def _declared_types(found: ActionSpec) -> dict[str, object]:
+    """The annotation the row's runner declares for each parameter, as written.
+
+    catalog.py uses `from __future__ import annotations`, so these are usually strings ("str").
+    Never resolved with `get_type_hints`, which would chase `Actor`/`Outcome` and can raise; and
+    a runner without a readable signature is simply not checked, because `perform` never raises.
+    """
+    try:
+        sig = inspect.signature(found.run)
+    except (TypeError, ValueError):
+        return {}
+    return {name: prm.annotation for name, prm in sig.parameters.items()}
 
 
 #: What a tracker actually calls a ticket: `189` (GitHub, optionally `#`-prefixed), `CONT-412`
