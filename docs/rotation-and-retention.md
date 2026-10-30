@@ -215,6 +215,10 @@ audit trail, so it is **created mode `0600`**: its owner reads and writes it, no
 whatever the process's umask (`SqliteMetricsSink._connect`). SQLite gives its `-wal` and `-shm`
 files the same mode. A file that already exists keeps the mode it has; that is the operator's.
 
+The copy `forget` takes first, under `backups/forget-*/metrics.db`, holds the same rows and is
+created the same way: `0600`, whatever the umask (`SqliteMetricsSink.backup`). A symbolic link
+at the store's path or the backup's is refused, naming the path, rather than followed.
+
 On compose the worker writes the file and the panel reads it, through the one volume they both
 mount (`beeverforge_state`), and both run as **one user**: root, since neither service sets
 `user:` and the worker image they share has no `USER`. A deployment that runs them as two users

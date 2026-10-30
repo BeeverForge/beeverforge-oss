@@ -362,3 +362,71 @@ def test_an_existing_store_keeps_its_mode(tmp_path):
     db.chmod(0o640)
     SqliteMetricsSink(db).record(_rec())
     assert stat.S_IMODE(db.stat().st_mode) == 0o640
+
+
+# A backup is the same rows — clients' messages and the audit trail — so it is created the same way.
+# Left to `sqlite3.connect(target)`, every copy `forget` takes would follow the umask.
+
+
+def _modes_of(db) -> dict[str, int]:
+    """The mode of `db` and of each `-wal`, `-shm` and `-journal` beside it that exists."""
+    return {p.name: stat.S_IMODE(p.stat().st_mode)
+            for p in [db, *(db.with_name(db.name + s) for s in ("-wal", "-shm", "-journal"))]
+            if p.exists()}
+
+
+@pytest.mark.parametrize("umask", [0o000, 0o022, 0o277], ids=["000", "022", "277"])
+def test_a_backup_is_private_whatever_the_umask(tmp_path, umask):
+    store, copy = tmp_path / "m.db", tmp_path / "copy.db"
+    SqliteMetricsSink(store).record(_rec())
+    old = os.umask(umask)
+    try:
+        assert SqliteMetricsSink(store).backup(copy) == copy
+        assert _modes_of(copy) == {"copy.db": 0o600}
+        # The copy's own `-wal` and `-shm` once it is opened: held open across a write so both
+        # exist when their mode is read.
+        held = sqlite3.connect(copy)
+        try:
+            held.execute("select count(*) from metrics").fetchone()
+            SqliteMetricsSink(copy).record(_rec(ticket="#8"))
+            assert _modes_of(copy) == {"copy.db": 0o600, "copy.db-wal": 0o600,
+                                       "copy.db-shm": 0o600}
+        finally:
+            held.close()
+    finally:
+        os.umask(old)
+    assert len(SqliteMetricsSink(copy).scan()) == 2   # a whole copy, and still writable
+
+
+# A symbolic link at the path is refused, dangling or not: `O_EXCL` fails on it without following
+# it, and `sqlite3.connect` then WOULD follow it — to a file made under the umask, somewhere else.
+
+
+def test_a_link_at_the_store_s_path_is_refused_by_name_and_nothing_is_made(tmp_path):
+    from beeverforge.observability.query import StoreUnreadable
+
+    db, elsewhere = tmp_path / "m.db", tmp_path / "elsewhere.db"
+    db.symlink_to(elsewhere)   # dangling: what a planted link looks like before the first write
+
+    assert SqliteMetricsSink(db).record(_rec()) is False
+    with pytest.raises(StoreUnreadable) as read:
+        SqliteMetricsSink(db).scan()
+    with pytest.raises(StoreUnreadable) as keyed:
+        SqliteMetricsSink(db).record_if_absent(_rec(), key="k#1")
+    for refused in (read, keyed):
+        said = str(refused.value)
+        assert f"{db} is a symbolic link" in said and "remove the link" in said, said
+        assert "BEEVERFORGE_METRICS_DB" in said, said
+    assert not elsewhere.exists(), "the link was followed"
+
+
+def test_a_link_at_the_backup_s_path_is_refused_by_name_and_nothing_is_made(tmp_path):
+    store, copy, elsewhere = tmp_path / "m.db", tmp_path / "copy.db", tmp_path / "elsewhere.db"
+    SqliteMetricsSink(store).record(_rec())
+    copy.symlink_to(elsewhere)
+
+    with pytest.raises(Exception, match="symbolic link") as refused:
+        SqliteMetricsSink(store).backup(copy)
+    assert f"{copy} is a symbolic link" in str(refused.value)
+    assert "remove the link" in str(refused.value)
+    assert not elsewhere.exists(), "the link was followed"
