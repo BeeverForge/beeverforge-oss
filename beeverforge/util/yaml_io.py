@@ -204,6 +204,78 @@ class Loader(yaml.SafeLoader):
             raise _refuse(f"more than {MAX_EXPANDED_BYTES:,} bytes of values{how} ({_line(mark)}): "
                           f"a YAML file is read to {MAX_EXPANDED_BYTES:,} bytes of values", mark)
 
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        """A value its constructor cannot build is refused by name, its line and its shape (#90).
+
+        A constructor raises what it raises: `2026-02-30` a ValueError (day is out of range for
+        month), `!!bool x` a KeyError, `!!timestamp x` an AttributeError. None of those is a
+        `yaml.YAMLError`, so each escaped every reader's `except yaml.YAMLError`; the ones that
+        were came back across lines without the value. Every one is `YamlRefused` here. A list, a
+        mapping, a set, an ordered map or pairs is built in two steps, the second after this call
+        returns (PyYAML's `state_generators`), so that step is named the same way. A refusal from
+        a value inside passes through unchanged: the innermost value is the one named."""
+        pending = len(self.state_generators)
+        try:
+            built = super().construct_object(node, deep)
+        except YamlRefused:
+            raise
+        except Exception as exc:
+            raise _cannot_build(node, exc) from exc
+        self.state_generators[pending:] = [_naming(step, node)
+                                           for step in self.state_generators[pending:]]
+        return built
+
+
+#: how much of a value, of its shape and of the constructor's reason the sentence quotes. The
+#: value and the line come first and stay inside the 120 and 200 characters readers quote.
+_VALUE_SHOWN = 40
+_SHAPE_SHOWN = 40
+_REASON_SHOWN = 60
+
+
+def _cut(text: str, at: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= at else text[:at - 1] + "…"
+
+
+def _spelled(node: yaml.Node) -> str:
+    """`node` as the file writes it: a scalar's text, a collection's span of the document without
+    the tag or anchor before it (as a scalar's text is), or its tag when that text is not at
+    hand."""
+    if isinstance(node, yaml.ScalarNode):
+        return node.value
+    buffer = node.start_mark.buffer
+    if buffer is None:
+        return node.tag
+    span = buffer[node.start_mark.index:node.end_mark.index]
+    while span[:1] in ("!", "&") and len(span.split(None, 1)) == 2:
+        span = span.split(None, 1)[1]
+    return span
+
+
+def _cannot_build(node: yaml.Node, exc: Exception) -> YamlRefused:
+    if isinstance(exc, yaml.MarkedYAMLError):
+        reason = exc.problem or exc.context or type(exc).__name__
+    elif isinstance(exc, ValueError):
+        reason = str(exc)
+    else:
+        reason = f"{type(exc).__name__}: {exc}"
+    shape = node.tag.replace("tag:yaml.org,2002:", "!!")
+    first = reason.splitlines()[0] if reason.strip() else type(exc).__name__
+    return _refuse(f"a value YAML cannot build (`{_cut(_spelled(node), _VALUE_SHOWN)}`, "
+                   f"{_line(node.start_mark)}, as {_cut(shape, _SHAPE_SHOWN)}): "
+                   f"{_cut(first, _REASON_SHOWN)}", node.start_mark)
+
+
+def _naming(step: Any, node: yaml.Node) -> Any:
+    """The second step of building `node`, its failure refused as `construct_object` refuses it."""
+    try:
+        yield from step
+    except YamlRefused:
+        raise
+    except Exception as exc:
+        raise _cannot_build(node, exc) from exc
+
 
 class CountingLoader(Loader):
     """`Loader` for a format whose own specification has anchors: an alias is read, counted at the

@@ -345,9 +345,10 @@ def test_a_tag_that_would_build_a_python_object_is_refused_never_built(tmp_path,
                                                                         spelling):
     docs, error = _read(reader, tmp_path, VALUES[where].format(spelling=spelling))
     assert docs is None
-    assert error.startswith(
-        f"{DOCS_MANIFEST} is not valid YAML: could not determine a constructor for the tag ")
-    assert yaml.compose(spelling, Loader=yaml.SafeLoader).tag in error
+    assert error.startswith(f"{DOCS_MANIFEST} is not valid YAML: a value YAML cannot build (")
+    assert "could not determine a constructor" in error
+    assert spelling.split()[0] in error
+    assert f"line {VALUES[where].count(chr(10))}," in error
 
 
 @pytest.mark.parametrize("text", ["product: books\n", "product: books\n? [a, b]\n: x\n"])
