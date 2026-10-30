@@ -490,8 +490,11 @@ _A_HANDLE = re.compile(r"(?<![A-Za-z0-9])@([A-Za-z0-9](?:[\w.@-]*\w)?)")
 #: wrapping's backtick), `<` (an HTML block, inside which markdown — the wrapping — is not read)
 #: and `&` (an entity, `&#x40;`, which decodes to a name after the wrapping was decided). And the
 #: emphasis markers `*`, `_` and `~`: with its backticks escaped, the agent's `Worker.__init__` and
-#: `*.py` lost the code span that kept them literal (review on 35a1cc0, measured on GitHub).
-_MARKUP = re.compile(r"([\\`<&*_~])")
+#: `*.py` lost the code span that kept them literal (review on 35a1cc0, measured on GitHub). And
+#: `!` and `$`: an `![…](…)` image, a `[!CAUTION]` alert and `$…$` math rendered inside the quote,
+#: and GitHub typesets math after resolving backslash escapes, so escaping `\` alone did not
+#: stop it (#112, measured on GitHub).
+_MARKUP = re.compile(r"([\\`<&*_~!$])")
 #: …and what would make one of its lines a HEADING, posing as a section of the platform's: an ATX
 #: `#`, a line of only `=` or `-` under another (setext), or a `>` of its own that a heading could
 #: follow. Escaped where it opens the line — after the indent, list markers and `>`s that can
