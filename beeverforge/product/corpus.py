@@ -43,8 +43,11 @@ def _field_re(name: str) -> re.Pattern[str]:
     # It used to end nowhere, so `- **Date of go-live:** 2027-03-01` above `- **Date:**` was read as
     # the date "of go-live:** 2027-03-01" — the first line that BEGAN with the word won. A label
     # with no colon and no bold is no label.
-    return re.compile(rf"^\s*[-*]\s*\**{re.escape(name)}(?:\**\s*:|\*\*)\**\s*(?P<value>.*?)\s*$",
-                      re.MULTILINE | re.IGNORECASE)
+    # NO GAP CROSSES A LINE BREAK (#76): `[ \t]`, not `\s`. Under MULTILINE `^\s*` ate every blank
+    # line after the one it began on, then backtracked, so a requirement's read was quadratic in
+    # its blank lines; and an empty `- **Status:**` read the NEXT line as its value.
+    return re.compile(rf"^[ \t]*[-*][ \t]*\**{re.escape(name)}(?:\**[ \t]*:|\*\*)\**[ \t]*"
+                      r"(?P<value>.*?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
 
 
 #: THE status-line pattern — one regex for reading AND rewriting. The writers in `authoring.py`

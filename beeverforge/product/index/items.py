@@ -220,8 +220,10 @@ def from_record(record: DocumentRecord) -> list[Item]:
 #: status, date, what it supersedes, and who asked (a name, which never crosses into another
 #: conversation — ADR-0051 D9) — which the item carries as fields; and the register's own table,
 #: indexed row by row as decisions.
-_HEADER_LINE = re.compile(r"^\s*(?:#\s+REQ-\d+.*|[-*]\s*\**(?:Asked by|Status|Date|Supersedes)"
-                          r":?\**.*)$", re.MULTILINE | re.IGNORECASE)
+#: `[ \t]`, not `\s`, before and after the bullet (#76): `^\s*` spanned blank lines and backtracked.
+_HEADER_LINE = re.compile(r"^[ \t]*(?:#\s+REQ-\d+.*"
+                          r"|[-*][ \t]*\**(?:Asked by|Status|Date|Supersedes):?\**.*)$",
+                          re.MULTILINE | re.IGNORECASE)
 
 
 def _register(body: str) -> tuple[str, list[tuple[str, str]]]:

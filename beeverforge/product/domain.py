@@ -43,7 +43,8 @@ _ENTRY_RE = re.compile(r"^###\s+(?P<term>.+?)\s*$", re.MULTILINE)
 
 
 def _field(block: str, name: str) -> str:
-    m = re.search(rf"^\s*[-*]\s*\**{name}:?\**\s*:?\s*(?P<v>.*?)\s*$",
+    # `[ \t]`, not `\s`, as in `corpus._field_re` (#76): a field never spans a line break.
+    m = re.search(rf"^[ \t]*[-*][ \t]*\**{name}:?\**[ \t]*:?[ \t]*(?P<v>.*?)[ \t]*$",
                   block, re.MULTILINE | re.IGNORECASE)
     return re.sub(r"<!--.*?-->", "", m.group("v")).strip() if m else ""
 
