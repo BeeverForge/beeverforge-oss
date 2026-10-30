@@ -118,10 +118,20 @@ _BRANCH_HELD = re.compile(
     r"is checked out in (?:another working tree|your repository)", re.I)
 
 _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    # ---- the tracker's own credential sentences, read before throttling ------------------------
+    # They name the email and the card key, either of which can carry a `429` (`ops429@acme.ai`,
+    # `DAR-429`); the refusal is a credential whatever its arguments say.
+    (CREDENTIAL, re.compile(r"different accounts|no api token reached", re.I), "credential"),
+
     # ---- transient: time alone fixes these -----------------------------------------------------
+    # The 429 counts only where the park lines put the HTTP status — Jira `failed: 429`, Azure
+    # DevOps `→ 429`, gh `HTTP 429`, a line that starts with it, `status`/`code` 429. A bare `429`
+    # read card `DAR-429`'s 404 and `ops429@acme.ai`'s refusal as throttling.
     (TRANSIENT, re.compile(
         r"rate.?limit(?:ed|ing)?\b|api rate limit|secondary rate limit|abuse detection|"
-        r"was submitted too quickly|429\b|too many requests|quota exceeded", re.I), "throttled"),
+        r"was submitted too quickly|"
+        r"(?:^|failed:|→|->|\bhttp|\bstatus(?: code)?|\bcode)[\s:=]*429\b|"
+        r"too many requests|quota exceeded", re.I), "throttled"),
     (TRANSIENT, re.compile(
         r"connection reset|connection refused|temporary failure in name resolution|"
         r"timed? ?out (?:while )?(?:connecting|reading)|network is unreachable|"
