@@ -117,21 +117,31 @@ _BRANCH_HELD = re.compile(
     r"is already (?:checked out at|used by worktree at)|"
     r"is checked out in (?:another working tree|your repository)", re.I)
 
+
+def _throttled(status_429: str) -> re.Pattern[str]:
+    """The throttling rule, with `status_429` as its reading of a bare HTTP 429."""
+    return re.compile(
+        r"rate.?limit(?:ed|ing)?\b|api rate limit|secondary rate limit|abuse detection|"
+        r"was submitted too quickly|" + status_429 + r"|too many requests|quota exceeded", re.I)
+
+
 _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # ---- the tracker's own credential sentences, read before throttling ------------------------
-    # They name the email and the card key, either of which can carry a `429` (`ops429@acme.ai`,
-    # `DAR-429`); the refusal is a credential whatever its arguments say.
+    # `different accounts` and `no api token reached` are the Jira tracker's own refusal (#749):
+    # an email and a token of different accounts, or no token, which Jira answers as an anonymous
+    # 404 (measured 2026-10-19). Without them the job's park line `ticket: <first 120
+    # characters>` read as `unknown`. They name the email and the card key, either of which can
+    # carry a `429` (`ops429@acme.ai`, `DAR-429`); the refusal is a credential whatever its
+    # arguments say.
     (CREDENTIAL, re.compile(r"different accounts|no api token reached", re.I), "credential"),
 
     # ---- transient: time alone fixes these -----------------------------------------------------
     # The 429 counts only where the park lines put the HTTP status — Jira `failed: 429`, Azure
     # DevOps `→ 429`, gh `HTTP 429`, a line that starts with it, `status`/`code` 429. A bare `429`
     # read card `DAR-429`'s 404 and `ops429@acme.ai`'s refusal as throttling.
-    (TRANSIENT, re.compile(
-        r"rate.?limit(?:ed|ing)?\b|api rate limit|secondary rate limit|abuse detection|"
-        r"was submitted too quickly|"
-        r"(?:^|failed:|→|->|\bhttp|\bstatus(?: code)?|\bcode)[\s:=]*429\b|"
-        r"too many requests|quota exceeded", re.I), "throttled"),
+    # `status`/`code` need a separator before it, or `code429@acme.ai` is a status too.
+    (TRANSIENT, _throttled(r"(?:(?:^|failed:|→|->|\bhttp)[\s:=]*|"
+                           r"(?:\bstatus(?: code)?|\bcode)[\s:=]+)429\b"), "throttled"),
     (TRANSIENT, re.compile(
         r"connection reset|connection refused|temporary failure in name resolution|"
         r"timed? ?out (?:while )?(?:connecting|reading)|network is unreachable|"
@@ -151,13 +161,8 @@ _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
      "race"),
 
     # ---- credential: this token is bad; another may not be -------------------------------------
-    # `different accounts` and `no api token reached` are the Jira tracker's own refusal (#749):
-    # an email and a token of different accounts, or no token, which Jira answers as an anonymous
-    # 404 (measured 2026-10-19). Without them the job's park line `ticket: <first 120
-    # characters>` read as `unknown`.
     (CREDENTIAL, re.compile(
         r"bad credentials|401 unauthorized|invalid.{0,12}(api key|token)|expired.{0,12}token|"
-        r"different accounts|no api token reached|"
         r"authentication failed|disabled claude subscription|subscription access|"
         r"use an anthropic api key|please (run )?/?login|credit balance", re.I), "credential"),
 
@@ -235,6 +240,23 @@ _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
         r"agent stopped: turn cap|effort budget|cost ceiling", re.I),
      "ticket-too-big"),
 )
+
+
+def _bare_429(rules: tuple[tuple[str, re.Pattern[str], str], ...]
+              ) -> tuple[tuple[str, re.Pattern[str], str], ...]:
+    """`rules` as they read before the 429 was anchored, for `classify(anchored_429=False)`: a
+    bare `429` is throttling, and the tracker's credential sentences sit with the other credential
+    words, after throttling, as one alternation did. Same cause and detail, so the same verdict."""
+    sentences, rest = rules[0], rules[1:]
+    out: list[tuple[str, re.Pattern[str], str]] = []
+    for cause, pattern, detail in rest:
+        if cause == CREDENTIAL and sentences not in out:
+            out.append(sentences)
+        out.append((cause, _throttled(r"429\b") if detail == "throttled" else pattern, detail))
+    return tuple(out)
+
+
+_BARE_429_RULES = _bare_429(_RULES)
 
 #: How long to wait before trying a transient failure again, when the failure itself did not say.
 #: GitHub's primary limit resets hourly, so a first attempt well inside that is wasted; a second
@@ -340,7 +362,8 @@ _RETRY_AFTER = re.compile(r"retry[- ]after[:= ]+(\d+)", re.I)
 _ENGINE_RE = re.compile(r"activity task timed out|heartbeat timed? ?out", re.I)
 
 
-def classify(note: str, *, state: str = "", engine: bool = True, cause: str = "") -> Verdict:
+def classify(note: str, *, state: str = "", engine: bool = True, cause: str = "",
+             anchored_429: bool = True) -> Verdict:
     """What this failure is. Pure, and never raises: it reads a string.
 
     `cause` IS THE PARK'S OWN DECLARATION, AND IT WINS. A hold a machine made knows what it is —
@@ -359,7 +382,10 @@ def classify(note: str, *, state: str = "", engine: bool = True, cause: str = ""
     `engine` gates the engine-death rule (#159), and exists for REPLAY, not for taste: this is
     called from inside a workflow, and a job parked under the old classification replays this
     very call — a different verdict there is a different command sequence, which is TMPRL1100.
-    The workflow passes `workflow.patched(...)`; every other caller takes the default."""
+    The workflow passes `workflow.patched(...)`; every other caller takes the default.
+    `anchored_429` gates the status-anchored 429 for the same reason: a job parked on `DAR-429`'s
+    404 was read `transient` (nap and re-run), and now reads `unknown` (escalate). False keeps the
+    bare `429` and the rule order before it."""
     text = note or ""
     stage = _stage_of(text)
     after = _RETRY_AFTER.search(text)
@@ -374,7 +400,7 @@ def classify(note: str, *, state: str = "", engine: bool = True, cause: str = ""
         return Verdict(cause=TRANSIENT, stage=stage, detail="engine-interrupted",
                        retry_after=retry_after, detail_source=text)
 
-    for cause, pattern, detail in _RULES:
+    for cause, pattern, detail in _RULES if anchored_429 else _BARE_429_RULES:
         if pattern.search(text):
             return Verdict(cause=cause, stage=stage, detail=detail, retry_after=retry_after,
                            detail_source=text)
