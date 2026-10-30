@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -73,6 +74,27 @@ CREATE INDEX IF NOT EXISTS metrics_expiry  ON metrics (expires_at);
 _SCHEMA_ENSURED: set[str] = set()
 
 
+def _create_private(path: Path) -> None:
+    """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched.
+
+    THE STORE HOLDS CLIENTS' MESSAGES AND THE AUDIT TRAIL. Left to `sqlite3.connect`, the file
+    took the process's umask — `0644` under the usual `022`, readable by every user on the machine.
+    So it is created here first, exclusively, and `fchmod`ed so no umask can widen or narrow it;
+    SQLite then opens a private file, and gives its `-wal` and `-shm` files the same mode.
+
+    `O_EXCL` is what leaves an existing store alone: its mode is the operator's, not ours.
+    `O_NOFOLLOW` keeps a planted symlink from becoming the file we make private."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
 class SqliteMetricsSink:
     """A `MetricsSink` that also reads. Safe to construct anywhere: it touches no disk until used —
     and the first use, read or write, makes sure the table exists (#137).
@@ -110,12 +132,13 @@ class SqliteMetricsSink:
         ensure = write or key not in _SCHEMA_ENSURED
         if write:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            _create_private(self.path)
         elif ensure:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                _create_private(self.path)
             except OSError as exc:   # the connect below fails honestly and names the file
-                log.info("metrics store %s: could not create its directory for a read — %s",
-                         self.path, exc)
+                log.info("metrics store %s: could not create it for a read — %s", self.path, exc)
         conn = sqlite3.connect(self.path, timeout=self.timeout)
         try:
             conn.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer
