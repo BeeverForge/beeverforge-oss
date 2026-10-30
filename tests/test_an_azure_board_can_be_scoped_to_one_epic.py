@@ -1,4 +1,4 @@
-"""An Azure Boards project can read and claim only the cards under ONE Epic (#1078).
+"""An Azure Boards project can read and claim only the cards under ONE Epic (#235).
 
 WHAT WAS FOUND. The pickup queue of an Azure Boards project is the cards of its TEAM's area paths
 (`AzureBoardsBoard._team_area_clause`), and nothing narrower. A repository whose work lives under

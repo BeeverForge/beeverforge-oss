@@ -380,15 +380,28 @@ Three acts are **not** held to the scope and reach any work item by its number: 
 card (`beeverforge run <project> <card>`, the floor's `start`), reopening a closed card, and
 commenting on one. Name only cards under the Epic to them.
 
-**Two limits to plan around.**
+**Three limits to plan around.**
 
-- **A card the factory files itself is not under the Epic.** A split's children, the product role's
-  cards and an impediment are created in the project and linked to nothing above them, and in an
-  Epic → Feature → Item hierarchy there is no obvious parent to attach them to. Outside the scope,
-  the poller does not pick them up, the panel does not show them, and a retry files another because
-  the search for an earlier filing does not find them. The scoped project refuses to edit, close,
-  remove, queue or rank them until they are under the Epic. File the cards you want worked under a
-  Feature of the Epic yourself.
+- **A card the factory files itself is not under the Epic, unless it is a split's child.** The
+  product role's cards and an impediment are created in the project and linked to nothing above
+  them, and in an Epic → Feature → Item hierarchy there is no obvious parent to attach them to.
+  Outside the scope, the poller does not pick them up, the panel does not show them, and a retry
+  files another because the search for an earlier filing does not find them. The scoped project
+  refuses to edit, close, remove, queue or rank them until they are under the Epic. File the cards
+  you want worked under a Feature of the Epic yourself.
+
+  A split's children are linked: the splitter puts each under the card it was split from, so they
+  are in the scope whenever that card is, from the next read of the board, and a re-run of the split
+  finds them. A child whose link failed is the exception. The worker's log names it (`could not
+  link <child> under <parent>`), it stays outside the scope, and a re-run of the split files another
+  unless you put that child under its parent first.
+- **An impediment on the project's own scoped board does not close itself.** When the factory board
+  is the project's own tracker, the factory looks for its open impediment through the same scoped
+  search, and an impediment is filed with no parent, so the search never finds it: it is not closed
+  when the trouble clears, and the trouble's next occurrence, and its first after the worker
+  restarts, files another beside it. Close them in Azure Boards yourself, since the scoped project
+  refuses to, or put each under the Epic, where the factory finds it and closes it once the trouble
+  clears.
 - **Every project on a shared team needs its own `scope_epic`.** The scope narrows only the project
   that declares it: a project left without one still reads the whole team. A work item has one
   parent, so two different Epics never overlap; two projects naming the same Epic read the same

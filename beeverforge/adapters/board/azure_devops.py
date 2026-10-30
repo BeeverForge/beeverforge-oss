@@ -160,7 +160,7 @@ class AzureBoardsBoard:
         self._columns_cache: list[dict] | None = None
         self._area_cache: str | None = None
         #: The id of the Epic whose subtree is this project's slice of the team's board, `""` for
-        #: the whole board (#1078). Declared in the tracker's options as `scope_epic`; the board
+        #: the whole board (#235). Declared in the tracker's options as `scope_epic`; the board
         #: takes it as a constructor argument, as it takes `areas`, so a value that is not an id
         #: cannot raise HERE — `scan_todo` does not catch a constructor, and a poller tick with a
         #: stack trace is no pickup queue. It reads as an unreadable board instead (`_epic_ids`).

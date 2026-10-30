@@ -1,4 +1,4 @@
-"""An Azure Boards project reads and claims only the cards under ONE Epic (ported from #1078).
+"""An Azure Boards project reads and claims only the cards under ONE Epic (#235).
 
 The claims, each held by a test this plan cuts under:
 

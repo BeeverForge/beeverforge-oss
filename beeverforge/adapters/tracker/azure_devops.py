@@ -196,7 +196,7 @@ class AzureBoardsTracker:
         #: area → repository, the board's own `areas` option (a JSON map, like `state_map`) — read
         #: backwards here to say which area a card of a repository is filed under
         self._areas = _areas_of((options or {}).get("areas"))
-        #: The Epic whose subtree is this project's slice of the cards (#1078), `""` for all of
+        #: The Epic whose subtree is this project's slice of the cards (#235), `""` for all of
         #: them. The board reads the same option through the same normaliser, so the poller's
         #: reads and the panel's cannot drift into two different slices of one project. What the
         #: subtree IS is read once per instance (`_below`), the outcome kept even when it is a
@@ -837,7 +837,7 @@ class AzureBoardsTracker:
         # `an O'Brien "quoted" title` answers 400 ("Expecting closing quote") — verified live — and
         # the splitter's one guard against filing a duplicate would be the thing that failed.
         escaped = (title or "").replace("'", "''")
-        # WITHIN THE EPIC'S SUBTREE (#1078), or the splitter and the product role reuse another
+        # WITHIN THE EPIC'S SUBTREE (#235), or the splitter and the product role reuse another
         # Epic's open card of the same title instead of filing their own. `_below` RAISES when the
         # scope cannot be told, because `None` here already means "nothing of that title": an
         # unreadable scope answered `None` would make the caller file a duplicate.

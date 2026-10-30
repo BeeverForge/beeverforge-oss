@@ -189,7 +189,7 @@ def _azure_devops(project, *, token, token_provider, options):
             "falling back to the convention that an area's leaf name IS the repository name. "
             "On a product whose areas are named differently, every card then routes to the "
             "default repository"),
-        # #1078: the Epic whose subtree is this project's slice of the team's board. Read through
+        # #235: the Epic whose subtree is this project's slice of the team's board. Read through
         # the one normaliser the tracker also uses, so the two axes cannot disagree about whether
         # a project is scoped.
         scope_epic=scope_epic_of(options),
@@ -282,7 +282,7 @@ def _azure_devops_unreadable(project) -> str:
               "200 and a sign-in PAGE rather than a 401, so this reads as an empty board. A GitHub "
               "token reaching this axis produces exactly that; the board takes the TRACKER's "
               "credential, never the forge's.")
-    # #1078: a declared Epic that names nothing this credential can read leaves the board exactly
+    # #235: a declared Epic that names nothing this credential can read leaves the board exactly
     # as unreadable, and the credential is only the first suspect — not the only one.
     scope = scope_epic_of(_options(project))
     if scope:

@@ -167,7 +167,7 @@ the search for an already filed card then read only the work items under it, at 
 Epic that cannot be resolved reads as an unreadable board, never as no scope. It is the Azure
 counterpart of Jira's `scope_jql` (below), and
 [docs/setup/azure-devops.md](../setup/azure-devops.md) §8 says what it limits, what it costs, and
-the two limits to plan around.
+the three limits to plan around.
 
 **A Jira tracker names the site's own words**, because every Jira project has its own workflow and
 its administrator named — and localised — everything in it:
