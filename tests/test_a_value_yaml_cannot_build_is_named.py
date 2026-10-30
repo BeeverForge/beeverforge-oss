@@ -135,3 +135,21 @@ def test_a_real_date_is_built_not_refused():
     assert yaml_io.load("x-when: 2026-02-28\n")["x-when"].day == 28
     _, error = parse_docs_manifest("product: books\nx-when: 2026-02-28\n")
     assert "is not valid YAML" not in error
+
+
+@pytest.mark.parametrize("loader", [yaml_io.Loader, yaml_io.CountingLoader])
+@pytest.mark.parametrize("text", [
+    "a: !!python/object/apply:os.system [\"touch /tmp/planted\"]\n",
+    "a: !!python/name:os.system touch\n",
+    "a: !no-such-tag touch\n",
+])
+def test_a_value_under_a_tag_the_loader_has_no_constructor_for_is_not_quoted(loader, text):
+    """A tag the safe loader has no constructor for is refused by its tag and line alone: what
+    is written under it is somebody else's payload (a command for `os.system`), and the sentence
+    travels into findings and the published map, so it is not echoed."""
+    with pytest.raises(yaml_io.YamlRefused) as caught:
+        yaml_io.load(text, loader=loader)
+    said = str(caught.value)
+    assert "touch" not in said
+    assert said.startswith("a value YAML cannot build (")
+    assert "line 1" in said and "could not determine a constructor" in said

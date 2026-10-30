@@ -213,17 +213,25 @@ class Loader(yaml.SafeLoader):
         were came back across lines without the value. Every one is `YamlRefused` here. A list, a
         mapping, a set, an ordered map or pairs is built in two steps, the second after this call
         returns (PyYAML's `state_generators`), so that step is named the same way. A refusal from
-        a value inside passes through unchanged: the innermost value is the one named."""
+        a value inside passes through unchanged: the innermost value is the one named. A value
+        under a tag this loader has no constructor for (`!!python/object/apply:os.system`) is
+        named by its tag alone: what is written under it is somebody else's payload, and the
+        sentence travels into findings and the published map."""
         pending = len(self.state_generators)
         try:
             built = super().construct_object(node, deep)
         except YamlRefused:
             raise
         except Exception as exc:
-            raise _cannot_build(node, exc) from exc
+            raise _cannot_build(node, exc, quoted=self._constructs(node.tag)) from exc
         self.state_generators[pending:] = [_naming(step, node)
                                            for step in self.state_generators[pending:]]
         return built
+
+    def _constructs(self, tag: str) -> bool:
+        """Whether this loader has a constructor of its own for `tag`, not the one for any tag."""
+        prefixes = (p for p in self.yaml_multi_constructors if p is not None)
+        return tag in self.yaml_constructors or any(tag.startswith(p) for p in prefixes)
 
 
 #: how much of a value, of its shape and of the constructor's reason the sentence quotes. The
@@ -253,7 +261,7 @@ def _spelled(node: yaml.Node) -> str:
     return span
 
 
-def _cannot_build(node: yaml.Node, exc: Exception) -> YamlRefused:
+def _cannot_build(node: yaml.Node, exc: Exception, *, quoted: bool = True) -> YamlRefused:
     if isinstance(exc, yaml.MarkedYAMLError):
         reason = exc.problem or exc.context or type(exc).__name__
     elif isinstance(exc, ValueError):
@@ -262,7 +270,9 @@ def _cannot_build(node: yaml.Node, exc: Exception) -> YamlRefused:
         reason = f"{type(exc).__name__}: {exc}"
     shape = node.tag.replace("tag:yaml.org,2002:", "!!")
     first = reason.splitlines()[0] if reason.strip() else type(exc).__name__
-    return _refuse(f"a value YAML cannot build (`{_cut(_spelled(node), _VALUE_SHOWN)}`, "
+    value = (f"`{_cut(_spelled(node), _VALUE_SHOWN)}`" if quoted
+             else "under a tag it has no constructor for")
+    return _refuse(f"a value YAML cannot build ({value}, "
                    f"{_line(node.start_mark)}, as {_cut(shape, _SHAPE_SHOWN)}): "
                    f"{_cut(first, _REASON_SHOWN)}", node.start_mark)
 

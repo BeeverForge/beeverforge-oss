@@ -16,17 +16,15 @@ _DOOR = "beeverforge/util/yaml_io.py"
 MUTATIONS = [
     ("THE DEFECT: the handler is removed, so the ValueError of `2026-02-30` and the KeyError of "
      "`!!bool x` escape both readers again",
-     _DOOR, "        except Exception as exc:\n            raise _cannot_build(node, exc) from exc\n"
-     "        self.state_generators",
-     "        except ZeroDivisionError as exc:\n            raise _cannot_build(node, exc) from exc\n"
-     "        self.state_generators"),
+     _DOOR, "        except Exception as exc:\n            raise _cannot_build(node, exc, quoted=",
+     "        except ZeroDivisionError as exc:\n            raise _cannot_build(node, exc, quoted="),
 
     ("only what is no YAMLError is renamed, so a ConstructorError (`!!seq x`, `!!binary a`) comes "
      "back across lines without its value",
      _DOOR, "        except YamlRefused:\n            raise\n        except Exception as exc:\n"
-     "            raise _cannot_build(node, exc) from exc\n        self.state_generators",
+     "            raise _cannot_build(node, exc, quoted=",
      "        except yaml.YAMLError:\n            raise\n        except Exception as exc:\n"
-     "            raise _cannot_build(node, exc) from exc\n        self.state_generators"),
+     "            raise _cannot_build(node, exc, quoted="),
 
     ("the second step of building a collection is not named, so `!!set x`, `!!omap x` and "
      "`!!pairs x` come back in PyYAML's words",
@@ -37,8 +35,13 @@ MUTATIONS = [
      _DOOR, "f\"{_line(node.start_mark)}, as ", "f\"line {node.start_mark.line}, as "),
 
     ("the value is not named, only its shape",
-     _DOOR, "a value YAML cannot build (`{_cut(_spelled(node), _VALUE_SHOWN)}`, ",
-     "a value YAML cannot build (`{node.tag}`, "),
+     _DOOR, "    value = (f\"`{_cut(_spelled(node), _VALUE_SHOWN)}`\" if quoted\n",
+     "    value = (f\"`{node.tag}`\" if quoted\n"),
+
+    ("what is written under a tag the loader has no constructor for is quoted, so the command "
+     "under `!!python/object/apply:os.system` reaches the findings and the published map",
+     _DOOR, "raise _cannot_build(node, exc, quoted=self._constructs(node.tag)) from exc\n",
+     "raise _cannot_build(node, exc, quoted=True) from exc\n"),
 
     ("a value of any length is named whole",
      _DOOR, "    return text if len(text) <= at else text[:at - 1] + \"…\"\n",
