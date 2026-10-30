@@ -229,6 +229,34 @@ def scope_named(scope: str) -> str:
     return f" within scope_jql {scope!r}" if scope else ""
 
 
+def unopened_parenthesis(scope: str) -> int | None:
+    """The index of the first `)` in `scope` that closes a parenthesis it never opened, outside a
+    quoted string, or `None` when there is none.
+
+    `within_scope` wraps the scope as `AND (<scope>)`: a stray `)` closes that wrapper, and what
+    follows it — `labels = "bf-api") OR (labels is not empty` — is ORed onto the project clause,
+    a read of the whole site (#121). JQL strings are `"..."` or `'...'`, a backslash escaping the
+    next character; an unterminated string ends the walk, and Jira refuses it with a 400."""
+    depth, quote, escaped = 0, "", False
+    for at, char in enumerate(scope):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                return at
+            depth -= 1
+    return None
+
+
 class JiraTracker:
     """Jira Cloud REST v3. Satisfies `TrackerAdapter`."""
 
@@ -282,7 +310,14 @@ class JiraTracker:
         #: against one Jira project each read the whole of it as their queue, and one ticket was
         #: picked up by three of them in one night (v0.6.0-rc.2). `""` = the whole project, the
         #: JQL unchanged; whitespace alone is `""`, so a blank YAML value cannot emit `AND ()`.
+        #: A `)` it never opened is refused here: it would close the `AND (...)` wrapper (#121).
         self.scope_jql = str(scope_jql or "").strip()
+        stray = unopened_parenthesis(self.scope_jql)
+        if stray is not None:
+            raise ValueError(
+                f"scope_jql {self.scope_jql!r} has a ')' at character {stray} that closes a "
+                f"parenthesis it never opened — it would widen {project_key}'s read past the "
+                f"project, so it is refused")
         #: The PROJECT's language, for the one sentence this row writes to a person in its own
         #: name — the note on a card it could not record as not delivered. Everything else it
         #: posts was composed by its caller, already in that language.
