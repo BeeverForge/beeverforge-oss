@@ -241,7 +241,10 @@ operator does by naming the card; reopening a closed card, which the reopen reac
 without asking the slice; and commenting on a card, which is written in the person's own name.
 Name only cards of this project's slice to them.
 
-A condition Jira cannot parse — an unclosed quote, an `ORDER BY` inside it — is answered `400`
+A condition that would escape its parentheses is refused when the tracker is built, naming the
+scope: a `)` it never opened, which would close the `AND (...)` and widen the read past the
+project, and a string it never closes, which the quotes after it would close. A condition Jira
+cannot parse otherwise — an `ORDER BY` inside it — is answered `400`
 (measured on Jira Cloud 2026-10-19): the board and the ticket list read as unreadable, never as
 empty, the pickup queue picks up nothing, and the warning names the `scope_jql` it searched with.
 A condition that parses but selects nothing is an empty queue, and nothing says so yet.

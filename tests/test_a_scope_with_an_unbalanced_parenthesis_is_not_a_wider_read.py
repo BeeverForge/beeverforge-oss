@@ -7,10 +7,14 @@ gladly: every labelled issue on the whole site, every project's, read as this pr
 
 WHAT IS NOW TRUE. `JiraTracker.__init__` refuses a scope whose parentheses go below depth zero
 outside a quoted string, with one sentence naming `scope_jql`, the scope, and the `)` that closes
-a parenthesis it never opened. `build_tracker` raises it before any request is made. A balanced
-scope, and parentheses inside `"..."` or `'...'` strings, construct exactly as before, the value
-unchanged. A trailing unclosed `(` is not refused here: Jira answers it 400 and the existing
-"unreadable" warning names the scope, which does not widen the read.
+a parenthesis it never opened, ending with the remedy and the setting to change. A backslash
+escapes the next character outside a string as inside one, as Jira's lexer reads an unquoted
+string: `labels = a\\") OR (...` is not the start of a string that hides the `)`. A scope that ends
+inside a string is refused too, because the quotes of the clauses appended after it would close
+that string and change what is read. `build_tracker` raises either before any request is made. A
+balanced scope, and parentheses inside `"..."` or `'...'` strings, construct exactly as before,
+the value unchanged. A trailing unclosed `(` is not refused here: Jira answers it 400 and the
+existing "unreadable" warning names the scope, which does not widen the read.
 """
 
 from __future__ import annotations
@@ -24,6 +28,14 @@ UNBALANCED = [
     ('labels = "bf-api") OR (labels is not empty', 17),
     (') OR (project = "OTHER"', 0),
     ("(a = 1)) OR (b = 2", 7),
+    ('labels = a\\") OR (labels is not empty OR labels = \\"b', 12),
+    ("labels = a\\') OR (labels is not empty OR labels = \\'b", 12),
+]
+
+UNTERMINATED = [
+    ('labels = "bf-api', 9),
+    ("summary ~ 'a ) b", 10),
+    ('summary ~ "say \\")', 10),
 ]
 
 
@@ -58,6 +70,8 @@ def _assert_one_sentence_naming(message: str, scope: str, at: int) -> None:
     assert "scope_jql" in message, message
     assert repr(scope) in message, message
     assert f"')' at character {at}" in message, message
+    assert message.endswith("remove that ')' or add the '(' it closes in "
+                            "tracker.options.scope_jql"), message
 
 
 @pytest.mark.parametrize(("scope", "at"), UNBALANCED)
@@ -83,7 +97,7 @@ def test_a_scope_whose_parenthesis_closes_the_project_clause_is_refused_at_const
     'summary ~ "fix )"',
     "summary ~ 'a ) b'",
     'summary ~ "say \\") here"',
-    'labels = "bf-api',
+    "labels = a\\ b",
     "",
     "   ",
 ])
@@ -98,3 +112,24 @@ def test_the_registry_row_keeps_a_balanced_scope_byte_for_byte(tmp_path, no_netw
     scope = '(summary ~ "a ) b" OR labels = \'x (\') AND status != Done'
     tracker = build_tracker(_project(tmp_path, scope), token="t")
     assert tracker.scope_jql == scope
+
+
+@pytest.mark.parametrize(("scope", "at"), UNTERMINATED)
+def test_a_scope_that_ends_inside_a_string_is_refused_at_construction(
+        scope, at, tmp_path, no_network):
+    """An unterminated string would be closed by the quotes of the clauses appended after the
+    scope (`AND status = "A Fazer"`), which changes what is read; every read of it is a 400 anyway.
+    Refused both ways in, with one sentence naming the opening quote and the remedy."""
+    from beeverforge.adapters.tracker.registry import build_tracker
+
+    for refusal in (lambda: _direct(scope),
+                    lambda: build_tracker(_project(tmp_path, scope), token="t")):
+        with pytest.raises(ValueError) as refused:
+            refusal()
+        message = str(refused.value)
+        assert "\n" not in message, message
+        assert ". " not in message, message
+        assert "scope_jql" in message and repr(scope) in message, message
+        assert f"{scope[at]} at character {at} that opens a string it never closes" in message, message
+        assert message.endswith(f"close that string or remove the {scope[at]} in "
+                                "tracker.options.scope_jql"), message
