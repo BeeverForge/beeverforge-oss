@@ -34,6 +34,7 @@ _NOT_THROTTLED = {
                                 "(https://api.github.com/repos/acme/code429/issues/7)",
     "email-code429": "ticket: jira GET issue/DAR-7 failed: 404 for code429@acme.ai",
     "email-status429": "ticket: jira GET issue/DAR-7 failed: 404 for status429@x.io",
+    "email-error429": "ticket: jira GET issue/DAR-7 failed: 404 for error429@x.io",
 }
 
 
@@ -59,6 +60,9 @@ _THROTTLED = {
     "github-http": "ticket: gh issue view failed: HTTP 429: (https://api.github.com/repos/a/b)",
     "github-app": "429 secondary limit",
     "status-code": "tracker answered status code 429",
+    # an agent harness's API refusal as a park note: codex reads a pause only from stderr
+    # (`codex._pause_from`) and falls back to the raw stream for its summary
+    "agent-api-error": 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}',
 }
 
 

@@ -137,11 +137,13 @@ _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
 
     # ---- transient: time alone fixes these -----------------------------------------------------
     # The 429 counts only where the park lines put the HTTP status — Jira `failed: 429`, Azure
-    # DevOps `→ 429`, gh `HTTP 429`, a line that starts with it, `status`/`code` 429. A bare `429`
-    # read card `DAR-429`'s 404 and `ops429@acme.ai`'s refusal as throttling.
-    # `status`/`code` need a separator before it, or `code429@acme.ai` is a status too.
+    # DevOps `→ 429`, gh `HTTP 429`, a line that starts with it, `status`/`code` 429, and an agent
+    # harness's `API Error: 429` (codex reads only stderr for a pause, so its stream's refusal can
+    # park as prose). A bare `429` read card `DAR-429`'s 404 and `ops429@acme.ai`'s refusal as
+    # throttling. `status`/`code`/`error` need a separator before it, or `code429@acme.ai` is a
+    # status too.
     (TRANSIENT, _throttled(r"(?:(?:^|failed:|→|->|\bhttp)[\s:=]*|"
-                           r"(?:\bstatus(?: code)?|\bcode)[\s:=]+)429\b"), "throttled"),
+                           r"(?:\bstatus(?: code)?|\bcode|\berror)[\s:=]+)429\b"), "throttled"),
     (TRANSIENT, re.compile(
         r"connection reset|connection refused|temporary failure in name resolution|"
         r"timed? ?out (?:while )?(?:connecting|reading)|network is unreachable|"
