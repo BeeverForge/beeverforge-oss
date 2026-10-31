@@ -282,8 +282,11 @@ def test_no_door_starts_a_harness_while_the_account_declares_what_it_cannot_leav
             path.unlink()
 
 
+@pytest.mark.parametrize("door", ["ask", "plan"])
 @pytest.mark.parametrize("kind", sorted(k for k, r in ISOLATION.items() if r.refused_when))
-def test_the_person_is_told_which_file_held_the_role_back_and_what_to_do(kind, box):
+def test_the_person_is_told_which_file_held_the_role_back_and_what_to_do(kind, door, box):
+    """The planner has no harness of its own: it runs on the executor's, so its refusal never
+    tells the person to give it another one without saying it is the executor's (#173)."""
     sandbox, ws, calls, home, _ = box
     adapter = registry.HARNESSES[kind]()
 
@@ -291,12 +294,17 @@ def test_the_person_is_told_which_file_held_the_role_back_and_what_to_do(kind, b
         path = home / declared
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}")
-        result = adapter.ask(sandbox=sandbox, workspace=ws, prompt="which module owns /health?")
-        path.unlink()
+        try:
+            fn, kw = _knock(adapter, door)
+            result = fn(sandbox=sandbox, workspace=ws, **kw)
+        finally:
+            path.unlink()
 
         assert not result.ok and _made(calls) == [], result
         said = result.summary or ""
         assert str(path) in said and "MCP" in said and "remove" in said.lower(), said
+        if door == "plan" and "another harness" in said:
+            assert "executor" in said, f"{kind}/plan: the planner has no harness of its own: {said}"
 
 
 def test_what_one_opencode_role_leaves_in_its_configuration_reaches_no_later_role(box):
