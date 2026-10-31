@@ -28,6 +28,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
@@ -126,6 +127,17 @@ def path_taken(branch: str, path: str, *, repo: str, what: str, owner: str = "",
     return (f"{branch} cannot be checked out at {path}, the path this job's working tree takes, "
             f"because {there} is there; it was left as it is, and this job did not start. Move "
             f"it with {move}, then resume.")
+
+
+def path_not_made(branch: str, path: str, *, error: OSError) -> str:
+    """The refusal for a box's path the box could not make (#124): one sentence naming the card's
+    branch, the path, the system's own reason, and what frees it. Git never ran, so nothing was
+    written there."""
+    reason = error.strerror or str(error)
+    return (f"{branch} cannot be checked out at {path}, the path this job's working tree takes, "
+            f"because the box could not create that directory ({reason}); nothing was written "
+            f"there, and this job did not start. Make {shlex.quote(str(Path(path).parent))} "
+            f"writable by this process and free {shlex.quote(path)}, then resume.")
 
 
 def branch_held(branch: str, path: str, *, main: bool, locked: bool, repo: str = "",
@@ -373,6 +385,32 @@ def _what_is_at(wt: Path) -> tuple[str, str, bool] | None:
     if tree is None:
         return "forgotten", str(owner), False
     return "tree", str(owner), tree.locked
+
+
+def _what_appeared_at(wt: Path, trees) -> tuple[str, str, bool] | None:
+    """What `os.mkdir(wt)` met at the box's path after `prepare` had read it as free, as
+    `(what, owner, locked)` for `path_taken`, or `None` when git may take the path: an empty
+    directory (a box stopped between its `mkdir` and the add left it), or, on an unread list, a
+    directory, which git judges as before. Read with `lstat`, so a link is named, never followed.
+    An `OSError` here is raised: what cannot be looked at is never handed to git."""
+    mode = os.lstat(wt).st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink", "", False
+    if not stat.S_ISDIR(mode):
+        return "file", "", False
+    taken = _what_is_at(wt)
+    if trees is None and taken is not None and taken[0] not in ("symlink", "file"):
+        return None
+    return taken
+
+
+def _remove_if_empty(wt: Path) -> None:
+    """Remove the directory the box made at `wt` for an add that failed, so a rerun is not blocked:
+    `rmdir`, never recursive, so whatever is in it now, or a link now at it, stays."""
+    try:
+        os.rmdir(wt)
+    except OSError:
+        pass
 
 
 def _add_mark(wt: Path) -> Path:
@@ -759,9 +797,14 @@ class WorktreeSandbox(SandboxAdapter):
         # `fatal: '<wt>' already exists` (2.34.1 and 2.43.0): after `branch -D` below, after `add
         # -b` made the branch again at the base (2.43.0, measured 2026-10-18: the job's work was
         # replaced by `main`), and after a hosted resume's fetch wrote `refs/remotes/origin/<b>`.
-        # Decided here, before any of that (engineering lessons §12). Only when the list was read:
-        # unread, `_clear_our_own` could not tell what is ours, and git judges as before.
-        taken = _what_is_at(wt) if trees is not None else None
+        # Decided here, before any of that (engineering lessons §12). A symlink or a file at `wt`
+        # is refused whether or not the list was read (#124): neither depends on it, and unread,
+        # git checked the card out through a link to an empty directory (rc 0, 2.50.1). Only the
+        # directory checks wait for the list: unread, `_clear_our_own` could not tell what is
+        # ours, and git judges a directory as before.
+        taken = _what_is_at(wt)
+        if trees is None and taken is not None and taken[0] not in ("symlink", "file"):
+            taken = None
         if taken is not None:
             what, owner, locked = taken
             raise RuntimeError(path_taken(branch, str(_where(wt)), repo=str(repo_path),
@@ -846,6 +889,28 @@ class WorktreeSandbox(SandboxAdapter):
         # add and removed only once `_run` returned, is what tells the box's own interrupted add
         # from a person's lock. Never in a `finally`: a `TimeoutExpired` is exactly the case the
         # mark must outlive.
+        # THE BOX MAKES ITS PATH ITSELF, RIGHT BEFORE THE ADD (#124, review of 4b54732). The check
+        # above reads the path with `lstat`, and git creates it only at the add: in between,
+        # `branch -D` runs, and a hosted resume's fetch (180 s timeout), so a link that appeared
+        # in that window was still written through. `os.mkdir` never follows a final link and
+        # fails on anything at the path; git accepts the empty directory it makes on every door,
+        # and a rerun reads one left behind as free (`_what_is_at`). What it met is read again
+        # and refused by name before git runs; any other failure to make it refuses too.
+        made = False
+        try:
+            os.mkdir(wt)
+            made = True
+        except FileExistsError:
+            try:
+                taken = _what_appeared_at(wt, trees)
+            except OSError as exc:
+                raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc
+            if taken is not None:
+                what, owner, locked = taken
+                raise RuntimeError(path_taken(branch, str(_where(wt)), repo=str(repo_path),
+                                              what=what, owner=owner, locked=locked)) from None
+        except OSError as exc:
+            raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc
         mark = _write_mark(repo_path, wt)
         rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())
         _unlink_mark(mark)
@@ -853,6 +918,8 @@ class WorktreeSandbox(SandboxAdapter):
             # Somebody may have checked the branch out between the read above and this add, or
             # the read may have failed; the porcelain is asked once more before git's sentence is
             # passed on.
+            if made:
+                _remove_if_empty(wt)
             held = _holder(repo_path, branch)
             if held is not None:
                 raise _branch_held_elsewhere(branch, held, repo_path=repo_path, rebuilt=rebuilt,

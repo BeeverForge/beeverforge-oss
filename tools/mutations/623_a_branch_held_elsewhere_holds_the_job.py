@@ -68,15 +68,16 @@ MUTATIONS = [
      "        trees = self._clear_our_own(repo_path, wt)\n"
      '        _run(["git", "-C", str(repo_path), "worktree", "prune"])\n'),
 
+    # Re-pinned by #124: the box's own `rmdir` of the path it made now stands above the re-ask.
     ("the porcelain is not asked again after git refuses the add, so a branch taken in the "
      "window between the read and the add fails the job with git's sentence", BOX,
-     "            # passed on.\n"
+     "                _remove_if_empty(wt)\n"
      "            held = _holder(repo_path, branch)\n"
      "            if held is not None:\n"
      "                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
      "rebuilt=rebuilt,\n"
      "                                             ours=wt)\n",
-     "            # passed on.\n"),
+     "                _remove_if_empty(wt)\n"),
 
     ("a bare `locked` line (a lock with no reason) is not read, so the person is told to remove a "
      "tree git refuses to remove",
