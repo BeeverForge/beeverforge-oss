@@ -196,3 +196,163 @@ def test_a_leftover_checkout_directory_is_replaced_by_the_ref(tmp_path, monkeypa
     assert factory._worktree_at(repo, "feat", _KEY) == dest
     assert not (dest / "sentinel").exists()
     assert (dest / "only-on-feat.txt").read_text() == "feat\n"
+
+
+# THE WINDOW (#317 review, the shape #124 / PR #312 settled). The guard reads the path once; git
+# creates it only at the `add`. Whatever appears in between must be refused by name, not written
+# through. The last git call before the add is this path's own `worktree remove`, so the spy plants
+# there, right after it ran — the latest point a test can reach before the function makes the path.
+
+
+def _plant_after_the_remove(monkeypatch, plant) -> list[list[str]]:
+    from beeverforge.runtime import repo_cache
+
+    calls: list[list[str]] = []
+    real = repo_cache._git
+
+    def planting(args, *a, **kw):
+        calls.append(list(args))
+        result = real(args, *a, **kw)
+        if "worktree" in args and "remove" in args:
+            plant()
+        return result
+
+    monkeypatch.setattr(repo_cache, "_git", planting)
+    return calls
+
+
+def _adds(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if "worktree" in c and "add" in c]
+
+
+@pytest.mark.parametrize("leftover", [False, True], ids=["fresh", "leftover-checkout"])
+def test_a_symlink_planted_after_the_check_is_refused_not_written_through(tmp_path, monkeypatch,
+                                                                          leftover):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    if leftover:
+        factory._worktree_at(repo, "feat", _KEY)
+    target = tmp_path / "empty"
+    target.mkdir()
+    calls = _plant_after_the_remove(monkeypatch, lambda: dest.symlink_to(target))
+
+    with pytest.raises(RuntimeError) as refused:
+        factory._worktree_at(repo, "feat", _KEY)
+
+    said = str(refused.value)
+    assert str(dest) in said and "symbolic link" in said, said
+    assert list(target.iterdir()) == [], "git checked out through the link"
+    assert _adds(calls) == [], f"git was asked to add: {calls}"
+    assert dest.is_symlink() and Path(dest.readlink()) == target
+
+
+def test_a_file_planted_after_the_check_is_refused_by_name(tmp_path, monkeypatch):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    calls = _plant_after_the_remove(monkeypatch, lambda: dest.write_text("a person's notes"))
+
+    with pytest.raises(RuntimeError) as refused:
+        factory._worktree_at(repo, "feat", _KEY)
+
+    said = str(refused.value)
+    assert str(dest) in said and "a file" in said and "symbolic link" not in said, said
+    assert dest.read_text() == "a person's notes"
+    assert _adds(calls) == []
+
+
+def test_a_path_that_cannot_be_made_is_refused_in_one_sentence(tmp_path, monkeypatch):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    real_mkdir = factory.os.mkdir
+
+    def refusing(path, *a, **kw):
+        if Path(path) == dest:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_mkdir(path, *a, **kw)
+
+    monkeypatch.setattr(factory.os, "mkdir", refusing)
+    calls = _spy(monkeypatch)
+
+    with pytest.raises(RuntimeError) as refused:
+        factory._worktree_at(repo, "feat", _KEY)
+
+    said = str(refused.value)
+    assert str(dest) in said and "Permission denied" in said and "run again" in said, said
+    assert _adds(calls) == []
+
+
+def _failing_add(monkeypatch, before=lambda: None) -> None:
+    from beeverforge.runtime import repo_cache
+
+    real = repo_cache._git
+
+    def failing(args, *a, **kw):
+        if "worktree" in args and "add" in args:
+            before()
+            return 128, "fatal: simulated"
+        return real(args, *a, **kw)
+
+    monkeypatch.setattr(repo_cache, "_git", failing)
+
+
+def test_a_failed_add_removes_only_the_empty_directory_it_made(tmp_path, monkeypatch):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    seen: list[bool] = []
+    _failing_add(monkeypatch, lambda: seen.append(dest.is_dir() and not dest.is_symlink()))
+
+    with pytest.raises(RuntimeError, match="could not check"):
+        factory._worktree_at(repo, "feat", _KEY)
+
+    assert seen == [True], "the path was not made before the add"
+    assert not dest.exists() and not dest.is_symlink()
+
+
+def test_a_failed_add_leaves_what_is_inside_the_directory(tmp_path, monkeypatch):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    _failing_add(monkeypatch, lambda: (dest / "theirs.txt").write_text("keep"))
+
+    with pytest.raises(RuntimeError, match="could not check"):
+        factory._worktree_at(repo, "feat", _KEY)
+
+    assert (dest / "theirs.txt").read_text() == "keep"
+
+
+def test_a_failed_add_leaves_a_link_now_at_the_path_alone(tmp_path, monkeypatch):
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    target = tmp_path / "somebody-elses"
+    target.mkdir()
+    (target / "keep.txt").write_text("theirs")
+
+    def swap():
+        dest.rmdir()
+        dest.symlink_to(target)
+
+    _failing_add(monkeypatch, swap)
+
+    with pytest.raises(RuntimeError, match="could not check"):
+        factory._worktree_at(repo, "feat", _KEY)
+
+    assert dest.is_symlink() and Path(dest.readlink()) == target
+    assert (target / "keep.txt").read_text() == "theirs"
+
+
+def test_a_leftover_directory_that_cannot_be_removed_is_refused_by_name(tmp_path, monkeypatch):
+    """`rmtree(..., ignore_errors=True)` says nothing when it fails; what is still there is looked
+    at before anything else runs."""
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    dest.mkdir()
+    (dest / "theirs.txt").write_text("keep")
+    monkeypatch.setattr(factory.shutil, "rmtree", lambda *a, **kw: None)
+    calls = _spy(monkeypatch)
+
+    with pytest.raises(RuntimeError) as refused:
+        factory._worktree_at(repo, "feat", _KEY)
+
+    said = str(refused.value)
+    assert str(dest) in said and "could not be removed" in said and "a directory" in said, said
+    assert (dest / "theirs.txt").read_text() == "keep"
+    assert _adds(calls) == []
