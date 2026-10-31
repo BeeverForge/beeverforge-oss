@@ -423,7 +423,9 @@ def _operator_open_at(operator_root: str | None) -> OpenAt:
 
 
 def _doc_summary(path: Path) -> str:
-    text = path.read_text()
+    # `utf-8-sig`: a document saved with a byte-order mark puts U+FEFF in front of `---` or `#`,
+    # and it would be named by its file name instead of its summary or heading (#321).
+    text = path.read_text(encoding="utf-8-sig")
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) == 3:
