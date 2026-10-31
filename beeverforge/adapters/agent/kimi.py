@@ -131,7 +131,8 @@ NOT_WHILE_DECLARED = (
     'for f in "$k/mcp.json" "$k/plugins/installed.json"; do '
     'if [ -e "$f" ]; then echo "Kimi Code starts every MCP server declared in $f and cannot be '
     'started without them, so they would reach this role. Nothing was started: remove the file '
-    'from the account that runs the harness, or give this role another harness."; '
+    'from the account that runs the harness, or give this role another harness (for the '
+    'planner, the executor\'s, which it runs on)."; '
     'exit 3; fi; done;')
 
 #: What the shell runs before Kimi Code: the refusal. `plugins/installed.json` refuses even when it
