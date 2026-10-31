@@ -393,6 +393,27 @@ _COST_LINE = "Cost: $"
 _SECTION_AS_IT_STANDS = object()
 
 
+def _as_text(words: str) -> str:
+    """`words` with every row that would start a `## ` section escaped, so it reads as text (#113).
+
+    The readers find a section by its heading row, and the body also carries what the platform
+    did not write: the card objective, the reviewer's summary and its findings. A row of those
+    that read `## Review — …` or `## What the agent says it did` was taken for the section, and the
+    next pass spliced its line or its fresh review into it. Escaped here, the platform is the ONLY
+    writer that can put a section heading in the body; the row still says what it said."""
+    return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
+
+
+def _sections_from(rows: list[str]) -> int:
+    """The first row a platform section can be in: the one after the LAST `## Validations` row.
+
+    `_pr_body` writes that row unconditionally, after the objective and before every section, so
+    a search that starts here never reads the objective (#113) — even one published before
+    `_as_text`, whose heading rows are raw. A body without the row, one this platform did not
+    write, is searched whole: 0."""
+    return next((i + 1 for i in range(len(rows) - 1, -1, -1) if rows[i] == "## Validations"), 0)
+
+
 def _review_lines(r: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
@@ -429,7 +450,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, r.summary]
+        out = [first, _as_text(r.summary)]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -440,7 +461,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {f.description}")
+            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
         return out
 
 
@@ -766,7 +787,10 @@ def _read_account(rows: list[str]) -> tuple[int, int, _Account] | None:
     Only what `_account_lines` writes is read back. Agent text cannot forge the label, the count or
     the cut line, because every agent row starts with `>`; and the executor's rows and the pass
     rows are told apart by position, the label between them."""
-    start = next((i for i, row in enumerate(rows) if row == AGENT_ACCOUNT_HEADING), None)
+    # the LAST heading row below `## Validations`: the objective is above it and may hold it (#113)
+    floor = _sections_from(rows)
+    start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
+                  if row == AGENT_ACCOUNT_HEADING), None)
     if start is None:
         return None
     end = next((i for i in range(start + 1, len(rows))
@@ -3984,7 +4008,10 @@ class JobRunner:
         rows = body.splitlines()
         cost_at = next((i for i in range(len(rows) - 1, -1, -1)
                         if rows[i].startswith(_COST_LINE)), None)
-        start = next((i for i, row in enumerate(rows)
+        # the LAST review heading, below `## Validations`: the objective is above it and may hold
+        # one, escaped or, in a body published before the escaping, raw (#113)
+        floor = _sections_from(rows)
+        start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
                       if row.startswith(_REVIEW_HEADING)), None)
         # `start is None`: a pull request this platform did not write a review section into.
         if review is not _SECTION_AS_IT_STANDS and start is not None:
@@ -4057,7 +4084,7 @@ class JobRunner:
         card = card or card_reference(ticket, owned=False)
         lines = [
             card.lead, *(["", card.closing] if card.closing else []),
-            "", "## Objective", card.text(ticket.objective), "", "## Validations",
+            "", "## Objective", _as_text(card.text(ticket.objective)), "", "## Validations",
         ]
         for v in result.validations:
             # An advisory FAILURE must not wear the same ❌ as a blocking one — the two ask
