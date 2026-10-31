@@ -759,9 +759,14 @@ class WorktreeSandbox(SandboxAdapter):
         # `fatal: '<wt>' already exists` (2.34.1 and 2.43.0): after `branch -D` below, after `add
         # -b` made the branch again at the base (2.43.0, measured 2026-10-18: the job's work was
         # replaced by `main`), and after a hosted resume's fetch wrote `refs/remotes/origin/<b>`.
-        # Decided here, before any of that (engineering lessons §12). Only when the list was read:
-        # unread, `_clear_our_own` could not tell what is ours, and git judges as before.
-        taken = _what_is_at(wt) if trees is not None else None
+        # Decided here, before any of that (engineering lessons §12). A symlink or a file at `wt`
+        # is refused whether or not the list was read (#124): neither depends on it, and unread,
+        # git checked the card out through a link to an empty directory (rc 0, 2.50.1). Only the
+        # directory checks wait for the list: unread, `_clear_our_own` could not tell what is
+        # ours, and git judges a directory as before.
+        taken = _what_is_at(wt)
+        if trees is None and taken is not None and taken[0] not in ("symlink", "file"):
+            taken = None
         if taken is not None:
             what, owner, locked = taken
             raise RuntimeError(path_taken(branch, str(_where(wt)), repo=str(repo_path),
