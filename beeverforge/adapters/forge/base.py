@@ -41,6 +41,27 @@ def truncated(text: str, max_chars: int) -> str:
               f"{max_chars} shown. It is NOT the whole change.]\n")
 
 
+#: The words `truncated_tail` opens its marker with, the log's counterpart of `DIFF_CUT_MARKER`:
+#: `repairable.log_names_the_change` reads a log that carries it as "could not see all of it",
+#: never as a log that names no changed file (#161).
+LOG_CUT_MARKER = "[... this log was cut here:"
+
+
+def truncated_tail(text: str, max_chars: int) -> str:
+    """The tail of a failing log that fits, and a MARKER at its head when it did not (#161).
+
+    A log cut with nothing saying so reads exactly like a whole one: a reader concludes that what
+    is not in it was not there, when it was only not seen. The TAIL is kept, the opposite of a
+    diff: a log's failure is at its end. The marker stands at the head because that is where the
+    cut is. Redact before cutting, so a cut never splits a secret past the redactor.
+    """
+    if len(text) > max_chars:
+        kept = text[len(text) - max_chars:]
+        return (f"{LOG_CUT_MARKER} {len(text)} characters in total, the last {max_chars} "
+                f"shown. It is NOT the whole log.]\n\n" + kept)
+    return text
+
+
 def host_of(url: str) -> str:
     """The host an https URL names, lowercased, or `""` for anything else.
 
