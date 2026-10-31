@@ -11,15 +11,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 
 from dotenv import load_dotenv
 
 from beeverforge.factory import resolve_box_image
 from beeverforge.registry import ProjectRegistry
 from beeverforge.runtime.temporal import TASK_QUEUE
-from beeverforge.runtime.temporal.connection import connect
+from beeverforge.runtime.temporal.connection import (
+    EngineNotDeclared,
+    EngineNotListening,
+    connect_at_birth,
+)
 from beeverforge.runtime.temporal.io import JobParams
 from beeverforge.runtime.temporal.workflow import JobWorkflow
+
+log = logging.getLogger("beeverforge.starter")
 
 
 async def main() -> None:
@@ -31,7 +38,15 @@ async def main() -> None:
     args = ap.parse_args()
 
     load_dotenv()
-    client = await connect()  # dev-server or Temporal Cloud, per env
+    # Dialled as the worker is born (#73): the bare `connect()` ended an unreachable engine in a
+    # traceback; this waits a bounded time for it to listen, then says so in one sentence. An
+    # engine nobody declared is refused at once, and its message is the sentence too.
+    from beeverforge.observability import logs
+
+    try:
+        client = await connect_at_birth()  # dev-server or Temporal Cloud, per env
+    except (EngineNotListening, EngineNotDeclared) as exc:
+        raise logs.exiting(log, f"starter: {exc}") from None
 
     wf_id = f"beeverforge-{args.project}-{args.issue}"
     handle = await client.start_workflow(
