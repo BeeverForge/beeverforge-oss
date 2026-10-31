@@ -124,7 +124,7 @@ def _not_one_account(email: str, method: str, path: str, *, has_token: bool,
     and a revoked one was not measured (2026-10-19: another account's token and an empty one
     answer alike, 404 and `myself` 401). With no token at all the request was anonymous for a
     reason of its own, and calling it "different accounts" would send a person looking for the
-    wrong mistake."""
+    wrong mistake. With a token and no email, the email is what is missing, and it is named."""
     seen = (f"Jira answered {method} {path} 404 as it does an anonymous request, and GET myself "
             f"401.")
     if refused:
@@ -139,6 +139,12 @@ def _not_one_account(email: str, method: str, path: str, *, has_token: bool,
         return (f"jira: no API token reached this tracker for {email} — {seen} Set "
                 f"{SHIPPED_ENV['jira']}, or the variable the project's tracker.options.token_env "
                 f"names.")
+    if not (email or "").strip():
+        # A token with no email is sent as `:<token>`, anonymous too; "different accounts" would
+        # send a person looking for a second account. A blank YAML value arrives as whitespace.
+        return (f"jira: no email reached this tracker for the API token — set "
+                f"tracker.options.email to the address of the account that created the token. "
+                f"{seen}")
     return (f"jira: the email {email} and the API token belong to different accounts, or the "
             f"token was revoked — {seen} Pair the email with an API token created by that same "
             f"account (id.atlassian.com → Security → API tokens), or replace a token that was "
