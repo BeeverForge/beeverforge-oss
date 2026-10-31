@@ -882,6 +882,75 @@ class WorktreeSandbox(SandboxAdapter):
         return Workspace(path=wt, host_path=wt, branch=branch, base_branch=base_branch,
                          base_commit=base_commit)
 
+    def prepare_tip(
+        self, *, repo_path: Path, base_branch: str, branch: str, remote_url: str | None = None,
+    ) -> Workspace:
+        """Check the branch's TIP out, detached, for a pass that writes nothing: a re-review (#55).
+
+        A READ NEEDS THE TIP, NOT THE BRANCH. `prepare` refuses a branch another working tree holds
+        (#623), and that is right for a pass that commits: a commit made on a detached checkout
+        would miss the pull request's branch. A re-review only reads the diff, and `worktree add
+        --detach` is allowed while a person has the branch out in their review tree, so nobody is
+        asked to close it for a read that could run anyway. No holder is asked for that reason.
+
+        NOTHING OF THE BRANCH IS WRITTEN. No `branch -D`, no `-b`, no reset of the branch, and on a
+        failed forge read no `branch -D` on the way out either: the only thing this adds and
+        removes is the box's own `wt`. On a hosted forge the tip is fetched as the continuing door
+        fetches it, into `refs/remotes/origin/<branch>`, and the diff is measured from where it
+        left the forge's base.
+
+        OPTIONAL BY DESIGN, as `guidelines_path`: callers ask through `getattr`, and a box without
+        it goes through `prepare`, which holds."""
+        self._repo_root = repo_path
+        self.root.mkdir(parents=True, exist_ok=True)
+        tip = self.root / branch.replace("/", "-")
+        trees = self._clear_our_own(repo_path, tip)
+        taken = _what_is_at(tip) if trees is not None else None
+        if taken is not None:
+            what, owner, locked = taken
+            raise RuntimeError(path_taken(branch, str(_where(tip)), repo=str(repo_path),
+                                          what=what, owner=owner, locked=locked))
+        here = _is_this_repo(remote_url, repo_path)
+        start = base_branch
+        if here:
+            if _branch_exists(repo_path, branch):
+                start = f"refs/heads/{branch}"
+            else:
+                log.warning("BEEVERFORGE_BRANCH_GONE %s is not in %s — this review reads %s "
+                            "instead of the pull request's branch", branch, repo_path,
+                            base_branch)
+        else:
+            rc, said = _run(["git", "-C", str(repo_path), "fetch", "--", remote_url or "origin",
+                             f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)
+            if rc == 0:
+                start = f"origin/{branch}"
+            elif _remote_has_no_such_branch(said):
+                log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this review reads "
+                            "%s instead of the pull request's branch", branch, base_branch)
+            else:
+                raise RuntimeError(
+                    f"could not ask the remote for {branch!r}, so this workspace cannot start "
+                    f"from the open PR's branch: {_redact(said).strip()[:300]}")
+        own_mark = _write_mark(repo_path, tip)
+        rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", str(tip),
+                         start], env=_in_gits_own_words())
+        _unlink_mark(own_mark)
+        if rc != 0:
+            raise RuntimeError(f"worktree add failed: {said}")
+        try:
+            gitworktrees.mark_as_job(tip)
+        except OSError as exc:
+            log.warning("could not mark %s as a running review's worktree (%s) — a repository "
+                        "cache sync may swap the checkout it stands on while it runs",
+                        tip, exc)
+        base_commit = None
+        if remote_url and not here:
+            base_commit = self._read_the_forges_base(
+                repo_path=repo_path, wt=tip, base_branch=base_branch, branch=branch,
+                remote_url=remote_url, from_base=False, drop_branch=False)
+        return Workspace(path=tip, host_path=tip, branch=branch, base_branch=base_branch,
+                         base_commit=base_commit)
+
     @staticmethod
     def _clear_our_own(repo_path: Path, wt: Path) -> list[gitworktrees.WorkingTree] | None:
         """Remove the box's own worktree at `wt`, registration and directory, and answer the
@@ -959,7 +1028,8 @@ class WorktreeSandbox(SandboxAdapter):
 
     @staticmethod
     def _read_the_forges_base(*, repo_path: Path, wt: Path, base_branch: str, branch: str,
-                              remote_url: str, from_base: bool) -> str | None:
+                              remote_url: str, from_base: bool,
+                              drop_branch: bool = True) -> str | None:
         """Read `base_branch` from the FORGE, cut a new job from it, and answer the commit the
         workspace's diff is measured from (#168).
 
@@ -998,7 +1068,8 @@ class WorktreeSandbox(SandboxAdapter):
             rc, out = _run(["git", "-C", wp, "reset", "--hard", "--quiet", "FETCH_HEAD"])
         if rc != 0:
             _run(["git", "-C", str(repo_path), "worktree", "remove", "--force", wp])
-            _run(["git", "-C", str(repo_path), "branch", "-D", branch])
+            if drop_branch:  # a detached read (#55) made no branch, and the one there is theirs
+                _run(["git", "-C", str(repo_path), "branch", "-D", branch])
             # THE STEP THAT FAILED IS THE ONE NAMED (review of #355). The fetch and the reset share
             # `rc`/`out`, and a reset that failed used to be read as the forge's answer and said as
             # "could not read … from the forge" — naming a fetch that had in fact succeeded.
