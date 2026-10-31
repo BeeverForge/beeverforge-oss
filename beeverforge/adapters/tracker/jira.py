@@ -229,6 +229,38 @@ def scope_named(scope: str) -> str:
     return f" within scope_jql {scope!r}" if scope else ""
 
 
+def unbalanced_at(scope: str) -> tuple[str, int] | None:
+    """Where `scope` cannot be wrapped safely: `(")", at)` for the first `)` that closes a
+    parenthesis it never opened, outside a quoted string; `(quote, at)` for the opening quote of a
+    string the scope never closes; `None` when there is neither.
+
+    `within_scope` wraps the scope as `AND (<scope>)`: a stray `)` closes that wrapper, and what
+    follows it — `labels = "bf-api") OR (labels is not empty` — is ORed onto the project clause,
+    a read of the whole site (#121). JQL strings are `"..."` or `'...'`; a backslash escapes the
+    next character inside a string AND outside one, as Jira's lexer reads an unquoted string, so
+    `labels = a\\")` is an escaped quote and a stray `)`, not the start of a string hiding it. A
+    string left open is refused too: the quotes of the clauses appended after the scope would
+    close it and change what is read."""
+    depth, quote, opened, escaped = 0, "", 0, False
+    for at, char in enumerate(scope):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote, opened = char, at
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                return ")", at
+            depth -= 1
+    return (quote, opened) if quote else None
+
+
 class JiraTracker:
     """Jira Cloud REST v3. Satisfies `TrackerAdapter`."""
 
@@ -282,7 +314,22 @@ class JiraTracker:
         #: against one Jira project each read the whole of it as their queue, and one ticket was
         #: picked up by three of them in one night (v0.6.0-rc.2). `""` = the whole project, the
         #: JQL unchanged; whitespace alone is `""`, so a blank YAML value cannot emit `AND ()`.
+        #: A `)` it never opened is refused here: it would close the `AND (...)` wrapper (#121);
+        #: so is a string it never closes, which the quotes appended after it would close.
         self.scope_jql = str(scope_jql or "").strip()
+        flaw = unbalanced_at(self.scope_jql)
+        if flaw and flaw[0] == ")":
+            raise ValueError(
+                f"scope_jql {self.scope_jql!r} has a ')' at character {flaw[1]} that closes a "
+                f"parenthesis it never opened — it would widen {project_key}'s read past the "
+                f"project, so it is refused; remove that ')' or add the '(' it closes in "
+                f"tracker.options.scope_jql")
+        if flaw:
+            raise ValueError(
+                f"scope_jql {self.scope_jql!r} has a {flaw[0]} at character {flaw[1]} that opens "
+                f"a string it never closes — the quotes appended after it would close it and "
+                f"change what {project_key} reads, so it is refused; close that string or remove "
+                f"the {flaw[0]} in tracker.options.scope_jql")
         #: The PROJECT's language, for the one sentence this row writes to a person in its own
         #: name — the note on a card it could not record as not delivered. Everything else it
         #: posts was composed by its caller, already in that language.
