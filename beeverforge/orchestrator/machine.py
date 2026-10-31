@@ -413,6 +413,79 @@ _A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
 #: text, as `_MARKUP` does for the agent's own; an `&` already escaped (`\&`) is left alone, as a
 #: second backslash would escape the first and leave the entity live.
 _A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
+#: A fence line, `` ``` `` or `~~~` and longer, at most three spaces in; a backtick fence's info
+#: string holds no backtick (CommonMark).
+_A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+#: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
+#: autolink (`<https://…>`) is not one.
+_AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]", re.MULTILINE)
+
+
+def _ampersands_escaped(words: str) -> str:
+    """The reviewer's `words` with every bare `&` escaped, except in a CLOSED fence, a CLOSED code
+    span and a bare link (`_A_URL`), where a backslash is not an escape: it showed in the code and
+    moved the link (review of #323, measured on `POST /markdown`). An entity there renders as
+    written and mentions no one. When in doubt it escapes: a fence or a span that never closes,
+    and the rest of the paragraph after it, and all of `words` if a row may open an HTML block."""
+    if _AN_HTML_ROW.search(words):
+        return _escaped_ampersands(words)
+    rows, out, paragraph, i = words.split("\n"), [], [], 0
+
+    def ended() -> list[str]:
+        return [_outside_spans("\n".join(paragraph))] if paragraph else []
+
+    while i < len(rows):
+        fence = _A_FENCE.match(rows[i])
+        if fence:
+            closing = re.compile(rf" {{0,3}}{re.escape(fence[1][0])}{{{len(fence[1])},}}[ \t]*$")
+            end = next((j for j in range(i + 1, len(rows)) if closing.match(rows[j])), None)
+            if end is not None:
+                out, paragraph, i = out + ended() + rows[i:end + 1], [], end + 1
+                continue
+        if rows[i].strip():
+            paragraph.append(rows[i])
+        else:
+            out, paragraph = out + ended() + [rows[i]], []
+        i += 1
+    return "\n".join(out + ended())
+
+
+def _outside_spans(text: str) -> str:
+    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and its
+    bare links. A span here closes on its own row: one that does not, or a `<` that reaches past
+    its row or over a backtick (an HTML tag or an autolink outranks a span), ends the guessing,
+    and the rest of the paragraph is escaped whole."""
+    out, start, i = [], 0, 0
+    while i < len(text):
+        row_end = len(text) if (n := text.find("\n", i)) < 0 else n
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "<":
+            close = text.find(">", i, row_end)
+            if close < 0 or "`" in text[i:close]:
+                break
+        elif text[i] == "`":
+            run = len(text[i:]) - len(text[i:].lstrip("`"))
+            span = re.compile(rf"(?<!`){'`' * run}(?!`)").search(text, i + run, row_end)
+            if span is None:
+                break
+            out += [_outside_links(text[start:i]), text[i:span.end()]]
+            start = i = span.end()
+            continue
+        i += 1
+    return "".join(out) + _outside_links(text[start:])
+
+
+def _outside_links(text: str) -> str:
+    """`text` with every bare `&` escaped outside its bare links, which keep theirs."""
+    links = _A_URL.split(text)
+    return "".join(piece if k % 2 else _escaped_ampersands(piece) for k, piece in enumerate(links))
+
+
+def _escaped_ampersands(text: str) -> str:
+    """`text` with every bare `&` escaped (`_A_BARE_AMPERSAND`)."""
+    return _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", text)
 
 
 def _without_reviewer_mentions(words: str) -> str:
@@ -422,9 +495,9 @@ def _without_reviewer_mentions(words: str) -> str:
     `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
     is written `card <number>` (`without_mentions`); a zero-width space after the `@` of a name
     and between `GH` and `-<number>` keeps both readable and makes them nothing a forge links.
-    Every bare `&` is escaped first, so no entity spells one of them. Applied before `_as_text`,
-    so a `## ` row is still escaped."""
-    words = _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", words)
+    Every bare `&` outside code and links is escaped first, so no entity spells one of them
+    (`_ampersands_escaped`). Applied before `_as_text`, so a `## ` row is still escaped."""
+    words = _ampersands_escaped(words)
     words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
     return _A_GH_REFERENCE.sub("\\1\u200b", words)
 
