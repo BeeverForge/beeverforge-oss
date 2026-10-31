@@ -147,6 +147,6 @@ MUTATIONS = [
      "${hostedBoards?`", SLICE),
 
     ("the deeper addresses stop being served, so a bookmarked board is the server's own 404", APP,
-     '@app.get("/p/{project}/board")\n@app.get("/p/{project}/card/{ref}")\n',
+     '@app.get("/p/{project}/board")\n@app.get("/p/{project}/card/{ref:path}")\n',
      "", SLICE),
 ]
