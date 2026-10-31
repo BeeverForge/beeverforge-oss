@@ -520,7 +520,7 @@ def _named(refs: list[str]) -> str:
 
 def _flat(text: str) -> str:
     """One line out of a markdown body: headings and emphasis marks dropped, whitespace folded."""
-    text = re.sub(r"(?m)^\s*#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^[ \t]*#{1,6}\s+", "", text)  # `[ \t]`: `^\s*` spanned blank lines (#76)
     return " ".join(text.replace("**", "").split())
 
 

@@ -34,18 +34,22 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from beeverforge.product.corpus import _without_comments
+
 LEARNED, CONFIRMED, RETIRED = "aprendido", "confirmado", "aposentado"
 _KNOWN_STATUS = {LEARNED, CONFIRMED, RETIRED}
 
 #: `### term` starts an entry. A heading rather than a table row because a term's explanation runs
 #: to a paragraph, and because a human has to be able to edit this by hand without counting pipes.
-_ENTRY_RE = re.compile(r"^###\s+(?P<term>.+?)\s*$", re.MULTILINE)
+#: The term runs to the end of its line and the caller strips it, as `corpus._TITLE_RE` (#76).
+_ENTRY_RE = re.compile(r"^###\s+(?P<term>[^\n]+)", re.MULTILINE)
 
 
 def _field(block: str, name: str) -> str:
-    m = re.search(rf"^\s*[-*]\s*\**{name}:?\**\s*:?\s*(?P<v>.*?)\s*$",
+    # `[ \t]`, not `\s`, as in `corpus._field_re` (#76): a field never spans a line break.
+    m = re.search(rf"^[ \t]*[-*][ \t]*\**{name}:?\**[ \t]*:?[ \t]*(?P<v>[^\n]*)",
                   block, re.MULTILINE | re.IGNORECASE)
-    return re.sub(r"<!--.*?-->", "", m.group("v")).strip() if m else ""
+    return _without_comments(m.group("v")).strip() if m else ""
 
 
 #: The labels a fact's metadata is read under: a file is written in its project's language
