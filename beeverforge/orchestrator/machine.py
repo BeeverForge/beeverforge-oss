@@ -404,6 +404,104 @@ def _as_text(words: str) -> str:
     return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
 
 
+#: A `GH-<number>` GitHub links as an issue, any case, not glued to a word (`AGH-3` is not one).
+#: Main's `without_mentions` leaves it alone (#315); `_without_reviewer_mentions` breaks it.
+_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
+#: An `&` no backslash escapes: after none, or after escaped pairs (`\\&`). GitHub decodes an
+#: entity before it links, so `&#x40;name`, `&commat;name`, `&#x23;1` and `GH&#x2D;1` mentioned
+#: and linked (review of #323, measured on `POST /markdown`). One more backslash makes the `&`
+#: text, as `_MARKUP` does for the agent's own; an `&` already escaped (`\&`) is left alone, as a
+#: second backslash would escape the first and leave the entity live.
+_A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
+#: A fence line, `` ``` `` or `~~~` and longer, at most three spaces in; a backtick fence's info
+#: string holds no backtick (CommonMark).
+_A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+#: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
+#: autolink (`<https://…>`) is not one.
+_AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]", re.MULTILINE)
+
+
+def _ampersands_escaped(words: str) -> str:
+    """The reviewer's `words` with every bare `&` escaped, except in a CLOSED fence, a CLOSED code
+    span and a bare link (`_A_URL`), where a backslash is not an escape: it showed in the code and
+    moved the link (review of #323, measured on `POST /markdown`). An entity there renders as
+    written and mentions no one. When in doubt it escapes: a fence or a span that never closes,
+    and the rest of the paragraph after it, and all of `words` if a row may open an HTML block."""
+    if _AN_HTML_ROW.search(words):
+        return _escaped_ampersands(words)
+    rows, out, paragraph, i = words.split("\n"), [], [], 0
+
+    def ended() -> list[str]:
+        return [_outside_spans("\n".join(paragraph))] if paragraph else []
+
+    while i < len(rows):
+        fence = _A_FENCE.match(rows[i])
+        if fence:
+            closing = re.compile(rf" {{0,3}}{re.escape(fence[1][0])}{{{len(fence[1])},}}[ \t]*$")
+            end = next((j for j in range(i + 1, len(rows)) if closing.match(rows[j])), None)
+            if end is not None:
+                out, paragraph, i = out + ended() + rows[i:end + 1], [], end + 1
+                continue
+        if rows[i].strip():
+            paragraph.append(rows[i])
+        else:
+            out, paragraph = out + ended() + [rows[i]], []
+        i += 1
+    return "\n".join(out + ended())
+
+
+def _outside_spans(text: str) -> str:
+    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and its
+    bare links. A span here closes on its own row: one that does not, or a `<` that reaches past
+    its row or over a backtick (an HTML tag or an autolink outranks a span), ends the guessing,
+    and the rest of the paragraph is escaped whole."""
+    out, start, i = [], 0, 0
+    while i < len(text):
+        row_end = len(text) if (n := text.find("\n", i)) < 0 else n
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "<":
+            close = text.find(">", i, row_end)
+            if close < 0 or "`" in text[i:close]:
+                break
+        elif text[i] == "`":
+            run = len(text[i:]) - len(text[i:].lstrip("`"))
+            span = re.compile(rf"(?<!`){'`' * run}(?!`)").search(text, i + run, row_end)
+            if span is None:
+                break
+            out += [_outside_links(text[start:i]), text[i:span.end()]]
+            start = i = span.end()
+            continue
+        i += 1
+    return "".join(out) + _outside_links(text[start:])
+
+
+def _outside_links(text: str) -> str:
+    """`text` with every bare `&` escaped outside its bare links, which keep theirs."""
+    links = _A_URL.split(text)
+    return "".join(piece if k % 2 else _escaped_ampersands(piece) for k, piece in enumerate(links))
+
+
+def _escaped_ampersands(text: str) -> str:
+    """`text` with every bare `&` escaped (`_A_BARE_AMPERSAND`)."""
+    return _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", text)
+
+
+def _without_reviewer_mentions(words: str) -> str:
+    """The reviewer's `words`, linking no issue and notifying no one (#315).
+
+    Its summary and findings reached the pull request as written, so a `#12`, `owner/repo#12`,
+    `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
+    is written `card <number>` (`without_mentions`); a zero-width space after the `@` of a name
+    and between `GH` and `-<number>` keeps both readable and makes them nothing a forge links.
+    Every bare `&` outside code and links is escaped first, so no entity spells one of them
+    (`_ampersands_escaped`). Applied before `_as_text`, so a `## ` row is still escaped."""
+    words = _ampersands_escaped(words)
+    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    return _A_GH_REFERENCE.sub("\\1\u200b", words)
+
+
 def _sections_from(rows: list[str]) -> int:
     """The first row a platform section can be in: the one after the LAST `## Validations` row.
 
@@ -450,7 +548,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, _as_text(r.summary)]
+        out = [first, _as_text(_without_reviewer_mentions(r.summary))]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -461,7 +559,8 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
+            words = _as_text(_without_reviewer_mentions(f.description))
+            out.append(f"- **{f.severity}**{loc}: {words}")
         return out
 
 
