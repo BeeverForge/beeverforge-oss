@@ -5157,6 +5157,37 @@ class ProductModule:
         return self._close_one(number, actor=actor, in_favour_of=in_favour_of, reason=reason,
                                delivered=False)
 
+    def _outside_the_slice(self, number: str, *, act: str, language) -> WriteResult | None:
+        """The answer for a card the snapshot holds but this project's slice may not — `None` when
+        the act may go on (#122).
+
+        THE SNAPSHOT IS NOT THE SLICE. The board is refreshed with `list_tickets(updated_since=…)`
+        within the project's scope (`product/board.py::_refresh`), and a card relabelled out of a
+        shared Jira project's slice IS updated, but that search no longer returns it and Jira's
+        `removed_since` answers `[]`: it stays in the snapshot until the full sweep
+        (`_FULL_AFTER`). So the act asks the board's `holds` for the card, as `promote` does.
+
+        Three answers, as there: `False` is another project's card, refused by name with the same
+        sentence `promote` answers; `None` is a slice that could not be asked, a failure and never
+        "inside"; `True` goes on. A board with no `holds` (local, GitHub), one that cannot be
+        built, and an unscoped Jira board (`True` with no request) cost nothing (lesson 10)."""
+        from beeverforge.product.voice import board_move_said, card_said
+
+        board = self._board_to_ask()
+        holds = getattr(board, "holds", None) if board is not None else None
+        inside = holds(str(number)) if callable(holds) else True
+        if inside is True:
+            return None
+        if inside is False:
+            return WriteResult(ok=False, refusal=NOT_WAITING, ref=f"#{number}",
+                               detail=board_move_said("outside_the_slice", ref=number,
+                                                      project=getattr(self.project, "name", ""),
+                                                      language=language))
+        return _could_not(card_said("board_unreadable", language=language), act=act,
+                          cause=RuntimeError(f"the board could not say whether {number} is in "
+                                             f"this project's slice"),
+                          ref=f"#{number}")
+
     def _close_one(self, number: str, *, actor: str, in_favour_of: str | None, reason: str,
                    delivered: bool = False, event: str = "closed") -> WriteResult:
         """`close_card` once the person is authorised — shared with `withdraw_card` (#384), so the
@@ -5183,6 +5214,10 @@ class ProductModule:
             # confirmation that authorised this was about a card that no longer needs it.
             return WriteResult(ok=False, refusal=ALREADY_CLOSED, existed=True, ref=f"#{number}",
                                detail=card_said("already_closed", number=number, language=lang))
+        # STILL THIS PROJECT'S (#122): the snapshot keeps a card relabelled out of the slice
+        outside = self._outside_the_slice(number, act=f"close #{number}", language=lang)
+        if outside is not None:
+            return outside
 
         survivor = None
         if in_favour_of is not None:
@@ -5420,6 +5455,10 @@ class ProductModule:
         if card.state != "open":
             return WriteResult(ok=False, refusal=ALREADY_CLOSED, existed=True, ref=f"#{number}",
                                detail=correction_refused("closed", number=number, language=lang))
+        # STILL THIS PROJECT'S (#122), as `_close_one` asks
+        outside = self._outside_the_slice(number, act=f"correct #{number}", language=lang)
+        if outside is not None:
+            return outside
         kind = filed_by_the_product_role(card.body or "")
         if kind not in _WHAT_WAS_ASKED:
             return WriteResult(ok=False, ref=f"#{number}", detail=correction_refused(
