@@ -88,8 +88,10 @@ MUTATIONS = [
      "            self._who_is_asking()\n"
      "            return json.loads(body) if body.strip() else {}"),
 
+    # re-pinned 2026-10-30 (#295): the sentences moved to their own rule, read before throttling
     ("a job parked on the refusal is classified as unknown, and names no cause", CLASSIFY,
-     "        r\"different accounts|no api token reached|\"\n",
+     "    (CREDENTIAL, re.compile(r\"different accounts|no api token reached\", re.I), "
+     "\"credential\"),\n",
      ""),
 
     ("with no token, the remedy names only `token_env`, which a project that names none has not "

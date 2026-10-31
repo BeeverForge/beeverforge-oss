@@ -31,8 +31,10 @@ MUTATIONS = [
 
     ("THE DEFECT ITSELF, IN THE BODY: the objective's `Fixes #36` reaches the forge verbatim",
      MACHINE,
-     '            "", "## Objective", card.text(ticket.objective), "", "## Validations",\n',
-     '            "", "## Objective", ticket.objective, "", "## Validations",\n'),
+     # RE-PINNED 2026-10-31 (#113): the objective is also escaped so it cannot write a section
+     # heading; the cut still hands the forge the objective verbatim, without `card.text`.
+     '            "", "## Objective", _as_text(card.text(ticket.objective)), "", "## Validations",\n',
+     '            "", "## Objective", _as_text(ticket.objective), "", "## Validations",\n'),
 
     # ── claim 2: owned ────────────────────────────────────────────────────────────────────────
     ("the owned card's text is rewritten too, so the forge's own `#37` stops naming its item",

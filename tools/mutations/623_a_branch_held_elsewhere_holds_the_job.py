@@ -206,12 +206,10 @@ MUTATIONS = [
      "            # A PERSON HAS THE BRANCH OUT (#623): no agent ran",
      RUNNER_TEST),
 
-    ("`review_pr` lets the refusal escape instead of holding", MACHINE,
-     "        except BranchHeldElsewhere as exc:\n"
-     "            # A PERSON HAS THE BRANCH OUT (#623): nothing was read",
-     "        except ZeroDivisionError as exc:\n"
-     "            # A PERSON HAS THE BRANCH OUT (#623): nothing was read",
-     RUNNER_TEST),
+    # RETIRED 2026-10-30: "`review_pr` lets the refusal escape instead of holding" moved to #55
+    # (tools/mutations/55_a_re_review_reads_a_held_branch.py). The worktree box now checks a
+    # re-review's tip out detached, so it no longer raises on that door; the except stays for a box
+    # without `prepare_tip`, and #55's fallback test holds it.
 
     ("the resumed attempt's handle is dropped, so the next resume starts the session fresh",
      MACHINE,

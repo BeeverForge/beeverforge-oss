@@ -5106,6 +5106,7 @@ async def _card_move(*, project: str, issue: str, column: str, by: Actor) -> Out
     stage = await asyncio.to_thread(_stage, proj, board, issue)
     if stage.cannot_tell:
         return refused(CONFLICT, stage.cannot_tell)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     event = CardEvent.PROMOTED if key == "todo" else CardEvent.REORDERED
 
     async def no_job_waits() -> Outcome | None:
@@ -5137,10 +5138,15 @@ class _Stage:
 
     `key` is the neutral column key (`""` when the card is on no board or in no column);
     `column` is the board's own name for it; `cannot_tell` is the sentence to refuse with when the
-    board could not answer — an unreadable board, or a column this platform does not map."""
+    board could not answer — an unreadable board, or a column this platform does not map.
+
+    `ref` is the board's own spelling of the card when it differs from what was typed in case
+    alone (`dar-1` filed as `DAR-1`, #108), `""` otherwise: every row behind the gate acts on
+    `ref or issue`, so the door records one card's history and the answer echoes one spelling."""
     key: str = ""
     column: str = ""
     cannot_tell: str = ""
+    ref: str = ""
 
 
 def _stage(proj, board, issue: str) -> _Stage:
@@ -5159,7 +5165,7 @@ def _stage(proj, board, issue: str) -> _Stage:
     does not learn it: `False` refuses by name, `None` refuses as an unreadable board does, and a
     board without the capability, or with no slice declared, answers as before."""
     from beeverforge.adapters.board.base import stage_key, stage_option
-    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.contracts.refs import board_key, canonical_ref
     from beeverforge.product.voice import card_outside_the_slice, card_unmapped
 
     if board is None:
@@ -5171,7 +5177,12 @@ def _stage(proj, board, issue: str) -> _Stage:
     where = board.columns()
     if where is None:
         return unreadable
-    column = where.get(canonical_ref(issue)) or where.get(str(issue))
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): `dar-1` is the card the read files as
+    # `DAR-1`, and from here on it is named as the board spells it
+    found = board_key(where, issue)
+    column = where.get(found, "")
+    ref = found if found and found not in (canonical_ref(issue), str(issue)) else ""
+    issue = ref or issue
     if not column:
         holds = getattr(board, "holds", None)
         inside = holds(issue) if callable(holds) else True
@@ -5208,8 +5219,8 @@ def _stage(proj, board, issue: str) -> _Stage:
         # project's language, with the line of configuration that maps the column in it.
         return _Stage(column=column, cannot_tell=card_unmapped(
             ref=issue, column=column, option=stage_option(board),
-            language=getattr(proj, "language", None)))
-    return _Stage(key=key, column=column)
+            language=getattr(proj, "language", None)), ref=ref)
+    return _Stage(key=key, column=column, ref=ref)
 
 
 def _stage_refusal(proj, board, issue: str, *, act: str = "edit",
@@ -5251,6 +5262,7 @@ def _stage_refusal(proj, board, issue: str, *, act: str = "edit",
     at = stage if stage is not None else _stage(proj, board, issue)
     if at.cannot_tell:
         return at.cannot_tell
+    issue = at.ref or issue
     key, column = at.key, at.column
     if act == "remove":
         # ONLY BEFORE PICKUP, AND NARROWER THAN A CLOSE (#384). Removing is for the cheapest moment
@@ -5463,6 +5475,7 @@ async def _card_edit(*, project: str, issue: str, by: Actor, title: str = "",
     # role opened is refused for that, which is the reason a person can act on, rather than for a
     # capability that would not have mattered (review of #153).
     stage = await asyncio.to_thread(_stage, proj, board, issue)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     refusal = (await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="changes")
                or _stage_refusal(proj, board, issue, stage=stage))
     if refusal:
@@ -5585,6 +5598,7 @@ async def _withdraw_refusal(proj, board, issue: str, *, remove: bool) -> tuple[_
     import asyncio
 
     stage = await asyncio.to_thread(_stage, proj, board, issue)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     if remove:
         return stage, _stage_refusal(proj, board, issue, act="remove", stage=stage)
     refusal = _stage_refusal(proj, board, issue, act="close", stage=stage)
@@ -5662,6 +5676,7 @@ async def _card_close(*, project: str, issue: str, by: Actor, reason: str = "") 
     stage, refusal = await _withdraw_refusal(proj, board, issue, remove=False)
     if refusal:
         return refused(CONFLICT, refusal)
+    issue = stage.ref or issue      # the board's own spelling (#108)
 
     from beeverforge.adapters.board.columns import has_finished
 
@@ -5725,6 +5740,7 @@ async def _card_remove(*, project: str, issue: str, by: Actor, reason: str = "")
     stage, refusal = await _withdraw_refusal(proj, board, issue, remove=True)
     if refusal:
         return refused(CONFLICT, refusal)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     if kind:
         return await _by_the_product_role(proj, issue, by=by, reason=said, remove=True,
                                           delivered=False, vouched=True)
@@ -5763,7 +5779,7 @@ def card_view(proj, tracker, board, ref: str, *, opened_by: str, column: str | N
     from beeverforge.adapters.board.base import stage_key
     from beeverforge.adapters.board.columns import has_finished, has_started
     from beeverforge.adapters.tracker.base import removes
-    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.contracts.refs import board_key
     from beeverforge.product.voice import card_controls
 
     if column is None and board is not None:
@@ -5773,7 +5789,7 @@ def card_view(proj, tracker, board, ref: str, *, opened_by: str, column: str | N
             log.info("could not read where %s is to draw its controls — the row asks again when "
                      "one is pressed", ref, exc_info=True)
             placed = {}
-        column = placed.get(canonical_ref(ref)) or placed.get(str(ref)) or ""
+        column = placed.get(board_key(placed, ref), "")
     key = stage_key(board, column) if (board is not None and column) else ""
     started, finished = has_started(key), has_finished(key)
     can_remove = removes(tracker)
@@ -5821,6 +5837,12 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
     bad = _refusal_of(moved)
     if bad:
         return bad
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): echoed as the door recorded it, `DAR-1`;
+    # any other ref (`#3`) is echoed as it was typed
+    from beeverforge.contracts.refs import canonical_ref
+
+    if moved.card != canonical_ref(issue) and moved.card.upper() == canonical_ref(issue).upper():
+        issue = moved.card
     if moved.outcome("reopen").startswith("failed") and not moved.recorded:
         return refused(UNAVAILABLE, f"{issue} is still closed: {moved.outcome('reopen')}")
     reopened = f"reopened {issue} ({by}) — it is back on the board for somebody to pick up"

@@ -318,11 +318,13 @@ class KimiAdapter:
         # Kimi has no --output-last-message equivalent, so the summary has to come from the
         # stream (or, failing that, the raw tail). That is a WEAKER contract than Codex's file.
         # It reads the captured shape — the last `role: assistant` message, never the `meta`
-        # resume hint after it (review of #783) — and when no assistant line is there, it degrades
-        # to raw output; the orchestrator only journals it and shows it in the PR.
+        # resume hint after it (review of #783). Only output where NO line parsed as an event
+        # degrades to the raw tail (a text-mode CLI); a stream that parsed but holds no assistant
+        # line hands back no summary, because its JSONL is not the agent's words and the PR quotes
+        # the summary under "What the agent says it did" (#110).
         res = AgentRunResult(
             ok=code == 0 and pause is None,
-            summary=_final_text(events) or _plain_tail(out),
+            summary=_final_text(events) or ("" if events else _plain_tail(out)),
             actions=_actions(events),
             model=model or "default",
             harness=self.name,

@@ -204,6 +204,122 @@ class Loader(yaml.SafeLoader):
             raise _refuse(f"more than {MAX_EXPANDED_BYTES:,} bytes of values{how} ({_line(mark)}): "
                           f"a YAML file is read to {MAX_EXPANDED_BYTES:,} bytes of values", mark)
 
+    def construct_object(self, node: yaml.Node, deep: bool = False) -> Any:
+        """A value its constructor cannot build is refused by name, its line and its shape (#90).
+
+        A constructor raises what it raises: `2026-02-30` a ValueError (day is out of range for
+        month), `!!bool x` a KeyError, `!!timestamp x` an AttributeError. None of those is a
+        `yaml.YAMLError`, so each escaped every reader's `except yaml.YAMLError`; the ones that
+        were came back across lines without the value. Every one is `YamlRefused` here, in the
+        loader's words rather than the exception's (`KeyError: 'x'` names nothing a person can
+        act on), ending on what to write instead. A list, a
+        mapping, a set, an ordered map or pairs is built in two steps, the second after this call
+        returns (PyYAML's `state_generators`), so that step is named the same way. A refusal from
+        a value inside passes through unchanged: the innermost value is the one named. A value
+        under a tag this loader has no constructor for (`!!python/object/apply:os.system`) is
+        named by its tag alone: what is written under it is somebody else's payload, and the
+        sentence travels into findings and the published map."""
+        pending = len(self.state_generators)
+        try:
+            built = super().construct_object(node, deep)
+        except YamlRefused:
+            raise
+        except Exception as exc:
+            raise _cannot_build(node, exc, quoted=self._constructs(node.tag)) from exc
+        self.state_generators[pending:] = [_naming(step, node)
+                                           for step in self.state_generators[pending:]]
+        return built
+
+    def _constructs(self, tag: str) -> bool:
+        """Whether this loader has a constructor of its own for `tag`, not the one for any tag."""
+        prefixes = (p for p in self.yaml_multi_constructors if p is not None)
+        return tag in self.yaml_constructors or any(tag.startswith(p) for p in prefixes)
+
+
+#: how much of a value, of its shape and of PyYAML's own sentence the refusal quotes. The value
+#: and the line come first and stay inside the 120 and 200 characters readers quote.
+_VALUE_SHOWN = 40
+_SHAPE_SHOWN = 40
+_REASON_SHOWN = 60
+
+#: what a value under each tag of a scalar is, as the remedy asks for it; a tag not here is "one"
+_WRITE = {
+    "!!timestamp": "a real date",
+    "!!int": "a whole number",
+    "!!float": "a number",
+    "!!bool": "true or false",
+    "!!binary": "base64 text",
+}
+
+
+def _cut(text: str, at: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= at else text[:at - 1] + "…"
+
+
+def _spelled(node: yaml.Node) -> str:
+    """`node` as the file writes it: a scalar's text, a collection's span of the document without
+    the tag or anchor before it (as a scalar's text is), or its tag when that text is not at
+    hand."""
+    if isinstance(node, yaml.ScalarNode):
+        return node.value
+    buffer = node.start_mark.buffer
+    if buffer is None:
+        return node.tag
+    span = buffer[node.start_mark.index:node.end_mark.index]
+    while span[:1] in ("!", "&") and len(span.split(None, 1)) == 2:
+        span = span.split(None, 1)[1]
+    return span
+
+
+def _tagged(node: yaml.Node) -> bool:
+    """Whether the file writes `node`'s tag (`!!int x`) rather than YAML reading it off the text
+    (`2026-02-30`): what keeps the value as text is then removing the tag, not quoting it."""
+    buffer = node.start_mark.buffer
+    if buffer is None:
+        return True
+    head = buffer[node.start_mark.index:node.end_mark.index]
+    if head[:1] == "&" and len(head.split(None, 1)) == 2:
+        head = head.split(None, 1)[1]
+    return head[:1] == "!"
+
+
+def _plain(problem: str) -> bool:
+    """Whether PyYAML's sentence is already the loader's to say (`expected a sequence node, but
+    found scalar`), not the interpreter's words it carries along (`failed to decode base64 data:
+    Invalid base64-encoded string…`)."""
+    return bool(problem) and not any(mark in problem for mark in (":", "'", '"', "\n"))
+
+
+def _cannot_build(node: yaml.Node, exc: Exception, *, quoted: bool = True) -> YamlRefused:
+    """The refusal of a value its constructor raised on, in the loader's words: the value, its
+    line, what it is not and what to write instead. An exception's own text (`KeyError: 'x'`,
+    `invalid literal for int() with base 10`) is the interpreter's, not a reason a person can act
+    on, so it is never the sentence; PyYAML's is kept where it is a plain sentence already."""
+    shape = _cut(node.tag.replace("tag:yaml.org,2002:", "!!"), _SHAPE_SHOWN)
+    where = _line(node.start_mark)
+    if not quoted:
+        return _refuse(f"a value YAML cannot build ({where}): YAML has no constructor for "
+                       f"`{shape}` — remove the tag", node.start_mark)
+    problem = exc.problem if isinstance(exc, yaml.MarkedYAMLError) else None
+    keep = "remove the tag to keep it as text" if _tagged(node) else "quote it to keep it as text"
+    if problem is not None and _plain(problem):
+        reason = f"{_cut(problem, _REASON_SHOWN)} — write what {shape} holds, or remove the tag"
+    else:
+        reason = f"not a {shape} — write {_WRITE.get(shape, 'one')}, or {keep}"
+    return _refuse(f"a value YAML cannot build (`{_cut(_spelled(node), _VALUE_SHOWN)}`, {where}): "
+                   f"{reason}", node.start_mark)
+
+
+def _naming(step: Any, node: yaml.Node) -> Any:
+    """The second step of building `node`, its failure refused as `construct_object` refuses it."""
+    try:
+        yield from step
+    except YamlRefused:
+        raise
+    except Exception as exc:
+        raise _cannot_build(node, exc) from exc
+
 
 class CountingLoader(Loader):
     """`Loader` for a format whose own specification has anchors: an alias is read, counted at the

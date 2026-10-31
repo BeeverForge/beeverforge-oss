@@ -231,6 +231,7 @@ def _cut(text: str, at: int) -> str:
 def _opening(body: str) -> str:
     """The body's first paragraph of prose — what a card without an `## Objective` section opens
     with, which is where "building on …" is written."""
+    body = body.replace("\r\n", "\n").replace("\r", "\n")     # a CRLF body keeps its front matter
     for paragraph in re.split(r"\n\s*\n", re.sub(r"\A---\n.*?\n---\n", "", body, flags=re.S)):
         text = paragraph.strip()
         if text and not text.startswith(("#", "<!--", "- ", "* ")):

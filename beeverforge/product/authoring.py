@@ -1955,7 +1955,7 @@ def distilled_until(folder: Path) -> str:
     latest = ""
     for one in sorted(Path(folder).glob("*.md")) if Path(folder).is_dir() else ():
         try:
-            fields, _body, _problem = front_matter(one.read_text(encoding="utf-8"))
+            fields, _body, _problem = front_matter(one.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeDecodeError):
             continue
         until = str(fields.get("until") or "")

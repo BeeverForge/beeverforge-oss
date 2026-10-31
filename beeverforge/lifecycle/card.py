@@ -133,7 +133,8 @@ def transition(project, card: str, event: CardEvent, *, by: str, why: str = "",
     sink = _sink(ports)
     first_id = event_id
     acted = False
-    for _ in range(_RACES):
+    races, asked = 0, card
+    while races < _RACES:
         history = record.History()
         if sink is not None:
             try:
@@ -152,6 +153,13 @@ def transition(project, card: str, event: CardEvent, *, by: str, why: str = "",
                                             for i, n in enumerate(again.effects)),
                               recorded=True, replayed=True, facts=dict(again.facts))
         seen = ports.seen(card)
+        if seen.ref and seen.ref != card and card == asked:
+            # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): the board files `dar-2` as
+            # `DAR-2`, and its record is `DAR-2`'s — read again under that one spelling, which
+            # this is not a race for. Once only, for the ref the caller asked about
+            card = seen.ref
+            first_id = event_id
+            continue
         if seen.cannot_tell:
             return Transition(card=card, event=event, refused=seen.cannot_tell,
                               unread=seen.unread)
@@ -222,6 +230,7 @@ def transition(project, card: str, event: CardEvent, *, by: str, why: str = "",
         if sink is not None:
             try:
                 if not record.write(sink, ports.name, row):
+                    races += 1
                     continue          # another transition took this number: read, decide again
                 recorded = True
             except Exception as exc:  # noqa: BLE001 — the decision stands; only its record failed

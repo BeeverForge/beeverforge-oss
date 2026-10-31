@@ -104,6 +104,7 @@ from beeverforge.runtime.temporal.activities import (
     verify_gate_seal,
 )
 from beeverforge.runtime.temporal.connection import (
+    EngineNotDeclared,
     EngineNotListening,
     address,
     connect_at_birth,
@@ -438,7 +439,9 @@ async def born() -> None:
     logs.configure()
     try:
         await main()
-    except EngineNotListening as exc:
+    # AN ENGINE NOBODY DECLARED is the other refusal at birth (#163), said the same way (#73):
+    # `connect_at_birth` asks `address()` before it waits, and its message is the sentence.
+    except (EngineNotListening, EngineNotDeclared) as exc:
         raise logs.exiting(log, f"worker: {exc}") from None
 
 

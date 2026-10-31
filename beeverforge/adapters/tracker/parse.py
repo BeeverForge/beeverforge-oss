@@ -103,6 +103,7 @@ def _split_front_matter(body: str) -> tuple[dict, str]:
     cannot be read is: none of them were set, and the whole body is markdown. The warning names the
     fence's FIRST LINE and nothing more — the body is the client's, and a log is not the place to
     copy it."""
+    body = body.replace("\r\n", "\n").replace("\r", "\n")     # a CRLF body keeps its front matter
     if body.startswith("---"):
         parts = body.split("---", 2)
         if len(parts) == 3:
