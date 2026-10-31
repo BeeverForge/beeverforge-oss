@@ -399,7 +399,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
             # answer in time. FAILED is a 500 and a traceback; this is the panel's 503 and one line.
             log.warning("action %s by %s: the engine did not answer (%s)", key, by, exc)
             return refused(UNAVAILABLE, f"could not {key}: {exc}", reason=ENGINE_UNREACHABLE)
-        except Exception as exc:  # noqa: BLE001 — an action must never take its caller down
+        except Exception as exc:  # noqa: BLE001 - an action must never take its caller down
             # THE REFERENCE IS IN THE LINE AND IN THE ANSWER (#908), so the person who reads "could
             # not …" can hand an operator the one traceback that is theirs; before, the answer named
             # nothing the log could be searched for.
