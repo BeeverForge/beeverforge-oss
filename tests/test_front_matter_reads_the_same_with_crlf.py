@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from beeverforge import gitpin
 from beeverforge.adapters.extract.text import front_matter
 from beeverforge.adapters.tracker.parse import _split_front_matter
 from beeverforge.knowledge.contracts import Concept
@@ -147,11 +148,12 @@ def _confirm_a_file_on_disk(monkeypatch, data: bytes) -> tuple[object, str]:
     written: list[str] = []
 
     def fake_git(args, cwd=None):
-        if args[0] == "clone":
+        command = gitpin.subcommand(args)
+        if command == "clone":
             target = Path(args[-1]) / "capabilities" / "checkout.md"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
-        elif args[0] == "commit":
+        elif command == "commit":
             written.append((Path(cwd) / "capabilities" / "checkout.md").read_text(encoding="utf-8"))
         return 0, ""
 

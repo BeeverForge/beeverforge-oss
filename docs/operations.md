@@ -245,6 +245,32 @@ prune/retention rules). The core never reads an agent token; it only round-trips
    Token acquisition is GitHub-specific and lives in the GitHub adapter; the core only
    ever sees the opaque `BEEVERFORGE_BOT_TOKEN`.
 
+### Which transports the core's git calls may use
+
+Every git call the core makes on the host that reaches a remote (`clone`, `fetch`,
+`ls-remote`, `push`, `remote set-url`) carries pinned transport settings, built in one place,
+`beeverforge/gitpin.py`. Those calls may use only:
+
+- **https** and **ssh**: the GitHub and Azure DevOps forges, and `git@…` / `ssh://…` remotes;
+- **file**, for user-initiated calls: any path or `file://` URL the core is handed, including the
+  local forge and the worker's cache. Git treats top-level calls started by the core as
+  user-initiated; recursive submodule clones are refused, as with Git's default
+  `protocol.file.allow=user`.
+
+**ext**, **fd**, **http**, **git**, **ftp** and **ftps** are refused whatever the machine's
+git configuration says, and any other protocol is refused by the `protocol.allow=never` default.
+A `-c` overrides only the same key, so the pin sets that default and each of these transports by
+name, before the subcommand: a machine's `protocol.ext.allow=always` does not let a remote named
+`ext::…` run a command on the host. Remotes on plain `http://` or `git://` are refused too; use
+`https://` or ssh.
+
+Known gap: a `GIT_ALLOW_PROTOCOL` environment variable in the core's environment still
+overrides these settings. Do not set it for the core's process.
+
+This is the first slice of #143. The core's local git calls (`add`, `commit`, `rev-parse`, …)
+and the shell-string git commands the core sends into the box are later slices of #143 and
+are not pinned yet.
+
 ### PR posture (merge policy)
 
 Default `merge_policy: human` — the bot opens the PR, posts the reviewer's verdict

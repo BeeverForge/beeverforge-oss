@@ -31,9 +31,17 @@ def _docstrings(tree: ast.AST) -> set[int]:
 def _fragments_named(path: Path) -> list[str]:
     tree = parsed(path)
     skip = _docstrings(tree)
+    names = FRAGMENTS | {name.rsplit("/", 1)[-1] for name in FRAGMENTS}
     return [node.value for node in ast.walk(tree)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
-            and id(node) not in skip and node.value.strip() in FRAGMENTS]
+            and id(node) not in skip and node.value.strip() in names]
+
+
+def test_the_guard_finds_a_fragment_named_as_a_separate_path_component(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "FRAGMENTS", {"changes/example.fix.md"})
+    source = tmp_path / "reader.py"
+    source.write_text('note = ROOT / "changes" / "example.fix.md"\n', encoding="utf-8")
+    assert _fragments_named(source) == ["example.fix.md"]
 
 
 def test_no_test_or_plan_names_a_fragment_in_its_code():

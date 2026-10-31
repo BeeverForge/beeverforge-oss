@@ -70,7 +70,7 @@ from typing import NamedTuple
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-from beeverforge import namespace, preview
+from beeverforge import gitpin, namespace, preview
 from beeverforge.adapters.preview.base import PREFIX, refusals
 from beeverforge.preview.assemble import shape_edits, url_var
 from beeverforge.preview.plan import (
@@ -201,7 +201,8 @@ def _host(argv: Sequence[str], *, env: Mapping[str, str] | None = None, timeout:
     except FileNotFoundError:
         return Ran(127, "", f"{argv[0]}: not found on PATH")
     except subprocess.TimeoutExpired:
-        return Ran(124, "", f"`{' '.join(argv[:3])} …` did not finish within {int(timeout)}s")
+        command = gitpin.without_pin(' '.join(argv)).split()[:3]
+        return Ran(124, "", f"`{' '.join(command)} …` did not finish within {int(timeout)}s")
     except OSError as exc:
         return Ran(126, "", f"{argv[0]} could not be run: {exc}")
     return Ran(done.returncode, done.stdout or "", done.stderr or "")
@@ -620,8 +621,9 @@ def _checkout(sources: Sequence[TreeSource], out: dict[str, Tree], *, workdir: s
         # inode as the cache's, so a write through it would reach every later job's checkout.
         # `--no-local` gives that and reads through the pack protocol, never copying the objects
         # directory file by file while git's own maintenance repacks it (#594).
-        r = _git("clone", "--no-local", "--quiet",
-                 *(["--branch", branch] if branch else []), "--", s.source, base)
+        r = _git(*gitpin.pinned(["clone", "--no-local", "--quiet",
+                                 *(["--branch", branch] if branch else []), "--", s.source,
+                                 base]))
         if r.rc:
             raise _Refusal(f"`{s.repo}`'s base branch `{branch or 'HEAD'}` could not be "
                            f"checked out: {_redact(r.said)}")
@@ -643,8 +645,8 @@ class _Refusal(Exception):
 def _change(s: TreeSource, tree: Tree, *, base: str, workdir: str, url: str) -> Tree:
     """The pull request's head beside the base, as a worktree of the same clone — one object
     store, two working trees — and the change's OWN diff, merge base to head."""
-    r = _git("-C", base, "fetch", "--quiet", "--no-tags", "--", url,
-             f"+{s.branch}:refs/remotes/origin/{s.branch}")
+    r = _git(*gitpin.pinned(["-C", base, "fetch", "--quiet", "--no-tags", "--", url,
+                             f"+{s.branch}:refs/remotes/origin/{s.branch}"]))
     if r.rc:
         raise _Refusal(f"the pull request's branch `{s.branch}` could not be fetched from "
                        f"`{s.repo}`: {_redact(r.said)}")
