@@ -3866,9 +3866,9 @@ def index() -> Response:
 
 @app.get("/p/{project}")
 @app.get("/p/{project}/board")
-@app.get("/p/{project}/card/{ref}")
+@app.get("/p/{project}/card/{ref:path}")
 @app.get("/p/{project}/pr/{ref}")
-@app.get("/p/{project}/preview/{ref}")
+@app.get("/p/{project}/preview/{ref:path}")
 def project_page(project: str, ref: str = "") -> Response:
     """The same single-page app; the client reads the path to focus one project's floor.
 
@@ -4598,6 +4598,5 @@ def _board_url(project) -> str:
         log.warning("panel: could not resolve the board link for %s (%s)",
                     getattr(project, "name", "?"), str(exc)[:120])
         return ""
-
 
 

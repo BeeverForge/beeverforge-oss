@@ -126,3 +126,21 @@ pending[0]();await settle();
 console.log(JSON.stringify({path:location.pathname,card:_bd.card,draft:_bd.draft,reads:pending.length}));
 """)
     assert got == {"path": "/p/myapp/card/1", "card": "1", "draft": "new draft", "reads": 4}
+
+
+def test_a_slower_read_of_a_card_left_behind_writes_no_address():
+    got = _routes("""
+const pending=[];refreshBoard=()=>new Promise(resolve=>pending.push(resolve));
+const first=boardOpenCard('1'), second=boardOpenCard('2');
+pending[1]();await second;pending[0]();await first;
+console.log(JSON.stringify({path:location.pathname,card:_bd.card,paths}));
+""")
+    assert got == {"path": "/p/myapp/card/2", "card": "2", "paths": ["/p/myapp/board", "/p/myapp/card/2"]}
+
+
+def test_closing_a_drawer_on_the_board_address_adds_no_history_entry():
+    got = _routes("""
+await openBoard('myapp'); boardCloseCard();
+console.log(JSON.stringify({paths}));
+""")
+    assert got == {"paths": ["/p/myapp/board"]}
