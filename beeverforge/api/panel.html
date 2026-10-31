@@ -5707,7 +5707,7 @@ function boardCloseCard(){   // the DRAWER, not the card — `boardCardClose` is
   if(drawer){ drawer.classList.remove("on"); drawer.setAttribute("aria-hidden","true"); }
   const scrim = $("#boardview .scrim"); if(scrim) scrim.classList.remove("on");
   const route=curBoard();
-  if(route && (route.card || route.preview)){
+  if(route && route.card){
     history.pushState({}, "", `/p/${encodeURIComponent(_bd.project)}/board`);
   }
 }

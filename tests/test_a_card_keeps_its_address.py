@@ -83,6 +83,16 @@ console.log(JSON.stringify({preview,path:location.pathname}));
     assert got == {"preview": "/p/myapp/preview/1", "path": "/p/myapp/card/2"}
 
 
+def test_closing_a_preview_drawer_returns_to_the_board_address():
+    got = _routes("""
+location.pathname='/p/myapp/preview/1'; paths[0]=location.pathname;
+await openBoard('myapp'); await boardOpenCard('1'); boardCloseCard();
+console.log(JSON.stringify({path:location.pathname,paths}));
+""")
+    assert got == {"path": "/p/myapp/board",
+                   "paths": ["/p/myapp/preview/1", "/p/myapp/board"]}
+
+
 def test_project_and_card_segments_are_encoded_and_pr_routes_are_preserved():
     got = _routes("""
 await openBoard('café team'); await boardOpenCard('PROJ/7');
