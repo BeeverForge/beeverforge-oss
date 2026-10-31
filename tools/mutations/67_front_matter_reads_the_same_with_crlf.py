@@ -4,7 +4,9 @@ normalisation, cut one at a time.
 WHAT THE ROWS BREAK: rows 1-5 remove the CRLF and lone-CR normalisation in each of the five
 front-matter readers; row 6 keeps the CRLF replace in `parse_capability` but drops the lone-CR one;
 row 7 removes the normalisation in the queue's `_opening`, so a CRLF card opens with its own
-front-matter block.
+front-matter block. Rows 8-10 put plain `utf-8` back in the three readers that open a file
+themselves (`read_concepts`, `confirm_in_repository`, `distilled_until`), so a file saved with a
+byte-order mark reads as having no front matter.
 """
 
 TEST = "tests/test_front_matter_reads_the_same_with_crlf.py"
@@ -37,4 +39,16 @@ MUTATIONS = [
 
     ("a CRLF card opens with its own front-matter block", "beeverforge/product/queue.py",
      BODY, ""),
+
+    ("a concept file saved with a BOM is read with its U+FEFF", "beeverforge/knowledge/okf.py",
+     'parse_concept(path.read_text(encoding="utf-8-sig"))',
+     'parse_concept(path.read_text(encoding="utf-8"))'),
+
+    ("a capability file saved with a BOM is confirmed as unreadable", CAPS,
+     'parse_capability(target.read_text(encoding="utf-8-sig"), path=rel)',
+     'parse_capability(target.read_text(encoding="utf-8"), path=rel)'),
+
+    ("a distillate saved with a BOM has no `until`", "beeverforge/product/authoring.py",
+     'front_matter(one.read_text(encoding="utf-8-sig"))',
+     'front_matter(one.read_text(encoding="utf-8"))'),
 ]

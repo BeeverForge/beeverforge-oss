@@ -399,7 +399,7 @@ def confirm_in_repository(*, docs_repo: str, clone_url: str, slug: str, flow: Fl
             return WriteResult(ok=False, refusal=NOT_VALID, ref=rel,
                                detail=record_said("capability_is_a_link", language=language))
         if target.is_file():
-            cap, _ = parse_capability(target.read_text(encoding="utf-8"), path=rel)
+            cap, _ = parse_capability(target.read_text(encoding="utf-8-sig"), path=rel)
             if cap is None:
                 return WriteResult(ok=False, refusal=NOT_REFUSED, ref=rel,
                                    detail=record_said("capability_unreadable", language=language))

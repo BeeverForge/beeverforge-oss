@@ -291,7 +291,7 @@ def read_concepts(bundle_dir: Path) -> list[Concept]:
         return out
     for path in sorted(okf.rglob("*.md")):
         try:
-            parsed = parse_concept(path.read_text(encoding="utf-8"))
+            parsed = parse_concept(path.read_text(encoding="utf-8-sig"))
         except OSError:
             continue
         if parsed is not None:
