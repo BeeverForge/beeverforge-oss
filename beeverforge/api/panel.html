@@ -151,6 +151,7 @@ button{font-family:inherit}
    "dark theme header, oops". */
 header.top{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--raised) 92%,transparent);
   backdrop-filter:blur(9px);border-bottom:1px solid var(--line);box-shadow:var(--shadow-1)}
+/* At 375px the unwrapped row made the page 592px wide and put controls off screen (2026-10-24). */
 .brand-row{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;padding:16px 22px;max-width:var(--max);margin:0 auto}
 @media (max-width:640px){
   .brand-row{gap:8px 12px}

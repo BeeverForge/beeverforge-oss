@@ -34,6 +34,7 @@ repository.
 | `shellcheck` | `make lint` checks `install.sh`, `docker/install-addons.sh` and `scripts/*.sh` with a local shellcheck if there is one, else with `koalaman/shellcheck:stable` in Docker | with neither, `make lint` refuses by name and exits non-zero — it does not skip |
 | `sha256sum` | the tests that drive `install.sh` and assemble a release | those tests skip, naming the missing tool |
 | Node.js (`node`) | the tests that execute the panel's JavaScript | they skip, each saying `node is not on PATH` |
+| Chrome or Chromium (`google-chrome`, `chromium`) | the test laying out the panel at phone widths | it skips, naming the browser |
 | the network, once | the durable-runtime tests start a throwaway Temporal server of their own, and the first run per `temporalio` version downloads its binary (about 65 MB) into the temp directory | setup errors until the binary can be downloaded; this is a hard prerequisite, not a skip |
 
 **Your shell's environment.** The suite deletes the variables that would let a test act on
