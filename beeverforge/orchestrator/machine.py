@@ -490,8 +490,27 @@ _A_HANDLE = re.compile(r"(?<![A-Za-z0-9])@([A-Za-z0-9](?:[\w.@-]*\w)?)")
 #: wrapping's backtick), `<` (an HTML block, inside which markdown — the wrapping — is not read)
 #: and `&` (an entity, `&#x40;`, which decodes to a name after the wrapping was decided). And the
 #: emphasis markers `*`, `_` and `~`: with its backticks escaped, the agent's `Worker.__init__` and
-#: `*.py` lost the code span that kept them literal (review on 35a1cc0, measured on GitHub).
-_MARKUP = re.compile(r"([\\`<&*_~])")
+#: `*.py` lost the code span that kept them literal (review on 35a1cc0, measured on GitHub). And
+#: `!`, whose `![…](…)` image rendered inside the quote; `\![…](…)` renders `!` and a link (#112).
+#: And `$`, which is not escaped but written `_NO_MATH`, below.
+_MARKUP = re.compile(r"([\\`<&*_~!$])")
+#: The agent's `$`, which GitHub would typeset: `$…$`, `$$…$$` and `` $`…`$ `` (backtick math,
+#: which turned the platform's code span around `@ann` back into a mention). GitHub resolves
+#: backslash escapes and entities before it pairs a `$`, so `\$` and `&#36;` were typeset; empty
+#: `<span>`s and `<!-- -->` between `$$` still were, and `<span>$</span>` stopped inline math
+#: only. A zero-width space before each `$` stopped all three, on the line and across lines,
+#: beside a span, a link and a digit (#112, review on a2714e1, measured on `POST /markdown`):
+#: the `$` reads as written, with an invisible character before it a copy keeps. An unescaped
+#: `&` is always the platform's (`&` is in `_MARKUP`), so `_seen` and `_cut_quote` read this as
+#: one character the agent wrote.
+_NO_MATH = "&#8203;\\$"
+#: A line GitHub reads as an ALERT when it opens a quote: `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+#: `[!WARNING]` or `[!CAUTION]`, any case, alone on its line with a line after it. It turned the
+#: quote into a `markdown-alert` box. `[\!CAUTION]`, `\[!CAUTION]`, `[!CAUTION\]`,
+#: `[&#33;CAUTION]` and an empty `>` row before it were alerts all the same (review on a2714e1);
+#: in a platform span, `` `[!CAUTION]` ``, it renders as code, in all five (measured on GitHub).
+_AN_ALERT = re.compile(r"^([ \t]*)\[\\!(note|tip|important|warning|caution)\]([ \t]*)$",
+                       re.IGNORECASE | re.MULTILINE)
 #: …and what would make one of its lines a HEADING, posing as a section of the platform's: an ATX
 #: `#`, a line of only `=` or `-` under another (setext), or a `>` of its own that a heading could
 #: follow. Escaped where it opens the line — after the indent, list markers and `>`s that can
@@ -560,7 +579,8 @@ def _neutralised(text: str) -> str:
         out += [_plain(text[pos:link.start()]), f"[{_plain(link[1])}]({link[2]})"]
         pos = link.end()
     out.append(_plain(text[pos:]))
-    return _A_DEFINITION.sub(r"\1\\[", _A_HEADING.sub(r"\1\\\2", "".join(out)))
+    return _AN_ALERT.sub(r"\1`[!\2]`\3",
+                         _A_DEFINITION.sub(r"\1\\[", _A_HEADING.sub(r"\1\\\2", "".join(out))))
 
 
 def _plain(text: str) -> str:
@@ -568,8 +588,12 @@ def _plain(text: str) -> str:
     in a platform span, verbatim; around them, `#N` rewritten, the markup escaped, names wrapped."""
     pieces = _A_URL.split(text)
     return "".join(f"`{piece}`" if k % 2 else _A_HANDLE.sub(
-        lambda m: f"`{m.group(0)}`", _MARKUP.sub(r"\\\1", without_mentions(piece)))
+        lambda m: f"`{m.group(0)}`", _MARKUP.sub(_escaped, without_mentions(piece)))
         for k, piece in enumerate(pieces))
+
+
+def _escaped(markup: re.Match) -> str:
+    return _NO_MATH if markup[1] == "$" else "\\" + markup[1]
 
 
 def _spans(row: str) -> list[tuple[int, int]]:
@@ -606,10 +630,14 @@ def _quoted(text: str) -> list[str]:
 
 
 def _seen(text: str) -> int:
-    """How many characters a reader sees of neutralised agent text: an escape is one, and the
-    platform's span backticks — the unescaped ones (`_spans`) — none."""
+    """How many characters a reader sees of neutralised agent text: an escape is one, an agent's
+    `$` as `_NO_MATH` is one, and the platform's span backticks — the unescaped ones (`_spans`) —
+    none."""
     seen, i = 0, 0
     while i < len(text):
+        if text.startswith(_NO_MATH, i):
+            seen, i = seen + 1, i + len(_NO_MATH)
+            continue
         if text[i] != "`":
             seen += 1
         i += 2 if text[i] == "\\" else 1
@@ -627,8 +655,9 @@ def _cut_quote(rows: list[str], room: int) -> list[str]:
     """The leading quote rows that fit in `room` characters as written in the body, prefixes and
     newlines counted. The row that crosses the bound is cut, never inside a code span — a span cut
     open would leave the name the wrapping hid outside it — and never inside an escape, whose lone
-    backslash the agent did not write and the cut line would not count as lost. A cut row that
-    would underline the row above it is left out."""
+    backslash the agent did not write and the cut line would not count as lost, nor inside an
+    agent's `$` as `_NO_MATH`, whose part would show `&#82` or lose the `$`. A cut row that would
+    underline the row above it is left out."""
     kept: list[str] = []
     used = -1  # no newline before the first row
     for row in rows:
@@ -637,11 +666,12 @@ def _cut_quote(rows: list[str], room: int) -> list[str]:
             used += 1 + len(row)
             continue
         cut = room - used - 1
-        i = 2
+        i = at = 2
         while i < cut:  # nor between an escape's backslash and what it escapes
-            i += 2 if row[i] == "\\" else 1
+            at = i
+            i += len(_NO_MATH) if row.startswith(_NO_MATH, i) else 2 if row[i] == "\\" else 1
         if i > cut:
-            cut -= 1
+            cut = at
         for link in _A_LINK_IN_ROW.finditer(row):  # nor inside a link, whose destination is raw
             if link.start() < cut < link.end():
                 cut = link.start()
