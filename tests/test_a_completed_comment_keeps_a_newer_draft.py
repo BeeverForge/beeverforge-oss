@@ -49,7 +49,7 @@ globalThis.boardCardPath = ()=>location.pathname;
     ('_bd.draft = "  submitted  ";', "  submitted  ", 1),
     ('_bd.card = "2";', "submitted", 0),
     ('_bd.project = "other";', "submitted", 0),
-    ('_bd.selection = {};', "submitted", 0),
+    ('_bd.selection = {};', "submitted", 1),
     ('_bd = {..._bd};', "submitted", 0),
 ])
 def test_a_completed_comment_owns_only_its_submitted_draft(change, expected, refreshes):
@@ -88,9 +88,11 @@ console.log(JSON.stringify({draft:_bd.draft,sent,refusal}));
 def test_an_earlier_comment_cannot_clear_a_draft_after_leaving_and_reopening_its_card():
     result = _run("""
 globalThis._bd = {project:"app",card:"1",selection:{},draft:"submitted"};
-let reply, refreshes = 0;
-globalThis.act = ()=>new Promise(resolve=>reply=resolve);
-globalThis.refreshBoard = async()=>refreshes++;
+let reply, refreshes = 0, stored = [], displayed = [];
+globalThis.act = (name,args)=>new Promise(resolve=>reply=()=>{
+  stored.push(args.message); resolve({ok:true});
+});
+globalThis.refreshBoard = async()=>{ refreshes++; displayed = [...stored]; };
 globalThis.toast = ()=>{};
 globalThis.$ = ()=>null;
 const original = _bd.selection, pending = boardComment();
@@ -98,7 +100,8 @@ await boardOpenCard("2");
 await boardOpenCard("1");
 // The same text typed into a new drawer is still a new draft, owned by that selection.
 _bd.draft = "submitted";
-reply({ok:true}); await pending;
-console.log(JSON.stringify({draft:_bd.draft,refreshes,newSelection:_bd.selection!==original}));
+reply(); await pending;
+console.log(JSON.stringify({draft:_bd.draft,refreshes,displayed,newSelection:_bd.selection!==original}));
 """, "boardComment", "boardOpenCard")
-    assert result == {"draft": "submitted", "refreshes": 2, "newSelection": True}
+    assert result == {"draft": "submitted", "refreshes": 3, "displayed": ["submitted"],
+                      "newSelection": True}

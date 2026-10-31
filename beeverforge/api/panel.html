@@ -5898,9 +5898,8 @@ async function boardComment(){
   if(!r.ok){ toast("Not posted", r.message||"", "err"); return; }
   // Clear only the submitted draft. The person can type again, or open another card, while
   // the request is pending; its response owns neither that newer text nor that other drawer.
-  if(_bd !== board || board.project !== project || board.card !== card ||
-     board.selection !== selection) return;
-  if(board.draft === draft) board.draft = "";
+  if(_bd !== board || board.project !== project || board.card !== card) return;
+  if(board.selection === selection && board.draft === draft) board.draft = "";
   await refreshBoard();
 }
 
