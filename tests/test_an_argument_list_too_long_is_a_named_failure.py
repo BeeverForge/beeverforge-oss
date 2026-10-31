@@ -6,7 +6,9 @@ counted) with `E2BIG`, and `subprocess.run` raises it as
 caught only `FileNotFoundError`, so a long text on a call site that still builds it into argv
 (`comment`'s `--body`, `close_ticket`'s `--comment`) reached the caller as a traceback. It is now a
 failed call, answered as `refused()` answers one, whose one sentence names the cause and the
-remedy (the text goes on stdin with `--body-file -`), and the bound is logged.
+remedy for that command (a comment's text goes on stdin with `--body-file -`; a close reason,
+since `gh issue close` has no `--body-file`, is posted as a comment on stdin before a bare
+close), and the bound is logged.
 
 `subprocess.run` is replaced by a fake that applies the kernel's rule; `gh` is never spawned. The
 bound is read from `MAX_ARG_STRLEN`, never typed here.
@@ -96,14 +98,24 @@ def test_a_long_comment_fails_by_name_not_as_oserror(kernel):
     with pytest.raises(RuntimeError) as caught:
         GitHubIssuesTracker("o/r").comment("#1", BIG)
     assert not isinstance(caught.value, OSError)
-    assert "--body-file -" in str(caught.value)
-    assert f"{MAX_ARG_STRLEN:,}" in str(caught.value)
+    message = str(caught.value)
+    assert "`gh issue comment`" in message
+    assert "must go to `gh` on stdin with `--body-file -`" in message
+    assert "without `--comment`" not in message
+    assert f"{MAX_ARG_STRLEN:,}" in message
 
 
 def test_a_long_close_reason_fails_by_name_not_as_oserror(kernel):
+    # `gh issue close` has no `--body-file`: its remedy is the comment on stdin, then a bare close
     with pytest.raises(RuntimeError) as caught:
         GitHubIssuesTracker("o/r").close_ticket("#1", BIG)
-    assert "--body-file -" in str(caught.value)
+    assert not isinstance(caught.value, OSError)
+    message = str(caught.value)
+    assert "`gh issue close`" in message
+    assert "posted first as a comment on stdin" in message
+    assert "closed without `--comment`" in message
+    assert "must go to `gh` on stdin with `--body-file -`" not in message
+    assert f"{MAX_ARG_STRLEN:,}" in message
 
 
 def test_the_retry_run_is_caught_too(monkeypatch):

@@ -74,9 +74,15 @@ def _argv_too_long(args: list[str], exc: OSError) -> subprocess.CompletedProcess
     if exc.errno != errno.E2BIG:
         raise exc
     command = " ".join(["gh", *args[:2]])
+    if args[:2] == ["issue", "close"]:
+        # `gh issue close` has no `--body-file` (only `-c/--comment`, `--duplicate-of`,
+        # `-r/--reason`), so its remedy is the comment on stdin first, then the bare close.
+        remedy = ("so the reason must be posted first as a comment on stdin "
+                  "(`gh issue comment --body-file -`), then the issue closed without `--comment`")
+    else:
+        remedy = "so the text must go to `gh` on stdin with `--body-file -`"
     why = (f"`{command}` was refused by the kernel before it started (E2BIG): one argument is "
-           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, so the text must go to `gh` on stdin "
-           "with `--body-file -`.")
+           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, {remedy}.")
     log.warning("BEEVERFORGE_GH_ARGV_TOO_LONG %s: an argument over %s bytes (MAX_ARG_STRLEN)",
                 command, f"{MAX_ARG_STRLEN:,}")
     return refused(args, why)

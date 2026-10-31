@@ -8,7 +8,8 @@ so `comment`'s `--body` and `close_ticket`'s `--comment` could still end in a tr
 
 Row 1 is the defect as it shipped: no catch on the first run. Row 2 catches the wrong errno. Row 3
 drops the log marker. Row 4 drops the remedy from the sentence. Row 5 removes the catch on the
-secondary-rate-limit retry. Row 6 re-raises instead of answering as `refused()` does.
+secondary-rate-limit retry. Row 6 re-raises instead of answering as `refused()` does. Row 7
+gives `gh issue close` the comment's remedy, `--body-file -`, a flag `gh issue close` does not have.
 """
 
 TEST = "tests/test_an_argument_list_too_long_is_a_named_failure.py"
@@ -32,8 +33,12 @@ MUTATIONS = [
      ""),
 
     ("the sentence names the cause but not the remedy", GH,
-     '"with `--body-file -`.")',
-     '"somehow.")'),
+     '"so the text must go to `gh` on stdin with `--body-file -`"',
+     '"so the text must go somewhere else"'),
+
+    ("the close is given the comment's remedy, naming a flag `gh issue close` lacks", GH,
+     '    if args[:2] == ["issue", "close"]:\n',
+     '    if args[:2] == ["issue", "closed"]:\n'),
 
     ("the rate-limit retry is not caught", GH,
      '            env=self._env(),\n'
