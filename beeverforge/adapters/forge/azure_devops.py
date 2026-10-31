@@ -51,6 +51,7 @@ from beeverforge.adapters.forge.base import (
     ForgeAdapter,
     ReviewComment,
     ReviewEvent,
+    truncated_tail,
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
 
@@ -1765,7 +1766,7 @@ class AzureReposForge(ForgeAdapter):
                     continue
                 chunks.append(f"### {record.get('name') or 'step'}\n" + "\n".join(
                     str(line) for line in lines))
-        return _redact("\n".join(chunks))[-max_chars:]
+        return truncated_tail(_redact("\n".join(chunks)), max_chars)
 
     # ---- tags ---------------------------------------------------------------------------------
 
