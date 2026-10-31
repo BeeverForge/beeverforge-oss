@@ -16,6 +16,8 @@ then read through both readers, as a field's value (line 1) and as an item under
 
 from __future__ import annotations
 
+import builtins
+import re
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,24 @@ def _shape(tag: str) -> str:
     return tag.replace("tag:yaml.org,2002:", "!!")
 
 
+#: every exception class a constructor could raise and a sentence could echo: the interpreter's
+#: own and PyYAML's
+EXCEPTIONS = {name for space in (vars(builtins), vars(yaml), vars(yaml.constructor))
+              for name, c in space.items() if isinstance(c, type) and issubclass(c, BaseException)}
+
+#: the remedy every sentence ends on: what to write instead
+REMEDY = re.compile(r" — (write|remove|quote) [^—]+$")
+
+
+def _speaks_the_loaders_words(said: str) -> None:
+    """The sentence is the loader's: no exception's class or its `Error:`, and a remedy at the end
+    (CONTRIBUTING.md, "Failures speak by name")."""
+    assert "Error:" not in said
+    assert not {name for name in EXCEPTIONS if name in said}, said
+    assert "invalid literal" not in said and "could not convert" not in said, said
+    assert REMEDY.search(said), f"no remedy in {said!r}"
+
+
 def test_every_constructor_family_has_a_failing_spelling():
     built = {tag for tag in yaml.SafeLoader.yaml_constructors if tag is not None}
     assert set(FAILING) == built
@@ -101,6 +121,7 @@ def test_a_value_a_constructor_cannot_build_is_answered_never_raised(tmp_path, r
     assert f"`{value}`" in error
     assert _shape(tag) in error
     assert "\n" not in error
+    _speaks_the_loaders_words(error)
 
 
 @pytest.mark.parametrize("loader", [yaml_io.Loader, yaml_io.CountingLoader])
@@ -109,8 +130,8 @@ def test_the_door_refuses_what_a_constructor_cannot_build(loader):
         yaml_io.load("a: 2026-02-30\n", loader=loader)
     assert isinstance(caught.value, yaml_io.YamlRefused)
     assert not isinstance(caught.value, ValueError)
-    assert str(caught.value) == ("a value YAML cannot build (`2026-02-30`, line 1, as "
-                                 "!!timestamp): day is out of range for month")
+    assert str(caught.value) == ("a value YAML cannot build (`2026-02-30`, line 1): not a "
+                                 "!!timestamp — write a real date, or quote it to keep it as text")
 
 
 def test_a_long_value_is_named_by_its_beginning_and_keeps_its_line():
@@ -151,5 +172,21 @@ def test_a_value_under_a_tag_the_loader_has_no_constructor_for_is_not_quoted(loa
         yaml_io.load(text, loader=loader)
     said = str(caught.value)
     assert "touch" not in said
-    assert said.startswith("a value YAML cannot build (")
-    assert "line 1" in said and "could not determine a constructor" in said
+    tag = text.split()[1].split("[")[0]
+    assert said == f"a value YAML cannot build (line 1): YAML has no constructor for `{tag}` — remove the tag"
+
+
+@pytest.mark.parametrize(("text", "said"), [
+    ("a: !!int x\n", "(`x`, line 1): not a !!int — write a whole number, or remove the tag to "
+                     "keep it as text"),
+    ("a: !!bool x\n", "(`x`, line 1): not a !!bool — write true or false, or remove the tag to "
+                      "keep it as text"),
+    ("a: !!binary a\n", "(`a`, line 1): not a !!binary — write base64 text, or remove the tag "
+                        "to keep it as text"),
+    ("a: !!seq x\n", "(`x`, line 1): expected a sequence node, but found scalar — write what "
+                     "!!seq holds, or remove the tag"),
+])
+def test_the_reason_and_the_remedy_are_the_loaders_own(text, said):
+    with pytest.raises(yaml_io.YamlRefused) as caught:
+        yaml_io.load(text)
+    assert str(caught.value) == f"a value YAML cannot build {said}"
