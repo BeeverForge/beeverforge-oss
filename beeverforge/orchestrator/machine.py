@@ -736,7 +736,9 @@ def _read_account(rows: list[str]) -> tuple[int, int, _Account] | None:
     Only what `_account_lines` writes is read back. Agent text cannot forge the label, the count or
     the cut line, because every agent row starts with `>`; and the executor's rows and the pass
     rows are told apart by position, the label between them."""
-    start = next((i for i, row in enumerate(rows) if row == AGENT_ACCOUNT_HEADING), None)
+    # the LAST heading row: the section is written after the objective, which may hold it (#113)
+    start = next((i for i, row in reversed(list(enumerate(rows)))
+                  if row == AGENT_ACCOUNT_HEADING), None)
     if start is None:
         return None
     end = next((i for i in range(start + 1, len(rows))
@@ -3943,7 +3945,8 @@ class JobRunner:
         rows = body.splitlines()
         cost_at = next((i for i in range(len(rows) - 1, -1, -1)
                         if rows[i].startswith(_COST_LINE)), None)
-        start = next((i for i, row in enumerate(rows)
+        # the LAST review heading: the objective comes first and may hold one (#113)
+        start = next((i for i, row in reversed(list(enumerate(rows)))
                       if row.startswith(_REVIEW_HEADING)), None)
         # `start is None`: a pull request this platform did not write a review section into.
         if review is not _SECTION_AS_IT_STANDS and start is not None:
