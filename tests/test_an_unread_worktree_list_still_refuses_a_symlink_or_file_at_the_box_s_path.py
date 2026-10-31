@@ -165,3 +165,187 @@ def test_a_directory_at_the_box_s_path_still_goes_to_git_when_the_list_cannot_be
     assert "a directory that is not a working tree" not in str(raised.value)
     assert sorted(os.listdir(wt)) == ["notes.txt"]
     assert (wt / "notes.txt").read_text() == "a person's notes\n"
+
+
+# ── THE WINDOW BETWEEN THE CHECK AND THE ADD (review of 4b54732) ───────────────────────────────
+# The check above reads the path with `lstat`, and git creates it much later: in between,
+# `branch -D` runs on a rebuild door, and a hosted resume's fetch (180 s timeout). The box now
+# makes the path itself with `os.mkdir` right before the add, which never follows a final link and
+# fails on anything already there. A step in the window is patched to put something at the path.
+
+
+def _in_the_window(monkeypatch, door: Door, wt: Path, put) -> dict:
+    """Patch the step each door runs between the check and the add so that, once it has run, `put`
+    places something at `wt`. Answers the refs as they stood right after that step, which is what
+    the refusal must leave them at."""
+    seen: dict = {}
+
+    def after(result):
+        put(wt)
+        seen["refs"] = _refs(door)
+        return result
+
+    if door.name == "local-keep":
+        real_exists = worktree_box._branch_exists
+        monkeypatch.setattr(worktree_box, "_branch_exists",
+                            lambda repo, branch: after(real_exists(repo, branch)))
+    else:
+        real_run = worktree_box._run
+        step = "branch" if door.name == "fresh" else "fetch"
+
+        def run(cmd, **kwargs):
+            result = real_run(cmd, **kwargs)
+            if cmd[3:4] == [step] and "refs" not in seen:
+                after(None)
+            return result
+
+        monkeypatch.setattr(worktree_box, "_run", run)
+    return seen
+
+
+@pytest.mark.parametrize("door_name", DOORS)
+def test_a_symbolic_link_that_appears_between_the_check_and_the_add_is_refused(
+        tmp_path, root, monkeypatch, door_name):
+    """Red before the box made the path itself: git checked the card out through the link."""
+    door = _door(door_name, tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    target = tmp_path / "their empty directory"
+    target.mkdir()
+    seen = _in_the_window(monkeypatch, door, wt, lambda p: os.symlink(target, p))
+
+    with pytest.raises(RuntimeError) as raised:
+        door.prepare()
+
+    assert not isinstance(raised.value, BranchHeldElsewhere)
+    assert str(raised.value) == path_taken(BRANCH, str(worktree_box._where(wt)),
+                                           repo=str(door.repo), what="symlink")
+    assert os.listdir(target) == []
+    assert wt.is_symlink() and os.readlink(wt) == str(target)
+    assert _refs(door) == seen["refs"]
+
+
+def test_a_symbolic_link_that_appears_in_the_window_is_refused_when_the_list_cannot_be_read(
+        tmp_path, root, unread, monkeypatch):
+    door = _door("fresh", tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    target = tmp_path / "their empty directory"
+    target.mkdir()
+    seen = _in_the_window(monkeypatch, door, wt, lambda p: os.symlink(target, p))
+
+    with pytest.raises(RuntimeError) as raised:
+        door.prepare()
+
+    assert str(raised.value) == path_taken(BRANCH, str(worktree_box._where(wt)),
+                                           repo=str(door.repo), what="symlink")
+    assert os.listdir(target) == []
+    assert _refs(door) == seen["refs"]
+
+
+@pytest.mark.parametrize("door_name", DOORS)
+def test_a_regular_file_that_appears_between_the_check_and_the_add_is_refused(
+        tmp_path, root, monkeypatch, door_name):
+    """Red before: git's `worktree add failed: ... already exists`."""
+    door = _door(door_name, tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    seen = _in_the_window(monkeypatch, door, wt,
+                          lambda p: p.write_bytes(b"a file that appeared\n"))
+
+    with pytest.raises(RuntimeError) as raised:
+        door.prepare()
+
+    assert str(raised.value) == path_taken(BRANCH, str(worktree_box._where(wt)),
+                                           repo=str(door.repo), what="file")
+    assert wt.read_bytes() == b"a file that appeared\n"
+    assert _refs(door) == seen["refs"]
+
+
+def test_a_path_the_box_cannot_make_is_refused_by_name(tmp_path, root, monkeypatch):
+    """Any other `OSError` from making the path refuses, naming the path and the cause, and git
+    never runs the add."""
+    door = _door("fresh", tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    real_mkdir = os.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if Path(path) == wt:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_box.os, "mkdir", mkdir)
+
+    with pytest.raises(RuntimeError) as raised:
+        door.prepare()
+
+    where = str(worktree_box._where(wt))
+    assert str(raised.value) == worktree_box.path_not_made(
+        BRANCH, where, error=PermissionError(13, "Permission denied", str(wt)))
+    assert where in str(raised.value) and "Permission denied" in str(raised.value)
+    assert not os.path.lexists(wt)
+    assert _sha(door.repo, BRANCH) == ""  # `branch -D` ran, `add -b` did not
+
+
+@pytest.mark.parametrize("door_name", DOORS)
+def test_the_box_checks_out_into_the_directory_it_made(tmp_path, root, monkeypatch, door_name):
+    """Git accepts the empty directory the box made on every door, and the card is checked out
+    in it, not through anything."""
+    door = _door(door_name, tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    made = []
+    real_mkdir = os.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if Path(path) == wt:
+            made.append(path)
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_box.os, "mkdir", mkdir)
+
+    workspace = door.prepare()
+
+    assert made == [wt]
+    assert workspace.path == wt
+    assert wt.is_dir() and not wt.is_symlink()
+    assert (wt / ".git").is_file() and (wt / "README.md").is_file()
+    assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD") == BRANCH
+
+
+@pytest.mark.parametrize("listed", ["read", "unread"])
+def test_an_add_that_fails_after_the_box_made_its_path_leaves_no_directory_behind(
+        tmp_path, root, monkeypatch, request, listed):
+    """The box removes the empty directory it made (`rmdir`, never recursive) so the rerun is not
+    blocked, and the rerun starts."""
+    if listed == "unread":
+        request.getfixturevalue("unread")
+    door = _door("fresh", tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    real_run = worktree_box._run
+
+    def run(cmd, **kwargs):
+        if cmd[3:5] == ["worktree", "add"]:
+            assert wt.is_dir() and os.listdir(wt) == []
+            return 128, "fatal: the add failed\n"
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(worktree_box, "_run", run)
+    with pytest.raises(RuntimeError, match="worktree add failed"):
+        door.prepare()
+    assert not os.path.lexists(wt)
+
+    monkeypatch.setattr(worktree_box, "_run", real_run)
+    assert door.prepare().path == wt
+    assert (wt / "README.md").is_file()
+
+
+@pytest.mark.parametrize("listed", ["read", "unread"])
+def test_an_empty_directory_left_at_the_box_s_path_is_read_as_free(
+        tmp_path, root, request, listed):
+    """A box killed between its `mkdir` and the add leaves an empty directory; the rerun reads it
+    as free and git checks out into it."""
+    if listed == "unread":
+        request.getfixturevalue("unread")
+    door = _door("fresh", tmp_path, root)
+    wt = root / BRANCH.replace("/", "-")
+    wt.mkdir(parents=True)
+
+    assert door.prepare().path == wt
+    assert (wt / "README.md").is_file() and not wt.is_symlink()

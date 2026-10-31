@@ -2,15 +2,21 @@
 at the box's path is still refused by name before anything is written, and a directory still goes
 to git.
 
-TWO CLAIMS:
+THREE CLAIMS:
 
   1. **A link or a file at the path is refused whether or not the list was read** (`prepare`,
      the `taken = _what_is_at(wt)` line): neither check depends on the list, and unread, git used
      to check the card out through a link to an empty directory.
   2. **Only the directory checks wait for the list**: unread, a directory at the path is left to
      git, which refuses it as before (`worktree add failed`), and a forgotten tree is kept.
+  3. **Nothing that appears at the path after the check is written through** (review of 4b54732):
+     the box makes the path with `os.mkdir` right before the add, which never follows a final
+     link and fails on anything there; what it met is refused by name before git runs, and an add
+     that fails afterwards leaves no directory behind.
 
-The guards are real git with real linked worktrees, with `_working_trees` answering `None`.
+The guards are real git with real linked worktrees, with `_working_trees` answering `None`, and,
+for claim 3, the step between the check and the add (`branch -D`, the fetch, or the keep door's
+branch check) patched to put a link or a file at the path.
 """
 
 TEST = "tests/test_an_unread_worktree_list_still_refuses_a_symlink_or_file_at_the_box_s_path.py"
@@ -40,4 +46,29 @@ MUTATIONS = [
      '        if trees is None and taken is not None and taken[0] not in ("symlink", "file"):\n',
      '        if False:\n',
      FORGOTTEN),
+
+    # ── claim 3: nothing that appears after the check is written through ───────────────────────
+    ("the box no longer makes its path: git creates it, and the window reopens", BOX,
+     "            os.mkdir(wt)\n            made = True\n",
+     "            made = False\n"),
+
+    ("what `mkdir` met at the path is swallowed, and git is handed it", BOX,
+     "                taken = _what_appeared_at(wt, trees)\n",
+     "                taken = None\n"),
+
+    ("a following create: an existing directory, or a link to one, is accepted as made", BOX,
+     "            os.mkdir(wt)\n",
+     "            os.makedirs(wt, exist_ok=True)\n"),
+
+    ("any other failure to make the path is passed over, and git is handed the path", BOX,
+     "        except OSError as exc:\n"
+     "            raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc\n"
+     "        mark = _write_mark(repo_path, wt)\n",
+     "        except OSError:\n"
+     "            pass\n"
+     "        mark = _write_mark(repo_path, wt)\n"),
+
+    ("the empty directory the box made is left behind when the add fails", BOX,
+     "            if made:\n                _remove_if_empty(wt)\n",
+     ""),
 ]
