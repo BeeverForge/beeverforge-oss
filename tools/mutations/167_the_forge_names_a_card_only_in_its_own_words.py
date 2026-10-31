@@ -12,8 +12,9 @@ THREE CLAIMS:
   1. **Not owned: the title, the commit and the body carry no `#<number>` of the card's text**, and
      each one is written `card <number>`, so the reference stays readable and traceable.
   2. **Owned: the text is unchanged** — `#37` is the forge's own item 37, the card it names.
-  3. **What counts as a mention**: a `#` directly before a number, wherever it stands; `C#`,
-     `issue # 4` and `PROJ-12` are not.
+  3. **What counts as a mention**: a `#` directly before a number, wherever it stands, and
+     `GH-<number>` in any case as a whole word (#111); `C#`, `issue # 4`, `PROJ-12`, `XGH-12`
+     and `GH-12a` are not.
 
 The guard is `tests/test_the_forge_names_a_card_only_in_its_own_words.py`.
 """
@@ -73,4 +74,9 @@ MUTATIONS = [
     ("a mention that opens the text gets a stray space in front of it", MACHINE,
      '        before = found.string[found.start() - 1] if found.start() else " "\n',
      '        before = found.string[found.start() - 1] if found.start() else "x"\n'),
+    ("`GH-12` is not rewritten", MACHINE, '    text = _A_GH_MENTION.sub("card ", text or "")\n', '    text = text or ""\n'),
+    ("only `GH-12` in capitals is a mention, so `gh-12` links", MACHINE, 're.compile(r"\\bGH-(?=\\d+\\b)", re.IGNORECASE)', 're.compile(r"\\bGH-(?=\\d+\\b)")'),
+    ("`XGH-12` is rewritten", MACHINE, 're.compile(r"\\bGH-(?=\\d+\\b)", re.IGNORECASE)', 're.compile(r"GH-(?=\\d+\\b)", re.IGNORECASE)'),
+    ("`GH-12a` is rewritten", MACHINE, 're.compile(r"\\bGH-(?=\\d+\\b)", re.IGNORECASE)', 're.compile(r"\\bGH-(?=\\d)", re.IGNORECASE)'),
+    ("only the first `GH-` mention is rewritten", MACHINE, '    text = _A_GH_MENTION.sub("card ", text or "")\n', '    text = _A_GH_MENTION.sub("card ", text or "", count=1)\n'),
 ]
