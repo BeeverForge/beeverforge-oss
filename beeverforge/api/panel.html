@@ -5251,8 +5251,13 @@ async function refreshBoard(){
   catch(e){ why = String((e&&e.message)||e); }
   // A response belongs to the selection that asked for it. A slower read must never put one
   // card's controls on screen while those controls write to the next card (measured 2026-10-24).
-  if(_bd !== board || board.acceptedRead > read || board.project !== project ||
-     board.card !== card || board.pr !== pr || board.selection !== selection) return;
+  if(_bd !== board || board.acceptedRead > read || board.project !== project) return;
+  if(board.card !== card || board.pr !== pr || board.selection !== selection){
+    // A write's re-read can finish after the drawer closes. Hosted boards do not poll, so a
+    // discarded newest read would otherwise leave the board stale until the next action.
+    if(board.read === read){ board.sig = null; refreshBoard(); }
+    return;
+  }
   board.acceptedRead = read;
   _bd.why = why;
   const sig = d === null ? "null:"+_bd.why : JSON.stringify(d);

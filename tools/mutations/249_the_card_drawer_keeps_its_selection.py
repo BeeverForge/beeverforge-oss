@@ -5,9 +5,9 @@ PANEL = "beeverforge/api/panel.html"
 
 MUTATIONS = [
     ("a slow response paints over the current card", PANEL,
-     "  if(_bd !== board || board.acceptedRead > read || board.project !== project ||\n"
-     "     board.card !== card || board.pr !== pr || board.selection !== selection) return;",
-     "  if(false) return;"),
+     "  if(_bd !== board || board.acceptedRead > read || board.project !== project) return;\n"
+     "  if(board.card !== card || board.pr !== pr || board.selection !== selection){",
+     "  if(false) return;\n  if(false){"),
     ("an older refresh of the same selection replaces the latest read", PANEL,
      "board.acceptedRead > read || board.project !== project",
      "board.project !== project"),
@@ -31,6 +31,14 @@ MUTATIONS = [
     ("an earlier open of the same card completes the newer open", PANEL,
      "board.selection !== selection || board.card !== ref",
      "board.card !== ref"),
+    ("a closed drawer leaves the board stale after a write", PANEL,
+     "    if(board.read === read){ board.sig = null; refreshBoard(); }",
+     "    if(false){}"),
+    ("an old open opens a replacement board's drawer", PANEL,
+     "  if(_bd !== board || board.selection !== selection || board.card !== ref) return;",
+     "  if(board.selection !== selection || board.card !== ref) return;"),
+    ("the loading placeholder names the previous card", PANEL,
+     '${esc(ref)}</span>', '${esc(_bd.data.card.ref)}</span>'),
     ("an explicit repaint displays a card that is not the action target", PANEL,
      "  if(!drawer || !c || String(c.ref) !== String(_bd.card)) return;",
      "  if(!drawer || !c) return;"),

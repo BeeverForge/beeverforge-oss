@@ -83,7 +83,7 @@ console.log(JSON.stringify({{painted, marker:_bd.data.marker, why:_bd.why, urls:
 
 @pytest.mark.parametrize("change", ['_bd.card = null;', '_bd.project = "other";',
                                    '_bd.pr = "7";', '_bd = {..._bd};'])
-def test_changing_or_closing_the_selection_invalidates_a_read_without_another_request(change):
+def test_changing_or_closing_the_selection_invalidates_the_reads_drawer(change):
     result = _run(f"""
 globalThis._bd = {{project:"app",card:"1",pr:null,timer:1,sig:null}};
 let reply, paints = 0;
@@ -137,7 +137,7 @@ console.log(JSON.stringify({paints}));
 
 def test_selecting_a_card_removes_old_controls_before_the_read_and_cannot_reopen_after_close():
     result = _run("""
-globalThis._bd = {project:"app",card:"1",pr:null,draft:"old",form:null};
+globalThis._bd = {project:"app",card:"1",pr:null,draft:"old",form:null,data:{card:{ref:"1"}}};
 const drawer = {innerHTML:"old card actions",classList:{add:()=>opened++},setAttribute:()=>{}};
 let opened = 0, reply;
 globalThis.$ = sel=>sel.endsWith(".drawer") ? drawer : null;
@@ -151,8 +151,51 @@ console.log(JSON.stringify({loading, opened, pr:_bd.pr}));
 """, "boardOpenCard")
     assert "old card actions" not in result["loading"]
     assert "loading" in result["loading"]
+    assert '<span class="ref">2</span>' in result["loading"]
     assert result["opened"] == 0
     assert result["pr"] is None
+
+
+@pytest.mark.parametrize("kind", ["card", "pr"])
+def test_a_writes_read_reaches_the_board_after_the_drawer_closes(kind):
+    result = _run(f"""
+globalThis._bd = {{project:"app",card:{'"1"' if kind == 'card' else 'null'},
+                  pr:{'"7"' if kind == 'pr' else 'null'},timer:null,sig:"before",
+                  data:{{marker:"before"}}}};
+const replies = [], painted = [];
+globalThis.api = url=>new Promise(resolve=>replies.push({{url,resolve}}));
+globalThis.paintBoard = ()=>painted.push(_bd.data.marker);
+globalThis.paintCard = ()=>{{}};
+globalThis.paintPR = ()=>{{}};
+globalThis._bwatch = ()=>{{}};
+globalThis.$ = ()=>null;
+_bd.sig = null;
+const pending = refreshBoard();
+{'boardCloseCard' if kind == 'card' else 'boardClosePR'}();
+replies[0].resolve({{marker:"stale drawer"}}); await pending;
+if(replies[1]) replies[1].resolve({{marker:"after write"}});
+await new Promise(r=>setTimeout(r,0));
+console.log(JSON.stringify({{painted, urls:replies.map(r=>r.url)}}));
+""", "refreshBoard", "boardCloseCard", "boardClosePR")
+    assert result["painted"] == ["after write"]
+    assert result["urls"][-1] == "/api/board/app"
+    assert len(result["urls"]) == 2
+
+
+def test_a_pending_open_does_not_open_a_replacement_boards_drawer():
+    result = _run("""
+globalThis._bd = {project:"app",card:null,pr:null,draft:"",form:null};
+let opened = 0, reply;
+const drawer = {innerHTML:"",classList:{add:()=>opened++},setAttribute:()=>{}};
+globalThis.$ = sel=>sel.endsWith(".drawer") ? drawer : null;
+globalThis.esc = String;
+globalThis.refreshBoard = ()=>new Promise(resolve=>reply=resolve);
+const pending = boardOpenCard("1");
+_bd = {project:"app",card:null,pr:null};
+reply(); await pending;
+console.log(JSON.stringify({opened}));
+""", "boardOpenCard")
+    assert result["opened"] == 0
 
 
 def test_reopening_the_same_card_does_not_let_an_older_open_complete_the_new_selection():
