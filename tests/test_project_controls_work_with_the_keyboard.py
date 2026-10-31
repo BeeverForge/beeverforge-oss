@@ -45,11 +45,13 @@ def test_each_project_has_a_native_link_and_a_named_native_switch(enabled):
 @pytest.mark.parametrize("control", ["project-acme", "pickup-acme"])
 def test_a_live_refresh_keeps_focus_on_the_same_project_control(control):
     got = run("""
+      projects=[{name:'acme',enabled:true,tracker:'local',forge:'local'}];
       document.activeElement={id:'CONTROL',closest:()=>true};
       renderIndex();return focused;
     """.replace("CONTROL", control), "renderIndex", "boxChip", stubs="""
       const inbox=[];function needsYouHtml(){return ''}
       const focused=[];nodes['#app']=node();
-      document.getElementById=id=>({focus:options=>focused.push({id,options})});
+      document.getElementById=id=>nodes['#app'].innerHTML.includes(' id="'+id+'"')
+        ?{focus:options=>focused.push({id,options})}:null;
     """)
     assert got == [{"id": control, "options": {"preventScroll": True}}]

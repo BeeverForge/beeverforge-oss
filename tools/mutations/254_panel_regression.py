@@ -16,4 +16,8 @@ MUTATIONS = [
     ('index refresh drops keyboard focus', PANEL,
      'if(next)next.focus({preventScroll:true});',
      'if(false)next.focus({preventScroll:true});'),
+    ('pickup loses the id focus is restored by', PANEL,
+     'id="pickup-${encodeURIComponent(p.name)}" ', ''),
+    ('project link loses the id focus is restored by', PANEL,
+     'id="project-${encodeURIComponent(p.name)}" ', ''),
 ]
