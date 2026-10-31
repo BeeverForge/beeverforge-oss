@@ -135,6 +135,14 @@ MUTATIONS = [
      "        key = canonical_ref(ref)\n",
      f"{SLICE}::test_an_unscoped_jira_boards_gate_asks_nothing_more"),
 
+    # K1 of #108, held once it was measured: an unread batch asks `holds` about `dar-2` as typed
+    ("`holds` compares the key Jira returns without folding case, and `dar-2` typed in "
+     "lowercase reads as outside the slice", BOARD,
+     'return any(str(i.get("key") or "").upper() == key.upper() for i in issues)',
+     'return any(str(i.get("key") or "") == key for i in issues)',
+     "tests/test_a_lowercase_jira_key_is_the_same_card.py::"
+     "test_a_lowercase_key_is_refused_queueing_as_its_own_spelling[scoped-read-refused]"),
+
     ("the gate ignores `holds`, and a card outside the slice reads as nobody moved it", CATALOG,
      "inside = holds(issue) if callable(holds) else True",
      "inside = True",

@@ -146,6 +146,10 @@ def test_a_lowercase_key_is_refused_queueing_as_its_own_spelling(scope, refused_
     assert not lower.ok, "a running card typed in lowercase was queued"
     assert lower.refusal == upper.refusal, (lower.refusal, upper.refusal)
     assert lower.detail == upper.detail, (lower.detail, upper.detail)
+    if not refused_read:
+        # a read batch resolves `dar-2` to the read's own spelling itself, so the answer names
+        # the card once, as the board does (the door resolves it too, but echoes nothing here)
+        assert lower.ref == upper.ref, (lower.ref, upper.ref)
     assert moved == []
 
 
@@ -178,3 +182,89 @@ def test_the_door_records_a_lowercase_key_under_the_boards_own_spelling():
     assert len(record.read(sink, "acme", "DAR-1").rows) == 1
     assert not record.read(sink, "acme", "dar-1").rows
     assert {c[1] for c in ports.calls if len(c) > 1} == {"DAR-1"}
+
+
+class _ClosedTracker:
+    """A Jira-like tracker holding one closed card, `DAR-1`: it reads a key in any case and
+    answers with its own spelling, as Jira does, and keeps every write it is asked for."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+
+    def get_ticket(self, ref):
+        from types import SimpleNamespace
+
+        if str(ref).lstrip("#").upper() != "DAR-1":
+            raise KeyError(ref)
+        return SimpleNamespace(id="DAR-1", title="a closed card", raw="", belongs_to="",
+                               state="closed", state_reason="not_planned")
+
+    def reopen_ticket(self, ref):
+        self.writes.append(("reopen", str(ref)))
+
+    def comment(self, ref, text):
+        self.writes.append(("comment", str(ref)))
+
+
+def test_the_door_records_a_reopen_of_a_lowercase_key_under_the_boards_own_spelling():
+    """A CLOSED card is read from its tracker, not its board, and `Ports.seen` once named it
+    without the tracker's spelling: a close of `dar-1` (through `_stage`) was recorded as `DAR-1`
+    and the reopen of the same card (`_card_reopen`, no `_stage`) as `dar-1`, a second history."""
+    from beeverforge.lifecycle import record
+    from beeverforge.lifecycle.card import transition
+    from beeverforge.lifecycle.ports import Ports as RealPorts
+    from beeverforge.lifecycle.table import CardEvent
+    from beeverforge.observability.metrics import InMemoryMetricsSink
+    from tests.test_the_card_lifecycle_does_what_its_table_says import Ports, Project
+
+    tracker = _ClosedTracker()
+    real = RealPorts(Project(), tracker=tracker, columns={})
+
+    class Door(Ports):
+        def seen(self, card):
+            asked.append(card)
+            return real.seen(card)
+
+    asked: list[str] = []
+    sink = InMemoryMetricsSink()
+    ports = Door(real.seen("DAR-1"), sink_=sink)
+
+    moved = transition(Project(), "dar-1", CardEvent.REOPENED, by="ana", why="came back",
+                       ports=ports)
+
+    assert moved.ok and moved.recorded, moved.refused
+    assert moved.card == "DAR-1"
+    assert asked == ["dar-1", "DAR-1"]
+    assert len(record.read(sink, "acme", "DAR-1").rows) == 1
+    assert not record.read(sink, "acme", "dar-1").rows
+    assert {c[1] for c in ports.calls if len(c) > 1} == {"DAR-1"}
+
+
+def test_a_reopen_of_a_lowercase_key_answers_with_the_boards_own_spelling(tmp_path,
+                                                                           monkeypatch):
+    """The reopen row echoes the card as its tracker spells it, the spelling its record is under,
+    so the person reads `reopened DAR-1`, never a second name for one card."""
+    import asyncio
+
+    from beeverforge import actions
+    from beeverforge.actions import catalog
+    from beeverforge.contracts.project import Project, ProviderRef
+    from beeverforge.lifecycle import record
+
+    monkeypatch.setenv("BEEVERFORGE_METRICS_SINK", "sqlite")
+    monkeypatch.setenv("BEEVERFORGE_METRICS_DB", str(tmp_path / "metrics.db"))
+    api = Project(name="api", repo_path=str(tmp_path), language="en", tracker=ProviderRef(
+        kind="jira", repo="DAR", options={"site": SITE, "email": "a@b.c",
+                                          "status_map": json.dumps(SM)}))
+    tracker = _ClosedTracker()
+    monkeypatch.setattr(catalog, "_board_pair", lambda project: (api, tracker, None, None))
+    by = actions.Actor(id="ana", display="Ana", via="panel", admin=True)
+
+    out = asyncio.run(catalog._card_reopen(project="api", issue="dar-1", by=by))
+
+    assert out.ok, out
+    assert "reopened DAR-1 " in out.message, out.message
+    assert "dar-1" not in out.message, out.message
+    assert tracker.writes and {ref for _, ref in tracker.writes} == {"DAR-1"}, tracker.writes
+    assert len(record.read(record.keyed_sink(), "api", "DAR-1").rows) == 1
+    assert not record.read(record.keyed_sink(), "api", "dar-1").rows

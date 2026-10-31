@@ -153,8 +153,13 @@ class Ports:
         opened_by = filed_by_the_product_role(getattr(ticket, "raw", "") or "")
         belongs_to = str(getattr(ticket, "belongs_to", "") or "")
         if (getattr(ticket, "state", "") or "open") != "open":
+            # A CLOSED CARD IS NAMED AS ITS TRACKER SPELLS IT (#108): its board may not place it,
+            # so the tracker's own key is the spelling its close was recorded under
+            own = canonical_ref(getattr(ticket, "id", "") or "")
+            asked = canonical_ref(card)
+            ref = own if own != asked and own.upper() == asked.upper() else ""
             return Seen(state=self._closed_as(card, ticket), title=title, opened_by=opened_by,
-                        open=False)
+                        open=False, ref=ref)
         board = self.board
         if board is None:
             return Seen(state=None, title=title, opened_by=opened_by, belongs_to=belongs_to)

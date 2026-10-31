@@ -5837,6 +5837,12 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
     bad = _refusal_of(moved)
     if bad:
         return bad
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): echoed as the door recorded it, `DAR-1`;
+    # any other ref (`#3`) is echoed as it was typed
+    from beeverforge.contracts.refs import canonical_ref
+
+    if moved.card != canonical_ref(issue) and moved.card.upper() == canonical_ref(issue).upper():
+        issue = moved.card
     if moved.outcome("reopen").startswith("failed") and not moved.recorded:
         return refused(UNAVAILABLE, f"{issue} is still closed: {moved.outcome('reopen')}")
     reopened = f"reopened {issue} ({by}) — it is back on the board for somebody to pick up"
