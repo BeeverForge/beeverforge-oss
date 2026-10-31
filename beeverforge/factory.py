@@ -245,6 +245,10 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
                 f"{_what_stands_at(dest)} — remove or move it yourself "
                 f"(`mv {shlex.quote(str(dest))} <a path of yours>`) and run again"
             )
+        # A leftover git still lists but `remove` would not take (its `.git` gone: "validation
+        # failed") was only rmtree'd, so its registration stands and `add` would refuse the path.
+        # Now the directory is gone, this path's own `remove` drops it (the `else` branch's clear).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
     else:
         # The directory is gone but git may still list it (a cache wiped by hand), and `add`
         # refuses a path it still believes in. THIS path's registration is dropped, never a

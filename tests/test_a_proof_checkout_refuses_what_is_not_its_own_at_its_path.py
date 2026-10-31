@@ -198,22 +198,46 @@ def test_a_leftover_checkout_directory_is_replaced_by_the_ref(tmp_path, monkeypa
     assert (dest / "only-on-feat.txt").read_text() == "feat\n"
 
 
+def test_an_emptied_leftover_checkout_is_checked_out_again(tmp_path, monkeypatch):
+    """A leftover directory git still lists but `worktree remove` will not take (its `.git` gone:
+    "validation failed, cannot remove working tree"). The rmtree takes the directory; the
+    registration stays unless this path's own `remove` runs once more, and then `add` fails with
+    git's raw "missing but already registered worktree"."""
+    repo = _repository(tmp_path)
+    dest = _here(tmp_path, monkeypatch)
+    factory._worktree_at(repo, "feat", _KEY)
+    for child in dest.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    assert list(dest.iterdir()) == []
+
+    assert factory._worktree_at(repo, "feat", _KEY) == dest
+    assert (dest / "only-on-feat.txt").read_text() == "feat\n"
+
+
 # THE WINDOW (#317 review, the shape #124 / PR #312 settled). The guard reads the path once; git
 # creates it only at the `add`. Whatever appears in between must be refused by name, not written
-# through. The last git call before the add is this path's own `worktree remove`, so the spy plants
-# there, right after it ran — the latest point a test can reach before the function makes the path.
+# through. The last git call before the add is this path's own `worktree remove` on an empty path
+# (the `else` branch's clear, or the one after a leftover's rmtree), so the spy plants there, once,
+# right after it ran — the latest point a test can reach before the function makes the path.
 
 
-def _plant_after_the_remove(monkeypatch, plant) -> list[list[str]]:
+def _plant_after_the_remove(monkeypatch, dest: Path, plant) -> list[list[str]]:
     from beeverforge.runtime import repo_cache
 
     calls: list[list[str]] = []
+    planted: list[bool] = []
     real = repo_cache._git
 
     def planting(args, *a, **kw):
         calls.append(list(args))
+        clear = "worktree" in args and "remove" in args and not dest.is_symlink() \
+            and not dest.exists()
         result = real(args, *a, **kw)
-        if "worktree" in args and "remove" in args:
+        if clear and not planted:
+            planted.append(True)
             plant()
         return result
 
@@ -234,7 +258,7 @@ def test_a_symlink_planted_after_the_check_is_refused_not_written_through(tmp_pa
         factory._worktree_at(repo, "feat", _KEY)
     target = tmp_path / "empty"
     target.mkdir()
-    calls = _plant_after_the_remove(monkeypatch, lambda: dest.symlink_to(target))
+    calls = _plant_after_the_remove(monkeypatch, dest, lambda: dest.symlink_to(target))
 
     with pytest.raises(RuntimeError) as refused:
         factory._worktree_at(repo, "feat", _KEY)
@@ -249,7 +273,7 @@ def test_a_symlink_planted_after_the_check_is_refused_not_written_through(tmp_pa
 def test_a_file_planted_after_the_check_is_refused_by_name(tmp_path, monkeypatch):
     repo = _repository(tmp_path)
     dest = _here(tmp_path, monkeypatch)
-    calls = _plant_after_the_remove(monkeypatch, lambda: dest.write_text("a person's notes"))
+    calls = _plant_after_the_remove(monkeypatch, dest, lambda: dest.write_text("a person's notes"))
 
     with pytest.raises(RuntimeError) as refused:
         factory._worktree_at(repo, "feat", _KEY)

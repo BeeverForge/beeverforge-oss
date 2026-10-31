@@ -3,9 +3,9 @@
 The dangerous reverse is the first cut: a symbolic link at the path reaches `worktree remove` and
 `worktree add`, which remove or check out into the tree the link names. The others: a file at the
 path reaching git, the sentence naming the wrong thing, the path's own stale registration left so
-a wiped cache cannot be measured again, the blanket `worktree prune` coming back, and the window
-between the check and the add: a link or file planted there, a create that follows a link, and
-the failed add's cleanup.
+a wiped cache cannot be measured again, an emptied leftover's registration left after its rmtree,
+the blanket `worktree prune` coming back, and the window between the check and the add: a link or
+file planted there, a create that follows a link, and the failed add's cleanup.
 """
 
 TEST = "tests/test_a_proof_checkout_refuses_what_is_not_its_own_at_its_path.py"
@@ -37,6 +37,15 @@ MUTATIONS = [
      '        # The directory is gone but git may still list it',
      '    elif False:\n'
      '        # The directory is gone but git may still list it'),
+
+    ("an emptied leftover's registration outlives its rmtree, so `add` fails with git's words",
+     FACTORY,
+     "        # Now the directory is gone, this path's own `remove` drops it (the `else` branch's "
+     "clear).\n"
+     '        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])',
+     "        # Now the directory is gone, this path's own `remove` drops it (the `else` branch's "
+     "clear).\n"
+     "        pass"),
 
     ("the blanket prune comes back and drops other people's registrations", FACTORY,
      '        # momentarily missing, other people\'s included (see adapters/sandbox/worktree.py).\n'
