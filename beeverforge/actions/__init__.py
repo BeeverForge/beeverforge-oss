@@ -280,7 +280,11 @@ def proposable(by: Actor) -> tuple[str, ...]:
 
 
 async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
-    """Run one action. Always returns an `Outcome`; only a `CancelledError` passes through.
+    """Run one action. Always returns an `Outcome`; only what is not an `Exception` passes through.
+
+    That is a cancellation, an interrupt or an exit (`CancelledError`, `KeyboardInterrupt`,
+    `SystemExit`, `GeneratorExit`): they are the caller's, never an outcome, so the outer guard
+    catches `Exception` and must not be widened to `BaseException`.
 
     An exception raised outside the row's own guard (the catalog failing to import, a parameter
     check that breaks) is answered as a row's exception is: `failed`, reason `raised`, with a
