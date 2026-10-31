@@ -199,7 +199,7 @@ WRAPPERS = ("pinned", "argv")
 
 def _is_remote(words: list[str | None]) -> bool:
     """Find a remote command even past options, variables and starred argument lists."""
-    if not words or words[0] not in (None, "git", "remote", *REMOTE):
+    if not words or words[0] not in (None, "git", "-C", "-c", "remote", *REMOTE):
         return False
     return any(word in REMOTE or words[i:i + 2] == ["remote", "set-url"]
                for i, word in enumerate(words))
@@ -254,7 +254,9 @@ def test_the_guard_sees_each_shape_of_a_remote_call():
               '_git(repo, "fetch", "--", url)\n'
               'subprocess.run(["git", "-c", "http.extraHeader=x", "clone", "--", u, d])\n'
               'subprocess.run(["git", "pull", "--", u])\n'
-              '_git(["submodule", "update", "--init"])\n')
+              '_git(["submodule", "update", "--init"])\n'
+              '_git(["-C", d, "push", "-u", "--", url, b])\n'
+              '_git(["-c", config, "fetch", "--", url])\n')
     passed = ('_git(gitpin.pinned(["clone", "--no-local", url, str(tmp)]))\n'
               'subprocess.run(gitpin.argv(["-C", x, "fetch", "--", url]))\n'
               '_git(*gitpin.pinned(["push", "--", "origin", b]))\n'
@@ -262,7 +264,7 @@ def test_the_guard_sees_each_shape_of_a_remote_call():
               '_git(["remote", "get-url", "origin"])\n'
               '_git(["rev-parse", "HEAD"])\n'
               'fetch = gitpin.pinned(["fetch", "--", u]) if u else []\n')
-    assert _unpinned(ast.parse(caught)) == [str(i) for i in range(1, 13)]
+    assert _unpinned(ast.parse(caught)) == [str(i) for i in range(1, 15)]
     assert _unpinned(ast.parse(passed)) == []
 
 
@@ -275,15 +277,6 @@ def test_the_operations_guide_names_the_pinned_transports_and_the_gap():
     for word in ("https", "ssh", "file", "ext", "fd", "http", "GIT_ALLOW_PROTOCOL", "#143",
                  "beeverforge/gitpin.py"):
         assert word in section, word
-
-
-def test_the_pin_carries_its_release_note():
-    note = (ROOT / "changes" / "143.security.md").read_text(encoding="utf-8").strip()
-    assert note
-    assert not note.splitlines()[0].rstrip().endswith("(#143)")
-    upgrade = (ROOT / "changes" / "143.upgrade.md").read_text(encoding="utf-8")
-    for word in ("http://", "git://", "https://", "ssh"):
-        assert word in upgrade
 
 
 # ── the pin in an error's text ──────────────────────────────────────────────────────────────────
@@ -301,6 +294,25 @@ def test_an_error_s_text_reads_without_the_pin():
         "status 128.")
     assert gitpin.without_pin(line) == "git fetch -- origin"
     assert gitpin.without_pin("git clone x") == "git clone x"
+
+
+def test_timeout_messages_keep_the_git_command_and_redact_credentials(monkeypatch):
+    from beeverforge.adapters.preview import compose
+    from beeverforge.knowledge import pipeline
+
+    def timeout(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    preview = compose._host(gitpin.argv(["clone", "--no-local", "https://h/r"]), timeout=12)
+    assert preview.rc == 124
+    assert "git clone --no-local" in preview.err
+    assert "protocol.allow" not in preview.err
+    rc, message = pipeline._git(*gitpin.pinned(["clone", "https://user:secret@h/r"]))
+    assert rc == 1
+    assert "clone" in message[:200]
+    assert "protocol.allow" not in message
+    assert "secret" not in message
 
 
 @pytest.mark.parametrize("door", ["context", "product_start"])

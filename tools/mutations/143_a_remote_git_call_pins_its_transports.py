@@ -16,6 +16,8 @@ TEST = "tests/test_a_remote_git_call_uses_only_https_ssh_and_file.py"
 PIN = "beeverforge/gitpin.py"
 CACHE = "beeverforge/runtime/repo_cache.py"
 DEMAND = "beeverforge/preview/demand.py"
+PREVIEW = "beeverforge/adapters/preview/compose.py"
+PIPELINE = "beeverforge/knowledge/pipeline.py"
 
 MUTATIONS = [
     # 1. the pin itself
@@ -47,10 +49,14 @@ MUTATIONS = [
 
     # 3. the guard and subcommand
     ("the guard reads lists and never a call's own arguments", TEST,
-     "        elif isinstance(node, ast.Call) and not _is_wrapper(node):\n            items = node.args\n",
+     "        elif isinstance(node, ast.Call) and not _is_wrapper(node):\n"
+     "            items = node.args\n",
      ""),
     ("the guard only sees a subcommand at the start", TEST,
      'for i, word in enumerate(words))', 'for i, word in enumerate(words[:1]))'),
+    ("the guard skips calls that begin with git option pairs", TEST,
+     'None, "git", "-C", "-c", "remote", *REMOTE',
+     'None, "git", "remote", *REMOTE'),
     ("the guard does not see `remote set-url`", TEST,
      ' or words[i:i + 2] == ["remote", "set-url"]',
      ""),
@@ -62,4 +68,10 @@ MUTATIONS = [
     ("an error's text keeps the pin, and the log line loses the command", PIN,
      '    return text.replace(listed, "").replace(spoken, "")',
      "    return text"),
+    ("a preview timeout names the pin instead of the command", PREVIEW,
+     "command = gitpin.without_pin(' '.join(argv)).split()[:3]",
+     "command = list(argv[:3])"),
+    ("a knowledge timeout names the pin instead of the command", PIPELINE,
+     "return 1, _redact(gitpin.without_pin(str(exc)))",
+     "return 1, _redact(str(exc))"),
 ]

@@ -211,7 +211,7 @@ class _Reader(_Recording):
 
 def _certificate(where: Path) -> tuple[Path, Path]:
     """A self-signed certificate for 127.0.0.1 and its key: the forge below speaks https, the one
-    transport besides ssh and file the core's git calls may use (#931)."""
+    transport besides ssh and file the core's git calls may use."""
     import datetime
 
     from cryptography import x509

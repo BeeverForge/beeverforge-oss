@@ -201,7 +201,8 @@ def _host(argv: Sequence[str], *, env: Mapping[str, str] | None = None, timeout:
     except FileNotFoundError:
         return Ran(127, "", f"{argv[0]}: not found on PATH")
     except subprocess.TimeoutExpired:
-        return Ran(124, "", f"`{' '.join(argv[:3])} …` did not finish within {int(timeout)}s")
+        command = gitpin.without_pin(' '.join(argv)).split()[:3]
+        return Ran(124, "", f"`{' '.join(command)} …` did not finish within {int(timeout)}s")
     except OSError as exc:
         return Ran(126, "", f"{argv[0]} could not be run: {exc}")
     return Ran(done.returncode, done.stdout or "", done.stderr or "")

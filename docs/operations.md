@@ -252,9 +252,10 @@ Every git call the core makes on the host that reaches a remote (`clone`, `fetch
 `beeverforge/gitpin.py`. Those calls may use only:
 
 - **https** and **ssh**: the GitHub and Azure DevOps forges, and `git@…` / `ssh://…` remotes;
-- **file**, for user-initiated calls: the local forge's repository paths and clones of the worker's
-  cache. Git-initiated operations such as recursive submodule clones are refused, as with Git's
-  default `protocol.file.allow=user`.
+- **file**, for user-initiated calls: any path or `file://` URL the core is handed, including the
+  local forge and the worker's cache. Git treats top-level calls started by the core as
+  user-initiated; recursive submodule clones are refused, as with Git's default
+  `protocol.file.allow=user`.
 
 **ext**, **fd**, **http**, **git**, **ftp** and **ftps** are refused whatever the machine's
 git configuration says, and any other protocol is refused by the `protocol.allow=never` default.

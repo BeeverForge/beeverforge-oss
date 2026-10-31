@@ -80,7 +80,7 @@ def _git(
             timeout=_GIT_TIMEOUT, env=env, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return 1, _redact(str(exc))
+        return 1, _redact(gitpin.without_pin(str(exc)))
     return p.returncode, _redact((p.stdout or "") + (p.stderr or ""))
 
 

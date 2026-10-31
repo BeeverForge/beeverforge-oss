@@ -33,6 +33,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from beeverforge import gitpin
 from beeverforge.contracts.product import ProductConfig
 from beeverforge.contracts.project import Project
 from beeverforge.memory import recall
@@ -210,7 +211,7 @@ def rendezvous(monkeypatch) -> None:
 
     def _git_then_meet(args, cwd=None):
         rc, out = real(args, cwd=cwd)
-        if args and args[0] == "clone":
+        if gitpin.subcommand(args) == "clone":
             try:
                 barrier.wait(timeout=1.0)
             except threading.BrokenBarrierError:
