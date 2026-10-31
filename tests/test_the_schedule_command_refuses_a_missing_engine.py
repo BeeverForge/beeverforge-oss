@@ -6,8 +6,16 @@ connection error: ... Connection refused`. Nothing named the cause or the remedy
 the bare `connect()`, while the worker is born through `connect_at_birth`, which waits a bounded
 time for the engine to listen and then refuses in one sentence naming the address and the remedy.
 
-The first test runs the real module under `__main__` in a process of its own, as a person types it,
-and reads its exit code and stderr. The second reads `main` off the module's syntax tree.
+AND AN ENGINE NOBODY DECLARED ended the same way (review of #318): `connect_at_birth` asks
+`address()` first, which raises `EngineNotDeclared` when neither `TEMPORAL_ADDRESS` nor
+`TEMPORAL_ENDPOINT` says where the engine is, and only `EngineNotListening` was caught. Its message
+is the sentence, so it is caught beside the other.
+
+The first two tests run the real module under `__main__` in a process of its own, as a person types
+it, and read its exit code and stderr. The third reads `main` off the module's syntax tree.
+
+`BEEVERFORGE_ENGINE_STARTS_IN` is a hundredth of a second, so the wait for a port nothing will ever
+bind is short; no test asserts how long anything took.
 """
 
 from __future__ import annotations
@@ -38,7 +46,7 @@ def test_the_schedule_command_with_no_engine_ends_in_a_SENTENCE_not_a_traceback(
     done = subprocess.run(
         [sys.executable, "-m", MODULE], cwd=tmp_path, capture_output=True, text=True, timeout=25,
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": str(ROOT),
-             "TEMPORAL_ADDRESS": f"127.0.0.1:{port}", "BEEVERFORGE_ENGINE_STARTS_IN": "1"})
+             "TEMPORAL_ADDRESS": f"127.0.0.1:{port}", "BEEVERFORGE_ENGINE_STARTS_IN": "0.01"})
 
     assert done.returncode != 0, done.stderr[-400:]
     assert "Traceback" not in done.stderr, done.stderr[-600:]
@@ -46,6 +54,26 @@ def test_the_schedule_command_with_no_engine_ends_in_a_SENTENCE_not_a_traceback(
     for owed in (f"127.0.0.1:{port}", "TEMPORAL_ADDRESS", "beeverforge up"):
         assert owed in said, f"the refusal does not say {owed!r}: {said[-600:]}"
     assert said.startswith("schedule: "), f"the refusal is not the command's sentence: {said[-600:]}"
+
+
+def test_the_schedule_command_with_an_engine_nobody_declared_ends_in_a_SENTENCE(tmp_path):
+    """Neither address variable says anything. They are set EMPTY rather than left out: an empty
+    value is "nobody said" to `address()`, and `load_dotenv` never overrides a variable that is
+    set, so a `.env` at the checkout's root cannot declare an engine behind this test's back."""
+    done = subprocess.run(
+        [sys.executable, "-m", MODULE], cwd=tmp_path, capture_output=True, text=True, timeout=25,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": str(ROOT),
+             "TEMPORAL_ADDRESS": "", "TEMPORAL_ENDPOINT": "",
+             "BEEVERFORGE_ENGINE_STARTS_IN": "0.01"})
+
+    assert done.returncode != 0, done.stderr[-400:]
+    assert "Traceback" not in done.stderr, done.stderr[-600:]
+    said = done.stderr.strip()
+    assert said.startswith("schedule: this deployment does not say where its durable engine is"), \
+        f"the refusal is not the command's sentence: {said[-600:]}"
+    for owed in ("TEMPORAL_ADDRESS", "TEMPORAL_ENDPOINT"):
+        assert owed in said, f"the refusal does not say {owed!r}: {said[-600:]}"
+    assert "\n" not in said, f"the refusal is more than one line: {said[-600:]}"
 
 
 def test_the_schedule_command_is_BORN_through_the_wait():
