@@ -20,6 +20,20 @@ MUTATIONS = [
      r'    return re.compile(rf"^[ \t]*[-*][ \t]*\**{re.escape(name)}',
      r'    return re.compile(rf"^\s*[-*][ \t]*\**{re.escape(name)}'),
 
+    # THE CRITERION'S SCALE, EACH ALONE: the same cut, run against only the 50,000-line growth
+    # tests, so their own red is proved and not borrowed from the 1,000-line ones beside them.
+    ("the field opens with `^\\s*` again: 12,500 → 50,000 blank lines and a Status grow n²",
+     _CORPUS,
+     r'    return re.compile(rf"^[ \t]*[-*][ \t]*\**{re.escape(name)}',
+     r'    return re.compile(rf"^\s*[-*][ \t]*\**{re.escape(name)}',
+     TEST + "::test_a_requirement_of_fifty_thousand_blank_lines_and_a_status_is_read_linearly"),
+
+    ("the field opens with `^\\s*` again: 12,500 → 50,000 blank lines and no field grow n²",
+     _CORPUS,
+     r'    return re.compile(rf"^[ \t]*[-*][ \t]*\**{re.escape(name)}',
+     r'    return re.compile(rf"^\s*[-*][ \t]*\**{re.escape(name)}',
+     TEST + "::test_a_requirement_of_fifty_thousand_blank_lines_and_no_field_is_read_linearly"),
+
     ("a domain fact's field opens with `^\\s*` again",
      _DOMAIN,
      r'    m = re.search(rf"^[ \t]*[-*][ \t]*\**{name}',

@@ -59,9 +59,9 @@ def _growth(read: Callable[[str], object], make: Callable[[int], str], n: int) -
     only ever made longer by what else the machine does, never shorter."""
     small, large = make(n), make(4 * n)
     reps = 1
-    while _seconds(read, small, reps) < CALIBRATED:
+    while (first := _seconds(read, small, reps)) < CALIBRATED:
         reps *= 2
-    base = max(min(_seconds(read, small, reps) for _ in range(3)), 1e-9)
+    base = max(min([first] + [_seconds(read, small, reps) for _ in range(2)]), 1e-9)
     ratio = float("inf")
     for _ in range(3):
         ratio = min(ratio, _seconds(read, large, reps) / base)
@@ -128,21 +128,34 @@ def test_a_comment_is_removed_from_a_value_and_only_within_its_line():
 # ── in time linear in the size ─────────────────────────────────────────────────────────────────
 
 
-def test_a_requirement_read_grows_linearly_in_its_blank_lines():
+#: THE SCALE OF THE CRITERION: 12,500 blank lines, then 50,000. A growth measurement at that size,
+#: not a bound on seconds, because the repository's reviewer takes no test bounded by elapsed or
+#: processor time (#301). The old patterns read 12,500 blank lines in about 4 s and 50,000 in about
+#: a minute, so each test first measures 3,125 → 12,500, where a regression already fails, and
+#: reaches 50,000 only when that step was linear.
+BLANK_LINES = 12_500
+
+
+def _linear_up_to_fifty_thousand(make: Callable[[int], str]) -> None:
+    _linear(_requirement, make, BLANK_LINES // 4)
+    _linear(_requirement, make, BLANK_LINES)
+
+
+def test_a_requirement_of_fifty_thousand_blank_lines_and_a_status_is_read_linearly():
     def make(n: int) -> str:
         return ("# REQ-0001 — t\n" + "\n" * n
                 + "- **Status:** accepted\n\n## Affects\n\n- the checkout\n")
-    req, _ = _requirement(make(N))
+    _linear_up_to_fifty_thousand(make)
+    req, _ = _requirement(make(4 * BLANK_LINES))
     assert req is not None and req.status == ACCEPTED and req.affects == ["the checkout"]
-    _linear(_requirement, make)
 
 
-def test_a_requirement_of_blank_lines_and_no_field_grows_linearly():
+def test_a_requirement_of_fifty_thousand_blank_lines_and_no_field_is_read_linearly():
     def make(n: int) -> str:
         return "# REQ-0001 — t\n" + "\n" * n + "only text\n"
-    req, findings = _requirement(make(N))
+    _linear_up_to_fifty_thousand(make)
+    req, findings = _requirement(make(4 * BLANK_LINES))
     assert req is not None and "status-missing" in {f.code for f in findings}
-    _linear(_requirement, make)
 
 
 def test_a_domain_fact_of_blank_lines_grows_linearly():
