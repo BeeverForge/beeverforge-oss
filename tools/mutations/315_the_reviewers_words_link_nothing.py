@@ -3,8 +3,9 @@
 `_review_lines` wrote the reviewer's `summary` and each finding's `description` into the pull
 request body as written, and `format_review` posted them the same way, so a `#1`, `GH-2`,
 `owner/repo#3` or `@someone` in them linked an unrelated issue or notified a stranger. Both now
-pass that text through `_without_reviewer_mentions`: main's `without_mentions`, then a zero-width
-space after a name's `@` and between `GH` and `-<number>`.
+pass that text through `_without_reviewer_mentions`: every bare `&` escaped (so no entity spells
+the others), main's `without_mentions`, then a zero-width space after a name's `@` and between
+`GH` and `-<number>`.
 """
 
 TEST = "tests/test_the_reviewers_words_link_nothing.py"
@@ -53,6 +54,14 @@ MUTATIONS = [
     ("an address's `@` is broken too", MACHINE,
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
      '''    words = re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
+
+    ("an entity is left live: `&` is not escaped", MACHINE,
+     '''    words = _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\\\&", words)''',
+     '''    words = words'''),
+
+    ("an `&` the reviewer escaped gets a second backslash, which frees it", MACHINE,
+     '''_A_BARE_AMPERSAND = re.compile(r"(?<!\\\\)((?:\\\\\\\\)*)&")''',
+     '''_A_BARE_AMPERSAND = re.compile(r"()&")'''),
 
     ("the summary loses its `## ` escaping while its mentions are broken", MACHINE,
      "        out = [first, _as_text(_without_reviewer_mentions(r.summary))]",

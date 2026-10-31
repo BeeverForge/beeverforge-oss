@@ -20,14 +20,21 @@ from beeverforge.contracts.review import Finding
 from beeverforge.orchestrator.machine import _REVIEW_HEADING, JobRunner
 from beeverforge.orchestrator.merge_policy import format_review
 
-WORDS = "Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone"
+#: GitHub decodes an entity before it links, so `&#x40;someone` and `&commat;someone` mention and
+#: `&#x23;1` and `GH&#x2D;1` link, as `@someone` and `#1` do (review of #323, measured on
+#: `POST /markdown`). `\\&commat;dee` is one the reviewer already escaped: a second backslash
+#: before it would escape the first instead and leave the entity live.
+ENTITIES = "&#x40;someone &commat;someone &#x23;1 GH&#x2D;1 \\&commat;dee"
+WORDS = f"Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone {ENTITIES}"
 ZWSP = "​"
 
 #: What a forge would link or notify: an issue number, a `GH-N`, a cross-repository reference
 #: (`owner/repo#3` is caught by the first) and a handle.
 LIVE = [re.compile(r"#(?=\d)"),
         re.compile(r"(?<![A-Za-z0-9])GH-\d", re.IGNORECASE),
-        re.compile(r"(?<![A-Za-z0-9])@[A-Za-z0-9]")]
+        re.compile(r"(?<![A-Za-z0-9])@[A-Za-z0-9]"),
+        # an `&` no backslash escapes: one after an even run of them (none, or escaped pairs)
+        re.compile(r"(?<!\\)(?:\\\\)*&")]
 
 
 def _review_rows(review: ReviewResult) -> list[str]:
@@ -46,7 +53,9 @@ def _assert_dead(text: str) -> None:
     for live in LIVE:
         assert not live.search(text), f"{live.pattern!r} still matches in {text!r}"
     # Still readable: the words are there, a zero-width space the only change to the name and GH-N.
-    for kept in ("card 1", "owner/repo card 3", f"@{ZWSP}someone", f"GH{ZWSP}-2", f"gh{ZWSP}-4"):
+    for kept in ("card 1", "owner/repo card 3", f"@{ZWSP}someone", f"GH{ZWSP}-2", f"gh{ZWSP}-4",
+                 "\\&#x40;someone", "\\&commat;someone", "\\&#x23;1", "GH\\&#x2D;1",
+                 " \\&commat;dee"):
         assert kept in text, f"{kept!r} not in {text!r}"
 
 
@@ -83,6 +92,7 @@ def test_an_address_and_a_card_key_are_left_as_written() -> None:
 
 def test_a_heading_row_in_the_reviewer_text_is_still_escaped() -> None:
     rows = _review_rows(ReviewResult(decision="approved", score=90,
-                                     summary="said\n## Review — x\n### Summary heading @ann"))
-    assert "\\## Review — x" in rows
+                                     summary="said\n## Review — x &#x40;ann\n"
+                                             "### Summary heading @ann"))
+    assert "\\## Review — x \\&#x40;ann" in rows
     assert f"### Summary heading @{ZWSP}ann" in rows

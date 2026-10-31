@@ -407,6 +407,12 @@ def _as_text(words: str) -> str:
 #: A `GH-<number>` GitHub links as an issue, any case, not glued to a word (`AGH-3` is not one).
 #: Main's `without_mentions` leaves it alone (#315); `_without_reviewer_mentions` breaks it.
 _A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
+#: An `&` no backslash escapes: after none, or after escaped pairs (`\\&`). GitHub decodes an
+#: entity before it links, so `&#x40;name`, `&commat;name`, `&#x23;1` and `GH&#x2D;1` mentioned
+#: and linked (review of #323, measured on `POST /markdown`). One more backslash makes the `&`
+#: text, as `_MARKUP` does for the agent's own; an `&` already escaped (`\&`) is left alone, as a
+#: second backslash would escape the first and leave the entity live.
+_A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
 
 
 def _without_reviewer_mentions(words: str) -> str:
@@ -416,7 +422,9 @@ def _without_reviewer_mentions(words: str) -> str:
     `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
     is written `card <number>` (`without_mentions`); a zero-width space after the `@` of a name
     and between `GH` and `-<number>` keeps both readable and makes them nothing a forge links.
-    Applied before `_as_text`, so a `## ` row is still escaped."""
+    Every bare `&` is escaped first, so no entity spells one of them. Applied before `_as_text`,
+    so a `## ` row is still escaped."""
+    words = _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", words)
     words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
     return _A_GH_REFERENCE.sub("\\1\u200b", words)
 
