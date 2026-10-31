@@ -34,6 +34,14 @@ MUTATIONS = [
     ("the HEAD is kept instead of the tail — the failure at the log's end is dropped", BASE,
      "        kept = text[len(text) - max_chars:]", "        kept = text[:max_chars]"),
 
+    ("a log exactly at its limit is cut, and marked, though nothing of it was dropped", BASE,
+     "    if len(text) > max_chars:\n        kept =",
+     "    if len(text) >= max_chars:\n        kept ="),
+
+    ("the marker names a file — the rule could read it as naming the change", BASE,
+     '                f"shown. It is NOT the whole log.]\\n\\n" + kept)',
+     '                f"shown. See README.md.]\\n\\n" + kept)'),
+
     # ── the rule ────────────────────────────────────────────────────────────────────────────────
     ("the rule ignores the marker: a cut log that names nothing visible reads as unrelated", RULE,
      "    if LOG_CUT_MARKER in log:\n        return True\n", ""),
