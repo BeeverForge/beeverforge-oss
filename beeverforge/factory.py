@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -217,6 +218,18 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
     # this measurement worktree is cut from a local repository and needs no mark.)
     dest = default_root() / "worktrees" / key
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # NOT OURS, NOT TOUCHED (#317, the defect #124 fixed for the box's `prepare`). The path is
+    # fixed and reused, so whatever stands there is looked at before git is asked to change a
+    # worktree: `exists()` follows a link, `worktree remove --force <link>` removes the tree the
+    # link names, and `worktree add` checks out through it. A link (dangling too, so `is_symlink`
+    # first) or a file is refused, and the person moves it.
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        there = "a symbolic link" if dest.is_symlink() else "a file"
+        raise RuntimeError(
+            f"{dest} is {there}, not a checkout this made, so {ref!r} was not checked out there — "
+            f"move it aside (`mv {shlex.quote(str(dest))} <a path of yours>`) and run again. "
+            f"Nothing was changed"
+        )
     if dest.exists():
         # Left by the previous measurement of this key. `worktree remove` unregisters it with git,
         # which a plain rmtree does not — and a stale registration makes the next `add` fail on a
@@ -224,7 +237,12 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
         _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
-    _git(["-C", str(repo), "worktree", "prune"])
+    else:
+        # The directory is gone but git may still list it (a cache wiped by hand), and `add`
+        # refuses a path it still believes in. THIS path's registration is dropped, never a
+        # blanket `worktree prune`: that drops every other registration whose directory is
+        # momentarily missing, other people's included (see adapters/sandbox/worktree.py).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
     rc, out = _git(["-C", str(repo), "worktree", "add", "--detach", str(dest), ref])
     if rc != 0:
         raise RuntimeError(f"could not check {ref!r} out of {repo}: {out.strip()[:300]}")
