@@ -2510,10 +2510,11 @@ class JobRunner:
         and refusing is not a capability. The operator was left to merge on their own reading of
         the diff, which is the work an independent review exists to remove.
 
-        NO AGENT PASS AND NO `setup:`. This writes nothing: it checks the branch out, reads the
-        diff and asks the reviewer. Running the project's build first would make an honest read of
-        a diff cost what a repair costs, and nothing here needs the environment to work — the
-        reviewer's input is the diff and the ticket.
+        NO AGENT PASS AND NO `setup:`. This writes nothing: it checks the branch's TIP out
+        detached, reads the diff and asks the reviewer, and never publishes the branch (#55).
+        Running the project's build first would make an honest read of a diff cost what a repair
+        costs, and nothing here needs the environment to work — the reviewer's input is the diff
+        and the ticket.
 
         A PASS, NOT A PROMISE. A deployment with review turned off answers "nothing re-read it"
         rather than silently leaving the old verdict standing wearing a fresh timestamp: the
@@ -2530,12 +2531,22 @@ class JobRunner:
                 ticket_id=ticket.id, state=JobState.PR_OPEN, branch=branch, code_changed=False,
                 note="this deployment has no reviewer — nothing re-read the pull request",
             )
+        # A READ NEEDS THE TIP, NOT THE BRANCH (#55). A box that can check the tip out detached
+        # does, so a person's review tree of the branch does not hold a pass that writes nothing.
+        # A box that cannot goes through `prepare`, which refuses the held branch, and holds below.
+        checkout = getattr(self.sandbox, "prepare_tip", None)
         try:
-            ws = self.sandbox.prepare(
-                repo_path=self.repo_path, base_branch=base, branch=branch, checkout_existing=True,
-                # the open PR's branch lives on the forge, and the cache keeps a tokenless origin
-                remote_url=self.forge.push_remote(),
-            )
+            if checkout is not None:
+                ws = checkout(repo_path=self.repo_path, base_branch=base, branch=branch,
+                              remote_url=self.forge.push_remote())
+            else:
+                ws = self.sandbox.prepare(
+                    repo_path=self.repo_path, base_branch=base, branch=branch,
+                    checkout_existing=True,
+                    # the open PR's branch lives on the forge, and the cache keeps a tokenless
+                    # origin
+                    remote_url=self.forge.push_remote(),
+                )
         except BranchHeldElsewhere as exc:
             # A PERSON HAS THE BRANCH OUT (#623): nothing was read, and the verdict that stands
             # still describes the pull request, as `repair_ci`'s hold says.
