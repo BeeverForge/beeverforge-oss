@@ -208,6 +208,22 @@ working teaches the same wrong lesson as one that disappears — the person conc
 forgot, when in fact it decided. `expired` says to ask again so the tech-lead can look at the
 floor as it is now.
 
+### Who can read the store
+
+The store is one sqlite file (`BEEVERFORGE_METRICS_DB`), and it holds clients' messages and the
+audit trail, so it is **created mode `0600`**: its owner reads and writes it, nobody else does,
+whatever the process's umask (`SqliteMetricsSink._connect`). SQLite gives its `-wal` and `-shm`
+files the same mode. A file that already exists keeps the mode it has; that is the operator's.
+
+The copy `forget` takes first, under `backups/forget-*/metrics.db`, holds the same rows and is
+created the same way: `0600`, whatever the umask (`SqliteMetricsSink.backup`). A symbolic link
+at the store's path or the backup's is refused, naming the path, rather than followed.
+
+On compose the worker writes the file and the panel reads it, through the one volume they both
+mount (`beeverforge_state`), and both run as **one user**: root, since neither service sets
+`user:` and the worker image they share has no `USER`. A deployment that runs them as two users
+locks the panel out of a `0600` store; give the two the same user.
+
 ### Where it lives
 
 - `beeverforge/memory/messages.py` — `READ_LAST`, `SUGGESTION_TTL_HOURS`, and the `staged` fold.

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -73,6 +74,43 @@ CREATE INDEX IF NOT EXISTS metrics_expiry  ON metrics (expires_at);
 _SCHEMA_ENSURED: set[str] = set()
 
 
+class LinkedPath(Exception):
+    """A symbolic link where the store or its backup is to be created (#228) — refused, not
+    followed. Not an `OSError`, so a read's "could not create it" logging does not swallow it."""
+
+
+_STORE_REMEDY = "remove the link, or point BEEVERFORGE_METRICS_DB at a regular file"
+
+
+def _create_private(path: Path, *, what: str = "metrics store",
+                    remedy: str = _STORE_REMEDY) -> None:
+    """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched.
+
+    THE STORE HOLDS CLIENTS' MESSAGES AND THE AUDIT TRAIL. Left to `sqlite3.connect`, the file
+    took the process's umask — `0644` under the usual `022`, readable by every user on the machine.
+    So it is created here first, exclusively, and `fchmod`ed so no umask can widen or narrow it;
+    SQLite then opens a private file, and gives its `-wal` and `-shm` files the same mode.
+
+    `O_EXCL` is what leaves an existing store alone: its mode is the operator's, not ours.
+
+    A SYMBOLIC LINK AT THE PATH IS REFUSED, dangling or not, with `LinkedPath`. `O_EXCL` fails on
+    a link without following it, but `sqlite3.connect` would then follow it — to a file made under
+    the umask, wherever the link points. What this does not close: a link planted between this
+    check and SQLite's own open, by somebody who can already write the store's directory."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        if path.is_symlink():
+            raise LinkedPath(f"the {what} at {path} is a symbolic link, which is refused rather "
+                             f"than followed — {remedy}") from None
+        return
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
 class SqliteMetricsSink:
     """A `MetricsSink` that also reads. Safe to construct anywhere: it touches no disk until used —
     and the first use, read or write, makes sure the table exists (#137).
@@ -110,12 +148,13 @@ class SqliteMetricsSink:
         ensure = write or key not in _SCHEMA_ENSURED
         if write:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            _create_private(self.path)
         elif ensure:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                _create_private(self.path)
             except OSError as exc:   # the connect below fails honestly and names the file
-                log.info("metrics store %s: could not create its directory for a read — %s",
-                         self.path, exc)
+                log.info("metrics store %s: could not create it for a read — %s", self.path, exc)
         conn = sqlite3.connect(self.path, timeout=self.timeout)
         try:
             conn.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer
@@ -240,9 +279,16 @@ class SqliteMetricsSink:
         alone is a backup missing exactly what was written last, and a copy taken mid-checkpoint
         is a file that may not open. `Connection.backup` copies pages under SQLite's own locks and
         restarts when a writer changes one underneath it, so what lands is one moment of the
-        store, whole."""
+        store, whole.
+
+        PRIVATE LIKE THE STORE (#228): the copy is the same clients' messages and audit trail, so
+        it is created by `_create_private` before SQLite opens it, and its `-journal`, `-wal` and
+        `-shm` take its `0600`. Left to `sqlite3.connect`, every copy `forget` takes followed the
+        umask — `0644` under the usual `022`."""
         target = Path(to)
         target.parent.mkdir(parents=True, exist_ok=True)
+        _create_private(target, what="metrics backup",
+                        remedy="remove the link, or back up to another path")
         with self._connect(write=False) as conn:
             copy = sqlite3.connect(target)
             try:
