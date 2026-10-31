@@ -7,7 +7,8 @@ The claims, each a row:
 
   1. the pin refuses ext, fd and http by name, so a machine's `protocol.<name>.allow=always`
      cannot widen it, and lets https, ssh and file through;
-  2. the core's own remote calls carry it (the cache's probe and clone, the preview's head read);
+  2. the core's own remote calls carry it (the cache's probe and clone, the preview's head read,
+     and the review workspace's fetch);
   3. the guard sees every shape a remote call is written in, and `subcommand` reads past the pin;
   4. an error's text reads without the pin, so a log line keeps the command.
 """
@@ -18,6 +19,7 @@ CACHE = "beeverforge/runtime/repo_cache.py"
 DEMAND = "beeverforge/preview/demand.py"
 PREVIEW = "beeverforge/adapters/preview/compose.py"
 PIPELINE = "beeverforge/knowledge/pipeline.py"
+WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
 
 MUTATIONS = [
     # 1. the pin itself
@@ -46,6 +48,15 @@ MUTATIONS = [
      '                                           f"refs/heads/{branch}"]),',
      '        done = subprocess.run(["git", "ls-remote", "--heads", "--", remote,\n'
      '                               f"refs/heads/{branch}"],'),
+    ("the review workspace's fetch reads the machine's transports again", WORKTREE,
+     '            rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",\n'
+     '                                         remote_url or "origin",\n'
+     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
+     'timeout=180)',
+     '            rc, said = _run(["git", "-C", str(repo_path), "fetch", "--",\n'
+     '                              remote_url or "origin",\n'
+     '                              f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)',
+     TEST + "::test_the_review_workspaces_fetch_never_runs_an_ext_remote"),
 
     # 3. the guard and subcommand
     ("the guard reads lists and never a call's own arguments", TEST,

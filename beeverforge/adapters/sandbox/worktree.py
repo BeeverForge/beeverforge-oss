@@ -921,8 +921,9 @@ class WorktreeSandbox(SandboxAdapter):
                             "instead of the pull request's branch", branch, repo_path,
                             base_branch)
         else:
-            rc, said = _run(["git", "-C", str(repo_path), "fetch", "--", remote_url or "origin",
-                             f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)
+            rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",
+                                         remote_url or "origin",
+                                         f"+{branch}:refs/remotes/origin/{branch}"]), timeout=180)
             if rc == 0:
                 start = f"origin/{branch}"
             elif _remote_has_no_such_branch(said):

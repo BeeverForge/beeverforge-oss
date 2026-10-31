@@ -159,6 +159,21 @@ def test_the_repo_cache_never_clones_an_ext_remote(hostile):
     assert not marker.exists()
 
 
+def test_the_review_workspaces_fetch_never_runs_an_ext_remote(hostile):
+    from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
+
+    repo = hostile / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    marker = hostile / "ran"
+    box = WorktreeSandbox(root=hostile / "boxes")
+
+    with pytest.raises(RuntimeError, match="transport 'ext' not allowed"):
+        box.prepare_tip(repo_path=repo, base_branch="main", branch="review",
+                        remote_url=_ext(marker))
+
+    assert not marker.exists()
+
+
 # ── subcommand ──────────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(("args", "sub"), [
