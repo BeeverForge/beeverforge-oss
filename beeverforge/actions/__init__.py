@@ -41,6 +41,7 @@ implemented by none of them.**
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 
@@ -460,7 +461,56 @@ def _check_params(found: ActionSpec, params: dict[str, object]) -> str:
     if unexpected:
         return (f"'{found.name}' does not take {', '.join(sorted(unexpected))} — it takes "
                 + (", ".join(found.parameters) or "no parameters") + ".")
+    declared = _declared_types(found)
+    for p in found.parameters:
+        if p not in params or declared.get(p) not in _ACCEPTS:
+            continue
+        word, accepted = _ACCEPTS[declared[p]]
+        if accepted and not isinstance(params[p], accepted):
+            return (f"'{found.name}' takes {p} as {word}, not "
+                    f"{_KIND.get(type(params[p]), 'a value of another kind')} — nothing was done.")
     return ""
+
+
+#: How a refusal names the value it was given: in the caller's terms (the panel sends JSON, not
+#: Python), with the article in the word, never a Python class name. Looked up by exact type, so a
+#: `bool` is never read as the `int` it subclasses.
+_KIND: dict[type, str] = {
+    list: "a list", dict: "an object", int: "a number", float: "a number",
+    str: "a string", bool: "true or false",
+}
+
+
+#: Every type a row's runner declares, with what a value for it must be: `(how the refusal names
+#: the type, the classes it accepts)`. An empty tuple accepts anything (`object`).
+#:
+#: A `str` parameter accepts any scalar, not only `str`: the CLI turns `true`/`false` into
+#: booleans and ticket numbers arrive as ints, and the rows pass those through `str()`. A `bool`
+#: parameter accepts only a boolean: the CLI already sends `true`/`false` as one, and a string
+#: such as "no" would reach `bool()` and mean yes. `None` stays what an optional value may be.
+#: `tests/test_a_parameter_of_the_wrong_type_is_refused.py` fails when a row declares a type
+#: missing here.
+_STR = ("a string", (str, int, float, bool, type(None)))
+_BOOL = ("true or false", (bool, type(None)))
+_ANY = ("anything", ())
+_ACCEPTS: dict[object, tuple[str, tuple[type, ...]]] = {
+    "str": _STR, str: _STR, "bool": _BOOL, bool: _BOOL, "object": _ANY, object: _ANY,
+}
+
+
+def _declared_types(found: ActionSpec) -> dict[str, object]:
+    """The annotation the row's runner declares for each parameter, as written.
+
+    catalog.py uses `from __future__ import annotations`, so these are usually strings ("str").
+    Never resolved with `get_type_hints`, which would chase `Actor`/`Outcome` and can raise; and
+    a runner without a readable signature is simply not checked, because `perform` never raises.
+    """
+    try:
+        sig = inspect.signature(found.run)
+    except (TypeError, ValueError):
+        return {}
+    return {name: prm.annotation for name, prm in sig.parameters.items()
+            if isinstance(prm.annotation, (str, type))}
 
 
 #: What a tracker actually calls a ticket: `189` (GitHub, optionally `#`-prefixed), `CONT-412`
