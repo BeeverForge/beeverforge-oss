@@ -4952,16 +4952,18 @@ class ProductModule:
             inner = build_board(self.project, token=tracker_token_for(self.project) or self.token)
         return None if inner is None else _WatchedWrites(inner, self._write_outcome)
 
-    def _board_to_ask(self):
-        """`_board()` for a question rather than a write — `None`, said in the log, when it cannot
-        be built. A reader and a sentence degrade to the platform's own names; neither raises."""
+    def _board_to_ask(self, *, unbuilt=None):
+        """`_board()` for a question rather than a write — `unbuilt` (`None` unless the caller asks
+        otherwise), said in the log, when it cannot be built. A reader and a sentence degrade to
+        the platform's own names; neither raises. A gate that must not read "could not build" as
+        "no board" (`_outside_the_slice`, #122) passes a sentinel of its own (lesson 2)."""
         try:
             return self._board()
         except Exception as exc:  # noqa: BLE001 — asking what a column is called is not a write
             log.warning("could not build %s's board to ask what its columns are called (%s) — "
                         "reading them by the platform's own names",
                         getattr(self.project, "name", "?"), str(exc)[:200])
-            return None
+            return unbuilt
 
     def _stages(self, tickets) -> dict[str, str]:
         """`{column: stage key}` for one board read, asked of THIS project's board (#502) — what
@@ -5169,13 +5171,22 @@ class ProductModule:
 
         Three answers, as there: `False` is another project's card, refused by name with the same
         sentence `promote` answers; `None` is a slice that could not be asked, a failure and never
-        "inside"; `True` goes on. A board with no `holds` (local, GitHub), one that cannot be
-        built, and an unscoped Jira board (`True` with no request) cost nothing (lesson 10)."""
-        from beeverforge.product.voice import board_move_said, card_said
+        "inside", answered with `promote`'s own "could not reach the board"; `True` goes on.
 
-        board = self._board_to_ask()
-        holds = getattr(board, "holds", None) if board is not None else None
-        inside = holds(str(number)) if callable(holds) else True
+        A BOARD THAT COULD NOT BE BUILT IS A SLICE THAT COULD NOT BE ASKED (PR #311 review): the
+        construction raising is `None`, not "inside" — lesson 2. A project with NO board
+        (`build_board` answering `None`: tickets only, a configuration, `adapters/board/factory.py`)
+        and a board with no `holds` (local, GitHub) have no slice to leave and go on; so does an
+        unscoped Jira board (`True` with no request). None of the three costs a request (lesson
+        10)."""
+        from beeverforge.product.voice import board_move_said
+
+        board = self._board_to_ask(unbuilt=_UNSET)
+        if board is _UNSET:
+            inside = None
+        else:
+            holds = getattr(board, "holds", None)
+            inside = holds(str(number)) if callable(holds) else True
         if inside is True:
             return None
         if inside is False:
@@ -5183,7 +5194,7 @@ class ProductModule:
                                detail=board_move_said("outside_the_slice", ref=number,
                                                       project=getattr(self.project, "name", ""),
                                                       language=language))
-        return _could_not(card_said("board_unreadable", language=language), act=act,
+        return _could_not(board_move_said("unreachable", language=language), act=act,
                           cause=RuntimeError(f"the board could not say whether {number} is in "
                                              f"this project's slice"),
                           ref=f"#{number}")
@@ -5360,6 +5371,10 @@ class ProductModule:
         if card.state != "open":
             return WriteResult(ok=False, refusal=ALREADY_CLOSED, existed=True, ref=f"#{number}",
                                detail=card_said("already_closed", number=number, language=lang))
+        # STILL THIS PROJECT'S (#122), as `_close_one` asks
+        outside = self._outside_the_slice(number, act=f"remove #{number}", language=lang)
+        if outside is not None:
+            return outside
         # THROUGH THE CARD'S DOOR (ADR-0055): the tracker's own removal, then what a removal means
         # for the promise, the requester, the preview and the snapshot
         from beeverforge.lifecycle import CardEvent, transition

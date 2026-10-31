@@ -8,9 +8,11 @@ relabelled out of the slice IS updated, but the scoped search no longer returns 
 `correct_card` treated it as this project's card; `promote` did not, because it asks `holds`.
 
 WHAT IS HELD HERE. The real `read_board`, with its snapshot, over an in-memory scoped tracker: a
-card relabelled between two reads is still in the snapshot (the window is real), and the close
-and the correction then ask the board's `holds` and refuse it by name. A slice that could not be
-asked is a failure, never "inside"; a card still in the slice is acted on as before.
+card relabelled between two reads is still in the snapshot (the window is real), and the close,
+the removal and the correction then ask the board's `holds` and refuse it by name. A slice that
+could not be asked — `holds` answering `None`, or a board that could not be built — is a failure,
+never "inside", answered as `promote` answers it; a card still in the slice is acted on as before,
+and so is a card on a project with no board at all (tickets only).
 """
 
 from __future__ import annotations
@@ -22,10 +24,10 @@ from beeverforge.contracts.product import ProductConfig
 from beeverforge.contracts.project import Project, ProviderRef
 from beeverforge.ops import impediment
 from beeverforge.product import board as board_module
-from beeverforge.product.authoring import NOT_WAITING, ticket_body
+from beeverforge.product.authoring import NOT_REFUSED, NOT_WAITING, ticket_body
 from beeverforge.product.module import ProductModule
 from beeverforge.product.triage import Ticket
-from beeverforge.product.voice import board_move_said, card_said
+from beeverforge.product.voice import board_move_said
 
 ADMIN = "U0PO"
 TODO = "A Fazer"
@@ -148,11 +150,20 @@ def _close(module, ref):
     return module._close_one(ref, actor=ADMIN, in_favour_of=None, reason="x")
 
 
+def _remove(module, ref):
+    return module._remove_one(ref, actor=ADMIN, reason="x")
+
+
 def _correct(module, ref):
     return module.correct_card(ref, actor=ADMIN, text="o pedido corrigido")
 
 
-ACTS = [pytest.param(_close, id="close"), pytest.param(_correct, id="correct")]
+ACTS = [pytest.param(_close, id="close"), pytest.param(_remove, id="remove"),
+        pytest.param(_correct, id="correct")]
+
+
+def _nothing_written(tracker) -> bool:
+    return tracker.closed == [] and tracker.bodies == [] and tracker.comments == []
 
 
 def test_the_snapshot_still_holds_a_relabelled_card(world):
@@ -186,6 +197,31 @@ def test_a_withdrawal_of_a_card_relabelled_out_of_the_slice_is_refused_too(world
     assert tracker.closed == []
 
 
+def test_a_removal_of_a_card_relabelled_out_of_the_slice_is_refused_before_the_next_sweep(world):
+    """`_remove_one` reads the same snapshot, so it asks the same question before any write."""
+    project, tracker, board, module = world
+    _relabelled_between_two_reads(project, tracker)
+
+    res = _remove(module, "DAR-1")
+
+    assert not res.ok
+    assert res.refusal == NOT_WAITING
+    assert res.detail == board_move_said("outside_the_slice", ref="DAR-1", project="api")
+    assert "DAR-1" in board.asked
+    assert _nothing_written(tracker)
+
+
+def test_a_withdrawal_by_removal_of_a_card_relabelled_out_of_the_slice_is_refused_too(world):
+    """The card's own "Remove from the board" removes through `_remove_one`."""
+    project, tracker, _, module = world
+    _relabelled_between_two_reads(project, tracker)
+
+    res = module.withdraw_card("DAR-1", actor=ADMIN, reason="x", remove=True)
+
+    assert not res.ok and res.refusal == NOT_WAITING
+    assert _nothing_written(tracker)
+
+
 def test_a_correction_of_a_card_relabelled_out_of_the_slice_is_refused_before_the_next_sweep(
         world):
     project, tracker, board, module = world
@@ -209,9 +245,47 @@ def test_a_slice_that_cannot_be_asked_is_a_failure_not_inside(world, act):
     res = act(module, "DAR-1")
 
     assert not res.ok
-    assert res.refusal != NOT_WAITING
-    assert res.detail == card_said("board_unreadable")
-    assert tracker.closed == [] and tracker.bodies == [] and tracker.comments == []
+    assert res.refusal == NOT_REFUSED
+    assert res.detail == board_move_said("unreachable")
+    assert _nothing_written(tracker)
+
+
+def _unbuildable(*_a, **_kw):
+    raise RuntimeError("the Jira site answered 503")
+
+
+@pytest.mark.parametrize("act", ACTS)
+def test_a_board_that_cannot_be_built_is_a_failure_not_inside(world, monkeypatch, act):
+    """The production path: no board injected, and the board's construction raises. The slice
+    could not be asked, so the act fails as `promote` does — it never goes on as "inside"."""
+    project, tracker, board, _ = world
+    _relabelled_between_two_reads(project, tracker)
+    monkeypatch.setattr("beeverforge.adapters.board.build_board", _unbuildable)
+    module = ProductModule(project, tracker=tracker)
+
+    res = act(module, "DAR-1")
+
+    assert not res.ok
+    assert res.refusal == NOT_REFUSED
+    assert res.detail == board_move_said("unreachable")
+    assert board.asked == []
+    assert _nothing_written(tracker)
+
+
+@pytest.mark.parametrize("act", ACTS[:2])
+def test_a_project_with_no_board_at_all_acts_as_before(world, monkeypatch, act):
+    """`build_board` answering `None` is a tickets-only project (`adapters/board/factory.py`), a
+    configuration and not a failure: there is no slice to leave, as with a board without `holds`.
+    Close and remove only: a correction needs the board to tell the card's stage, and refuses
+    without one as it did before this guard."""
+    project, tracker, _, _ = world
+    _relabelled_between_two_reads(project, tracker)
+    monkeypatch.setattr("beeverforge.adapters.board.build_board", lambda project, **kw: None)
+    module = ProductModule(project, tracker=tracker)
+
+    res = act(module, "DAR-9")
+
+    assert res.ok, res.detail
 
 
 @pytest.mark.parametrize("act", ACTS)
