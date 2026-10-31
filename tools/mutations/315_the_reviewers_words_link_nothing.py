@@ -4,7 +4,7 @@
 request body as written, and `format_review` posted them the same way, so a `#1`, `GH-2`,
 `owner/repo#3` or `@someone` in them linked an unrelated issue or notified a stranger. Both now
 pass that text through `_without_reviewer_mentions`: every bare `&` escaped outside closed code
-and bare links (so no entity spells the others), main's `without_mentions`, then a zero-width space after a name's `@` and between
+and the links GitHub makes of bare ones (so no entity spells the others), main's `without_mentions`, then a zero-width space after a name's `@` and between
 `GH` and `-<number>`.
 """
 
@@ -65,16 +65,50 @@ MUTATIONS = [
 
     # ── where a backslash is not an escape, and where that is in doubt ──────────────────────────
     ("an `&` in a closed code span is escaped", MACHINE,
-     "            out += [_outside_links(text[start:i]), text[i:span.end()]]",
-     "            out += [_outside_links(text[start:i]), _escaped_ampersands(text[i:span.end()])]"),
+     "            out += [_outside_links(text[start:i], text[start - 1:start]), text[i:span.end()]]",
+     "            out += [_outside_links(text[start:i], text[start - 1:start]),"
+     " _escaped_ampersands(text[i:span.end()])]"),
 
     ("an `&` in a closed fence is escaped", MACHINE,
      "                out, paragraph, i = out + ended() + rows[i:end + 1], [], end + 1",
      "                out, paragraph, i = out + ended() + [_escaped_ampersands(r) for r in rows[i:end + 1]], [], end + 1"),
 
     ("an `&` in a bare link is escaped", MACHINE,
-     "    return \"\".join(piece if k % 2 else _escaped_ampersands(piece) for k, piece in enumerate(links))",
-     "    return _escaped_ampersands(text)"),
+     "        if _autolinked(link[0], prior, text[link.end():link.end() + 1]):",
+     "        if False:"),
+
+    # ── which bare links GitHub makes, and so keep their `&` (review of #323 at 8bf6101) ────────
+    ("a bare link keeps its `&` with no domain after the scheme", MACHINE,
+     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return True"),
+
+    ("a bare link keeps its `&` after any character", MACHINE,
+     '''    if before and not before.isspace() and before not in "*_~(":''',
+     '''    if False:'''),
+
+    ("a bare link keeps its `&` with `_` in its last two labels", MACHINE,
+     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return len(labels) > 1 and all(labels[:-1])"),
+
+    ("a scheme with nothing after it is a domain", MACHINE,
+     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])"),
+
+    ("an empty label is a domain's", MACHINE,
+     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return len(labels) > 1 and not any(\"_\" in label for label in labels[-2:])"),
+
+    ("an angle autolink's `&` is escaped", MACHINE,
+     '''    if before == "<" and after == ">":''',
+     '''    if False:'''),
+
+    ("a bare link after a closed span is read as at the start", MACHINE,
+     "            out += [_outside_links(text[start:i], text[start - 1:start]), text[i:span.end()]]",
+     "            out += [_outside_links(text[start:i]), text[i:span.end()]]"),
+
+    ("the text after the last span is read as at the start", MACHINE,
+     "    return \"\".join(out) + _outside_links(text[start:], text[start - 1:start])",
+     "    return \"\".join(out) + _outside_links(text[start:])"),
 
     ("a backtick that does not close on its row is skipped, and a later one opens a span", MACHINE,
      "            if span is None:\n                break",

@@ -423,10 +423,11 @@ _AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]
 
 def _ampersands_escaped(words: str) -> str:
     """The reviewer's `words` with every bare `&` escaped, except in a CLOSED fence, a CLOSED code
-    span and a bare link (`_A_URL`), where a backslash is not an escape: it showed in the code and
-    moved the link (review of #323, measured on `POST /markdown`). An entity there renders as
-    written and mentions no one. When in doubt it escapes: a fence or a span that never closes,
-    and the rest of the paragraph after it, and all of `words` if a row may open an HTML block."""
+    span and a link GitHub makes (`_autolinked`), where a backslash is not an escape: it showed in
+    the code and moved the link (review of #323, measured on `POST /markdown`). An entity there
+    renders as written and mentions no one. When in doubt it escapes: a fence or a span that
+    never closes, and the rest of the paragraph after it, and all of `words` if a row may open an
+    HTML block."""
     if _AN_HTML_ROW.search(words):
         return _escaped_ampersands(words)
     rows, out, paragraph, i = words.split("\n"), [], [], 0
@@ -451,10 +452,10 @@ def _ampersands_escaped(words: str) -> str:
 
 
 def _outside_spans(text: str) -> str:
-    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and its
-    bare links. A span here closes on its own row: one that does not, or a `<` that reaches past
-    its row or over a backtick (an HTML tag or an autolink outranks a span), ends the guessing,
-    and the rest of the paragraph is escaped whole."""
+    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and the
+    links GitHub makes of its bare ones. A span here closes on its own row: one that does not, or
+    a `<` that reaches past its row or over a backtick (an HTML tag or an autolink outranks a
+    span), ends the guessing, and the rest of the paragraph is escaped whole."""
     out, start, i = [], 0, 0
     while i < len(text):
         row_end = len(text) if (n := text.find("\n", i)) < 0 else n
@@ -470,17 +471,44 @@ def _outside_spans(text: str) -> str:
             span = re.compile(rf"(?<!`){'`' * run}(?!`)").search(text, i + run, row_end)
             if span is None:
                 break
-            out += [_outside_links(text[start:i]), text[i:span.end()]]
+            out += [_outside_links(text[start:i], text[start - 1:start]), text[i:span.end()]]
             start = i = span.end()
             continue
         i += 1
-    return "".join(out) + _outside_links(text[start:])
+    return "".join(out) + _outside_links(text[start:], text[start - 1:start])
 
 
-def _outside_links(text: str) -> str:
-    """`text` with every bare `&` escaped outside its bare links, which keep theirs."""
-    links = _A_URL.split(text)
-    return "".join(piece if k % 2 else _escaped_ampersands(piece) for k, piece in enumerate(links))
+#: A bare link's scheme (or `www.`) and the domain after it, as GFM reads one: labels of
+#: `[A-Za-z0-9_-]` separated by dots.
+_A_LINK_DOMAIN = re.compile(r"(https?://|www\.)([A-Za-z0-9_.-]*)")
+
+
+def _autolinked(link: str, before: str, after: str) -> bool:
+    """Whether GitHub makes a link of `link`, a bare link `_A_URL` found between the characters
+    `before` and `after` (empty at an end of the paragraph). `_A_URL` also finds what GitHub does
+    not link, where an `&` is text and an entity mentions or links (review of #323, measured on
+    `POST /markdown`). Linked: an angle autolink (`<https://…>`), or, by GFM's extended rule, one
+    after the start, whitespace, `*`, `_`, `~` or `(` whose domain has at least two labels, none
+    empty but the last and no `_` in the last two (`www.` counts as one). In doubt, it is not."""
+    if before == "<" and after == ">":
+        return True
+    if before and not before.isspace() and before not in "*_~(":
+        return False
+    scheme, domain = _A_LINK_DOMAIN.findall(link)[0]  # `link` opens with its scheme
+    labels = ["www", *domain.split(".")] if scheme == "www." else domain.split(".")
+    return len(labels) > 1 and all(labels[:-1]) and not any("_" in label for label in labels[-2:])
+
+
+def _outside_links(text: str, before: str = "") -> str:
+    """`text`, after the character `before`, with every bare `&` escaped outside the links GitHub
+    makes of its bare links (`_autolinked`), which keep theirs."""
+    out, start = [], 0
+    for link in _A_URL.finditer(text):
+        prior = text[link.start() - 1:link.start()] or before
+        if _autolinked(link[0], prior, text[link.end():link.end() + 1]):
+            out += [_escaped_ampersands(text[start:link.start()]), link[0]]
+            start = link.end()
+    return "".join(out) + _escaped_ampersands(text[start:])
 
 
 def _escaped_ampersands(text: str) -> str:
