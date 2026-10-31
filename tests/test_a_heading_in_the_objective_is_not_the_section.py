@@ -231,6 +231,18 @@ def test_the_review_cannot_write_a_section_heading(where):
     assert any(row.endswith(f"\\{REVIEW_IN_OBJECTIVE}") for row in rows)  # said, as text
 
 
+def test_a_lower_level_heading_is_written_as_it_was():
+    """Only a `## ` row is the platform's; a `### ` sub-heading still renders as one."""
+    review = ReviewResult(decision="rejected", score=58, summary="### Summary heading",
+                          findings=[Finding(severity="high", description="### Finding heading")])
+    rows = _body("### Context", review=review).splitlines()
+
+    assert "### Context" in _objective(rows)
+    assert "### Summary heading" in rows
+    assert any(row.endswith(": ### Finding heading") for row in rows)
+    assert not any("\\###" in row for row in rows)
+
+
 @pytest.mark.parametrize("where", ["summary", "finding"])
 def test_a_fresh_review_replaces_the_whole_old_one_when_it_held_a_heading(where):
     """#187's case: a stale verdict left standing as the first review heading."""

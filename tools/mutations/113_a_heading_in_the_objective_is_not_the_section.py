@@ -57,4 +57,8 @@ MUTATIONS = [
     ("the escaping escapes nothing", MACHINE,
      '''    return "\\n".join(f"\\\\{row}" if row.startswith("## ") else row for row in words.split("\\n"))''',
      '''    return words'''),
+
+    ("the escaping takes every `#` row, so a `### ` sub-heading no longer renders", MACHINE,
+     '''    return "\\n".join(f"\\\\{row}" if row.startswith("## ") else row for row in words.split("\\n"))''',
+     '''    return "\\n".join(f"\\\\{row}" if row.startswith("#") else row for row in words.split("\\n"))'''),
 ]
