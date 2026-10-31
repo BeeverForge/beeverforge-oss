@@ -5622,22 +5622,24 @@ async function boardSaveCard(){
       : await act("card_edit", {project, issue:card, title, body});
   } catch(e){ r = {ok:false, message:e.message||"the card could not be saved"}; }
   f.saving = false;
-  if(_bd.form !== f || _bd.project !== project || _bd.card !== card) return;
-  const currentSave = $("#b_save"); if(currentSave) currentSave.disabled = false;
+  // Always report the answer, but only alter the form it belongs to.
+  const current = _bd.form === f && _bd.project === project && _bd.card === card;
+  if(current){ const currentSave = $("#b_save"); if(currentSave) currentSave.disabled = false; }
   if(!r.ok){
     // A PARTIAL EDIT IS NOT "NOT CHANGED": the row names what landed in `changed`, and the form it
     // was typed in no longer describes the card, so it closes onto the card as it now is.
     const partly = f.mode === "edit" && (r.data||{}).changed;
     toast(f.mode === "new" ? "Not opened" : partly ? "Partly changed" : "Not changed",
           r.message||"", "err");
-    if(partly){ if(f.timer) clearTimeout(f.timer); _bd.form = null; _bd.sig = null;
+    if(partly && current){ if(f.timer) clearTimeout(f.timer); _bd.form = null; _bd.sig = null;
                 await refreshBoard(); }
     return;
   }
-  if(f.timer) clearTimeout(f.timer);
-  _bd.form = null;
   toast(f.mode === "new" ? "Card opened" : "Card corrected", r.message||"",
         (r.data||{}).refusal ? "warn" : "");
+  if(!current) return;
+  if(f.timer) clearTimeout(f.timer);
+  _bd.form = null;
   if(f.mode === "new" && (r.data||{}).issue){
     await boardOpenCard(String(r.data.issue).replace(/^#/, ""));
     return;

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html.parser import HTMLParser
+
 import pytest
 
 from tests.test_a_refusal_is_not_an_answer import run
@@ -116,3 +118,46 @@ def test_a_blank_title_still_refuses_without_sending_a_request():
 
     assert got == {"count": 0, "saving": False, "disabled": False,
                    "toasts": [["Not saved", "say what the card is called", "err"]]}
+
+
+@pytest.mark.parametrize("answer, said", [
+    ("{ok:false,message:'taken up'}", ["Not changed", "taken up", "err"]),
+    ("{ok:true,message:'corrected',data:{}}", ["Card corrected", "corrected", ""]),
+    ("{ok:false,message:'partly applied',data:{changed:'title'}}",
+     ["Partly changed", "partly applied", "err"]),
+])
+def test_a_save_answered_after_the_person_moved_on_is_still_said(answer, said):
+    got = saved(f"""
+      _bd.form=_blank('edit');_bd.form.title='Keep it';_bd.card='7';
+      const first=boardSaveCard();_bd.form=null;_bd.card='9';
+      pending[0].resolve({answer});await first;
+      return {{toasts,card:_bd.card,form:_bd.form,opened,refreshes}};
+    """)
+    assert got["toasts"] == [said]
+    assert got["card"] == "9" and got["form"] is None
+    assert got["opened"] == [] and got["refreshes"] == 0
+
+
+def test_a_created_card_is_announced_after_its_form_was_cancelled():
+    got = saved("""
+      _bd.form=_blank('new');_bd.form.title='Keep it';
+      const first=boardSaveCard();_bd.form=null;
+      pending[0].resolve({ok:true,data:{issue:'8'}});await first;
+      return {toasts,form:_bd.form,opened,refreshes};
+    """)
+    assert got == {"toasts": [["Card opened", "", ""]], "form": None,
+                   "opened": [], "refreshes": 0}
+
+
+def test_the_button_the_handler_disables_is_the_save_button_the_form_paints():
+    got = saved("_bd.form=_blank('new');paintForm();"
+                "return {html:nodes['#boardview .drawer'].innerHTML};")
+    found = []
+
+    class Buttons(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag == "button" and dict(attrs).get("onclick") == "boardSaveCard()":
+                found.append(dict(attrs).get("id"))
+
+    Buttons().feed(got["html"])
+    assert found == ["b_save"]
