@@ -136,7 +136,9 @@ def parse_capability(text: str, *, path: str) -> tuple[Capability | None, list[F
     """One capability file. Never raises: an unreadable one is a finding, and one bad file must
     not cost the rest."""
     slug = Path(path).stem
-    match = _FRONTMATTER.match(text or "")
+    # a CRLF file keeps its front matter
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    match = _FRONTMATTER.match(text)
     if match is None:
         return None, [Finding(level="error", code="no-front-matter", slug=slug,
                               message="no front matter — nothing says what it links")]
@@ -397,7 +399,7 @@ def confirm_in_repository(*, docs_repo: str, clone_url: str, slug: str, flow: Fl
             return WriteResult(ok=False, refusal=NOT_VALID, ref=rel,
                                detail=record_said("capability_is_a_link", language=language))
         if target.is_file():
-            cap, _ = parse_capability(target.read_text(encoding="utf-8"), path=rel)
+            cap, _ = parse_capability(target.read_text(encoding="utf-8-sig"), path=rel)
             if cap is None:
                 return WriteResult(ok=False, refusal=NOT_REFUSED, ref=rel,
                                    detail=record_said("capability_unreadable", language=language))
