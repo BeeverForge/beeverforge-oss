@@ -207,6 +207,34 @@ def test_a_scoped_board_queues_only_the_cards_under_its_epic(azure):
     assert board.items_in_status("Approved") == ["102", "103"]
 
 
+def test_the_epic_is_verified_on_the_project_because_wit_routes_refuse_a_team_segment(
+        azure, monkeypatch):
+    """`wit/wiql` takes the team segment, but the root's type and Epic category do not. The
+    team-scoped work item route answered 404 live (the board module's docstring); reproduced
+    through the real HTTP client on 2026-10-31, it makes a scoped board unreadable."""
+    from beeverforge.adapters.azure_devops import AzureDevOpsError
+    from beeverforge.adapters.board.azure_devops import AzureBoardsBoard
+
+    board, site = azure(scope_epic="100")
+
+    class Scoped:
+        def __init__(self, team: bool) -> None:
+            self.team = team
+
+        def call(self, method, path, **kw):
+            if self.team and path.startswith("wit/") and path != "wit/wiql":
+                raise AzureDevOpsError(
+                    f"{method} {path} → 404 The controller for path "
+                    f"'/acme/factory Team/_apis/{path}' was not found")
+            return site.call(method, path, **kw)
+
+        def __getattr__(self, name):
+            return getattr(site, name)
+
+    monkeypatch.setattr(AzureBoardsBoard, "_client", lambda self, *, team=False: Scoped(team))
+    assert board.items_in_status("Approved") == ["102", "103"]
+
+
 def test_the_backlog_is_scoped_too_so_the_panel_shows_one_epics_board(azure):
     """`columns()` is the panel's board and the gate's reading of "where is this card". Scoping the
     queue alone would leave the Board page showing another Epic's cards in the project's name."""

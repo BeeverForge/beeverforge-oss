@@ -40,6 +40,11 @@ MUTATIONS = [
      "where.append(within_epic(below))",
      "pass"),
 
+    ("the Epic's type is asked of the team, whose segment every wit/ route but wiql refuses",
+     BOARD,
+     "epic_subtree(self._client(), self._scope_epic)",
+     "epic_subtree(self._client(team=True), self._scope_epic)"),
+
     ("the scope is read on the UNSCOPED path too, one wasted request for every project",
      BOARD,
      "        if self._scope_epic:\n            below = self._epic_ids()",

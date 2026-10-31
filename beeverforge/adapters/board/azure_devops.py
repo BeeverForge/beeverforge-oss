@@ -452,7 +452,9 @@ class AzureBoardsBoard:
         if self._epic_read:
             return self._epic_cache
         try:
-            self._epic_cache = epic_subtree(self._client(team=True), self._scope_epic)
+            # Type/category reads are project-only `wit/` routes: the team segment answers 404
+            # (measured live, module docstring). The subtree itself does not depend on the team.
+            self._epic_cache = epic_subtree(self._client(), self._scope_epic)
         except Exception as exc:  # noqa: BLE001 — unreadable is None, whatever the cause
             log.warning("could not read the work items under scope_epic %r of %s/%s (%s) — "
                         "reporting the board as UNREADABLE rather than as unscoped, which would "
