@@ -404,6 +404,23 @@ def _as_text(words: str) -> str:
     return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
 
 
+#: A `GH-<number>` GitHub links as an issue, any case, not glued to a word (`AGH-3` is not one).
+#: Main's `without_mentions` leaves it alone (#315); `_without_reviewer_mentions` breaks it.
+_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
+
+
+def _without_reviewer_mentions(words: str) -> str:
+    """The reviewer's `words`, linking no issue and notifying no one (#315).
+
+    Its summary and findings reached the pull request as written, so a `#12`, `owner/repo#12`,
+    `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
+    is written `card <number>` (`without_mentions`); a zero-width space after the `@` of a name
+    and between `GH` and `-<number>` keeps both readable and makes them nothing a forge links.
+    Applied before `_as_text`, so a `## ` row is still escaped."""
+    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    return _A_GH_REFERENCE.sub("\\1\u200b", words)
+
+
 def _sections_from(rows: list[str]) -> int:
     """The first row a platform section can be in: the one after the LAST `## Validations` row.
 
@@ -450,7 +467,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, _as_text(r.summary)]
+        out = [first, _as_text(_without_reviewer_mentions(r.summary))]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -461,7 +478,8 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
+            words = _as_text(_without_reviewer_mentions(f.description))
+            out.append(f"- **{f.severity}**{loc}: {words}")
         return out
 
 

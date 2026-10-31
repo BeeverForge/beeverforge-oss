@@ -12,6 +12,8 @@ whose objective rows are raw, is never searched in its objective either.
 TEST = "tests/test_a_heading_in_the_objective_is_not_the_section.py"
 MACHINE = "beeverforge/orchestrator/machine.py"
 
+# RE-PINNED 2026-10-31 (#315): the summary and finding rows now pass through
+# `_without_reviewer_mentions` before `_as_text`; their cuts drop only the escaping.
 MUTATIONS = [
     # ── a body published before the escaping: only the rows below `## Validations` are searched ─
     # RE-PINNED 2026-10-31: both searches are now bounded below `## Validations`; each cut puts
@@ -47,12 +49,12 @@ MUTATIONS = [
      '''            "", "## Objective", card.text(ticket.objective), "", "## Validations",'''),
 
     ("the reviewer's summary is written raw, so a stale verdict outlives a fresh one", MACHINE,
-     "        out = [first, _as_text(r.summary)]",
-     "        out = [first, r.summary]"),
+     "        out = [first, _as_text(_without_reviewer_mentions(r.summary))]",
+     "        out = [first, _without_reviewer_mentions(r.summary)]"),
 
     ("a finding is written raw, so a stale verdict outlives a fresh one", MACHINE,
-     '            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")',
-     '            out.append(f"- **{f.severity}**{loc}: {f.description}")'),
+     "            words = _as_text(_without_reviewer_mentions(f.description))",
+     "            words = _without_reviewer_mentions(f.description)"),
 
     ("the escaping escapes nothing", MACHINE,
      '''    return "\\n".join(f"\\\\{row}" if row.startswith("## ") else row for row in words.split("\\n"))''',
