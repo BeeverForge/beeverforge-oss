@@ -393,6 +393,17 @@ _COST_LINE = "Cost: $"
 _SECTION_AS_IT_STANDS = object()
 
 
+def _as_text(words: str) -> str:
+    """`words` with every row that would start a `## ` section escaped, so it reads as text (#113).
+
+    The readers find a section by its heading row, and the body also carries what the platform
+    did not write: the card objective, the reviewer's summary and its findings. A row of those
+    that read `## Review — …` or `## What the agent says it did` was taken for the section, and the
+    next pass spliced its line or its fresh review into it. Escaped here, the platform is the ONLY
+    writer that can put a section heading in the body; the row still says what it said."""
+    return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
+
+
 def _review_lines(r: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
@@ -429,7 +440,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, r.summary]
+        out = [first, _as_text(r.summary)]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -440,7 +451,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {f.description}")
+            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
         return out
 
 
@@ -4019,7 +4030,7 @@ class JobRunner:
         card = card or card_reference(ticket, owned=False)
         lines = [
             card.lead, *(["", card.closing] if card.closing else []),
-            "", "## Objective", card.text(ticket.objective), "", "## Validations",
+            "", "## Objective", _as_text(card.text(ticket.objective)), "", "## Validations",
         ]
         for v in result.validations:
             # An advisory FAILURE must not wear the same ❌ as a blocking one — the two ask
