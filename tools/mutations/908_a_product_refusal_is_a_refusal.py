@@ -133,9 +133,9 @@ MUTATIONS = [
      "              did,",
      FAILURE),
     ("an action that raised answers no reference", ACTIONS,
-     '        return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED,\n'
-     "                       reference=reference)\n",
-     '        return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED)\n',
+     '            return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED,\n'
+     "                           reference=reference)\n",
+     '            return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED)\n',
      FAILURE),
     # AIMED AT THE ATTRIBUTE READ, not the Mapping one: `_product_card` rebuilds the worker's dict
     # as a `SimpleNamespace` before `_write_outcome` reads it (a cut of the `Mapping` branch
