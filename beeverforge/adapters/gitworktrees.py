@@ -131,8 +131,12 @@ def mark_as_job(worktree: Path) -> None:
     The content is for a person reading the directory: the worktree and the UTC time it was
     written. The age the cache reads is the file's mtime. Raises `OSError` when git cannot answer
     or the file cannot be written; the caller says so."""
-    done = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
-                          capture_output=True, text=True, timeout=60, check=False)
+    try:
+        done = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
+                              capture_output=True, text=True, timeout=60, check=False)
+    except subprocess.SubprocessError as exc:
+        # a hung git raises `TimeoutExpired`, not `OSError`: the caller catches only the latter
+        raise OSError(f"git did not name the admin directory of {worktree}: {exc}") from exc
     admin = (done.stdout or "").strip()
     if done.returncode != 0 or not admin:
         raise OSError(f"git could not name the admin directory of {worktree} "
