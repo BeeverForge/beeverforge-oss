@@ -4458,14 +4458,15 @@ async function toggleProject(name,enabled){
 }
 let _modalOpener="";
 function modal(html){
-  const el=$("#modal"), active=el.contains(document.activeElement)?document.activeElement.id:"";
+  const el=$("#modal"), a=document.activeElement, inside=el.open&&a!==el&&el.contains(a);
+  const F="input,select,textarea,button,[tabindex='0']", active=inside?a.id:"", at=inside?[...el.querySelectorAll(F)].indexOf(a):-1;
   el.innerHTML=`<div class="mbox">${html}</div>`;
   const title=el.querySelector("h3");
   if(title){title.id="modalTitle";el.setAttribute("aria-labelledby",title.id)}
   else el.removeAttribute("aria-labelledby");
   if(!el.open){_modalOpener=(document.activeElement||{}).id||"";el.showModal()}
   else{
-    const next=(active&&document.getElementById(active))||el.querySelector("input,select,textarea,button,[tabindex='0']");
+    const next=(active&&document.getElementById(active))||(at>=0&&el.querySelectorAll(F)[at])||el.querySelector(F);
     if(next)next.focus();
   }
 }
