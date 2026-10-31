@@ -408,3 +408,44 @@ def test_with_no_token_the_refusal_names_the_variable_a_project_that_names_none_
     with pytest.raises(JiraRefused) as raised:
         _tracker(token=token).get_ticket(REF)
     assert SHIPPED_ENV["jira"] in str(raised.value), str(raised.value)
+
+
+# ── C6: a token and no email ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("email", ["", "   "], ids=["empty", "whitespace"])
+def test_with_a_token_and_no_email_the_refusal_names_tracker_options_email(site, email):
+    """C6. A token with no email is sent as `:<token>`, the same anonymous request; calling it
+    "different accounts" sends a person looking for a second account that does not exist. The
+    repair is the email, named in the first 120 characters (the park line keeps no more)."""
+    site(routes={("GET", ISSUE): 404}, myself=401)
+
+    with pytest.raises(JiraRefused) as raised:
+        _tracker(email=email, token=TOKEN).get_ticket(REF)
+
+    said = str(raised.value)
+    assert raised.value.code == 401, said
+    assert "tracker.options.email" in said[:120], said
+    assert "different accounts" not in said
+    assert "no API token" not in said
+    assert TOKEN not in said
+
+
+def test_with_no_token_and_no_email_the_refusal_still_says_no_token(site):
+    """C6, precedence: with neither, the missing token is named first, as before."""
+    site(routes={("GET", ISSUE): 404}, myself=401)
+
+    with pytest.raises(JiraRefused) as raised:
+        _tracker(email="", token=None).get_ticket(REF)
+
+    assert "no API token" in str(raised.value), str(raised.value)
+
+
+def test_a_job_parked_on_the_no_email_refusal_is_classified_as_a_credential(site):
+    """C6, the job's park: the no-email sentence's first 120 characters read as a credential."""
+    site(routes={("GET", ISSUE): 404}, myself=401)
+
+    with pytest.raises(JiraRefused) as raised:
+        _tracker(email="", token=TOKEN).get_ticket(REF)
+
+    park = f"ticket: {str(raised.value)[:120]}"
+    assert classify(park).cause == CREDENTIAL, park
