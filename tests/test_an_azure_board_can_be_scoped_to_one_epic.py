@@ -51,6 +51,8 @@ class _Azure:
         self.queries: list[str] = []
         #: every state write, `(id, state)` — the tests that say "nothing was moved" read this
         self.patched: list[tuple[int, str]] = []
+        self.epic_types = ["Epic", "Custom Epic"]
+        self.calls: list[tuple[str, str]] = []
 
     def add(self, number: int, kind: str, *, column: str = "", parent: int | None = None,
             title: str = "") -> None:
@@ -81,6 +83,9 @@ class _Azure:
         raise AssertionError(f"the board listed {path}, a route Azure DevOps never had")
 
     def call(self, method: str, path: str, *, body=None, **_kw) -> dict:
+        self.calls.append((method, path))
+        if (method, path) == ("GET", "wit/workitemtypecategories/Microsoft.EpicCategory"):
+            return {"workItemTypes": [{"name": kind} for kind in self.epic_types]}
         if method == "GET" and path.startswith("projects/"):
             return {"defaultTeam": {"name": "factory Team"}}
         if (method, path) == ("GET", "work/teamsettings/teamfieldvalues"):
@@ -243,6 +248,21 @@ def test_an_epic_that_does_not_exist_queues_nothing_it_never_falls_back_to_the_t
     assert "scope_epic" in caplog.text and "999" in caplog.text, caplog.text
 
 
+def test_a_link_query_without_the_root_is_unreadable_even_if_the_item_can_be_read(
+        azure, monkeypatch):
+    """A partial or inconsistent response must not look like a readable empty Epic."""
+    board, site = azure(scope_epic="999")
+    real = site.call
+
+    def call(method, path, **kw):
+        if (method, path) == ("GET", "wit/workitems/999"):
+            return {"fields": {"System.WorkItemType": "Epic"}}
+        return real(method, path, **kw)
+
+    monkeypatch.setattr(site, "call", call)
+    assert board.columns() is None
+
+
 #: `1_0` and `+5` are in the list because Python's `int()` ACCEPTS them (10 and 5): they are the
 #: values that tell the pattern in `epic_subtree` from a bare `int(epic)`, which would let them
 #: through and ask Azure about an id nobody wrote.
@@ -260,15 +280,60 @@ def test_a_scope_epic_that_is_not_an_id_is_unreadable_and_names_the_option(azure
     assert site.queries == [], "a value that is not an id must not reach Azure DevOps at all"
 
 
-def test_a_readable_leaf_scope_is_an_empty_queue_not_an_unreadable_board(azure):
-    """Scope resolves a hierarchy root without checking its type. A readable leaf therefore gives
-    an empty board (`{}`), where a missing or unreadable root says `None`."""
-    board, site = azure(scope_epic="300")       # a card with no children: the root alone
+@pytest.mark.parametrize("root", ["101", "300"])
+def test_a_scope_that_is_not_an_epic_is_unreadable_on_board_and_tracker(azure, tracker, root):
+    from beeverforge.adapters.azure_devops import AzureDevOpsError
+
+    board, _ = azure(scope_epic=root)
+    scoped, _ = tracker(scope_epic=root)
+    assert board.columns() is None
+    assert scoped.list_tickets() is None
+    with pytest.raises(AzureDevOpsError, match="scope_epic"):
+        scoped.find_ticket(title="Export the report")
+
+
+def test_a_custom_epic_type_is_accepted_by_category_not_literal_name(azure):
+    board, site = azure(scope_epic="100")
+    site.items[100]["type"] = "Custom Epic"
+    assert board.items_in_status("Approved") == ["102", "103"]
+
+
+def test_an_epic_with_no_children_is_a_readable_empty_board(azure):
+    board, site = azure(scope_epic="400")
+    site.add(400, "Epic")
 
     assert board.items_in_status("Approved") == []
     assert board.columns() == {}
     assert not any("IN (" in q for q in site.queries if "FROM WorkItems " in q), (
         "an empty subtree must not become an empty `IN ()`, which Azure refuses")
+
+
+@pytest.mark.parametrize("path", ["wit/workitems/100",
+                                   "wit/workitemtypecategories/Microsoft.EpicCategory"])
+def test_a_failure_to_verify_the_epic_type_is_unreadable(azure, tracker, monkeypatch, path):
+    from beeverforge.adapters.azure_devops import AzureDevOpsError
+
+    board, board_site = azure(scope_epic="100")
+    scoped, tracker_site = tracker(scope_epic="100")
+    for site in (board_site, tracker_site):
+        real = site.call
+
+        def fail(method, requested, *, _real=real, **kw):
+            if requested == path:
+                raise ConnectionResetError("connection reset by peer")
+            return _real(method, requested, **kw)
+
+        monkeypatch.setattr(site, "call", fail)
+    assert board.columns() is None
+    assert scoped.list_tickets() is None
+    with pytest.raises(AzureDevOpsError, match="scope_epic"):
+        scoped.find_ticket(title="Export the report")
+
+
+def test_missing_epic_category_metadata_is_unreadable(azure):
+    board, site = azure(scope_epic="100")
+    site.epic_types = []
+    assert board.columns() is None
 
 
 # ── cost ────────────────────────────────────────────────────────────────────────────────────────
@@ -282,6 +347,8 @@ def test_the_subtree_is_read_once_per_board_not_once_per_column(azure):
 
     assert site.link_queries == 1
     assert sum("FROM WorkItems " in q for q in site.queries) == len(COLUMNS)
+    assert site.calls.count(("GET", "wit/workitems/100")) == 1
+    assert site.calls.count(("GET", "wit/workitemtypecategories/Microsoft.EpicCategory")) == 1
 
 
 # ── the gate: a card outside the slice ──────────────────────────────────────────────────────────
@@ -310,6 +377,12 @@ def test_a_board_that_cannot_tell_whether_it_holds_a_card_says_none_not_false(az
     board, _site = azure(scope_epic="999")
 
     assert board.holds("102") is None
+
+
+def test_the_board_holds_a_card_by_its_repository_qualified_ref(azure):
+    board, _ = azure(scope_epic="100")
+    assert board.holds("acme/api#102") is True
+    assert board.holds("acme/api#202") is False
 
 
 # ── the tracker: the panel, the product role and the "already filed?" check ─────────────────────
@@ -391,6 +464,32 @@ def test_a_tracker_whose_epic_cannot_be_told_lists_unreadable_and_refuses_to_sea
     assert scoped.list_tickets() is None
     with pytest.raises(AzureDevOpsError, match="scope_epic"):
         scoped.find_ticket(title="Export the report")
+
+
+def test_a_tracker_whose_subtree_request_fails_is_unreadable_and_refuses_to_search(
+        tracker, monkeypatch):
+    from beeverforge.adapters.azure_devops import AzureDevOpsError
+
+    scoped, site = tracker(scope_epic="100")
+    real = site.call
+
+    def reset(method, path, *, body=None, **kw):
+        if body and "FROM WorkItemLinks" in body.get("query", ""):
+            raise ConnectionResetError("connection reset by peer")
+        return real(method, path, body=body, **kw)
+
+    monkeypatch.setattr(site, "call", reset)
+    assert scoped.list_tickets() is None
+    with pytest.raises(AzureDevOpsError, match="scope_epic"):
+        scoped.find_ticket(title="Export the report")
+
+
+def test_a_tracker_scoped_to_an_empty_epic_lists_and_finds_nothing(tracker):
+    scoped, site = tracker(scope_epic="400")
+    site.add(400, "Epic")
+    assert scoped.list_tickets() == []
+    assert scoped.find_ticket(title="Backlog inside") is None
+    assert not any("IN ()" in q for q in site.queries)
 
 
 def test_a_tracker_scope_that_is_not_an_id_never_reaches_azure(tracker):

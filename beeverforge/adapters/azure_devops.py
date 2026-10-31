@@ -122,7 +122,7 @@ def epic_subtree(client, epic: str) -> frozenset[str]:
     it cannot be resolved widens the read to the whole team, which is the accident it exists to
     prevent.
 
-    TWO READS ARE NEEDED AND THIS IS THE FIRST. Measured against a live project (2026-10-23):
+    THE RECURSIVE READ. Measured against a live project (2026-10-23):
 
       * flat WIQL has no "descendant of", and `[System.Parent]` reaches one level while the depth
         is the process's (Epic → Feature → Product Backlog Item here, Epic → Issue → Task on Basic);
@@ -155,6 +155,21 @@ def epic_subtree(client, epic: str) -> frozenset[str]:
         raise AzureDevOpsError(
             f"scope_epic {epic} names no work item this credential can read, so the board cannot "
             "say which cards are under it.")
+    # The category contains names, not reference names. Checking the literal "Epic" would reject
+    # a custom work item type assigned to the Epic category; treating missing metadata as an empty
+    # subtree would turn a typo or a failed read into a healthy-looking idle factory.
+    try:
+        item = client.call("GET", f"wit/workitems/{root}",
+                           params={"fields": "System.WorkItemType"})
+        category = client.call("GET", "wit/workitemtypecategories/Microsoft.EpicCategory")
+        kind = (item.get("fields") or {}).get("System.WorkItemType")
+        epic_types = {entry.get("name") for entry in category.get("workItemTypes", [])}
+    except Exception as exc:
+        raise AzureDevOpsError(
+            f"scope_epic {epic} could not be verified against the Epic category: {exc}") from exc
+    if not kind or kind not in epic_types:
+        raise AzureDevOpsError(
+            f"scope_epic {epic} is not a work item in the Epic category; choose an Epic id.")
     below = frozenset(str(r["target"]["id"]) for r in relations
                       if r.get("source") is not None and (r.get("target") or {}).get("id"))
     if len(below) > SCOPE_CEILING:

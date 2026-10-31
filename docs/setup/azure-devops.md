@@ -345,9 +345,9 @@ tracker:
 
 It is the id, not the title, because two work items can share a title. Quote it in YAML.
 
-The hierarchy root's work item type is not checked: a readable Feature id also scopes to its
-descendants, and a readable leaf id produces an empty board. Check that the id names the intended
-Epic before enabling pickup.
+The root must belong to the project's Epic work item type category. A Feature or a task id is
+unreadable, rather than a healthy-looking empty queue. Custom work item types in the Epic category
+are accepted.
 
 **What it limits.** The pickup queue, the board the panel and the product role read, the list of
 the project's cards, and the search for an already filed card of the same title. Each is the query
@@ -360,13 +360,15 @@ Issue → Task on Basic). Unset, or blank, the queries are exactly those of a pr
 shows this project's scoped slice. A Jira project with `scope_jql` follows the same rule. Every
 other project opens its provider's board.
 
-**What it costs.** One extra request per board or tracker instance, a recursive link query that
-returns the Epic's subtree; it is not repeated for each column. An Epic can name at most 1,500 work
+**What it costs.** Three extra requests per board or tracker instance: a recursive link query that
+returns the Epic's subtree, a read of the root's type, and a read of the Epic category. They are not
+repeated for each column. An Epic can name at most 1,500 work
 items under it, because they travel in one query; past that the board is unreadable and the warning
 says how many there are.
 
 **It fails closed.** An id that is not a number, an id that names no work item this credential can
-read, a subtree past the ceiling and a request that failed all read as an unreadable board, never as
+read, a work item outside the Epic category, a subtree past the ceiling and a request that failed
+all read as an unreadable board, never as
 a project without a scope, which would hand the factory the whole team. `beeverforge doctor` reports
 the board as unreadable and its remedy names `scope_epic` beside the credential, and the worker's
 log names the option and the id. An Epic with nothing under it is a readable, empty board.

@@ -61,6 +61,16 @@ MUTATIONS = [
      '    if not any(r.get("source") is None',
      '    if False and not any(r.get("source") is None'),
 
+    ("a Feature or leaf is accepted as an Epic and quietly scopes the wrong hierarchy",
+     SHARED,
+     "    if not kind or kind not in epic_types:",
+     "    if False:"),
+
+    ("only a work item literally named Epic is accepted, rejecting custom Epic types",
+     SHARED,
+     "kind not in epic_types:",
+     'kind != "Epic":'),
+
     ("any string that Python's int() accepts is taken for an id",
      SHARED,
      'if not re.fullmatch(r"[0-9]+", epic or ""):',
@@ -97,6 +107,11 @@ MUTATIONS = [
      "            return None\n        number = ref_number(split_repo_ref(ref)[1])",
      "            return False\n        number = ref_number(split_repo_ref(ref)[1])"),
 
+    ("a repository-qualified reference is treated as outside the Epic",
+     BOARD,
+     "ref_number(split_repo_ref(ref)[1])",
+     "ref_number(ref)"),
+
     ("the refusal of a card outside the slice no longer names the scope",
      BOARD,
      'return f"within scope_epic {self._scope_epic!r}" if self._scope_epic else ""',
@@ -122,6 +137,21 @@ MUTATIONS = [
      TRACKER,
      "raise self._epic_outcome",
      "return frozenset()"),
+
+    ("a failed subtree request becomes empty, so an unreadable scope files a duplicate",
+     TRACKER,
+     "                self._epic_outcome = AzureDevOpsError(\n                    f\"scope_epic {self._scope_epic!r} could not be read",
+     "                self._epic_outcome = frozenset() if True else AzureDevOpsError(\n                    f\"scope_epic {self._scope_epic!r} could not be read"),
+
+    ("an empty Epic sends IN () when listing, instead of returning an empty list",
+     TRACKER,
+     "                if not below:\n                    return []     # an Epic with nothing under it: a read, and nothing there",
+     "                if False:\n                    return []     # an Epic with nothing under it: a read, and nothing there"),
+
+    ("an empty Epic sends IN () when searching, instead of returning no match",
+     TRACKER,
+     "            if not below:\n                return None\n            scope = f\"AND {within_epic(below)} \"",
+     "            if False:\n                return None\n            scope = f\"AND {within_epic(below)} \""),
 
     # ── the doctor's remedy ────────────────────────────────────────────────────────────────────
     ("the remedy for an unreadable board never names the scope",
