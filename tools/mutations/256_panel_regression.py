@@ -19,4 +19,9 @@ MUTATIONS = [
     ('Escape closes Cost behind an open modal', PANEL,
      '!modal.open && modal.style.display!=="flex"',
      'true'),
+    ('Escape is wired to nothing', PANEL,
+     'document.addEventListener("keydown",costKeydown);', ''),
+    ('chart fallback has no live status element', PANEL,
+     '  <div id="chartStatus" class="sub" role="status">${window.Chart?"":"Loading charts — '
+     'totals and task details are available below."}</div>\n', ''),
 ]

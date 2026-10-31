@@ -1,6 +1,9 @@
 """Hold metrics and the optional CDN independently, including out-of-order visits."""
 
-from tests.test_a_refusal_is_not_an_answer import run
+import re
+from html.parser import HTMLParser
+
+from tests.test_a_refusal_is_not_an_answer import CODE, run
 
 STUBS = """
 let _DASH=null,_dc={},_dashRead=0,_chartReady=null;
@@ -78,3 +81,38 @@ def test_escape_closes_cost_only_when_no_modal_is_open():
     """)
     assert got == {"whileModal": "block", "whileNativeModal": "block", "otherKey": "block",
                    "after": "none"}
+
+
+def test_the_page_wires_escape_to_close_cost():
+    wiring = "\n".join(re.findall(r'^document\.addEventListener\("keydown",.*$', CODE, re.M))
+    got = run(wiring + """
+      nodes['#dash'].style.display='block';
+      (listeners.keydown||[]).forEach(f=>f({key:'Escape'}));
+      return {display:nodes['#dash'].style.display};
+    """, "costKeydown", "closeCosts", stubs="""
+      let _dashRead=0,_dc={};nodes['#dash']=node();nodes['#modal']=node();
+      const listeners={};document.addEventListener=(t,f)=>(listeners[t]=listeners[t]||[]).push(f);
+    """)
+    assert got == {"display": "none"}
+
+
+def test_the_real_shell_has_a_live_place_for_the_chart_fallback():
+    got = run("""
+      _renderDashShell({runs:[],projects:[]});return {html:nodes['#dash'].innerHTML};
+    """, "_opt", "_renderDashShell", stubs="""
+      const window={};nodes['#dash']=node();function _renderAutonomy(){}function _dashApply(){}
+      for(const id of ["fModel","fHarness","fRole","fKnow","fFrom","fTo"])
+        nodes['#'+id]={addEventListener(){}};
+    """)
+
+    class Status(HTMLParser):
+        found = None
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            if attributes.get("id") == "chartStatus":
+                self.found = attributes.get("role")
+
+    parser = Status()
+    parser.feed(got["html"])
+    assert parser.found == "status"
