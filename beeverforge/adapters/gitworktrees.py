@@ -103,8 +103,8 @@ JOB_MARKER_MAX_AGE = 24 * 60 * 60
 
 @dataclass(frozen=True)
 class JobMark:
-    """One marked worktree that is still on disk: its path, as git wrote it in the admin
-    directory's `gitdir` file without the trailing `/.git`, and its marker's age in seconds."""
+    """One marked worktree that is still on disk: its path, the admin directory's `gitdir` file
+    resolved (symlinks followed) without the trailing `/.git`, and its marker's age in seconds."""
 
     worktree: str
     age: float
@@ -147,7 +147,11 @@ def live_job_marks(repo: Path, *, now: float | None = None) -> JobMarks | None:
 
     A MARK HOLDS ONLY WHILE ITS WORKTREE STANDS. Each `<repo>/.git/worktrees/<name>/` carries a
     `gitdir` file naming the worktree's `<wt>/.git` as git wrote it (absolute on git 2.34.1 and
-    2.43.0; resolved against the admin directory when a newer git writes it relative). A marked
+    2.43.0; relative to the REAL admin directory when git 2.48+ writes it under
+    `worktree.useRelativePaths`). It is never normalised as text (#115): with the cache root a
+    symlink deeper than its target, `normpath` applied the `..` to the symlink's spelling and
+    named a directory that does not exist. The path is asked of the filesystem as written, so the
+    kernel follows the symlink first, and the worktree is named from its resolved path. A marked
     admin directory whose `<wt>/.git` is gone — a job's directory deleted without `prune` — holds
     nothing. A marker older than `JOB_MARKER_MAX_AGE` is `stale`: listed, not live.
 
@@ -173,10 +177,11 @@ def live_job_marks(repo: Path, *, now: float | None = None) -> JobMarks | None:
                 gitdir = (admin / "gitdir").read_text(encoding="utf-8").strip()
             except FileNotFoundError:
                 continue    # git is midway through removing it: nothing stands on the tree
-            where = Path(os.path.normpath(admin / gitdir))
+            where = admin / gitdir  # the kernel follows a symlink before it applies `..` (#115)
             if not where.exists():
                 continue
-            mark = JobMark(worktree=str(where.parent), age=max(0.0, now - marked.st_mtime))
+            mark = JobMark(worktree=str(where.resolve().parent),
+                           age=max(0.0, now - marked.st_mtime))
             (live if mark.age < JOB_MARKER_MAX_AGE else stale).append(mark)
     except OSError:
         return None
