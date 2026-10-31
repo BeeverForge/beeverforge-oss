@@ -33,8 +33,10 @@ from beeverforge.product.template import (
 #: heading so that two files can never claim the same id while looking different on disk.
 _FILE_RE = re.compile(r"^(?P<num>\d{4})-(?P<slug>[a-z0-9][a-z0-9-]*)\.md$")
 
-#: `# REQ-0001 — title`
-_TITLE_RE = re.compile(r"^#\s+REQ-(?P<num>\d{4})\s*[—–-]\s*(?P<title>.+?)\s*$", re.MULTILINE)
+#: `# REQ-0001 — title`. THE TITLE RUNS TO THE END OF ITS LINE and the caller strips it (#76): a
+#: lazy `.+?` closed by `\s*$` tried every end on the line and scanned the rest of it from each, so
+#: a title followed by n spaces cost n² steps. Every group that closed so below is read this way.
+_TITLE_RE = re.compile(r"^#\s+REQ-(?P<num>\d{4})\s*[—–-]\s*(?P<title>[^\n]+)", re.MULTILINE)
 
 #: `- **Status:** accepted` — tolerant of the bold markers being dropped, because a human editing
 #: a markdown file by hand should not lose a requirement's status to a missing asterisk.
@@ -45,9 +47,11 @@ def _field_re(name: str) -> re.Pattern[str]:
     # with no colon and no bold is no label.
     # NO GAP CROSSES A LINE BREAK (#76): `[ \t]`, not `\s`. Under MULTILINE `^\s*` ate every blank
     # line after the one it began on, then backtracked, so a requirement's read was quadratic in
-    # its blank lines; and an empty `- **Status:**` read the NEXT line as its value.
+    # its blank lines; and an empty `- **Status:**` read the NEXT line as its value. The value runs
+    # to the end of its line, trailing space included, and every caller strips it: `.*?[ \t]*$`
+    # tried every end and scanned the rest of the line from each, n² steps on n spaces.
     return re.compile(rf"^[ \t]*[-*][ \t]*\**{re.escape(name)}(?:\**[ \t]*:|\*\*)\**[ \t]*"
-                      r"(?P<value>.*?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
+                      r"(?P<value>[^\n]*)", re.MULTILINE | re.IGNORECASE)
 
 
 #: THE status-line pattern — one regex for reading AND rewriting. The writers in `authoring.py`
@@ -74,7 +78,7 @@ _OBSERVED_AT_RE = _field_re("Observed at commit")
 #: The first section heading. Everything above it is where a requirement states its own fields —
 #: the writers', the template's and a hand-edited file's alike — and everything below is its text.
 _FIRST_SECTION_RE = re.compile(r"^#{2,}\s", re.MULTILINE)
-_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_HEADING_RE = re.compile(r"^##\s+([^\n]+)", re.MULTILINE)  # stripped by the caller (#76)
 
 #: the number in `superseded-by 0007`
 _SUPERSEDED_BY_RE = re.compile(r"superseded[-\s]?by\s*:?\s*(?:REQ-)?(\d{4})", re.IGNORECASE)
@@ -275,7 +279,7 @@ def _status_of(text: str, path: str) -> tuple[str, int | None, list[Finding]]:
     m = _STATUS_RE.search(text)
     raw = (m.group("value") if m else "").strip()
     # strip a trailing markdown comment, which the template uses to list the allowed values
-    raw = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    raw = _without_comments(raw).strip().lower()
     if not raw:
         return PROPOSED, None, [Finding(
             level="warn", code="status-missing", path=path,
@@ -402,8 +406,31 @@ def parse_requirement(
     return req, findings
 
 
+def _without_comments(text: str) -> str:
+    """`text` with each `<!-- … -->` that opens and closes on one line removed — what
+    `re.sub(r"<!--.*?-->", "", text)` did, in one left-to-right scan (#76). The pattern searched
+    for a close from every `<!--` to the end of the line, so a value of n openings cost n² steps."""
+    out: list[str] = []
+    at = 0
+    eol = -1
+    while (start := text.find("<!--", at)) != -1:
+        if eol < start:
+            eol = text.find("\n", start)
+            eol = len(text) if eol == -1 else eol
+        end = text.find("-->", start + 4, eol)
+        if end == -1:
+            # no close on this line, so none for any later opening on it either
+            out.append(text[at:eol])
+            at = eol
+            continue
+        out.append(text[at:start])
+        at = end + 3
+    out.append(text[at:])
+    return "".join(out)
+
+
 def _clean(value: str) -> str:
-    return re.sub(r"<!--.*?-->", "", value or "").strip().strip("<>").strip()
+    return _without_comments(value or "").strip().strip("<>").strip()
 
 
 def _header(text: str) -> str:

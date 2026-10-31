@@ -115,7 +115,15 @@ def digest_of(*parts: object) -> str:
 # ── documents ───────────────────────────────────────────────────────────────────────────────────
 
 _PAGE = re.compile(r"^\[page (\d+)\]")
-_HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+#: The heading runs to the end of its line; `_heading_name` drops its closing `#`s (#76): a lazy
+#: `.+?` closed by `\s*#*\s*$` scanned the rest of the line from every end it tried.
+_HEADING = re.compile(r"^#{1,6}\s+([^\n]+)", re.MULTILINE)
+
+
+def _heading_name(raw: str) -> str:
+    """A heading's name: its text without the closing `#`s and the space around them, never
+    shorter than one character — what `(.+?)\\s*#*\\s*$` took."""
+    return (raw.rstrip().rstrip("#").rstrip() or raw[:1]).strip()
 
 
 def chunks(text: str) -> list[tuple[str, str]]:
@@ -135,7 +143,7 @@ def chunks(text: str) -> list[tuple[str, str]]:
         if page:
             here = f"page {page.group(1)}"
         elif heading:
-            here = f"§ {heading.group(1).strip()[:80]}"
+            here = f"§ {_heading_name(heading.group(1))[:80]}"
         if buf and (size + len(piece) > CHUNK_CHARS or here != where):
             out.append((where, "\n\n".join(buf)))
             buf, size = [], 0
