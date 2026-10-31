@@ -3671,11 +3671,26 @@ class JobRunner:
             "git checkout -- .github/workflows 2>/dev/null; "
             "git clean -fdq .github/workflows 2>/dev/null; "
         )
-        self.sandbox.run(
+        # BY EXIT CODE, NOT `|| true` (#172). git commit exits 1 for "nothing to commit", and that
+        # stays quiet; but a box whose git refuses the workspace ("detected dubious ownership")
+        # exits 128, and `|| true` read that as nothing to commit — the job silently committed
+        # nothing. Exit 1 is believed only when the tree is read back clean.
+        rc, out = self.sandbox.run(
             workspace=ws,
-            command=f"{strip_workflows}git add -A && {author}git commit -m {msg} || true",
+            command=f"{strip_workflows}git add -A && {author}git commit -m {msg}",
             timeout=120,
         )
+        if rc == 0:
+            return
+        if rc == 1:
+            status_rc, status = self.sandbox.run(
+                workspace=ws, command="git status --porcelain", timeout=60)
+            if status_rc == 0 and not (status or "").strip():
+                return
+        words = " ".join((out or "").split())[:300] or "no output"
+        raise RuntimeError(
+            f"git refused to commit the job's work in the box (exit {rc}: {words}), so nothing "
+            "was committed; make git usable on this workspace in the box.")
 
     def _note_stripped_workflows(self, ws: Workspace, ticket: Ticket) -> None:
         """Record (and announce) any `.github/workflows/**` change about to be stripped. Purely

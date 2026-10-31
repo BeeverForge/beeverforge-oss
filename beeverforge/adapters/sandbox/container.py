@@ -632,8 +632,27 @@ class ContainerSandbox(SandboxAdapter):
             raise RuntimeError(
                 f"could not start the box {cname!r} (docker run exited {rc}): {out.strip()[:300]}"
                 + _NO_INIT_BINARY * any(w in out for w in ("init binary", "catatonit")))
-        _host(["docker", "exec", cname, "git", "config", "--global",
-               "--add", "safe.directory", _WORKDIR])
+        # THE WRITE IS CHECKED (#172). A client image whose HOME cannot hold a global config (a
+        # `HOME=/nonexistent` user, measured 2026-10-20) fails this write, and every later git call
+        # in the box is then refused with "detected dubious ownership", exit 128 — which used to
+        # read as "nothing to commit" further down. Refuse here, by name, with no box left behind.
+        rc, out = _host(["docker", "exec", cname, "git", "config", "--global",
+                         "--add", "safe.directory", _WORKDIR])
+        if rc != 0:
+            home_rc, home_out = _host(
+                ["docker", "exec", cname, "sh", "-c", 'printf "OFHOME:%s\\n" "$HOME"'])
+            home = next((ln[len("OFHOME:"):].strip() for ln in (home_out or "").splitlines()
+                         if ln.startswith("OFHOME:")), "") if home_rc == 0 else ""
+            _host(["docker", "rm", "-f", cname])
+            shutil.rmtree(host_clone, ignore_errors=True)
+            words = " ".join((out or "").split())[:200] or "no output"
+            raise RuntimeError(
+                f"the box image {self.image!r} could not mark {_WORKDIR} as a safe git directory "
+                f"(`git config --global` exited {rc}: {words}) because "
+                + (f"its HOME {home!r}" if home else "an unreadable HOME")
+                + " cannot hold a global git config, so every git call in the box would be "
+                "refused; give the image a writable HOME (set `HOME` to a writable directory in "
+                "its Dockerfile, or run it as a user whose home directory exists).")
 
         self._container, self._host_clone = cname, host_clone
         # A NEW container is a new HOME: the image may differ from the last job's (ADR-0037 D4
