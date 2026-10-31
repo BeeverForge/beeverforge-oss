@@ -4,24 +4,41 @@ Both headings were found by their FIRST matching row, and the objective is writt
 section, so the next pass spliced its line or a fresh review into the objective. The review's own
 summary and findings could carry a heading row too, and a fresh verdict then left the stale one
 standing as the first review heading (#187's case). Two defences: every row the platform did not
-write is escaped as it is written (`_as_text`), and a body published before that escaping is still
-read by its LAST heading row.
+write is escaped as it is written (`_as_text`), and both searches read only the rows below the
+platform's last `## Validations` row, from the end — so a body published before the escaping,
+whose objective rows are raw, is never searched in its objective either.
 """
 
 TEST = "tests/test_a_heading_in_the_objective_is_not_the_section.py"
 MACHINE = "beeverforge/orchestrator/machine.py"
 
 MUTATIONS = [
-    # ── a body published before the escaping: the last heading row is the platform's ───────────
+    # ── a body published before the escaping: only the rows below `## Validations` are searched ─
+    # RE-PINNED 2026-10-31: both searches are now bounded below `## Validations`; each cut puts
+    # back main's first-match search over the whole body.
     ("the agent's section is found by its first heading row again", MACHINE,
-     '''    start = next((i for i, row in reversed(list(enumerate(rows)))
+     '''    start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
                   if row == AGENT_ACCOUNT_HEADING), None)''',
      '''    start = next((i for i, row in enumerate(rows) if row == AGENT_ACCOUNT_HEADING), None)'''),
 
     ("the review section is found by its first heading row again", MACHINE,
-     '''        start = next((i for i, row in reversed(list(enumerate(rows)))
+     '''        start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
                       if row.startswith(_REVIEW_HEADING)), None)''',
      '''        start = next((i for i, row in enumerate(rows)
+                      if row.startswith(_REVIEW_HEADING)), None)'''),
+
+    ("the agent's section is searched for above `## Validations` too, so a raw objective is it",
+     MACHINE,
+     '''    start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
+                  if row == AGENT_ACCOUNT_HEADING), None)''',
+     '''    start = next((i for i, row in reversed(list(enumerate(rows)))
+                  if row == AGENT_ACCOUNT_HEADING), None)'''),
+
+    ("the review section is searched for above `## Validations` too, so a raw objective is it",
+     MACHINE,
+     '''        start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
+                      if row.startswith(_REVIEW_HEADING)), None)''',
+     '''        start = next((i for i, row in reversed(list(enumerate(rows)))
                       if row.startswith(_REVIEW_HEADING)), None)'''),
 
     # ── only the platform writes a section heading ──────────────────────────────────────────────

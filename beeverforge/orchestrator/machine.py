@@ -404,6 +404,16 @@ def _as_text(words: str) -> str:
     return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
 
 
+def _sections_from(rows: list[str]) -> int:
+    """The first row a platform section can be in: the one after the LAST `## Validations` row.
+
+    `_pr_body` writes that row unconditionally, after the objective and before every section, so
+    a search that starts here never reads the objective (#113) — even one published before
+    `_as_text`, whose heading rows are raw. A body without the row, one this platform did not
+    write, is searched whole: 0."""
+    return next((i + 1 for i in range(len(rows) - 1, -1, -1) if rows[i] == "## Validations"), 0)
+
+
 def _review_lines(r: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
@@ -747,8 +757,9 @@ def _read_account(rows: list[str]) -> tuple[int, int, _Account] | None:
     Only what `_account_lines` writes is read back. Agent text cannot forge the label, the count or
     the cut line, because every agent row starts with `>`; and the executor's rows and the pass
     rows are told apart by position, the label between them."""
-    # the LAST heading row: the section is written after the objective, which may hold it (#113)
-    start = next((i for i, row in reversed(list(enumerate(rows)))
+    # the LAST heading row below `## Validations`: the objective is above it and may hold it (#113)
+    floor = _sections_from(rows)
+    start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
                   if row == AGENT_ACCOUNT_HEADING), None)
     if start is None:
         return None
@@ -3956,8 +3967,10 @@ class JobRunner:
         rows = body.splitlines()
         cost_at = next((i for i in range(len(rows) - 1, -1, -1)
                         if rows[i].startswith(_COST_LINE)), None)
-        # the LAST review heading: the objective comes first and may hold one (#113)
-        start = next((i for i, row in reversed(list(enumerate(rows)))
+        # the LAST review heading, below `## Validations`: the objective is above it and may hold
+        # one, escaped or, in a body published before the escaping, raw (#113)
+        floor = _sections_from(rows)
+        start = next((floor + i for i, row in reversed(list(enumerate(rows[floor:])))
                       if row.startswith(_REVIEW_HEADING)), None)
         # `start is None`: a pull request this platform did not write a review section into.
         if review is not _SECTION_AS_IT_STANDS and start is not None:

@@ -123,21 +123,23 @@ def test_a_republished_pass_row_lands_in_the_real_section_too(raw):
     _assert_pass_in_the_real_section(body.splitlines(), holder.forge.body.splitlines())
 
 
-def test_a_body_opened_before_the_agents_section_gets_one_below_the_objective():
+@BODIES
+def test_a_body_opened_before_the_agents_section_gets_one_below_the_objective(raw):
     """The upgrade path: no real section, so `_with_passes` inserts one before `Cost:` — and the
-    objective's heading row must not be read as the section it lacks."""
-    rows = _body(AGENT_ACCOUNT_HEADING).splitlines()
-    real = rows.index(AGENT_ACCOUNT_HEADING)
+    objective's heading row, raw as a body opened before the escaping carries it, must not be read
+    as the section it lacks. Only the rows below `## Validations` are searched."""
+    rows = _body(AGENT_ACCOUNT_HEADING, raw=raw).splitlines()
+    real = max(i for i, row in enumerate(rows) if row == AGENT_ACCOUNT_HEADING)
     cost = max(i for i, row in enumerate(rows) if row.startswith(_COST_LINE))
     before = rows[:real] + rows[cost:]  # as a pull request opened before #627 carries it
     while not before[real - 1].strip():
         before.pop(real - 1)
         real -= 1
-    assert AGENT_ACCOUNT_HEADING not in before
+    assert before.count(AGENT_ACCOUNT_HEADING) == (1 if raw else 0)  # the objective's, if raw
 
     after = _with_passes(before, [PASS])
     _assert_pass_in_the_real_section(before, after)
-    assert after.count(AGENT_ACCOUNT_HEADING) == 1
+    assert after.count(AGENT_ACCOUNT_HEADING) == (2 if raw else 1)
 
 
 # ── the review section ──────────────────────────────────────────────────────────────────────────
@@ -169,15 +171,48 @@ def test_a_dated_review_is_the_real_one_when_the_objective_holds_its_heading(raw
     assert any("**was:**" in row and "OLD-SENTINEL" in row for row in below)
 
 
-def test_a_body_opened_with_no_review_keeps_its_objective_when_a_review_arrives():
+@BODIES
+@pytest.mark.parametrize("review", [FRESH, None], ids=["fresh", "dated"])
+def test_a_body_opened_with_no_review_keeps_its_objective_when_a_review_arrives(raw, review):
     """The upgrade path: no review section to replace, so nothing is spliced anywhere — and the
-    objective's heading row must not be read as the section it lacks."""
-    body = _body("## Review — a (score 1)", review=None)
+    objective's heading row, raw as a body opened before the escaping carries it, must not be read
+    as the section it lacks. Only the rows below `## Validations` are searched."""
+    body = _body("## Review — a (score 1)", raw=raw, review=None)
     holder = _holder(body)
 
-    assert not JobRunner._republish_review(holder, PR, review=FRESH)
+    assert not JobRunner._republish_review(holder, PR, review=review)
     assert holder.forge.body == body
-    assert not _review_headings(body.splitlines())
+    assert len(_review_headings(body.splitlines())) == (1 if raw else 0)  # the objective's, if raw
+
+
+# ── a body with no `## Validations` row: the whole body is searched, from the end ───────────────
+
+def _without_validations(body: str) -> list[str]:
+    rows = body.splitlines()
+    rows.remove("## Validations")
+    return rows
+
+
+def test_a_body_without_validations_still_gets_the_pass_row_in_its_section():
+    before = _without_validations(_body("no heading here"))
+
+    after = _with_passes(before, [PASS])
+    assert after.count(AGENT_ACCOUNT_HEADING) == 1
+    assert after.count(PASS_ROW) == 1
+    real = after.index(AGENT_ACCOUNT_HEADING)
+    cost = max(i for i, row in enumerate(after) if row.startswith(_COST_LINE))
+    assert real < after.index(PASS_ROW) < cost
+
+
+def test_a_body_without_validations_still_gets_its_review_replaced():
+    body = "\n".join(_without_validations(_body("no heading here")))
+    holder = _holder(body)
+
+    assert JobRunner._republish_review(holder, PR, review=FRESH)
+    after = holder.forge.body.splitlines()
+    assert _review_headings(after) == ["## Review — approved (score 77)"]
+    assert not any("OLD-SENTINEL" in row for row in after)
+    assert "KEEP-THIS-LINE" in after
 
 
 def _with_a_heading_in_the_review(where: str) -> ReviewResult:
