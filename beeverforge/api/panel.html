@@ -4518,7 +4518,7 @@ async function renderLogsPage(){
   }catch(e){ rows=[]; error=String((e&&e.message)||e) }
   // Each visit reads again; an older visit must not paint over a newer route or response.
   if(request!==_logs.request || location.pathname!==path)return;
-  _logs.rows=rows;_logs.error=error;
+  _logs.rows=rows;_logs.error=error;_logs.loaded="";
   paintLogList();
   if(at.project&&at.issue)loadJobLog(at.project,at.issue);
 }

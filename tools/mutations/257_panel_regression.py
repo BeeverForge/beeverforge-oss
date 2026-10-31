@@ -13,4 +13,14 @@ MUTATIONS = [
     ('a response paints after leaving logs', PANEL,
      'if(request!==_logs.request || location.pathname!==path)return;',
      'if(request!==_logs.request)return;'),
+    ('the selected run remains cached between visits', PANEL,
+     '_logs.rows=rows;_logs.error=error;_logs.loaded="";',
+     '_logs.rows=rows;_logs.error=error;'),
+    ('the request counter is not initialized', PANEL,
+     ',all:false,request:0}', ',all:false}'),
+    ('a stale response overwrites stored rows', PANEL,
+     '  if(request!==_logs.request || location.pathname!==path)return;\n'
+     '  _logs.rows=rows;_logs.error=error;_logs.loaded="";',
+     '  _logs.rows=rows;_logs.error=error;_logs.loaded="";\n'
+     '  if(request!==_logs.request || location.pathname!==path)return;'),
 ]
