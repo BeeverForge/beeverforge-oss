@@ -110,6 +110,17 @@ def onboarding(monkeypatch):
     return _wire
 
 
+@pytest.fixture
+def a_context_repository_nobody_serves(monkeypatch):
+    """The clone after the creation goes to the context repository's URL, a made-up `github.com`
+    one here; a path that does not exist fails that clone as it failed there, without dialling
+    anybody's forge (#335)."""
+    from beeverforge.product import onboard
+
+    monkeypatch.setattr(onboard, "context_clone_url",
+                        lambda project, docs_repo: "/nonexistent/acme-context.git")
+
+
 # ── without consent, it refuses and says what to do ─────────────────────────────────────────────
 
 def test_a_project_with_NO_context_repository_is_refused_and_told_what_to_do(onboarding):
@@ -141,6 +152,7 @@ def test_nothing_is_created_without_the_flag(onboarding):
 
 # ── with consent, it creates, names it deliberately, and RECORDS it ─────────────────────────────
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_with_consent_it_creates_and_RECORDS_the_repository(onboarding):
     """The half that makes the creation real. Without the record the product module stays off and
     the client is left with an empty repository and a role that will not speak."""
@@ -228,6 +240,7 @@ def test_the_context_repository_is_reached_THROUGH_THE_PORT_on_any_vendor(onboar
     assert forge.opened[0]["base"] == "main", "the base must be read from the clone, not assumed"
 
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_the_NAME_is_derived_and_not_a_free_parameter(onboarding):
     """A repository in a client's organisation is not a place to accept free text from whoever
     typed the command. The name comes from the project; the organisation from the forge."""
@@ -241,6 +254,7 @@ def test_the_NAME_is_derived_and_not_a_free_parameter(onboarding):
         "a client's requirements were about to be published")
 
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_a_repository_that_ALREADY_EXISTS_is_reported_as_FOUND_not_created(onboarding):
     """"We created a repository in your organisation" and "we found the one you already had" are
     different sentences, and only one of them belongs in an email to a client."""

@@ -282,8 +282,9 @@ markers = [
     "owns_its_engine: starts and disposes of its own ephemeral Temporal server",
     # A test that dials a real non-loopback address ON PURPOSE. `tests/conftest.py` refuses that
     # for every other test, because a unit test that cloned a real dev.azure.com address waited
-    # 300 s for a timeout on every run and passed (#335). It covers Python sockets only: a
-    # subprocess such as `git clone` opens its own and is not seen.
+    # 300 s for a timeout on every run and passed (#335). It covers Python sockets and git run
+    # from `PATH` (refused by GIT_ALLOW_PROTOCOL=file, named by a shim); any other subprocess
+    # (gh, curl, docker) and the Rust core under temporalio are not seen.
     "network: reaches a real non-loopback address on purpose; tests/conftest.py refuses that for every other test (#335)",
     # Long-running; excluded by `-m 'not slow'`. Declared so the run stops warning about it.
     "slow: minutes rather than seconds",

@@ -131,6 +131,39 @@ _PROBES = textwrap.dedent('''
             shutil.rmtree(where, ignore_errors=True)
 
 
+    def _git(url):
+        import subprocess
+        from beeverforge import gitpin
+
+        try:
+            done = subprocess.run(gitpin.argv(["ls-remote", "--", url]), capture_output=True,
+                                  text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return "GIT WAITED ON THE REMOTE"
+        return done.stderr
+
+
+    def test_git_remote_refused():
+        try:
+            said = _git("https://192.0.2.1/x")
+        except Exception:
+            return  # what `activities._land_product_proposals` does with every error
+        assert "not allowed" in said, "GIT DIALLED THE REMOTE: " + said
+
+
+    def test_git_refuses_a_remote_before_it_dials():
+        said = _git("https://127.0.0.1:9/x")
+        assert "not allowed" in said, "GIT DIALLED THE REMOTE: " + said
+
+
+    def test_git_to_a_name_that_can_never_resolve_allowed():
+        _git("https://example.invalid/x")  # RFC 6761: an address asking to be unreachable
+
+
+    def test_git_handed_a_value_that_is_no_transport_allowed():
+        _git("--upload-pack=touch x;://x")  # what a guard against option injection hands git
+
+
     @pytest.mark.network
     def test_marked_allowed():
         try:
@@ -139,8 +172,11 @@ _PROBES = textwrap.dedent('''
             assert "not loopback" not in str(exc), str(exc)
 ''')
 
-REFUSED = ("test_connect_refused", "test_connect_ex_refused", "test_connect_swallowed")
-ALLOWED = ("test_loopback_v4_allowed", "test_loopback_v6_allowed",
+REFUSED = ("test_connect_refused", "test_connect_ex_refused", "test_connect_swallowed",
+           "test_git_remote_refused")
+ALLOWED = ("test_git_refuses_a_remote_before_it_dials",
+           "test_git_to_a_name_that_can_never_resolve_allowed",
+           "test_git_handed_a_value_that_is_no_transport_allowed", "test_loopback_v4_allowed", "test_loopback_v6_allowed",
            "test_localhost_by_name_allowed", "test_unix_socket_allowed", "test_marked_allowed")
 
 
@@ -186,8 +222,16 @@ def test_a_connection_to_a_non_loopback_address_fails_the_test(inner, probe):
 def test_the_refusal_names_the_test_the_address_and_the_marker(inner, probe):
     said = inner[probe]["said"]
     assert f"{PROBE}::{probe} " in said, said
-    assert f"{TARGET}:9" in said, said
+    where = "https://192.0.2.1/x" if "git" in probe else f"{TARGET}:9"
+    assert where in said, said
     assert MARKER in said, said
+
+
+def test_git_is_refused_the_remote_rather_than_left_to_wait_on_it(inner):
+    """The by-name failure says WHICH test ran a remote git; this says the git never dialled it, so
+    a test that swallows the error is red at once rather than after a 300 s timeout."""
+    said = inner["test_git_remote_refused"]["said"]
+    assert "GIT DIALLED THE REMOTE" not in said and "GIT WAITED" not in said, said
 
 
 @pytest.mark.parametrize("probe", ALLOWED)
@@ -199,7 +243,7 @@ def test_loopback_unix_sockets_and_a_marked_test_are_let_through(inner, probe):
 def test_the_refusal_is_one_sentence_naming_the_test_the_address_and_the_marker():
     from tests.conftest import network_refusal
 
-    sentence = network_refusal("tests/test_x.py::test_y", "203.0.113.7", 443)
+    sentence = network_refusal("tests/test_x.py::test_y", "203.0.113.7:443")
     assert "\n" not in sentence and sentence.endswith(".") and ". " not in sentence, sentence
     assert "tests/test_x.py::test_y" in sentence and "203.0.113.7:443" in sentence, sentence
     assert MARKER in sentence, sentence

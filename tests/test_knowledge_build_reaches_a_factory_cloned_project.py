@@ -22,6 +22,13 @@ from typer.testing import CliRunner
 from beeverforge.cli import app
 
 
+def _nothing_published_to_read(monkeypatch) -> None:
+    """The published bundle is read with a `git clone` of the context repository's URL, here a
+    made-up `github.com` one; None is what that failed clone answered, without dialling it (#335)."""
+    monkeypatch.setattr("beeverforge.knowledge.pipeline.fetch_published_bundle",
+                        lambda remote_url, *, subpath: None)
+
+
 @pytest.fixture
 def url_registered(tmp_path, monkeypatch):
     """A URL-registered project whose 'clone' the cache resolves to a real local repo."""
@@ -71,6 +78,7 @@ def test_publish_pushes_through_the_pipeline_and_reports_the_branch(url_register
         return True
 
     monkeypatch.setattr("beeverforge.knowledge.pipeline.publish_bundle", _publish)
+    _nothing_published_to_read(monkeypatch)
     monkeypatch.setattr("beeverforge.adapters.forge.registry.clone_url_for",
                         lambda p, r, token=None: "https://github.com/acme/demo-context.git")
     result = CliRunner().invoke(app, ["knowledge", "build", "demo", "--publish"])
@@ -85,6 +93,7 @@ def test_publish_pushes_through_the_pipeline_and_reports_the_branch(url_register
 def test_a_failed_publish_is_a_failure_not_a_shrug(url_registered, monkeypatch):
     monkeypatch.setattr("beeverforge.knowledge.pipeline.publish_bundle",
                         lambda *a, **kw: False)
+    _nothing_published_to_read(monkeypatch)
     monkeypatch.setattr("beeverforge.adapters.forge.registry.clone_url_for",
                         lambda p, r, token=None: "https://github.com/acme/demo-context.git")
     result = CliRunner().invoke(app, ["knowledge", "build", "demo", "--publish"])

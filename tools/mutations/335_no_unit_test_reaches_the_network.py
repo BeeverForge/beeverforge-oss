@@ -6,6 +6,12 @@ leaving `connect_ex` open, letting a swallowed refusal pass, and a sentence that
 the address or the marker. The proof is an inner pytest run of probe tests, so each cut is seen
 the way a real test would meet it.
 
+Then the git half, since the 300 s wait was a `git` SUBPROCESS no socket patch sees: git left free
+to dial a remote (no `GIT_ALLOW_PROTOCOL=file`), and a remote git run that no longer fails its test
+by name, or one that names a remote it could not reach (`.invalid`) or a value that is no
+transport at all. And #335's own case: the sweep test put back as it was on the base, cloning through the
+real `ProductModule.context`, must now fail rather than wait 300 s and pass.
+
 The last two rows are the sweep test's own claim, which had to survive losing its clone: the
 activity's call that drops `forge=`, and one that hands an Azure project's sweep a GitHub client.
 """
@@ -54,12 +60,50 @@ MUTATIONS = [
      'f"a test tried to connect'),
 
     ("the sentence no longer names the address", CONFTEST,
-     "tried to connect to {host}:{port}, which",
+     "tried to connect to {address}, which",
      "tried to connect to an address, which"),
 
     ("the sentence no longer names the marker that would allow it", CONFTEST,
      "@pytest.mark.{NETWORK}",
      "a marker"),
+
+    ("git is left free to dial a remote, so a swallowed clone waits on the internet again",
+     CONFTEST,
+     '    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")\n',
+     ""),
+
+    ("a remote git run is refused but no longer fails its test by name", CONFTEST,
+     '    refused += [network_refusal(request.node.nodeid, f"{_without_userinfo(url)} (git)")\n'
+     "                for url in urls if not _a_local_host(_a_remote_url_host(url))\n"
+     "                and not _never_resolves(_a_remote_url_host(url))]\n",
+     ""),
+
+    ("a `.invalid` remote, which can never resolve, fails its test as if it were the internet",
+     CONFTEST,
+     '    return host.rstrip(".").lower().endswith(".invalid")',
+     "    return False"),
+
+    ("a value shaped like an option counts as a remote, so a refused option fails its test",
+     CONFTEST,
+     "    file://*|-*) ;;",
+     "    file://*) ;;"),
+
+    ("#335 itself: the sweep test clones through the real context again, as on the base",
+     "tests/test_the_product_path_is_not_github_by_construction.py",
+     "    link = resolve_product_link(project=_ado_project(), manifest_docs_repo=DOCS_REPO, "
+     "docs=_docs())\n"
+     "    context = ProductContext(link=link, requirements_dir=\"reqs\")\n"
+     "    loads: list = []\n"
+     "    monkeypatch.setattr(product_module, \"load_product_context\",\n"
+     "                        lambda *a, **kw: loads.append((a, kw)) or context)\n"
+     "    monkeypatch.setattr(product_module.ProductModule, \"context\",\n"
+     "                        lambda self, *, refresh=False: context)\n"
+     "\n"
+     "    assert acts._land_product_proposals(_ado_project(), token=\"pat\") == []\n"
+     "    assert loads == [], \"the sweep test synced the documentation repository: a real clone\"\n"
+     "    assert seen.get(\"requirements_dir\") == \"reqs\", seen\n",
+     "    assert acts._land_product_proposals(_ado_project(), token=\"pat\") == []\n",
+     SWEEP_TEST),
 
     ("the hourly sweep runs without a forge again and lands nothing", ACTIVITIES,
      "            forge=module._forge(),\n",

@@ -214,7 +214,7 @@ def pack(made, root: Path, *, speaker: str = bed.YURI) -> str:
 
 
 @pytest.fixture
-def seen(made, tmp_path):
+def seen(made, tmp_path, a_remote_that_never_answers):
     """`(fields, problems, text)`: what the panel shows, what the guard could not read, and the
     role's files."""
     fields, problems = panel_fields(TestClient(panel.app, raise_server_exceptions=False))

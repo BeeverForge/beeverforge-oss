@@ -824,10 +824,10 @@ def _no_live_durable_engine(request, monkeypatch) -> None:
 NETWORK = "network"
 
 
-def network_refusal(nodeid: str, host: object, port: object) -> str:
-    """The one sentence a refused connection fails its test with: which test, which address, and
-    the two ways out."""
-    return (f"{nodeid} tried to connect to {host}:{port}, which is not loopback, so patch the "
+def network_refusal(nodeid: str, address: str) -> str:
+    """The one sentence a refused connection fails its test with: which test, which address (a
+    `host:port` or a git remote's URL), and the two ways out."""
+    return (f"{nodeid} tried to connect to {address}, which is not loopback, so patch the "
             f"call that reaches it or mark the test @pytest.mark.{NETWORK} if it must reach the "
             f"real network.")
 
@@ -849,8 +849,67 @@ def _a_local_host(host: object) -> bool:
     return ip.is_loopback or ip.is_unspecified
 
 
+#: THE GIT A REMOTE-REACHING SUBCOMMAND GOES THROUGH in a test without the marker: it writes every
+#: remote URL it is handed to the file `$BEEVERFORGE_TEST_GIT_REMOTES` names, then runs the real
+#: git. A `git@host:path` address counts too; a `file://` path does not, nor does a value shaped
+#: like an option, which a guard hands git to see it refused. Shell, not Python, because every git
+#: call of the suite pays for it.
+_GIT_SHIM = """#!/bin/sh
+sub=
+skip=
+for a in "$@"; do
+  if [ -z "$sub" ]; then
+    if [ -n "$skip" ]; then skip=; continue; fi
+    case "$a" in -c|-C) skip=1 ;; -*) ;; *) sub=$a ;; esac
+    continue
+  fi
+  case "$sub" in clone|fetch|ls-remote|pull|push|archive) ;; *) break ;; esac
+  case "$a" in
+    file://*|-*) ;;
+    *://*|?*@?*:*) [ -n "$BEEVERFORGE_TEST_GIT_REMOTES" ] &&
+                   printf '%s\\n' "$a" >> "$BEEVERFORGE_TEST_GIT_REMOTES" ;;
+  esac
+done
+exec '{real}' "$@"
+"""
+
+
+@pytest.fixture(scope="session")
+def _a_git_that_names_its_remotes(tmp_path_factory) -> str | None:
+    """The directory holding the `_GIT_SHIM`, put first on `PATH`; None on a machine with no git."""
+    real = shutil.which("git")
+    if real is None:
+        return None
+    where = tmp_path_factory.mktemp("git-shim")
+    shim = where / "git"
+    shim.write_text(_GIT_SHIM.replace("{real}", real.replace("'", "'\\''")), encoding="utf-8")
+    shim.chmod(0o755)
+    return str(where)
+
+
+def _a_remote_url_host(url: str) -> str:
+    """The host of a git remote, `https://u:p@h:1/x` or `u@h:x`, so a loopback one is let through."""
+    from urllib.parse import urlsplit
+
+    if "://" in url:
+        return urlsplit(url).hostname or ""
+    return url.split("@", 1)[-1].split(":", 1)[0]
+
+
+def _never_resolves(host: str) -> bool:
+    """A name under `.invalid`, which RFC 6761 reserves so that it never resolves: a test naming
+    one is asking for a remote that cannot be reached, and git refuses it here before any lookup."""
+    return host.rstrip(".").lower().endswith(".invalid")
+
+
+def _without_userinfo(url: str) -> str:
+    """A URL as a refusal may print it: a token before the `@` is not repeated in a test report."""
+    head, sep, rest = url.partition("://")
+    return head + sep + rest.split("@", 1)[-1] if sep else url
+
+
 @pytest.fixture(autouse=True)
-def _no_unit_test_reaches_the_network(request, monkeypatch):
+def _no_unit_test_reaches_the_network(request, monkeypatch, _a_git_that_names_its_remotes):
     """No test may open a connection to a non-loopback address unless it carries
     `@pytest.mark.network` (#335).
 
@@ -859,9 +918,14 @@ def _no_unit_test_reaches_the_network(request, monkeypatch):
     plain socket, so a unit test that reached the internet was found only by somebody timing it.
 
     AT `socket.socket.connect`, the class attribute, so `ssl` and `asyncio` go through it too.
-    Loopback and AF_UNIX pass: they are the suite's own servers and the Docker daemon. A SUBPROCESS
-    (`git clone`, `gh`) and the Rust core under `temporalio` open their sockets outside Python and
-    are NOT covered; a test that reaches one of those is fixed at its seam, as that sweep test was.
+    Loopback and AF_UNIX pass: they are the suite's own servers and the Docker daemon.
+
+    AND AT GIT, because that 300 s wait was a `git ls-remote` SUBPROCESS, which no socket patch
+    sees. `GIT_ALLOW_PROTOCOL=file` overrides the `-c protocol.*` pin (`beeverforge/gitpin.py`), so
+    git refuses a remote at once (`fatal: transport 'https' not allowed`), and the `_GIT_SHIM` first
+    on `PATH` records the URL so the test fails by name. A git run with an `env=` that drops the
+    environment, a fetch of a remote given by NAME rather than URL (refused, not named), and every
+    other subprocess (`gh`, `curl`, `docker`) and the Rust core under `temporalio` are NOT covered.
 
     A REFUSAL ALSO FAILS THE TEST AT TEARDOWN, because the code it is written for swallows errors:
     the activity that cloned catches every `Exception`, so a raise alone would have stayed green."""
@@ -870,6 +934,14 @@ def _no_unit_test_reaches_the_network(request, monkeypatch):
         return
     import socket
 
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    remotes = None
+    if _a_git_that_names_its_remotes:
+        remotes = Path(_a_git_that_names_its_remotes) / "remotes"
+        remotes.unlink(missing_ok=True)
+        monkeypatch.setenv("BEEVERFORGE_TEST_GIT_REMOTES", str(remotes))
+        monkeypatch.setenv("PATH", _a_git_that_names_its_remotes + os.pathsep
+                           + os.environ.get("PATH", ""))
     refused: list[str] = []
     real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
 
@@ -878,7 +950,7 @@ def _no_unit_test_reaches_the_network(request, monkeypatch):
             return
         if _a_local_host(address[0]):
             return
-        sentence = network_refusal(request.node.nodeid, address[0], address[1])
+        sentence = network_refusal(request.node.nodeid, f"{address[0]}:{address[1]}")
         refused.append(sentence)
         raise ConnectionRefusedError(sentence)
 
@@ -893,8 +965,23 @@ def _no_unit_test_reaches_the_network(request, monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", _connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
     yield
+    urls = remotes.read_text(encoding="utf-8").split() if remotes and remotes.exists() else []
+    refused += [network_refusal(request.node.nodeid, f"{_without_userinfo(url)} (git)")
+                for url in urls if not _a_local_host(_a_remote_url_host(url))
+                and not _never_resolves(_a_remote_url_host(url))]
     if refused:
         pytest.fail(refused[0], pytrace=False)
+
+
+@pytest.fixture
+def a_remote_that_never_answers(monkeypatch):
+    """For a test whose code syncs a repository it names but never stands up (`a/docs`,
+    `forge.example/...`): `RepoCache.sync` answers None, which is what it answered when the clone of
+    that made-up remote failed, so the test reads as it did without dialling anybody's forge (#335).
+    A test whose SUBJECT is the cache failing must not use this; it fails the cache for real."""
+    from beeverforge.runtime.repo_cache import RepoCache
+
+    monkeypatch.setattr(RepoCache, "sync", lambda self, project, clone_url, base_branch="": None)
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

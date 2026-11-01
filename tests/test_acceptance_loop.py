@@ -179,6 +179,7 @@ def test_the_announcement_ASKS_rather_than_declaring_victory(wired, monkeypatch)
     assert "não quero dar como resolvido" in said, "no exit offered — that is a chase, not a check"
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_delivery_loop_still_closes_so_it_is_never_announced_twice(wired, monkeypatch):
     """Two cards' transitions, or the door's converge applying one again: the second finds the
     delivery closed, and the weekly sweep that ran after them says nothing either."""
@@ -282,6 +283,7 @@ def test_a_yes_on_a_PENDING_DRAFT_still_confirms_the_draft(wired, monkeypatch):
     assert noted == ["erp"], "the pending draft lost its confirmation to the acceptance path"
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_an_unanswered_acceptance_is_chased_once_and_never_auto_closed(wired):
     """It stays open until a person answers. Time closing it would turn 'nobody replied' into
     'the client accepted', which is the most expensive lie this system could tell."""
@@ -377,6 +379,7 @@ def test_the_judge_reads_did_not_work_before_worked():
 
 
 # ── 5b. the sweep must not spend the production rate limit from a test ────────────────────────
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_sweep_reaches_the_landing_step_through_the_faked_seam(wired):
     """Reach-proofing the fixture itself. The sweep's proposal-landing step runs on every pass; if
     it stops routing through `authoring.land_open_proposals` (or the fixture stops patching it),

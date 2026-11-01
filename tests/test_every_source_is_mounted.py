@@ -255,6 +255,9 @@ def _secret_server(where: Path, monkeypatch) -> tuple[http.server.HTTPServer, st
             return
 
     cert, key = _certificate(where)
+    # THIS FORGE IS ON LOOPBACK, so git may speak https to it: the suite refuses every transport
+    # but `file` by default and names any non-loopback remote a test reaches (#335).
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:https")
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     monkeypatch.setenv("GIT_SSL_CAINFO", str(cert))
@@ -335,7 +338,9 @@ def test_a_source_the_credential_may_not_read_is_named_as_not_authorised(bed, tm
     assert "`src/harbourline-tracking/`" not in prompt
 
 
-def test_a_source_whose_forge_cannot_be_reached_is_named_as_unreachable(bed):
+def test_a_source_whose_forge_cannot_be_reached_is_named_as_unreachable(bed, monkeypatch):
+    # A closed port ON LOOPBACK, so git must be let speak https to find it closed (#335).
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:https")
     bed.urls["harbourline-web"] = f"https://127.0.0.1:{_closed_port()}/acme/web.git"
     harness = _Recording()
     bed.module(agent=harness).answer("what does the quote page show?")

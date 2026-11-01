@@ -523,6 +523,11 @@ def test_preflight_degrades_visibly_when_the_repo_is_unreachable(monkeypatch):
     import beeverforge.factory as factory_mod
     import beeverforge.runtime.boxed_job as ep_mod
     monkeypatch.setattr(ep_mod, "clone_url", lambda repo, token: "/definitely/does/not/exist")
+    # THE URL THE PREFLIGHT CLONES COMES FROM `clone_url_for` NOW, so the patch above no longer
+    # reached it and the clone went to github.com/o/app (#335); it is pointed at nothing here too.
+    import beeverforge.adapters.forge.registry as registry_mod
+    monkeypatch.setattr(registry_mod, "clone_url_for",
+                        lambda project, repo="", *, token=None: "/definitely/does/not/exist")
     monkeypatch.setattr(bot_mod, "forge_token", lambda: None)
     monkeypatch.setattr(factory_mod, "github_app_token_from_env", lambda: None)
 
