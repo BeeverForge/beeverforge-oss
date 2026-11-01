@@ -90,6 +90,40 @@ def test_a_shape_another_worker_built_is_read_not_built_again(tmp_path):
     assert _git(two, "rev-parse", "HEAD") == _git(one, "rev-parse", "HEAD")
 
 
+def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path):
+    """A worker killed in the middle of a manifest write left it truncated: the next ask for the
+    shape builds it again, instead of every later request failing on the JSON."""
+    built: list[Path] = []
+
+    def build(where, env):
+        built.append(where)
+        _one_commit(where, env)
+
+    one = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "one", build)
+    [manifest] = (tmp_path / "bed").glob("*/manifest.json")
+    manifest.write_text(manifest.read_text(encoding="utf-8")[:20], encoding="utf-8")
+
+    two = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "two", build)
+
+    assert len(built) == 2, "the shape behind a truncated manifest was not built again"
+    assert _git(two, "rev-parse", "HEAD") == _git(one, "rev-parse", "HEAD")
+    assert Bed(tmp_path / "bed").copy("one-commit", tmp_path / "three", build).is_dir()
+    assert len(built) == 2, "the rebuilt manifest was not read by the next worker"
+
+
+def test_a_manifest_is_written_whole_or_not_at_all(tmp_path, monkeypatch):
+    """A worker killed before its manifest is in place leaves none, never a part of one: the
+    manifest is written beside itself and moved into place in one step."""
+    def killed(*_args, **_kw):
+        raise KeyboardInterrupt("the worker was killed")
+
+    monkeypatch.setattr(os, "replace", killed)
+    with pytest.raises(KeyboardInterrupt):
+        Bed(tmp_path / "bed").copy("one-commit", tmp_path / "one", _one_commit)
+
+    assert not list((tmp_path / "bed").glob("*/manifest.json")), "a part-written manifest is left"
+
+
 def test_a_copy_is_the_shape_and_not_the_template(tmp_path):
     """A commit in one copy reaches neither the next copy nor the template."""
     bed = Bed(tmp_path / "bed")

@@ -133,16 +133,30 @@ class Bed:
         self.root.mkdir(parents=True, exist_ok=True)
         with open(self.root / f"{slug}.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if manifest.is_file():
-                made = json.loads(manifest.read_text(encoding="utf-8"))
-                template = _Template(root=where, print_=tuple(tuple(e) for e in made["print"]),
-                                     texts=made["texts"])
-            else:
+            template = self._read(manifest, where)
+            if template is None:
                 template = self._build(name, build, home, where)
-                manifest.write_text(json.dumps({"name": name, "print": template.print_,
-                                                "texts": template.texts}), encoding="utf-8")
+                # WRITTEN WHOLE OR NOT AT ALL: beside itself, then moved into place in one step,
+                # so a worker killed mid-write leaves no manifest and the next ask builds again.
+                part = home / "manifest.json.part"
+                part.write_text(json.dumps({"name": name, "print": template.print_,
+                                            "texts": template.texts}), encoding="utf-8")
+                os.replace(part, manifest)
         self._shapes[name] = template
         return template
+
+    @staticmethod
+    def _read(manifest: Path, where: Path) -> _Template | None:
+        """The template another process recorded in `manifest`, or None when there is none or it
+        does not parse (one a killed worker left truncated), so the shape is built again."""
+        try:
+            made = json.loads(manifest.read_text(encoding="utf-8"))
+            return _Template(root=where, print_=tuple(tuple(e) for e in made["print"]),
+                             texts=list(made["texts"]))
+        except FileNotFoundError:
+            return None
+        except (ValueError, KeyError, TypeError):  # truncated or not the shape's: build it again
+            return None
 
     def _build(self, name: str, build: Build, home: Path, where: Path) -> _Template:
         shutil.rmtree(home, ignore_errors=True)

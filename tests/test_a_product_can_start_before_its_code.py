@@ -99,8 +99,9 @@ def _start_before_its_code(where: Path, env) -> None:
     """What `started` holds: `myapp` started before its code through the row, `ana` its owner."""
     where.mkdir()
     _deployed(where, env)
-    # the checkouts the row makes are the build's own, never the worker's cache the tests share
-    env.setenv("BEEVERFORGE_REPO_CACHE", str(where.with_name("checkouts")))
+    # the checkouts the row makes are the build's own, never the worker's cache the tests share,
+    # and inside the template: fingerprinted with it, and a copy's paths into it are its own
+    env.setenv("BEEVERFORGE_REPO_CACHE", str(where / "checkouts"))
     out = _act("product_start", project="myapp", docs_repo=CONTEXT)
     assert out.ok, out.message
     path = where / "registry.yaml"
@@ -113,7 +114,7 @@ def _registered_with_its_code(where: Path, env) -> None:
     """`myapp` registered with its code, through `project init` over a person's repository."""
     where.mkdir()
     _deployed(where, env)
-    env.setenv("BEEVERFORGE_REPO_CACHE", str(where.with_name("checkouts")))
+    env.setenv("BEEVERFORGE_REPO_CACHE", str(where / "checkouts"))
     assert om.cli("project", "init", "myapp", str(om.a_repository(where)))[0] == 0
 
 

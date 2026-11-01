@@ -2,15 +2,16 @@
 `tests/` does not grow back (#337, slice 4 of the suite-cost audit): every guard the bed claims,
 cut one at a time.
 
-ROWS 1-6 ARE THE BED: a changed template handed out again (the check before a copy gone), never
+ROWS 1-8 ARE THE BED: a changed template handed out again (the check before a copy gone), never
 caught at the end of the session (`verify_all` a no-op), the template itself handed out, a shape
-built again by the next worker (the manifest never read), a copy left naming the template's path,
-and a binary file naming it let through.
+built again by the next worker (the manifest never read), a truncated manifest failing every later
+ask, a manifest written in place, a copy left naming the template's path, and a binary file naming
+it let through.
 
-ROWS 7-8 ARE THE SESSION: the fixture's check at the end of the session gone, and the build's
+ROWS 9-10 ARE THE SESSION: the fixture's check at the end of the session gone, and the build's
 direct writes to `os.environ` left in the test that built the shape.
 
-ROWS 9-19 ARE THE COUNT: each form the counter reads dropped (a `["git", ..., "init"]` list, a git
+ROWS 11-21 ARE THE COUNT: each form the counter reads dropped (a `["git", ..., "init"]` list, a git
 helper given `"init"`, a git helper given a list, a command line in a string), the subcommand read
 past an option or as any argument, a docstring counted, the bed and its guard counted, the text
 filter too narrow to let a command line through, and the line moved by one or turned round.
@@ -40,8 +41,17 @@ MUTATIONS = [
      "        return template.root"),
 
     ("a shape another worker built is built again: the manifest is never read", BED,
-     "            if manifest.is_file():",
-     "            if False:"),
+     "            template = self._read(manifest, where)\n",
+     "            template = None\n"),
+
+    ("a manifest a killed worker left truncated fails every later ask instead of a rebuild", BED,
+     "        except (ValueError, KeyError, TypeError):  # truncated or not the shape's: build it again\n"
+     "            return None\n",
+     ""),
+
+    ("the manifest is written in place, so a worker killed mid-write leaves a part of one", BED,
+     '                part = home / "manifest.json.part"\n',
+     "                part = manifest\n"),
 
     ("a copy keeps the template's path in its remote URL and its text files", BED,
      "        for rel in template.texts:",
