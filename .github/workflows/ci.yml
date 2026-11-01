@@ -66,7 +66,7 @@ jobs:
           # selection a second time to learn what these four already executed. Each slice writes
           # one data file and is held to nothing; the job named `test` holds the four combined.
           # Empty on a pull request: the Makefile reads an empty TEST_COVERAGE as unset.
-          TEST_COVERAGE: ${{ github.event_name == 'push' && '1' || '' }}
+          TEST_COVERAGE: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '1' || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -77,7 +77,7 @@ jobs:
       # red below the floor. `error` when a passing slice wrote nothing, or the floor would be held
       # over three slices' data as if it were four.
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'pull_request')
         with:
           name: coverage-unit-${{ matrix.shard }}
           path: ${{ runner.temp }}/beeverforge-coverage/
@@ -136,13 +136,13 @@ jobs:
       # data, combined, against `fail_under` in pyproject.toml. Only coverage.py is needed to read
       # it, not the suite's dependencies, at the floor pytest-cov 7.1 itself requires. Skipped
       # when a slice failed: that job's own red already names the failure.
-      - if: github.event_name == 'push' && needs.unit.result == 'success'
+      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'
         run: pip install 'coverage>=7.10.6'
       - uses: actions/download-artifact@v4
-        if: github.event_name == 'push' && needs.unit.result == 'success'
+        if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'
         with:
           pattern: coverage-unit-*
           path: ${{ runner.temp }}/beeverforge-coverage
           merge-multiple: true
-      - if: github.event_name == 'push' && needs.unit.result == 'success'
+      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'
         run: make coverage-report

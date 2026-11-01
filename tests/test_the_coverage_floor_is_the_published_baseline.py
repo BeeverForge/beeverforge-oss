@@ -183,6 +183,7 @@ def test_every_unit_slice_measures_and_hands_its_data_to_the_test_job():
     assert download["with"].get("merge-multiple") is True
 
 
+@pytest.mark.skip(reason="TEMPORARY (#344 review): CI measures on pull requests for 2-3 runs to set the floor from CI; reverted before merge")
 def test_a_push_to_main_is_measured_and_held_and_a_pull_request_is_neither():
     """The choice made for #334: measuring costs the unit tests 1.4x to 1.9x their wall clock, so a
     pull request is not slowed by it, and the floor is held on every push to main — right after
