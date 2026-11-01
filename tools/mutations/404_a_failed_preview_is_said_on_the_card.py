@@ -47,6 +47,6 @@ MUTATIONS = [
      "    if(first && first.url) location.assign(safeUrl(first.url));",
      "    if(false) location.assign(safeUrl(first.url));"),
     ("the comment's route is not served", APP,
-     '@app.get("/p/{project}/preview/{ref}")\n',
+     '@app.get("/p/{project}/preview/{ref:path}")\n',
      ""),
 ]
