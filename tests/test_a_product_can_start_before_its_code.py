@@ -42,12 +42,21 @@ import yaml
 from beeverforge import actions
 from beeverforge.actions import base, catalog
 from beeverforge.actions.base import Actor
+from tests import the_git_bed
 
 sys.path.insert(0, "tests")
 import one_machine as om  # noqa: E402
 
 ADMIN = Actor(id="ana", display="ana", via="cli", admin=True)
 CONTEXT = "myapp-context"
+#: Who commits on this machine: every test here, and every bed shape built for them.
+IDENTITY = (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+            ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t"))
+
+#: The worker's repository bed (`tests/the_git_bed.py`), this module's fixture as well. The
+#: deployments below are its shapes, built once through the real rows and copied into each test's
+#: own deployment.
+git_bed = the_git_bed.git_bed
 
 
 def _act(name: str, **params):
@@ -58,15 +67,54 @@ def _git(*args, cwd=None) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 
 
+def _deployed(root: Path, monkeypatch) -> Path:
+    """One machine at `root` and nothing registered: a registry, a board file and an operator
+    home, committing as `t`."""
+    monkeypatch.setenv("HOME", str(root))
+    om.a_deployment(root, monkeypatch=monkeypatch)
+    for key, value in IDENTITY:
+        monkeypatch.setenv(key, value)
+    return root
+
+
 @pytest.fixture
 def deployment(tmp_path, monkeypatch):
     """One machine and nothing registered: a registry, a board file and an operator home."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    om.a_deployment(tmp_path, monkeypatch=monkeypatch)
-    for key, value in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
-                       ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
-        monkeypatch.setenv(key, value)
-    return tmp_path
+    return _deployed(tmp_path, monkeypatch)
+
+
+def _a_repository(bed: the_git_bed.Bed, root: Path) -> Path:
+    """`om.a_repository(root)`, copied from the bed: a person's own repository at
+    `root / "myapp"` — `main`, one commit, no remote anywhere."""
+    def build(where: Path, env) -> None:
+        for key, value in IDENTITY:
+            env.setenv(key, value)
+        om.a_repository(where)
+
+    bed.copy("a-persons-repository", root, build)
+    return root / "myapp"
+
+
+def _start_before_its_code(where: Path, env) -> None:
+    """What `started` holds: `myapp` started before its code through the row, `ana` its owner."""
+    where.mkdir()
+    _deployed(where, env)
+    # the checkouts the row makes are the build's own, never the worker's cache the tests share
+    env.setenv("BEEVERFORGE_REPO_CACHE", str(where.with_name("checkouts")))
+    out = _act("product_start", project="myapp", docs_repo=CONTEXT)
+    assert out.ok, out.message
+    path = where / "registry.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["projects"]["myapp"]["product"]["admins"] = ["ana"]
+    path.write_text(yaml.safe_dump(data))
+
+
+def _registered_with_its_code(where: Path, env) -> None:
+    """`myapp` registered with its code, through `project init` over a person's repository."""
+    where.mkdir()
+    _deployed(where, env)
+    env.setenv("BEEVERFORGE_REPO_CACHE", str(where.with_name("checkouts")))
+    assert om.cli("project", "init", "myapp", str(om.a_repository(where)))[0] == 0
 
 
 def _registry(root: Path) -> dict:
@@ -85,14 +133,11 @@ def _context_file(root: Path, rel: str) -> str:
 
 
 @pytest.fixture
-def started(deployment):
-    """`myapp`, started before its code through the row, with `ana` its product owner."""
-    out = _act("product_start", project="myapp", docs_repo=CONTEXT)
-    assert out.ok, out.message
-    path = deployment / "registry.yaml"
-    data = yaml.safe_load(path.read_text())
-    data["projects"]["myapp"]["product"]["admins"] = ["ana"]
-    path.write_text(yaml.safe_dump(data))
+def started(deployment, git_bed):
+    """`myapp`, started before its code through the row, with `ana` its product owner: the row ran
+    once for the run (`_start_before_its_code`), and this deployment holds a copy of what it
+    wrote — the registry and the context repository the local forge owns."""
+    git_bed.copy("started-before-its-code", deployment, _start_before_its_code)
     return deployment
 
 
@@ -317,9 +362,11 @@ def test_every_row_that_does_not_need_the_code_runs_for_one(started, spied, name
 
 
 @pytest.mark.parametrize("name", WAITING)
-def test_a_project_with_code_is_never_refused_for_it(deployment, spied, name):
+def test_a_project_with_code_is_never_refused_for_it(deployment, spied, name, git_bed):
+    """`project init` over a person's repository ran once for the run, its exit code asserted
+    there (`_registered_with_its_code`); this deployment holds a copy of what it wrote."""
     ran, spy = spied
-    assert om.cli("project", "init", "myapp", str(om.a_repository(deployment)))[0] == 0
+    git_bed.copy("registered-with-its-code", deployment, _registered_with_its_code)
     spy(name)
     out = _act(name, **_params(catalog.CATALOG[name], "myapp"))
 
@@ -459,14 +506,14 @@ def test_a_product_starts_with_its_context_and_no_code(deployment):
     assert declared["product"] == "myapp" and declared["sources"] == []
 
 
-def test_starting_it_again_finds_it_and_starting_one_with_code_is_refused(started):
+def test_starting_it_again_finds_it_and_starting_one_with_code_is_refused(started, git_bed):
     again = _act("product_start", project="myapp", docs_repo=CONTEXT)
     assert again.ok and not again.data["registered"], again.message
 
     elsewhere = _act("product_start", project="myapp", docs_repo="another-context")
     assert elsewhere.code == base.CONFLICT and "product declare" in elsewhere.message
 
-    assert om.cli("project", "add", "theirs", str(om.a_repository(started / "c")))[0] == 0
+    assert om.cli("project", "add", "theirs", str(_a_repository(git_bed, started / "c")))[0] == 0
     coded = _act("product_start", project="theirs", docs_repo="theirs-context")
     assert coded.code == base.CONFLICT and "already registered with its code" in coded.message
 
@@ -609,13 +656,13 @@ def test_the_worker_reports_the_wait_as_the_module_said_it_and_files_no_front_as
 
 # ── the doors that are not rows yet ─────────────────────────────────────────────────────────────
 
-def test_pickup_leaves_it_off_the_poll_list(started, caplog):
+def test_pickup_leaves_it_off_the_poll_list(started, caplog, git_bed):
     import logging
 
     from beeverforge.runtime.temporal import activities
 
     caplog.set_level(logging.INFO)
-    assert om.cli("project", "init", "theirs", str(om.a_repository(started / "c")))[0] == 0
+    assert om.cli("project", "init", "theirs", str(_a_repository(git_bed, started / "c")))[0] == 0
     polled = [row["project"] for row in asyncio.run(activities.scan_projects())]
 
     assert "myapp" not in polled and "theirs" in polled
@@ -677,14 +724,14 @@ def test_the_readiness_check_answers_for_it_and_holds_on_the_state_once(started)
 # ── 4. the first source ─────────────────────────────────────────────────────────────────────────
 
 def test_the_first_source_is_listed_and_recorded_and_the_breakdown_needs_no_other_step(
-        started, engine):
+        started, engine, git_bed):
     from beeverforge.contracts.project import before_its_code
     from beeverforge.product.loader import load_product_context
     from beeverforge.registry import ProjectRegistry
 
     _write_requirement(started, 1)
     assert _act("product_accept", project="myapp", number="1", yes=True).ok
-    repo = om.a_repository(started / "code")
+    repo = _a_repository(git_bed, started / "code")
     out = _act("product_first_source", project="myapp", repo_path=str(repo))
 
     assert out.ok and out.data["listed_now"] and out.data["waiting"] == [1], out.message
@@ -704,8 +751,8 @@ def test_the_first_source_is_listed_and_recorded_and_the_breakdown_needs_no_othe
     assert engine[-1] == ("myapp", 2, False), "an acceptance did not file its own cards"
 
 
-def test_a_first_source_is_given_once(started):
-    repo = om.a_repository(started / "code")
+def test_a_first_source_is_given_once(started, git_bed):
+    repo = _a_repository(git_bed, started / "code")
     assert _act("product_first_source", project="myapp", repo_path=str(repo)).ok
     tip = _git("--git-dir", _context_path(), "rev-parse", "main").stdout
     again = _act("product_first_source", project="myapp", repo_path=str(started / "other"))
@@ -738,20 +785,20 @@ def test_the_registry_gives_a_project_its_code_once(deployment):
     assert (deployment / "registry.yaml").read_text() == written
 
 
-def test_a_context_that_cannot_be_written_leaves_the_registry_as_it_was(started):
+def test_a_context_that_cannot_be_written_leaves_the_registry_as_it_was(started, git_bed):
     """The context first, then the registry: a registry naming code its `sources:` does not list
     would turn the product role off as a membership conflict."""
     import shutil
 
     shutil.rmtree(_context_path())
     out = _act("product_first_source", project="myapp",
-               repo_path=str(om.a_repository(started / "code")))
+               repo_path=str(_a_repository(git_bed, started / "code")))
 
     assert out.code == base.UNAVAILABLE and "nothing was written" in out.message, out.message
     assert _registry(started)["myapp"]["repo_path"] == ""
 
 
-def test_a_context_that_already_lists_it_is_not_written_again(started):
+def test_a_context_that_already_lists_it_is_not_written_again(started, git_bed):
     """The scaffold's way: whatever made the repository listed it first — in its own spelling —
     and the act records it in the registry without a second commit."""
     work = started / "scaffold"
@@ -763,7 +810,7 @@ def test_a_context_that_already_lists_it_is_not_written_again(started):
     tip = _git("--git-dir", _context_path(), "rev-parse", "main").stdout
 
     out = _act("product_first_source", project="myapp",
-               repo_path=str(om.a_repository(started / "code")))
+               repo_path=str(_a_repository(git_bed, started / "code")))
 
     assert out.ok and not out.data["listed_now"], out.message
     assert _git("--git-dir", _context_path(), "rev-parse", "main").stdout == tip
@@ -774,7 +821,7 @@ def test_a_context_that_already_lists_it_is_not_written_again(started):
                                           (["clienta-web", "MyApp"], True)],
                          ids=["lists-others", "lists-others-and-it"])
 def test_a_context_that_lists_other_sources_admits_the_first_source_only_when_it_lists_it(
-        started, others, found):
+        started, others, found, git_bed):
     """One declaration per act (review of 9f18a788): a product that has sources admits another
     repository when its context lists it — written there by whoever writes the context — and is
     never given one by the act that also registers it. Until then the role stays off, since a
@@ -787,7 +834,7 @@ def test_a_context_that_lists_other_sources_admits_the_first_source_only_when_it
     assert (before.active, before.kind) == (False, "conflict"), before.reason
 
     out = _act("product_first_source", project="myapp",
-               repo_path=str(om.a_repository(started / "code")))
+               repo_path=str(_a_repository(git_bed, started / "code")))
 
     assert _git("--git-dir", _context_path(), "rev-parse", "main").stdout == tip
     if found:
