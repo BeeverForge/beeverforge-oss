@@ -6,13 +6,14 @@ nothing could hold that rule without a number: a test could be deleted and nobod
 it had been the only one to reach.
 
 THE RULES THIS FILE HOLDS:
-  1. docs/STATUS.md publishes the baseline (line, branch, total, the commit it was measured on),
-     and its TOTAL is `fail_under` in pyproject.toml — the one place the floor is read. Editing one
-     without the other is red here, so a stale baseline cannot be a green one;
+  1. docs/STATUS.md publishes what CI measured (line, branch, total, the commit it was measured on)
+     and the FLOOR set from it, which is `fail_under` in pyproject.toml — the one place the floor
+     is read — and sits just under the measured total. Editing one without the other is red here,
+     so a stale baseline cannot be a green one;
   2. the floor measures `beeverforge/` alone, with branches;
   3. CI measures in every unit slice and holds the COMBINED data to the floor, in the job the
-     rulesets know (`test`) — on pushes to main only, never on a pull request (measuring costs the
-     unit tests 1.4x to 1.9x their wall clock); no slice is held to the whole suite's floor alone;
+     rulesets know (`test`) — on pushes to main only, never on a pull request (measuring costs a
+     unit slice 1.1x to 2.1x its time on the runners); no slice is held to the whole floor alone;
   4. below the floor the report fails, with coverage.py's sentence naming the figure and the floor,
      and ours naming the remedy — run for real, over a measurement of one import.
 """
@@ -34,25 +35,31 @@ ROOT = Path(__file__).resolve().parent.parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 STATUS = ROOT / "docs" / "STATUS.md"
 
-#: The sentence on docs/STATUS.md that carries the baseline. Its three figures are read in order,
-#: and the commit after them is the one they were measured on. `\s+` between words, because the
-#: page is prose wrapped at 100 columns and a re-wrap must not read as a missing baseline.
+#: The sentence on docs/STATUS.md that carries the measurement CI made. Its three figures are read
+#: in order, the commit after them is the code they were measured on, and the floor after that is
+#: the one set from them. `\s+` between words, because the page is prose wrapped at 100 columns
+#: and a re-wrap must not read as a missing baseline.
 BASELINE = re.compile(
-    r"coverage\s+of\s+`beeverforge/`.*?line\s+\*\*(\d+\.\d{2})%\*\*,\s+branch\s+"
-    r"\*\*(\d+\.\d{2})%\*\*,\s+total\s+\*\*(\d+\.\d{2})%\*\*.*?measured\s+on\s+"
-    r"`([0-9a-f]{7,40})`", re.S | re.I)
+    r"coverage\s+of\s+`beeverforge/`.*?line\s+\*\*(\d+\.\d{2,4})%\*\*,\s+branch\s+"
+    r"\*\*(\d+\.\d{2,4})%\*\*,\s+total\s+\*\*(\d+\.\d{2,4})%\*\*.*?measured\s+on\s+"
+    r"`([0-9a-f]{7,40})`.*?floor\s+\*\*(\d+\.\d{2})%\*\*", re.S | re.I)
+
+#: How far under the measured total a floor may sit. The floor is the measurement less the spread
+#: CI showed between two attempts (0.0090 points when it was set); a floor a tenth of a point or
+#: more under the figure it claims to come from lets a hundred lines go untested, and is stale.
+LEEWAY = 0.1
 
 
 def _coverage_config() -> dict:
     return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["coverage"]
 
 
-def _published() -> tuple[float, float, float, str]:
+def _published() -> tuple[float, float, float, str, float]:
     found = BASELINE.search(STATUS.read_text(encoding="utf-8"))
     assert found, ("docs/STATUS.md no longer publishes the coverage baseline (line, branch and total "
-                   "of `beeverforge/`, and the commit they were measured on)")
-    line, branch, total, sha = found.groups()
-    return float(line), float(branch), float(total), sha
+                   "of `beeverforge/`, the commit they were measured on, and the floor set from them)")
+    line, branch, total, sha, floor = found.groups()
+    return float(line), float(branch), float(total), sha, float(floor)
 
 
 def _make_n(*args: str) -> str:
@@ -65,20 +72,33 @@ def _make_n(*args: str) -> str:
 
 # ── 1. the published figure is the floor ────────────────────────────────────────────────────────
 
-def test_the_total_status_publishes_is_the_floor_pyproject_holds():
-    _, _, total, _ = _published()
+def test_the_floor_status_publishes_is_the_floor_pyproject_holds():
+    *_, published = _published()
     floor = _coverage_config()["report"].get("fail_under")
 
-    assert floor == total, (
-        f"docs/STATUS.md publishes a coverage total of {total:.2f}% and pyproject.toml's "
+    assert floor == published, (
+        f"docs/STATUS.md publishes a coverage floor of {published:.2f}% and pyproject.toml's "
         f"[tool.coverage.report] fail_under is {floor} — the floor CI holds and the figure the page "
         f"states have parted; edit both in the pull request that moved one")
+
+
+def test_the_floor_sits_just_under_the_measurement_it_was_set_from():
+    """At or under the measured total, or the first run of the same code is red; and less than
+    LEEWAY under it, or the floor is a figure from some other, older tree."""
+    *_, total, _, floor = _published()
+
+    assert floor <= total, (
+        f"the floor ({floor:.2f}%) is above the total CI measured ({total}%): the code that was "
+        f"measured fails it")
+    assert total - floor < LEEWAY, (
+        f"the floor ({floor:.2f}%) sits {total - floor:.4f} points under the total it was set from "
+        f"({total}%): set it from a fresh measurement less the spread CI showed")
 
 
 def test_the_published_figures_are_a_measurement_and_not_a_typo():
     """A total is the lines and branches counted together, so it lies between the two — a total
     outside them was typed, not measured. And the commit is one this history holds."""
-    line, branch, total, sha = _published()
+    line, branch, total, sha, _ = _published()
 
     assert 0 < min(line, branch) <= total <= max(line, branch) <= 100, (
         f"line {line}%, branch {branch}%, total {total}%: a total of lines and branches lies "
@@ -184,7 +204,7 @@ def test_every_unit_slice_measures_and_hands_its_data_to_the_test_job():
 
 
 def test_a_push_to_main_is_measured_and_held_and_a_pull_request_is_neither():
-    """The choice made for #334: measuring costs the unit tests 1.4x to 1.9x their wall clock, so a
+    """The choice made for #334: measuring costs a unit slice 1.1x to 2.1x its time on CI, so a
     pull request is not slowed by it, and the floor is held on every push to main — right after
     each merge, where a red names the merge that lowered it. Judged by evaluating each condition on
     both events, so a rewording that means the same stays green and one that does not is red."""
@@ -201,7 +221,7 @@ def test_a_push_to_main_is_measured_and_held_and_a_pull_request_is_neither():
                                   if _holds(cond, "pull_request"))
     assert not on_for_pull_requests, (
         f"on a pull request the coverage steps {on_for_pull_requests} run: every pull request pays "
-        f"the 1.4x to 1.9x of the unit wall clock the measurement costs")
+        f"the 1.1x to 2.1x per unit slice the measurement costs")
 
 
 def test_the_condition_reader_judges_both_events_and_refuses_what_it_cannot_read():
@@ -310,9 +330,11 @@ def test_no_data_is_refused_by_name_and_not_reported_as_a_low_figure(tmp_path):
 
 
 def test_the_reader_of_the_page_reads_a_sentence_of_the_shape_it_expects():
-    """Verify the verifier: the pattern reads the three figures in order and the commit."""
+    """Verify the verifier: the pattern reads the three figures in order, at two decimals or four,
+    the commit, and the floor after them."""
     text = textwrap.dedent("""\
-        The coverage of `beeverforge/` by the unit tests is line **81.20%**, branch **70.05%**,
-        total **78.40%**, measured on `b5f2742` with `make coverage`.""")
+        The coverage of `beeverforge/` by the unit tests is line **81.2041%**, branch **70.05%**,
+        total **78.4012%**, measured on `b5f2742` with `make coverage`; the
+        floor **78.39%** is set from it.""")
 
-    assert BASELINE.search(text).groups() == ("81.20", "70.05", "78.40", "b5f2742")
+    assert BASELINE.search(text).groups() == ("81.2041", "70.05", "78.4012", "b5f2742", "78.39")

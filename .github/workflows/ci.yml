@@ -58,11 +58,12 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}
           TEST_SHARDS: 4
           TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/ran-unit-${{ matrix.shard }}.txt
-          # THE COVERAGE FLOOR IS MEASURED HERE, ON PUSHES TO MAIN ONLY (#334). Measuring costs the
-          # unit tests 1.4x to 1.9x their wall clock (the Makefile has the runs), so a pull request
-          # keeps today's speed; a push to main is the merge itself, so the floor is held right
-          # after each one, and a red there names the merge that lowered it. `make coverage` runs
-          # the same before a merge. In these slices, because a job of its own would run the whole
+          # THE COVERAGE FLOOR IS MEASURED HERE, ON PUSHES TO MAIN ONLY (#334). Measured on these
+          # runners (2026-11-01, the Makefile has the table), it costs each slice 1.1x to 2.1x its
+          # `make test-unit` step, median 1.9x — the slowest slice 263 s unmeasured, 487–507 s
+          # measured — so a pull request keeps today's speed; a push to main is the merge itself,
+          # so the floor is held right after each one, and a red there names the merge that
+          # lowered it. `make coverage` runs the same before a merge. In these slices, because a job of its own would run the whole
           # selection a second time to learn what these four already executed. Each slice writes
           # one data file and is held to nothing; the job named `test` holds the four combined.
           # Empty on a pull request: the Makefile reads an empty TEST_COVERAGE as unset.

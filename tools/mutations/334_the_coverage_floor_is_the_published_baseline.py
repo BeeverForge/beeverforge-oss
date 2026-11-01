@@ -14,13 +14,27 @@ CI = ".github/workflows/ci.yml"
 
 MUTATIONS = [
     # ── the published figure is the floor ───────────────────────────────────────────────────────
-    ("STATUS's total drifts from fail_under — the page publishes a floor CI does not hold", STATUS,
-     "**89.37%**, measured on", "**89.38%**, measured on"),
+    # RE-PINNED (#344 review): the floor moved to 89.36, set from CI's measurement less its spread,
+    # and STATUS publishes that floor beside the measurement rather than as the measured total.
+    ("STATUS's floor drifts from fail_under — the page publishes a floor CI does not hold", STATUS,
+     "floor **89.36%**", "floor **89.35%**"),
 
-    ("fail_under drifts from STATUS's total — the floor moves and the page does not", PYPROJECT,
-     "fail_under = 89.37", "fail_under = 89.36"),
+    ("fail_under drifts from STATUS's floor — the floor moves and the page does not", PYPROJECT,
+     "fail_under = 89.36", "fail_under = 89.35"),
 
-    ("fail_under removed — there is no floor", PYPROJECT, "fail_under = 89.37\n", ""),
+    ("fail_under removed — there is no floor", PYPROJECT, "fail_under = 89.36\n", ""),
+
+    ("the floor is set above what CI measured — the measured code fails it", PYPROJECT,
+     "fail_under = 89.36", "fail_under = 89.40"),
+
+    ("…and on the page too, so only the measurement can say it is wrong", STATUS,
+     "floor **89.36%**", "floor **89.40%**"),
+
+    ("the measured total is re-typed upward and the floor left — a stale, lenient floor", STATUS,
+     "total **89.3785%**", "total **89.5785%**"),
+
+    ("a figure is mistyped — the total no longer lies between its line and branch", STATUS,
+     "branch **85.5513%**", "branch **95.5513%**"),
 
     ("the baseline names a commit this history does not hold", STATUS,
      "measured on `b5f2742`", "measured on `0000000`"),

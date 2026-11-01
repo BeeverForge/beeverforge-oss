@@ -278,18 +278,22 @@ source = ["beeverforge"]
 branch = true
 relative_files = true
 
-# `fail_under` IS THE FLOOR, AND THIS IS THE ONE PLACE IT IS READ. It is the baseline TOTAL (lines
-# and branches together, as coverage.py counts them) of the run docs/STATUS.md names, and
-# `tests/test_the_coverage_floor_is_the_published_baseline.py` holds that page's figure equal to
-# this one, so editing either alone is red. A pull request that raises coverage raises this line
+# `fail_under` IS THE FLOOR, AND THIS IS THE ONE PLACE IT IS READ. It is set from the TOTAL (lines
+# and branches together, as coverage.py counts them) CI measured in the run docs/STATUS.md names,
+# and `tests/test_the_coverage_floor_is_the_published_baseline.py` holds that page's floor equal
+# to this one, so editing either alone is red. A pull request that raises coverage raises this line
 # and STATUS's together; one that lowers it fails `make coverage-report` until it either covers
 # what it dropped or lowers both, in the open, with the reason in its description.
 #
-# 89.37, NOT 89.38: the baseline measured 89.3755% (docs/STATUS.md has the run), which coverage.py
-# displays as 89.38. The floor is that figure ROUNDED DOWN, so a run that lands a hundredth of a
-# point under the display — the same tests, the same code — is not red for a reason no change made.
+# 89.36, FROM CI AND NOT FROM A LAPTOP (#344 review). The floor is enforced in four 4-core GitHub
+# slices, each in its own random order, so it is set from what THAT configuration measured: the
+# two attempts of run 41323669639 combined to 89.3875% and 89.3785% (88,937 and 88,928 of 99,496
+# lines and branches). The floor is the lower less the spread between them (9, 0.0090 points),
+# 89.3694, rounded down: 89.36. coverage.py fails a run whose total rounds below it — 88,904 or
+# fewer — so 23 lines or branches under the lower attempt are noise this floor absorbs, not a
+# reason no change made. An earlier figure set from local runs (89.37) left about five.
 [tool.coverage.report]
-fail_under = 89.37
+fail_under = 89.36
 precision = 2
 
 [tool.pytest.ini_options]

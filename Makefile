@@ -102,11 +102,18 @@ test-ran-once: ## fail unless every collected test was started exactly once acro
 # figure under-reads the suite, and holds as a floor all the same: what it misses, it misses on
 # every run alike.
 #
-# WHAT IT COSTS, measured 2026-11-01 on one 12-core machine (`-n auto`, runs back to back, load
-# average under 2 before each started, nothing else of note running): `make test-unit` 335 s and
-# 376 s wall (24,538–24,547 tests), `make coverage` 639 s, 528 s and 535 s, the report's combine
-# included — +150 s to +300 s, 1.4x to 1.9x the plain run. coverage.py traces
-# with its C tracer here: on Python 3.12 the cheaper sys.monitoring core cannot measure branches.
+# WHAT IT COSTS, ON THE RUNNERS THAT PAY IT (#344 review): the `make test-unit` step of each of
+# CI's four unit slices (GitHub's ubuntu-latest, 4 cores), 2026-11-01, in seconds —
+#
+#                                                   slice 1  slice 2  slice 3  slice 4
+#     unmeasured, main at b5f2742 (run 41302814099)   203      263      258      258
+#     measured, run 41322787942                       331      281      487      490
+#     measured, run 41323669639 attempt 1             410      459      501      347
+#     measured, run 41323669639 attempt 2             417      467      507      474
+#
+# — 1.1x to 2.1x per slice, median 1.9x, and the slowest slice from 263 s to 487–507 s. Locally
+# (12 cores, `-n auto`) `make test-unit` took 335–376 s and `make coverage` 528–639 s. coverage.py
+# traces with its C tracer: on Python 3.12 the cheaper sys.monitoring core cannot measure branches.
 # So the measurement is NOT on every run — plain `make test-unit` stays as it was — and CI pays it
 # ON PUSHES TO MAIN ONLY, never on a pull request: a pull request keeps its speed, and the floor
 # is held right after each merge, where a red names the merge that lowered it. `make coverage` is
