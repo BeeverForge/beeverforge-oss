@@ -168,6 +168,9 @@ def _from_web(cp: str, url: str) -> str:
     return (done.stdout or done.stderr).strip()
 
 
+# THE MACHINE'S OWN LAN ADDRESS IS NOT LOOPBACK, and this test dials it on purpose: `_lan_address`
+# finds it with a UDP connect, and the test proves the preview is NOT published there (#335).
+@pytest.mark.network
 def test_s1_opens_at_its_preview_host_through_a_host_process_panel(tmp_path, monkeypatch,
                                                                    s1_product_builds):
     pytest.importorskip("temporalio")

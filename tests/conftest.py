@@ -818,6 +818,85 @@ def _no_live_durable_engine(request, monkeypatch) -> None:
     monkeypatch.setattr("temporalio.client.Client.connect", _refuse)
 
 
+#: THE ONE LEGITIMATE REASON TO DIAL A NON-LOOPBACK ADDRESS, declared rather than inferred, for
+#: the reason `OWNS_ITS_ENGINE` gives: a marker is greppable and cannot let some OTHER real host
+#: through by accident.
+NETWORK = "network"
+
+
+def network_refusal(nodeid: str, host: object, port: object) -> str:
+    """The one sentence a refused connection fails its test with: which test, which address, and
+    the two ways out."""
+    return (f"{nodeid} tried to connect to {host}:{port}, which is not loopback, so patch the "
+            f"call that reaches it or mark the test @pytest.mark.{NETWORK} if it must reach the "
+            f"real network.")
+
+
+def _a_local_host(host: object) -> bool:
+    """`localhost` by name, or an IP literal on this machine. Any other NAME is not local, and it is
+    refused before it is resolved, so a refusal never waits on DNS."""
+    import ipaddress
+
+    if not isinstance(host, str):
+        return False
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_loopback or ip.is_unspecified
+
+
+@pytest.fixture(autouse=True)
+def _no_unit_test_reaches_the_network(request, monkeypatch):
+    """No test may open a connection to a non-loopback address unless it carries
+    `@pytest.mark.network` (#335).
+
+    MEASURED: `test_the_HOURLY_sweep_is_handed_the_forge_it_used_to_run_without` spent `300.11s
+    call` for `user 0.57` of CPU waiting on `dev.azure.com`, and then passed. Nothing blocked a
+    plain socket, so a unit test that reached the internet was found only by somebody timing it.
+
+    AT `socket.socket.connect`, the class attribute, so `ssl` and `asyncio` go through it too.
+    Loopback and AF_UNIX pass: they are the suite's own servers and the Docker daemon. A SUBPROCESS
+    (`git clone`, `gh`) and the Rust core under `temporalio` open their sockets outside Python and
+    are NOT covered; a test that reaches one of those is fixed at its seam, as that sweep test was.
+
+    A REFUSAL ALSO FAILS THE TEST AT TEARDOWN, because the code it is written for swallows errors:
+    the activity that cloned catches every `Exception`, so a raise alone would have stayed green."""
+    if request.node.get_closest_marker(NETWORK):
+        yield
+        return
+    import socket
+
+    refused: list[str] = []
+    real_connect, real_connect_ex = socket.socket.connect, socket.socket.connect_ex
+
+    def _refuse_the_internet(sock, address) -> None:
+        if sock.family not in (socket.AF_INET, socket.AF_INET6):
+            return
+        if _a_local_host(address[0]):
+            return
+        sentence = network_refusal(request.node.nodeid, address[0], address[1])
+        refused.append(sentence)
+        raise ConnectionRefusedError(sentence)
+
+    def _connect(self, address):
+        _refuse_the_internet(self, address)
+        return real_connect(self, address)
+
+    def _connect_ex(self, address):
+        _refuse_the_internet(self, address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", _connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _connect_ex)
+    yield
+    if refused:
+        pytest.fail(refused[0], pytrace=False)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Every failure's NAME survives the run, in a ledger nothing truncates.
 
