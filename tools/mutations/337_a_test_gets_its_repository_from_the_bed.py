@@ -2,16 +2,17 @@
 `tests/` does not grow back (#337, slice 4 of the suite-cost audit): every guard the bed claims,
 cut one at a time.
 
-ROWS 1-8 ARE THE BED: a changed template handed out again (the check before a copy gone), never
-caught at the end of the session (`verify_all` a no-op), the template itself handed out, a shape
-built again by the next worker (the manifest never read), a truncated manifest failing every later
+ROWS 1-9 ARE THE BED: a changed template handed out again (the check before a copy gone), never
+caught at the end of the session (`verify_all` a no-op), the template itself handed out, two
+workers building one shape at once (the lock never taken), a shape built again by the next worker
+(the manifest never read), a truncated manifest failing every later
 ask, a manifest written in place, a copy left naming the template's path, and a binary file naming
 it let through.
 
-ROWS 9-10 ARE THE SESSION: the fixture's check at the end of the session gone, and the build's
+ROWS 10-11 ARE THE SESSION: the fixture's check at the end of the session gone, and the build's
 direct writes to `os.environ` left in the test that built the shape.
 
-ROWS 11-21 ARE THE COUNT: each form the counter reads dropped (a `["git", ..., "init"]` list, a git
+ROWS 12-22 ARE THE COUNT: each form the counter reads dropped (a `["git", ..., "init"]` list, a git
 helper given `"init"`, a git helper given a list, a command line in a string), the subcommand read
 past an option or as any argument, a docstring counted, the bed and its guard counted, the text
 filter too narrow to let a command line through, and the line moved by one or turned round.
@@ -39,6 +40,10 @@ MUTATIONS = [
      "        return dest",
      "            path.write_bytes(path.read_bytes().replace(old, new))\n"
      "        return template.root"),
+
+    ("two workers build one shape at once: the lock is never taken", BED,
+     "            fcntl.flock(lock, fcntl.LOCK_EX)\n",
+     "            pass\n"),
 
     ("a shape another worker built is built again: the manifest is never read", BED,
      "            template = self._read(manifest, where)\n",

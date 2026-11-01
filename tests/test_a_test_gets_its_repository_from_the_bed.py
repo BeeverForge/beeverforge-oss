@@ -11,8 +11,9 @@ few milliseconds).
 What is pinned:
 
   1. a shape is built once — once for every process sharing the bed's root, as the xdist workers
-     of one run do — and handed out as a copy: never the template, and a change in one copy
-     reaches neither the next copy nor the template;
+     of one run do, under a lock no second process can take while the first builds — and handed
+     out as a copy: never the template, and a change in one copy reaches neither the next copy
+     nor the template;
   2. a template a test changed in place is refused by name, at the next copy and at the end of
      the session — an order-dependent failure caught as what it is;
   3. a copy names its own path wherever the template named its own (a remote URL, a text file),
@@ -23,8 +24,10 @@ What is pinned:
 
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,6 +91,42 @@ def test_a_shape_another_worker_built_is_read_not_built_again(tmp_path):
 
     assert len(built) == 1, "the second worker built the shape again"
     assert _git(two, "rev-parse", "HEAD") == _git(one, "rev-parse", "HEAD")
+
+
+def test_a_shape_is_built_under_a_lock_no_other_process_can_take_meanwhile(tmp_path):
+    """The build is held open, and the shape's lock is tried from outside it: a second worker
+    asking while the first still builds must wait, not run `_build` beside it (whose first step
+    deletes the template being built). `flock` locks belong to the open file, so a second open in
+    this process is refused as another worker's would be. No timers: the build waits on an event
+    the test sets."""
+    building, go = threading.Event(), threading.Event()
+    failed: list[BaseException] = []
+
+    def build(where, env):
+        building.set()
+        go.wait()
+        _one_commit(where, env)
+
+    def ask():
+        try:
+            Bed(tmp_path / "bed").copy("one-commit", tmp_path / "one", build)
+        except BaseException as error:  # handed to the test thread, which reports it
+            failed.append(error)
+        finally:
+            building.set()
+
+    asker = threading.Thread(target=ask)
+    asker.start()
+    try:
+        building.wait()
+        (lock,) = (tmp_path / "bed").glob("*.lock")
+        with open(lock, "w") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        go.set()
+        asker.join()
+    assert not failed, failed
 
 
 def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path):
