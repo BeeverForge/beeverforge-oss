@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from beeverforge import gitpin
 from beeverforge.adapters.sandbox import worktree as worktree_box
 from beeverforge.adapters.sandbox.base import BranchHeldElsewhere
 from beeverforge.adapters.sandbox.worktree import WorktreeSandbox, path_taken
@@ -195,7 +196,8 @@ def _in_the_window(monkeypatch, door: Door, wt: Path, put) -> dict:
 
         def run(cmd, **kwargs):
             result = real_run(cmd, **kwargs)
-            if cmd[3:4] == [step] and "refs" not in seen:
+            # the subcommand past the transport pin (#283) and `-C`, not a fixed position
+            if gitpin.subcommand(cmd) == step and "refs" not in seen:
                 after(None)
             return result
 
