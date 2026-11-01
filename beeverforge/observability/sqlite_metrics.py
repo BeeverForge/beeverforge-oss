@@ -143,13 +143,19 @@ class SqliteMetricsSink:
         `CREATE ... IF NOT EXISTS`.
 
         A store that cannot take the schema — a read-only directory, a file that is not a database —
-        is still read, and the read says what it finds: `StoreUnreadable`, never a silent `[]`."""
+        is still read, and the read says what it finds: `StoreUnreadable`, never a silent `[]`.
+
+        THE FILE IS MADE SURE OF ON EVERY OPEN, THE SCHEMA ONCE (#228). The cache remembers a
+        pathname, not that its file is still there: a store deleted under a running process was
+        made again by `sqlite3.connect` under the umask, and a path swapped for a link after the
+        first read was followed. So the private creation and the link refusal run before every
+        open, cached or not — one `open` that fails `EEXIST` when the store is already there."""
         key = str(self.path)
         ensure = write or key not in _SCHEMA_ENSURED
         if write:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             _create_private(self.path)
-        elif ensure:
+        else:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 _create_private(self.path)

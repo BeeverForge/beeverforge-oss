@@ -430,3 +430,20 @@ def test_a_link_at_the_backup_s_path_is_refused_by_name_and_nothing_is_made(tmp_
     assert f"{copy} is a symbolic link" in str(refused.value)
     assert "remove the link" in str(refused.value)
     assert not elsewhere.exists(), "the link was followed"
+
+
+def test_a_link_swapped_in_after_a_first_cached_read_is_refused_too(tmp_path):
+    """The schema is made sure of once per file per process; the link refusal is not. A path
+    replaced by a link to another valid store after the first read must not be followed."""
+    from beeverforge.observability.query import StoreUnreadable
+
+    db, other = tmp_path / "m.db", tmp_path / "other.db"
+    sink = SqliteMetricsSink(db)
+    assert sink.scan() == []   # the first read: the schema is now cached for this path
+    SqliteMetricsSink(other).record(_rec(ticket="#9"))
+    db.unlink()
+    db.symlink_to(other)
+
+    with pytest.raises(StoreUnreadable) as read:
+        sink.scan()
+    assert f"{db} is a symbolic link" in str(read.value), str(read.value)

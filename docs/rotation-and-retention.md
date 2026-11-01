@@ -219,6 +219,9 @@ The copy `forget` takes first, under `backups/forget-*/metrics.db`, holds the sa
 created the same way: `0600`, whatever the umask (`SqliteMetricsSink.backup`). A symbolic link
 at the store's path or the backup's is refused, naming the path, rather than followed.
 
+Both hold on every open, not only the first: a store deleted while the panel or worker runs is
+made again `0600`, and a link put at its path later is refused just the same.
+
 On compose the worker writes the file and the panel reads it, through the one volume they both
 mount (`beeverforge_state`), and both run as **one user**: root, since neither service sets
 `user:` and the worker image they share has no `USER`. A deployment that runs them as two users

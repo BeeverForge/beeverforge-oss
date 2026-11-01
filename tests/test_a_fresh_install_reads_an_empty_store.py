@@ -17,9 +17,12 @@ not a database is `StoreUnreadable`, never `[]`.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 
 import pytest
 
+from beeverforge.observability.metrics import MetricRecord
 from beeverforge.observability.query import StoreUnreadable
 from beeverforge.observability.sqlite_metrics import SqliteMetricsSink
 
@@ -81,13 +84,23 @@ def test_a_store_deleted_while_the_process_runs_is_made_again_on_the_next_read(t
     rest of its life."""
     path = tmp_path / "metrics.db"
     sink = SqliteMetricsSink(path)
-    assert sink.scan() == []
-    for leftover in tmp_path.glob("metrics.db*"):
-        leftover.unlink()
-
-    # the connection that finds no table fails once, honestly, and the next read makes it again
+    old = os.umask(0o022)
     try:
-        sink.scan()
-    except StoreUnreadable:
-        pass
-    assert sink.scan() == []
+        assert sink.scan() == []
+        for leftover in tmp_path.glob("metrics.db*"):
+            leftover.unlink()
+
+        # the connection that finds no table fails once, honestly, and the next read makes it
+        # again — and the file it is made in is private (#228), though the schema was cached
+        try:
+            sink.scan()
+        except StoreUnreadable:
+            pass
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert sink.scan() == []
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert sink.record(MetricRecord(project="p", kind="person", role="r", ticket="t1",
+                                        ts="2026-09-17T00:00:00+00:00"))
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
