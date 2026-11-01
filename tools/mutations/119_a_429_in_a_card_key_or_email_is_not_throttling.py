@@ -27,8 +27,8 @@ MUTATIONS = [
 
     ("the credential sentences are no longer read first, so `ops429@acme.ai` is not a credential",
      CLASSIFY,
-     '    (CREDENTIAL, re.compile(r"different accounts|no api token reached", re.I), '
-     '"credential"),\n',
+     '    (CREDENTIAL, re.compile(r"different accounts|no api token reached|no email reached", '
+     're.I),\n     "credential"),\n',
      ""),
 
     # ── each status position is needed by a real 429 ───────────────────────────────────────────

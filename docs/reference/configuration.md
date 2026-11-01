@@ -180,7 +180,8 @@ id.atlassian.com by the account whose address `email` holds. Jira Cloud does not
 another account, nor an empty one; it answers as if nobody had signed in, a 404 on every card that
 exists (measured 2026-10-19). The tracker tells that apart by asking Jira who is signed in, and
 refuses by name: *"the email … and the API token belong to different accounts, or the token was
-revoked"*, or *"no API token reached this tracker"* — never "not found". The first sentence names
+revoked"*, *"no API token reached this tracker"*, or *"no email reached this tracker for the API
+token — set tracker.options.email"* — never "not found". The first sentence names
 a revoked token too, because nothing tells the two apart; a revoked token was not measured. A card
 that is really missing still reads as missing.
 
