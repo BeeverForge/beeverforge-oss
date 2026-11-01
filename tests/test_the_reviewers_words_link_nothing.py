@@ -27,11 +27,14 @@ from beeverforge.orchestrator.merge_policy import format_review
 #: closes opens no code span, so the entity after it still mentions and is escaped too.
 ENTITIES = "&#x40;someone &commat;someone &#x23;1 GH&#x2D;1 \\&commat;dee see `x &#x40;github"
 #: What `_A_URL` finds but GitHub does not autolink, so its `&` is text and the entity is live
-#: (review of #323 at 8bf6101, measured on `POST /markdown`): a scheme with no domain after it, a
-#: domain with `_` in its last two labels, and a link glued to a word or after a `:`.
+#: (reviews of #323 at 8bf6101 and 41956ed, measured on `POST /markdown`): a scheme with no host
+#: after it, a host that starts with `-` or has `_` in its last two labels, a scheme link glued to
+#: a letter or after a `[`, and a `www.` link after a `<`, which is no autolink (it needs a scheme).
 NOT_LINKS = ["https://&#x40;someone", "http://&#x40;someone x", "(https://&#x40;someone)",
              "see:https://&#x40;someone", "https://a_b.c_d/&#x40;someone",
-             "xhttps://ex.com/&#x40;someone", "https://&#x23;1"]
+             "http://a_b/&#x40;someone", "http://-x/&#x40;someone",
+             "xhttps://ex.com/&#x40;someone", "[https://ex.com/&#x40;someone", "https://&#x23;1",
+             "see <www.&#x40;someone> x", "see <www.&#x23;1> x"]
 WORDS = f"Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone {ENTITIES} {' '.join(NOT_LINKS)}"
 ZWSP = "​"
 
@@ -113,7 +116,14 @@ VERBATIM = ["use `a && b` here", "x && y", "see https://ex.com/?a=1&b=2 now",
             "or <https://ex.com/?a=1&b=2> too", "an ``a ` && b`` span",
             "<https://ex.com/?c=3&d=4> opens a row",
             # links GitHub does make, so the entity is part of the address and mentions no one
-            "see https://ex.com/a&#x40;github, (https://ex.com/&#x23;1) *www.&#x40;github*"]
+            "see https://ex.com/a&#x40;github, (https://ex.com/&#x23;1) *www.&#x40;github*",
+            # a scheme link follows any character but an ASCII letter or `[`, and one label is a
+            # host (review of #323 at 41956ed, measured on `POST /markdown`)
+            '"https://ex.com/?a=1&b=2"', "http://localhost:8080/?a=1&b=2",
+            "see:https://ex.com/?a=1&b=2", "éhttps://ex.com/?a=1&b=2",
+            "`a`https://ex.com/&#x40;x", "`a`https://ex.com/&#x40;x `b`",
+            # an angle autolink takes any host after its scheme (CommonMark)
+            "or <http://a_b/?a=1&b=2> too"]
 FENCED = "\n".join([VERBATIM[0], "```sh", VERBATIM[1], "```", *VERBATIM[2:]])
 
 
@@ -143,10 +153,12 @@ def test_where_the_code_is_in_doubt_an_ampersand_is_escaped() -> None:
                         ("<div>\n`&#x40;x`", "`\\&#x40;x`"),
                         # GitHub closes this span on the next row: the `&` after it is text
                         ("`a\nb` &#x40;x `c`", "b` \\&#x40;x `c`"),
-                        # a link glued to a closed span's backtick is not one GitHub makes
-                        ("`a`https://ex.com/&#x40;x", "`a`https://ex.com/\\&#x40;x"),
-                        ("`a`https://ex.com/&#x40;x `b`", "`a`https://ex.com/\\&#x40;x `b`"),
+                        # a `www.` link glued to a closed span's backtick is not one GFM makes
+                        ("`a`www.ex.com/&#x40;x", "`a`www.ex.com/\\&#x40;x"),
+                        ("`a`www.ex.com/&#x40;x `b`", "`a`www.ex.com/\\&#x40;x `b`"),
                         # an empty label is no domain GFM describes
-                        ("see https://.ex.com/&#x40;x", "see https://.ex.com/\\&#x40;x")]:
+                        ("see https://.ex.com/&#x40;x", "see https://.ex.com/\\&#x40;x"),
+                        ("see https://ex..com/&#x40;x", "see https://ex..com/\\&#x40;x"),
+                        ("see www..ex.com/&#x40;x", "see www..ex.com/\\&#x40;x")]:
         rows = _review_rows(ReviewResult(decision="approved", score=90, summary=words))
         assert kept in rows, f"{kept!r} not in {rows!r}"

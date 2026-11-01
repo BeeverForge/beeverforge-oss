@@ -77,30 +77,54 @@ MUTATIONS = [
      "        if _autolinked(link[0], prior, text[link.end():link.end() + 1]):",
      "        if False:"),
 
-    # ── which bare links GitHub makes, and so keep their `&` (review of #323 at 8bf6101) ────────
-    ("a bare link keeps its `&` with no domain after the scheme", MACHINE,
-     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
-     "    return True"),
+    # ── which bare links GitHub makes, and so keep their `&` (reviews of #323) ─────────────────
+    ("a host that starts with neither a letter nor a digit is a host", MACHINE,
+     "    elif not domain[:1].isalnum():",
+     "    elif not domain:"),
 
-    ("a bare link keeps its `&` after any character", MACHINE,
-     '''    if before and not before.isspace() and before not in "*_~(":''',
-     '''    if False:'''),
+    ("a scheme with nothing after it is a host", MACHINE,
+     "    elif not domain[:1].isalnum():",
+     "    elif False:"),
+
+    ("a `www.` link keeps its `&` after any character", MACHINE,
+     '''        if before and not before.isspace() and before not in "*_~(":''',
+     '''        if False:'''),
 
     ("a bare link keeps its `&` with `_` in its last two labels", MACHINE,
-     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
-     "    return len(labels) > 1 and all(labels[:-1])"),
-
-    ("a scheme with nothing after it is a domain", MACHINE,
-     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
-     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])"),
+     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return all(labels[:-1])"),
 
     ("an empty label is a domain's", MACHINE,
-     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
-     "    return len(labels) > 1 and not any(\"_\" in label for label in labels[-2:])"),
+     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return not any(\"_\" in label for label in labels[-2:])"),
 
-    ("an angle autolink's `&` is escaped", MACHINE,
-     '''    if before == "<" and after == ">":''',
-     '''    if False:'''),
+    ("a scheme link's single-label host is refused", MACHINE,
+     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return len(labels) > 1 and all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])"),
+
+    ("a scheme link follows the `www.` rule again", MACHINE,
+     '''    if scheme == "www.":''',
+     '''    if True:'''),
+
+    ("the angle shortcut takes a `www.` link too", MACHINE,
+     '''    if scheme == "www.":''',
+     '''    if scheme == "www." and not (before == "<" and after == ">"):'''),
+
+    ("an angle autolink's `&` is escaped when its host is not one", MACHINE,
+     '''    elif before == "<" and after == ">":''',
+     '''    elif False:'''),
+
+    ("a `[` no longer blocks a scheme link", MACHINE,
+     '''    elif before == "[" or (before.isascii() and before.isalpha()):''',
+     '''    elif before.isascii() and before.isalpha():'''),
+
+    ("a scheme link glued to a letter keeps its `&`", MACHINE,
+     '''    elif before == "[" or (before.isascii() and before.isalpha()):''',
+     '''    elif before == "[":'''),
+
+    ("a scheme link after a non-ASCII letter is refused", MACHINE,
+     '''    elif before == "[" or (before.isascii() and before.isalpha()):''',
+     '''    elif before == "[" or before.isalpha():'''),
 
     ("a bare link after a closed span is read as at the start", MACHINE,
      "            out += [_outside_links(text[start:i], text[start - 1:start]), text[i:span.end()]]",

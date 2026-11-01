@@ -486,17 +486,25 @@ _A_LINK_DOMAIN = re.compile(r"(https?://|www\.)([A-Za-z0-9_.-]*)")
 def _autolinked(link: str, before: str, after: str) -> bool:
     """Whether GitHub makes a link of `link`, a bare link `_A_URL` found between the characters
     `before` and `after` (empty at an end of the paragraph). `_A_URL` also finds what GitHub does
-    not link, where an `&` is text and an entity mentions or links (review of #323, measured on
-    `POST /markdown`). Linked: an angle autolink (`<https://…>`), or, by GFM's extended rule, one
-    after the start, whitespace, `*`, `_`, `~` or `(` whose domain has at least two labels, none
-    empty but the last and no `_` in the last two (`www.` counts as one). In doubt, it is not."""
-    if before == "<" and after == ">":
-        return True
-    if before and not before.isspace() and before not in "*_~(":
-        return False
+    not link, where an `&` is text and an entity mentions or links (reviews of #323, measured on
+    `POST /markdown`). A `www.` link, by GFM's extended rule: after the start, whitespace, `*`,
+    `_`, `~` or `(`, never after `<` (an angle autolink needs a scheme). A scheme link: an angle
+    autolink (`<https://…>`), or one after any character but an ASCII letter or `[`, whose host
+    starts with a letter or a digit (one label is enough). Either way no label is empty but the
+    last and none of the last two holds a `_`. In doubt, it is not."""
     scheme, domain = _A_LINK_DOMAIN.findall(link)[0]  # `link` opens with its scheme
-    labels = ["www", *domain.split(".")] if scheme == "www." else domain.split(".")
-    return len(labels) > 1 and all(labels[:-1]) and not any("_" in label for label in labels[-2:])
+    labels = domain.split(".")
+    if scheme == "www.":
+        if before and not before.isspace() and before not in "*_~(":
+            return False
+        labels = ["www", *labels]
+    elif before == "<" and after == ">":
+        return True
+    elif before == "[" or (before.isascii() and before.isalpha()):
+        return False
+    elif not domain[:1].isalnum():
+        return False
+    return all(labels[:-1]) and not any("_" in label for label in labels[-2:])
 
 
 def _outside_links(text: str, before: str = "") -> str:
