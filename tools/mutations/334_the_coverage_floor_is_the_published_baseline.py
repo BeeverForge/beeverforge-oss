@@ -37,40 +37,40 @@ MUTATIONS = [
 
     # ── CI measures every slice and holds the combined data — on pushes to main only ───────────
     ("the unit slices run without TEST_COVERAGE — the floor is held over nothing", CI,
-     "          TEST_COVERAGE: ${{ github.event_name == 'push' && '1' || '' }}\n", ""),
+     "          TEST_COVERAGE: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '1' || '' }}\n", ""),
 
     ("the unit slices measure on pull requests too — every pull request pays the cost", CI,
-     "          TEST_COVERAGE: ${{ github.event_name == 'push' && '1' || '' }}\n",
+     "          TEST_COVERAGE: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && '1' || '' }}\n",
      '          TEST_COVERAGE: "1"\n'),
 
     ("the unit slices measure on pull requests INSTEAD of pushes", CI,
-     "github.event_name == 'push' && '1' || ''", "github.event_name == 'pull_request' && '1' || ''"),
+     "(github.event_name == 'push' || github.event_name == 'pull_request') && '1' || ''", "github.event_name == 'pull_request' && '1' || ''"),
 
     ("the slices upload coverage on pull requests too", CI,
-     "        if: github.event_name == 'push'\n        with:\n          name: coverage-unit-",
+     "        if: (github.event_name == 'push' || github.event_name == 'pull_request')\n        with:\n          name: coverage-unit-",
      "        with:\n          name: coverage-unit-"),
 
     ("the test job no longer holds the combined coverage to the floor", CI,
-     "      - if: github.event_name == 'push' && needs.unit.result == 'success'\n"
+     "      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'\n"
      "        run: make coverage-report\n", ""),
 
     ("the report's push condition is dropped — it would hold pull requests, over no data", CI,
-     "      - if: github.event_name == 'push' && needs.unit.result == 'success'\n"
+     "      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'\n"
      "        run: make coverage-report\n",
      "      - if: needs.unit.result == 'success'\n        run: make coverage-report\n"),
 
     ("the download's push condition is dropped", CI,
-     "        if: github.event_name == 'push' && needs.unit.result == 'success'\n"
+     "        if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'\n"
      "        with:\n          pattern: coverage-unit-*",
      "        if: needs.unit.result == 'success'\n        with:\n          pattern: coverage-unit-*"),
 
     ("the install's push condition is dropped", CI,
-     "      - if: github.event_name == 'push' && needs.unit.result == 'success'\n"
+     "      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'\n"
      "        run: pip install",
      "      - if: needs.unit.result == 'success'\n        run: pip install"),
 
     ("the report runs on pull requests only — main is never held", CI,
-     "      - if: github.event_name == 'push' && needs.unit.result == 'success'\n"
+     "      - if: (github.event_name == 'push' || github.event_name == 'pull_request') && needs.unit.result == 'success'\n"
      "        run: make coverage-report\n",
      "      - if: github.event_name == 'pull_request' && needs.unit.result == 'success'\n"
      "        run: make coverage-report\n"),
