@@ -3140,8 +3140,11 @@ class JobWorkflow:
                     # prose reading must replay the prose reading (TMPRL1100). This is the fix's
                     # own gate: a merge-gate hold whose check a team named "rate-limit tests" was
                     # read as throttling and auto-resumed three times, at a full agent pass each.
+                    # `anchored_429` the same way: a bare `429` read card `DAR-429`'s 404 as
+                    # throttling, and a job parked on that reading must replay it.
                     verdict = classify(parked.note or "", state=parked.state.value,
                                        engine=workflow.patched("classify-engine-interrupted"),
+                                       anchored_429=workflow.patched("classify-anchored-429"),
                                        cause=(getattr(parked, "hold_cause", "") or "")
                                        if workflow.patched("a-hold-says-its-own-cause") else "")
                     tried = self._remedied.get(verdict.cause, 0)
@@ -3252,6 +3255,7 @@ class JobWorkflow:
                     # records rather than compares — the marker keeps the two readings together.)
                     verdict_here = classify(
                         parked.note or "", state=parked.state.value,
+                        anchored_429=workflow.patched("classify-anchored-429"),
                         cause=(getattr(parked, "hold_cause", "") or "")
                         if workflow.patched("a-hold-says-its-own-cause") else "")
                     remedy_here = remedy_for(

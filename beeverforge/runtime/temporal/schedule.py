@@ -38,7 +38,12 @@ from temporalio.client import (
 )
 
 from beeverforge.runtime.temporal import TASK_QUEUE
-from beeverforge.runtime.temporal.connection import connect
+from beeverforge.runtime.temporal.connection import (
+    EngineNotDeclared,
+    EngineNotListening,
+    connect,
+    connect_at_birth,
+)
 from beeverforge.runtime.temporal.io import PollInput
 
 log = logging.getLogger("beeverforge.schedule")
@@ -289,7 +294,15 @@ async def main() -> None:
     args = ap.parse_args()
 
     load_dotenv()
-    client = await connect()
+    # Dialled as the worker is born (#73): the bare `connect()` ended an unreachable engine in a
+    # traceback; this waits a bounded time for it to listen, then says so in one sentence. An
+    # engine nobody declared is refused at once, and its message is the sentence too.
+    from beeverforge.observability import logs
+
+    try:
+        client = await connect_at_birth()
+    except (EngineNotListening, EngineNotDeclared) as exc:
+        raise logs.exiting(log, f"schedule: {exc}") from None
     sched = _schedule(args.every_minutes, args.sandbox)
     try:
         await client.create_schedule(SCHEDULE_ID, sched)

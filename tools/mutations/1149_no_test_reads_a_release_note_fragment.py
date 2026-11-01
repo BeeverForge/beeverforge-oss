@@ -26,6 +26,10 @@ PLAN_RETIRED = ("    # RETIRED 2026-10-28: the C3 cut of `changes/362.limitation
                 "Assembling\n")
 
 MUTATIONS = [
+    ("the guard misses a fragment named as a separate path component", TEST,
+     'names = FRAGMENTS | {name.rsplit("/", 1)[-1] for name in FRAGMENTS}',
+     'names = FRAGMENTS',
+     TEST + "::test_the_guard_finds_a_fragment_named_as_a_separate_path_component"),
     ("the Kimi documents' guard reads the 0.1.0 note again", KIMI_GUARD, GUARD_RETIRED,
      '    "changes/362.limitation.md": lambda: (ROOT / "changes/362.limitation.md").read_text(\n'
      '        encoding="utf-8"),\n' + GUARD_RETIRED,

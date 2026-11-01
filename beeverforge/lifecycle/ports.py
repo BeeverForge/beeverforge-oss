@@ -41,6 +41,9 @@ class Seen:
     #: (#908): measured on 3a996b0a, a forge answering 503 here reached a person as 409 `conflict`
     #: with no reference. False for a column nobody maps (`card_unmapped`), which is a refusal
     unread: bool = False
+    #: the board's own spelling of the card when it differs from the ref asked about in case alone
+    #: (`dar-2` filed as `DAR-2`, #108), `""` otherwise — the door records and names that one
+    ref: str = ""
 
 
 #: How a tracker says a card was closed as NOT delivered, in its own word (`Ticket.state_reason`).
@@ -132,7 +135,7 @@ class Ports:
         A REFUSAL NAMES THE CARD AS ITS TRACKER DOES (#497): `promote` answers a person with it
         since it queues through the door (#414), and nobody on Jira writes `#DAR-9`."""
         from beeverforge.adapters.board.base import stage_key, stage_option
-        from beeverforge.contracts.refs import canonical_ref, ref_label
+        from beeverforge.contracts.refs import board_key, canonical_ref, ref_label
         from beeverforge.product.voice import card_unmapped
 
         try:
@@ -150,8 +153,13 @@ class Ports:
         opened_by = filed_by_the_product_role(getattr(ticket, "raw", "") or "")
         belongs_to = str(getattr(ticket, "belongs_to", "") or "")
         if (getattr(ticket, "state", "") or "open") != "open":
+            # A CLOSED CARD IS NAMED AS ITS TRACKER SPELLS IT (#108): its board may not place it,
+            # so the tracker's own key is the spelling its close was recorded under
+            own = canonical_ref(getattr(ticket, "id", "") or "")
+            asked = canonical_ref(card)
+            ref = own if own != asked and own.upper() == asked.upper() else ""
             return Seen(state=self._closed_as(card, ticket), title=title, opened_by=opened_by,
-                        open=False)
+                        open=False, ref=ref)
         board = self.board
         if board is None:
             return Seen(state=None, title=title, opened_by=opened_by, belongs_to=belongs_to)
@@ -160,7 +168,12 @@ class Ports:
             return Seen(title=title, unread=True, cannot_tell=(
                 f"{self.name}'s board could not be read, so there is no way to tell where "
                 f"{ref_label(card)} is. Nothing was changed — try again."))
-        column = where.get(canonical_ref(card)) or where.get(str(card))
+        found = board_key(where, card)
+        column = where.get(found, "")
+        # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): found as the board spells it, and
+        # named that way from here on
+        ref = found if found and found not in (canonical_ref(card), str(card)) else ""
+        card = ref or card
         if not column:
             return Seen(state=None, title=title, opened_by=opened_by, belongs_to=belongs_to)
         state = BY_COLUMN.get(stage_key(board, column))
@@ -177,7 +190,7 @@ class Ports:
                 ref=card, column=column, option=stage_option(board),
                 language=getattr(self.project, "language", None)))
         return Seen(state=state, title=title, opened_by=opened_by, column=column,
-                    belongs_to=belongs_to)
+                    belongs_to=belongs_to, ref=ref)
 
     def _closed_as(self, card: str, ticket) -> State:
         """A closed card is `delivered` when it was closed as finished work — the tracker's own
@@ -186,7 +199,7 @@ class Ports:
         planned. Unsure is `closed`: a reopen is allowed from both, and only a finished card may
         be closed again as delivered."""
         from beeverforge.adapters.board.base import stage_key
-        from beeverforge.contracts.refs import canonical_ref
+        from beeverforge.contracts.refs import board_key
 
         if withdrawn(ticket):
             return State.CLOSED
@@ -198,7 +211,7 @@ class Ports:
         except Exception:  # noqa: BLE001 — unsure, and unsure is `closed`
             log.info("could not read where closed #%s sits on its board", card, exc_info=True)
             where = {}
-        column = where.get(canonical_ref(card)) or where.get(str(card))
+        column = where.get(board_key(where, card), "")
         if column and BY_COLUMN.get(stage_key(self.board, column)) is State.DELIVERED:
             return State.DELIVERED
         return State.CLOSED

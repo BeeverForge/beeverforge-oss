@@ -49,6 +49,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
+from beeverforge import gitpin
 from beeverforge.knowledge.flows import ConceptLink, Flow, Flows, InterfaceLink
 from beeverforge.util import yaml_io
 
@@ -136,7 +137,9 @@ def parse_capability(text: str, *, path: str) -> tuple[Capability | None, list[F
     """One capability file. Never raises: an unreadable one is a finding, and one bad file must
     not cost the rest."""
     slug = Path(path).stem
-    match = _FRONTMATTER.match(text or "")
+    # a CRLF file keeps its front matter
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    match = _FRONTMATTER.match(text)
     if match is None:
         return None, [Finding(level="error", code="no-front-matter", slug=slug,
                               message="no front matter — nothing says what it links")]
@@ -388,8 +391,8 @@ def confirm_in_repository(*, docs_repo: str, clone_url: str, slug: str, flow: Fl
                            refusal=NOT_REFUSED)
 
     try:
-        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
-                        str(tmp)])
+        rc, out = _git(gitpin.pinned(["clone", "--no-local", "--depth", "1", "--branch", base,
+                                      "--", clone_url, str(tmp)]))
         if rc != 0:
             return failed("could not clone", out)
         target = tmp / rel
@@ -397,7 +400,7 @@ def confirm_in_repository(*, docs_repo: str, clone_url: str, slug: str, flow: Fl
             return WriteResult(ok=False, refusal=NOT_VALID, ref=rel,
                                detail=record_said("capability_is_a_link", language=language))
         if target.is_file():
-            cap, _ = parse_capability(target.read_text(encoding="utf-8"), path=rel)
+            cap, _ = parse_capability(target.read_text(encoding="utf-8-sig"), path=rel)
             if cap is None:
                 return WriteResult(ok=False, refusal=NOT_REFUSED, ref=rel,
                                    detail=record_said("capability_unreadable", language=language))
@@ -425,7 +428,7 @@ def confirm_in_repository(*, docs_repo: str, clone_url: str, slug: str, flow: Fl
                        cwd=tmp)
         if rc != 0:
             return failed("could not commit", out)
-        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        rc, out = _git(gitpin.pinned(["push", "--", clone_url, f"HEAD:{base}"]), cwd=tmp)
         if rc != 0:
             return failed("the push was refused (no direct write to the branch?)", out)
         return WriteResult(ok=True, ref=rel)
