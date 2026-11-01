@@ -3674,7 +3674,9 @@ class JobRunner:
         # BY EXIT CODE, NOT `|| true` (#172). git commit exits 1 for "nothing to commit", and that
         # stays quiet; but a box whose git refuses the workspace ("detected dubious ownership")
         # exits 128, and `|| true` read that as nothing to commit — the job silently committed
-        # nothing. Exit 1 is believed only when the tree is read back clean.
+        # nothing. Exit 1 is believed only when nothing is staged: not "is the tree clean?",
+        # because a dirty submodule stays ` M sub` in `git status` while `git add -A` stages
+        # nothing of it, and a hook that rejects the commit leaves its changes staged.
         rc, out = self.sandbox.run(
             workspace=ws,
             command=f"{strip_workflows}git add -A && {author}git commit -m {msg}",
@@ -3683,9 +3685,9 @@ class JobRunner:
         if rc == 0:
             return
         if rc == 1:
-            status_rc, status = self.sandbox.run(
-                workspace=ws, command="git status --porcelain", timeout=60)
-            if status_rc == 0 and not (status or "").strip():
+            staged_rc, _ = self.sandbox.run(
+                workspace=ws, command="git diff --cached --quiet", timeout=60)
+            if staged_rc == 0:
                 return
         words = " ".join((out or "").split())[:300] or "no output"
         raise RuntimeError(

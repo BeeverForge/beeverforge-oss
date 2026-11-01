@@ -85,6 +85,51 @@ def test_a_failed_safe_directory_write_with_an_unreadable_home_says_so(monkeypat
     assert "an unreadable HOME" in msg and "''" not in msg, msg
 
 
+NO_GIT = ('OCI runtime exec failed: exec failed: unable to start container process: exec: "git": '
+          'executable file not found in $PATH: unknown')
+STOPPED = "Error response from daemon: container 0123abcd is not running"
+
+
+def _refusal(monkeypatch, tmp_path, write: tuple[int, str]) -> tuple[str, list[list[str]]]:
+    calls = _a_daemon(monkeypatch, tmp_path, write=write, home=(0, "OFHOME:/root\n"))
+    with pytest.raises(RuntimeError) as err:
+        _prepare(ContainerSandbox(image=IMAGE), tmp_path)
+    started = next(c for c in calls if c[:3] == ["docker", "run", "-d"])
+    assert ["docker", "rm", "-f", started[started.index("--name") + 1]] in calls, \
+        "the refused box was left running"
+    msg = str(err.value)
+    assert repr(IMAGE) in msg, msg
+    assert "\n" not in msg and msg.endswith("."), f"not one sentence: {msg}"
+    return msg, calls
+
+
+def test_an_image_without_git_is_told_to_put_git_on_path_not_to_fix_its_home(
+        monkeypatch, tmp_path):
+    msg, _ = _refusal(monkeypatch, tmp_path, write=(127, NO_GIT))
+
+    assert "HOME" not in msg, f"a box with no git is blamed on its HOME: {msg}"
+    assert "exited 127" in msg and "executable file not found" in msg, msg
+    assert "git on PATH" in msg, f"the refusal names no remedy for a missing git: {msg}"
+
+
+def test_a_box_that_stopped_after_it_started_is_told_so_not_to_fix_its_home(
+        monkeypatch, tmp_path):
+    msg, _ = _refusal(monkeypatch, tmp_path, write=(1, STOPPED))
+
+    assert "HOME" not in msg, f"a stopped box is blamed on its HOME: {msg}"
+    assert "git on PATH" not in msg, f"a stopped box is told to install git: {msg}"
+    assert "is not running" in msg and "stopped" in msg, msg
+
+
+def test_a_git_failure_that_is_not_a_config_write_names_neither_home_nor_path(
+        monkeypatch, tmp_path):
+    msg, _ = _refusal(monkeypatch, tmp_path, write=(128, "fatal: bad config line 1 in /etc/x"))
+
+    assert "HOME" not in msg and "git on PATH" not in msg, f"a wrong remedy is named: {msg}"
+    assert "exited 128" in msg and "bad config line 1" in msg, msg
+    assert "git config --global --add safe.directory /workspace` succeed" in msg, msg
+
+
 def test_a_safe_directory_write_that_succeeds_prepares_the_box(monkeypatch, tmp_path):
     calls = _a_daemon(monkeypatch, tmp_path, write=(0, ""), home=(0, "OFHOME:/root\n"))
     box = ContainerSandbox(image=IMAGE)
@@ -156,16 +201,16 @@ class _RealSandbox:
 
 
 class _Answers:
-    """A box whose git answers what it is told: the commit and the status read."""
+    """A box whose git answers what it is told: the commit and the read of what is staged."""
 
-    def __init__(self, commit: tuple[int, str], status: tuple[int, str]) -> None:
-        self.commit, self.status = commit, status
+    def __init__(self, commit: tuple[int, str], staged: tuple[int, str]) -> None:
+        self.commit, self.staged = commit, staged
 
     def run(self, *, command: str, **_):
         if "git commit" in command:
             return self.commit
-        if "status --porcelain" in command and "workflows" not in command:
-            return self.status
+        if "diff --cached --quiet" in command:
+            return self.staged
         return 0, ""
 
 
@@ -218,7 +263,7 @@ def test_a_git_refusal_fails_the_commit_with_gits_exit_and_words(repo):
 
 
 def test_a_git_refusal_answered_by_a_double_fails_the_commit(repo):
-    r = _runner(_Answers(commit=(128, DUBIOUS), status=(128, DUBIOUS)))
+    r = _runner(_Answers(commit=(128, DUBIOUS), staged=(128, DUBIOUS)))
 
     with pytest.raises(RuntimeError) as err:
         r._commit(_ws(repo), _ticket())
@@ -226,8 +271,8 @@ def test_a_git_refusal_answered_by_a_double_fails_the_commit(repo):
     _assert_names_the_refusal(str(err.value), 128, "detected dubious ownership")
 
 
-def test_exit_1_with_a_dirty_tree_is_a_failure(repo):
-    r = _runner(_Answers(commit=(1, "hook said no"), status=(0, " M app.py\n")))
+def test_exit_1_with_staged_changes_is_a_failure(repo):
+    r = _runner(_Answers(commit=(1, "hook said no"), staged=(1, "")))
 
     with pytest.raises(RuntimeError) as err:
         r._commit(_ws(repo), _ticket())
@@ -235,10 +280,48 @@ def test_exit_1_with_a_dirty_tree_is_a_failure(repo):
     _assert_names_the_refusal(str(err.value), 1, "hook said no")
 
 
-def test_exit_1_whose_status_read_fails_is_a_failure(repo):
-    r = _runner(_Answers(commit=(1, "nothing to commit"), status=(128, DUBIOUS)))
+def test_exit_1_whose_staged_read_fails_is_a_failure(repo):
+    r = _runner(_Answers(commit=(1, "nothing to commit"), staged=(128, DUBIOUS)))
 
     with pytest.raises(RuntimeError) as err:
         r._commit(_ws(repo), _ticket())
 
     assert "exit 1" in str(err.value), str(err.value)
+
+
+def test_a_hook_that_rejects_the_commit_is_a_failure(repo):
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho hook said no >&2\nexit 1\n")
+    hook.chmod(0o755)
+    (repo / "new.py").write_text("N = 1\n")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(RuntimeError) as err:
+        _runner(_RealSandbox(repo))._commit(_ws(repo), _ticket())
+
+    _assert_names_the_refusal(str(err.value), 1, "hook said no")
+    assert _git(repo, "rev-parse", "HEAD") == head
+
+
+def test_a_dirty_submodule_is_nothing_to_commit(repo, tmp_path):
+    """`git add -A` does not stage what changed INSIDE a submodule, so the commit exits 1 while
+    `git status --porcelain` still prints ` M sub`: nothing was staged, git refused nothing."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    _git(lib, "init", "-q")
+    (lib / "f").write_text("f\n")
+    _git(lib, "add", "-A")
+    _git(lib, "commit", "-qm", "lib")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "sub")
+    _git(repo, "commit", "-qm", "sub")
+    (repo / "sub" / "build.out").write_text("z\n")
+    with (repo / "sub" / "f").open("a") as f:
+        f.write("dirty\n")
+    assert _git(repo, "status", "--porcelain") == "M sub", "the submodule is not dirty"
+    head = _git(repo, "rev-parse", "HEAD")
+    r = _runner(_RealSandbox(repo))
+
+    r._commit(_ws(repo), _ticket())
+
+    assert _git(repo, "rev-parse", "HEAD") == head
+    assert r.events.events == []
