@@ -33,7 +33,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +47,8 @@ from beeverforge.knowledge import requests as asked
 from beeverforge.knowledge.okf import parse_concept
 from beeverforge.product.module import ProductModule
 from beeverforge.product.speaker import ENGINEER, Person
+from tests import the_git_bed
+from tests.the_git_bed import a_served_tree
 
 FIXTURE = Path(__file__).parent / "fixtures" / "evaluation" / "quayside"
 REPOS = ("quayside-orders", "quayside-billing", "quayside-freight", "quayside-platform")
@@ -58,6 +59,10 @@ THREE = {"quayside-orders": ("orders/placing.py", "def place(order: Order, quote
 FLOW = "0001-an-order-is-invoiced-the-moment-it-is-placed"
 FLOW_FILE = "concepts/flow/an-order-is-invoiced-the-moment-it-is-placed.md"
 UNCOVERED = "orders/cancelling.py"
+
+
+#: The worker's repository bed (`tests/the_git_bed.py`), this module's fixture as well.
+git_bed = the_git_bed.git_bed
 
 
 # ── the bed ─────────────────────────────────────────────────────────────────────────────────────
@@ -71,19 +76,6 @@ def _git(repo: Path, *args: str) -> str:
 def _commit(repo: Path, message: str) -> None:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", message)
-
-
-def _repository(src: Path, dest: Path) -> Path:
-    """`src` as a git repository at `dest`, one commit on `main`, serving partial clones."""
-    shutil.copytree(src, dest)
-    _git(dest, "init", "-q", "-b", "main")
-    _git(dest, "config", "user.name", "fixture")
-    _git(dest, "config", "user.email", "fixture@example.invalid")
-    _git(dest, "config", "commit.gpgsign", "false")
-    _git(dest, "config", "uploadpack.allowFilter", "true")
-    _git(dest, "config", "uploadpack.allowAnySHA1InWant", "true")
-    _commit(dest, "the fixture")
-    return dest
 
 
 class _Checkouts:
@@ -125,7 +117,7 @@ class Bed:
 
 
 @pytest.fixture()
-def bed(tmp_path, monkeypatch) -> Bed:
+def bed(tmp_path, monkeypatch, git_bed) -> Bed:
     monkeypatch.setenv("BEEVERFORGE_REPO_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("BEEVERFORGE_METRICS_SINK", "null")
     monkeypatch.setenv("BEEVERFORGE_BOARD_DB", str(tmp_path / "board.db"))
@@ -133,8 +125,9 @@ def bed(tmp_path, monkeypatch) -> Bed:
     # the read model is #267's, and reads the engine; the tests that walk the chain hand one in
     monkeypatch.setattr("beeverforge.product.module._the_read_model", lambda module, root: {})
     made = tmp_path / "repositories"
-    repos = {name: _repository(FIXTURE / "sources" / name, made / name) for name in REPOS}
-    context = _repository(FIXTURE / "context", made / "quayside-context")
+    repos = {name: a_served_tree(git_bed, FIXTURE / "sources" / name, made / name)
+             for name in REPOS}
+    context = a_served_tree(git_bed, FIXTURE / "context", made / "quayside-context")
     # a person's confirmation is pushed to it, as to a forge
     _git(context, "config", "receive.denyCurrentBranch", "updateInstead")
     urls = {**{name: f"file://{path}" for name, path in repos.items()},

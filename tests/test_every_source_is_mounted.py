@@ -28,7 +28,6 @@ import ipaddress
 import logging
 import os
 import re
-import shutil
 import ssl
 import stat
 import subprocess
@@ -44,6 +43,8 @@ from beeverforge.contracts.product import ProductConfig
 from beeverforge.contracts.project import Project, ProviderRef
 from beeverforge.product import sources as mount
 from beeverforge.product.module import ProductModule
+from tests import the_git_bed
+from tests.the_git_bed import a_served_tree
 
 FIXTURE = Path(__file__).parent / "fixtures" / "evaluation" / "harbourline"
 
@@ -63,6 +64,10 @@ OPENS = {"harbourline": ("harbourline/bookings.py", "QUOTE_VALID_FOR = timedelta
 SECRET = "ghp_q268SECRETSECRETSECRETSECRET"
 
 
+#: The worker's repository bed (`tests/the_git_bed.py`), this module's fixture as well.
+git_bed = the_git_bed.git_bed
+
+
 # ── the bed ─────────────────────────────────────────────────────────────────────────────────────
 
 def _git(repo: Path, *args: str) -> str:
@@ -74,19 +79,6 @@ def _git(repo: Path, *args: str) -> str:
 def _commit(repo: Path, message: str) -> None:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", message)
-
-
-def _repository(src: Path, dest: Path) -> Path:
-    """`src` as a git repository at `dest`, one commit on `main`, serving partial clones."""
-    shutil.copytree(src, dest)
-    _git(dest, "init", "-q", "-b", "main")
-    _git(dest, "config", "user.name", "fixture")
-    _git(dest, "config", "user.email", "fixture@example.invalid")
-    _git(dest, "config", "commit.gpgsign", "false")
-    _git(dest, "config", "uploadpack.allowFilter", "true")
-    _git(dest, "config", "uploadpack.allowAnySHA1InWant", "true")
-    _commit(dest, "the fixture")
-    return dest
 
 
 class _Checkouts:
@@ -130,7 +122,7 @@ class Bed:
 
 
 @pytest.fixture()
-def bed(tmp_path, monkeypatch) -> Bed:
+def bed(tmp_path, monkeypatch, git_bed) -> Bed:
     cache = tmp_path / "cache"
     monkeypatch.setenv("BEEVERFORGE_REPO_CACHE", str(cache))
     monkeypatch.setenv("BEEVERFORGE_METRICS_SINK", "null")
@@ -142,8 +134,9 @@ def bed(tmp_path, monkeypatch) -> Bed:
     # the read model is #267's, and reads the engine; nothing here is about it
     monkeypatch.setattr("beeverforge.product.module._the_read_model", lambda module, root: {})
     made = tmp_path / "repositories"
-    repos = {name: _repository(FIXTURE / rel, made / name) for name, rel in REPOS.items()}
-    context = _repository(FIXTURE / "context", made / "harbourline-context")
+    repos = {name: a_served_tree(git_bed, FIXTURE / rel, made / name)
+             for name, rel in REPOS.items()}
+    context = a_served_tree(git_bed, FIXTURE / "context", made / "harbourline-context")
     urls = {name: f"file://{path}" for name, path in repos.items()}
     asked: list[str] = []
 
