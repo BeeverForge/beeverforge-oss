@@ -53,9 +53,11 @@ MUTATIONS = [
     ("the refusal reaches the person as a traceback again", WORKER,
      # RE-PINNED 2026-10-18 (#681): the sentence is raised through `logs.exiting`, which logs it
      # as a JSON line when the log is JSON and is the same `SystemExit` otherwise. Same cut.
-     "    except EngineNotListening as exc:\n"
+     # RE-PINNED 2026-10-31 (#73): the clause catches `EngineNotDeclared` beside it; the row that
+     # takes that one out is in `73_the_worker_refuses_an_engine_nobody_declared.py`. Same cut.
+     "    except (EngineNotListening, EngineNotDeclared) as exc:\n"
      "        raise logs.exiting(log, f\"worker: {exc}\") from None",
-     "    except EngineNotListening:\n        raise"),
+     "    except (EngineNotListening, EngineNotDeclared):\n        raise"),
 
     ("`beeverforge worker` keeps the old door", CLI,
      "    from beeverforge.runtime.temporal.worker import born as worker_born\n\n"

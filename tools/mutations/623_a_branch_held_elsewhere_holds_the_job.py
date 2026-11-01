@@ -68,15 +68,16 @@ MUTATIONS = [
      "        trees = self._clear_our_own(repo_path, wt)\n"
      '        _run(["git", "-C", str(repo_path), "worktree", "prune"])\n'),
 
+    # Re-pinned by #124: the box's own `rmdir` of the path it made now stands above the re-ask.
     ("the porcelain is not asked again after git refuses the add, so a branch taken in the "
      "window between the read and the add fails the job with git's sentence", BOX,
-     "            # passed on.\n"
+     "                _remove_if_empty(wt)\n"
      "            held = _holder(repo_path, branch)\n"
      "            if held is not None:\n"
      "                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
      "rebuilt=rebuilt,\n"
      "                                             ours=wt)\n",
-     "            # passed on.\n"),
+     "                _remove_if_empty(wt)\n"),
 
     ("a bare `locked` line (a lock with no reason) is not read, so the person is told to remove a "
      "tree git refuses to remove",
@@ -206,12 +207,10 @@ MUTATIONS = [
      "            # A PERSON HAS THE BRANCH OUT (#623): no agent ran",
      RUNNER_TEST),
 
-    ("`review_pr` lets the refusal escape instead of holding", MACHINE,
-     "        except BranchHeldElsewhere as exc:\n"
-     "            # A PERSON HAS THE BRANCH OUT (#623): nothing was read",
-     "        except ZeroDivisionError as exc:\n"
-     "            # A PERSON HAS THE BRANCH OUT (#623): nothing was read",
-     RUNNER_TEST),
+    # RETIRED 2026-10-30: "`review_pr` lets the refusal escape instead of holding" moved to #55
+    # (tools/mutations/55_a_re_review_reads_a_held_branch.py). The worktree box now checks a
+    # re-review's tip out detached, so it no longer raises on that door; the except stays for a box
+    # without `prepare_tip`, and #55's fallback test holds it.
 
     ("the resumed attempt's handle is dropped, so the next resume starts the session fresh",
      MACHINE,

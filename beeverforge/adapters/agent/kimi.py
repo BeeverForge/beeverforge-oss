@@ -121,24 +121,44 @@ _AUTH_RE = re.compile(r"unauthor|forbidden|invalid api key|not logged in|401|403
 # the shared wall-clock wall — see beeverforge/adapters/sandbox/timeouts.py
 _TIMEOUT = AGENT_TIMEOUT
 
-#: NO MCP SERVER OF THE ACCOUNT, AND KIMI CODE CANNOT BE STARTED WITHOUT THEM. It has no flag and no
-#: variable for it (0.31.1, pinned, read in its bundle): `loadMcpServers` reads
-#: `$KIMI_CODE_HOME/mcp.json`, every enabled plugin under `$KIMI_CODE_HOME/plugins/` adds its own,
-#: and the login lives in the same directory, so the directory cannot be moved away. So no role
-#: starts while the account declares either, and the person reads which file and what to do.
-NOT_WHILE_DECLARED = (
-    'k="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; '
-    'for f in "$k/mcp.json" "$k/plugins/installed.json"; do '
-    'if [ -e "$f" ]; then echo "Kimi Code starts every MCP server declared in $f and cannot be '
-    'started without them, so they would reach this role. Nothing was started: remove the file '
-    'from the account that runs the harness, or give this role another harness."; '
-    'exit 3; fi; done;')
+#: A role name the refusal below can echo inside shell double quotes as it is: a plain word.
+_PLAIN_ROLE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def not_while_declared(role: str) -> str:
+    """NO MCP SERVER OF THE ACCOUNT, AND KIMI CODE CANNOT BE STARTED WITHOUT THEM. It has no flag
+    and no variable for it (0.31.1, pinned, read in its bundle): `loadMcpServers` reads
+    `$KIMI_CODE_HOME/mcp.json`, every enabled plugin under `$KIMI_CODE_HOME/plugins/` adds its own,
+    and the login lives in the same directory, so the directory cannot be moved away. So no role
+    starts while the account declares either, and the person reads which file and what to do.
+
+    THE REMEDY NAMES THE ENTRY TO CHANGE, `role`, the one this adapter was built for (#173): a pass
+    with no `harness:` entry of its own runs on one that has, the planner on `executor`, the card
+    judge and the documents role on `reviewer`, the context ask and the sizer on `techlead`, so
+    "give this role another harness" was a setting nobody could find."""
+    if not _PLAIN_ROLE.fullmatch(role):
+        raise ValueError(f"role {role!r} is not a plain word, so Kimi Code's refusal cannot name "
+                         f"it in the shell; give the role a name of letters, digits, '.', '_' "
+                         f"or '-'.")
+    return (
+        'k="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; '
+        'for f in "$k/mcp.json" "$k/plugins/installed.json"; do '
+        'if [ -e "$f" ]; then echo "Kimi Code starts every MCP server declared in $f and cannot be '
+        'started without them, so they would reach this role. Nothing was started: remove the '
+        'file from the account that runs the harness, or set another harness on the '
+        f'{role} entry of the project\'s harness setting in the deployment\'s project registry."; '
+        'exit 3; fi; done;')
+
+
+#: The guard of an adapter built for the executor, its own role and the planner's.
+NOT_WHILE_DECLARED = not_while_declared("executor")
 
 #: What the shell runs before Kimi Code: the refusal. `plugins/installed.json` refuses even when it
 #: enables nothing: its format is readable in the bundle (`{"version": 1, "plugins": [{"enabled":
 #: …}]}`, a plugin's servers starting only when `enabled` is truthy), but this check runs in the
 #: box's own POSIX shell, which has no JSON reader, and deciding truthiness by matching text would
-#: be a guess. On the safe side, and the person reads the file to remove.
+#: be a guess. On the safe side, and the person reads the file to remove. An adapter built for
+#: another role runs its own, `KimiAdapter.before_the_harness`.
 BEFORE_THE_HARNESS = NOT_WHILE_DECLARED
 
 
@@ -155,12 +175,14 @@ class KimiAdapter:
     name = "kimi"
 
     def __init__(self, *, model: str | None = None, log_dir=None,
-                 language: str | None = None) -> None:
+                 language: str | None = None, role: str = "executor") -> None:
         self.model = model or os.environ.get("BEEVERFORGE_EXECUTOR_MODEL") or None
         self.planner_model = os.environ.get("BEEVERFORGE_PLANNER_MODEL") or self.model
         self.log_dir = log_dir
         #: the project's language for anything a human reads (agent/roles.py)
         self.language = language
+        #: the refusal run before every pass, naming `role`'s entry of the `harness` setting
+        self.before_the_harness = not_while_declared(role)
 
     # ---- the coding contract -----------------------------------------------------------------
 
@@ -261,8 +283,8 @@ class KimiAdapter:
         # Read in the bundle, 0.31.1 and 0.32.0: no path reads stdin into the prompt. `prompt_path`
         # is therefore always None here (the caller asks with `channel=False`), and the branch stays
         # so the day that CLI grows a stdin or file form is a one-line change rather than a rewrite.
-        head = ([BEFORE_THE_HARNESS, f"cat {shlex.quote(prompt_path)} |", harness] if prompt_path
-                else [BEFORE_THE_HARNESS, harness])
+        head = ([self.before_the_harness, f"cat {shlex.quote(prompt_path)} |", harness]
+                if prompt_path else [self.before_the_harness, harness])
         # NO `--auto`, `-y` OR `--plan` (#362): 0.31.1 refuses each beside `-p` before it calls a
         # model, and prompt mode is auto already — see the module docstring, difference 1.
         cmd = [*head, "--output-format", "stream-json"]
@@ -318,11 +340,13 @@ class KimiAdapter:
         # Kimi has no --output-last-message equivalent, so the summary has to come from the
         # stream (or, failing that, the raw tail). That is a WEAKER contract than Codex's file.
         # It reads the captured shape — the last `role: assistant` message, never the `meta`
-        # resume hint after it (review of #783) — and when no assistant line is there, it degrades
-        # to raw output; the orchestrator only journals it and shows it in the PR.
+        # resume hint after it (review of #783). Only output where NO line parsed as an event
+        # degrades to the raw tail (a text-mode CLI); a stream that parsed but holds no assistant
+        # line hands back no summary, because its JSONL is not the agent's words and the PR quotes
+        # the summary under "What the agent says it did" (#110).
         res = AgentRunResult(
             ok=code == 0 and pause is None,
-            summary=_final_text(events) or _plain_tail(out),
+            summary=_final_text(events) or ("" if events else _plain_tail(out)),
             actions=_actions(events),
             model=model or "default",
             harness=self.name,

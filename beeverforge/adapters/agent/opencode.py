@@ -489,8 +489,16 @@ def _failure_summary(events: list[dict], out: str) -> str:
     if rejected:
         return ("the run stopped after a tool call was refused — the harness ran without approval "
                 f"for: {', '.join(rejected[:5])}")
-    return (_scrub(out) or "").strip()[-4000:]
+    # NEVER THE STREAM (#110): a pass row quotes this summary as the agent's words, failed or
+    # not, so a stream with no text gets a fixed sentence. Output with no event at all (the CLI
+    # died before it spoke JSON) is the CLI's own prose, and stays readable.
+    if not events:
+        return (_scrub(out) or "").strip()[-4000:] or _NO_FINAL_MESSAGE
+    return _NO_FINAL_MESSAGE
 
+
+#: The failure summary of a run that emitted events but no text; `raw_output` keeps the stream.
+_NO_FINAL_MESSAGE = "the run ended without a final message"
 
 #: Keys an error event echoes straight from the provider. `responseHeaders` can carry
 #: authentication echoes and `responseBody` arbitrary provider detail, and `raw_output` is written

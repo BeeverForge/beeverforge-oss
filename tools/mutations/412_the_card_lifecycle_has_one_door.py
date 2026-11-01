@@ -111,6 +111,7 @@ MUTATIONS = [
     ("the transition that lost the race for the card's number is applied beside the winner's",
      CARD,
      "                if not record.write(sink, ports.name, row):\n"
+     "                    races += 1\n"
      "                    continue          # another transition took this number: read, decide again\n",
      "                if not record.write(sink, ports.name, row):\n"
      "                    pass\n",

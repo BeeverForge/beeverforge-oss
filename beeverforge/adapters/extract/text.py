@@ -116,6 +116,7 @@ def front_matter(text: str) -> tuple[dict, str, str]:
     """`(fields, body, problem)` — the leading YAML block and what follows it. A block that is
     not a mapping, or not YAML, is left in the body and named in `problem`: the document is still
     read, and the record says its front matter was not."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")     # a CRLF file keeps its front matter
     match = _FRONT.match(text)
     if not match:
         return {}, text, ""

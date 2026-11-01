@@ -99,6 +99,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from beeverforge import gitpin
 from beeverforge.product.authoring import NOT_REFUSED, NOT_VALID, NOT_WAITING, WriteResult
 from beeverforge.product.corpus import (
     _FIRST_SECTION_RE,
@@ -611,7 +612,7 @@ def promise_of(text: str, renumbered: dict[int, int] | None) -> str:
     body = text[first.start():] if first else ""
     body = re.sub(rf"^##\s+{re.escape(DECISIONS_HEADING)}\s*$.*?(?=^##\s|\Z)", "", body,
                   flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
-    said = (title.group("title") if title else "") + "\n" + body
+    said = (title.group("title").strip() if title else "") + "\n" + body
     if renumbered is None:
         said = _REF.sub("REQ-####", said)
     else:
@@ -1387,8 +1388,8 @@ def land_import(*, docs_repo: str, clone_url: str, brought: Brought, forge,
                         detail=_w(language, "branches_unreadable"))
     tmp = Path(tempfile.mkdtemp(prefix="beeverforge-import-"))
     try:
-        rc, out = _git(["clone", "--no-local", "--depth", "1", "--branch", base, "--", clone_url,
-                        str(tmp)])
+        rc, out = _git(gitpin.pinned(["clone", "--no-local", "--depth", "1", "--branch", base,
+                                      "--", clone_url, str(tmp)]))
         if rc != 0:
             return Imported(ok=False, refusal=NOT_REFUSED,
                             detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
@@ -1431,7 +1432,7 @@ def land_import(*, docs_repo: str, clone_url: str, brought: Brought, forge,
         if rc != 0:
             return Imported(ok=False, refusal=NOT_REFUSED, plan=the_plan,
                             detail=f"nothing to commit: {_scrub(out)[-200:]}")
-        rc, out = _git(["push", "--", clone_url, f"HEAD:{base}"], cwd=tmp)
+        rc, out = _git(gitpin.pinned(["push", "--", clone_url, f"HEAD:{base}"]), cwd=tmp)
         if rc != 0:
             # SAID, NEVER RETRIED BLINDLY. Under the semaphore nothing of this product moved the
             # base; a refusal here is the repository's own (protected, or moved by somebody

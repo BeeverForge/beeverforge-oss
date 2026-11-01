@@ -56,7 +56,7 @@ GATE = getattr(_causes, "GATE", "gate")
 INNOCENT_NAMES = [
     "rate-limit tests",                 # transient / throttled
     "connection reset regression",      # transient / network
-    "429 budget check",                 # transient / throttled
+    "HTTP 429 handling tests",          # transient / throttled (a bare 429 no longer is)
     "still running e2e",                # transient / race
 ]
 

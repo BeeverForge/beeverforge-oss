@@ -161,6 +161,14 @@ such as `token_env: file:acme-ado-pat` for a secret mounted as a file:
 complete ADO walkthrough, `work_item_type`, `state_map` and the multi-repo `areas` map included,
 is [docs/setup/azure-devops.md](../setup/azure-devops.md).)
 
+**An Azure Boards project can be limited to one Epic** with `scope_epic: "70133"` in the tracker's
+options, the id of the Epic whose work items are this project's: the pickup queue, the board and
+the search for an already filed card then read only the work items under it, at any depth, and an
+Epic that cannot be resolved reads as an unreadable board, never as no scope. It is the Azure
+counterpart of Jira's `scope_jql` (below), and
+[docs/setup/azure-devops.md](../setup/azure-devops.md) §8 says what it limits, what it costs, and
+the three limits to plan around.
+
 **A Jira tracker names the site's own words**, because every Jira project has its own workflow and
 its administrator named — and localised — everything in it:
 
@@ -180,7 +188,8 @@ id.atlassian.com by the account whose address `email` holds. Jira Cloud does not
 another account, nor an empty one; it answers as if nobody had signed in, a 404 on every card that
 exists (measured 2026-10-19). The tracker tells that apart by asking Jira who is signed in, and
 refuses by name: *"the email … and the API token belong to different accounts, or the token was
-revoked"*, or *"no API token reached this tracker"* — never "not found". The first sentence names
+revoked"*, *"no API token reached this tracker"*, or *"no email reached this tracker for the API
+token — set tracker.options.email"* — never "not found". The first sentence names
 a revoked token too, because nothing tells the two apart; a revoked token was not measured. A card
 that is really missing still reads as missing.
 
@@ -215,6 +224,10 @@ nothing in it reads as an empty board, and a project that is not there still rea
 Single-quote it in YAML, because JQL quotes with `"`. Unset, or blank, the queries are exactly
 those of a project without it.
 
+**The cockpit's Board link opens the panel's own board for a project with `scope_jql`**, so it
+shows that project's scoped slice. An Azure Boards project with `scope_epic` follows the same
+rule. Every other project opens its provider's board.
+
 **Every project on a shared Jira project needs its own `scope_jql`, and no issue may be in two
 scopes.** The scope narrows only the project that declares it: one project left without a scope
 still reads all of `DAR` as its queue and picks up every other project's tickets. Nothing compares
@@ -241,7 +254,10 @@ operator does by naming the card; reopening a closed card, which the reopen reac
 without asking the slice; and commenting on a card, which is written in the person's own name.
 Name only cards of this project's slice to them.
 
-A condition Jira cannot parse — an unclosed quote, an `ORDER BY` inside it — is answered `400`
+A condition that would escape its parentheses is refused when the tracker is built, naming the
+scope: a `)` it never opened, which would close the `AND (...)` and widen the read past the
+project, and a string it never closes, which the quotes after it would close. A condition Jira
+cannot parse otherwise — an `ORDER BY` inside it — is answered `400`
 (measured on Jira Cloud 2026-10-19): the board and the ticket list read as unreadable, never as
 empty, the pickup queue picks up nothing, and the warning names the `scope_jql` it searched with.
 A condition that parses but selects nothing is an empty queue, and nothing says so yet.

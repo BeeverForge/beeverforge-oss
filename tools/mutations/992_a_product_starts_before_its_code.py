@@ -114,8 +114,8 @@ MUTATIONS = [
 
     # ── 2. the family rule ───────────────────────────────────────────────────────────────────────
     ("perform runs a row that needs the code on a project before it", LAYER,
-     "    if waits_for_code(found):\n        waiting = _waiting_for_its_code(",
-     "    if False:\n        waiting = _waiting_for_its_code(",
+     "        if waits_for_code(found):\n            waiting = _waiting_for_its_code(",
+     "        if False:\n            waiting = _waiting_for_its_code(",
      T + "::test_every_row_that_needs_the_code_refuses_a_project_before_it_by_name"
          "[product_break_down]"),
     ("a row added without a word about the code runs before it", BASE,

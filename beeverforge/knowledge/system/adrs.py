@@ -57,6 +57,7 @@ def read_adr(text: str, rel: str) -> AdrDecl:
     number = _ADR_FILE.match(posixpath.basename(rel))
     out = AdrDecl(number=number.group(1) if number else "")
     front: dict = {}
+    text = text.replace("\r\n", "\n").replace("\r", "\n")     # a CRLF file keeps its front matter
     if m := _FRONTMATTER.match(text):
         try:
             loaded = load_yaml(m.group(1))

@@ -47,7 +47,8 @@ class _Engine:
 @pytest.fixture
 def engine(tmp_path, monkeypatch) -> _Engine:
     """One enabled project with the product module, one disabled project without it, a fake engine
-    behind `connection.connect`, and no `.env` read from wherever the checkout sits."""
+    behind `connection.connect` and `connect_at_birth`, and no `.env` read from wherever the
+    checkout sits."""
     monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(tmp_path / "registry.yaml"))
     from beeverforge.contracts.product import ProductConfig
     from beeverforge.contracts.project import Project, ProviderRef
@@ -66,10 +67,12 @@ def engine(tmp_path, monkeypatch) -> _Engine:
     async def _connect(*_args, **_kwargs) -> _Engine:
         return fake
 
-    # The re-executed module runs `from ...connection import connect` at exec time, so it binds
-    # this one. `find_dotenv` walks up from schedule.py, so a `.env` at the checkout's root would
-    # otherwise reach `main()` on a developer's machine and nowhere else.
+    # The re-executed module runs `from ...connection import connect, connect_at_birth` at exec
+    # time, so it binds these. `main()` dials `connect_at_birth` (#73), which would otherwise wait
+    # for a socket no test opens. `find_dotenv` walks up from schedule.py, so a `.env` at the
+    # checkout's root would otherwise reach `main()` on a developer's machine and nowhere else.
     monkeypatch.setattr("beeverforge.runtime.temporal.connection.connect", _connect)
+    monkeypatch.setattr("beeverforge.runtime.temporal.connection.connect_at_birth", _connect)
     monkeypatch.setattr("dotenv.load_dotenv", lambda *_a, **_k: False)
     monkeypatch.setattr(sys, "argv", ["schedule", "--every-minutes", "3"])
     # With the module already imported, runpy warns that it was "found in sys.modules ... prior to

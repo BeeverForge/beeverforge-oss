@@ -19,6 +19,7 @@ from beeverforge.adapters.forge.base import (
     Reran,
     ReviewComment,
     ReviewEvent,
+    truncated_tail,
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
 from beeverforge.adapters.github_cli import LoginRefused, credential_of, nothing_named, refused
@@ -1119,7 +1120,7 @@ class GitHubForge(ForgeAdapter):
             text, _why_not = self._failing_log(repo, rid)
             if text:
                 chunks.append(text)
-        return _redact("\n".join(chunks))[-max_chars:]
+        return truncated_tail(_redact("\n".join(chunks)), max_chars)
 
     def _failing_log(self, repo: str, rid: str) -> tuple[str, str]:
         """`(the failing log of run rid, "")` when it reads, else `("", why not)`: one definition
