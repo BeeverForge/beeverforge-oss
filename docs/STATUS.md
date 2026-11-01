@@ -7,6 +7,16 @@ This page describes the `v0.1.0` tag of `beeverforge-oss`. Its claims were check
 code at main at `171de5f` of `beeverforge-oss`, where CI ran 24,161 tests green (228 skipped) on
 2026-10-26.
 
+The unit tests' coverage of `beeverforge/` is line **90.57%**, branch **85.53%**, total
+**89.37%**, measured on `b5f2742` of `beeverforge-oss` on 2026-11-01 with `make coverage`: the
+`make test-unit` selection, counting the code the test processes run themselves — not what a test
+reaches through a subprocess, and not the integration or alone runs. The total is the measured 89.3755% rounded down,
+and it is the floor CI's `test` job holds the four unit slices to on every push to main — not on
+pull requests, which measuring would slow by 1.4 to 1.9 times, so a drop shows on main right after
+the merge that caused it, and `make coverage` holds it before one (`fail_under` in
+`pyproject.toml`; `tests/test_the_coverage_floor_is_the_published_baseline.py` holds the two
+equal). A pull request that raises coverage raises both.
+
 BeeverForge 0.1.0 is OpenFactory 0.7.0 under a new name; its earlier history is at
 <https://github.com/BeeverForge/openfactory-core>.
 

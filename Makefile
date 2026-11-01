@@ -78,8 +78,8 @@ test-collect: ## write the node id of every test the suite collects to TEST_IDS
 	python -m pytest -q --collect-only -p no:randomly $(if $(TEST_IDS),--record-ids=$(TEST_IDS)) > $(TEST_IDS_DIR)/collect.log 2>&1 || { tail -50 $(TEST_IDS_DIR)/collect.log; exit 1; }
 	@tail -1 $(TEST_IDS_DIR)/collect.log
 
-test-unit: ## the tests that start no engine and need no Docker, in parallel (TEST_SHARD/TEST_SHARDS: one slice)
-	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15 $(if $(TEST_SHARDS),--shard=$(TEST_SHARD)/$(TEST_SHARDS)) $(if $(TEST_IDS),--record-ids=$(TEST_IDS))
+test-unit: ## the tests that start no engine and need no Docker, in parallel (TEST_SHARD/TEST_SHARDS: one slice; TEST_COVERAGE=1: measure)
+	$(if $(TEST_COVERAGE),$(if $(TEST_SHARDS),,rm -rf $(COVERAGE_DIR) && )mkdir -p $(COVERAGE_DIR) && COVERAGE_FILE=$(COVERAGE_RUN_DATA) )python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15 $(if $(TEST_SHARDS),--shard=$(TEST_SHARD)/$(TEST_SHARDS)) $(if $(TEST_IDS),--record-ids=$(TEST_IDS)) $(if $(TEST_COVERAGE),$(COVERAGE_ARGS))
 
 # `--dist loadgroup`: the tests on the real Docker daemon share compose projects, so they carry
 # `xdist_group("docker")` and run on one worker, one after another; the rest spread as before.
@@ -91,6 +91,67 @@ test-alone: ## the tests that assert their own CPU time, in one process with no 
 
 test-ran-once: ## fail unless every collected test was started exactly once across CI's jobs
 	python scripts/every_test_ran_once.py $(TEST_IDS_DIR)/collected.txt $(wildcard $(TEST_IDS_DIR)/ran-*.txt)
+
+# ── the coverage floor (#334) ────────────────────────────────────────────────────────────────────
+# WHAT IS MEASURED: `beeverforge/` (lines and branches, `[tool.coverage.*]` in pyproject.toml) under
+# the UNIT selection — `test-unit` with TEST_COVERAGE=1, the same marker expression, so the figure
+# and CI's four unit slices measure one thing. The integration and alone runs are not in it: they
+# start engines and Docker, and a floor that a missing daemon could lower would be red for a
+# reason no change made. Code a test reaches only in a SUBPROCESS (the CLI driven as a command, a
+# probe pytest) is not counted either — pytest-cov 7 traces the test processes alone — so the
+# figure under-reads the suite, and holds as a floor all the same: what it misses, it misses on
+# every run alike.
+#
+# WHAT IT COSTS, measured 2026-11-01 on one 12-core machine (`-n auto`, runs back to back, load
+# average under 2 before each started, nothing else of note running): `make test-unit` 335 s and
+# 376 s wall (24,538–24,547 tests), `make coverage` 639 s, 528 s and 535 s, the report's combine
+# included — +150 s to +300 s, 1.4x to 1.9x the plain run. coverage.py traces
+# with its C tracer here: on Python 3.12 the cheaper sys.monitoring core cannot measure branches.
+# So the measurement is NOT on every run — plain `make test-unit` stays as it was — and CI pays it
+# ON PUSHES TO MAIN ONLY, never on a pull request: a pull request keeps its speed, and the floor
+# is held right after each merge, where a red names the merge that lowered it. `make coverage` is
+# how to hold it BEFORE a merge. On main it is paid in the unit slices CI already runs, not in a
+# job of its own: a fifth job would run the whole selection a second time, alone, at nearly twice
+# its cost, to learn what the four slices already executed.
+#
+# OUTSIDE THE TREE, like TEST_IDS_DIR: a data file appearing in the checkout mid-run is a file a
+# tree-scanning test can trip over, and it names the paths of whoever ran it.
+#
+# `--cov-fail-under=0` ON THE RUN, because pytest-cov reads `fail_under` from the config and would
+# hold ONE SLICE to the whole suite's floor — every CI slice would be red. The floor is applied
+# once, to the combined data, by `coverage-report`. `--cov-report=` keeps the per-run table out of
+# the slices' logs; the combined report prints it once.
+#
+# ONE FILE PER RUN, NAMED BY ITS SLICE: pytest-cov's xdist controller combines its workers into the
+# exact file COVERAGE_FILE names, so four slices writing `coverage` would overwrite one another
+# when CI downloads them into one directory. `coverage-report` combines every `coverage.*` there.
+# A WHOLE run empties the directory first — it supersedes every slice, and a slice left over from
+# last week combined into today's figure would make a stale number look like a measured one.
+COVERAGE_DIR ?= $(or $(RUNNER_TEMP),$(TMPDIR),/tmp)/beeverforge-coverage
+COVERAGE_RUN_DATA = $(COVERAGE_DIR)/coverage.unit$(if $(TEST_SHARDS),-$(TEST_SHARD)-of-$(TEST_SHARDS))
+# THE COMBINED FILE SITS IN A DIRECTORY OF ITS OWN. coverage.py 7.17's `report` also combines — and
+# DELETES — every `coverage.*` beside the file it reads, and earlier 7.x releases do not; read from
+# here, it finds no slice to fold in, so the report says the same on every version and a second
+# `make coverage-report` re-reads the slices instead of finding them gone.
+COVERAGE_COMBINED = $(COVERAGE_DIR)/combined/coverage
+COVERAGE_ARGS := --cov --cov-report= --cov-fail-under=0
+.PHONY: coverage coverage-report
+coverage: ## measure the unit tests' coverage of beeverforge/ and hold it to the floor in pyproject.toml
+	$(MAKE) --no-print-directory test-unit TEST_COVERAGE=1
+	$(MAKE) --no-print-directory coverage-report
+
+# coverage.py names both numbers itself ("Coverage failure: total of X is less than
+# fail-under=Y") and exits 2; the sentence after it says what to do, since that line alone reads
+# like a tool error to somebody who has never seen the floor. Any other exit is coverage's own
+# error and passes through as it is. An EMPTY directory is refused by name rather than reported as
+# 0% under the floor: no data is a run that did not happen, not a run that covered nothing.
+coverage-report: ## combine the coverage data in COVERAGE_DIR and fail below the floor
+	@mkdir -p $(dir $(COVERAGE_COMBINED)) && COVERAGE_FILE=$(COVERAGE_COMBINED) python -m coverage combine --keep $(COVERAGE_DIR) \
+	  || { echo "make $@: there is no coverage data to combine in $(COVERAGE_DIR) — run \`make coverage\`, or \`make test-unit TEST_COVERAGE=1\` once per slice, first." >&2; exit 1; }
+	@COVERAGE_FILE=$(COVERAGE_COMBINED) python -m coverage report --skip-covered --sort=cover; rc=$$?; \
+	  if [ $$rc -eq 2 ]; then \
+	    echo "make $@: coverage of beeverforge/ fell below the floor in pyproject.toml ([tool.coverage.report] fail_under) — cover what this change left unexecuted (\`python -m coverage report -m\` names the lines), or lower fail_under and its figure in docs/STATUS.md together and say why in the pull request." >&2; \
+	  fi; exit $$rc
 
 # ── shellcheck, and why it is not a CI-only step ─────────────────────────────
 # `install.sh` is the first thing a stranger runs and the one artefact in this repository that no
