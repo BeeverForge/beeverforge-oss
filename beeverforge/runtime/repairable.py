@@ -20,8 +20,10 @@ than the whole repair budget spent on re-runs.
 
 AN UNREADABLE OR CUT DIFF ANSWERS "RELATED". `changed_paths` answers `None` for a diff the forge
 could not read and for one `truncated` cut — the file the log names may sit past the cut — and the
-caller launches the agent as it did before. "Could not see the change" is never "the change
-touches nothing in the log". An empty log never reaches the rule: `what_to_repair` holds it first.
+caller launches the agent as it did before. A log `truncated_tail` cut answers "related" too (#161):
+the line naming a changed file may sit in its dropped head. "Could not see the change" is never
+"the change touches nothing in the log". An empty log never reaches the rule: `what_to_repair`
+holds it first.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ import re
 import time
 from collections.abc import Callable
 
-from beeverforge.adapters.forge.base import DIFF_CUT_MARKER
+from beeverforge.adapters.forge.base import DIFF_CUT_MARKER, LOG_CUT_MARKER
 from beeverforge.contracts import JobState, RunResult
 from beeverforge.contracts.checks import ASK, REPAIR, decide
 from beeverforge.contracts.checks import read as read_checks
@@ -223,7 +225,13 @@ def log_names_the_change(log: str, paths: list[str]) -> bool:
     the file systems the runners check out onto. NEVER THE STEM: `invoice` is any word in a
     sentence, and reading it as `invoice.py` would launch an agent on every log that says
     "invoice". Nothing is required on the RIGHT, so `a.pyc` reads as naming `a.py`, the same
-    wrong "related"."""
+    wrong "related".
+
+    A CUT LOG ANSWERS "RELATED" (#161): it carries `LOG_CUT_MARKER`, and the line naming a changed
+    file may sit in the head `truncated_tail` dropped, as `changed_paths` answers `None` for a cut
+    diff."""
+    if LOG_CUT_MARKER in log:
+        return True
     text = _COLOUR.sub("", log)
     for path in paths:
         name = posixpath.basename(path)
