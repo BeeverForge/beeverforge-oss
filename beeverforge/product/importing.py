@@ -611,7 +611,7 @@ def promise_of(text: str, renumbered: dict[int, int] | None) -> str:
     body = text[first.start():] if first else ""
     body = re.sub(rf"^##\s+{re.escape(DECISIONS_HEADING)}\s*$.*?(?=^##\s|\Z)", "", body,
                   flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
-    said = (title.group("title") if title else "") + "\n" + body
+    said = (title.group("title").strip() if title else "") + "\n" + body
     if renumbered is None:
         said = _REF.sub("REQ-####", said)
     else:
