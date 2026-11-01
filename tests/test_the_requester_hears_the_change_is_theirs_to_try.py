@@ -493,6 +493,7 @@ def test_the_agenda_speaks_the_projects_language():
         assert "tell " not in item.said and "owed" not in item.chip and "since" not in item.when
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_agenda_on_the_panel_says_what_it_is_in_the_projects_language(
         monkeypatch, registry, ledger):
     monkeypatch.setenv("BEEVERFORGE_PANEL_TOKENS", f"tok-ana:{ANA}:Ana")
