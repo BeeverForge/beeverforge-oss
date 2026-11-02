@@ -46,6 +46,11 @@ SUN_PATH_MAX = 104
 #: Where `_socket_dir` puts things, so a guard can count what a run left behind.
 SOCKET_ROOT, SOCKET_PREFIX = pathlib.Path("/tmp"), "ofsock"
 
+#: The length of pytest's base temp on the macOS of #121 (`/private/var/folders/…/T/pytest-of-
+#: <user>/pytest-<N>`), before the test's own directory is appended. The child run is handed a
+#: base temp this long, so a socket put back under `tmp_path` fails to bind on EVERY machine.
+MACOS_BASETEMP = 90
+
 
 @pytest.fixture
 def self_cleanup():
@@ -199,13 +204,22 @@ def test_the_file_runs_without_an_error_and_leaves_no_directory_behind(monkeypat
     always passes: the helper is called under the same variable and must land inside it, and the
     child run must have written there. It did not, for as long as the variable began with
     `BEEVERFORGE_`: the child's conftest strips that prefix before any test runs, so its sockets
-    went to `/tmp` and the count was of an empty directory (found by this change's mutation run)."""
+    went to `/tmp` and the count was of an empty directory (found by this change's mutation run).
+
+    AND THE CHILD'S BASE TEMP IS AS LONG AS MACOS'S. On Linux, with `TMPDIR=/tmp`, pytest's
+    `tmp_path` is ~45 bytes and a socket under it binds fine, so a fixture that put the bind back
+    there errored only on a machine whose `TMPDIR` happened to be long: the row "the module
+    fixture binds under tmp_path again" was red in one shell and survived in the gate's (#336).
+    `--basetemp` of `MACOS_BASETEMP` bytes makes the child's `tmp_path` the length #121 met."""
     from tests.test_the_installer_builds_the_commands_it_says_it_does import (
         SOCKET_ROOT_ENV,
         _socket_dir,
     )
 
     root = pathlib.Path(tempfile.mkdtemp(prefix="ofroot", dir=SOCKET_ROOT))
+    # NOT under `root`: making it there would change the mtime the `written` check reads.
+    base = pathlib.Path(tempfile.mkdtemp(prefix="ofbase", dir=SOCKET_ROOT))
+    basetemp = base / ("t" * (MACOS_BASETEMP - len(str(base)) - 1))
     try:
         monkeypatch.setenv(SOCKET_ROOT_ENV, str(root))   # inherited by the subprocess below
         probe = _socket_dir()
@@ -216,11 +230,16 @@ def test_the_file_runs_without_an_error_and_leaves_no_directory_behind(monkeypat
         untouched = root.stat().st_mtime_ns
 
         done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly",
-                               str(INSTALLER_TESTS)], capture_output=True, text=True, cwd=ROOT)
+                               f"--basetemp={basetemp}", str(INSTALLER_TESTS)],
+                              capture_output=True, text=True, cwd=ROOT)
         leaked = {p for p in root.iterdir() if p.name.startswith(SOCKET_PREFIX)}
         written = root.stat().st_mtime_ns != untouched
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(base, ignore_errors=True)
+    assert len(str(basetemp).encode()) == MACOS_BASETEMP, (
+        f"the child's base temp is {len(str(basetemp).encode())} bytes, not {MACOS_BASETEMP}, so "
+        f"a socket under its tmp_path no longer fails the way #121's did; fix the padding above")
     tail = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
 
     assert " error" not in tail, (
