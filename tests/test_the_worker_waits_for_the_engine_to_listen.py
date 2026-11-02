@@ -98,8 +98,9 @@ def test_a_listener_that_starts_LATE_is_waited_for_and_dialled_once(dialled, mon
     port = _a_free_port()
     monkeypatch.setenv("TEMPORAL_ADDRESS", f"127.0.0.1:{port}")
 
-    with _ListensAfter(port, delay=1.2) as engine:
-        client = asyncio.run(connection.connect_at_birth(within=10.0))
+    # LATE BY SIX PROBES, not by five of the shipped quarter-second ones (#362: `delay=1.2`).
+    with _ListensAfter(port, delay=0.3) as engine:
+        client = asyncio.run(connection.connect_at_birth(within=10.0, every=0.05))
 
     assert client == "the client"
     assert len(dialled) == 1, f"the engine was dialled {len(dialled)} times"
@@ -128,14 +129,17 @@ def test_an_engine_that_NEVER_listens_is_a_bounded_wait_and_a_sentence(dialled, 
         # A CASE ABOUT A BOUND MUST HAVE ONE OF ITS OWN. With the bound cut out of the code this
         # case waited for ever — it held the mutation runner for ten minutes on 2026-09-19 —
         # and a guard that hangs on the defect it names has not reported it.
-        return await asyncio.wait_for(connection.connect_at_birth(within=1.0), timeout=8.0)
+        # What the bound bounds is a refused connect, probed every 50 ms: a few milliseconds of
+        # probing. 0.6 s, not 1.0 s (#362), and the sentence still says it whole, "1s".
+        return await asyncio.wait_for(connection.connect_at_birth(within=0.6, every=0.05),
+                                      timeout=8.0)
 
     began = time.monotonic()
     with pytest.raises(connection.EngineNotListening) as refused:
         asyncio.run(born())
     took = time.monotonic() - began
 
-    assert 1.0 <= took < 3.0, f"a 1 s bound took {took:.1f}s"
+    assert 0.6 <= took < 2.6, f"a 0.6 s bound took {took:.1f}s"
     assert not dialled, "nothing was listening, so the client had nothing to dial"
     said = str(refused.value)
     for owed in (f"127.0.0.1:{port}", "1s", "TEMPORAL_ADDRESS", "BEEVERFORGE_ENGINE_STARTS_IN",
@@ -149,11 +153,14 @@ def test_an_engine_that_takes_the_socket_and_never_answers_is_given_the_start_up
     A process being born gives that connect what is left of `BEEVERFORGE_ENGINE_STARTS_IN`, not the
     few seconds a read gets (`BEEVERFORGE_ENGINE_DEADLINE`), and gives up as the start-up wait runs
     out, in one sentence naming the setting that bounded it (delta review of #818: no case could
-    tell a birth connect from a read's, and the sentence named the read deadline)."""
+    tell a birth connect from a read's, and the sentence named the read deadline).
+
+    The two waits keep their order and most of their distance, eight to one, at a third of the
+    time (#362: a 2.5 s start-up wait against a 0.2 s read deadline)."""
     port = _a_free_port()
     monkeypatch.setenv("TEMPORAL_ADDRESS", f"127.0.0.1:{port}")
-    monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "0.2")
-    monkeypatch.setenv("BEEVERFORGE_ENGINE_STARTS_IN", "2.5")
+    monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "0.1")
+    monkeypatch.setenv("BEEVERFORGE_ENGINE_STARTS_IN", "0.8")
 
     async def never_answers(*_args, **_kwargs):
         dialled.append(time.monotonic())
@@ -170,8 +177,8 @@ def test_an_engine_that_takes_the_socket_and_never_answers_is_given_the_start_up
     took = time.monotonic() - began
 
     assert len(dialled) == 1, f"the engine was dialled {len(dialled)} times"
-    assert took >= 2.0, f"it gave up after {took:.1f}s, as a read would, not at the start-up wait"
-    assert took < 8.0, f"a 2.5 s start-up wait took {took:.1f}s"
+    assert took >= 0.6, f"it gave up after {took:.1f}s, as a read would, not at the start-up wait"
+    assert took < 8.0, f"a 0.8 s start-up wait took {took:.1f}s"
     said = str(gone.value)
     for owed in (f"127.0.0.1:{port}", "BEEVERFORGE_ENGINE_STARTS_IN"):
         assert owed in said, f"the sentence does not say {owed!r}: {said}"
@@ -236,7 +243,9 @@ def test_the_wait_ends_when_it_is_cancelled(dialled, monkeypatch):
 
     # FROM THE START, NOT FROM THE CANCEL: a wait that blocks the loop also blocks the coroutine
     # asking it to stop, so "how long did the cancel take" reads fast exactly when it is broken.
-    assert asyncio.run(cancelled_after(0.6)) < 1.5
+    # Cancelled a beat into the wait, not 0.6 s into it (#362): a probe that blocks the loop holds
+    # it for two seconds, past the bound, either way.
+    assert asyncio.run(cancelled_after(0.15)) < 1.0
 
 
 def test_the_worker_is_BORN_through_the_wait():
@@ -275,7 +284,7 @@ def test_a_worker_with_no_engine_to_reach_ends_in_a_SENTENCE_not_a_traceback(tmp
     done = subprocess.run(
         [sys.executable, "-c", drive], cwd=ROOT, capture_output=True, text=True, timeout=25,
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": str(ROOT),
-             "TEMPORAL_ADDRESS": f"127.0.0.1:{port}", "BEEVERFORGE_ENGINE_STARTS_IN": "1"})
+             "TEMPORAL_ADDRESS": f"127.0.0.1:{port}", "BEEVERFORGE_ENGINE_STARTS_IN": "0.2"})
 
     assert done.returncode == 1, done.stderr[-400:]
     assert "Traceback" not in done.stderr, done.stderr[-600:]

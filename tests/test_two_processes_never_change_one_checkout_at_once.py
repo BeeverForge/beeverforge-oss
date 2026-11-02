@@ -40,8 +40,10 @@ from beeverforge.runtime.repo_cache import RepoCache
 CACHES = [RepoCache, *RepoCache.__subclasses__()]
 SPAWN = multiprocessing.get_context("spawn")
 #: How long the parent lets the second process try while the first waits. On a lock that does not
-#: hold it is in git within milliseconds; on one that does, no wait of any length lets it in.
-TRY_SECONDS = 3
+#: hold it is in git as soon as it has started: 0.102 s at most from its start, measured with four
+#: of these runs side by side on four cores (#362, which took this from 3 s). On a lock that does
+#: hold, no wait of any length lets it in.
+TRY_SECONDS = 0.6
 #: An upper bound on anything that should happen at once — a process starting, a sync finishing.
 #: Reached only when something is broken.
 BOUND = 120
@@ -201,7 +203,7 @@ def test_a_sync_that_cannot_have_the_key_in_time_degrades(tmp_path, origin, cach
     """A sync whose key is held past its wait returns nothing, as any failed sync does, and its
     caller degrades; it does not wait for ever behind a holder that hung."""
     run, first, second, _ = _two(tmp_path, cache.__name__, "jornada", "jornada", origin,
-                                 second_wait=0.5)
+                                 second_wait=0.2)
 
     assert run.said(second) == "failed", run.lines()
     assert not [row for row in run.lines() if row[1] == second and row[2] == "start"], (

@@ -180,6 +180,12 @@ def test_stdout_and_stderr_arrive_in_the_order_they_were_written(tmp_path):
 
 # ── the wall keeps what was already written — the container's own defect ─────────────────────────
 
+#: The wall of a case that walls a command on purpose. What it bounds is a shell started and one
+#: line written before the `sleep` it is walled in, a few milliseconds (#362: these cases waited out
+#: a 2 s wall each).
+WALL = 0.5
+
+
 def test_the_worktree_wall_keeps_the_partial_output(tmp_path):
     """THE MARKER IS NOT IN THE COMMAND, and that is not fussiness — it is what this guard is for.
 
@@ -189,7 +195,7 @@ def test_the_worktree_wall_keeps_the_partial_output(tmp_path):
     answer. So the marker is produced by the process and appears nowhere in what was asked of it."""
     (tmp_path / "trace.txt").write_text("how-far-it-got\n")
     rc, out = WorktreeSandbox(root=tmp_path).run(
-        workspace=_ws(tmp_path), command="cat trace.txt; exec sleep 30", timeout=2)
+        workspace=_ws(tmp_path), command="cat trace.txt; exec sleep 30", timeout=WALL)
     assert rc == TIMEOUT_EXIT and timed_out(rc, out)
     assert "how-far-it-got" in out
 
@@ -216,7 +222,7 @@ def test_the_container_wall_keeps_the_partial_output_too(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", instead_of_docker)
 
-    rc, out = box.run(workspace=_ws(tmp_path), command="claude -p ...", timeout=2)
+    rc, out = box.run(workspace=_ws(tmp_path), command="claude -p ...", timeout=WALL)
 
     assert rc == TIMEOUT_EXIT and timed_out(rc, out)
     assert "partial-work" in out, "the production box discarded the transcript at the wall"
@@ -238,38 +244,48 @@ def test_a_walled_command_s_late_output_cannot_land_in_the_next_command(tmp_path
     as the current one's pulses. `subprocess.run(capture_output=True)` could not do this — each call
     owned its buffers — so the shared buffer is what introduced it.
 
-    `_DRAIN_SECONDS` is shortened so the abandonment happens in half a second instead of ten; the
-    orphan then speaks well inside the second command, which is the whole scenario."""
+    `_DRAIN_SECONDS` is shortened so the abandonment happens in a fifth of a second instead of ten;
+    the orphan then speaks well inside the second command, which is the whole scenario. THE ORDER
+    IS THE CASE, scaled down together (#362: it was a 1 s wall, a 0.5 s drain, the orphan at 3 s
+    and a 5 s second command): the wall and the drain are over at 0.4 s, the orphan speaks at
+    0.8 s, and the second command, started at about 0.4 s, ends at about 2 s."""
     import beeverforge.adapters.sandbox.base as base
 
-    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.5)
+    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.2)
     box = WorktreeSandbox(root=tmp_path)
 
     rc, _ = box.run(
-        workspace=_ws(tmp_path), timeout=1,
-        command="(sleep 3; echo leaked-from-the-killed-command) & sleep 30")
+        workspace=_ws(tmp_path), timeout=0.2,
+        command="(sleep 0.8; echo leaked-from-the-killed-command) & sleep 30")
     assert rc == TIMEOUT_EXIT
     box.tail()  # the watcher drains what the walled command left, as it would on its next tick
 
-    rc, out = box.run(workspace=_ws(tmp_path), command="sleep 5; echo real-file.py", timeout=30)
+    rc, out = box.run(workspace=_ws(tmp_path), command="sleep 1.6; echo real-file.py",
+                      timeout=30)
 
     assert rc == 0
     assert out.splitlines() == ["real-file.py"], (
-        "a command that was killed six seconds ago wrote into this one's output")
+        "a command that was killed before this one started wrote into this one's output")
     assert [line.rstrip("\n") for line in box.tail()] == ["real-file.py"]
 
 
-def test_a_walled_run_returns_within_its_own_bound(tmp_path):
+def test_a_walled_run_returns_within_its_own_bound(tmp_path, monkeypatch):
     """MEASURED, because the first cut of this did not. `close()` on the pipe needs the buffer lock
     that the blocked `readline` holds, so closing it waited for the orphan to die: a 2s timeout took
     30.02s to return — the full lifetime of the `sleep 30` that outlived the shell we killed. The
-    wall is only a wall if giving up is bounded."""
+    wall is only a wall if giving up is bounded.
+
+    The wall and the drain are made short (#362: a 2 s wall and the shipped 10 s drain, 12 s a
+    run); the `sleep 30` is not, because it is what a pipe closed under the orphan would wait for."""
+    import beeverforge.adapters.sandbox.base as base
+
+    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.5)
     started = time.monotonic()
     rc, _ = WorktreeSandbox(root=tmp_path).run(
-        workspace=_ws(tmp_path), command="echo x; sleep 30", timeout=2)
+        workspace=_ws(tmp_path), command="echo x; sleep 30", timeout=WALL)
     elapsed = time.monotonic() - started
     assert rc == TIMEOUT_EXIT
-    assert elapsed < 25, f"the wall took {elapsed:.1f}s to give up on a 2s timeout"
+    assert elapsed < 25, f"the wall took {elapsed:.1f}s to give up on a {WALL}s timeout"
 
 
 # ── an observer is an observer ───────────────────────────────────────────────────────────────────

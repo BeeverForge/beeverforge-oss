@@ -800,17 +800,21 @@ class _KimiThatWaitsForTheLateWrite(KimiAdapter):
 def test_a_kimi_planner_that_outlives_its_timeout_and_writes_later_reaches_no_commit(
         repo, tmp_path, monkeypatch):
     """Criterion 3 (T1). The real `KimiAdapter.plan` on the worktree box starts a `kimi` stub that
-    prints its answer, leaves a detached `( sleep 3; echo late > late.txt )` behind, and sleeps past
-    a 2 s wall. The box kills the shell only, so the orphan writes after the second reading. On
-    main the job reached PR_OPEN with `late.txt` in the pushed branch."""
+    prints its answer, leaves a detached `( sleep 1; echo late > late.txt )` behind, and sleeps past
+    a 0.5 s wall. The box kills the shell only, so the orphan writes after the second reading. On
+    main the job reached PR_OPEN with `late.txt` in the pushed branch.
+
+    THE ORDER IS THE CASE, scaled down together (#362: a 2 s wall, the orphan at 3 s, a 5 s stub
+    and 6 s to outlast it): the second reading ended 18 ms after the wall, so the orphan, half a
+    second after the wall, writes well after it, and the case outlasts the orphan by a second."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "kimi"
     stub.write_text("#!/bin/sh\n"
                     "echo '{\"role\":\"assistant\",\"content\":\"read the tree\"}'\n"
-                    "( sleep 3; echo late > late.txt ) </dev/null >/dev/null 2>&1 &\n"
+                    "( sleep 1; echo late > late.txt ) </dev/null >/dev/null 2>&1 &\n"
                     "exec >/dev/null 2>&1 </dev/null\n"
-                    "sleep 5\n",
+                    "sleep 2\n",
                     encoding="utf-8")
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     home = tmp_path / "home"
@@ -818,7 +822,7 @@ def test_a_kimi_planner_that_outlives_its_timeout_and_writes_later_reaches_no_co
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
-    monkeypatch.setattr(beeverforge.adapters.agent.kimi, "_TIMEOUT", 2)
+    monkeypatch.setattr(beeverforge.adapters.agent.kimi, "_TIMEOUT", 0.5)
 
     agent = _KimiThatWaitsForTheLateWrite()
     assert agent.name == "kimi"
@@ -832,7 +836,7 @@ def test_a_kimi_planner_that_outlives_its_timeout_and_writes_later_reaches_no_co
     assert runner.forge.opened is None, f"a pull request was opened: {runner.forge.opened}"
     assert _branches_on_origin(tmp_path) == {"refs/heads/main"}, _branches_on_origin(tmp_path)
     # outlast the orphan, then read every commit either repository holds
-    time.sleep(max(0.0, 6.0 - (time.monotonic() - started)))
+    time.sleep(max(0.0, 2.0 - (time.monotonic() - started)))
     for where in (repo, tmp_path / "origin.git"):
         names = _git(["log", "--all", "--name-only", "--format="], where)
         assert "late.txt" not in names, f"the late write reached a commit in {where}: {names}"

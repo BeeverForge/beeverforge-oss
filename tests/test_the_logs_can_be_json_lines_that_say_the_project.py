@@ -1701,7 +1701,11 @@ async def test_a_cancelled_attempt_is_nobodys_failure_and_those_behind_it_try(mo
 async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_attempt(monkeypatch):
     """The lock around the held client and the flight is what makes the single flight hold across
     THREADS (re-review on 3cd816ac, measured: with `_HOLDING` a no-op, 32 threads released by one
-    barrier made 2 or 3 library attempts in 4 trials of 20; with the lock, 1 in 20 of 20)."""
+    barrier made 2 or 3 library attempts in 4 trials of 20; with the lock, 1 in 20 of 20).
+
+    THE ATTEMPT IS IN FLIGHT WHILE THEY ARRIVE: the 32 arrived within 33.9 ms of each other at most,
+    measured with four of these side by side on four cores, so an attempt that takes 0.15 s is
+    still in flight when the last one comes (#362: it took 0.2 s, thirty times a case)."""
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
@@ -1710,7 +1714,7 @@ async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_a
     async def _connect(*_args, **_kwargs):
         with counting:
             attempts.append(1)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
         return object()
 
     monkeypatch.setattr(connection.Client, "connect", _connect)
@@ -1831,8 +1835,10 @@ def _door(name: str):
     from beeverforge.runtime.temporal import connection, view
 
     return {"connection.connect": connection.connect,
-            "connection.connect_at_birth": lambda: connection.connect_at_birth(within=0.1,
-                                                                               every=0.02),
+            # A port nobody listens on is refused at once: what this wait bounds is a refused
+            # connect, a millisecond (#362: `within=0.1` was 1.1 s for a case's eleven connects).
+            "connection.connect_at_birth": lambda: connection.connect_at_birth(within=0.01,
+                                                                               every=0.005),
             "view.connect": view.connect}[name]()
 
 
