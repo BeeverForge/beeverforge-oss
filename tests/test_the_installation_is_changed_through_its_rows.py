@@ -38,9 +38,13 @@ import dataclasses
 import functools
 import importlib
 import inspect
+import itertools
 import json
 import re
+import sys
+import types
 import typing
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -61,7 +65,7 @@ from tests.test_a_person_is_invited_not_signed_up import (
     invite_and_register,
     local,  # noqa: F401 — the fixture
 )
-from tests.the_tree_read_once import parsed
+from tests.the_tree_read_once import could_say, parsed
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PY = ROOT / "beeverforge" / "actions" / "catalog.py"
@@ -125,13 +129,54 @@ def _named_only_by_their_writer() -> dict[str, str]:
     store: on 2026-10-24 those were `add` (a set's, and six other modules'), `remove` (a list's and
     a set's, and `lifecycle/ports.py`'s), `set_enabled` (a route of the panel's) and `register` (a
     function inside the panel's app)."""
-    defined = collections.Counter(
-        n.name for path in sorted((ROOT / "beeverforge").rglob("*.py"))
-        for n in ast.walk(parsed(path)) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef))
+    defined = _definitions()
     return {method: cls for cls, methods in WRITERS.items() for method in methods
             if defined[method] == 1 and not any(hasattr(t, method) for t in _BUILTINS)}
 
 
+def _definitions(*, every_module: bool = False) -> collections.Counter[str]:
+    """How many functions and methods of the package carry each name, counted in the modules whose
+    text can say `def <a writer's name>` (`could_say`): a module that cannot say it defines none
+    of the writers' names, and only theirs are asked. `every_module` counts every module, the reading
+    this one is held to."""
+    said = re.compile(r"def[\s\\]+(?:" + "|".join(
+        re.escape(m) for methods in WRITERS.values() for m in sorted(methods)) + r")\b")
+    return collections.Counter(
+        n.name for path in sorted((ROOT / "beeverforge").rglob("*.py"))
+        if every_module or _could_define(path.read_text(encoding="utf-8"), said)
+        for n in ast.walk(parsed(path)) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef))
+
+
+def _could_define(text: str, said: re.Pattern[str]) -> bool:
+    """`could_say(text, said)`, without normalising a text NFKC already leaves as it is."""
+    return said.search(text) is not None or (
+        not unicodedata.is_normalized("NFKC", text) and could_say(text, said))
+
+
+@functools.cache
+def _nodes(node: ast.AST) -> tuple[ast.AST, ...]:
+    """`ast.walk(node)`, in its order, walked once per process: the trees are shared and never
+    changed (`the_tree_read_once`). Breadth first over each node's fields in their order, as
+    `ast.walk` goes, without its generators."""
+    out = [node]
+    for n in out:  # the list grows under the loop: that is the queue
+        for name in n._fields:
+            field = getattr(n, name, None)
+            if isinstance(field, ast.AST):
+                out.append(field)
+            elif isinstance(field, list):
+                out += [item for item in field if isinstance(item, ast.AST)]
+    return tuple(out)
+
+
+@functools.cache
+def _read_nodes(fn: ast.AST) -> tuple[ast.AST, ...]:
+    """The nodes of `fn` the walk reads, in `ast.walk`'s order: a name, an attribute and a call —
+    the only nodes `_written` and `_entered` give anything for."""
+    return tuple(n for n in _nodes(fn) if isinstance(n, ast.Name | ast.Attribute | ast.Call))
+
+
+@functools.cache
 def _module_file(dotted: str) -> Path | None:
     """The file of a module of the package, or `None` for a name that is not one."""
     for candidate in (ROOT / (dotted.replace(".", "/") + ".py"),
@@ -141,14 +186,37 @@ def _module_file(dotted: str) -> Path | None:
     return None
 
 
+@functools.cache
 def _from_the_package(node: ast.AST) -> dict[str, str]:
     """What `node` imports from the package: local name → dotted path, a module's (`from
     beeverforge.product import before_code`, `import beeverforge.product.onboard as onboard`,
     `import beeverforge.product.onboard`, which binds `beeverforge`) or a function's or a class's
     (`from beeverforge.product.onboard import create_context_repository`). A relative import is
-    not read: the package had none on 2026-10-24."""
+    not read: the package had none on 2026-10-24. Read once per node per process, off its
+    statements alone (`_statements`): a caller copies it, never changes it."""
+    return _imported(_statements(node))
+
+
+def _statements(node: ast.AST):
+    """The statements under `node`, in `ast.walk`'s order: an import is a statement, and a
+    statement sits only in another's body or branch — never inside an expression — so the
+    walk need not enter one."""
+    todo = collections.deque([node])
+    while todo:
+        node = todo.popleft()
+        todo.extend(n for n in ast.iter_child_nodes(node) if isinstance(n, _STATEMENTS))
+        yield node
+
+
+#: What holds a statement: a statement, an `except` clause, a `case` of a `match`.
+_STATEMENTS = (ast.stmt, ast.excepthandler, ast.match_case)
+
+
+def _imported(nodes) -> dict[str, str]:
+    """What the import statements among `nodes` import from the package, a later one over an
+    earlier one of the same name (`_from_the_package`)."""
     out: dict[str, str] = {}
-    for n in ast.walk(node):
+    for n in nodes:
         if isinstance(n, ast.ImportFrom) and not n.level and (n.module or "").startswith(
                 "beeverforge"):
             out.update({alias.asname or alias.name: f"{n.module}.{alias.name}" for alias in n.names})
@@ -260,7 +328,7 @@ def _named(scope: _Scope, node: ast.AST) -> tuple[str, Path, str] | None:
     if not isinstance(node, ast.Name) or node.id in scope.typed:
         return None
     head = scope.names.get(node.id) or f"{_module(scope.path).dotted}.{node.id}"
-    return _target(".".join([head, *reversed(parts)]))
+    return _target(".".join([head, *reversed(parts)]) if parts else head)
 
 
 def _annotated(scope: _Scope, node: ast.AST | None) -> _Is | None:
@@ -325,7 +393,7 @@ def _returns(path: Path, key: str) -> _Is | None:
         _RETURNS[(path, key)] = None  # a cycle returns nothing known
         fn, scope = _module(path).functions[key], _scope(path, key)
         _RETURNS[(path, key)] = _annotated(scope, fn.returns) or next(
-            (found for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None
+            (found for n in _nodes(fn) if isinstance(n, ast.Return) and n.value is not None
              and (found := _type(scope, n.value)) is not None), None)
     return _RETURNS[(path, key)]
 
@@ -347,6 +415,24 @@ def _bound(node: ast.AST):
             yield target.id, node.iter, True
 
 
+@functools.cache
+def _binds(fn: ast.AST) -> tuple[tuple[str, ast.AST, bool], ...]:
+    """What every node of `fn` binds (`_bound`), in `ast.walk`'s order, read once per process."""
+    return tuple(bound for n in _nodes(fn) if isinstance(n, _BINDERS) for bound in _bound(n))
+
+
+@functools.cache
+def _stored(fn: ast.AST) -> frozenset[str]:
+    """The names `fn` stores to anywhere in it, read once per process."""
+    return frozenset(n.id for n in _nodes(fn)
+                     if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+
+
+#: The nodes `_bound` reads a binding off.
+_BINDERS = (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.withitem, ast.For, ast.AsyncFor,
+            ast.comprehension)
+
+
 _TOPS: dict[Path, dict[str, _Is]] = {}
 
 
@@ -355,9 +441,9 @@ def _held_at_the_top(path: Path) -> dict[str, _Is]:
     ProjectRegistry()`), read as a function's own names are."""
     if path not in _TOPS:
         typed = _TOPS[path] = {}  # a cycle sees what is known so far
-        scope = _Scope(path, _module(path).imports, typed)
+        scope, body = _Scope(path, _module(path).imports, typed), parsed(path).body
         for _ in range(3):  # a name bound to a name bound to a build
-            for n in parsed(path).body:
+            for n in body:
                 for name, value, each in _bound(n):
                     if not each and (held := _type(scope, value)) is not None:
                         typed.setdefault(name, held)
@@ -378,22 +464,21 @@ def _scope(path: Path, key: str, given: frozenset = frozenset()) -> _Scope:
         for p in params:
             if (found := _annotated(scope, p.annotation)) is not None:
                 scope.typed.setdefault(p.arg, found)
-        own = {p.arg for p in (*params, fn.args.vararg, fn.args.kwarg) if p is not None} | {
-            n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        own = {p.arg for p in (*params, fn.args.vararg, fn.args.kwarg) if p is not None} | \
+            _stored(fn)
         for name, held in _held_at_the_top(path).items():
             if name not in own:
                 scope.typed.setdefault(name, held)
         for _ in range(3):  # a name bound to a name bound to a build
-            for n in ast.walk(fn):
-                for name, value, each in _bound(n):
-                    if each:  # an item of the catalogue's `values()` or `items()` is a row
-                        held = (_ROW if isinstance(value, ast.Call)
-                                and getattr(value.func, "attr", "") in ("values", "items")
-                                and _is_the_catalogue(scope, value.func.value) else None)
-                    else:
-                        held = _type(scope, value)
-                    if held is not None:
-                        scope.typed.setdefault(name, held)
+            for name, value, each in _binds(fn):
+                if each:  # an item of the catalogue's `values()` or `items()` is a row
+                    held = (_ROW if isinstance(value, ast.Call)
+                            and getattr(value.func, "attr", "") in ("values", "items")
+                            and _is_the_catalogue(scope, value.func.value) else None)
+                else:
+                    held = _type(scope, value)
+                if held is not None:
+                    scope.typed.setdefault(name, held)
     return _SCOPES[(path, key, given)]
 
 
@@ -520,12 +605,22 @@ def _reaches(path: Path, name: str, *, door: tuple[Path, str] | None = None,
     class's method, `catalog.CATALOG["enable"].run(...)` and `import beeverforge.product.onboard
     as pob` — and each passed this walk; each is a cut of plan 741d now. A second review bound a
     registry at `cli.py`'s top and wrote `set_enabled` through it from a command, which passed too;
-    so is that."""
+    so is that.
+
+    READ ONCE PER FUNCTION PER PROCESS (`_reached`), and held to the plain walk by
+    `test_the_cached_reading_reads_exactly_what_the_plain_walk_reads`."""
+    writers, entered = _reached(path, name, door)
+    if seen is not None:
+        seen |= entered
+    if not writers:
+        return {}
     return _walk(path, name, frozenset(), door, set() if seen is None else seen, set())
 
 
 def _walk(path: Path, key: str, given: frozenset, door, seen: set,
           entered: set) -> dict[str, tuple[str, ...]]:
+    """The plain reading: the reference `_reached` is held to, and what gives a writer its
+    trail."""
     if (path, key) == door or key not in _module(path).functions or (path, key, given) in entered:
         return {}
     entered.add((path, key, given))
@@ -541,10 +636,70 @@ def _walk(path: Path, key: str, given: frozenset, door, seen: set,
     return out
 
 
+#: `(door, path, key, given) → (the writers it reaches, the functions it enters)`, for every walk
+#: state the reading has finished. In this process only: a mutation run reads its tree afresh.
+_CLOSURES: dict[tuple, tuple[frozenset[str], frozenset[tuple[Path, str]]]] = {}
+
+
+def _reached(path: Path, key: str,
+             door=None) -> tuple[frozenset[str], frozenset[tuple[Path, str]]]:
+    """What `_walk` reads from the function `key` of the module at `path`, without its trails: the
+    writers it reaches, and every function it enters — each walk state read once per process.
+
+    WHY IT IS THE SAME READING. One plain walk shares its `entered` across the whole walk, so a
+    state met twice, round a cycle or in a sibling's subtree, gives nothing the second time, and
+    a writer reaches the root along the edges it was first met by. So what the root writes is the
+    union of what every state it reaches writes itself, the door and a name that is no function
+    of the module left out, and what it enters is those states' functions: `entered` only decides
+    which caller carries a writer up, never which writers arrive. A state's edges are its `_scope`
+    — which is why `given` keys the cache — and `door` removes states, so it keys it too. What
+    `_walk` RETURNS is cut by `entered`, so it is never what is kept: a state's CLOSURE is, and it
+    is known only when the state's strongly connected component is finished (Tarjan's visit),
+    every member then holding the component's union."""
+    if (path, key) == door or key not in _module(path).functions:
+        return frozenset(), frozenset()
+    if (door, path, key, frozenset()) not in _CLOSURES:
+        _visit((door, path, key, frozenset()), {}, {}, [], {})
+    return _CLOSURES[(door, path, key, frozenset())]
+
+
+def _visit(state: tuple, index: dict, low: dict, stack: list, partial: dict) -> None:
+    """One state of `_reached`'s visit, read as `_walk` reads it, node by node and in the same
+    order, so every table the reading fills is filled as the plain walk fills it."""
+    door, path, key, given = state
+    index[state] = low[state] = len(index)
+    at = len(stack)
+    stack.append(state)
+    scope = _scope(path, key, given)
+    writers = {f"schedule.{key}"} if path == SCHEDULE_PY and key in _poller_holds() else set()
+    entered = {(path, key)}
+    for node in _read_nodes(_module(path).functions[key]):
+        writers |= _written(scope, node)
+        for callee in _entered(scope, node):
+            nxt = (door, *callee)
+            if callee[:2] == door or callee[1] not in _module(callee[0]).functions:
+                continue
+            if nxt not in index and nxt not in _CLOSURES:
+                _visit(nxt, index, low, stack, partial)
+            if nxt in _CLOSURES:
+                writers |= _CLOSURES[nxt][0]
+                entered |= _CLOSURES[nxt][1]
+            else:  # on the stack: a cycle back into the component being read
+                low[state] = min(low[state], low[nxt])
+    partial[state] = (writers, entered)
+    if low[state] == index[state]:  # the component is finished: each member holds its union
+        members = stack[at:]
+        del stack[at:]
+        closure = (frozenset().union(*(partial[m][0] for m in members)),
+                   frozenset().union(*(partial[m][1] for m in members)))
+        for m in members:
+            _CLOSURES[m] = closure
+
+
 @functools.cache
 def _catalog_writes() -> dict[str, set[str]]:
     """`row → what it writes`, following what its runner names into the package (`_reaches`)."""
-    return {name: set(_reaches(*_home(spec.run))) for name, spec in catalog.CATALOG.items()}
+    return {name: set(_reached(*_home(spec.run))[0]) for name, spec in catalog.CATALOG.items()}
 
 
 def test_what_writes_the_installation_is_read_off_the_modules_that_write_it():
@@ -568,6 +723,114 @@ def test_what_writes_the_installation_is_read_off_the_modules_that_write_it():
     held = [getattr(importlib.import_module(_module(path).dotted), name)
             for path, name in sorted(THE_CATALOGUE)]
     assert len(held) == 2 and all(h["enable"] is catalog.CATALOG["enable"] for h in held), held
+
+
+def test_the_cached_reading_reads_exactly_what_the_plain_walk_reads():
+    """The reading is held once per function per process (`_reached`), and that cache must read
+    what the plain walk reads, row by row and command by command: the writers a row's runner
+    reaches, and every function a command's walk enters — the positive twin reads those. The
+    plain walk runs here, after the cached one, so both read through the same tables; what those
+    tables read once is held to a full walk by the test below."""
+    differ = []
+    for name, spec in sorted(catalog.CATALOG.items()):
+        cached, cached_seen = _reached(*_home(spec.run))
+        plain_seen: set[tuple[Path, str]] = set()
+        plain = set(_walk(*_home(spec.run), frozenset(), None, plain_seen, set()))
+        if _catalog_writes()[name] != plain or set(cached) != plain or cached_seen != plain_seen:
+            differ.append(f"row {name}: writes {sorted(_catalog_writes()[name] ^ plain)}, "
+                          f"entered {sorted(map(str, cached_seen ^ plain_seen))}")
+    door = _the_door()
+    for words, fn in sorted(_commands().items()):
+        cached, cached_seen = _reached(*_home(fn), door)
+        plain_seen = set()
+        plain = set(_walk(*_home(fn), frozenset(), door, plain_seen, set()))
+        if set(cached) != plain or cached_seen != plain_seen:
+            differ.append(f"`beeverforge {words}`: writes {sorted(set(cached) ^ plain)}, "
+                          f"entered {sorted(map(str, cached_seen ^ plain_seen))}")
+
+    assert not differ, "the cached reading and the plain walk disagree:\n" + "\n".join(differ)
+
+
+#: Functions calling each other round cycles, each `w_<name>` a write: `a`, `b` and `c` are one
+#: component, entered at `a` and left again through `c` into `d`.
+_CYCLES = '''
+def a():
+    w_a
+    b()
+    c()
+
+def b():
+    w_b
+    a()
+
+def c():
+    b()
+    d()
+    print()
+
+def d():
+    w_d
+'''
+
+
+def test_the_cached_reading_is_the_plain_walk_round_every_cycle(monkeypatch):
+    """The package's own graph may hold no cycle a wrong cache trips over, so the cache is held to
+    the plain walk on one that does: read from each function in every order — so a later reading
+    starts at a state an earlier one kept — with the door shut and open, both readings agree. A
+    state kept before its component is finished reads `c` without `a`'s write, and a cycle that
+    does not hold the component open reads `b` without it."""
+    toy = ROOT / "the_cycles.py"
+    functions = {n.name: n for n in ast.parse(_CYCLES).body}
+    read = _module
+    monkeypatch.setattr(sys.modules[__name__], "_module", lambda path: types.SimpleNamespace(
+        functions=functions) if path == toy else read(path))
+    monkeypatch.setattr(sys.modules[__name__], "_scope", lambda path, key, given=frozenset(): None)
+    monkeypatch.setattr(sys.modules[__name__], "_written", lambda scope, node: (
+        {node.id} if isinstance(node, ast.Name) and node.id.startswith("w_") else set()))
+    monkeypatch.setattr(sys.modules[__name__], "_entered", lambda scope, node: (
+        [(toy, node.func.id, frozenset())] if isinstance(node, ast.Call) else []))
+
+    differ = []
+    for door in (None, (toy, "d")):
+        for order in itertools.permutations(sorted(functions)):
+            monkeypatch.setattr(sys.modules[__name__], "_CLOSURES", {})
+            for key in order:
+                writers, entered = _reached(toy, key, door)
+                plain_seen: set[tuple[Path, str]] = set()
+                plain = set(_walk(toy, key, frozenset(), door, plain_seen, set()))
+                if set(writers) != plain or entered != plain_seen:
+                    differ.append(f"{key}, read in the order {order}, door {door is not None}: "
+                                  f"{sorted(writers)} where the plain walk reads {sorted(plain)}")
+
+    assert not differ, "the cached reading and the plain walk disagree:\n" + "\n".join(differ[:5])
+
+
+def test_what_the_reading_reads_once_is_what_a_full_walk_reads():
+    """The tables the walk reads through are each read once per process, and each more narrowly
+    than a full walk of the tree: a function's nodes off its fields (`_nodes`), its imports off
+    its statements alone (`_from_the_package`), and the writers' names counted only in the
+    modules whose text can define one (`_definitions`). Each is held here to the full walk, over
+    every module of the package and every function in it, so a narrowing that loses a node, an
+    import or a definition is seen."""
+    differ = []
+    for path in sorted((ROOT / "beeverforge").rglob("*.py")):
+        tree = parsed(path)
+        for node in (tree, *(n for n in ast.walk(tree)
+                             if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef))):
+            where = f"{path.relative_to(ROOT)}:{getattr(node, 'lineno', 0)}"
+            walked = tuple(ast.walk(node))
+            if len(_nodes(node)) != len(walked) or any(
+                    a is not b for a, b in zip(_nodes(node), walked, strict=True)):
+                differ.append(f"{where}: its nodes are not `ast.walk`'s, in its order")
+            if list(_from_the_package(node).items()) != list(_imported(walked).items()):
+                differ.append(f"{where}: its imports {_from_the_package(node)} are not "
+                              f"{_imported(walked)}")
+    every, asked = _definitions(every_module=True), _definitions()
+    names = sorted(m for methods in WRITERS.values() for m in methods)
+    differ += [f"`{m}` is defined {every[m]} times, counted {asked[m]}" for m in names
+               if every[m] != asked[m]]
+
+    assert not differ, "a table read once reads less than the full walk:\n" + "\n".join(differ)
 
 
 # ── 1. a row that writes the installation says so, and only such a row ─────────────────────────
@@ -1434,7 +1697,7 @@ def _rows_reaching(helper: str) -> set[str]:
             return False
         seen.add(name)
         return name == helper or any(isinstance(n, ast.Name) and reaches(n.id, seen)
-                                     for n in ast.walk(functions[name]))
+                                     for n in _nodes(functions[name]))
 
     return {name for name, spec in catalog.CATALOG.items() if reaches(spec.run.__name__, set())}
 
