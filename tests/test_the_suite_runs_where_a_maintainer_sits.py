@@ -46,6 +46,11 @@ SUN_PATH_MAX = 104
 #: Where `_socket_dir` puts things, so a guard can count what a run left behind.
 SOCKET_ROOT, SOCKET_PREFIX = pathlib.Path("/tmp"), "ofsock"
 
+#: The length of pytest's base temp on the macOS of #121 (`/private/var/folders/…/T/pytest-of-
+#: <user>/pytest-<N>`), before the test's own directory is appended. The child run is handed a
+#: base temp this long, so a socket put back under `tmp_path` fails to bind on EVERY machine.
+MACOS_BASETEMP = 90
+
 
 @pytest.fixture
 def self_cleanup():
@@ -166,32 +171,25 @@ def test_the_installer_file_can_be_collected_at_all():
     assert "error" not in done.stdout.lower(), done.stdout[-800:]
 
 
-def test_the_fixture_actually_uses_the_short_directory():
-    """THE GUARD ABOVE MEASURED THE HELPER AND NOT ITS CALLER, and a mutation row survived saying
-    so: putting the bind back under `tmp_path` left every guard here green, because none of them
-    ran the fixture. `--collect-only` does not execute fixtures either, so the collection guard
-    could not see it.
+def test_the_file_runs_without_an_error_and_leaves_no_directory_behind(monkeypatch):
+    """TWO CLAIMS, ONE RUN OF THAT FILE (#336). Each used to start its own child pytest over the
+    installer's tests, about 6 s apiece beside busy workers, to read two things off runs that
+    were identical but for one variable. One run under the private parent answers both.
 
-    This RUNS the file. Failures are none of this guard's business — the point is that no test in
-    it ERRORS, because an error is the module-scoped fixture dying and taking the file with it."""
-    done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly",
-                           str(INSTALLER_TESTS)], capture_output=True, text=True, cwd=ROOT)
-    tail = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
+    NO TEST IN IT ERRORS. THE GUARD ABOVE MEASURED THE HELPER AND NOT ITS CALLER, and a mutation
+    row survived saying so: putting the bind back under `tmp_path` left every guard here green,
+    because none of them ran the fixture. `--collect-only` does not execute fixtures either, so
+    the collection guard could not see it. This RUNS the file. Failures are none of this guard's
+    business — the point is that no test in it ERRORS, because an error is the module-scoped
+    fixture dying and taking the file with it.
 
-    assert " error" not in tail, (
-        f"the installer tests error rather than run on this machine — the fixture is not using a "
-        f"bindable socket path: {tail}"
-    )
-
-
-def test_the_run_leaves_no_directory_behind(monkeypatch):
-    """THE CLAIM THE DOCSTRING USED TO MAKE AND NOBODY KEPT. It read `the caller owns the cleanup`
-    while neither caller cleaned up, so every run of that file left two directories under `/tmp`
-    for good — on the machine of the maintainer this whole change exists for.
-
-    Counted around a real run rather than asserted from the source, because `shutil.rmtree` being
-    written somewhere is not the same claim as the directory being gone: a `finally` on the wrong
-    block, an early return, or a second call site added later all read identically in a diff.
+    AND NO DIRECTORY IS LEFT. THE CLAIM THE DOCSTRING USED TO MAKE AND NOBODY KEPT. It read `the
+    caller owns the cleanup` while neither caller cleaned up, so every run of that file left two
+    directories under `/tmp` for good — on the machine of the maintainer this whole change exists
+    for. Counted around a real run rather than asserted from the source, because `shutil.rmtree`
+    being written somewhere is not the same claim as the directory being gone: a `finally` on the
+    wrong block, an early return, or a second call site added later all read identically in a
+    diff.
 
     COUNTED IN A DIRECTORY OF ITS OWN, NOT IN `/tmp` (#423). The first version took a snapshot of
     `/tmp/ofsock*`, ran the file, and called every new name a leak — while other xdist workers
@@ -203,13 +201,25 @@ def test_the_run_leaves_no_directory_behind(monkeypatch):
     parent through `SOCKET_ROOT_ENV`, so what is counted is what THIS run made and nothing else.
 
     AND THE PARENT IS PROVED TO BE USED, or an empty private directory would be a guard that
-    always passes: the helper is called under the same variable and must land inside it."""
+    always passes: the helper is called under the same variable and must land inside it, and the
+    child run must have written there. It did not, for as long as the variable began with
+    `BEEVERFORGE_`: the child's conftest strips that prefix before any test runs, so its sockets
+    went to `/tmp` and the count was of an empty directory (found by this change's mutation run).
+
+    AND THE CHILD'S BASE TEMP IS AS LONG AS MACOS'S. On Linux, with `TMPDIR=/tmp`, pytest's
+    `tmp_path` is ~45 bytes and a socket under it binds fine, so a fixture that put the bind back
+    there errored only on a machine whose `TMPDIR` happened to be long: the row "the module
+    fixture binds under tmp_path again" was red in one shell and survived in the gate's (#336).
+    `--basetemp` of `MACOS_BASETEMP` bytes makes the child's `tmp_path` the length #121 met."""
     from tests.test_the_installer_builds_the_commands_it_says_it_does import (
         SOCKET_ROOT_ENV,
         _socket_dir,
     )
 
     root = pathlib.Path(tempfile.mkdtemp(prefix="ofroot", dir=SOCKET_ROOT))
+    # NOT under `root`: making it there would change the mtime the `written` check reads.
+    base = pathlib.Path(tempfile.mkdtemp(prefix="ofbase", dir=SOCKET_ROOT))
+    basetemp = base / ("t" * (MACOS_BASETEMP - len(str(base)) - 1))
     try:
         monkeypatch.setenv(SOCKET_ROOT_ENV, str(root))   # inherited by the subprocess below
         probe = _socket_dir()
@@ -217,13 +227,29 @@ def test_the_run_leaves_no_directory_behind(monkeypatch):
             f"{SOCKET_ROOT_ENV} was set and the helper still made {probe} — the count below would "
             f"be of a directory nothing writes to")
         probe.rmdir()
+        untouched = root.stat().st_mtime_ns
 
-        subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly",
-                        str(INSTALLER_TESTS)], capture_output=True, text=True, cwd=ROOT)
+        done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:randomly",
+                               f"--basetemp={basetemp}", str(INSTALLER_TESTS)],
+                              capture_output=True, text=True, cwd=ROOT)
         leaked = {p for p in root.iterdir() if p.name.startswith(SOCKET_PREFIX)}
+        written = root.stat().st_mtime_ns != untouched
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(base, ignore_errors=True)
+    assert len(str(basetemp).encode()) == MACOS_BASETEMP, (
+        f"the child's base temp is {len(str(basetemp).encode())} bytes, not {MACOS_BASETEMP}, so "
+        f"a socket under its tmp_path no longer fails the way #121's did; fix the padding above")
+    tail = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
 
+    assert " error" not in tail, (
+        f"the installer tests error rather than run on this machine — the fixture is not using a "
+        f"bindable socket path: {tail}"
+    )
+    assert written, (
+        f"the run of that file made nothing under {root}, so its sockets went elsewhere and the "
+        f"count below is of a directory nothing writes to; hand the child {SOCKET_ROOT_ENV} under "
+        f"a name its conftest does not strip")
     assert not leaked, (
         f"{len(leaked)} directory(ies) survived one run of that file and nothing will ever remove "
         f"them: {sorted(str(p) for p in leaked)}"

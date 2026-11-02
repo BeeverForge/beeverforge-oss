@@ -7,6 +7,9 @@ that happens to fix it today.
 
 TEST = "tests/test_the_suite_runs_where_a_maintainer_sits.py"
 SRC = "tests/test_the_installer_builds_the_commands_it_says_it_does.py"
+#: #336: the "no test errors" run and the "no directory left" run became ONE child run of SRC, so
+#: the rows those two guards turned red are aimed at the one node that now asks both.
+RUN = f"{TEST}::test_the_file_runs_without_an_error_and_leaves_no_directory_behind"
 
 MUTATIONS = [
     # RETIRED 2026-09-14: THE CUT WAS AIMED WRONG, the second of the three meanings a survivor
@@ -22,17 +25,30 @@ MUTATIONS = [
      '    return pathlib.Path(tempfile.mkdtemp(prefix="ofsock", '
      'dir=os.environ.get(SOCKET_ROOT_ENV,',
      '    return pathlib.Path(tempfile.mkdtemp(prefix="a" * 90, '
-     'dir=os.environ.get(SOCKET_ROOT_ENV,'),
+     'dir=os.environ.get(SOCKET_ROOT_ENV,', RUN),
 
     ("the module fixture binds under tmp_path again", SRC,
      '    socket_home = _socket_dir()\n    socket_path = socket_home / "docker.sock"'
      '\n    import socket as socketlib',
      '    socket_home = _socket_dir()\n    socket_path = home / "docker.sock"'
-     '\n    import socket as socketlib'),
+     '\n    import socket as socketlib', RUN),
 
     ("the fixture stops releasing its directory, as it never did until #128's review", SRC,
      "\n    shutil.rmtree(socket_home, ignore_errors=True)\n",
-     "\n"),
+     "\n", RUN),
+
+    # #336: THE OTHER CALLERS release theirs too, and the merged run has to see each one. This is
+    # the helper most of the file's tests reach through, and it is not a fixture, so it is the
+    # cut the module fixture's row cannot stand in for.
+    ("the installer helper stops releasing its directory", SRC,
+     "        shutil.rmtree(socket_home, ignore_errors=True)\n    return done, house",
+     "        pass\n    return done, house", RUN),
+
+    # #336: AND THE PARENT HAS TO REACH THE CHILD. Under a `BEEVERFORGE_*` name the child's
+    # conftest stripped it, the sockets went to `/tmp`, and the row above survived on main.
+    ("the private parent goes back under a name the child's conftest strips", SRC,
+     'SOCKET_ROOT_ENV = "TEST_SOCKET_ROOT"',
+     'SOCKET_ROOT_ENV = "BEEVERFORGE_TEST_SOCKET_ROOT"', RUN),
 
     ("the curl stub rewrites the checksums with GNU's spelling of sed", SRC,
      "    && sed 's| \\\\./| |' SHA256SUMS > SHA256SUMS.rewritten && mv SHA256SUMS.rewritten SHA256SUMS ) ;;",
