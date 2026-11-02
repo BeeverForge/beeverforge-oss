@@ -39,6 +39,8 @@ CONSOLE = f"{TEST}::test_the_bare_pytest_console_script_can_COLLECT_the_suite"
 SAME = f"{TEST}::test_that_invocation_sees_the_same_tests_this_one_does"
 TOYLESS = f"{TEST}::test_collection_survives_a_machine_without_THE_OPTIONAL_TOY_PROJECTS"
 WHOLE = f"{TEST}::test_no_guard_here_collects_the_whole_suite"
+LINT = f"{TEST}::test_ci_s_one_whole_collection_is_the_bare_console_script_without_the_toy_projects"
+MAKEFILE = "Makefile"
 
 MUTATIONS += [
     # THE INCIDENT OF 2026-08-05: nothing puts the root on `sys.path`, so the console script
@@ -61,6 +63,15 @@ MUTATIONS += [
     ("a helper reaches the toy projects at import and breaks without them", "tests/dockerfiles.py",
      "",
      "\nfrom tests.demo_projects import demo_projects as _dp\n_X = _dp() / 'x'\n", TOYLESS),
+
+    # #350: THE LINT JOB'S ONE COLLECTION holds the whole-tree halves the subsets leave. It goes
+    # back to `python -m pytest`, or back to a machine with the toy projects, and is refused.
+    ("the lint job's collection goes back to `python -m pytest`", MAKEFILE,
+     "BEEVERFORGE_FIXTURES=$(CURDIR)/no-such-toy-projects pytest -q --collect-only",
+     "BEEVERFORGE_FIXTURES=$(CURDIR)/no-such-toy-projects python -m pytest -q --collect-only", LINT),
+    ("the lint job's collection sees the toy projects again", MAKEFILE,
+     "BEEVERFORGE_FIXTURES=$(CURDIR)/no-such-toy-projects pytest -q --collect-only",
+     "pytest -q --collect-only", LINT),
 
     # CRITERION 3: a guard that goes back to collecting the whole tree is refused by name.
     ("the toy-less guard collects the whole tree again", TEST,

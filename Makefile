@@ -73,9 +73,15 @@ TEST_IDS_DIR ?= $(or $(RUNNER_TEMP),$(TMPDIR),/tmp)/beeverforge-test-ids
 .PHONY: test-collect test-unit test-integration test-alone test-ran-once
 # The listing goes to a file, not the terminal: printed, 17,000 lines took five of the job's six
 # minutes on GitHub's runner while the collection itself took forty seconds.
+# THE BARE CONSOLE SCRIPT, ON A MACHINE WITHOUT THE TOY PROJECTS (#350). This is the one collection
+# of the whole tree CI makes, so it is the one that asks the two whole-tree questions the unit
+# guards in tests/test_ci_runs_what_we_run.py now ask of a subset (#336): does `pytest`, not
+# `python -m pytest`, collect every module (2026-08-05: it died on `No module named 'tests'`), and
+# does collection survive a checkout with no toy projects (88139ad: 253 red runs). A module that
+# fails only there, outside the subsets, fails this job.
 test-collect: ## write the node id of every test the suite collects to TEST_IDS
 	@mkdir -p $(TEST_IDS_DIR)
-	python -m pytest -q --collect-only -p no:randomly $(if $(TEST_IDS),--record-ids=$(TEST_IDS)) > $(TEST_IDS_DIR)/collect.log 2>&1 || { tail -50 $(TEST_IDS_DIR)/collect.log; exit 1; }
+	BEEVERFORGE_FIXTURES=$(CURDIR)/no-such-toy-projects pytest -q --collect-only -p no:randomly $(if $(TEST_IDS),--record-ids=$(TEST_IDS)) > $(TEST_IDS_DIR)/collect.log 2>&1 || { tail -50 $(TEST_IDS_DIR)/collect.log; exit 1; }
 	@tail -1 $(TEST_IDS_DIR)/collect.log
 
 test-unit: ## the tests that start no engine and need no Docker, in parallel (TEST_SHARD/TEST_SHARDS: one slice)

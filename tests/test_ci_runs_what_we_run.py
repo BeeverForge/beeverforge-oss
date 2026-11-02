@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -335,6 +336,42 @@ def test_no_guard_here_collects_the_whole_suite(monkeypatch: pytest.MonkeyPatch)
         f"the guards collect {len(named)} of {len(every)} test files, which is the whole suite "
         f"in pieces; collect only the files that can hold each guard's failure")
 
+
+
+@pytest.mark.skipif(not CI.exists(), reason="no CI workflow in this checkout")
+def test_ci_s_one_whole_collection_is_the_bare_console_script_without_the_toy_projects():
+    """THE WHOLE-TREE HALF of the three guards above, held where it costs nothing (#350). Since
+    #336 they collect subsets: the modules that declare `pytest_plugins`, and the modules that can
+    reach the toy-project reader. A module that fails only under the bare console script, or only
+    without the toy projects, OUTSIDE those subsets, is seen by one collection alone: the lint
+    job's `make test-collect`, the whole tree once per CI run. So that collection must be the
+    console script's, on a machine without the toy projects.
+
+    Read as make expands it (`make -n test-collect`), as the lines above are, so the Makefile's
+    own variables are what is checked, not our reading of them."""
+    assert "make test-collect" in CI.read_text(), (
+        "ci.yml no longer runs `make test-collect`, so no job collects the whole tree under the "
+        "console script; run it in the lint job again, or move this guard to what replaced it")
+    shown = subprocess.run(["make", "-n", "test-collect"], cwd=ROOT, capture_output=True,
+                           text=True, timeout=60)
+    lines = [line for line in shown.stdout.splitlines() if "--collect-only" in line]
+    assert len(lines) == 1, (
+        f"`make test-collect` should run one collection, and `make -n` shows {len(lines)}: "
+        f"{shown.stdout or shown.stderr}")
+    words = shlex.split(lines[0])
+    assigned = {}
+    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        name, _, value = words.pop(0).partition("=")
+        assigned[name] = value
+    assert words and Path(words[0]).name == "pytest", (
+        f"`make test-collect` runs `{' '.join(words[:3])}`, not the bare `pytest` console script, "
+        f"so a module that dies only under the console script outside the plugin subset is "
+        f"collected nowhere; start the recipe with `pytest`")
+    fixtures = assigned.get("BEEVERFORGE_FIXTURES", "")
+    assert fixtures and not Path(fixtures).exists(), (
+        f"`make test-collect` collects with BEEVERFORGE_FIXTURES={fixtures!r}, not a directory "
+        f"that does not exist, so a machine with the toy projects never sees the collection a "
+        f"machine without them gets; set it to `$(CURDIR)/no-such-toy-projects`")
 
 @pytest.mark.skipif(not CI.exists(), reason="no CI workflow in this checkout")
 def test_ci_still_runs_the_command_this_guard_protects():
