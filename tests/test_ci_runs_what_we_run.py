@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -334,6 +335,39 @@ def test_no_guard_here_collects_the_whole_suite(monkeypatch: pytest.MonkeyPatch)
     assert named < every, (
         f"the guards collect {len(named)} of {len(every)} test files, which is the whole suite "
         f"in pieces; collect only the files that can hold each guard's failure")
+
+
+
+@pytest.mark.skipif(not CI.exists(), reason="no CI workflow in this checkout")
+def test_ci_s_one_whole_collection_is_the_bare_console_script():
+    """THE WHOLE-TREE HALF of the console-script guards above, held where it costs nothing (#350).
+    Since #336 they collect a subset: the modules that declare `pytest_plugins`, and the modules
+    those name. A module that fails only under the bare console script OUTSIDE that subset is
+    seen by one collection alone: the lint job's `make test-collect`, the whole tree once per CI
+    run. So CI must run that step, and its recipe must be the console script's.
+
+    Read, not grepped: the step is one of CI's `run:` lines (a commented-out step is not), and the
+    recipe is what `make -n test-collect` expands to, as the lines below are read. No toy-project
+    setting is checked: tests/conftest.py strips every `BEEVERFORGE_*` variable before collection,
+    so every collection is already toy-less, and
+    tests/test_the_suite_reads_no_operators_beeverforge.py holds that strip."""
+    runs = re.findall(r"^\s*(?:-\s*)?run:\s*(.+?)\s*$", CI.read_text(), re.M)
+    assert "make test-collect" in runs, (
+        "ci.yml runs no `make test-collect` step, so no job collects the whole tree under the "
+        "console script; run it in the lint job again, or move this guard to what replaced it")
+    shown = subprocess.run(["make", "-n", "test-collect"], cwd=ROOT, capture_output=True,
+                           text=True, timeout=60)
+    lines = [line for line in shown.stdout.splitlines() if "--collect-only" in line]
+    assert len(lines) == 1, (
+        f"`make test-collect` should run one collection, and `make -n` shows {len(lines)}: "
+        f"{shown.stdout or shown.stderr}")
+    words = shlex.split(lines[0])
+    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        words.pop(0)
+    assert words and Path(words[0]).name == "pytest", (
+        f"`make test-collect` runs `{' '.join(words[:3])}`, not the bare `pytest` console script, "
+        f"so a module that dies only under the console script outside the plugin subset is "
+        f"collected nowhere; start the recipe with `pytest`")
 
 
 @pytest.mark.skipif(not CI.exists(), reason="no CI workflow in this checkout")
