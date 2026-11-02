@@ -1703,20 +1703,32 @@ async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_a
     THREADS (re-review on 3cd816ac, measured: with `_HOLDING` a no-op, 32 threads released by one
     barrier made 2 or 3 library attempts in 4 trials of 20; with the lock, 1 in 20 of 20).
 
-    THE ATTEMPT IS IN FLIGHT WHILE THEY ARRIVE: the 32 arrived within 33.9 ms of each other at most,
-    measured with four of these side by side on four cores, so an attempt that takes 0.15 s is
-    still in flight when the last one comes (#362: it took 0.2 s, thirty times a case)."""
+    THE ATTEMPT IS IN FLIGHT WHILE THEY ARRIVE: it lands only once all 32 have asked whether their
+    target rests, the question each caller asks under the lock one line before it reads the flight
+    (#362: it was a fixed 0.2 s, thirty times a case, against arrivals 33.9 ms apart at most). The
+    5 s is a backstop for a caller that never asks, never the wait itself."""
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
     attempts, counting = [], threading.Lock()
+    asked = [0]
+    resting = connection._resting
+
+    def _counted(key):
+        with counting:
+            asked[0] += 1
+        return resting(key)
 
     async def _connect(*_args, **_kwargs):
         with counting:
             attempts.append(1)
-        await asyncio.sleep(0.15)
+        for _ in range(5000):
+            if asked[0] >= 32:
+                break
+            await asyncio.sleep(0.001)
         return object()
 
+    monkeypatch.setattr(connection, "_resting", _counted)
     monkeypatch.setattr(connection.Client, "connect", _connect)
     before = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
@@ -1724,6 +1736,7 @@ async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_a
         for trial in range(30):
             connection.forget()
             attempts.clear()
+            asked[0] = 0
             together = threading.Barrier(32)
 
             def _ask(together: threading.Barrier = together) -> None:

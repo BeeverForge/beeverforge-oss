@@ -244,23 +244,23 @@ def test_a_walled_command_s_late_output_cannot_land_in_the_next_command(tmp_path
     as the current one's pulses. `subprocess.run(capture_output=True)` could not do this — each call
     owned its buffers — so the shared buffer is what introduced it.
 
-    `_DRAIN_SECONDS` is shortened so the abandonment happens in a fifth of a second instead of ten;
+    `_DRAIN_SECONDS` is shortened so the abandonment happens in a tenth of a second instead of ten;
     the orphan then speaks well inside the second command, which is the whole scenario. THE ORDER
     IS THE CASE, scaled down together (#362: it was a 1 s wall, a 0.5 s drain, the orphan at 3 s
-    and a 5 s second command): the wall and the drain are over at 0.4 s, the orphan speaks at
-    0.8 s, and the second command, started at about 0.4 s, ends at about 2 s."""
+    and a 5 s second command): the wall and the drain are over at 0.2 s, the second command starts
+    about 2 ms later, the orphan speaks at 0.4 s, and the second command ends at about 0.8 s."""
     import beeverforge.adapters.sandbox.base as base
 
-    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.2)
+    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.1)
     box = WorktreeSandbox(root=tmp_path)
 
     rc, _ = box.run(
-        workspace=_ws(tmp_path), timeout=0.2,
-        command="(sleep 0.8; echo leaked-from-the-killed-command) & sleep 30")
+        workspace=_ws(tmp_path), timeout=0.1,
+        command="(sleep 0.4; echo leaked-from-the-killed-command) & sleep 30")
     assert rc == TIMEOUT_EXIT
     box.tail()  # the watcher drains what the walled command left, as it would on its next tick
 
-    rc, out = box.run(workspace=_ws(tmp_path), command="sleep 1.6; echo real-file.py",
+    rc, out = box.run(workspace=_ws(tmp_path), command="sleep 0.6; echo real-file.py",
                       timeout=30)
 
     assert rc == 0

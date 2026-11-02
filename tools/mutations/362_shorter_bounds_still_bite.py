@@ -79,7 +79,7 @@ MUTATIONS = [
      "timeout=None)",
      READY + "::test_the_probe_gives_up_on_a_listener_that_never_answers"),
 
-    # ── the box's wall: 0.5 s and 0.2 s walls, 0.2 s and 0.5 s drains ───────────────────────
+    # ── the box's wall: 0.5 s and 0.1 s walls, 0.1 s and 0.5 s drains ───────────────────────
     ("the worktree box drops what a walled command had written", SANDBOX,
      "    return timeout_result(command, timeout, captured) if walled else",
      "    return timeout_result(command, timeout) if walled else",
@@ -134,7 +134,7 @@ MUTATIONS = [
      "                try:\n                    return self._sync(",
      CHECKOUT + "::test_a_sync_that_cannot_have_the_key_in_time_degrades[RepoCache]"),
 
-    # ── the engine's door: a 0.15 s attempt, a 0.01 s wait on a port nobody listens on ──────
+    # ── the engine's door: an attempt held until all 32 ask, a 0.01 s wait on a dead port ───
     ("the held client and the flight are read and written without their lock", CONNECTION,
      "_HOLDING = threading.Lock()",
      "_HOLDING = __import__('contextlib').nullcontext()",
@@ -171,7 +171,7 @@ MUTATIONS = [
      "        return BUSY\n", "        return FAILED\n",
      PUSH + "::test_a_publish_that_cannot_have_the_semaphore_in_time_is_busy"),
 
-    # ── a walled kimi planner: a 0.5 s wall, the orphan at 1 s, 2 s to outlast it ───────────
+    # ── a walled kimi planner: a 0.25 s wall, the orphan at 0.5 s, 1 s to outlast it ────────
     ("a walled planner's job goes on to the executor", MACHINE,
      "                if before is not None and plan_result.walled:\n",
      "                if False:\n",
