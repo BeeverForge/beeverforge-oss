@@ -3,8 +3,8 @@
 `_review_lines` wrote the reviewer's `summary` and each finding's `description` into the pull
 request body as the reviewer wrote them, so a `#12`, `GH-12`, `owner/repo#12` or `@someone` in
 them linked an unrelated issue or notified a stranger. The agent's own prose already went through
-`without_mentions`; the reviewer's text now does too, and its `@name` and `GH-N` get a zero-width
-space that keeps them readable and makes them nothing a forge links. `format_review`, the review
+`without_mentions`; the reviewer's text now does too (`#12` and `GH-12` read `card 12`, #111), and
+its `@name` gets a zero-width space that keeps it readable and makes it nothing a forge links. `format_review`, the review
 the platform posts on the same pull request, writes the same text and is held to the same rule.
 """
 
@@ -69,8 +69,8 @@ def _review_rows(review: ReviewResult) -> list[str]:
 def _assert_dead(text: str) -> None:
     for live in LIVE:
         assert not live.search(text), f"{live.pattern!r} still matches in {text!r}"
-    # Still readable: the words are there, a zero-width space the only change to the name and GH-N.
-    for kept in ("card 1", "owner/repo card 3", f"@{ZWSP}someone", f"GH{ZWSP}-2", f"gh{ZWSP}-4",
+    # Still readable: the words are there; a zero-width space is the only change to the name.
+    for kept in ("card 1", "owner/repo card 3", f"@{ZWSP}someone", "card 2", "card 4",
                  "\\&#x40;someone", "\\&commat;someone", "\\&#x23;1", "GH\\&#x2D;1",
                  " \\&commat;dee", "see `x \\&#x40;github",
                  *(link.replace("&", "\\&") for link in NOT_LINKS),

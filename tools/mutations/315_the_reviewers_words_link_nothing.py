@@ -4,8 +4,8 @@
 request body as written, and `format_review` posted them the same way, so a `#1`, `GH-2`,
 `owner/repo#3` or `@someone` in them linked an unrelated issue or notified a stranger. Both now
 pass that text through `_without_reviewer_mentions`: every bare `&` escaped outside closed code
-and the links GitHub makes of bare ones (so no entity spells the others), main's `without_mentions`, then a zero-width space after a name's `@` and between
-`GH` and `-<number>`.
+and the links GitHub makes of bare ones (so no entity spells the others), main's `without_mentions` (which writes `#1` and `GH-2` as `card 1` and
+`card 2`, #111), then a zero-width space after a name's `@`.
 """
 
 TEST = "tests/test_the_reviewers_words_link_nothing.py"
@@ -32,28 +32,16 @@ MUTATIONS = [
 
     # ── what the helper does ────────────────────────────────────────────────────────────────────
     ("the helper leaves `#<number>` live", MACHINE,
-     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", words)'''),
 
     ("the helper leaves a name live", MACHINE,
-     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
-     '''    words = without_mentions(words)'''),
-
-    ("the helper leaves `GH-<number>` live", MACHINE,
-     '''    return _A_GH_REFERENCE.sub("\\\\1\\u200b", words)''',
-     '''    return words'''),
-
-    ("`gh-<number>` is left live", MACHINE,
-     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)", re.IGNORECASE)''',
-     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)")'''),
-
-    ("a `GH` glued to a word is broken too", MACHINE,
-     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)", re.IGNORECASE)''',
-     '''_A_GH_REFERENCE = re.compile(r"(GH)(?=-\\d)", re.IGNORECASE)'''),
+     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    return without_mentions(words)'''),
 
     ("an address's `@` is broken too", MACHINE,
-     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
-     '''    words = re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
+     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    return re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
 
     ("an entity is left live: `&` is not escaped", MACHINE,
      '''    words = _ampersands_escaped(words)''',
