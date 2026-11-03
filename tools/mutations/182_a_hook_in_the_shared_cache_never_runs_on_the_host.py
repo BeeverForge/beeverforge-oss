@@ -19,7 +19,22 @@ WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
 MARKS = "beeverforge/adapters/gitworktrees.py"
 CACHE = "beeverforge/runtime/repo_cache.py"
 
+ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
+CACHE_GUARD = f"{TEST}::test_every_literal_git_call_in_a_cache_caller_turns_hooks_off"
+
 MUTATIONS = [
+    ("the knowledge refresh's checkout and clean run with the shared cache's hooks (#384's review)",
+     ACTIVITIES,
+     '            subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), *args],',
+     '            subprocess.run(["git", "-C", str(repo_path), *args],', CACHE_GUARD),
+
+    ("`_head_of` runs with the shared cache's hooks", ACTIVITIES,
+     "def _head_of(repo_path: Path) -> str:\n"
+     "    # hooks off: `repo_path` is the shared repo cache, whose hooks a pass can write (#182)\n"
+     '    head = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse",',
+     "def _head_of(repo_path: Path) -> str:\n"
+     '    head = subprocess.run(["git", "-C", str(repo_path), "rev-parse",', CACHE_GUARD),
+
     # 1. the push
     ("the push runs a pre-push hook again: `--no-verify` is gone", WORKTREE,
      '"push", "--force", "--no-verify", "--", target,',

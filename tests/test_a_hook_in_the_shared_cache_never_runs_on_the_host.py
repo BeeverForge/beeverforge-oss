@@ -325,6 +325,29 @@ def test_no_host_git_call_in_the_box_bypasses_the_runner(source):
         f"{source} spawns a process outside `_run` without the hooks override"
 
 
+#: Host code outside the box that runs git with a literal argv in a `RepoCache` path (#384's
+#: review: the knowledge refresh's `checkout -- knowledge` fired a planted `post-checkout`).
+CACHE_CALLERS = ("beeverforge/runtime/temporal/activities.py",)
+
+
+def _literal_git_calls(tree: ast.AST) -> list[ast.Call]:
+    """Every `subprocess.run([...])` whose argv is a literal list starting with "git"."""
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "run" and isinstance(n.func.value, ast.Name)
+            and n.func.value.id == "subprocess" and n.args and isinstance(n.args[0], ast.List)
+            and n.args[0].elts and isinstance(n.args[0].elts[0], ast.Constant)
+            and n.args[0].elts[0].value == "git"]
+
+
+@pytest.mark.parametrize("source", CACHE_CALLERS)
+def test_every_literal_git_call_in_a_cache_caller_turns_hooks_off(source):
+    calls = _literal_git_calls(parsed(ROOT / source))
+    assert calls, f"{source} has no literal git call left to hold: drop it from CACHE_CALLERS"
+    missing = [c.lineno for c in calls if not _carries_override(c)]
+    assert missing == [], f"{source}: git calls without the hooks override at lines {missing}"
+
+
 # ── the repository cache, the same shared cache ─────────────────────────────────────────────
 
 
