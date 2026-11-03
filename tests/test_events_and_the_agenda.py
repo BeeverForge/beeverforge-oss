@@ -627,6 +627,7 @@ def _agenda_of(client, token: str) -> dict:
     return r.json()
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_agenda_is_ON_THE_PANEL_and_filtered_by_who_the_credential_names(panel):
     ana, bruno = _agenda_of(panel, "tok-ana"), _agenda_of(panel, "tok-bruno")
 

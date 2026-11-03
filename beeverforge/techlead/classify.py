@@ -127,13 +127,14 @@ def _throttled(status_429: str) -> re.Pattern[str]:
 
 _RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     # ---- the tracker's own credential sentences, read before throttling ------------------------
-    # `different accounts` and `no api token reached` are the Jira tracker's own refusal (#749):
-    # an email and a token of different accounts, or no token, which Jira answers as an anonymous
-    # 404 (measured 2026-10-19). Without them the job's park line `ticket: <first 120
-    # characters>` read as `unknown`. They name the email and the card key, either of which can
-    # carry a `429` (`ops429@acme.ai`, `DAR-429`); the refusal is a credential whatever its
-    # arguments say.
-    (CREDENTIAL, re.compile(r"different accounts|no api token reached", re.I), "credential"),
+    # `different accounts`, `no api token reached` and `no email reached` are the Jira tracker's
+    # own refusal (#749): an email and a token of different accounts, no token, or no email, which
+    # Jira answers as an anonymous 404 (measured 2026-10-19). Without them the job's park line
+    # `ticket: <first 120 characters>` read as `unknown`. They name the email and the card key,
+    # either of which can carry a `429` (`ops429@acme.ai`, `DAR-429`); the refusal is a credential
+    # whatever its arguments say.
+    (CREDENTIAL, re.compile(r"different accounts|no api token reached|no email reached", re.I),
+     "credential"),
 
     # ---- transient: time alone fixes these -----------------------------------------------------
     # The 429 counts only where the park lines put the HTTP status — Jira `failed: 429`, Azure

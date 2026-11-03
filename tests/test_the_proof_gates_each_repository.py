@@ -63,6 +63,7 @@ def test_a_foreign_repo_without_a_proof_is_held_BY_NAME(proofs, monkeypatch):
     assert "--repo acme/web" in reason, "the remedy must name the per-repo prove"
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_a_foreign_repo_with_its_own_proof_passes(proofs, monkeypatch):
     from beeverforge.runtime.card_repo import _checkout_key
 

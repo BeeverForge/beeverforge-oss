@@ -63,7 +63,8 @@ MUTATIONS = [
      "'fi; done;')\n\n#: What the shell runs before OpenCode"),
     # ── Kimi Code ──
     ("TODAY'S RUN: Kimi starts with every server the account declares", KIMI,
-     "                else [BEFORE_THE_HARNESS, harness])", "                else [harness])"),
+     "                if prompt_path else [self.before_the_harness, harness])",
+     "                if prompt_path else [harness])"),
     ("the guard ignores a relocated KIMI_CODE_HOME", KIMI,
      "'k=\"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; '", "'k=\"$HOME/.kimi-code\"; '"),
     ("a plugin's servers are not looked for", KIMI,

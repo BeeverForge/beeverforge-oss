@@ -38,6 +38,12 @@ _READ_S = 0.3
 _A_TICK_IS_LATE_BY = 0.15
 _DEADLINE = 1.5
 _HANGS_AFTER = 6.0
+#: The deadline for a read that HANGS: it bounds no work, since the read never answers, so it is
+#: only as long as the case that waits it out has to be (#362: 1.5 s here was 1.5 s per case).
+_HUNG_DEADLINE = 0.3
+#: How long a case watches for a window that must stay EMPTY. A read that lands fills it within
+#: milliseconds of its release; this is ten times that and more.
+_STAYS_EMPTY_FOR, _LOOKS = 0.25, 10
 
 T0 = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
 
@@ -93,6 +99,14 @@ def read(monkeypatch):
     monkeypatch.setattr(reading, "_budget", made)
     yield made
     made.release.set()      # never leave a blocked worker thread behind
+
+
+def _done_with(read: _Read) -> None:
+    """A hung read, released once its case has measured what it came for. RELEASED IN THE CASE,
+    not by the fixture above: the case's loop shuts its default executor down first, and that
+    waits for the thread the hang holds — 12 s per case, `_HANGS_AFTER * 2`, after the case was
+    done (#362)."""
+    read.release.set()
 
 
 async def _watched(coro):
@@ -208,12 +222,15 @@ async def test_the_window_still_holds_a_GOOD_answer(read):
 # ── 3. a `gh` that hangs ────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_a_read_that_HANGS_degrades_to_unread_inside_the_declared_deadline(read):
+async def test_a_read_that_HANGS_degrades_to_unread_inside_the_declared_deadline(monkeypatch,
+                                                                               read):
     read.hangs = True
+    monkeypatch.setenv("BEEVERFORGE_BUDGET_DEADLINE", str(_HUNG_DEADLINE))
 
     started = time.monotonic()
     got, worst = await _watched(reading.gather(want=("budget",), now=T0))
     took = time.monotonic() - started
+    _done_with(read)
 
     assert got.budget == {"state": "unread"}, (
         "a forge that never answers is reported as something other than unread")
@@ -230,18 +247,22 @@ async def test_the_deadline_is_the_DEPLOYMENTS_to_set(monkeypatch, read):
 
     started = time.monotonic()
     got = await reading.gather(want=("budget",), now=T0)
+    took = time.monotonic() - started
+    _done_with(read)
 
     assert got.budget == {"state": "unread"}
-    assert time.monotonic() - started < _DEADLINE / 2, (
+    assert took < _DEADLINE / 2, (
         "BEEVERFORGE_BUDGET_DEADLINE was not read, so the number is not the operator's")
 
 
 @pytest.mark.asyncio
-async def test_a_read_that_ran_out_of_time_STILL_FILLS_the_window_when_it_lands(read):
+async def test_a_read_that_ran_out_of_time_STILL_FILLS_the_window_when_it_lands(monkeypatch,
+                                                                                 read):
     """It is shielded from the deadline for the reason every waiter is shielded: the read is
     nobody's, and throwing it away would make the next floor read spawn a second subprocess while
     the first is still running."""
     read.hangs = True
+    monkeypatch.setenv("BEEVERFORGE_BUDGET_DEADLINE", str(_HUNG_DEADLINE))
     first = await reading.gather(want=("budget",), now=T0)
     assert first.budget == {"state": "unread"}
 
@@ -271,8 +292,8 @@ async def test_a_read_DETACHED_while_it_was_in_flight_does_not_fill_the_window(r
     got = await asking
 
     assert got.budget == OK, "the read that lost the slot stopped answering its own waiter"
-    for _ in range(20):
-        await asyncio.sleep(0.05)
+    for _ in range(_LOOKS):
+        await asyncio.sleep(_STAYS_EMPTY_FOR / _LOOKS)
         if reading._budget_memo is not None:
             break
     assert reading._budget_memo is None, (

@@ -12,6 +12,8 @@ Jira Cloud answers a Basic pair whose token is not the email's account as an ano
   - the sentence puts the cause first (the park line and the card's door keep 120 characters),
     never carries the token, and with no token says so instead of "different accounts", naming
     the variable a project that names no `token_env` reads;
+  - with a token and no email (or an email of whitespace only, as a blank YAML value arrives), the
+    sentence names `tracker.options.email` instead of "different accounts";
   - a job parked on either refusal is classified as a credential, not as unknown.
 """
 
@@ -88,11 +90,26 @@ MUTATIONS = [
      "            self._who_is_asking()\n"
      "            return json.loads(body) if body.strip() else {}"),
 
-    # re-pinned 2026-10-30 (#295): the sentences moved to their own rule, read before throttling
+    # re-pinned 2026-10-30 (#295): the sentences moved to their own rule, read before throttling;
+    # the rule spans two lines since `no email reached` joined it (#120)
     ("a job parked on the refusal is classified as unknown, and names no cause", CLASSIFY,
-     "    (CREDENTIAL, re.compile(r\"different accounts|no api token reached\", re.I), "
-     "\"credential\"),\n",
+     "    (CREDENTIAL, re.compile(r\"different accounts|no api token reached|no email reached\", "
+     "re.I),\n     \"credential\"),\n",
      ""),
+
+    ("with a token and no email, the refusal says the pair is of different accounts", JIRA,
+     "    if not (email or \"\").strip():\n",
+     "    if False:\n"),
+
+    ("an email of whitespace only, as a blank YAML value arrives, reads as an email of a "
+     "different account", JIRA,
+     "    if not (email or \"\").strip():\n",
+     "    if not email:\n"),
+
+    ("a job parked on the no-email refusal is classified as unknown, and names no cause",
+     CLASSIFY,
+     "|no email reached\"",
+     "\""),
 
     ("with no token, the remedy names only `token_env`, which a project that names none has not "
      "got", JIRA,

@@ -543,7 +543,7 @@ class GitHubProjectBoard:
         for it in self._board_items():
             if it.get("number") != issue_number or not it.get("id"):
                 continue
-            if repo and it.get("repo") and it["repo"] != repo:
+            if repo and it.get("repo") and it["repo"].casefold() != repo.casefold():
                 continue
             self._item_ids[key] = it["id"]
             return it["id"]
@@ -748,7 +748,7 @@ class GitHubProjectBoard:
         for it in self._board_items():
             if it.get("number") != issue_number or not it.get("id"):
                 continue
-            if repo and it.get("repo") and it["repo"] != repo:
+            if repo and it.get("repo") and it["repo"].casefold() != repo.casefold():
                 continue
             self._item_ids[key] = it["id"]
             return it["id"]

@@ -36,8 +36,10 @@ from beeverforge.adapters.sandbox import worktree as worktree_box
 from beeverforge.adapters.sandbox.base import BranchHeldElsewhere
 from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
 from beeverforge.techlead.classify import TREE, classify
+from tests import the_git_bed
+from tests.the_git_bed import a_card_repository, a_hosted_door
 
-BRANCH = "beeverforge/28"
+BRANCH = the_git_bed.CARD_BRANCH
 #: git's own words for a path that is taken, in English (2.34.1 and 2.43.0) and as `fatal:`.
 GITS_WORDS = ("already exists", "fatal:")
 
@@ -48,6 +50,11 @@ DOORS = ["fresh", "local-keep", "hosted-resume"]
 #: The cases whose `.git` file names another repository, which the sentence names as the owner.
 OWNED = {"another-repositorys-live-tree", "another-repositorys-forgotten-tree"}
 
+#: The worker's repository bed (`tests/the_git_bed.py`), this module's fixture as well. The card
+#: repositories and the hosted door are its shapes; every worktree and clone of them is made in
+#: the copy, never in a template, since a worktree registers its absolute path.
+git_bed = the_git_bed.git_bed
+
 
 def _git(cwd: Path, *args: str) -> str:
     p = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=60)
@@ -55,27 +62,10 @@ def _git(cwd: Path, *args: str) -> str:
     return p.stdout.strip()
 
 
-def _commit(repo: Path, name: str, text: str, message: str) -> None:
-    (repo / name).write_text(text)
-    _git(repo, "add", "-A")
-    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgSign=false",
-         "commit", "-q", "-m", message)
-
-
 def _sha(repo: Path, ref: str) -> str:
     p = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref],
                        capture_output=True, text=True)
     return p.stdout.strip()
-
-
-def _repository(where: Path, work: str = "WORK = True\n") -> Path:
-    """`main`, and the card's branch carrying the job's committed work."""
-    subprocess.run(["git", "init", "-q", "-b", "main", str(where)], capture_output=True, check=True)
-    _commit(where, "README.md", "# app\n", "base")
-    _git(where, "switch", "-q", "-c", BRANCH)
-    _commit(where, "work.py", work, "the job's work")
-    _git(where, "switch", "-q", "main")
-    return where
 
 
 def _registered(repo: Path) -> list[str]:
@@ -96,33 +86,26 @@ class Door:
                                 checkout_existing=True, remote_url=self.remote)
 
 
-def _door(name: str, tmp_path: Path, root: Path) -> Door:
+def _door(name: str, tmp_path: Path, root: Path, bed: the_git_bed.Bed) -> Door:
     box = WorktreeSandbox(root=root)
     if name == "fresh":
-        return Door(name, _repository(tmp_path / "myapp"), None, box)
+        return Door(name, a_card_repository(bed, tmp_path / "myapp"), None, box)
     if name == "local-keep":
-        repo = _repository(tmp_path / "myapp")
+        repo = a_card_repository(bed, tmp_path / "myapp")
         return Door(name, repo, str(repo), box)
     # a hosted forge: a bare origin holds the card's branch, the clone's tracking ref is behind it
-    origin = tmp_path / "forge.git"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
-                   capture_output=True, check=True)
-    seed = _repository(tmp_path / "seed")
-    _git(seed, "push", "-q", str(origin), "main", BRANCH)
-    clone = tmp_path / "myapp"
-    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], capture_output=True,
-                   check=True)
-    _git(seed, "switch", "-q", BRANCH)
-    _commit(seed, "work.py", "WORK = 2\n", "the factory's second pass")
-    _git(seed, "push", "-q", str(origin), BRANCH)
+    a_hosted_door(bed, tmp_path)
+    clone, origin = tmp_path / "myapp", tmp_path / "forge.git"
+    assert _git(clone, "config", "--get", "remote.origin.url") == str(origin), (
+        "the copy's clone does not name the copy's forge")
     return Door(name, clone, f"file://{origin}", box)
 
 
-def _put(case: str, wt: Path, tmp_path: Path) -> Path | None:
+def _put(case: str, wt: Path, tmp_path: Path, bed: the_git_bed.Bed) -> Path | None:
     """Put `case` at the box's path `wt`. Answers the other repository, where there is one."""
     wt.parent.mkdir(parents=True, exist_ok=True)
     if case in OWNED or case == "a-clone":
-        other = _repository(tmp_path / "other app", work="THEIRS = True\n")
+        other = a_card_repository(bed, tmp_path / "other app", work="THEIRS = True\n")
         if case == "a-clone":
             subprocess.run(["git", "clone", "-q", str(other), str(wt)], capture_output=True,
                            check=True)
@@ -178,10 +161,10 @@ def root(tmp_path, request):
     return tmp_path / request.param
 
 
-def _taken(case: str, door_name: str, tmp_path: Path, root: Path):
-    door = _door(door_name, tmp_path, root)
+def _taken(case: str, door_name: str, tmp_path: Path, root: Path, bed: the_git_bed.Bed):
+    door = _door(door_name, tmp_path, root, bed)
     wt = root / BRANCH.replace("/", "-")
-    other = _put(case, wt, tmp_path)
+    other = _put(case, wt, tmp_path, bed)
     return door, wt, other
 
 
@@ -189,12 +172,12 @@ def _taken(case: str, door_name: str, tmp_path: Path, root: Path):
 
 @pytest.mark.parametrize("door_name", DOORS)
 @pytest.mark.parametrize("case", CASES)
-def test_what_is_at_the_box_s_path_is_left_as_it_was(tmp_path, root, case, door_name):
+def test_what_is_at_the_box_s_path_is_left_as_it_was(tmp_path, root, case, door_name, git_bed):
     """C2. REVERSE GUARD: green on c0a50f3, where git refused the add over it, and it stays green.
     Another repository's tree (live, or forgotten by that repository), a clone, a plain directory
     with a file, a `.git` file naming no repository or a symlink loop, and a regular file are none
     of them provably this repository's forgotten tree, so none is removed."""
-    door, wt, other = _taken(case, door_name, tmp_path, root)
+    door, wt, other = _taken(case, door_name, tmp_path, root, git_bed)
     before = _snapshot(wt)
     with pytest.raises(RuntimeError):
         door.prepare()
@@ -204,10 +187,10 @@ def test_what_is_at_the_box_s_path_is_left_as_it_was(tmp_path, root, case, door_
 
 
 @pytest.mark.parametrize("door_name", DOORS)
-def test_an_empty_directory_at_the_box_s_path_is_used(tmp_path, root, door_name):
+def test_an_empty_directory_at_the_box_s_path_is_used(tmp_path, root, door_name, git_bed):
     """C2, reverse. REVERSE GUARD: green on c0a50f3. Git accepts an empty directory as the add's
     path (rc 0, 2.34.1 and 2.43.0, measured), so the refusal of a taken path must not refuse it."""
-    door = _door(door_name, tmp_path, root)
+    door = _door(door_name, tmp_path, root, git_bed)
     wt = root / BRANCH.replace("/", "-")
     wt.mkdir(parents=True)
     ws = door.prepare()
@@ -226,13 +209,13 @@ def _refusal(door: Door) -> RuntimeError:
 @pytest.mark.parametrize("door_name", DOORS)
 @pytest.mark.parametrize("case", CASES)
 def test_the_refusal_names_the_path_whose_it_is_and_what_moves_it(tmp_path, root, case,
-                                                                  door_name):
+                                                                  door_name, git_bed):
     """C3. On c0a50f3 the message was `worktree add failed: … fatal: '<wt>' already exists`: git's
     sentence, naming no owner and no remedy, classified `unknown`. It is one sentence of the box's
     own: the path, whose it is, that it was left as it is, the command that moves it (every path
     shell-quoted) and resume. Not a hold on the person's branch: a `RuntimeError`, not
     `BranchHeldElsewhere`, and never classified as an edit or a branch in the person's tree."""
-    door, wt, other = _taken(case, door_name, tmp_path, root)
+    door, wt, other = _taken(case, door_name, tmp_path, root, git_bed)
     error = _refusal(door)
     said = str(error)
     assert not isinstance(error, BranchHeldElsewhere), said
@@ -253,12 +236,12 @@ def test_the_refusal_names_the_path_whose_it_is_and_what_moves_it(tmp_path, root
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_the_refusal_comes_before_the_card_s_branch_is_deleted(tmp_path, root, case):
+def test_the_refusal_comes_before_the_card_s_branch_is_deleted(tmp_path, root, case, git_bed):
     """C3, decide before you write (engineering lessons §12). On c0a50f3 a fresh door ran
     `branch -D` before git refused the add, and `worktree add -b` made the branch again at the base
     before it refused the path (git 2.43.0, measured 2026-10-18: the tip moved from the job's work
     to `main`), so the card's branch no longer held what it held."""
-    door, wt, other = _taken(case, "fresh", tmp_path, root)
+    door, wt, other = _taken(case, "fresh", tmp_path, root, git_bed)
     before = _sha(door.repo, f"refs/heads/{BRANCH}")
     assert before
     with pytest.raises(RuntimeError):
@@ -268,10 +251,11 @@ def test_the_refusal_comes_before_the_card_s_branch_is_deleted(tmp_path, root, c
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_on_a_hosted_resume_the_refusal_writes_no_remote_tracking_ref(tmp_path, root, case):
+def test_on_a_hosted_resume_the_refusal_writes_no_remote_tracking_ref(tmp_path, root, case,
+                                                                     git_bed):
     """C3, the same rule on a hosted resume. On c0a50f3 the fetch wrote the forge's newer push
     into `refs/remotes/origin/<branch>` of the clone, then git refused the add."""
-    door, wt, other = _taken(case, "hosted-resume", tmp_path, root)
+    door, wt, other = _taken(case, "hosted-resume", tmp_path, root, git_bed)
     tracking = _sha(door.repo, f"refs/remotes/origin/{BRANCH}")
     with pytest.raises(RuntimeError):
         door.prepare()
@@ -291,14 +275,14 @@ def _run_as_written(command: str, where: Path) -> None:
 
 @pytest.mark.parametrize("case", CASES)
 def test_following_the_sentence_frees_the_path_and_the_other_repository_s_tree_still_works(
-        tmp_path, case):
+        tmp_path, case, git_bed):
     """C3, the command works as written. The root holds a space, so a path that is not quoted
     splits. Run as the sentence gives it, the command moves what was there to a path of the
     person's, with everything in it; the job then starts; and another repository's live tree,
     moved, is still a working tree of that repository (`worktree move`, not `mv`, which would
     break its registration). On c0a50f3 there was no command to follow."""
     root = tmp_path / "my boxes"
-    door, wt, other = _taken(case, "fresh", tmp_path, root)
+    door, wt, other = _taken(case, "fresh", tmp_path, root, git_bed)
     before = _snapshot(wt)
     said = str(_refusal(door))
     moves = _commands(said)
@@ -317,12 +301,12 @@ def test_following_the_sentence_frees_the_path_and_the_other_repository_s_tree_s
     "Preparing worktree (new branch 'beeverforge/28')\nfatal: '{wt}' already exists\n",
     "Preparando worktree (novo ramo 'beeverforge/28')\nfatal: '{wt}' já existe\n",
 ], ids=["git-2.34.1", "pt_BR"])
-def test_the_refusal_is_the_same_whatever_git_s_wording(tmp_path, monkeypatch, wording):
+def test_the_refusal_is_the_same_whatever_git_s_wording(tmp_path, monkeypatch, wording, git_bed):
     """C3, version and locale. The sentence is built from what the box read at the path, never from
     git's prose: with the add answering in another wording, the refusal is the same sentence. On
     c0a50f3 git's sentence was passed through, so the two differed."""
     root = tmp_path / "boxes"
-    door, wt, other = _taken("another-repositorys-live-tree", "fresh", tmp_path, root)
+    door, wt, other = _taken("another-repositorys-live-tree", "fresh", tmp_path, root, git_bed)
     plain = str(_refusal(door))
 
     real = worktree_box._run
@@ -340,14 +324,14 @@ def test_the_refusal_is_the_same_whatever_git_s_wording(tmp_path, monkeypatch, w
 
 @pytest.mark.parametrize("door_name", DOORS)
 def test_a_symbolic_link_at_the_box_s_path_is_refused_and_nothing_is_checked_out_where_it_points(
-        tmp_path, root, door_name):
+        tmp_path, root, door_name, git_bed):
     """C2 and C3 for a symbolic link at the box's path (review of 35ac306). `git worktree add`
     over a link to an empty directory answers rc 0 on 2.43.0 and registers the link's TARGET,
     which `_same_dir` then read as the box's own: on c0a50f3 the first `prepare` checked the card
     out into the directory the link names, and the rerun's `remove --force` deleted that
     directory, with what had been written into it since. It is refused by name, and the link and
     what it names are left as they were."""
-    door = _door(door_name, tmp_path, root)
+    door = _door(door_name, tmp_path, root, git_bed)
     wt = root / BRANCH.replace("/", "-")
     theirs = tmp_path / "a directory of theirs"
     theirs.mkdir()
@@ -362,13 +346,13 @@ def test_a_symbolic_link_at_the_box_s_path_is_refused_and_nothing_is_checked_out
 
 
 def test_another_repository_s_tree_whose_list_cannot_be_read_is_told_to_move_with_git_not_mv(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, git_bed):
     """C3 with lessons §2, for the owner (review of 35ac306). When the other repository's list
     cannot be read, the box cannot tell its live tree from one it forgot; `worktree move` refuses
     loudly on a forgotten one, where `mv` would break a live registration, so the sentence gives
     `git -C <owner> worktree …`."""
     root = tmp_path / "boxes"
-    door, wt, other = _taken("another-repositorys-live-tree", "fresh", tmp_path, root)
+    door, wt, other = _taken("another-repositorys-live-tree", "fresh", tmp_path, root, git_bed)
     real = worktree_box._working_trees
     monkeypatch.setattr(worktree_box, "_working_trees", lambda repo_path: None
                         if Path(repo_path).resolve() == other.resolve() else real(repo_path))
@@ -380,12 +364,12 @@ def test_another_repository_s_tree_whose_list_cannot_be_read_is_told_to_move_wit
 
 @pytest.mark.parametrize("door_name", DOORS)
 def test_a_symbolic_link_at_the_box_s_path_to_a_person_s_own_tree_of_this_repository_keeps_that_tree(
-        tmp_path, root, door_name):
+        tmp_path, root, door_name, git_bed):
     """C2 for a link naming a linked working tree of THIS repository that a person made. Git lists
     the tree's real path and `_same_dir` resolves through the link, so `_clear_our_own` read it as
     the box's own and `worktree remove --force` deleted it with its uncommitted work (rc 0, 2.43.0);
     `worktree remove --force <link>`, on an unread list, does the same."""
-    door = _door(door_name, tmp_path, root)
+    door = _door(door_name, tmp_path, root, git_bed)
     mine = tmp_path / "my own tree"
     _git(door.repo, "worktree", "add", "-q", "-b", "mine", str(mine))
     (mine / "unsaved.txt").write_text("a person's uncommitted work\n")
@@ -399,9 +383,9 @@ def test_a_symbolic_link_at_the_box_s_path_to_a_person_s_own_tree_of_this_reposi
 
 
 def test_a_symbolic_link_at_the_box_s_path_to_a_person_s_own_tree_is_kept_when_the_list_cannot_be_read(
-        tmp_path, root, monkeypatch):
+        tmp_path, root, monkeypatch, git_bed):
     """The same, on an unread list: `worktree remove --force <link>` removes the tree it names."""
-    door = _door("fresh", tmp_path, root)
+    door = _door("fresh", tmp_path, root, git_bed)
     mine = tmp_path / "my own tree"
     _git(door.repo, "worktree", "add", "-q", "-b", "mine", str(mine))
     (mine / "unsaved.txt").write_text("a person's uncommitted work\n")

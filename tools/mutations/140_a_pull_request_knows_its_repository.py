@@ -85,8 +85,8 @@ MUTATIONS = [
 
     ("the fast-forward runs in the project's repository, where the proposal's refs do not exist",
      FORGE,
-     '            p = self._git("fetch", "--", ".", f"{head}:{base}", cwd=where)',
-     '            p = self._git("fetch", "--", ".", f"{head}:{base}")'),
+     '            p = self._git(*gitpin.pinned(["fetch", "--", ".", f"{head}:{base}"]), cwd=where)',
+     '            p = self._git(*gitpin.pinned(["fetch", "--", ".", f"{head}:{base}"]))'),
 
     ("`mergeable_state` looks for the head in the project's repository, and the page says `dirty` "
      "for a proposal that would merge", FORGE,
@@ -111,7 +111,8 @@ MUTATIONS = [
     # ── 3. the file that was already running ───────────────────────────────────────────────────
     ("the column is never added to a file that already exists, so every running deployment's "
      "first proposal fails with `no column named repo`", DB,
-     "        _add_columns(conn)\n",
+     # RE-PINNED 2026-11-02 (#199): the call moved into `board_db._prepare`, one indent out
+     "    _add_columns(conn)\n",
      ""),
 
     ("a LOST race to add the column raises out of `connect`, taking down whichever of the worker "

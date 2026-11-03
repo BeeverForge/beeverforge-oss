@@ -69,16 +69,17 @@ MUTATIONS = [
     # `a-clone` cases of task 3's file against rows 2 and 7.
 
     # ── claim 2: anything else is refused by name, before anything is written ──────────────────
+    # Re-pinned by #124: the line no longer gates on `trees`, which the line after it now does.
     ("the pre-write refusal of a taken path is removed", BOX,
-     "        taken = _what_is_at(wt) if trees is not None else None\n",
+     "        taken = _what_is_at(wt)\n",
      "        taken = None\n",
      NOT_OURS),
 
     ("the refusal comes after `branch -D`", BOX,
-     "        taken = _what_is_at(wt) if trees is not None else None\n",
+     "        taken = _what_is_at(wt)\n",
      "        if not (checkout_existing and _is_this_repo(remote_url, repo_path)):\n"
      '            _run(["git", "-C", str(repo_path), "branch", "-D", branch])\n'
-     "        taken = _what_is_at(wt) if trees is not None else None\n",
+     "        taken = _what_is_at(wt)\n",
      NOT_OURS),
 
     ("another repository's live tree is told to `mv`, which breaks its registration", BOX,

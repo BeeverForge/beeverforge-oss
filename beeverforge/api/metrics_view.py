@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
+from beeverforge.lifecycle.record import KIND as _CARD_TRANSITION
+
 log = logging.getLogger("beeverforge.metrics")
 
 
@@ -242,13 +244,27 @@ def _delta(arms: dict) -> dict | None:
     return out
 
 
+# THE KINDS THE DASHBOARD READS, and so the only keys its selector lists (#209). The people store
+# keeps its `person` and invitation rows under `_deployment_`, and listing every row's key put that
+# "project" in the selector and opened the dashboard on it, showing nothing spent. An allow-list by
+# kind, not an exclusion of `_deployment_`, so a future non-project kind stays out too.
+#
+# `card_transition` is one of them: the autonomy block `cost_dashboard` returns beside these
+# numbers reads it (`observability/autonomy.py`), and it is written as cards move, while `job` and
+# `agent_run` rows land only when a job ends. Without it a project whose first card is still in
+# flight dropped out of the selector though its autonomy block had rows (#374's review).
+DASHBOARD_KINDS = ("agent_run", "job", _CARD_TRANSITION)
+
+
 def dashboard(records: list[dict], project: str | None = None) -> dict:
-    """The panel's dashboard payload. `projects` lists every project seen (for the selector);
-    everything else is scoped to `project` (or the first project if none given). Cost breakdowns
-    come from `agent_run` items (model/harness/role + cost); the per-task table joins each
-    ticket's agent_runs (cost/turns/models/harnesses) with its `job` record (wall-clock, state)."""
+    """The panel's dashboard payload. `projects` lists every key holding a row of a kind the
+    dashboard reads (`DASHBOARD_KINDS`, for the selector); everything else is scoped to `project`
+    (or the first project if none given). Cost breakdowns come from `agent_run` items
+    (model/harness/role + cost); the per-task table joins each ticket's agent_runs
+    (cost/turns/models/harnesses) with its `job` record (wall-clock, state)."""
     projects = sorted({str(r.get("pk") or r.get("project") or "") for r in records
-                       if (r.get("pk") or r.get("project"))})
+                       if (r.get("pk") or r.get("project"))
+                       and r.get("kind") in DASHBOARD_KINDS})
     project = project or (projects[0] if projects else "")
 
     scoped = [r for r in records if str(r.get("pk") or r.get("project") or "") == project]

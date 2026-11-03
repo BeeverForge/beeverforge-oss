@@ -127,6 +127,13 @@ def _project():
                                          agent_name="Nina"))
 
 
+def _context():
+    from beeverforge.product.config import resolve_product_link
+    from beeverforge.product.loader import ProductContext
+
+    return ProductContext(link=resolve_product_link(project=_project()))
+
+
 @pytest.fixture()
 def wired(monkeypatch):
     """The seams the repair crosses: the channel, the telemetry table, the product module."""
@@ -334,9 +341,18 @@ def test_a_rescue_that_cannot_run_says_what_broke_it_and_what_the_client_will_he
         raise RuntimeError("gh: command not found")
 
     monkeypatch.setattr(authoring, "land_open_proposals", _boom)
+    # NO CLONE ON THE WAY TO THE SWEEP (#335): the activity reads `module.context()` first, and the
+    # real one clones the documentation repository in a subprocess. The loader is a recorder that
+    # must stay silent, so the only failure the line can name is the sweep's own.
+    loads: list = []
+    monkeypatch.setattr(product_module, "load_product_context",
+                        lambda *a, **kw: loads.append((a, kw)) or _context())
+    monkeypatch.setattr(product_module.ProductModule, "context",
+                        lambda self, *, refresh=False: _context())
 
     with caplog.at_level(logging.DEBUG, logger=ACTIVITY_LOG):
         assert acts._land_product_proposals(_project(), token="tok") == []
+    assert loads == [], "the rescue test synced the documentation repository: a real clone"
 
     lines = [r.getMessage() for r in caplog.records
              if "BEEVERFORGE_PRODUCT_PROPOSAL_LAND_FAILED" in r.getMessage()]

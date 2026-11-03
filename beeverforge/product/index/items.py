@@ -115,7 +115,15 @@ def digest_of(*parts: object) -> str:
 # ── documents ───────────────────────────────────────────────────────────────────────────────────
 
 _PAGE = re.compile(r"^\[page (\d+)\]")
-_HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+#: The heading runs to the end of its line; `_heading_name` drops its closing `#`s (#76): a lazy
+#: `.+?` closed by `\s*#*\s*$` scanned the rest of the line from every end it tried.
+_HEADING = re.compile(r"^#{1,6}\s+([^\n]+)", re.MULTILINE)
+
+
+def _heading_name(raw: str) -> str:
+    """A heading's name: its text without the closing `#`s and the space around them, never
+    shorter than one character — what `(.+?)\\s*#*\\s*$` took."""
+    return (raw.rstrip().rstrip("#").rstrip() or raw[:1]).strip()
 
 
 def chunks(text: str) -> list[tuple[str, str]]:
@@ -135,7 +143,7 @@ def chunks(text: str) -> list[tuple[str, str]]:
         if page:
             here = f"page {page.group(1)}"
         elif heading:
-            here = f"§ {heading.group(1).strip()[:80]}"
+            here = f"§ {_heading_name(heading.group(1))[:80]}"
         if buf and (size + len(piece) > CHUNK_CHARS or here != where):
             out.append((where, "\n\n".join(buf)))
             buf, size = [], 0
@@ -220,8 +228,10 @@ def from_record(record: DocumentRecord) -> list[Item]:
 #: status, date, what it supersedes, and who asked (a name, which never crosses into another
 #: conversation — ADR-0051 D9) — which the item carries as fields; and the register's own table,
 #: indexed row by row as decisions.
-_HEADER_LINE = re.compile(r"^\s*(?:#\s+REQ-\d+.*|[-*]\s*\**(?:Asked by|Status|Date|Supersedes)"
-                          r":?\**.*)$", re.MULTILINE | re.IGNORECASE)
+#: `[ \t]`, not `\s`, before and after the bullet (#76): `^\s*` spanned blank lines and backtracked.
+_HEADER_LINE = re.compile(r"^[ \t]*(?:#\s+REQ-\d+.*"
+                          r"|[-*][ \t]*\**(?:Asked by|Status|Date|Supersedes):?\**.*)$",
+                          re.MULTILINE | re.IGNORECASE)
 
 
 def _register(body: str) -> tuple[str, list[tuple[str, str]]]:

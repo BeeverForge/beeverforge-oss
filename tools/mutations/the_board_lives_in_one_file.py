@@ -65,15 +65,22 @@ MUTATIONS = [
     ("THE REVIEW'S FINDING, PUT BACK: the WAL conversion is asked for once and not again, so two "
      "connections opening a brand-new file race for a lock SQLite refuses to wait for — and the "
      "loser gets `database is locked` out of `connect`, before it has run anything", DB,
-     "        _to_wal(conn)", '        conn.execute("PRAGMA journal_mode=WAL")', SLICE),
+     # RE-PINNED 2026-11-02 (#199): `_to_wal` became `_open`, which asks the whole opening
+     # sequence again; the cut is the same one — a lock refused once is raised, not asked again
+     "            if not _locked(exc):\n                raise\n            last = exc\n"
+     "        time.sleep(_OPEN_WAIT_S)",
+     "            raise\n        time.sleep(_OPEN_WAIT_S)", SLICE),
 
     ("the retry gives up after one try, which is the unconverted file said another way — and it "
      "must RAISE rather than return over a database it never put in WAL", DB,
-     "    for _ in range(_WAL_TRIES):", "    for _ in range(1):", SLICE),
+     # RE-PINNED 2026-11-02 (#199): the bound is `_open`'s deadline, not `_WAL_TRIES`; one try
+     # is the loop leaving after its first refusal
+     "        time.sleep(_OPEN_WAIT_S)\n    log.warning(", "        break\n    log.warning(", SLICE),
 
     ("the journal goes back to the default, so the panel reading blocks the worker writing", DB,
-     '        conn.execute("PRAGMA journal_mode=WAL")',
-     '        conn.execute("PRAGMA journal_mode=DELETE")', SLICE),
+     # RE-PINNED 2026-11-02 (#199): the pragma moved into `_prepare`, one indent out
+     '    conn.execute("PRAGMA journal_mode=WAL")',
+     '    conn.execute("PRAGMA journal_mode=DELETE")', SLICE),
 
     ("the number sequence stops being per project — two projects in one file then fight over "
      "the same numbers", DB,

@@ -30,6 +30,7 @@ that is a migration and it will need saying out loud.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -38,20 +39,38 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 #: Where the file is, when the deployment names it. Compose points the worker AND the panel at the
 #: state volume they already share, exactly as it does for the registry; a host installation names
 #: nothing and gets the operator's own directory.
 PATH_ENV = "BEEVERFORGE_BOARD_DB"
 
-#: How long a writer waits for another process's lock before giving up. Five seconds is the
-#: registry's own flock timeout, and the operations here are single-statement — a wait that long
-#: means another process is wedged, not busy, and the caller should hear about it.
+#: SQLite's busy timeout for this file, and the unit of the module's two bounds. Five seconds is
+#: the registry's own flock timeout. It bounds two different waits, and they are NOT the same on
+#: purpose (#199, #383's review):
+#:   - the OPENING (`_open`): `BUSY_TIMEOUT_MS` in all, with the busy handler off, because two
+#:     openers each waiting out the other's busy timeout is what failed #166 (one conversion waited
+#:     5.004 s, the schema statement that then lost waited 6.389 s, measured under load);
+#:   - the WRITE LOCK (`_begin`): `_BEGIN_TRIES` x `BUSY_TIMEOUT_MS`, about 15 s, because one lost
+#:     busy timeout under load is a slow neighbour, not a wedged one. Measured under load, the
+#:     other writer held the lock 2.315 s at most and `BEGIN IMMEDIATE` waited 1.833 s at most;
+#:     #199's loss was not reproduced in 920 runs, so tries two and three are headroom, not a cure.
 BUSY_TIMEOUT_MS = 5000
 
-#: How long to keep asking for the WAL conversion, and why it needs asking at all — see `_to_wal`.
-#: Forty tries of 10 ms is 0.4 s at the very worst, on the one open per process that can meet a
-#: converting neighbour; every later open finds the file already in WAL and returns on the first.
-_WAL_TRIES, _WAL_WAIT_S = 40, 0.01
+#: THE OPENING SEQUENCE'S BOUND — the WAL conversion, the schema, the columns and the triggers,
+#: asked again as one while another connection holds the file (`_open`). The TOTAL is
+#: `BUSY_TIMEOUT_MS` on the monotonic clock, the same five seconds as every other write here, and
+#: it cannot multiply: the busy handler is OFF while the sequence runs (`busy_timeout` 0), so no
+#: statement in a try waits at all and the loop's own pauses of `_OPEN_WAIT_S` are the only
+#: waiting there is. Worst case: `BUSY_TIMEOUT_MS` plus one try's own work. Every open of a file
+#: that already holds the board finds nothing to write and returns on its first try.
+_OPEN_WAIT_S = 0.01
+
+#: THE WRITE LOCK'S BOUND (#199): `BEGIN IMMEDIATE` is asked at most `_BEGIN_TRIES` times, each a
+#: full `BUSY_TIMEOUT_MS` on SQLite's busy handler, with `_BEGIN_WAIT_S` between them — so a writer
+#: waits at most 3 x 5 s + 2 x 10 ms, about 15 s, and is then refused with `BoardLocked`.
+_BEGIN_TRIES, _BEGIN_WAIT_S = 3, 0.01
 
 _SCHEMA = (
     # A card. `ref` is an INTEGER per project because the number sequence is per project (D5);
@@ -211,6 +230,24 @@ _TRIGGERS = (
 )
 
 
+class BoardLocked(sqlite3.OperationalError):
+    """Another process held the board file past this module's stated bound — a wedged neighbour,
+    not a busy one. An `OperationalError`, so every caller that already catches SQLite's errors
+    handles it as it always did; the difference is the sentence, which names the file and what to
+    do about it."""
+
+
+def _refused(target: Path, waited: str) -> BoardLocked:
+    return BoardLocked(
+        f"The board file {target} stayed locked by another process for {waited}, so stop the "
+        f"worker, panel or CLI command that is holding it and try again.")
+
+
+def _locked(exc: sqlite3.OperationalError) -> bool:
+    """SQLITE_BUSY, the one refusal a wait can cure; anything else is raised as it is."""
+    return "database is locked" in str(exc)
+
+
 def db_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Where `board.db` is — the registry's own resolution, for the same reasons.
 
@@ -263,21 +300,15 @@ def connect(path: str | os.PathLike[str] | None = None,
     remedy nobody can act on from the error sqlite3 gives."""
     target = Path(db_path(path))
     target.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    conn = sqlite3.connect(target, timeout=0, isolation_level=None)
     try:
         conn.row_factory = sqlite3.Row
-        _to_wal(conn)
+        _open(conn, target)
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA foreign_keys=ON")
-        for statement in _SCHEMA:
-            conn.execute(statement)
-        _add_columns(conn)
-        for statement in _TRIGGERS:
-            conn.execute(statement)
         if not write:
             yield conn
             return
-        conn.execute("BEGIN IMMEDIATE")
+        _begin(conn, target)
         try:
             yield conn
         except BaseException:
@@ -288,53 +319,90 @@ def connect(path: str | os.PathLike[str] | None = None,
         conn.close()
 
 
-def _to_wal(conn: sqlite3.Connection) -> None:
-    """Put the file in WAL, asking again while a neighbour is converting it.
+def _open(conn: sqlite3.Connection, target: Path) -> None:
+    """Put the file in WAL and give it the board's tables, asking again while another connection
+    holds it — for `BUSY_TIMEOUT_MS` in all, then `BoardLocked`.
 
-    THE ONE STATEMENT THE BUSY HANDLER DOES NOT COVER. Every other lock here is waited out by
-    `busy_timeout`; the WAL conversion needs a brief EXCLUSIVE lock and SQLite refuses that
-    upgrade IMMEDIATELY rather than calling the handler. So two connections opening a brand-new
-    file race for it, and the loser gets `database is locked` — from `connect`, before it has run
-    anything.
+    THE WHOLE SEQUENCE, NOT THE CONVERSION ALONE (#166). Two connections opening a brand-new file
+    race for it, and the WAL conversion was the step this module used to ask again, 40 times in
+    0.4 s. Measured under load on 2026-11-02 (920 runs of the two-openers race on four CPUs beside
+    the full suite, load average about 16), the one failure was NOT the conversion: it went
+    through, and `CREATE TABLE IF NOT EXISTS cards` then lost the lock to the other opener after
+    6.389 s. Every step here that finds something missing writes, so every step can lose, and the
+    retry covers them all — conversion, schema, columns, triggers — under one bound.
 
-    THIS IS A DEPLOYMENT'S FIRST MINUTE, NOT A TEST'S BAD LUCK. `board.db` does not exist yet on a
-    fresh install, so the first concurrent opens ARE this race: the worker polling, the panel
-    serving and a CLI verb in a shell, which is the arrangement this module's own docstring
-    describes. Once the file is in WAL the pragma is a no-op and the race is gone, which is why it
-    is rare and why it looked like a flaky test.
+    THE BUSY HANDLER IS OFF WHILE IT RUNS (`sqlite3.connect(timeout=0)` in `connect`). On a file
+    still in the rollback journal SQLite sometimes refuses the conversion at once and sometimes
+    waits out the WHOLE busy timeout for it (5.004 s measured) while this connection holds a
+    shared lock the other opener needs to write its schema. Two openers each waiting for the
+    other's lock is how one statement waited 6.389 s and still lost. With the handler off a
+    refused statement holds nothing, the next pause is the loop's, and the total is the loop's
+    deadline rather than the deadline times the statements in a try.
 
-    MEASURED, INCLUDING THE FIX THAT DOES NOT WORK. Two threads opening a brand-new file, per
-    variant:
+    MEASURED BEFORE, INCLUDING THE FIX THAT DOES NOT WORK: two threads opening a brand-new file
+    failed 6/30 with an unconditional conversion and 6/40 with `busy_timeout` moved before it,
+    and 0/60 once the conversion was asked again. Reordering is not a remedy. On an EXISTING
+    file none of this arises — every step finds its table and writes nothing.
 
-        as it was, unconditional pragma              6 / 30 failed
-        `busy_timeout` moved BEFORE the conversion   6 / 40 failed  (and 26/60 on the reviewer's
-                                                                     machine — no better, likely
-                                                                     worse)
-        this: ask again while it is refused          0 / 60 failed
-
-    Reordering is the obvious remedy and it is the wrong one: executing anything first takes a
-    shared lock the conversion then has to break, and that upgrade is exactly what SQLite will not
-    wait for. On an EXISTING file none of this arises — six processes writing 25 cards each
-    produced 150 contiguous numbers, no duplicates, no failures.
-
-    RAISES ON THE LAST TRY rather than degrading to a rollback journal: a file that is not in WAL
-    would serialise the panel behind the worker, and the caller should hear that its database is
-    genuinely wedged rather than silently getting the slower shape."""
-    # THE EXHAUSTION RAISES WITHOUT CONSULTING THE BOUND, and a mutation is what taught the
-    # difference. Written as `if attempt == _WAL_TRIES - 1: raise`, the loop's limit and its
-    # give-up condition are two expressions that have to agree — cut the limit alone and the
-    # function returns NORMALLY over a file it never converted, leaving the deployment in a
-    # rollback journal with nobody told. Falling out of the loop cannot disagree with itself.
+    RAISES WHEN THE BOUND RUNS OUT rather than degrading to a rollback journal or handing out a
+    file without its tables: a file that is not in WAL would serialise the panel behind the
+    worker, and the caller should hear that its database is wedged, in one sentence that names
+    it."""
+    # THE EXHAUSTION IS FALLING OUT OF THE LOOP, and a mutation is what taught that shape: written
+    # as a give-up condition inside the `except`, the bound and the give-up are two expressions
+    # that have to agree — cut one alone and the function returns NORMALLY over a file it never
+    # prepared. Here the only way past the loop is the raise.
+    deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
     last: sqlite3.OperationalError | None = None
-    for _ in range(_WAL_TRIES):
+    while time.monotonic() < deadline:
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
+            _prepare(conn)
             return
         except sqlite3.OperationalError as exc:
+            if not _locked(exc):
+                raise
             last = exc
-            time.sleep(_WAL_WAIT_S)
-    raise last if last is not None else RuntimeError(
-        "the journal mode was never set and nothing said why")
+        time.sleep(_OPEN_WAIT_S)
+    log.warning("%s stayed locked through the whole opening wait (%d ms): %s",
+                target, BUSY_TIMEOUT_MS, last)
+    raise _refused(target, f"{BUSY_TIMEOUT_MS} ms while it was being opened") from last
+
+
+def _prepare(conn: sqlite3.Connection) -> None:
+    """One try of the opening sequence: WAL, then the schema, the columns and the triggers.
+
+    Idempotent from any point it stopped at, which is what lets `_open` simply ask again: every
+    statement is `IF NOT EXISTS`, the pragma is a no-op on a file in WAL, and `_add_columns` reads
+    before it alters."""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    for statement in _SCHEMA:
+        conn.execute(statement)
+    _add_columns(conn)
+    for statement in _TRIGGERS:
+        conn.execute(statement)
+
+
+def _begin(conn: sqlite3.Connection, target: Path) -> None:
+    """`BEGIN IMMEDIATE`, asked again when a full busy timeout went by without the lock (#199).
+
+    A writer that loses one busy timeout under load has not met a wedged neighbour, only a slow
+    one, and losing its card for it is the defect. So it asks `_BEGIN_TRIES` times in all, each a
+    full `BUSY_TIMEOUT_MS`, and only then is refused — logged, and in one sentence. Nothing has
+    been written when this runs, so asking again cannot write anything twice."""
+    last: sqlite3.OperationalError | None = None
+    for _ in range(_BEGIN_TRIES):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if not _locked(exc):
+                raise
+            last = exc
+        time.sleep(_BEGIN_WAIT_S)
+    log.warning("%s: no write lock after %d tries of %d ms each: %s",
+                target, _BEGIN_TRIES, BUSY_TIMEOUT_MS, last)
+    raise _refused(target, f"{_BEGIN_TRIES} tries of {BUSY_TIMEOUT_MS} ms") from last
 
 
 def _add_columns(conn: sqlite3.Connection) -> None:

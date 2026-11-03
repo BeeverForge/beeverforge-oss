@@ -19,6 +19,7 @@ the SAME probe set through both and require them to agree, line for line.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -138,21 +139,29 @@ def test_the_build_is_null_outside_a_built_image_and_carried_inside_one():
 
 # ── the command, and the one rule both renderings read ──────────────────────────────────────────
 
-@pytest.mark.parametrize("over", [
+#: The three deployments both renderings are compared over: green, broken, and a step ahead.
+RENDERED = pytest.mark.parametrize("over", [
     {},
     {"docker_running": lambda: (False, "the daemon did not answer")},
     {"manifest": _no_manifest, "box_gate": lambda: NEVER_PROVEN},
 ], ids=["green", "broken", "expected"])
-def test_the_document_and_the_screen_say_the_same_thing(tmp_path, monkeypatch, over):
-    """TWO RENDERINGS OF ONE REPORT. Every line the screen marks `ok`/`FAIL` is in the document
-    with the same result, and the closing sentence is the verdict the document names — so a
-    reader of either is told the same thing about the same deployment."""
+
+
+def _render_both_and_agree(tmp_path, monkeypatch, over, before_text=lambda: None,
+                           before_json=lambda: None) -> dict:
+    """Render one probe set on the screen and as the document, and require them to agree.
+
+    `before_text` and `before_json` run just ahead of each render — the seam a test uses to move
+    the clock between them. Returns the document so a caller can assert on it further.
+    """
     from beeverforge.cli import app
 
     runner = _registered(tmp_path, monkeypatch)
     monkeypatch.setattr(doctor, "probes_for", lambda _p: a_fully_pinned_probe_set(**over))
 
+    before_text()
     text = runner.invoke(app, ["doctor", "demo"])
+    before_json()
     as_json = runner.invoke(app, ["doctor", "demo", "--json"])
     document = json.loads(as_json.stdout)
 
@@ -166,6 +175,42 @@ def test_the_document_and_the_screen_say_the_same_thing(tmp_path, monkeypatch, o
     assert sentence in text.output, (document["verdict"], text.output[-400:])
     if document["verdict"] == "expected":
         assert f"Next: {document['next_step']}." in text.output
+    return document
+
+
+@RENDERED
+def test_the_document_and_the_screen_say_the_same_thing(tmp_path, monkeypatch, over):
+    """TWO RENDERINGS OF ONE REPORT. Every line the screen marks `ok`/`FAIL` is in the document
+    with the same result, and the closing sentence is the verdict the document names — so a
+    reader of either is told the same thing about the same deployment."""
+    _render_both_and_agree(tmp_path, monkeypatch, over)
+
+
+@RENDERED
+def test_the_document_and_the_screen_agree_across_a_minute_boundary(tmp_path, monkeypatch, over):
+    """THE TWO RENDERS STRADDLE A MINUTE (#155). The screen renders at HH:MM:59.9 and the document
+    a moment later, past the minute. The pinned budget's "refills at HH:MM" must be one time in
+    both, so the clock a render happens to read cannot make the two disagree. The clock is a stub:
+    nothing here sleeps or measures elapsed time."""
+    # Local time, because the doctor formats the reset with `time.localtime`; a November morning,
+    # away from any daylight-saving change.
+    first = time.mktime((2026, 11, 3, 6, 45, 59, 0, 0, -1)) + 0.9
+    second = first + 0.2
+    assert time.localtime(int(first) + 3600).tm_min != time.localtime(int(second) + 3600).tm_min, (
+        "the stubbed clock no longer straddles a minute, so this test proves nothing")
+    clock = [first]
+
+    def at(moment):
+        def move():
+            clock[0] = moment
+        return move
+
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    document = _render_both_and_agree(tmp_path, monkeypatch, over,
+                                      before_text=at(first), before_json=at(second))
+
+    budget = next(c for c in document["checks"] if c["id"] == "api_budget")
+    assert "refills at" in budget["detail"], budget
 
 
 def test_json_mode_prints_the_document_and_nothing_else(tmp_path, monkeypatch):

@@ -609,7 +609,25 @@ def test_the_HOURLY_sweep_is_handed_the_forge_it_used_to_run_without(monkeypatch
 
     monkeypatch.setattr(authoring, "land_open_proposals", _sweep)
 
+    # NO CLONE ON THE WAY TO THE SWEEP (#335). The activity reads `module.context()` before it
+    # reaches the sweep, and the real one syncs the documentation repository: a `git clone` of a
+    # `dev.azure.com` address with a fake PAT, in a subprocess the socket block in
+    # `tests/conftest.py` cannot see, which waited 300 s for a timeout on every run. The context is
+    # handed in, and the loader that would clone is replaced by a recorder that must stay silent.
+    from beeverforge.product import module as product_module
+    from beeverforge.product.loader import ProductContext
+
+    link = resolve_product_link(project=_ado_project(), manifest_docs_repo=DOCS_REPO, docs=_docs())
+    context = ProductContext(link=link, requirements_dir="reqs")
+    loads: list = []
+    monkeypatch.setattr(product_module, "load_product_context",
+                        lambda *a, **kw: loads.append((a, kw)) or context)
+    monkeypatch.setattr(product_module.ProductModule, "context",
+                        lambda self, *, refresh=False: context)
+
     assert acts._land_product_proposals(_ado_project(), token="pat") == []
+    assert loads == [], "the sweep test synced the documentation repository: a real clone"
+    assert seen.get("requirements_dir") == "reqs", seen
     assert isinstance(seen.get("forge"), AzureReposForge), seen
     # The adapter is bound to the SOURCE repository and every method it serves the sweep takes a
     # repository — which is the whole reason the port's read side can act on the docs repo at all.
