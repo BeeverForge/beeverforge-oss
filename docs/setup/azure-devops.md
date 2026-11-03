@@ -373,14 +373,14 @@ a project without a scope, which would hand the factory the whole team. `beeverf
 the board as unreadable and its remedy names `scope_epic` beside the credential, and the worker's
 log names the option and the id. An Epic with nothing under it is a readable, empty board.
 
-**A scoped project refuses, by name, to edit, close, remove, queue or rank a card that is not under
-its Epic.** Those acts reach a card by its number, so the board asks whether the card is in the
+**A scoped project refuses, by name, to edit, close, remove, reopen, queue or rank a card that is
+not under its Epic.** Those acts reach a card by its number, so the board asks whether the card is in the
 slice, and answers "it is not this project's" or, when it could not tell, as for an unreadable
 board. A project without `scope_epic` makes no extra request.
 
-Three acts are **not** held to the scope and reach any work item by its number: starting a job on a
-card (`beeverforge run <project> <card>`, the floor's `start`), reopening a closed card, and
-commenting on one. Name only cards under the Epic to them.
+Two acts are **not** held to the scope and reach any work item by its number: starting a job on a
+card (`beeverforge run <project> <card>`, the floor's `start`) and commenting on one. Name only
+cards under the Epic to them.
 
 **Three limits to plan around.**
 
