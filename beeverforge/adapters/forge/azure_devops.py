@@ -372,9 +372,10 @@ class AzureReposForge(ForgeAdapter):
     def _client_for(self, repo: str) -> AzureDevOpsClient:
         """A client scoped to the PROJECT the ref names, falling back to this adapter's own.
 
-        Every repository route on this vendor is project-scoped, and `_repo_or_self` throws the
-        qualifier away — right for C-18, whose refs qualify with this adapter's own project, and
-        wrong for the one caller that legitimately points elsewhere: the CONTEXT repository. A
+        Every repository route on this vendor is project-scoped, and `_repo_or_self` keeps only
+        the repository's name, so the project has to come from here — every route that takes a
+        caller's ref, the branch delete and the pull-request reads included. The caller that
+        legitimately points elsewhere is the CONTEXT repository. A
         client may keep documentation in a shared project of the same organisation, and a
         deployment has both shapes at once — measured on a real enterprise organisation, where
         some projects keep a documentation repository and others do not. Aimed at the wrong
@@ -470,9 +471,12 @@ class AzureReposForge(ForgeAdapter):
         the project it actually lives in. Ids are project-wide (proven live), and this is the only
         route that does not need to be told the repository up front.
 
-        `repo` IS ACCEPTED AND DOES NOT ADDRESS ANYTHING, WHICH IS WORTH A PARAGRAPH RATHER THAN
-        A SHRUG. The port gives `pr_status`/`merge_pr` a `repo` so the product path can name the
-        documentation repository it means; on this vendor the id already answers that. Measured
+        `repo` PICKS THE PROJECT AND NOTHING ELSE, WHICH IS WORTH A PARAGRAPH RATHER THAN A
+        SHRUG. The port gives `pr_status`/`merge_pr` a `repo` so the product path can name the
+        documentation repository it means. Its project is read through `_client_for`, the rule
+        `clone_url` uses, so a PR opened in a shared documentation project (`Docs/web`) is read
+        there and not in this adapter's own (#410, #414's review); within the project the id
+        already answers which repository. Measured
         on a live client project (2026-08-06), by opening PR 13 in another repository of that same
         project (`{other-repo}`) from an adapter configured for `fx-ado`:
 
@@ -490,7 +494,7 @@ class AzureReposForge(ForgeAdapter):
         unambiguous across the project — but the mismatch is a caller holding a false belief and
         must not be silent. GitHub does the same thing without telling anybody: `gh pr view <url>
         --repo <other>` answers the URL's repository and never mentions the flag."""
-        data = self._client().call("GET", f"git/pullrequests/{self._pr_id(pr)}")
+        data = self._client_for(repo).call("GET", f"git/pullrequests/{self._pr_id(pr)}")
         wanted = (repo or "").strip().strip("/").rsplit("/", 1)[-1]
         if wanted:
             actual = ((data.get("repository") or {}).get("name") or "").strip()
@@ -583,10 +587,14 @@ class AzureReposForge(ForgeAdapter):
     def _repo_or_self(self, repo: str) -> str:
         """The repository name the caller meant. "" is this adapter's own.
 
-        REDUCED TO ITS LAST SEGMENT, exactly as `clone_url` does and for the same reason: C-18
-        hands qualified `project/repo` refs around, and the project is already one of this
-        adapter's own coordinates. An Azure Repos repository name cannot contain a slash, so
-        there is nothing here that a legitimate name could lose."""
+        REDUCED TO ITS LAST SEGMENT, because a route names the repository as one path segment
+        and C-18 hands qualified `project/repo` refs around. THE PROJECT IS NOT DROPPED BY
+        ACCIDENT, IT IS READ ELSEWHERE: a caller that addresses a route builds its client from
+        `_client_for(repo)` with the same ref, which obeys the qualifier when it names another
+        repository (`Docs/web` is read in `Docs`) and ignores it for this adapter's own. Pairing
+        this name with `_client()` instead sends that ref to this adapter's project (#414's
+        review). An Azure Repos repository name cannot contain a slash, so there is nothing here
+        that a legitimate name could lose."""
         return (repo or "").strip().strip("/").rsplit("/", 1)[-1] or self.repo
 
     def list_branches(self, repo: str = "", *, prefix: str = "") -> list[str] | None:
@@ -657,7 +665,7 @@ class AzureReposForge(ForgeAdapter):
         target = self._repo_or_self(repo)
         zero = "0" * 40
         try:
-            answer = self._client().call(
+            answer = self._client_for(repo).call(
                 "POST", f"git/repositories/{urllib.parse.quote(target)}/refs",
                 body=[{"name": _branch_ref(branch), "oldObjectId": zero, "newObjectId": zero}])
         except (AzureDevOpsError, ValueError) as exc:
@@ -1064,7 +1072,7 @@ class AzureReposForge(ForgeAdapter):
     def merge_pr(self, *, pr: str, repo: str = "") -> None:
         """Trigger the merge, on the `auto` policy only.
 
-        `repo` NAMES THE CALLER'S INTENT AND THE PR'S OWN REPOSITORY STILL DECIDES — see `_pr`,
+        `repo` PICKS THE PROJECT AND THE PR'S OWN REPOSITORY STILL DECIDES — see `_pr`,
         which measured why: a project-wide id resolves the repository by itself here, and a
         mismatch is logged rather than obeyed. Merging into a repository the caller named but the
         pull request does not live in is not something this vendor can even express.
@@ -1081,7 +1089,7 @@ class AzureReposForge(ForgeAdapter):
         immediately after would report an honest merge as a failure. The durable merge-watch polls
         `pr_status` and is the only thing entitled to that verdict.
         """
-        client = self._client()
+        client = self._client_for(repo)
         pr_data = self._pr(pr, repo=repo)
         target = urllib.parse.quote(self._repo_of(pr_data))
         pr_id = int(pr_data["pullRequestId"])
@@ -1192,7 +1200,7 @@ class AzureReposForge(ForgeAdapter):
         body = self._fit_description(body)
         try:
             pr_data = self._pr(pr, repo=repo)
-            client = self._client()  # the PR's own repository, in this adapter's project
+            client = self._client_for(repo)  # the PR's own repository, in the ref's project
             target = urllib.parse.quote(self._repo_of(pr_data))
             pr_id = int(pr_data["pullRequestId"])
             client.call("PATCH", f"git/repositories/{target}/pullrequests/{pr_id}",
@@ -1687,7 +1695,7 @@ class AzureReposForge(ForgeAdapter):
         """
         try:
             pr_data = self._pr(pr, repo=repo)
-            client = self._client_for(self._repo_of(pr_data))
+            client = self._client_for(repo)
             base = (pr_data.get("lastMergeTargetCommit") or {}).get("commitId") or ""
             head = (pr_data.get("lastMergeSourceCommit") or {}).get("commitId") or ""
             if not base or not head:
