@@ -49,9 +49,10 @@ MUTATIONS = [
     # re-pinned after review round 1 (9882b73) replaced the paragraph model with escaping
     # re-pinned after review round 3 (be48a54) split bare links out first, and after review
     # round 4 (3c6d12c) moved that body into `_plain`
+    # and after #112 (review on a2714e1) wrote the agent's `$` through `_escaped`
     ("a `#N` the agent writes stays a forge item", MACHINE,
-     '_MARKUP.sub(r"\\\\\\1", without_mentions(piece))',
-     '_MARKUP.sub(r"\\\\\\1", piece)'),
+     '_MARKUP.sub(_escaped, without_mentions(piece))',
+     '_MARKUP.sub(_escaped, piece)'),
     ("an `@name` the agent writes is left to notify", MACHINE,
      '    return "".join(f"`{piece}`" if k % 2 else _A_HANDLE.sub(\n',
      '    return "".join(f"`{piece}`" if k % 2 else (lambda f, t: t)(\n'),
@@ -60,12 +61,12 @@ MUTATIONS = [
      '_A_HANDLE = re.compile(r"(?<![A-Za-z0-9])@',
      '_A_HANDLE = re.compile(r"(?<!\\w)@'),
     ("the agent's backticks pair with the wrapping (its markup is not escaped)", MACHINE,
-     '_MARKUP.sub(r"\\\\\\1", without_mentions(piece))',
+     '_MARKUP.sub(_escaped, without_mentions(piece))',
      "without_mentions(piece)"),
-    # re-pinned after review round 2 (35a1cc0) added the emphasis markers
+    # re-pinned after review round 2 (35a1cc0) added the emphasis markers, and #112 `!` and `$`
     ("an HTML block or a backslash the agent writes is left to unwrap the name", MACHINE,
-     '_MARKUP = re.compile(r"([\\\\`<&*_~])")\n',
-     '_MARKUP = re.compile(r"([`*_~])")\n'),
+     '_MARKUP = re.compile(r"([\\\\`<&*_~!$])")\n',
+     '_MARKUP = re.compile(r"([`*_~!$])")\n'),
     ("wrapping the first of `@x@name` exposes the second", MACHINE,
      '@([A-Za-z0-9](?:[\\w.@-]*\\w)?)")',
      '@([A-Za-z0-9](?:[\\w.-]*\\w)?)")'),
@@ -78,11 +79,11 @@ MUTATIONS = [
      "            if False:\n                cut = start\n"),
     # ── review round 2 on 35a1cc0: identifiers read as written, and the guards that survived ─
     ("the agent's `__init__` and `*.py` render as emphasis", MACHINE,
-     '_MARKUP = re.compile(r"([\\\\`<&*_~])")\n',
-     '_MARKUP = re.compile(r"([\\\\`<&])")\n'),
+     '_MARKUP = re.compile(r"([\\\\`<&*_~!$])")\n',
+     '_MARKUP = re.compile(r"([\\\\`<&!$])")\n'),
     ("an entity the agent writes decodes to a name", MACHINE,
-     '_MARKUP = re.compile(r"([\\\\`<&*_~])")\n',
-     '_MARKUP = re.compile(r"([\\\\`<*_~])")\n'),
+     '_MARKUP = re.compile(r"([\\\\`<&*_~!$])")\n',
+     '_MARKUP = re.compile(r"([\\\\`<*_~!$])")\n'),
     ("a heading after a list marker or the agent's `>` renders", MACHINE,
      r'(?:(?:[-+]|\d{1,9}[.)])\s+)*)(#|>|',
      r')(#|>|'),
@@ -138,8 +139,9 @@ MUTATIONS = [
      "            if link.start() < cut < link.end():\n                cut = link.start()\n",
      "            if False:\n                cut = link.start()\n"),
     ("a reference definition parses, and its address is on the page nowhere", MACHINE,
-     '    return _A_DEFINITION.sub(r"\\1\\\\[", _A_HEADING.sub(',
-     "    return (lambda f, t: t)(r\"\", _A_HEADING.sub("),
+     # re-pinned after #112 (review on a2714e1) wrapped it in the alert pass
+     '                         _A_DEFINITION.sub(r"\\1\\\\[", _A_HEADING.sub(',
+     '                         (lambda f, t: t)(r"", _A_HEADING.sub('),
     ("a bare link's span admits the agent's backtick, which closes it before a name", MACHINE,
      # re-pinned after review round 6 (b440cf5) kept parentheses out of the span
      r'_A_URL = re.compile(r"(?<!\]\()((?:https?://|www\.)[^\s`<>\\()]*',
@@ -160,8 +162,9 @@ MUTATIONS = [
      "sum(_seen(row[2:]) for row in rows)",
      "sum(len(row[2:]) for row in rows)"),
     ("a cut may split an escape", MACHINE,
-     "        if i > cut:\n            cut -= 1\n",
-     "        if False:\n            cut -= 1\n"),
+     # re-pinned after #112 (review on a2714e1): the cut goes back to the escape's start
+     "        if i > cut:\n            cut = at\n",
+     "        if False:\n            cut = at\n"),
     ("a cut row may underline the agent's row above it", MACHINE,
      "        if cut > 2 and not _AN_UNDERLINE.match(row[2:cut]):\n",
      "        if cut > 2:\n"),

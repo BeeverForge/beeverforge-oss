@@ -16,6 +16,7 @@ time on any of them and said nowhere what day it was — five days of silence re
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -139,10 +140,15 @@ def test_a_turn_five_days_after_the_last_hands_the_model_five_days(store, monkey
 
     monkeypatch.setattr(pc, "_reply_of", lambda answer, **kw: answer.text, raising=False)
     project = _project()
+    # ONE READ of the clock (#393), handed to the rows and to the turn and compared against below:
+    # a second read just after UTC midnight would name another day though the code is right
+    said = datetime.now(UTC)
     transcript.record(project.name, thread="T5", role="person",
-                      text="o fechamento contábil já roda sozinho?", actor="U1")
-    transcript.record(project.name, thread="T5", role="agent", text="ainda não")
-    monkeypatch.setattr(clock, "current", lambda: datetime.now(UTC) + timedelta(days=5))
+                      text="o fechamento contábil já roda sozinho?", actor="U1",
+                      at=said.isoformat())
+    transcript.record(project.name, thread="T5", role="agent", text="ainda não",
+                      at=said.isoformat())
+    monkeypatch.setattr(clock, "current", lambda: said + timedelta(days=5))
 
     module = _Module()
     chat_turn(project, text="e aí, andou?", user="U1", thread="T5", module=module)
@@ -150,9 +156,54 @@ def test_a_turn_five_days_after_the_last_hands_the_model_five_days(store, monkey
     now, convo = module.seen.get("now", ""), module.seen.get("conversation", "")
     assert "5 days ago" in now, f"the role was not told how long the silence was: {now!r}"
     assert "(UTC)" in now
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = said.strftime("%Y-%m-%d")
     assert f"[{today} " in convo, f"the conversation's lines carry no time: {convo!r}"
     assert "e aí, andou?" not in convo
+
+
+@pytest.mark.usefixtures("store")
+def test_a_line_said_a_tenth_of_a_second_before_midnight_is_stamped_with_its_own_day(monkeypatch):
+    """The code reads its clock at 23:59:59.9 UTC and the test's own clock reads just after
+    midnight (#393): the day the conversation carries is the day the code read, so the test
+    compares against the moment it handed the code — never against a second read of its own."""
+    import beeverforge.product.channel as pc
+
+    # ONE REAL READ, before anything is patched: yesterday, so the rows are in the past and inside
+    # the store's retention (it drops a row whose `expires_at` is before the real now).
+    day = (datetime.now(UTC) - timedelta(days=1)).date()
+    moment = datetime(day.year, day.month, day.day, 23, 59, 59, 900000, tzinfo=UTC)
+    after_midnight = moment + timedelta(milliseconds=200)
+
+    class _CodeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    class _TestClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return after_midnight.astimezone(tz) if tz else after_midnight.replace(tzinfo=None)
+
+    monkeypatch.setattr(pc, "_reply_of", lambda answer, **kw: answer.text, raising=False)
+    monkeypatch.setattr(transcript, "datetime", _CodeClock)
+    project = _project()
+    # no `at=`: each row is stamped by the code's own clock, which reads 23:59:59.9
+    transcript.record(project.name, thread="T7", role="person",
+                      text="o fechamento contábil já roda sozinho?", actor="U1")
+    transcript.record(project.name, thread="T7", role="agent", text="ainda não")
+    monkeypatch.setattr(clock, "current", lambda: moment + timedelta(days=5))
+
+    module = _Module()
+    chat_turn(project, text="e aí, andou?", user="U1", thread="T7", module=module)
+
+    # from here on, this module's own clock reads the next day
+    monkeypatch.setattr(sys.modules[__name__], "datetime", _TestClock)
+    now, convo = module.seen.get("now", ""), module.seen.get("conversation", "")
+    assert "5 days ago" in now, f"the role was not told how long the silence was: {now!r}"
+    told = moment.strftime("%Y-%m-%d")
+    assert f"[{told} 23:59] " in convo, f"the line is not stamped with its own day: {convo!r}"
+    next_day = (moment + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert f"[{next_day} " not in convo, f"a line is stamped with the next day: {convo!r}"
 
 
 def test_a_module_that_predates_the_clock_is_answered_as_before(store, monkeypatch):  # noqa: F811

@@ -305,12 +305,33 @@ async def test_a_check_that_answers_again_is_said_once(deployment, engine, monke
 
 # ── readiness: bounded, and kind to the engine ──────────────────────────────────────────────────
 
+#: The readiness deadline of a case where one check HANGS. It bounds only the hung check: every
+#: other check is `_answer_at_once`, so nothing that should answer can run past it, however loaded
+#: the runner (#367's review: with the real registry and identity reads, a fresh process under a
+#: `-n 4` suite at a load of 15-18 named them beside the hung one in 4 of 8 runs). So a case waits
+#: this out, not the 1.5 s, or 0.3 s a poll, it used to.
+HUNG_DEADLINE = 0.2
+
+
+def _answer_at_once(monkeypatch, hung: str) -> None:
+    """Every check but `hung` is a double that answers at once, on the loop, with no thread: what
+    these cases prove is that the HUNG one is bounded, named alone and asked once, so the others'
+    real speed on a loaded runner is not theirs to depend on."""
+    async def answers():
+        return None
+
+    for name in health.CHECKS:
+        if name != hung:
+            monkeypatch.setitem(health.CHECKS, name, answers)
+
+
 @pytest.mark.parametrize("slow", sorted(health.CHECKS))
 async def test_a_check_that_hangs_is_named_within_the_deadline(deployment, monkeypatch, slow):
     async def hangs():
         await asyncio.sleep(10)
 
-    monkeypatch.setattr(health, "deadline", lambda: 1.5)
+    _answer_at_once(monkeypatch, slow)
+    monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     monkeypatch.setitem(health.CHECKS, slow, hangs)
 
     started = time.monotonic()
@@ -457,7 +478,8 @@ async def test_a_hung_check_starves_no_request_and_blames_no_other_check(deploym
     from beeverforge.api.app import app
 
     monkeypatch.setenv("BEEVERFORGE_PANEL_TOKEN", "the-operator")
-    monkeypatch.setattr(health, "deadline", lambda: 1.5)
+    _answer_at_once(monkeypatch, hung)
+    monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
     entered, release = HANG[hung](monkeypatch, engine)
@@ -513,7 +535,8 @@ async def test_polls_that_give_up_on_a_hung_check_share_its_one_question(deploym
     per deadline). Each poll gives up at the deadline and names the check; the question it gave up
     on keeps the slot, so the next poll joins it: the dependency is asked once, and at most one
     thread of readiness's waits on it, however many polls give up."""
-    monkeypatch.setattr(health, "deadline", lambda: 0.3)
+    _answer_at_once(monkeypatch, hung)
+    monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     entered, release = HANG[hung](monkeypatch, engine)
     try:
         for _ in range(POLLS):
@@ -537,7 +560,8 @@ async def test_a_check_that_hangs_is_said_once_however_many_polls_give_up(deploy
     up skipping the log, a dependency that hung was never logged at all — the one failure whose
     cause an operator has nowhere else to read). Polls in new windows each give up and name it;
     readiness says why once."""
-    monkeypatch.setattr(health, "deadline", lambda: 0.3)
+    _answer_at_once(monkeypatch, hung)
+    monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     clock = [1000.0]
     monkeypatch.setattr(health, "_clock", lambda: clock[0])
     entered, release = HANG[hung](monkeypatch, engine)
@@ -1073,10 +1097,14 @@ async def test_a_supervisor_reads_which_check_hung_through_the_listener_and_the_
 def test_the_probe_gives_up_on_a_listener_that_never_answers(monkeypatch, capfd):
     """A port that accepts and never answers — a process whose loop is stuck — is not one the
     probe waits on for ever: it gives up after `probe_timeout()` and exits 1 (review on f48b79fd,
-    C4). The connection is left in the backlog, accepted by the kernel and by nobody else."""
+    C4). The connection is left in the backlog, accepted by the kernel and by nobody else.
+
+    The probe's own wait is made short (#362: it was the 0.5 s deadline and two seconds more):
+    a connect to loopback and a request written are all it bounds here."""
     import socket
 
-    monkeypatch.setattr(health, "deadline", lambda: 0.5)
+    monkeypatch.setattr(health, "deadline", lambda: 0.1)
+    monkeypatch.setattr(health, "probe_timeout", lambda: 0.3)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)

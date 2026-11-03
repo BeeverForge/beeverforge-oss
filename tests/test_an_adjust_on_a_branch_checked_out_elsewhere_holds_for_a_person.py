@@ -7,10 +7,11 @@ operator reviewed the pull request in a scratch `git worktree` of `beeverforge/2
 
 WHAT IS PROVEN HERE, on a real repository with a bare origin, the worktree box, and a person's
 review tree of the pull request's branch in the same clone: every door of the machine that
-checks out a card's branch (`repair_ci` for a person's adjust and for a check's repair, `run`
-resuming a paused attempt, `review_pr`) returns a hold for a person whose note names that tree, with
-`hold_cause == TREE`, and launches no agent. Once the tree is removed, the same adjust runs and
-pushes.
+checks out a card's branch to commit on it (`repair_ci` for a person's adjust and for a check's
+repair, `run` resuming a paused attempt) returns a hold for a person whose note names that tree,
+with `hold_cause == TREE`, and launches no agent. Once the tree is removed, the same adjust runs and
+pushes. A re-review writes nothing and reads the branch's tip detached instead (#55,
+`tests/test_a_re_review_reads_a_branch_checked_out_elsewhere.py`).
 """
 
 from __future__ import annotations
@@ -135,18 +136,6 @@ def test_a_resumed_attempt_on_a_held_branch_holds_and_keeps_its_handle(repo, tmp
     # the next resume still continues the paused attempt (ADR-0012/0013 D1)
     assert got.resume_handle == "h1"
     assert agent.calls == 0
-
-
-def test_a_re_review_on_a_held_branch_holds(repo, tmp_path):  # noqa: F811
-    review = _an_open_pull_request_a_person_reviews(repo)
-    reviewer = _CountingReviewer()
-    runner, tracker = _machine(repo, tmp_path, _Agent(), reviewer=reviewer)
-
-    got = runner.review_pr("#9", pr_url=PR)
-
-    _held_for_a_person(got, tracker, review)
-    assert got.merge_refused is True and got.code_changed is False
-    assert reviewer.calls == 0
 
 
 def test_once_freed_the_same_adjust_runs_and_pushes(repo, tmp_path):  # noqa: F811

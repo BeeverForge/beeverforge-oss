@@ -65,7 +65,8 @@ CODES = frozenset({OK, INVALID, DENIED, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED
 
 #: `perform` was asked for a name no row has. Not any row's reason: there is no row to declare it.
 UNKNOWN_ACTION = "unknown_action"
-#: a required parameter is missing, or one the row does not take was passed
+#: a required parameter is missing, one the row does not take was passed, or one was passed a
+#: value of the wrong type
 BAD_PARAMETERS = "bad_parameters"
 #: the ticket ref is not one any tracker could issue
 BAD_REF = "bad_ref"

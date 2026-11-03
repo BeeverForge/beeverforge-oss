@@ -499,20 +499,25 @@ def test_kimi_is_registered_but_carries_no_cost_claim():
 
 # ── the wall-clock wall (4h) — an OUTCOME, never a silent kill ────────────────────────────────────
 
-def test_a_timeout_becomes_a_non_zero_exit_not_an_exception(tmp_path):
+def test_a_timeout_becomes_a_non_zero_exit_not_an_exception(tmp_path, monkeypatch):
     """`subprocess.TimeoutExpired` used to propagate out of the whole job, so a hung agent parked
     as a generic "errored" crash and the reason was lost — the tech-lead then diagnosed a crash
-    that never happened. It is converted at the sandbox, in one place."""
+    that never happened. It is converted at the sandbox, in one place.
+
+    The wall and the drain are made short (#362): the `sleep` outlives the shell the wall kills
+    and holds the pipe, so the run waited out the whole `sleep 5`, inside the shipped 10 s drain."""
+    import beeverforge.adapters.sandbox.base as base
     from beeverforge.adapters.sandbox.base import Workspace
     from beeverforge.adapters.sandbox.timeouts import TIMEOUT_EXIT, timed_out
     from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
 
+    monkeypatch.setattr(base, "_DRAIN_SECONDS", 0.2)
     ws = Workspace(path=tmp_path, host_path=tmp_path, branch="b", base_branch="main")
     code, out = WorktreeSandbox(root=tmp_path).run(
-        workspace=ws, command="sleep 5", timeout=1)
+        workspace=ws, command="sleep 5", timeout=0.3)
     assert code == TIMEOUT_EXIT
     assert timed_out(code, out)
-    assert "killed after 1s" in out
+    assert "killed after 0.3s" in out
 
 
 def test_the_wall_is_four_hours_and_shared_by_every_harness():

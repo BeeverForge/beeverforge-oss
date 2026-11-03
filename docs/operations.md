@@ -245,6 +245,32 @@ prune/retention rules). The core never reads an agent token; it only round-trips
    Token acquisition is GitHub-specific and lives in the GitHub adapter; the core only
    ever sees the opaque `BEEVERFORGE_BOT_TOKEN`.
 
+### Which transports the core's git calls may use
+
+Every git call the core makes on the host that reaches a remote (`clone`, `fetch`,
+`ls-remote`, `push`, `remote set-url`) carries pinned transport settings, built in one place,
+`beeverforge/gitpin.py`. Those calls may use only:
+
+- **https** and **ssh**: the GitHub and Azure DevOps forges, and `git@…` / `ssh://…` remotes;
+- **file**, for user-initiated calls: any path or `file://` URL the core is handed, including the
+  local forge and the worker's cache. Git treats top-level calls started by the core as
+  user-initiated; recursive submodule clones are refused, as with Git's default
+  `protocol.file.allow=user`.
+
+**ext**, **fd**, **http**, **git**, **ftp** and **ftps** are refused whatever the machine's
+git configuration says, and any other protocol is refused by the `protocol.allow=never` default.
+A `-c` overrides only the same key, so the pin sets that default and each of these transports by
+name, before the subcommand: a machine's `protocol.ext.allow=always` does not let a remote named
+`ext::…` run a command on the host. Remotes on plain `http://` or `git://` are refused too; use
+`https://` or ssh.
+
+Known gap: a `GIT_ALLOW_PROTOCOL` environment variable in the core's environment still
+overrides these settings. Do not set it for the core's process.
+
+This is the first slice of #143. The core's local git calls (`add`, `commit`, `rev-parse`, …)
+and the shell-string git commands the core sends into the box are later slices of #143 and
+are not pinned yet.
+
 ### PR posture (merge policy)
 
 Default `merge_policy: human` — the bot opens the PR, posts the reviewer's verdict
@@ -451,6 +477,71 @@ DEBIAN_MIRROR=https://deb.debian.org
 root your proxy presents, and that failure is the least informative one in this document: apt
 returns no package lists at all and every install line then reports `E: Unable to locate package
 git`, which reads like a broken mirror rather than a missing certificate.
+
+## The compose stack, or the worker image as one container
+
+The compose stack runs the durable engine, its database, the worker and the panel, each in its
+own container:
+
+```bash
+docker compose --env-file .env.compose up -d --build
+```
+
+Where the durable engine already runs somewhere else (a hosted Temporal namespace, or one your
+platform team operates), the published `beeverforge-worker` image runs the worker **and** the
+panel in one long-lived container. The image's entry point is `tini -s --`, so the command is
+the container's `CMD`. It needs the engine's variables and a panel sign-in,
+`BEEVERFORGE_PANEL_TOKEN` (or per-person `BEEVERFORGE_PANEL_TOKENS`), which is **required**: the
+panel listens on every interface of the container, and without a token the command refuses to
+start, by name, rather than serve an open panel. Publish the port on the host's loopback, as the
+compose stack does, unless you mean to expose the panel — and then put TLS in front of it:
+
+```bash
+docker run -d --restart on-failure -p 127.0.0.1:8787:8787 \
+  -e TEMPORAL_ADDRESS -e TEMPORAL_NAMESPACE -e TEMPORAL_API_KEY -e BEEVERFORGE_PANEL_TOKEN \
+  ghcr.io/beeverforge/beeverforge-worker:main \
+  python -m beeverforge.cli worker --with-panel
+```
+
+For a container that publishes no port and whose panel is reached from a sidecar in the same
+network namespace, hold the panel to the loopback with `--panel-host 127.0.0.1`. There the
+command starts without a token, but anything else in that network namespace then reaches an open
+panel, so pass the token there too:
+
+```bash
+docker run -d --restart on-failure \
+  -e TEMPORAL_ADDRESS -e TEMPORAL_NAMESPACE -e TEMPORAL_API_KEY -e BEEVERFORGE_PANEL_TOKEN \
+  ghcr.io/beeverforge/beeverforge-worker:main \
+  python -m beeverforge.cli worker --with-panel --panel-host 127.0.0.1
+```
+
+**In this mode the panel shares the worker's environment and its credentials.** Both processes
+start from the container's one environment, so the panel's HTTP process holds whatever the
+worker holds: the GitHub App key, the model credential, the engine's API key. Removing them from
+the panel's process alone would separate nothing: the two run as one user in one container, and
+the panel's process can read the worker's environment (`/proc/<pid>/environ`) and its files
+anyway. That is why the panel token is required here. Keep the container's environment to what
+the worker uses, and leave out what it does not:
+
+- the forge credential it does not use: `BEEVERFORGE_BOT_TOKEN` when the GitHub App's three
+  `BEEVERFORGE_GH_APP_*` variables are set, or those three when a token is;
+- the model credentials the harness does not use: the failover pool `BEEVERFORGE_AGENT_TOKENS`
+  or a single `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` — the one the worker reads, not
+  all three;
+- ambient cloud credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+  `AWS_PROFILE`) unless jobs run in a box that needs them;
+- the vendor credentials of a tracker no project uses (`AZURE_DEVOPS_PAT`, `JIRA_API_TOKEN`);
+- `TEMPORAL_API_KEY` against an engine that does not ask for one.
+
+To keep the panel's process away from the worker's processes, its files and the Docker socket,
+run the compose stack, where the worker and the panel are separate containers and only the worker
+mounts the socket. Both of its containers still read every row of `.env.compose`.
+
+`--panel-port` moves the panel off 8787. The two processes stop together: `docker stop` (a
+SIGTERM, which `tini` hands on) stops both and the container exits 0; when either one ends on its
+own, the other is stopped and the container exits with the status of the one that ended, so a
+restart policy sees it. With `TEMPORAL_ADDRESS` unset the command refuses to start, by name. It
+never starts an engine; `beeverforge up` is the one-machine command that does.
 
 ## Web panel (observability + management)
 

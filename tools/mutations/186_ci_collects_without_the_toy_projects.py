@@ -31,6 +31,55 @@ MUTATIONS = [
      "    return demo_projects()"),
 ]
 
+#: #336: THE THREE COLLECTIONS ABOVE NO LONGER TAKE THE WHOLE TREE, each a subset derived from the
+#: failure it exists for. These rows prove each narrowed run still holds its incident, on the
+#: node that asks.
+PYPROJECT = "pyproject.toml"
+CONSOLE = f"{TEST}::test_the_bare_pytest_console_script_can_COLLECT_the_suite"
+SAME = f"{TEST}::test_that_invocation_sees_the_same_tests_this_one_does"
+TOYLESS = f"{TEST}::test_collection_survives_a_machine_without_THE_OPTIONAL_TOY_PROJECTS"
+WHOLE = f"{TEST}::test_no_guard_here_collects_the_whole_suite"
+LINT = f"{TEST}::test_ci_s_one_whole_collection_is_the_bare_console_script"
+MAKEFILE = "Makefile"
+CIYML = ".github/workflows/ci.yml"
+
+MUTATIONS += [
+    # THE INCIDENT OF 2026-08-05: nothing puts the root on `sys.path`, so the console script
+    # cannot import `tests.test_walking_skeleton` by name. The plugin subset must still hit it.
+    ("pytest's config drops pythonpath, and the console script's subset collection dies", PYPROJECT,
+     'pythonpath = ["."]\n', "", CONSOLE),
+    ("pytest's config drops pythonpath, and the two invocations' subset counts part", PYPROJECT,
+     'pythonpath = ["."]\n', "", SAME),
+
+    # THE SOFT SHAPE of the same split: a declarer vanishes under the console script alone, with
+    # exit code 0. Only the count comparison can see it.
+    ("a plugin declarer vanishes under the console script only", "tests/test_a_failing_setup_is_not_silent.py",
+     "",
+     "\nimport sys as _sys\nif _sys.argv[0].endswith('/pytest'):\n"
+     "    import pytest as _p\n    _p.skip('console script only', allow_module_level=True)\n", SAME),
+
+    # THE TRANSITIVE HALF of the toy-project closure: a helper no test names as a toy-project
+    # reader breaks at import, and every module importing it aborts the toy-less collection.
+    # None of `tests/dockerfiles.py`'s importers names the reader, so only the closure reaches them.
+    ("a helper reaches the toy projects at import and breaks without them", "tests/dockerfiles.py",
+     "",
+     "\nfrom tests.demo_projects import demo_projects as _dp\n_X = _dp() / 'x'\n", TOYLESS),
+
+    # #350: THE LINT JOB'S ONE COLLECTION holds the whole-tree half the plugin subset leaves. Its
+    # recipe goes back to `python -m pytest`, or CI stops running the step, and it is refused.
+    ("the lint job's collection goes back to `python -m pytest`", MAKEFILE,
+     "\tpytest -q --collect-only",
+     "\tpython -m pytest -q --collect-only", LINT),
+    ("CI stops running the lint job's collection, the step left as a comment", CIYML,
+     "      - run: make test-collect\n",
+     "      # - run: make test-collect   (step removed)\n", LINT),
+
+    # CRITERION 3: a guard that goes back to collecting the whole tree is refused by name.
+    ("the toy-less guard collects the whole tree again", TEST,
+     '"--collect-only", *_toy_project_subset()), stripped)',
+     '"--collect-only"), stripped)', WHOLE),
+]
+
 #: The SECOND defect the same accident exposed, in the same file it lives in. Kept here rather
 #: than in its own plan because it is one commit's worth of repair: the marker that went dark is
 #: the marker `.gitignore` now refuses.

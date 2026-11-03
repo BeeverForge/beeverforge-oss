@@ -80,7 +80,9 @@ needs_a_posix_shell = pytest.mark.skipif(
 
 #: Where `_socket_dir` makes its directories instead of `/tmp`, when set. Read by the helper and
 #: set by exactly one caller: the leak guard in `test_the_suite_runs_where_a_maintainer_sits.py`.
-SOCKET_ROOT_ENV = "BEEVERFORGE_TEST_SOCKET_ROOT"
+#: NOT `BEEVERFORGE_*`: the conftest strips that prefix before collection, in the child run the guard
+#: starts too, so under that name the helper never saw it and the guard counted an empty directory.
+SOCKET_ROOT_ENV = "TEST_SOCKET_ROOT"
 
 
 def _socket_dir() -> pathlib.Path:

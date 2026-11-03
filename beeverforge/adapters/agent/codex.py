@@ -36,7 +36,8 @@ WHAT IS AND ISN'T PROVEN HERE
   recorded `read-only` in the session's rollout where the first run had `workspace-write`; with
   the `-c` it recorded `workspace-write`. `codex exec resume … -s workspace-write` exits 2.
 - The final message comes from `--output-last-message`, a file whose contract is "the last
-  message", so `summary` does not depend on any event schema.
+  message", so `summary` does not depend on any event schema. No file means no summary, never
+  the stream (#110).
 - The `--json` event schema was OBSERVED from real runs against codex-cli 0.145.0, not guessed:
       {"type":"thread.started","thread_id":"…"}                       ← the id `exec resume` takes
       {"type":"turn.started"} / {"type":"turn.completed","usage":{…}}
@@ -306,7 +307,9 @@ class CodexAdapter:
         pause, retry_at = _pause_from(out)
         res = AgentRunResult(
             ok=code == 0 and pause is None,
-            summary=summary or (out or "")[-2000:],
+            # No file, no summary (#110): the stream is not the agent's words, and the pull
+            # request quotes the summary as them. The stream stays in `raw_output`.
+            summary=summary,
             actions=_actions(events),
             model=model or "default",
             harness=self.name,

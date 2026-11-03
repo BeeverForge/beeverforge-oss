@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 from typer.testing import CliRunner
 
+from beeverforge import gitpin
 from beeverforge.cli import app
 
 
@@ -109,6 +110,17 @@ def onboarding(monkeypatch):
     return _wire
 
 
+@pytest.fixture
+def a_context_repository_nobody_serves(monkeypatch):
+    """The clone after the creation goes to the context repository's URL, a made-up `github.com`
+    one here; a path that does not exist fails that clone as it failed there, without dialling
+    anybody's forge (#335)."""
+    from beeverforge.product import onboard
+
+    monkeypatch.setattr(onboard, "context_clone_url",
+                        lambda project, docs_repo: "/nonexistent/acme-context.git")
+
+
 # ── without consent, it refuses and says what to do ─────────────────────────────────────────────
 
 def test_a_project_with_NO_context_repository_is_refused_and_told_what_to_do(onboarding):
@@ -140,6 +152,7 @@ def test_nothing_is_created_without_the_flag(onboarding):
 
 # ── with consent, it creates, names it deliberately, and RECORDS it ─────────────────────────────
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_with_consent_it_creates_and_RECORDS_the_repository(onboarding):
     """The half that makes the creation real. Without the record the product module stays off and
     the client is left with an empty repository and a role that will not speak."""
@@ -171,7 +184,7 @@ def test_the_create_run_reaches_the_plan_instead_of_refusing_its_own_record(onbo
         returncode, stdout, stderr = 0, "", ""
 
     def _fake_git(cmd, **kw):
-        if cmd[:2] == ["git", "clone"]:
+        if cmd[:1] == ["git"] and gitpin.subcommand(cmd) == "clone":
             Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
         return _Done()
 
@@ -206,7 +219,7 @@ def test_the_context_repository_is_reached_THROUGH_THE_PORT_on_any_vendor(onboar
 
     def _fake_git(cmd, **kw):
         seen.append(list(cmd))
-        if cmd[:2] == ["git", "clone"]:
+        if cmd[:1] == ["git"] and gitpin.subcommand(cmd) == "clone":
             from pathlib import Path
 
             Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
@@ -218,7 +231,7 @@ def test_the_context_repository_is_reached_THROUGH_THE_PORT_on_any_vendor(onboar
     result = CliRunner().invoke(app, ["product", "init", "acme", "--write"])
 
     assert result.exit_code == 0, result.output
-    cloned = next(c for c in seen if c[:2] == ["git", "clone"])
+    cloned = next(c for c in seen if c[:1] == ["git"] and gitpin.subcommand(c) == "clone")
     assert "dev.azure.com" in " ".join(cloned), (
         f"the clone URL was not asked of the forge: {cloned}")
     assert not any("gh" == c[0] for c in seen), "it still shells out to `gh`"
@@ -227,6 +240,7 @@ def test_the_context_repository_is_reached_THROUGH_THE_PORT_on_any_vendor(onboar
     assert forge.opened[0]["base"] == "main", "the base must be read from the clone, not assumed"
 
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_the_NAME_is_derived_and_not_a_free_parameter(onboarding):
     """A repository in a client's organisation is not a place to accept free text from whoever
     typed the command. The name comes from the project; the organisation from the forge."""
@@ -240,6 +254,7 @@ def test_the_NAME_is_derived_and_not_a_free_parameter(onboarding):
         "a client's requirements were about to be published")
 
 
+@pytest.mark.usefixtures("a_context_repository_nobody_serves")
 def test_a_repository_that_ALREADY_EXISTS_is_reported_as_FOUND_not_created(onboarding):
     """"We created a repository in your organisation" and "we found the one you already had" are
     different sentences, and only one of them belongs in an email to a client."""

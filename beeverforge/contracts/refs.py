@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 log = logging.getLogger("beeverforge.refs")
 
@@ -66,6 +66,26 @@ def canonical_ref(ref: object) -> str:
     has always persisted and the form `beeverforge.actions._clean_ref` produces, so nothing
     migrates."""
     return str(ref or "").strip().lstrip("#").strip()
+
+
+def board_key(where: Mapping | None, ref: object) -> str:
+    """The key a board read (`columns()`, key → column) files `ref` under, `""` when it files it
+    nowhere — the ONE place a ref is looked up in a board read (#108).
+
+    A KEY TYPED IN LOWERCASE IS THE SAME CARD. Jira answers every key in capitals, so `dar-1`
+    looked up as typed was missing from the read and passed for a card nobody moved. The ref as
+    typed is tried first (bare, then verbatim), and only then a key the READ returned that differs
+    from it in case alone; the answer is the board's own spelling, so the caller acts on, records
+    and echoes one spelling of the card. A ref is never rewritten into a key the board lacks."""
+    if not where:
+        return ""
+    bare = canonical_ref(ref)
+    for key in (bare, str(ref)):
+        if where.get(key):
+            return key
+    folded = bare.upper()
+    return next((str(k) for k, column in where.items()
+                 if column and str(k).upper() == folded), "")
 
 
 def canonical_refs(refs: Iterable[object]) -> list[str]:
@@ -131,9 +151,13 @@ def qualify_ref(repo: str, ref: object, default_repo: str = "") -> str:
 
     Qualified ONLY when it must be: the bare spelling is what every persisted key, workflow id
     and journal stem already uses, so qualifying the common case would split one ticket into two
-    identities — the exact defect `canonical_ref` exists to prevent, one level up."""
+    identities — the exact defect `canonical_ref` exists to prevent, one level up.
+
+    Compared WITHOUT CASE (#380): GitHub and Azure DevOps names ignore case, and a board answers
+    in the forge's own spelling, so `Acme/api` read back for a registry that says `acme/api` is
+    the project's own card, bare — never a second identity for one ticket."""
     bare = canonical_ref(ref)
-    if not repo or repo == default_repo:
+    if not repo or repo.casefold() == (default_repo or "").casefold():
         return bare
     return f"{repo}#{bare}"
 

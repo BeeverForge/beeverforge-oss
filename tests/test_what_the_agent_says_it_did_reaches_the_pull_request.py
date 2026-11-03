@@ -235,6 +235,17 @@ def test_a_mention_the_agent_writes_notifies_nobody(repo: Path, tmp_path: Path):
     assert "> stray \\` then `@after`" in block, block
 
 
+
+def test_a_gh_or_qualified_reference_the_agent_writes_links_nothing(repo: Path, tmp_path: Path):
+    said = "Fixes GH-1 and see GH-2.\n\nowner/repo#3"
+    block = _quoted_block(_opened(repo, tmp_path, _Says(said)))
+    quoted = "\n".join(block)
+
+    assert "> Fixes card 1 and see card 2." in block, block
+    assert "> owner/repo card 3" in block, block
+    assert not re.search(r"\bGH-\d", quoted, re.IGNORECASE), block
+    assert not re.search(r"#\d", quoted), block
+
 @pytest.mark.parametrize("said", [
     "thanks _@someone_ for the report",                    # `_` is \w: the look-behind skipped it
     "I changed the ` key\nthen `@someone said so` here",    # a span CommonMark pairs across lines

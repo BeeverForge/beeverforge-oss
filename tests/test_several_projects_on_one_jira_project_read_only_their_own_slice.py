@@ -280,8 +280,9 @@ def test_a_scope_jira_refuses_is_named_and_the_read_stays_unreadable(site, tmp_p
     """Q3: a scope Jira cannot parse answers 400 (the existing "unreadable" branch). The warning
     names `scope_jql` and the condition, so the person reading it sees the cause, and the read is
     still unreadable — `None` from `columns` and `list_tickets` — never an empty board. On main the
-    warnings said only "could not search DAR"."""
-    broken = 'labels = "bf-api'
+    warnings said only "could not search DAR". (An unclosed quote, the example here before
+    #121, is now refused when the tracker is built, so the 400 is an `ORDER BY` inside it.)"""
+    broken = 'labels = "bf-api" ORDER BY Rank ASC'
     site(broken, strict=False, refuse=True)
     tracker, board = _built(_project(tmp_path, scope_jql=broken))
 
@@ -907,3 +908,121 @@ def test_a_close_of_a_card_outside_the_slice_is_refused_whatever_the_engine_says
     said = _withdrawn(project, board, "DAR-2", monkeypatch)
 
     assert said["close"].startswith("DAR-2 is not in api's slice of its board"), said
+
+
+class _ClosedTracker:
+    """A tracker holding closed cards (`DAR-2`, web's, and `DAR-7`, which no label selects), with
+    every write it is asked for kept. The reopen's transition POST and its note are these writes,
+    so `writes == []` is "no transition was POSTed"; the site, which has no transition route,
+    would also fail any request the board made to one."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+
+    def get_ticket(self, ref):
+        from types import SimpleNamespace
+
+        if str(ref).upper() not in ("DAR-2", "DAR-7"):
+            raise KeyError(ref)
+        return SimpleNamespace(id=str(ref).upper(), title="a closed card", raw="", belongs_to="",
+                               state="closed", state_reason="completed")
+
+    def reopen_ticket(self, ref):
+        self.writes.append(("reopen", str(ref)))
+
+    def comment(self, ref, text):
+        self.writes.append(("comment", str(ref)))
+
+
+def _reopen(tmp_path, monkeypatch, project, board, ref: str):
+    """`card_reopen` of `ref` from `project`, through the real row, with `board` as its board."""
+    import asyncio
+
+    from beeverforge import actions
+    from beeverforge.actions import catalog
+
+    monkeypatch.setenv("BEEVERFORGE_METRICS_SINK", "sqlite")
+    monkeypatch.setenv("BEEVERFORGE_METRICS_DB", str(tmp_path / "metrics.db"))
+    tracker = _ClosedTracker()
+    monkeypatch.setattr(catalog, "_board_pair", lambda name: (project, tracker, board, None))
+    by = actions.Actor(id="ana", display="Ana", via="panel", admin=True)
+    return asyncio.run(catalog._card_reopen(project=project.name, issue=ref, by=by)), tracker
+
+
+def test_another_projects_closed_card_is_not_reopened_from_this_one(site, tmp_path, monkeypatch):
+    """Issue #156 (review of openfactory-core#884, point 3): `card_reopen` reached a closed card by
+    key and went to the door without asking the slice, so `holds` was never asked, and api could reopen
+    web's closed `DAR-2`. It now asks the slice first and refuses by name, writing nothing."""
+    from beeverforge.product.voice import card_outside_the_slice
+
+    jira = site(API)
+    project = _project(tmp_path, scope_jql=API)
+    _, board = _built(project)
+
+    out, tracker = _reopen(tmp_path, monkeypatch, project, board, "DAR-2")
+
+    assert not out.ok, out
+    assert out.message == card_outside_the_slice(
+        ref="DAR-2", project="api", within=board.scope_named(), language=None), out.message
+    assert out.message.startswith("DAR-2 is not in api's slice of its board"), out.message
+    assert f"(within scope_jql {API!r})" in out.message, out.message
+    assert f'project = "{KEY}" AND ({API}) AND key = "DAR-2"' in jira.searches, jira.searches
+    assert tracker.writes == [], tracker.writes
+    assert [r for r in jira.requests if r[0] == "POST"] == [], jira.requests
+
+
+def test_a_slice_that_cannot_be_asked_about_a_card_refuses_to_reopen_it(site, tmp_path,
+                                                                        monkeypatch):
+    """"Could not see" is not "ours": when the search asking whether the card is in the slice is
+    refused, the reopen refuses saying the slice could not be asked, and writes nothing."""
+    jira = site(API)
+    answer = jira.urlopen
+
+    def refuse_the_key_search(req, timeout=0):
+        if req.get_method() == "GET" and " AND key = " in jira._jql_of(req):
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", hdrs=None,
+                                         fp=io.BytesIO(b'{"errorMessages":["x"]}'))
+        return answer(req, timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse_the_key_search)
+    project = _project(tmp_path, scope_jql=API)
+    _, board = _built(project)
+
+    out, tracker = _reopen(tmp_path, monkeypatch, project, board, "DAR-2")
+
+    assert not out.ok, out
+    assert "api's board could not be asked whether DAR-2 is in this project's slice" in \
+        out.message, out.message
+    assert tracker.writes == [], tracker.writes
+    assert [r for r in jira.requests if r[0] == "POST"] == [], jira.requests
+
+
+def test_an_unscoped_reopen_asks_the_slice_nothing(site, tmp_path, monkeypatch):
+    """Lesson 10, for the reopen: a project that declares no scope owns every card of its Jira
+    project, so its reopen makes NO request to the board, neither a read nor a `key =` search,
+    as on the base (#378's review), and it reopens as before."""
+    jira = site("")
+    project = _project(tmp_path)
+    _, board = _built(project)
+
+    out, tracker = _reopen(tmp_path, monkeypatch, project, board, "DAR-7")
+
+    assert out.ok, out
+    assert ("reopen", "DAR-7") in tracker.writes, tracker.writes
+    assert jira.searches == [], jira.searches
+
+
+def test_an_unscoped_reopen_does_not_wait_on_a_board_that_cannot_be_read(site, tmp_path,
+                                                                        monkeypatch):
+    """The reopen of a closed card never needed the board's columns: on an unscoped project whose
+    board cannot be read, it still reopens, as on the base (#378's review measured it refused
+    here as "api's board could not be read")."""
+    site("")
+    project = _project(tmp_path)
+    _, board = _built(project)
+    monkeypatch.setattr(board, "columns", lambda: None)
+
+    out, tracker = _reopen(tmp_path, monkeypatch, project, board, "DAR-7")
+
+    assert out.ok, out.message
+    assert ("reopen", "DAR-7") in tracker.writes, tracker.writes

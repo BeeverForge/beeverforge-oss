@@ -21,9 +21,10 @@ MUTATIONS = [
      '_ENGINE_RE = re.compile(r"activity task timed out", re.I)'),
 
     # ── replay safety ───────────────────────────────────────────────────────────────────────────
+    # re-pinned 2026-10-30 (#295): the signature gained `anchored_429` on its own line
     ("the gate is ignored, so a replayed park computes a new verdict (TMPRL1100)", CLASSIFY,
-     'engine: bool = True, cause: str = "") -> Verdict:\n    """',
-     'engine: bool = True, cause: str = "") -> Verdict:\n    engine = True\n    """'),
+     'anchored_429: bool = True) -> Verdict:\n    """',
+     'anchored_429: bool = True) -> Verdict:\n    engine = True\n    """'),
 
     ("the workflow stops passing patched(), so every in-flight park replays the new rule",
      WORKFLOW,

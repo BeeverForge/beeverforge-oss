@@ -34,6 +34,7 @@ repository.
 | `shellcheck` | `make lint` checks `install.sh`, `docker/install-addons.sh` and `scripts/*.sh` with a local shellcheck if there is one, else with `koalaman/shellcheck:stable` in Docker | with neither, `make lint` refuses by name and exits non-zero — it does not skip |
 | `sha256sum` | the tests that drive `install.sh` and assemble a release | those tests skip, naming the missing tool |
 | Node.js (`node`) | the tests that execute the panel's JavaScript | they skip, each saying `node is not on PATH` |
+| Chrome or Chromium (`google-chrome`, `chromium`) | the test laying out the panel at phone widths | it skips, naming the browser |
 | the network, once | the durable-runtime tests start a throwaway Temporal server of their own, and the first run per `temporalio` version downloads its binary (about 65 MB) into the temp directory | setup errors until the binary can be downloaded; this is a hard prerequisite, not a skip |
 
 **Your shell's environment.** The suite deletes the variables that would let a test act on
@@ -140,6 +141,18 @@ dropped.py`) precisely so that this search works.
   YAML and read the key. Where you must search text, strip comments first, and prefer asserting
   against a value the code exports over a string you hope is unique. A guard that cannot fail is
   worse than no guard, because it also stops anyone looking.
+- **A test gets its git repository from the bed, not from its own `git init`.** Building the
+  same repository again for every test was half the suite's time: 2,058 s of 4,246 s summed in the
+  2026-11-01 run, in files that run git. `tests/the_git_bed.py` builds each shape once per run,
+  shared by every xdist worker, and hands each test a fresh copy. Register its fixture in your
+  module (`git_bed = the_git_bed.git_bed`), then ask for `git_bed` and copy a shape:
+  `a_served_tree(git_bed, src, dest)`, `a_card_repository(git_bed, dest)`, or your own through
+  `git_bed.copy(name, dest, build)`, where `build(where, env)` makes it the first time. A copy is
+  yours to commit, push and delete in. A template is never changed: the bed fingerprints every
+  template and refuses, by name, one that a test changed in place, both at the next copy and when
+  the session ends. `tests/test_a_test_gets_its_repository_from_the_bed.py` counts the bare
+  `git init` calls under `tests/` and holds the count at its `BASELINE`. Lower the baseline when
+  you move a file onto the bed; never raise it.
 
 ## Card ids in comments — `#137`, `C-22`, `#106 item 4`
 

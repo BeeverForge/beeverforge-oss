@@ -138,11 +138,20 @@ def github_owners(project: Project) -> set[str]:
 def owners_by_project(projects: list[Project]) -> dict[str, list[str]]:
     """`{owner: [project names]}` over every project's `github_owners` — `{}` when no project
     names a GitHub organisation. The one grouping: `spanning_installations` filters it, and
-    `beeverforge doctor`'s `installation_scope` line compares it with the App's account (#743)."""
+    `beeverforge doctor`'s `installation_scope` line compares it with the App's account (#743).
+
+    GitHub logins ignore case, so `Acme/api` and `acme/web` are ONE organisation (#150): owners
+    are grouped by their casefold, named by the first spelling met in registry order (each
+    project's owners sorted, so the spelling never depends on hash order), and a project spelling
+    its organisation two ways is listed once."""
+    spelling: dict[str, str] = {}
     by_owner: dict[str, list[str]] = {}
     for project in projects:
-        for owner in github_owners(project):
-            by_owner.setdefault(owner, []).append(project.name)
+        for owner in sorted(github_owners(project)):
+            key = spelling.setdefault(owner.casefold(), owner)
+            names = by_owner.setdefault(key, [])
+            if project.name not in names:
+                names.append(project.name)
     return by_owner
 
 
@@ -219,7 +228,8 @@ def installation_scope_line(by_owner: dict[str, list[str]],
 
     THE COMPARISON IGNORES CASE, as GitHub's logins do: `Acme/api` in the registry and an
     installation on `acme` are one account, and a case-sensitive test would fail a correct
-    deployment. `spanning_installations` still groups by the spelling (a separate defect)."""
+    deployment. `owners_by_project` groups the same way (#150), so the two spellings are one
+    organisation here too."""
     from beeverforge.doctor import NOT_APPLICABLE
 
     if len(by_owner) > 1:
@@ -581,12 +591,13 @@ class ProjectRegistry:
         mine = github_owners(project)
         if not mine:
             return
+        same = {owner.casefold() for owner in mine}
         board = getattr(getattr(project, "factory_board", None), "tracker", None)
         docs = getattr(getattr(project, "product", None), "docs_repo", None)
         for label, repo in (("factory_board", getattr(board, "repo", None)),
                             ("product.docs_repo", docs)):
             owner = (repo or "").split("/", 1)[0].strip()
-            if owner and owner not in mine:
+            if owner and owner.casefold() not in same:
                 log.warning(
                     "registry: project %r points %s at %r, in a different GitHub organisation "
                     "(%s) from its own (%s). One process holds ONE App installation, so that "

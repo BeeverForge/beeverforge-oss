@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from beeverforge import namespace
+from beeverforge import gitpin, namespace
 from beeverforge.actions.base import (
     CONFLICT,
     DENIED,
@@ -5106,6 +5106,7 @@ async def _card_move(*, project: str, issue: str, column: str, by: Actor) -> Out
     stage = await asyncio.to_thread(_stage, proj, board, issue)
     if stage.cannot_tell:
         return refused(CONFLICT, stage.cannot_tell)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     event = CardEvent.PROMOTED if key == "todo" else CardEvent.REORDERED
 
     async def no_job_waits() -> Outcome | None:
@@ -5137,10 +5138,43 @@ class _Stage:
 
     `key` is the neutral column key (`""` when the card is on no board or in no column);
     `column` is the board's own name for it; `cannot_tell` is the sentence to refuse with when the
-    board could not answer — an unreadable board, or a column this platform does not map."""
+    board could not answer — an unreadable board, or a column this platform does not map.
+
+    `ref` is the board's own spelling of the card when it differs from what was typed in case
+    alone (`dar-1` filed as `DAR-1`, #108), `""` otherwise: every row behind the gate acts on
+    `ref or issue`, so the door records one card's history and the answer echoes one spelling."""
     key: str = ""
     column: str = ""
     cannot_tell: str = ""
+    ref: str = ""
+
+
+def _reopen_refusal(proj, board, issue: str) -> str:
+    """Why `issue` may not be reopened from `proj`, or `""`: what the board's `holds` answers.
+
+    A REOPEN ASKS ONE QUESTION, whether the card is in the slice — not where it sits, which is
+    what `_stage` reads `columns()` for (#378's review). Through `_stage` every reopen paid a full
+    board read, on unscoped boards too, and refused whenever that read failed, though a closed
+    card's reopen never read the board before. `holds` answers `True` with no request where no
+    slice is declared, and with one `key =` search where one is. Read through `getattr`, so a
+    board without it, or no board, refuses nothing. `is False` / `is None`, not falsiness: only
+    the row's own answer refuses."""
+    from beeverforge.product.voice import card_outside_the_slice
+
+    holds = getattr(board, "holds", None) if board is not None else None
+    if not callable(holds):
+        return ""
+    inside = holds(issue)
+    if inside is False:
+        named = getattr(board, "scope_named", None)
+        return card_outside_the_slice(ref=issue, project=proj.name,
+                                      within=named() if callable(named) else "",
+                                      language=getattr(proj, "language", None))
+    if inside is None:
+        return (f"{proj.name}'s board could not be asked whether {issue} is in this project's "
+                f"slice, so it was not reopened. Nothing was changed — try again, and if the "
+                f"board stays unreadable, reopen it from the tracker's own screen.")
+    return ""
 
 
 def _stage(proj, board, issue: str) -> _Stage:
@@ -5159,7 +5193,7 @@ def _stage(proj, board, issue: str) -> _Stage:
     does not learn it: `False` refuses by name, `None` refuses as an unreadable board does, and a
     board without the capability, or with no slice declared, answers as before."""
     from beeverforge.adapters.board.base import stage_key, stage_option
-    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.contracts.refs import board_key, canonical_ref
     from beeverforge.product.voice import card_outside_the_slice, card_unmapped
 
     if board is None:
@@ -5171,7 +5205,12 @@ def _stage(proj, board, issue: str) -> _Stage:
     where = board.columns()
     if where is None:
         return unreadable
-    column = where.get(canonical_ref(issue)) or where.get(str(issue))
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): `dar-1` is the card the read files as
+    # `DAR-1`, and from here on it is named as the board spells it
+    found = board_key(where, issue)
+    column = where.get(found, "")
+    ref = found if found and found not in (canonical_ref(issue), str(issue)) else ""
+    issue = ref or issue
     if not column:
         holds = getattr(board, "holds", None)
         inside = holds(issue) if callable(holds) else True
@@ -5208,8 +5247,8 @@ def _stage(proj, board, issue: str) -> _Stage:
         # project's language, with the line of configuration that maps the column in it.
         return _Stage(column=column, cannot_tell=card_unmapped(
             ref=issue, column=column, option=stage_option(board),
-            language=getattr(proj, "language", None)))
-    return _Stage(key=key, column=column)
+            language=getattr(proj, "language", None)), ref=ref)
+    return _Stage(key=key, column=column, ref=ref)
 
 
 def _stage_refusal(proj, board, issue: str, *, act: str = "edit",
@@ -5251,6 +5290,7 @@ def _stage_refusal(proj, board, issue: str, *, act: str = "edit",
     at = stage if stage is not None else _stage(proj, board, issue)
     if at.cannot_tell:
         return at.cannot_tell
+    issue = at.ref or issue
     key, column = at.key, at.column
     if act == "remove":
         # ONLY BEFORE PICKUP, AND NARROWER THAN A CLOSE (#384). Removing is for the cheapest moment
@@ -5463,6 +5503,7 @@ async def _card_edit(*, project: str, issue: str, by: Actor, title: str = "",
     # role opened is refused for that, which is the reason a person can act on, rather than for a
     # capability that would not have mattered (review of #153).
     stage = await asyncio.to_thread(_stage, proj, board, issue)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     refusal = (await asyncio.to_thread(_product_owned_refusal, tracker, issue, act="changes")
                or _stage_refusal(proj, board, issue, stage=stage))
     if refusal:
@@ -5585,6 +5626,7 @@ async def _withdraw_refusal(proj, board, issue: str, *, remove: bool) -> tuple[_
     import asyncio
 
     stage = await asyncio.to_thread(_stage, proj, board, issue)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     if remove:
         return stage, _stage_refusal(proj, board, issue, act="remove", stage=stage)
     refusal = _stage_refusal(proj, board, issue, act="close", stage=stage)
@@ -5662,6 +5704,7 @@ async def _card_close(*, project: str, issue: str, by: Actor, reason: str = "") 
     stage, refusal = await _withdraw_refusal(proj, board, issue, remove=False)
     if refusal:
         return refused(CONFLICT, refusal)
+    issue = stage.ref or issue      # the board's own spelling (#108)
 
     from beeverforge.adapters.board.columns import has_finished
 
@@ -5725,6 +5768,7 @@ async def _card_remove(*, project: str, issue: str, by: Actor, reason: str = "")
     stage, refusal = await _withdraw_refusal(proj, board, issue, remove=True)
     if refusal:
         return refused(CONFLICT, refusal)
+    issue = stage.ref or issue      # the board's own spelling (#108)
     if kind:
         return await _by_the_product_role(proj, issue, by=by, reason=said, remove=True,
                                           delivered=False, vouched=True)
@@ -5763,7 +5807,7 @@ def card_view(proj, tracker, board, ref: str, *, opened_by: str, column: str | N
     from beeverforge.adapters.board.base import stage_key
     from beeverforge.adapters.board.columns import has_finished, has_started
     from beeverforge.adapters.tracker.base import removes
-    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.contracts.refs import board_key
     from beeverforge.product.voice import card_controls
 
     if column is None and board is not None:
@@ -5773,7 +5817,7 @@ def card_view(proj, tracker, board, ref: str, *, opened_by: str, column: str | N
             log.info("could not read where %s is to draw its controls — the row asks again when "
                      "one is pressed", ref, exc_info=True)
             placed = {}
-        column = placed.get(canonical_ref(ref)) or placed.get(str(ref)) or ""
+        column = placed.get(board_key(placed, ref), "")
     key = stage_key(board, column) if (board is not None and column) else ""
     started, finished = has_started(key), has_finished(key)
     can_remove = removes(tracker)
@@ -5810,6 +5854,13 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
                        f"{proj.name}'s tracker cannot reopen a card from here. Reopen it in the "
                        f"tracker's own screen — the card, its thread and its number are all still "
                        f"there, because closing never deleted anything.")
+    # ANOTHER PROJECT'S CLOSED CARD IS NOT REOPENED FROM THIS ONE (#156, review of
+    # openfactory-core#884 point 3). The door reaches a closed card by key, and this row went to it
+    # without asking the slice, so a board that reads only its project's slice (Jira's `scope_jql`,
+    # Azure's `scope_epic`) was never asked `holds`: api reopened web's closed card.
+    refusal = await asyncio.to_thread(_reopen_refusal, proj, _board, issue)
+    if refusal:
+        return refused(CONFLICT, refusal)
     # THROUGH THE CARD'S DOOR (ADR-0055). Its table allows a reopen of a CLOSED card only: this row
     # once reopened an open one, and on the local board that threw a card in progress back into
     # Backlog. The note saying who reopened it is the door's comment, and the promise the close
@@ -5821,6 +5872,12 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
     bad = _refusal_of(moved)
     if bad:
         return bad
+    # A KEY TYPED IN LOWERCASE IS THE SAME CARD (#108): echoed as the door recorded it, `DAR-1`;
+    # any other ref (`#3`) is echoed as it was typed
+    from beeverforge.contracts.refs import canonical_ref
+
+    if moved.card != canonical_ref(issue) and moved.card.upper() == canonical_ref(issue).upper():
+        issue = moved.card
     if moved.outcome("reopen").startswith("failed") and not moved.recorded:
         return refused(UNAVAILABLE, f"{issue} is still closed: {moved.outcome('reopen')}")
     reopened = f"reopened {issue} ({by}) — it is back on the board for somebody to pick up"
@@ -7996,9 +8053,10 @@ def _the_context_step(name: str) -> dict | None:
         created, where = seed_context_repository(project, docs, sources=[name])
         there = where or forge.clone_url(docs)
     except Exception as exc:  # noqa: BLE001 — the project is registered; the step is said
-        log.warning("could not seed the context repository for %s (%s)", name, str(exc)[:200])
+        said = gitpin.without_pin(str(exc))
+        log.warning("could not seed the context repository for %s (%s)", name, said[:200])
         return _step("context", STEP_FAILED, f"the product role's context repository could not "
-                                             f"be created ({exc}) — the doctor will say the "
+                                             f"be created ({said}) — the doctor will say the "
                                              f"product module is unusable until it is")
     if not where:
         return _step("context", STEP_ALREADY, f"the product role's context repository is there "
@@ -8210,8 +8268,8 @@ def _the_declaration_step(project, docs_repo: str, root: Path, *, sources: list[
     url = context_clone_url(project, docs_repo)
     # THE CREDENTIAL, NOT THE ADDRESS: an address on this machine is a path a person needs to read.
     withhold.append(_the_credential_in(url))
-    clone = ["git", "clone", "--no-local", *([] if made_now else ["--depth", "1"]), "--", url,
-             str(root)]
+    clone = gitpin.argv(["clone", "--no-local", *([] if made_now else ["--depth", "1"]), "--", url,
+                         str(root)])
     try:
         cloned = subprocess.run(clone, capture_output=True, text=True, timeout=_A_CONTEXT_GIT_S)
     except subprocess.TimeoutExpired:
@@ -8262,13 +8320,14 @@ def _the_declaration_step(project, docs_repo: str, root: Path, *, sources: list[
                  # --force: the bot's OWN onboarding branch, so a run after a partial failure
                  # (pushed, then the review request did not open) overwrites rather than
                  # dead-locking on a non-fast-forward — and an open review shows the latest
-                 ["push", "--force", "-u", "--", "origin", branch]):
+                 gitpin.pinned(["push", "--force", "-u", "--", "origin", branch])):
         ran = subprocess.run(["git", "-C", str(root), *ident, *args],
                              capture_output=True, text=True, timeout=_A_CONTEXT_GIT_S)
         if ran.returncode != 0:
             # `origin` IS THE CLONE'S ADDRESS, and a push that cannot reach it names it.
+            said = _withheld(ran.stderr or '', *withhold)[-200:]
             return _step("declaration", STEP_FAILED,
-                         f"git {args[0]} failed: {_withheld(ran.stderr or '', *withhold)[-200:]}")
+                         f"git {gitpin.subcommand(args)} failed: {said}")
     # THROUGH THE PORT, NOT THROUGH ONE VENDOR'S CLI (#95), and ASKED FIRST: a review already open
     # on this branch is the one the push just updated, and opening a second is what a retry used
     # to attempt. Unread is not "none" — then it opens, as it always did.

@@ -49,7 +49,7 @@ import pytest
 
 from beeverforge.product import voice
 from tests import test_card_maintenance as maintenance
-from tests.test_capabilities_and_checks import _commit, bed  # noqa: F401 — the fixture
+from tests.test_capabilities_and_checks import _commit, bed, git_bed  # noqa: F401 - pytest finds these fixtures by name; ruff cannot see the use
 from tests.test_card_maintenance import (  # noqa: F401 — the bed and its isolation, reused
     _ALIGNED,
     _REFINED,

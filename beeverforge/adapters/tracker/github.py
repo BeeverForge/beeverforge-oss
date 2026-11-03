@@ -8,12 +8,14 @@ label. Runs as the bot when a token is provided (GH_TOKEN), else ambient auth.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import subprocess
 import time
 
+from beeverforge.adapters.agent.base import MAX_ARG_STRLEN
 from beeverforge.adapters.github_cli import credential_of, nothing_named, refused
 from beeverforge.adapters.tracker.base import (
     Budget,
@@ -63,6 +65,27 @@ def _summary(row: dict, *, ref: str) -> TicketSummary:
         assignees=[str(x.get("login") or "") for x in (row.get("assignees") or [])],
         updated_at=str(row.get("updatedAt") or ""),
     )
+
+
+def _argv_too_long(args: list[str], exc: OSError) -> subprocess.CompletedProcess[str]:
+    """An argv the kernel refused (`E2BIG`, #130), answered as a failed call the way `refused()`
+    answers one, so a text too long for one argument fails by name instead of as a traceback.
+    Any other `OSError` is not this one and is raised unchanged."""
+    if exc.errno != errno.E2BIG:
+        raise exc
+    command = " ".join(["gh", *args[:2]])
+    if args[:2] == ["issue", "close"]:
+        # `gh issue close` has no `--body-file` (only `-c/--comment`, `--duplicate-of`,
+        # `-r/--reason`), so its remedy is the comment on stdin first, then the bare close.
+        remedy = ("so the reason must be posted first as a comment on stdin "
+                  "(`gh issue comment --body-file -`), then the issue closed without `--comment`")
+    else:
+        remedy = "so the text must go to `gh` on stdin with `--body-file -`"
+    why = (f"`{command}` was refused by the kernel before it started (E2BIG): one argument is "
+           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, {remedy}.")
+    log.warning("BEEVERFORGE_GH_ARGV_TOO_LONG %s: an argument over %s bytes (MAX_ARG_STRLEN)",
+                command, f"{MAX_ARG_STRLEN:,}")
+    return refused(args, why)
 
 
 class GitHubIssuesTracker(TrackerAdapter):
@@ -146,16 +169,22 @@ class GitHubIssuesTracker(TrackerAdapter):
                 "the `gh` CLI is not installed — the GitHub tracker/board speak through it. "
                 "Install it (https://cli.github.com) and run `gh auth login` (or set "
                 "BEEVERFORGE_BOT_TOKEN / the GitHub App variables).") from None
+        except OSError as exc:
+            return _argv_too_long(args, exc)
         # RESILIENCE: GitHub's SECONDARY / abuse-detection limits clear in seconds — one brief
         # backoff + retry rides them out instead of failing the whole ticket. (A primary limit,
         # minutes away, still fails here and the caller degrades; the poller's own budget check
         # keeps us from spending into it in the first place.)
-        if p.returncode != 0 and any(m in (p.stderr or "").lower() for m in self._RATE_MARKERS):
+        if p.returncode == 0 or not any(m in (p.stderr or "").lower() for m in self._RATE_MARKERS):
+            return p
+        try:
             time.sleep(8)
             p = subprocess.run(
                 ["gh", *args], input=stdin, capture_output=True, text=True, timeout=timeout,
                 env=self._env(),
             )
+        except OSError as exc:
+            return _argv_too_long(args, exc)
         return p
 
     def _write(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:

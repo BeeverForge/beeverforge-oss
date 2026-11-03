@@ -51,6 +51,7 @@ from beeverforge.adapters.forge.base import (
     ForgeAdapter,
     ReviewComment,
     ReviewEvent,
+    truncated_tail,
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
 
@@ -552,8 +553,10 @@ class AzureReposForge(ForgeAdapter):
         # adapter's own constructor tolerates by reducing to the leaf — would otherwise have its
         # OWNER read as an ADO project and every clone aimed somewhere that does not exist.
         # Cross-project addressing is a real need (a shared documentation project); silently
-        # re-reading the adapter's own coordinates is not.
-        where = head.strip() if (head.strip() and name != self.repo) else self.project
+        # re-reading the adapter's own coordinates is not. Azure DevOps names ignore case, so
+        # `API` is this adapter's `api` (#399); the URL still carries the spelling given.
+        own = name.casefold() == self.repo.casefold()
+        where = head.strip() if (head.strip() and not own) else self.project
         base = (f"dev.azure.com/{urllib.parse.quote(self.organization)}"
                 f"/{urllib.parse.quote(where)}/_git/{urllib.parse.quote(name)}")
         if token:
@@ -1765,7 +1768,7 @@ class AzureReposForge(ForgeAdapter):
                     continue
                 chunks.append(f"### {record.get('name') or 'step'}\n" + "\n".join(
                     str(line) for line in lines))
-        return _redact("\n".join(chunks))[-max_chars:]
+        return truncated_tail(_redact("\n".join(chunks)), max_chars)
 
     # ---- tags ---------------------------------------------------------------------------------
 

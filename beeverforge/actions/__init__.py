@@ -41,6 +41,8 @@ implemented by none of them.**
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import re
 
@@ -279,7 +281,15 @@ def proposable(by: Actor) -> tuple[str, ...]:
 
 
 async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
-    """Run one action. Never raises. Always returns an `Outcome`.
+    """Run one action. Always returns an `Outcome`; only what is not an `Exception` passes through.
+
+    That is a cancellation, an interrupt or an exit (`CancelledError`, `KeyboardInterrupt`,
+    `SystemExit`, `GeneratorExit`): they are the caller's, never an outcome, so the outer guard
+    catches `Exception` and must not be widened to `BaseException`.
+
+    An exception raised outside the row's own guard (the catalog failing to import, a parameter
+    check that breaks) is answered as a row's exception is: `failed`, reason `raised`, with a
+    reference that names its one logged traceback (#207).
 
     THE SIX THINGS THAT HAPPEN HERE RATHER THAN IN THREE FRONT ENDS:
 
@@ -307,115 +317,130 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
     the fixed string "Activity task failed" (#66).
     """
     key = (name or "").strip().lower()
-    found = _catalog().get(key)
-    if found is None:
-        return refused(
-            NOT_FOUND,
-            f"there is no action called {name!r} — this deployment does: " + ", ".join(names()),
-            reason=UNKNOWN_ACTION,
-        )
-
-    problem = _check_params(found, params)
-    if problem:
-        return refused(INVALID, problem, reason=BAD_PARAMETERS)
-
-    if "issue" in params:
-        ref, bad = _clean_ref(str(params["issue"]))
-        if bad:
-            return refused(INVALID, bad, reason=BAD_REF)
-        params["issue"] = ref
-
-    # SCOPE BEFORE ADMIN, because they answer different questions and the order is the point: a
-    # business analyst holding a product credential IS an admin of the product area — accepting a
-    # requirement is the most consequential act there — and must still be refused `merge` outright.
-    # Asking `admin` first would let that credential through on every row it happens to satisfy.
-    if not by.may_enter(found.scope):
-        log.warning("DENIED_SCOPE %s (%s) by %s (%s)", key, found.scope, by, _loggable(params))
-        # AN INSTALLATION ROW NAMES THE ADMINISTRATOR, NOT THE AREA (#741): a row that changes the
-        # installation is refused to a credential of ANY area, so sending a product credential to
-        # "somebody whose credential covers the floor" is the wrong remedy — a floor credential is
-        # refused it too. The reason stays `out_of_scope` (the area check is what refused), but the
-        # sentence points where the fix is.
-        remedy = ("ask somebody who administers this deployment" if found.installation
-                  else f"ask somebody whose credential covers the {found.scope}")
-        return refused(
-            DENIED,
-            f"this credential is scoped to {', '.join(sorted(by.scopes or ())) or 'nothing'} and "
-            f"{key} belongs to the {found.scope}. Nothing was done — {remedy}.",
-            reason=OUT_OF_SCOPE,
-        )
-
-    # THE INSTALLATION IS THE ADMINISTRATOR'S (#741), asked after the area and before `admin`. A
-    # credential scoped to ANY area — a board token, a product token, an invitation to one of them
-    # — is somebody's operator or requirement-writer, and it is `admin` on its own surface; what it
-    # may never do is change what the deployment is: its projects, the people it names, whether it
-    # picks work up. Only an unscoped credential reaches these rows, which is the panel's own token
-    # and its per-person rows, an invitation to neither area, and a shell on the host.
-    if found.installation and by.scopes is not None:
-        log.warning("DENIED_INSTALLATION %s by %s (%s)", key, by, _loggable(params))
-        return refused(
-            DENIED,
-            f"{key} changes this installation, which is the administrator's; this credential is "
-            f"scoped to {', '.join(sorted(by.scopes)) or 'nothing'}. Nothing was done — ask "
-            f"somebody who administers this deployment.",
-            reason=NOT_THE_INSTALLATIONS,
-        )
-
-    if found.needs_admin and not by.admin:
-        log.warning("DENIED %s by %s (%s)", key, by, _loggable(params))
-        return refused(
-            DENIED,
-            f"{by} is not allowed to {key} — ask somebody listed as an admin for this project.",
-            reason=NOT_ADMIN,
-        )
-
-    # WHO FIRST, THEN WHAT THE PROJECT IS (#992): a row that needs the code is refused, by name and
-    # before it runs, on a project whose product started before its code — a refusal somebody can
-    # act on, where running it would fail in a clone, a board or a box with a sentence about that
-    if waits_for_code(found):
-        waiting = _waiting_for_its_code(params.get("project"), key)
-        if waiting:
-            log.info("NO_CODE_YET %s by %s (%s)", key, by, _loggable(params))
-            return refused(CONFLICT, waiting, reason=NO_CODE_YET)
-
-    from beeverforge.runtime.temporal.vocabulary import EngineUnreachable
-
+    # THE OUTER GUARD (#207): what breaks before or after the row's own guard, the catalog
+    # failing to import or a parameter check that breaks, is the same named answer a row's
+    # exception gets, not a raise that a route turns into an unhandled 500.
     try:
-        outcome = await found.run(by=by, **params)
-    except EngineUnreachable as exc:
-        # NOT A FAILURE OF THE ACTION, a state of the deployment (#674): the engine did not answer
-        # in time. FAILED is a 500 and a traceback; this is the panel's 503 and one line.
-        log.warning("action %s by %s: the engine did not answer (%s)", key, by, exc)
-        return refused(UNAVAILABLE, f"could not {key}: {exc}", reason=ENGINE_UNREACHABLE)
-    except Exception as exc:  # noqa: BLE001 — an action must never take its caller down
-        # THE REFERENCE IS IN THE LINE AND IN THE ANSWER (#908), so the person who reads "could
-        # not …" can hand an operator the one traceback that is theirs; before, the answer named
-        # nothing the log could be searched for.
+        found = _catalog().get(key)
+        if found is None:
+            return refused(
+                NOT_FOUND,
+                f"there is no action called {name!r} — this deployment does: " + ", ".join(names()),
+                reason=UNKNOWN_ACTION,
+            )
+
+        problem = _check_params(found, params)
+        if problem:
+            return refused(INVALID, problem, reason=BAD_PARAMETERS)
+
+        if "issue" in params:
+            ref, bad = _clean_ref(str(params["issue"]))
+            if bad:
+                return refused(INVALID, bad, reason=BAD_REF)
+            params["issue"] = ref
+
+        # SCOPE BEFORE ADMIN, because they answer different questions and the order is the point: a
+        # business analyst holding a product credential IS an admin of the product area — accepting
+        # a requirement is the most consequential act there — and must still be refused `merge`
+        # outright. Asking `admin` first would let that credential through on every row it happens
+        # to satisfy.
+        if not by.may_enter(found.scope):
+            log.warning("DENIED_SCOPE %s (%s) by %s (%s)", key, found.scope, by, _loggable(params))
+            # AN INSTALLATION ROW NAMES THE ADMINISTRATOR, NOT THE AREA (#741): a row that changes
+            # the installation is refused to a credential of ANY area, so sending a product
+            # credential to "somebody whose credential covers the floor" is the wrong remedy — a
+            # floor credential is refused it too. The reason stays `out_of_scope` (the area check is
+            # what refused), but the sentence points where the fix is.
+            remedy = ("ask somebody who administers this deployment" if found.installation
+                      else f"ask somebody whose credential covers the {found.scope}")
+            return refused(
+                DENIED,
+                f"this credential is scoped to {', '.join(sorted(by.scopes or ())) or 'nothing'} "
+                f"and {key} belongs to the {found.scope}. Nothing was done — {remedy}.",
+                reason=OUT_OF_SCOPE,
+            )
+
+        # THE INSTALLATION IS THE ADMINISTRATOR'S (#741), asked after the area and before `admin`. A
+        # credential scoped to ANY area — a board token, a product token, an invitation to one of
+        # them — is somebody's operator or requirement-writer, and it is `admin` on its own surface;
+        # what it may never do is change what the deployment is: its projects, the people it names,
+        # whether it picks work up. Only an unscoped credential reaches these rows, which is the
+        # panel's own token and its per-person rows, an invitation to neither area, and a shell on
+        # the host.
+        if found.installation and by.scopes is not None:
+            log.warning("DENIED_INSTALLATION %s by %s (%s)", key, by, _loggable(params))
+            return refused(
+                DENIED,
+                f"{key} changes this installation, which is the administrator's; this credential "
+                f"is scoped to {', '.join(sorted(by.scopes)) or 'nothing'}. Nothing was done — ask "
+                f"somebody who administers this deployment.",
+                reason=NOT_THE_INSTALLATIONS,
+            )
+
+        if found.needs_admin and not by.admin:
+            log.warning("DENIED %s by %s (%s)", key, by, _loggable(params))
+            return refused(
+                DENIED,
+                f"{by} is not allowed to {key} — ask somebody listed as an admin for this project.",
+                reason=NOT_ADMIN,
+            )
+
+        # WHO FIRST, THEN WHAT THE PROJECT IS (#992): a row that needs the code is refused, by name
+        # and before it runs, on a project whose product started before its code — a refusal
+        # somebody can act on, where running it would fail in a clone, a board or a box with a
+        # sentence about that
+        if waits_for_code(found):
+            waiting = _waiting_for_its_code(params.get("project"), key)
+            if waiting:
+                log.info("NO_CODE_YET %s by %s (%s)", key, by, _loggable(params))
+                return refused(CONFLICT, waiting, reason=NO_CODE_YET)
+
+        from beeverforge.runtime.temporal.vocabulary import EngineUnreachable
+
+        try:
+            outcome = await found.run(by=by, **params)
+        except EngineUnreachable as exc:
+            # NOT A FAILURE OF THE ACTION, a state of the deployment (#674): the engine did not
+            # answer in time. FAILED is a 500 and a traceback; this is the panel's 503 and one line.
+            log.warning("action %s by %s: the engine did not answer (%s)", key, by, exc)
+            return refused(UNAVAILABLE, f"could not {key}: {exc}", reason=ENGINE_UNREACHABLE)
+        except Exception as exc:  # noqa: BLE001 - an action must never take its caller down
+            # THE REFERENCE IS IN THE LINE AND IN THE ANSWER (#908), so the person who reads "could
+            # not …" can hand an operator the one traceback that is theirs; before, the answer named
+            # nothing the log could be searched for.
+            reference = failure_reference()
+            log.exception("action %s raised for %s reference=%s", key, by, reference)
+            return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED,
+                           reference=reference)
+        if not isinstance(outcome, Outcome):  # an action that returns None is a silent success (F5)
+            log.error("action %s returned %r, not an Outcome", key, type(outcome).__name__)
+            return refused(
+                FAILED,
+                f"'{key}' did not report what it did — treat this as a failure and check the logs "
+                f"before assuming it happened.",
+                reason=REPORTED_NOTHING,
+            )
+        if not outcome.ok and outcome.data.get("reason") not in reasons(key):
+            # THE ANSWER STANDS — it is the row's, and rewriting it here would hide the very word
+            # the caller needs to report. The guards in `tests/test_the_action_layer.py` read every
+            # row's refusals off its source; this is for the one they could not see.
+            log.error("action %s refused with an undeclared reason %r — it declares %s", key,
+                      outcome.data.get("reason"), ", ".join(reasons(key)))
+        # A LABEL IS PRINTED AS ONE (`Actor.label`): what an anonymous caller says it is, beside the
+        # credential it used — never in `by=`, which is who that credential is.
+        label = str(getattr(by, "label", "") or "")
+        log.info("action=%s by=%s%s ok=%s code=%s params=%s", key, by,
+                 f" label={label!r}" if label else "", outcome.ok, outcome.code or "-",
+                 _loggable(params))
+        return outcome
+    except asyncio.CancelledError:
+        raise  # a cancellation is the caller's, never an outcome
+    except Exception as exc:
         reference = failure_reference()
-        log.exception("action %s raised for %s reference=%s", key, by, reference)
+        log.exception("action %s raised outside its guard for %s reference=%s", key, by,
+                      reference)
         return refused(FAILED, f"could not {key}: {_why(exc)}", reason=RAISED,
                        reference=reference)
-    if not isinstance(outcome, Outcome):  # an action that returns None is a silent success (F5)
-        log.error("action %s returned %r, not an Outcome", key, type(outcome).__name__)
-        return refused(
-            FAILED,
-            f"'{key}' did not report what it did — treat this as a failure and check the logs "
-            f"before assuming it happened.",
-            reason=REPORTED_NOTHING,
-        )
-    if not outcome.ok and outcome.data.get("reason") not in reasons(key):
-        # THE ANSWER STANDS — it is the row's, and rewriting it here would hide the very word the
-        # caller needs to report. The guards in `tests/test_the_action_layer.py` read every
-        # row's refusals off its source; this is for the one they could not see.
-        log.error("action %s refused with an undeclared reason %r — it declares %s", key,
-                  outcome.data.get("reason"), ", ".join(reasons(key)))
-    # A LABEL IS PRINTED AS ONE (`Actor.label`): what an anonymous caller says it is, beside the
-    # credential it used — never in `by=`, which is who that credential is.
-    label = str(getattr(by, "label", "") or "")
-    log.info("action=%s by=%s%s ok=%s code=%s params=%s", key, by,
-             f" label={label!r}" if label else "", outcome.ok, outcome.code or "-",
-             _loggable(params))
-    return outcome
 
 
 #: Parameters whose VALUE must never reach a log line. `approve_prod` and `promote` take the
@@ -460,7 +485,56 @@ def _check_params(found: ActionSpec, params: dict[str, object]) -> str:
     if unexpected:
         return (f"'{found.name}' does not take {', '.join(sorted(unexpected))} — it takes "
                 + (", ".join(found.parameters) or "no parameters") + ".")
+    declared = _declared_types(found)
+    for p in found.parameters:
+        if p not in params or declared.get(p) not in _ACCEPTS:
+            continue
+        word, accepted = _ACCEPTS[declared[p]]
+        if accepted and not isinstance(params[p], accepted):
+            return (f"'{found.name}' takes {p} as {word}, not "
+                    f"{_KIND.get(type(params[p]), 'a value of another kind')} — nothing was done.")
     return ""
+
+
+#: How a refusal names the value it was given: in the caller's terms (the panel sends JSON, not
+#: Python), with the article in the word, never a Python class name. Looked up by exact type, so a
+#: `bool` is never read as the `int` it subclasses.
+_KIND: dict[type, str] = {
+    list: "a list", dict: "an object", int: "a number", float: "a number",
+    str: "a string", bool: "true or false",
+}
+
+
+#: Every type a row's runner declares, with what a value for it must be: `(how the refusal names
+#: the type, the classes it accepts)`. An empty tuple accepts anything (`object`).
+#:
+#: A `str` parameter accepts any scalar, not only `str`: the CLI turns `true`/`false` into
+#: booleans and ticket numbers arrive as ints, and the rows pass those through `str()`. A `bool`
+#: parameter accepts only a boolean: the CLI already sends `true`/`false` as one, and a string
+#: such as "no" would reach `bool()` and mean yes. `None` stays what an optional value may be.
+#: `tests/test_a_parameter_of_the_wrong_type_is_refused.py` fails when a row declares a type
+#: missing here.
+_STR = ("a string", (str, int, float, bool, type(None)))
+_BOOL = ("true or false", (bool, type(None)))
+_ANY = ("anything", ())
+_ACCEPTS: dict[object, tuple[str, tuple[type, ...]]] = {
+    "str": _STR, str: _STR, "bool": _BOOL, bool: _BOOL, "object": _ANY, object: _ANY,
+}
+
+
+def _declared_types(found: ActionSpec) -> dict[str, object]:
+    """The annotation the row's runner declares for each parameter, as written.
+
+    catalog.py uses `from __future__ import annotations`, so these are usually strings ("str").
+    Never resolved with `get_type_hints`, which would chase `Actor`/`Outcome` and can raise; and
+    a runner without a readable signature is simply not checked, because `perform` never raises.
+    """
+    try:
+        sig = inspect.signature(found.run)
+    except (TypeError, ValueError):
+        return {}
+    return {name: prm.annotation for name, prm in sig.parameters.items()
+            if isinstance(prm.annotation, (str, type))}
 
 
 #: What a tracker actually calls a ticket: `189` (GitHub, optionally `#`-prefixed), `CONT-412`

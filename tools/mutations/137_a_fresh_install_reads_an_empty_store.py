@@ -32,8 +32,9 @@ MUTATIONS = [
      "            elif False:\n                try:\n"
      "                    conn.executescript(_SCHEMA)"),
 
+    # Re-pinned (#228): the read creates the file on every open now, under `else:`.
     ("a read before the state directory exists fails instead of reading an empty store", SINK,
-     "        elif ensure:\n            try:\n                self.path.parent.mkdir(",
+     "        else:\n            try:\n                self.path.parent.mkdir(",
      "        elif False:\n            try:\n                self.path.parent.mkdir("),
 
     ("a store removed under a running process fails every read for the rest of its life", SINK,

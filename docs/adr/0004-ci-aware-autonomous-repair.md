@@ -164,7 +164,8 @@ amendment, not a reversal: the agent still repairs every red build the step does
   attempt launches the agent whatever the log says, and a wrong "unrelated" costs one CI re-run, not
   the repair budget.
 - **"Could not see" is "related".** A diff the forge could not read, or one `truncated` cut (it
-  carries `DIFF_CUT_MARKER`), launches the agent as before.
+  carries `DIFF_CUT_MARKER`), or a log `truncated_tail` cut (it carries `LOG_CUT_MARKER`, #161),
+  launches the agent as before.
 - **After a pass that changed nothing, the failed jobs are re-run once.** A pass that answered
   `PR_OPEN` with `code_changed is False` pushed nothing, so nothing would run the checks again, and
   the watch would read the same red off the same run. The re-run is said on the pull request too

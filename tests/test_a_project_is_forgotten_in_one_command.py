@@ -700,3 +700,27 @@ def test_with_context_the_command_removes_the_distillates_through_the_project_s_
     assert "REQ-0002 requirements/0002-monthly-report.md" in line and "product_drop" in line
     assert "conversations/notes.md" in _tree(context_repo, tmp_path)
     assert not [p for p in _tree(context_repo, tmp_path) if p.startswith("conversations/room")]
+
+
+# ── the backup is private (#228) ────────────────────────────────────────────────────────────────
+# It holds the clients' messages and the audit trail being forgotten. Umask `0o277` is not here:
+# under it the backup's own new folder is created unwritable to its owner, before any store is
+# reached; `tests/test_sqlite_metrics.py` proves the copy itself under that umask.
+
+@pytest.mark.parametrize("umask", [0o000, 0o022], ids=["000", "022"])
+def test_the_metrics_backup_forget_takes_is_private_whatever_the_umask(remembered, tmp_path,
+                                                                      umask):
+    import os
+    import stat
+
+    old = os.umask(umask)
+    try:
+        done = _forget("books", "--yes")
+    finally:
+        os.umask(old)
+
+    assert done.exit_code == 0, done.output
+    copy = next((tmp_path / "state" / "backups").glob("forget-books-*")) / "metrics.db"
+    beside = [copy, *(copy.with_name(copy.name + s) for s in ("-wal", "-shm", "-journal"))]
+    assert {p.name: stat.S_IMODE(p.stat().st_mode) for p in beside if p.exists()} == {
+        "metrics.db": 0o600}

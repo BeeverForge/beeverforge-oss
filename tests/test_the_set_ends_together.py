@@ -150,7 +150,9 @@ def test_one_child_dying_still_ends_the_set(tmp_path, cleanup):
     children = _pids(*files)
     cleanup.extend(children)
 
-    assert supervisor.wait(timeout=20) == 0
+    # THE SET ENDS WITH THE STATUS OF THE CHILD THAT ENDED IT (#363), not 0: a container whose
+    # worker died must not exit clean, or its restart policy never sees the death.
+    assert supervisor.wait(timeout=20) == 3
     assert _gone(children, within=10) == []
     assert "short exited (3)" in supervisor.stdout.read()
 
