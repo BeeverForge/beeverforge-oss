@@ -478,6 +478,43 @@ root your proxy presents, and that failure is the least informative one in this 
 returns no package lists at all and every install line then reports `E: Unable to locate package
 git`, which reads like a broken mirror rather than a missing certificate.
 
+## The compose stack, or the worker image as one container
+
+The compose stack runs the durable engine, its database, the worker and the panel, each in its
+own container:
+
+```bash
+docker compose --env-file .env.compose up -d --build
+```
+
+Where the durable engine already runs somewhere else (a hosted Temporal namespace, or one your
+platform team operates), the published `beeverforge-worker` image runs the worker **and** the
+panel in one long-lived container. The image's entry point is `tini -s --`, so the command is
+the container's `CMD`, and it needs nothing but the engine's variables:
+
+```bash
+docker run -d --restart on-failure -p 8787:8787 \
+  -e TEMPORAL_ADDRESS -e TEMPORAL_NAMESPACE -e TEMPORAL_API_KEY \
+  ghcr.io/beeverforge/beeverforge-worker:main \
+  python -m beeverforge.cli worker --with-panel
+```
+
+For a container that publishes no port and whose panel is reached from a sidecar in the same
+network namespace, hold the panel to the loopback with `--panel-host 127.0.0.1`:
+
+```bash
+docker run -d --restart on-failure \
+  -e TEMPORAL_ADDRESS -e TEMPORAL_NAMESPACE -e TEMPORAL_API_KEY \
+  ghcr.io/beeverforge/beeverforge-worker:main \
+  python -m beeverforge.cli worker --with-panel --panel-host 127.0.0.1
+```
+
+`--panel-port` moves the panel off 8787. The two processes stop together: `docker stop` (a
+SIGTERM, which `tini` hands on) stops both and the container exits 0; when either one ends on its
+own, the other is stopped and the container exits with the status of the one that ended, so a
+restart policy sees it. With `TEMPORAL_ADDRESS` unset the command refuses to start, by name. It
+never starts an engine; `beeverforge up` is the one-machine command that does.
+
 ## Web panel (observability + management)
 
 ```bash

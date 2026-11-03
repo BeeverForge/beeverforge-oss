@@ -3090,13 +3090,37 @@ def people_list() -> None:
                    f"registered)")
 
 
+#: Said when `worker --with-panel` is asked to start with nowhere for the worker to dial (#363).
+NO_ENGINE_DECLARED = (
+    "the worker and the panel cannot start: nobody said where the durable engine is, and this "
+    "command starts none. Set `TEMPORAL_ADDRESS` to the engine's host:port — and "
+    "`TEMPORAL_NAMESPACE` and `TEMPORAL_API_KEY` for a hosted engine — and start it again; on a "
+    "machine that should run its own engine, use `beeverforge up` instead.")
+
+
 @app.command("worker")
-def worker_cmd() -> None:
+def worker_cmd(
+    with_panel: bool = typer.Option(
+        False, "--with-panel",
+        help="Also serve the panel, supervised with the worker: one container command against a "
+             "remote engine"),
+    panel_host: str = typer.Option(
+        "0.0.0.0", help="With --with-panel: the interface the panel listens on (127.0.0.1 keeps "
+                        "it to the container, for a sidecar)"),
+    panel_port: int | None = typer.Option(
+        None, help=f"With --with-panel: where the panel listens (default: the port "
+                   f"`{_PANEL.reach_vars[0]}` or `{_PANEL.port_var}` names, else "
+                   f"{_PANEL.default_port})"),
+) -> None:
     """Run the durable worker in the foreground — what the compose stack runs in its container.
 
     The module has always been runnable (`python -m beeverforge.runtime.temporal.worker`) and the
     compose file runs exactly that; a person on their own machine had to know the module path,
     which is the kind of thing a platform should not ask anybody to remember.
+
+    With `--with-panel` it also serves the panel and stops both together: the published worker
+    image's command for one long-lived container against an engine run elsewhere. It ends with
+    the status of whichever process ended, and SIGTERM stops both.
 
     Without the durable engine's client library (the `runtime` extra) it refuses in one sentence
     that names the install, instead of starting."""
@@ -3105,11 +3129,40 @@ def worker_cmd() -> None:
     # module named 'temporalio'` — the leftover #174 named. The ids stay here and not in the
     # docstring: that is this command's `--help`, and a stranger cannot open a card.
     _refuse_without_the_client("the worker cannot start", code=1)
+    if with_panel:
+        _worker_with_panel(panel_host=panel_host, panel_port=panel_port)
+        return
     # `born`, not `main`: the same door the module's own `-m` entry uses, so an engine that never
     # started listening is a sentence here too rather than a traceback (#135).
     from beeverforge.runtime.temporal.worker import born as worker_born
 
     asyncio.run(worker_born())
+
+
+def _worker_with_panel(*, panel_host: str, panel_port: int | None) -> None:
+    """`worker --with-panel`: the worker and the panel under `host.run`, which supervises (#363).
+
+    NOT `up --no-engine`, which plans the panel alone and never a worker — a worker there, beside
+    the `localhost` engine address `init` writes, would exit at once and take the panel down."""
+    from beeverforge import listeners
+    from beeverforge.runtime import host
+
+    # NOWHERE TO DIAL IS A SENTENCE, NOT A SET THAT STARTS AND DIES: the worker would exit on its
+    # first connection and its exit would end the panel with it.
+    if not listeners.ENGINE.declared():
+        typer.echo(f"✗ {NO_ENGINE_DECLARED}", err=True)
+        raise typer.Exit(code=1)
+    try:
+        planned = host.worker_and_panel(panel_host=panel_host, panel_port=panel_port)
+    except listeners.CannotHonour as exc:
+        typer.echo(f"worker: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    for line in planned.said:
+        typer.echo(f"! {line}")
+    typer.echo(f"the panel will be at {planned.reach[_PANEL.name]} (listening on {panel_host})")
+    code = host.run(planned.plan, say=typer.echo, env=planned.env)
+    if code:
+        raise typer.Exit(code)
 
 
 @app.command("up")
