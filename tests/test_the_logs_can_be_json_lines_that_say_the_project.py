@@ -1929,6 +1929,15 @@ def _threads_of_this_process() -> int | None:
 #: How many connects each case below makes in a row, after the first.
 REFUSED_CONNECTS = 10
 
+#: The bound each of `test_a_connect_refused_once_the_socket_took_it_keeps_no_runtime_alive`'s
+#: connects runs under, in place of the engine's 3 s read deadline (#392). The library is refused
+#: when `closing`'s thread closes what it took, so on a loaded runner the refusal waits for that
+#: thread to be scheduled: measured under `taskset -c 0-3`, beside eight `-n 4` loops of the other
+#: `owns_its_engine` cases (load average 36-45), the worst of 319 refused connects took 5.21 s and
+#: the median 0.17 s; at a load of 24 the worst was 0.48 s. 30 s is 5.8 times that worst. It
+#: bounds the attempt, and the case asserts nothing about how long it took.
+REFUSED_CONNECT_WITHIN_S = 30.0
+
 #: The doors a process connects to its engine through, each asked as its callers ask it: the one
 #: client's own (`connection.connect` — the worker's tools, a release, a preview's stop), a worker's
 #: birth, bounded short here, and the read side's (`view.connect` — every panel read, and
@@ -2172,7 +2181,7 @@ async def test_a_connect_refused_once_the_socket_took_it_keeps_no_runtime_alive(
     async def _refused() -> None:
         await _until_no_target_rests()
         with pytest.raises(RuntimeError):
-            await connection.connect()
+            await connection.connect(within=REFUSED_CONNECT_WITHIN_S)
 
     await _refused()
     after_one = _threads_of_this_process()
