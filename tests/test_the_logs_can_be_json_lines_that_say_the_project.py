@@ -1701,18 +1701,34 @@ async def test_a_cancelled_attempt_is_nobodys_failure_and_those_behind_it_try(mo
 async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_attempt(monkeypatch):
     """The lock around the held client and the flight is what makes the single flight hold across
     THREADS (re-review on 3cd816ac, measured: with `_HOLDING` a no-op, 32 threads released by one
-    barrier made 2 or 3 library attempts in 4 trials of 20; with the lock, 1 in 20 of 20)."""
+    barrier made 2 or 3 library attempts in 4 trials of 20; with the lock, 1 in 20 of 20).
+
+    THE ATTEMPT IS IN FLIGHT WHILE THEY ARRIVE: it lands only once all 32 have asked whether their
+    target rests, the question each caller asks under the lock one line before it reads the flight
+    (#362: it was a fixed 0.2 s, thirty times a case, against arrivals 33.9 ms apart at most). The
+    5 s is a backstop for a caller that never asks, never the wait itself."""
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
     attempts, counting = [], threading.Lock()
+    asked = [0]
+    resting = connection._resting
+
+    def _counted(key):
+        with counting:
+            asked[0] += 1
+        return resting(key)
 
     async def _connect(*_args, **_kwargs):
         with counting:
             attempts.append(1)
-        await asyncio.sleep(0.2)
+        for _ in range(5000):
+            if asked[0] >= 32:
+                break
+            await asyncio.sleep(0.001)
         return object()
 
+    monkeypatch.setattr(connection, "_resting", _counted)
     monkeypatch.setattr(connection.Client, "connect", _connect)
     before = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
@@ -1720,6 +1736,7 @@ async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_a
         for trial in range(30):
             connection.forget()
             attempts.clear()
+            asked[0] = 0
             together = threading.Barrier(32)
 
             def _ask(together: threading.Barrier = together) -> None:
@@ -1831,8 +1848,10 @@ def _door(name: str):
     from beeverforge.runtime.temporal import connection, view
 
     return {"connection.connect": connection.connect,
-            "connection.connect_at_birth": lambda: connection.connect_at_birth(within=0.1,
-                                                                               every=0.02),
+            # A port nobody listens on is refused at once: what this wait bounds is a refused
+            # connect, a millisecond (#362: `within=0.1` was 1.1 s for a case's eleven connects).
+            "connection.connect_at_birth": lambda: connection.connect_at_birth(within=0.01,
+                                                                               every=0.005),
             "view.connect": view.connect}[name]()
 
 

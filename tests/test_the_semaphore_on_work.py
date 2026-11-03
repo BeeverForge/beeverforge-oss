@@ -201,10 +201,16 @@ def _module(project: Project, base: Path | None = None, *, corpus: Corpus | None
     return module
 
 
+#: How long a writer's clone waits for the other's. Two clones of this base, started together,
+#: took 28.8 ms at most under four workers (#362), so they meet well inside it; with the semaphore
+#: the first writer waits it out once a case, which was a whole second.
+MEET_WITHIN = 0.25
+
+
 @pytest.fixture
 def rendezvous(monkeypatch) -> None:
-    """Every clone waits, up to a second, for the other writer's clone. WITHOUT the semaphore both
-    writers clone the same base and mint from it; WITH it the second is still waiting for the
+    """Every clone waits, up to `MEET_WITHIN`, for the other writer's clone. WITHOUT the semaphore
+    both writers clone the same base and mint from it; WITH it the second is still waiting for the
     semaphore, the first gives up waiting, pushes, and only then does the second clone."""
     barrier = threading.Barrier(2)
     real = authoring._git
@@ -213,7 +219,7 @@ def rendezvous(monkeypatch) -> None:
         rc, out = real(args, cwd=cwd)
         if gitpin.subcommand(args) == "clone":
             try:
-                barrier.wait(timeout=1.0)
+                barrier.wait(timeout=MEET_WITHIN)
             except threading.BrokenBarrierError:
                 pass
         return rc, out
@@ -603,7 +609,11 @@ def test_the_semaphore_is_let_go_when_the_write_raises():
 
 
 def _hold_in_another_process(tmp_path: Path, *, registry_name: str, seconds: float):
+    """Another process holds the product's semaphore until `_let_go(proc)` is called, or for
+    `seconds` at most — the backstop, so a case that never lets go still ends (#362: the holder
+    used to sleep its whole `seconds` after the case had seen what it came for)."""
     ready = tmp_path / f"held-{registry_name}"
+    go = tmp_path / f"let-go-{registry_name}"
     code = textwrap.dedent(f"""
         import pathlib, time
         from beeverforge.contracts.product import ProductConfig
@@ -613,7 +623,9 @@ def _hold_in_another_process(tmp_path: Path, *, registry_name: str, seconds: flo
                           product=ProductConfig(docs_repo={DOCS!r}))
         with semaphore.held(project):
             pathlib.Path({str(ready)!r}).write_text("held")
-            time.sleep({seconds})
+            until = time.monotonic() + {seconds}
+            while not pathlib.Path({str(go)!r}).exists() and time.monotonic() < until:
+                time.sleep(0.02)
     """)
     proc = subprocess.Popen([sys.executable, "-c", code], env=dict(os.environ),
                             cwd=str(Path(__file__).resolve().parent.parent))
@@ -622,7 +634,13 @@ def _hold_in_another_process(tmp_path: Path, *, registry_name: str, seconds: flo
         assert proc.poll() is None, "the holding process died before it held anything"
         assert time.monotonic() < deadline, "the holding process never took the semaphore"
         time.sleep(0.05)
+    proc.let_go = go
     return proc
+
+
+def _let_go(proc: subprocess.Popen) -> None:
+    """The holder lets go now: the case has seen what it came for."""
+    proc.let_go.touch()
 
 
 def test_a_semaphore_held_by_another_process_times_out_in_words(tmp_path, caplog):
@@ -638,6 +656,7 @@ def test_a_semaphore_held_by_another_process_times_out_in_words(tmp_path, caplog
         assert busy.value.sentence == voice.semaphore_busy(language=LANG)
         assert "BEEVERFORGE_PRODUCT_SEMAPHORE_TIMEOUT" in caplog.text
     finally:
+        _let_go(proc)
         proc.wait(timeout=30)
     assert _holds(project, 5.0), "the semaphore was not let go when its holder ended"
 
@@ -651,6 +670,7 @@ def test_a_write_that_cannot_have_the_semaphore_tells_the_person_and_writes_noth
         result = _module(project, docs_base, corpus=_corpus(docs_base)).propose(
             _drafted("Exportar extrato em PDF"), actor=ADMIN)
     finally:
+        _let_go(proc)
         proc.wait(timeout=30)
 
     assert not result.ok and result.detail == voice.semaphore_busy(language=LANG)

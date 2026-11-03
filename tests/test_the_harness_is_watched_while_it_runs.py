@@ -369,12 +369,22 @@ def test_a_real_box_running_a_real_harness_is_read_while_it_runs(tmp_path):
     from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
 
     script = tmp_path / "fake-harness.sh"
+    # THE HARNESS GOES ON WHEN THE CASE SAYS SO, and the wall below is the backstop (#362). It
+    # slept 0.5 s between its two events, and then `sleep 9` that the 6 s wall killed the shell of:
+    # the orphaned `sleep` held the pipe, and the case waited 9.5 s for it. EACH WAIT ENDS ON ITS
+    # OWN after 15 s too, the case's own join: the wall kills the shell that runs this script, not
+    # the script, so a case that fails or is killed before it says "go on" must not leave it behind.
+    read_once, done = tmp_path / "read-once", tmp_path / "the-case-is-done"
+
+    def _until(gate) -> str:
+        return f"i=0; while [ ! -e {gate} ] && [ $i -lt 750 ]; do sleep 0.02; i=$((i+1)); done\n"
+
     script.write_text(
         "#!/bin/sh\n"
         f"echo '{_assistant('planning').strip()}'\n"
-        "sleep 0.5\n"
-        f"echo '{_tool('Bash', 'pytest -q').strip()}'\n"
-        "sleep 9\n"  # still running: the wall below stops it, which is the point
+        + _until(read_once)
+        + f"echo '{_tool('Bash', 'pytest -q').strip()}'\n"
+        + _until(done)  # still running while it is read
     )
     script.chmod(0o755)
 
@@ -417,6 +427,7 @@ def test_a_real_box_running_a_real_harness_is_read_while_it_runs(tmp_path):
     try:
         first = read_until(1, time.monotonic() + 5.0)
         assert first is not None and first.events >= 1, "nothing was read from a live process"
+        read_once.touch()
         # One stream event is several pulses (an assistant message is a TURN and its content), so
         # the second wait is expressed against what the first actually saw rather than a literal.
         second = read_until(first.events + 1, time.monotonic() + 5.0)
@@ -428,4 +439,6 @@ def test_a_real_box_running_a_real_harness_is_read_while_it_runs(tmp_path):
         # …and the same reading, twelve minutes on, is the stall the card is about.
         assert [s.kind for s in watch.read(now=time.time() + 13 * 60).stalls] == ["harness-silent"]
     finally:
+        read_once.touch()
+        done.touch()
         thread.join(timeout=15)
