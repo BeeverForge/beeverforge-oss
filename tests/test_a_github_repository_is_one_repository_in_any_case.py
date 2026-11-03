@@ -81,11 +81,12 @@ def board(monkeypatch):
     for name in ("GH_HOST", "GITHUB_HOST"):
         monkeypatch.delenv(name, raising=False)
 
-    def make(*cards: tuple[str, int, str, str]) -> tuple[gp.GitHubProjectBoard, _Gh]:
+    def make(*cards: tuple[str, int, str, str],
+             registry: str = REGISTRY_REPO) -> tuple[gp.GitHubProjectBoard, _Gh]:
         gh = _Gh(list(cards))
         monkeypatch.setattr(gp, "_run_gh", gh)
         return gp.GitHubProjectBoard(owner="acme", number="1", token="tok",
-                                     default_repo=REGISTRY_REPO), gh
+                                     default_repo=registry), gh
     return make
 
 
@@ -144,3 +145,36 @@ def test_a_rank_never_anchors_on_another_repositorys_card(board):
     assert not projects.place_after(issue="12", issue_url=URL.format(n=12), after="7",
                                     column="Backlog")
     assert gh.positions == []
+
+
+# ── the other direction: the registry has the capitals, GitHub does not (#388's review) ─────────
+# Each site folds BOTH sides. With the registry always lowercase above, a fold of the board's
+# spelling alone passed every test; a registry that says `Acme/API` for the repository GitHub
+# spells `acme/api` is the same defect from the other side.
+
+CAPITALISED = "Acme/API"
+
+
+def test_a_registry_in_capitals_reads_its_own_card_bare(board):
+    projects, _ = board(("I12", 12, "acme/api", "Backlog"), registry=CAPITALISED)
+
+    assert projects.columns() == {"12": "Backlog"}
+    assert projects.items_in_status("Backlog") == ["12"]
+    assert qualify_ref("acme/api", "#12", CAPITALISED) == "12"
+
+
+def test_a_registry_in_capitals_moves_the_card_github_spells_in_lowercase(board):
+    projects, gh = board(("I12", 12, "acme/api", "Backlog"), registry=CAPITALISED)
+
+    assert projects.set_column(issue="12", issue_url="https://github.com/Acme/API/issues/12",
+                               name="In progress")
+    assert gh.moves == [("I12", "o2")]
+
+
+def test_a_registry_in_capitals_ranks_after_an_anchor_github_spells_in_lowercase(board):
+    projects, gh = board(("I12", 12, "Acme/API", "Backlog"), ("I7", 7, "acme/api", "Backlog"),
+                         registry=CAPITALISED)
+
+    assert projects.place_after(issue="12", issue_url="https://github.com/Acme/API/issues/12",
+                                after="7", column="Backlog")
+    assert gh.positions == [("I12", "I7")]

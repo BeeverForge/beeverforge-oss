@@ -1,7 +1,10 @@
 """#380: a GitHub repository typed in another case is one repository to the Projects board.
 
-The first three cuts put each comparison back to spelling, one site at a time; the last three
+The first three cuts put each comparison back to spelling, one site at a time; the next three
 attack the other edge of the same line, so a fix that matched every repository would go red too.
+The last three fold only GitHub's side and leave the registry's as typed (#388's review): with the
+registry always in lowercase, that one-sided fold passed every test, so they are aimed at the cases
+where the registry has the capitals.
 
 The two board sites carry byte-identical compare lines, so each anchor starts at the line that
 only its own method has above the scan: `_item_id` logs a failed add, `_existing_item_id` goes
@@ -23,6 +26,7 @@ _RANK = ('            return self._item_ids[key]\n'
 _FOLDED = '            if repo and it.get("repo") and it["repo"].casefold() != repo.casefold():\n'
 _SPELLED = '            if repo and it.get("repo") and it["repo"] != repo:\n'
 _NONE = '            if False:\n'
+_BOARD_SIDE = '            if repo and it.get("repo") and it["repo"].casefold() != repo:\n'
 
 MUTATIONS = [
     ("qualify_ref compares by spelling, so the project's own card leaves as `Acme/api#12`", REFS,
@@ -50,4 +54,18 @@ MUTATIONS = [
     ("a rank stops comparing repositories, so it anchors on another repository's card #7", BOARD,
      _RANK + _FOLDED, _RANK + _NONE,
      f"{TEST}::test_a_rank_never_anchors_on_another_repositorys_card"),
+
+    ("qualify_ref folds GitHub's spelling only, so a registry in capitals qualifies its own card",
+     REFS,
+     '    if not repo or repo.casefold() == (default_repo or "").casefold():',
+     '    if not repo or repo.casefold() == (default_repo or ""):',
+     f"{TEST}::test_a_registry_in_capitals_reads_its_own_card_bare"),
+
+    ("a move folds GitHub's spelling only, so a registry in capitals never finds its card", BOARD,
+     _MOVE + _FOLDED, _MOVE + _BOARD_SIDE,
+     f"{TEST}::test_a_registry_in_capitals_moves_the_card_github_spells_in_lowercase"),
+
+    ("a rank folds GitHub's spelling only, so a registry in capitals never finds its anchor", BOARD,
+     _RANK + _FOLDED, _RANK + _BOARD_SIDE,
+     f"{TEST}::test_a_registry_in_capitals_ranks_after_an_anchor_github_spells_in_lowercase"),
 ]
