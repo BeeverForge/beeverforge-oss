@@ -46,8 +46,19 @@ class FakeBox:
 
     def __init__(self, *, remotes=("origin",), base_resolves=True, diff=("tests/test_added.py",),
                  gate_rc=0, gate_out="", dirty="", cleanup_raises=False, prepare_raises=False,
-                 setup_rc=0, git_dirs=(".git", ".git"), git_dirs_rc=0, diff_rc=0) -> None:
+                 setup_rc=0, git_dirs=(".git", ".git"), git_dirs_rc=0, diff_rc=0, commit_rc=0, commit_out="",
+                 diff_unreadable=False, status_rc=0, status_out="") -> None:
         self.setup_rc = setup_rc
+        #: What `git add -A && git commit` answers (#331). A command that still ends in `|| true`
+        #: is answered 0, as the shell would, so a mutation that brings it back really does
+        #: swallow the code.
+        self.commit_rc = commit_rc
+        self.commit_out = commit_out
+        #: `diff_paths` answers None, as the real box does when git refuses `git diff` too.
+        self.diff_unreadable = diff_unreadable
+        #: What `git status --porcelain` exits with, and prints when it fails.
+        self.status_rc = status_rc
+        self.status_out = status_out
         #: What `git rev-parse --git-dir --git-common-dir` answers. EQUAL = a repository of its
         #: own; DIFFERENT = a linked worktree sharing another repository's config. The default is
         #: what real git answers in a `git clone --local` — verified against git 2.50, both ways.
@@ -89,13 +100,17 @@ class FakeBox:
         if command.startswith("git rev-parse --verify"):
             return (0, "abc123") if self.base_resolves else (128, "fatal: Needed a single revision")
         if command.startswith("git status --porcelain"):
+            if self.status_rc:
+                return self.status_rc, self.status_out
             return 0, self.dirty
         if command.startswith("git diff "):
             if self.diff_rc:
                 return self.diff_rc, "fatal: ambiguous argument 'main..HEAD': unknown revision"
             return 0, "diff --git a/tests/test_added.py b/tests/test_added.py\n+def test_x(): ..."
         if "git commit" in command:
-            return 0, ""
+            if command.rstrip().endswith("|| true"):
+                return 0, self.commit_out
+            return self.commit_rc, self.commit_out
         if command.startswith("pip install"):  # the client's `setup:` — see `_manifest`
             return self.setup_rc, "could not resolve host: feed.acme.internal" if self.setup_rc \
                 else "installed"
@@ -105,6 +120,8 @@ class FakeBox:
         return self.gate_rc, "pytest output\nE   assert 1 == 2" if self.gate_rc else "3 passed"
 
     def diff_paths(self, *, workspace):  # noqa: ARG002
+        if self.diff_unreadable:
+            return None
         return list(self.diff)
 
     def cleanup(self, *, workspace):  # noqa: ARG002
@@ -768,6 +785,79 @@ def test_a_diff_that_could_not_be_read_never_reaches_the_reviewer():
     assert "reviewer's ENTIRE input" in stage.remedy
     assert built["reviewer"].calls == 0, "a reviewer judged the client's code from an error message"
     assert run.verdict == "WOULD FAIL AT diff"
+
+
+def test_a_commit_git_refuses_fails_the_diff_step_with_gits_words():
+    """`git add -A && git commit ... || true` threw git's exit code away, so a refusal (exit 128,
+    dubious ownership or a lock) read as "nothing to commit"; `diff_paths` then hit the same
+    refusal and the person was told to check that the box has git and the base branch (#331).
+
+    MUTATION: bring back `|| true`, or let the refusal branch fall through, and this goes red."""
+    words = "fatal: detected dubious ownership in repository at '/workspace'"
+    p, built = _probes(box=FakeBox(commit_rc=128, commit_out=words, diff_unreadable=True),
+                       reviewer=FakeReviewer())
+
+    run = fr.rehearse(p, consent=APPROVED)
+
+    stage = next(s for s in run.stages if s.name == "diff")
+    assert not stage.ok
+    assert "exited 128" in stage.message and "dubious ownership" in stage.message
+    assert "make git usable on this workspace in the box" in stage.remedy
+    assert "base branch is present" not in stage.message + stage.remedy
+    assert built["reviewer"].calls == 0
+    assert run.verdict == "WOULD FAIL AT diff"
+
+
+def test_nothing_to_commit_still_goes_on_quietly():
+    """Exit 1 with a clean tree is git saying there was nothing to commit (the agent committed its
+    own work), and the round carries on as before #331.
+
+    MUTATION: treat exit 1 with a clean tree as a refusal and this goes red."""
+    box = FakeBox(commit_rc=1, commit_out="nothing to commit, working tree clean", dirty="")
+    p, _ = _probes(box=box, reviewer=FakeReviewer())
+
+    run = fr.rehearse(p, consent=APPROVED)
+
+    stage = next(s for s in run.stages if s.name == "diff")
+    assert stage.ok, stage.message
+    commit = next(c for c in box.log if "git commit" in c)
+    assert not commit.rstrip().endswith("|| true")
+    assert run.verdict == "LOOP PROVEN"
+
+
+def test_a_commit_that_exits_1_on_a_dirty_tree_is_a_refusal():
+    """Exit 1 is also what a refusing pre-commit hook answers; with the agent's files still in the
+    tree it is not "nothing to commit" (#331).
+
+    MUTATION: read exit 1 alone as nothing to commit and this goes red."""
+    box = FakeBox(commit_rc=1, commit_out="error: the pre-commit hook refused",
+                  dirty=" M src/app.py\n")
+    p, built = _probes(box=box, reviewer=FakeReviewer())
+
+    run = fr.rehearse(p, consent=APPROVED)
+
+    stage = next(s for s in run.stages if s.name == "diff")
+    assert not stage.ok
+    assert "exited 1" in stage.message and "pre-commit hook" in stage.message
+    assert "make git usable on this workspace in the box" in stage.remedy
+    assert built["reviewer"].calls == 0
+
+
+def test_a_status_git_refuses_is_not_an_agent_that_wrote_nothing():
+    """After an empty diff, a `git status --porcelain` that FAILED fell through to "the agent
+    produced no change at all", sending the person to the agent for git's refusal (#331's sweep).
+
+    MUTATION: drop the status's exit-code branch and this goes red."""
+    words = "fatal: detected dubious ownership in repository at '/workspace'"
+    p, _ = _probes(box=FakeBox(diff=(), status_rc=128, status_out=words), reviewer=FakeReviewer())
+
+    run = fr.rehearse(p, consent=APPROVED)
+
+    stage = next(s for s in run.stages if s.name == "diff")
+    assert not stage.ok
+    assert "exited 128" in stage.message and "dubious ownership" in stage.message
+    assert "make git usable on this workspace in the box" in stage.remedy
+    assert "no change at all" not in stage.message
 
 
 def test_the_image_that_was_measured_is_named_in_the_report():

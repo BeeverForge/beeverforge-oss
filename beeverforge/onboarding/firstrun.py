@@ -1144,8 +1144,18 @@ class _Runner:
                   f"GIT_COMMITTER_NAME={shlex.quote(bot.name)} "
                   f"GIT_COMMITTER_EMAIL={shlex.quote(bot.email)} ")
         msg = shlex.quote(f"{REHEARSAL_ID}: environment rehearsal (never pushed)")
-        box.run(workspace=ws, command=f"git add -A && {author}git commit -m {msg} || true",
-                timeout=120)
+        # GIT'S EXIT CODE IS READ (#331). This ended in `|| true`, so a commit git REFUSED (exit
+        # 128: dubious ownership, a lock it could not take) read as "nothing to commit", and the
+        # person was then told to check for git and the base branch. Exit 0 is committed; exit 1
+        # on a clean tree is nothing to commit; anything else is git refusing, in its own words.
+        rc, out = box.run(workspace=ws, command=f"git add -A && {author}git commit -m {msg}",
+                          timeout=120)
+        if rc != 0 and not (rc == 1 and self._tree_is_clean()):
+            self.finish(_fail(
+                "diff", f"`git add -A && git commit` exited {rc} in the workspace\n"
+                        f"{_tail(out, 8)}",
+                _GIT_REFUSED_REMEDY, on=self.on), started)
+            return False
         read = box.diff_paths(workspace=ws)
         if read is None:
             # THE PORT SAYS IT NOW (#251). This used to be indistinguishable from "nothing was
@@ -1164,7 +1174,14 @@ class _Runner:
             # --porcelain` is what tells that apart: a dirty tree here means the COMMIT did not
             # take the agent's files, which is our problem rather than theirs.
             rc, dirty = box.run(workspace=ws, command="git status --porcelain", timeout=60)
-            if rc == 0 and (dirty or "").strip():
+            if rc != 0:
+                # A status git refused is not an agent that wrote nothing (#331's sweep).
+                self.finish(_fail(
+                    "diff", f"`git status --porcelain` exited {rc} in the workspace\n"
+                            f"{_tail(dirty, 8)}",
+                    _GIT_REFUSED_REMEDY, on=self.on), started)
+                return False
+            if (dirty or "").strip():
                 self.finish(_fail(
                     "diff", "the agent wrote files and the commit did not take them:\n"
                             f"{_tail(dirty, 10)}",
@@ -1205,6 +1222,13 @@ class _Runner:
         self.finish(_ok("diff", f"{len(paths)} file(s): {', '.join(paths[:6])}"
                                 f"{' …' if len(paths) > 6 else ''}{where}", on=self.on), started)
         return True
+
+    def _tree_is_clean(self) -> bool:
+        """`git status --porcelain` exited 0 and printed nothing: what makes a commit's exit 1 mean
+        "nothing to commit" rather than a hook or git refusing (#331)."""
+        rc, dirty = self.box.run(workspace=self.workspace, command="git status --porcelain",
+                                 timeout=60)
+        return rc == 0 and not (dirty or "").strip()
 
     def gates_stage(self) -> bool:
         """THE CLIENT'S OWN GATES, RUN BY THE FACTORY'S OWN GATE LOOP — not by a copy of it.
@@ -1385,6 +1409,10 @@ class _GateHost:
         anything while it runs — and swallowing them would make the quietest part of the round
         the one most likely to hang."""
         log.info("first round · %s · %s", kind, message)
+
+
+_GIT_REFUSED_REMEDY = ("make git usable on this workspace in the box — git itself refused it, "
+                       "so the round could not commit or read the agent's work")
 
 
 def _tail(text: str, lines: int = 20) -> str:
