@@ -7,8 +7,10 @@ matches, aimed at the twin where the repository really is another.
 
 The card checkout has two comparisons in its Azure DevOps branch, the name's leaf and its
 qualifier, and each gets its own cuts. The product module labels its own mount on two lines, one
-for a mounted source and one for a missing one, and each line gets the three cuts; their anchors
-carry the text in front of `own=`, because the folded comparison is the same on both.
+for a mounted source and one for a missing one, and each line gets the three cuts plus a fold of
+the registry's side alone, aimed at a source in capitals for a registry in lowercase (#401's
+review: that one-sided fold of the missing line passed every test). Their anchors carry the text
+in front of `own=`, because the folded comparison is the same on both.
 """
 
 TEST = "tests/test_a_github_repository_is_one_repository_at_every_site.py"
@@ -105,6 +107,10 @@ MUTATIONS = [
      MODULE, _MOUNTED,
      "path=os.path.relpath(path, root),\n                             own=repo.casefold() == own,",
      f"{TEST}::test_a_registry_in_capitals_labels_its_lowercase_mounted_source_its_own"),
+    ("a mounted source folds the registry only, so `Acme/API` is not `acme/api`'s own mount",
+     MODULE, _MOUNTED,
+     "path=os.path.relpath(path, root),\n                             own=repo == own.casefold(),",
+     f"{TEST}::test_a_source_spelling_the_projects_own_repository_otherwise_is_its_own_mount"),
     ("every mounted source is the project's own",
      MODULE, _MOUNTED,
      "path=os.path.relpath(path, root),\n                             own=True,",
@@ -117,6 +123,9 @@ MUTATIONS = [
     ("a missing source folds its own side only, so a registry in capitals loses its own mount",
      MODULE, _MISSING, "why=why, own=repo.casefold() == own)",
      f"{TEST}::test_a_registry_in_capitals_labels_its_lowercase_missing_source_its_own"),
+    ("a missing source folds the registry only, so `Acme/API` is not `acme/api`'s own",
+     MODULE, _MISSING, "why=why, own=repo == own.casefold())",
+     f"{TEST}::test_a_lowercase_registry_labels_its_missing_source_in_capitals_its_own"),
     ("every missing source is the project's own",
      MODULE, _MISSING, "why=why, own=True)",
      f"{TEST}::test_a_source_spelling_the_projects_own_repository_otherwise_is_its_own_mount"),

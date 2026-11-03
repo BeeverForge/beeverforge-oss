@@ -193,6 +193,17 @@ def test_a_registry_in_capitals_labels_its_lowercase_missing_source_its_own(tmp_
         mounted)
 
 
+def test_a_lowercase_registry_labels_its_missing_source_in_capitals_its_own(tmp_path):
+    """The twin of the test above: the capitals are on the missing source's side, so a fold of
+    the registry's side alone still reads `Acme/API` as another repository (#401's review)."""
+    mounted = ProductModule.mounts(_view(tmp_path, own="acme/api",
+                                         mounted={"acme/web": "web"},
+                                         missing={"Acme/API": "why"}))
+
+    assert [(m.repo, m.own) for m in mounted] == [("Acme/API", True), ("acme/web", False)], (
+        mounted)
+
+
 def test_a_registry_in_capitals_labels_its_lowercase_mounted_source_its_own(tmp_path):
     mounted = ProductModule.mounts(_view(tmp_path, own="Acme/API",
                                          mounted={"acme/web": "web", "acme/api": "api"},
