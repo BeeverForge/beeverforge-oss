@@ -283,6 +283,19 @@ def _axis_credential(project, axis: str, generic, *,
     return (found.reference, found.value) if found.value else ("", None)
 
 
+def app_private_key_source() -> str:
+    """Where `app_private_key()` found the key, for a sentence about it: the content variable's
+    reference, else the path variable's with the path, else `""`. Read in the order
+    `app_private_key` reads them, and quietly: it says where, never resolves anything new (#217)."""
+    content = credential_store.lookup("BEEVERFORGE_GH_APP_KEY_CONTENT", quiet=True)
+    if content.value:
+        return f"`{content.reference}`"
+    if content.refused:
+        return ""
+    path = credential_store.lookup("BEEVERFORGE_GH_APP_KEY", quiet=True)
+    return f"`{path.reference}` ({path.value})" if path.value else ""
+
+
 def app_key_refusal() -> str:
     """Why the GitHub App key is refused, or `""` — the content first, then the path, the order
     `app_private_key` reads them in (#742)."""
