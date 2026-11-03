@@ -50,7 +50,8 @@ globalThis.boardCardPath = ()=>location.pathname;
     ('_bd.card = "2";', "submitted", 0),
     ('_bd.project = "other";', "submitted", 0),
     ('_bd.selection = {};', "submitted", 1),
-    ('_bd = {..._bd};', "submitted", 0),
+    ('_bd = {..._bd};', "submitted", 1),
+    ('_bd = {project:null, card:null, draft:""};', "", 0),
 ])
 def test_a_completed_comment_owns_only_its_submitted_draft(change, expected, refreshes):
     result = _run(f"""
@@ -105,3 +106,25 @@ console.log(JSON.stringify({draft:_bd.draft,refreshes,displayed,newSelection:_bd
 """, "boardComment", "boardOpenCard")
     assert result == {"draft": "submitted", "refreshes": 3, "displayed": ["submitted"],
                       "newSelection": True}
+
+
+def test_a_posted_comment_refreshes_the_reopened_board_without_clearing_its_draft():
+    result = _run("""
+globalThis._bd = {project:"app",card:"1",selection:{},draft:"submitted"};
+let reply, refreshes = 0, stored = [], displayed = [];
+globalThis.act = (name,args)=>new Promise(resolve=>reply=()=>{
+  stored.push(args.message); resolve({ok:true});
+});
+globalThis.refreshBoard = async()=>{ refreshes++; displayed = [...stored]; };
+globalThis.toast = ()=>{};
+globalThis.$ = ()=>null;
+const original = _bd, pending = boardComment();
+// Closing and reopening the board creates a new state object and reads before the POST completes.
+_bd = {project:"app",card:null,draft:""};
+await boardOpenCard("1");
+_bd.draft = "submitted";
+reply(); await pending;
+console.log(JSON.stringify({draft:_bd.draft,refreshes,displayed,newBoard:_bd!==original}));
+""", "boardComment", "boardOpenCard")
+    assert result == {"draft": "submitted", "refreshes": 2, "displayed": ["submitted"],
+                      "newBoard": True}
