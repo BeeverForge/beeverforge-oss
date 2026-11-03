@@ -128,7 +128,9 @@ def test_an_unanswered_listener_says_how_long_the_doctor_waited_and_what_sets_it
      "panel": (True, "http://localhost:8787")},
     {"engine": (True, "localhost:7233"), "engine UI": (False, ""),
      "panel": (True, "http://localhost:8787")},
-], ids=["everything answers", "nobody said where the UI is"])
+    {"engine": (False, "not declared — set `TEMPORAL_ADDRESS=localhost:7233`"),
+     "panel": (True, "http://localhost:8787")},
+], ids=["everything answers", "nobody said where the UI is", "the engine is not declared"])
 def test_where_nothing_was_waited_on_no_wait_is_named(monkeypatch, answered):
     monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "7")
 

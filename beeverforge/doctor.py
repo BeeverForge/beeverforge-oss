@@ -1006,6 +1006,11 @@ def _api_budget(p: Probes, *, pickup_held: bool = False) -> Finding:
                    f"{resource} budget {share} (refills at {when})")
 
 
+#: How an engine nobody declared is reported in `probes_for`'s answers: it was never dialled, so
+#: no wait is named beside it (#407).
+NOT_DECLARED = "not declared"
+
+
 def _the_wait() -> str:
     """How long the doctor waited for each listener, and what sets it (#407) — said only where a
     listener was asked and did not answer."""
@@ -1078,7 +1083,8 @@ def _processes(p: Probes) -> Finding:
             f"started",
             "run `beeverforge up` (it starts the engine, the worker and the panel together), or "
             "`temporal server start-dev` if you would rather run them separately"
-            f"{_the_wait()}")
+            # NO WAIT FOR AN ENGINE NOBODY DECLARED: it was never dialled (#407).
+            f"{'' if engine_where.startswith(NOT_DECLARED) else _the_wait()}")
     return Finding(
         "processes", False,
         f"neither the durable engine ({engine_where}) nor the panel ({panel_where}) answers on "
@@ -2880,7 +2886,7 @@ def probes_for(project) -> Probes:
                 # dial one nobody named, so "it answers on the default port" would be a pass
                 # about an engine nothing will connect to.
                 answered[listener.name] = (
-                    False, f"not declared — set `{ENGINE.reach_vars[0]}={ENGINE.local()}`")
+                    False, f"{NOT_DECLARED} — set `{ENGINE.reach_vars[0]}={ENGINE.local()}`")
                 continue
             where = listener.declared() or up_starts.get(listener.name, "")
             if not where and listener is ENGINE_UI:

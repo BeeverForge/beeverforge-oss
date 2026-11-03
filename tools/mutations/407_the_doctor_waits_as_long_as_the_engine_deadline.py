@@ -6,7 +6,7 @@ The claims, each a row:
 
   1. the connect is bounded by `read_deadline()`, not by a literal and not by nothing (rows 1-3);
   2. a listener that was asked and did not answer says how long the doctor waited and which
-     variable sets it (rows 4-5).
+     variable sets it (rows 4-5), and one nobody dialled names no wait (row 6).
 """
 
 TEST = "tests/test_the_doctor_waits_as_long_as_the_engine_deadline.py"
@@ -30,4 +30,7 @@ MUTATIONS = [
     ("the wait is said without the variable that sets it", DOCTOR,
      'f"that answers later, raise `BEEVERFORGE_ENGINE_DEADLINE`")',
      'f"that answers later, raise the deadline")'),
+    ("an engine nobody declared, and so never dialled, is said to have been waited on", DOCTOR,
+     "f\"{'' if engine_where.startswith(NOT_DECLARED) else _the_wait()}\")",
+     "f\"{_the_wait()}\")"),
 ]
