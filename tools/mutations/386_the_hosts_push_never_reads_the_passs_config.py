@@ -48,15 +48,14 @@ MUTATIONS = [
 
     ("the container box pushes from the bind-mounted host clone again, reading the job's config",
      CONTAINER,
-     "        push_from_the_hosts_own_repository(\n"
-     "            git_dir=git_dir, branch=workspace.branch, target=target, run=_host, "
-     "redact=_redact,\n"
-     "            ambient_env=None if remote_url else dict(os.environ))\n",
-     "        rc, out = _host(gitpin.argv([\"-C\", str(self._host_clone), \"push\", \"--force\", "
-     "\"--\",\n"
-     "                                     target, workspace.branch]))\n"
-     "        if rc != 0:\n"
-     "            raise RuntimeError(f\"push failed: {_redact(out)}\")\n"),
+     "            push_from_the_hosts_own_repository(\n"
+     "                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,\n"
+     "                redact=_redact, ambient_env=None if remote_url else dict(os.environ))\n",
+     "            rc, out = _host(gitpin.argv([\"-C\", str(self._host_clone), \"push\", "
+     "\"--force\",\n"
+     "                                         \"--\", target, workspace.branch]))\n"
+     "            if rc != 0:\n"
+     "                raise RuntimeError(f\"push failed: {_redact(out)}\")\n"),
 
     ("the helper pushes with the pass's git directory as its own", PUSH,
      '[*_HOOKLESS, "-C", str(own), "push",', '[*_HOOKLESS, "-C", str(git_dir), "push",'),
@@ -134,8 +133,30 @@ MUTATIONS = [
      "        if self._git_dir is None:\n", "        if False:\n"),
 
     ("the container box reads whatever the clone's `.git` now names", CONTAINER,
-     "        if git_dir.is_symlink() or not git_dir.is_dir():\n",
-     "        if False:\n"),
+     "            if git_dir.is_symlink() or not git_dir.is_dir():\n",
+     "            if False:\n"),
+
+    # ── the container box's freeze (review of #403) ────────────────────────────────────────────
+    ("the container box is never frozen, so a process the job left running can plant a link "
+     "after the walk", CONTAINER,
+     '            rc, out = _host(["docker", "pause", self._container])\n',
+     "            rc, out = 0, \"\"\n"),
+
+    ("a box that could not be frozen is pushed from anyway", CONTAINER,
+     "        if rc != 0:\n            raise RuntimeError(\n"
+     "                f\"push failed: could not freeze the box",
+     "        if False:\n            raise RuntimeError(\n"
+     "                f\"push failed: could not freeze the box"),
+
+    ("the box is unfrozen only when the push succeeds, so a refusal or a failed push leaves it "
+     "frozen", CONTAINER,
+     "        finally:\n            self._thaw()\n",
+     "        except BaseException:\n            raise\n        else:\n            self._thaw()\n"),
+
+    ("a box that cannot be unfrozen turns a pushed branch into a failure", CONTAINER,
+     "        if rc != 0:\n            log.warning(\"could not unfreeze the box",
+     "        if rc != 0:\n            raise RuntimeError(\"push failed: unpause\")\n"
+     "            log.warning(\"could not unfreeze the box"),
 
     # ── 3. the forge door reads no configuration the pass can write ────────────────────────────
     ("the forge door runs in the host's whole environment, reading every config again", PUSH,

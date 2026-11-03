@@ -208,7 +208,7 @@ def test_the_container_boxs_push_reaches_the_forge_whatever_the_pass_wrote_in_it
     _materialize_workspace(repo_path=cache, host_clone=host_clone, base_branch="main",
                            branch="sdlc/2", checkout_existing=False,
                            remote_url=str(scene["forge"]))
-    box = ContainerSandbox(image="unused")
+    box = _a_container_box(ContainerSandbox)
     box._host_clone, box._repo_path = host_clone, cache
     head = _commit(host_clone, "print('three')\n")
     _the_pass_writes_its_config(scene, host_clone)
@@ -218,6 +218,141 @@ def test_the_container_boxs_push_reaches_the_forge_whatever_the_pass_wrote_in_it
     box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
 
     _the_push_reached_the_forge_and_nothing_else(scene, "sdlc/2", head)
+
+
+# ── the container box's freeze (review of #403) ─────────────────────────────────────────────────
+
+#: The name the container box is given here: the docker the fake below answers for.
+BOX_NAME = "beeverforge-test-box"
+
+
+def _a_container_box(ContainerSandbox):
+    box = ContainerSandbox(image="unused")
+    box._container = BOX_NAME
+    return box
+
+
+@pytest.fixture(autouse=True)
+def docker(monkeypatch):
+    """The container box's docker, without a daemon: `docker pause` and `docker unpause` of
+    `BOX_NAME` are answered here (exit codes settable per test), every other command goes to the
+    host as before. `said` records, in order, the docker calls, the walk and the git subcommands
+    the push runs."""
+    from beeverforge.adapters.sandbox import container, host_push
+
+    real_host, real_walk = container._host, host_push._borrows_nothing
+    fake = {"said": [], "pause": 0, "unpause": 0}
+
+    def host(cmd, timeout=120, env=None):
+        if cmd[:1] == ["docker"] and cmd[1:2] in (["pause"], ["unpause"]):
+            assert cmd[2:] == [BOX_NAME], cmd
+            fake["said"].append(cmd[1])
+            rc = fake[cmd[1]]
+            return rc, "" if rc == 0 else f"Error response from daemon: {cmd[1]} refused"
+        if cmd[:1] == ["git"]:
+            fake["said"].append(gitpin.subcommand(cmd))
+        return real_host(cmd, timeout=timeout, env=env)
+
+    def walk(git_dir):
+        fake["said"].append("walk")
+        return real_walk(git_dir)
+
+    monkeypatch.setattr(container, "_host", host)
+    monkeypatch.setattr(host_push, "_borrows_nothing", walk)
+    return fake
+
+
+@pytest.fixture
+def container_box(scene):
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.container import ContainerSandbox, _materialize_workspace
+
+    host_clone = scene["root"] / "host-clone"
+    _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
+                           branch="sdlc/2", checkout_existing=False,
+                           remote_url=str(scene["forge"]))
+    box = _a_container_box(ContainerSandbox)
+    box._host_clone, box._repo_path = host_clone, scene["repo"]
+    ws = Workspace(path=Path("/workspace"), host_path=host_clone, branch="sdlc/2",
+                   base_branch="main")
+    return box, host_clone, ws
+
+
+def _from_the_freeze(said: list[str]) -> list[str]:
+    return said[said.index("pause"):] if "pause" in said else said
+
+
+def test_the_container_box_is_frozen_from_before_the_walk_until_the_push_is_done(
+        scene, docker, container_box):
+    """A process the job left running lives until `cleanup()`, after the push, so it could plant
+    a link under `objects` after the walk. The box is paused before the walk and unpaused only
+    once git has read the objects. (The planter itself needs a real daemon; this pins the
+    order.)"""
+    box, host_clone, ws = container_box
+    head = _commit(host_clone, "print('three')\n")
+    docker["said"].clear()
+
+    box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    assert _from_the_freeze(docker["said"]) == ["pause", "walk", "init", "update-ref", "push",
+                                                "unpause"], docker["said"]
+    _the_push_reached_the_forge_and_nothing_else(scene, "sdlc/2", head)
+
+
+def test_a_box_that_cannot_be_frozen_pushes_nothing_and_says_what_to_do(scene, docker,
+                                                                        container_box):
+    box, host_clone, ws = container_box
+    _commit(host_clone, "print('three')\n")
+    docker["pause"] = 1
+    docker["said"].clear()
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    said = str(refused.value)
+    assert said.startswith("push failed:") and "could not freeze the box" in said
+    assert "nothing was pushed" in said and "run the job again" in said
+    assert "push" not in docker["said"] and "walk" not in docker["said"]
+    assert _git(scene["forge"], "rev-parse", "--verify", "--quiet", "refs/heads/sdlc/2",
+                check=False).returncode != 0
+
+
+def test_the_box_is_unfrozen_when_the_walk_refuses(scene, docker, container_box):
+    box, host_clone, ws = container_box
+    _commit(host_clone, "print('three')\n")
+    (host_clone / ".git" / "objects" / "info" / "alternates").write_text("/nowhere/objects\n")
+    docker["said"].clear()
+
+    with pytest.raises(RuntimeError, match="borrows objects from elsewhere"):
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    assert _from_the_freeze(docker["said"]) == ["pause", "walk", "unpause"], docker["said"]
+
+
+def test_the_box_is_unfrozen_when_the_push_fails(scene, docker, container_box):
+    box, host_clone, ws = container_box
+    _commit(host_clone, "print('three')\n")
+    docker["said"].clear()
+
+    with pytest.raises(RuntimeError, match="push failed:"):
+        box.publish_branch(workspace=ws, remote_url=str(scene["root"] / "no-such-forge.git"))
+
+    assert _from_the_freeze(docker["said"])[-2:] == ["push", "unpause"], docker["said"]
+
+
+def test_a_box_that_cannot_be_unfrozen_keeps_its_pushed_branch_and_says_so(
+        scene, docker, container_box, caplog):
+    box, host_clone, ws = container_box
+    head = _commit(host_clone, "print('three')\n")
+    docker["unpause"] = 1
+
+    with caplog.at_level("WARNING", logger="beeverforge.sandbox.container"):
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    _the_push_reached_the_forge_and_nothing_else(scene, "sdlc/2", head)
+    said = caplog.text
+    assert "could not unfreeze the box" in said and "until cleanup removes it" in said
+    assert f"docker unpause {BOX_NAME}" in said
 
 
 # ── the refusals, and nothing left behind ───────────────────────────────────────────────────────
@@ -367,7 +502,7 @@ def test_the_container_boxs_forge_push_never_reads_the_workers_user_config(scene
     _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
                            branch="sdlc/2", checkout_existing=False,
                            remote_url=str(scene["forge"]))
-    box = ContainerSandbox(image="unused")
+    box = _a_container_box(ContainerSandbox)
     box._host_clone, box._repo_path = host_clone, scene["repo"]
     head = _commit(host_clone, "print('three')\n")
     _plant_in(scene, workers_home() / ".gitconfig")
@@ -480,7 +615,7 @@ def test_a_container_clone_whose_git_directory_the_job_replaced_is_refused(scene
     _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
                            branch="sdlc/2", checkout_existing=False,
                            remote_url=str(scene["forge"]))
-    box = ContainerSandbox(image="unused")
+    box = _a_container_box(ContainerSandbox)
     box._host_clone, box._repo_path = host_clone, scene["repo"]
     decoy = _a_decoy_branch(scene, "sdlc/2")
     (host_clone / ".git").rename(scene["root"] / "the-clones-own-git")
@@ -650,7 +785,7 @@ def test_the_container_boxs_push_never_sends_objects_from_a_directory_the_box_ca
     _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
                            branch="sdlc/2", checkout_existing=False,
                            remote_url=str(scene["forge"]))
-    box = ContainerSandbox(image="unused")
+    box = _a_container_box(ContainerSandbox)
     box._host_clone, box._repo_path = host_clone, scene["repo"]
     _commit(host_clone, "print('three')\n")
     theirs = _a_job_borrowing_from_elsewhere(scene, host_clone / ".git", "alternates")
@@ -735,7 +870,7 @@ def test_the_container_boxs_push_refuses_a_link_below_objects(scene, shape):
     _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
                            branch="sdlc/2", checkout_existing=False,
                            remote_url=str(scene["forge"]))
-    box = ContainerSandbox(image="unused")
+    box = _a_container_box(ContainerSandbox)
     box._host_clone, box._repo_path = host_clone, scene["repo"]
     _commit(host_clone, "print('three')\n")
     theirs = _a_job_linking_below_objects(scene, host_clone / ".git", shape)

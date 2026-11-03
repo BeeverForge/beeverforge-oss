@@ -74,9 +74,15 @@ interesting surface is well-defined:
   workload running as that user can already read. On both doors the push borrows the job's
   objects directory, and refuses it when it carries `info/alternates` or `info/http-alternates`,
   a symlink anywhere under `objects` (`objects` itself included), or an entry that is neither a
-  regular file nor a directory; so a job cannot make the push send another repository's objects
-  through any of those. The check runs once, just before the push: a process the job left
-  running could still plant one between the check and git reading the objects. With the local
+  regular file nor a directory. The check runs once, just before the push. On the container box
+  the container is paused (`docker pause`) from before the check until the push's git calls are
+  done, and nothing is pushed if it cannot be paused, so nothing the job left running can plant
+  one in between: there a job cannot make the push send another repository's objects through any
+  of those. On the worktree box there is no container to freeze, so a process the job left
+  running can still plant one between the check and git reading the objects, and make the push
+  send objects from another repository on the machine. That process runs as the worker's user,
+  who can already read every repository that user can; what it could push is what it could
+  already read. With the local
   forge the push's target is a
   repository on this machine, whose receiving side runs under that repository's own config and
   hooks; that is tracked with the other host-side git calls in #400.

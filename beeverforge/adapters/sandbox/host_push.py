@@ -36,9 +36,16 @@ project's cache) could make the push send that directory's objects to this proje
 before anything is borrowed the push walks the job's `objects` with `lstat`, following no link,
 and refuses a symlink anywhere in it (`objects` itself, `info`, `pack`, a fan-out directory, an
 object file), any entry that is neither a regular file nor a directory, and an
-`info/alternates` or `info/http-alternates`. No box makes any of these. The walk runs once, just
-before the push: a process the job left running could still plant one between the walk and
-git reading the objects. Before #386, and with the fetch, git followed all of them.
+`info/alternates` or `info/http-alternates`. No box makes any of these. Before #386, and with
+the fetch, git followed all of them.
+
+THE WALK RUNS ONCE, so what holds it still differs by box (review of #403). The container box
+pauses its container (`docker pause`) before the ref is read and the walk runs, and unpauses it
+only once the push's git calls are done: nothing the job left running in it can plant a link in
+between, and if the pause fails nothing is pushed. The worktree box has no container to freeze, so
+a process the job left running can still plant one between the walk and git reading the objects;
+that process runs as the worker's user, who can already read every repository that user can, so
+what it could have pushed is what it could already read.
 
 WHICH CONFIGURATION THE PUSH READS, PER DOOR:
 
@@ -172,8 +179,10 @@ def _borrows_nothing(git_dir: Path) -> None:
         directory on the host, another project's cache included. No box makes one (neither the
         cache, the worktree box nor the container clone, which is `--no-local`).
 
-    ONCE, JUST BEFORE THE PUSH: a process the job left running could still plant one of these
-    between this walk and git reading the objects.
+    ONCE, JUST BEFORE THE PUSH: on the container box the container is paused around it and the
+    push (`ContainerSandbox.publish_branch`); on the worktree box a process the job left running
+    could still plant one of these between this walk and git reading the objects (module
+    docstring).
 
     WHAT THE WALK COSTS, measured 2026-11-03 (warm cache, five runs each): this repository's
     objects, 3,216 entries, 5 to 6 ms; a 1.38 GiB repository, 1,453 entries, 3 to 4 ms; two
