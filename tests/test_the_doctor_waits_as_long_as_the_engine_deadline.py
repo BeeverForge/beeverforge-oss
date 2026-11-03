@@ -5,6 +5,11 @@ down while the rest of the deployment waited `BEEVERFORGE_ENGINE_DEADLINE` (`rea
 for the same engine. A robustness gap, not an observed failure: #398 measured a probe max of
 6.4 ms at a load average of 3-6, #402 a max of 120 ms at load averages up to 49.
 
+A REFUSAL IS NOT A WAIT. A port nothing listens on refuses in milliseconds, so a remedy that
+says the doctor waited the deadline for it, and points at the variable that raises it, names a
+cause that did not happen and a lever that cannot help. Only a listener that timed out is said to
+have been waited on.
+
 NO REAL SOCKET AND NO REAL WAIT. The stand-in for `socket.create_connection` is handed the
 `timeout` the probe chose and decides by comparing it with a simulated answer time; it never
 sleeps, and nothing here is bounded by elapsed or processor time.
@@ -41,9 +46,13 @@ class _Connected:
         return False
 
 
-def _a_machine(monkeypatch, answers_after: dict[int, float | None]) -> list:
-    """Replace the connect with one whose listeners answer after a simulated time (None: never).
-    Returns the list of `timeout` values the probe handed it."""
+REFUSES = "refuses"
+
+
+def _a_machine(monkeypatch, answers_after: dict[int, float | None | str]) -> list:
+    """Replace the connect with one whose listeners answer after a simulated time (None: never,
+    so the connect times out; `REFUSES`: nothing listens, so it is refused at once). Returns the
+    list of `timeout` values the probe handed it."""
     handed: list = []
 
     def create_connection(address, timeout=None, *args, **kwargs):
@@ -51,6 +60,8 @@ def _a_machine(monkeypatch, answers_after: dict[int, float | None]) -> list:
         if timeout is None:
             raise AssertionError(f"an unbounded connect to {address}")
         after = answers_after[address[1]]
+        if after == REFUSES:
+            raise ConnectionRefusedError(111, "Connection refused")
         if after is not None and after <= timeout:
             return _Connected()
         raise TimeoutError(f"{address} did not answer within {timeout}s")
@@ -103,24 +114,62 @@ def _processes_finding(answered):
     return next(f for f in report.findings if f.check == "processes")
 
 
-@pytest.mark.parametrize("answered, already", [
-    ({"engine": (True, "localhost:7233"), "engine UI": (False, "http://localhost:8080"),
-      "panel": (True, "http://localhost:8787")}, "TEMPORAL_UI_URL"),
-    ({"engine": (False, "localhost:7233"), "engine UI": (False, "http://localhost:8080"),
-      "panel": (True, "http://localhost:8787")}, "beeverforge up"),
-    ({"engine": (False, "localhost:7233"), "engine UI": (False, "http://localhost:8080"),
-      "panel": (False, "http://localhost:8787")}, "beeverforge up"),
+_WHO = {ENGINE: "durable engine", UI: "UI", PANEL: "panel"}
+
+
+@pytest.mark.parametrize("answers_after, already", [
+    ({ENGINE: 0.0, UI: None, PANEL: 0.0}, "TEMPORAL_UI_URL"),
+    ({ENGINE: None, UI: None, PANEL: 0.0}, "beeverforge up"),
+    ({ENGINE: None, UI: None, PANEL: None}, "beeverforge up"),
 ], ids=["the UI does not answer", "the engine does not answer", "neither answers"])
 def test_an_unanswered_listener_says_how_long_the_doctor_waited_and_what_sets_it(
-        monkeypatch, answered, already):
+        monkeypatch, tmp_path, answers_after, already):
     monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "7")
+    _a_machine(monkeypatch, answers_after)
 
-    finding = _processes_finding(answered)
+    finding = _processes_finding(_probe(monkeypatch, tmp_path)())
 
     assert not finding.ok
     assert "7s" in finding.remedy and "BEEVERFORGE_ENGINE_DEADLINE" in finding.remedy, (
         finding.remedy)
     assert already in finding.remedy, finding.remedy
+
+
+@pytest.mark.parametrize("answers_after, already", [
+    ({ENGINE: 0.0, UI: REFUSES, PANEL: 0.0}, "TEMPORAL_UI_URL"),
+    ({ENGINE: REFUSES, UI: REFUSES, PANEL: 0.0}, "beeverforge up"),
+    ({ENGINE: REFUSES, UI: REFUSES, PANEL: REFUSES}, "beeverforge up"),
+], ids=["the UI refuses", "the engine refuses", "both refuse"])
+def test_a_listener_that_refused_at_once_names_no_wait(
+        monkeypatch, tmp_path, answers_after, already):
+    """The common case: nothing was started on this machine, every port refuses in milliseconds,
+    and raising the deadline would change nothing."""
+    monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "7")
+    _a_machine(monkeypatch, answers_after)
+
+    finding = _processes_finding(_probe(monkeypatch, tmp_path)())
+
+    assert not finding.ok
+    assert "waited" not in finding.remedy and "BEEVERFORGE_ENGINE_DEADLINE" not in finding.remedy, (
+        finding.remedy)
+    assert already in finding.remedy, finding.remedy
+
+
+@pytest.mark.parametrize("answers_after, waited_on, not_waited_on", [
+    ({ENGINE: REFUSES, UI: REFUSES, PANEL: None}, PANEL, ENGINE),
+    ({ENGINE: None, UI: REFUSES, PANEL: REFUSES}, ENGINE, PANEL),
+], ids=["the engine refuses and the panel times out", "the engine times out and the panel refuses"])
+def test_where_only_some_timed_out_the_wait_is_said_of_those_alone(
+        monkeypatch, tmp_path, answers_after, waited_on, not_waited_on):
+    monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "7")
+    _a_machine(monkeypatch, answers_after)
+
+    finding = _processes_finding(_probe(monkeypatch, tmp_path)())
+
+    assert not finding.ok and "beeverforge up" in finding.remedy, finding.remedy
+    _, said, wait = finding.remedy.partition("; the doctor waited 7s")
+    assert said and "BEEVERFORGE_ENGINE_DEADLINE" in wait, finding.remedy
+    assert _WHO[waited_on] in wait and _WHO[not_waited_on] not in wait, finding.remedy
 
 
 @pytest.mark.parametrize("answered", [
@@ -138,3 +187,17 @@ def test_where_nothing_was_waited_on_no_wait_is_named(monkeypatch, answered):
 
     said = f"{finding.message} {finding.remedy or ''} {getattr(finding, 'note', '') or ''}"
     assert "BEEVERFORGE_ENGINE_DEADLINE" not in said, said
+
+
+def test_an_engine_nobody_declared_is_not_said_to_have_been_waited_on(monkeypatch, tmp_path):
+    """Through the probe itself: an undeclared engine is never dialled, so the panel that answers
+    beside it leaves nothing that was waited on."""
+    monkeypatch.setenv("BEEVERFORGE_ENGINE_DEADLINE", "7")
+    _a_machine(monkeypatch, {UI: None, PANEL: 0.0})
+    probe = _probe(monkeypatch, tmp_path)
+    monkeypatch.delenv("TEMPORAL_ADDRESS")
+
+    finding = _processes_finding(probe())
+
+    assert not finding.ok and "not declared" in finding.message, finding.message
+    assert "BEEVERFORGE_ENGINE_DEADLINE" not in finding.remedy, finding.remedy
