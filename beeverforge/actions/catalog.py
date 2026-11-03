@@ -7728,9 +7728,9 @@ def _the_steps_came_to(project: str, steps: list[dict], **data: object) -> Outco
 
 def _differs(held, asked) -> list[str]:
     """The fields `asked` was given that `held` does not hold the same — `[]` when the registry
-    already says what was asked. An axis agrees when its kind and its repository are the same and
-    every option asked for is held with the same value, so a board attached since, or a credential
-    variable named since, is not a disagreement."""
+    already says what was asked. An axis agrees when its kind and its repository are the same (in
+    any case, #385) and every option asked for is held with the same value, so a board attached
+    since, or a credential variable named since, is not a disagreement."""
     from beeverforge.contracts.project import ProviderRef
 
     out = []
@@ -7738,7 +7738,7 @@ def _differs(held, asked) -> list[str]:
         want, have = getattr(asked, key), getattr(held, key, None)
         if isinstance(want, ProviderRef):
             same = (isinstance(have, ProviderRef) and want.kind == have.kind
-                    and want.repo == have.repo
+                    and (want.repo or "").casefold() == (have.repo or "").casefold()
                     and all(have.options.get(k) == v for k, v in want.options.items()))
         else:
             same = want == have

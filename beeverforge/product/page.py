@@ -118,9 +118,10 @@ def card_of(project, card: str) -> tuple[str, str]:
     repo, bare = split_repo_ref(card, default_repo=mine)
     if not bare or len(bare) > _REF_MAX or not _BARE_REF.match(bare):
         return "", f"{card!r} is not a card of this board."
-    if repo != mine:
+    if repo.casefold() != mine.casefold():     # GitHub names ignore case (#385)
         return "", (f"that card lives in {repo}, not on "
-                    f"{getattr(project, 'name', '') or 'this project'}'s board.")
+                    f"{getattr(project, 'name', '') or 'this project'}'s board — ask about it "
+                    f"from the project that registers {repo}, or name a card of this board.")
     return bare, ""
 
 
