@@ -152,7 +152,7 @@ def _a_repository_of_fixed_size(root: Path) -> None:
 
 
 @pytest.mark.alone
-def test_generating_is_fast_enough_to_do_every_time():
+def test_generating_is_fast_enough_to_do_every_time(capsys):
     """0.24s for 215 files, measured 2026-07-29. The assertion is generous — it guards the
     ARCHITECTURE (deriving beats caching) rather than a benchmark: if this ever failed, the answer
     would not be to raise the number, it would be to revisit ADR-0023.
@@ -203,8 +203,9 @@ def test_generating_is_fast_enough_to_do_every_time():
         f"did not read the input it was timed on"
     )
     per_file_ms = elapsed / FILES * 1000
-    print(f"knowledge generation: {elapsed:.3f}s of CPU for {FILES} files "
-          f"({per_file_ms:.2f} ms a file), budget {budget:.1f}s")
+    with capsys.disabled():  # in CI's log even when it passes: the margin is read there (#415)
+        print(f"\nknowledge generation: {elapsed:.3f}s of CPU for {FILES} files "
+              f"({per_file_ms:.2f} ms a file), budget {budget:.1f}s")
     assert elapsed < budget, (
         f"generation cost {elapsed:.2f}s of CPU for {FILES} files ({per_file_ms:.2f} ms a file, "
         f"budget {budget:.1f}s) — if this is real, the cache ADR-0023 removed may have been "
