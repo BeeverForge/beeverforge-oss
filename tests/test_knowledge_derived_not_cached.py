@@ -176,9 +176,11 @@ def test_generating_is_fast_enough_to_do_every_time(capsys):
     repository's average one — and its budget is `FILES × PER_FILE_ALLOWANCE`. What it guards is
     the PER-FILE cost, which is what ADR-0023 rests on (a map of N files costs N small, linear
     pieces of work), and adding files to this repository cannot fail it. MEASURED 2026-11-03 on
-    this input, alone: 0.83 s (2.08 ms a file, median of 5) on a laptop, and 0.760 s (1.90 ms a
-    file) in CI's `integration` job, so the 8 ms allowance leaves about 3.9 and 4.2 times of
-    margin. (The 2.5 times CI was slower on the whole repository does not carry over: git and the
+    this input, alone: 0.83 s (2.08 ms a file, median of 5) on a laptop, and 0.760 to 1.320 s
+    (1.90 to 3.30 ms a file, two runs the same day) in CI's `integration` job. So the 8 ms
+    allowance leaves about 3.9 times of margin on the laptop and 2.4 to 4.2 times on CI, against
+    the 11 to 14 times dearer per file that `tools/mutations/415_*` makes it, and about 1.0 times
+    the old guard had left by then. (The 2.5 times CI was slower on the whole repository does not carry over: git and the
     size of the tree differ between machines, and this input has neither.) A heavily loaded
     machine can still eat the margin, as it could the old one. If generation gets several times
     dearer per file, this goes red — and the answer is still not to raise the allowance."""
