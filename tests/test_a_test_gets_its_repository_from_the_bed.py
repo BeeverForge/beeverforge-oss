@@ -129,23 +129,33 @@ def test_a_shape_is_built_under_a_lock_no_other_process_can_take_meanwhile(tmp_p
     assert not failed, failed
 
 
-def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path):
+def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path, monkeypatch):
     """A worker killed in the middle of a manifest write left it truncated: the next ask for the
-    shape builds it again, instead of every later request failing on the JSON."""
+    shape builds it again, instead of every later request failing on the JSON.
+
+    THE TWO BUILDS LAND ON TWO DATES ON EVERY RUN, pinned, not left to the clock (#371): two
+    builds a second apart give two commits, so they are compared by what every build of the
+    shape shares, the tree."""
     built: list[Path] = []
 
     def build(where, env):
         built.append(where)
         _one_commit(where, env)
 
+    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.setenv(name, "2026-01-01T00:00:00+0000")
     one = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "one", build)
     [manifest] = (tmp_path / "bed").glob("*/manifest.json")
     manifest.write_text(manifest.read_text(encoding="utf-8")[:20], encoding="utf-8")
 
+    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+        monkeypatch.setenv(name, "2026-01-02T00:00:00+0000")
     two = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "two", build)
 
     assert len(built) == 2, "the shape behind a truncated manifest was not built again"
-    assert _git(two, "rev-parse", "HEAD") == _git(one, "rev-parse", "HEAD")
+    assert _git(two, "rev-parse", "HEAD^{tree}") == _git(one, "rev-parse", "HEAD^{tree}")
+    assert _git(two, "rev-parse", "HEAD") != _git(one, "rev-parse", "HEAD"), \
+        "the second copy is not a build made on the second date"
     assert Bed(tmp_path / "bed").copy("one-commit", tmp_path / "three", build).is_dir()
     assert len(built) == 2, "the rebuilt manifest was not read by the next worker"
 
