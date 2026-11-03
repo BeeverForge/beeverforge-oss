@@ -305,10 +305,24 @@ async def test_a_check_that_answers_again_is_said_once(deployment, engine, monke
 
 # ── readiness: bounded, and kind to the engine ──────────────────────────────────────────────────
 
-#: The readiness deadline of a case where one check HANGS. What it bounds is the checks that do
-#: answer: under four workers they took 4.3 ms at most, and 47.6 ms once, the first registry read
-#: of a fresh worker (#362). So a case waits this out, not the 1.5 s, or 0.3 s a poll, it used to.
+#: The readiness deadline of a case where one check HANGS. It bounds only the hung check: every
+#: other check is `_answer_at_once`, so nothing that should answer can run past it, however loaded
+#: the runner (#367's review: with the real registry and identity reads, a fresh process under a
+#: `-n 4` suite at a load of 15-18 named them beside the hung one in 4 of 8 runs). So a case waits
+#: this out, not the 1.5 s, or 0.3 s a poll, it used to.
 HUNG_DEADLINE = 0.2
+
+
+def _answer_at_once(monkeypatch, hung: str) -> None:
+    """Every check but `hung` is a double that answers at once, on the loop, with no thread: what
+    these cases prove is that the HUNG one is bounded, named alone and asked once, so the others'
+    real speed on a loaded runner is not theirs to depend on."""
+    async def answers():
+        return None
+
+    for name in health.CHECKS:
+        if name != hung:
+            monkeypatch.setitem(health.CHECKS, name, answers)
 
 
 @pytest.mark.parametrize("slow", sorted(health.CHECKS))
@@ -316,6 +330,7 @@ async def test_a_check_that_hangs_is_named_within_the_deadline(deployment, monke
     async def hangs():
         await asyncio.sleep(10)
 
+    _answer_at_once(monkeypatch, slow)
     monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     monkeypatch.setitem(health.CHECKS, slow, hangs)
 
@@ -463,6 +478,7 @@ async def test_a_hung_check_starves_no_request_and_blames_no_other_check(deploym
     from beeverforge.api.app import app
 
     monkeypatch.setenv("BEEVERFORGE_PANEL_TOKEN", "the-operator")
+    _answer_at_once(monkeypatch, hung)
     monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
@@ -519,6 +535,7 @@ async def test_polls_that_give_up_on_a_hung_check_share_its_one_question(deploym
     per deadline). Each poll gives up at the deadline and names the check; the question it gave up
     on keeps the slot, so the next poll joins it: the dependency is asked once, and at most one
     thread of readiness's waits on it, however many polls give up."""
+    _answer_at_once(monkeypatch, hung)
     monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     entered, release = HANG[hung](monkeypatch, engine)
     try:
@@ -543,6 +560,7 @@ async def test_a_check_that_hangs_is_said_once_however_many_polls_give_up(deploy
     up skipping the log, a dependency that hung was never logged at all — the one failure whose
     cause an operator has nowhere else to read). Polls in new windows each give up and name it;
     readiness says why once."""
+    _answer_at_once(monkeypatch, hung)
     monkeypatch.setattr(health, "deadline", lambda: HUNG_DEADLINE)
     clock = [1000.0]
     monkeypatch.setattr(health, "_clock", lambda: clock[0])
