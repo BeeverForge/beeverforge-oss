@@ -37,7 +37,10 @@ NOT_LINKS = ["https://&#x40;someone", "http://&#x40;someone x", "(https://&#x40;
              "xhttps://ex.com/&#x40;someone", "[https://ex.com/&#x40;someone", "https://&#x23;1",
              "see <www.&#x40;someone> x", "see <www.ex.com/&#x40;someone> x", "see <www.&#x23;1> x",
              # an escaped `<` is no autolink, so the bare link in it is read on its own
-             "see \\<https://a_b.c_d/&#x40;someone> x"]
+             "see \\<https://a_b.c_d/&#x40;someone> x",
+             # a scheme in upper case is read as GitHub reads it, and `WWW.` is no `www.` link
+             # (review of #323 at 7fcf99b, measured on `POST /markdown`)
+             "see WWW.ex.com/&#x40;someone x", "xHTTPS://ex.com/&#x40;someone", "HTTPS://&#x40;someone"]
 #: An autolink whose scheme is not `http(s)`: no backslash inside one is an escape, so `\&` left
 #: the entity live (review of #323 at 208035c, measured on `POST /markdown`). The `:` after its
 #: scheme is escaped, so it is no autolink and `\&` is an escape again; not its `<`, whose `\` a
@@ -179,7 +182,10 @@ VERBATIM = ["use `a && b` here", "x && y", "see https://ex.com/?a=1&b=2 now",
             # an `http(s)` autolink glued to a bare link: GitHub links both, and no one is named
             "see https://ex.com/<https://x/&#x40;someone> x",
             # an `http(s)` autolink after a backslash is read as it was before
-            "see https://ex.com/\\<https://x/&#x40;someone> x", "see \\<https://ex.com/?a=1&b=2> x"]
+            "see https://ex.com/\\<https://x/&#x40;someone> x", "see \\<https://ex.com/?a=1&b=2> x",
+            # a bare link's scheme in any case is linked (review of #323 at 7fcf99b, measured)
+            "see HTTPS://ex.com/?a=1&b=2 x", "see Https://ex.com/?a=1&b=2 x", "\\<HTTPS://x/?a=1&b=2>",
+            "see hTTp://ex.com/?a=1&b=2 x"]
 FENCED = "\n".join([VERBATIM[0], "```sh", VERBATIM[1], "```", *VERBATIM[2:]])
 
 
@@ -192,6 +198,12 @@ def test_code_and_links_keep_their_ampersands() -> None:
         assert kept in rows, f"{kept!r} not in {rows!r}"
         assert kept in posted, f"{kept!r} not in {posted!r}"
     assert f"- **low**: {VERBATIM[0]}" in rows
+
+
+def test_the_reviewers_bare_link_is_mains_with_its_scheme_in_any_case() -> None:
+    # `_A_BARE_LINK` mirrors `_A_URL`, the agent's path, which keeps its lower-case scheme
+    from beeverforge.orchestrator.machine import _A_BARE_LINK, _A_URL
+    assert _A_BARE_LINK.pattern.replace("(?i:https?)", "https?", 1) == _A_URL.pattern
 
 
 def test_outside_the_closed_span_an_ampersand_is_still_escaped() -> None:

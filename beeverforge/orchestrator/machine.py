@@ -487,14 +487,19 @@ def _outside_spans(text: str) -> str:
 
 #: A bare link's scheme (or `www.`) and the domain after it, as GFM reads one: labels of
 #: `[A-Za-z0-9_-]` separated by dots.
-_A_LINK_DOMAIN = re.compile(r"(https?://|www\.)([A-Za-z0-9_.-]*)")
+_A_LINK_DOMAIN = re.compile(r"((?i:https?)://|www\.)([A-Za-z0-9_.-]*)")
+#: `_A_URL` as GitHub reads the reviewer's words: its scheme in any case, as `HTTPS://…` and
+#: `Https://…` are linked (review of #323 at 7fcf99b, measured on `POST /markdown`), so their `&`
+#: is not escaped into the address; `www.` in lower case only, as `WWW.ex.com/&#x40;name` is not
+#: linked and mentions (measured too). `_A_URL` itself, the agent's path, is left as it is.
+_A_BARE_LINK = re.compile(r"(?<!\]\()((?:(?i:https?)://|www\.)[^\s`<>\\()]*[^\s`<>\\.,;:!?'\")\]()])")
 
 
 def _autolinked(link: str, before: str, after: str) -> bool:
-    """Whether GitHub makes a link of `link`, a bare link `_A_URL` found between the characters
-    `before` and `after` (empty at an end of the paragraph). `_A_URL` also finds what GitHub does
-    not link, where an `&` is text and an entity mentions or links (reviews of #323, measured on
-    `POST /markdown`). A `www.` link, by GFM's extended rule: after the start, whitespace, `*`,
+    """Whether GitHub makes a link of `link`, a bare link `_A_BARE_LINK` found between the
+    characters `before` and `after` (empty at an end of the paragraph). It also finds what GitHub
+    does not link, where an `&` is text and an entity mentions or links (reviews of #323, measured
+    on `POST /markdown`). A `www.` link, by GFM's extended rule: after the start, whitespace, `*`,
     `_`, `~` or `(`, never after `<` (an angle autolink needs a scheme). A scheme link: after any
     character but an ASCII letter or `[`, whose host starts with a letter or a digit (one label
     is enough). Either way no label is empty but the last and none of the last two holds a `_`.
@@ -545,7 +550,8 @@ def _outside_links(text: str, before: str = "") -> str:
     makes of its autolinks (`_unlinked`) and bare links (`_autolinked`), which keep theirs. A bare
     link inside an autolink is the autolink's."""
     out, start = [], 0
-    links = sorted([*_AN_AUTOLINK.finditer(text), *_A_URL.finditer(text)], key=lambda m: m.start())
+    links = sorted([*_AN_AUTOLINK.finditer(text), *_A_BARE_LINK.finditer(text)],
+                   key=lambda m: m.start())
     for link in links:
         prior = text[link.start() - 1:link.start()] or before
         if link.start() < start:

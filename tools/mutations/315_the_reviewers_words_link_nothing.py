@@ -81,6 +81,18 @@ MUTATIONS = [
      "        elif False:"),
 
     # ── which bare links GitHub makes, and so keep their `&` (reviews of #323) ─────────────────
+    ("the reviewer's bare link takes a lower-case scheme only", MACHINE,
+     r'''_A_BARE_LINK = re.compile(r"(?<!\]\()((?:(?i:https?)://|www\.)''',
+     r'''_A_BARE_LINK = re.compile(r"(?<!\]\()((?:https?://|www\.)'''),
+
+    ("a bare link's domain is read after a lower-case scheme only", MACHINE,
+     r'''_A_LINK_DOMAIN = re.compile(r"((?i:https?)://|www\.)([A-Za-z0-9_.-]*)")''',
+     r'''_A_LINK_DOMAIN = re.compile(r"(https?://|www\.)([A-Za-z0-9_.-]*)")'''),
+
+    ("`WWW.` is read as a `www.` link", MACHINE,
+     r'''_A_BARE_LINK = re.compile(r"(?<!\]\()((?:(?i:https?)://|www\.)''',
+     r'''_A_BARE_LINK = re.compile(r"(?<!\]\()((?i:https?://|www\.)'''),
+
     ("a bare link keeps its `&` whatever its domain", MACHINE,
      "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
      "    return True"),
