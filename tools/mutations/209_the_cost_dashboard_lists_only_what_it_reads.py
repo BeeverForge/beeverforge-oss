@@ -4,8 +4,9 @@ The people store keeps its `person` and invitation rows under `_deployment_`. `d
 every row's key, so the selector read `['_deployment_', 'books']` and the dashboard opened on
 `_deployment_`, showing nothing spent beside the project that did.
 
-ONE CLAIM: the selector, and so the default view, holds only keys with an `agent_run` or `job`
-row (`DASHBOARD_KINDS`).
+ONE CLAIM: the selector, and so the default view, holds only keys with an `agent_run`, `job` or
+`card_transition` row (`DASHBOARD_KINDS`); the last is what the autonomy block beside the numbers
+reads, so a project whose first card is still in flight is listed (#374's review).
 
 The guard is `tests/test_the_cost_dashboard_lists_only_what_it_reads.py`.
 """
@@ -22,12 +23,16 @@ MUTATIONS = [
      '                       if (r.get("pk") or r.get("project"))})\n'),
 
     ("a key holding only `job` rows drops out of the selector", VIEW,
-     'DASHBOARD_KINDS = ("agent_run", "job")\n',
-     'DASHBOARD_KINDS = ("agent_run",)\n'),
+     'DASHBOARD_KINDS = ("agent_run", "job", _CARD_TRANSITION)\n',
+     'DASHBOARD_KINDS = ("agent_run", _CARD_TRANSITION)\n'),
 
     ("a key holding only `agent_run` rows drops out of the selector", VIEW,
-     'DASHBOARD_KINDS = ("agent_run", "job")\n',
-     'DASHBOARD_KINDS = ("job",)\n'),
+     'DASHBOARD_KINDS = ("agent_run", "job", _CARD_TRANSITION)\n',
+     'DASHBOARD_KINDS = ("job", _CARD_TRANSITION)\n'),
+
+    ("a project whose first card is still in flight drops out of the selector", VIEW,
+     'DASHBOARD_KINDS = ("agent_run", "job", _CARD_TRANSITION)\n',
+     'DASHBOARD_KINDS = ("agent_run", "job")\n'),
 
     ("the default view is not the first listed project", VIEW,
      '    project = project or (projects[0] if projects else "")\n',

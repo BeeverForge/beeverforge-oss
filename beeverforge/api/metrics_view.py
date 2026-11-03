@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 
+from beeverforge.lifecycle.record import KIND as _CARD_TRANSITION
+
 log = logging.getLogger("beeverforge.metrics")
 
 
@@ -246,7 +248,12 @@ def _delta(arms: dict) -> dict | None:
 # keeps its `person` and invitation rows under `_deployment_`, and listing every row's key put that
 # "project" in the selector and opened the dashboard on it, showing nothing spent. An allow-list by
 # kind, not an exclusion of `_deployment_`, so a future non-project kind stays out too.
-DASHBOARD_KINDS = ("agent_run", "job")
+#
+# `card_transition` is one of them: the autonomy block `cost_dashboard` returns beside these
+# numbers reads it (`observability/autonomy.py`), and it is written as cards move, while `job` and
+# `agent_run` rows land only when a job ends. Without it a project whose first card is still in
+# flight dropped out of the selector though its autonomy block had rows (#374's review).
+DASHBOARD_KINDS = ("agent_run", "job", _CARD_TRANSITION)
 
 
 def dashboard(records: list[dict], project: str | None = None) -> dict:

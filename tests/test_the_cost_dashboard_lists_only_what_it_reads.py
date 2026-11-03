@@ -5,11 +5,12 @@ audit rows #43 already left out. `dashboard` listed every row's key, so after on
 and one `agent_run` of `books` the selector read `['_deployment_', 'books']` and the dashboard
 opened on `_deployment_`, showing `cost_usd 0, agent_runs 0` beside the project that spent.
 
-The selector is now an allow-list by kind (`agent_run`, `job`), so a future non-project kind
-cannot come back into it.
+The selector is now an allow-list by kind (`agent_run`, `job`, and `card_transition`, which the
+autonomy block beside the numbers reads), so a future non-project kind cannot come back into it.
 """
 
 from beeverforge.api.metrics_view import dashboard
+from beeverforge.lifecycle import record
 
 RUN = {"pk": "books", "kind": "agent_run", "ticket": "BK-1", "cost_usd": 0.42,
        "model": "m", "harness": "h", "role": "executor", "ts": "2026-11-01T10:00:00"}
@@ -41,6 +42,15 @@ def test_the_selector_lists_only_keys_of_the_kinds_it_reads():
     got = dashboard(rows)
     assert got["projects"] == ["jobs-only", "runs-only"]
     assert got["project"] == "jobs-only"
+
+
+def test_a_project_whose_first_card_is_still_in_flight_is_listed():
+    """Its `card_transition` rows land as the card moves, before any job ends; the autonomy block
+    beside the numbers reads them, so the selector lists it (#374's review)."""
+    moving = {"pk": "newproj", "kind": record.KIND, "issue": "N-1", "ts": "2026-11-02T10:00:00"}
+    got = dashboard([RUN, moving])
+    assert got["projects"] == ["books", "newproj"]
+    assert dashboard([moving])["projects"] == ["newproj"]
 
 
 def test_a_requested_project_still_scopes_as_before():
