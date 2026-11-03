@@ -19,6 +19,7 @@ import pytest
 from beeverforge.adapters.sandbox import container
 from beeverforge.adapters.sandbox.base import Workspace
 from beeverforge.adapters.sandbox.container import ContainerSandbox
+from tests import the_git_bed
 
 IMAGE = "client/app:1"
 LOCK = "error: could not lock config file /nonexistent/.gitconfig: No such file or directory"
@@ -178,15 +179,14 @@ def _git(repo: Path, *args: str) -> str:
                           text=True, env=env).stdout.strip()
 
 
+#: The worker's repository bed (`tests/the_git_bed.py`), this module's fixture as well.
+git_bed = the_git_bed.git_bed
+
+
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    (repo / "app.py").write_text("x = 1\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
-    return repo
+def repo(tmp_path: Path, git_bed) -> Path:
+    """A committed repository on `main` with a clean tree, copied from the bed."""
+    return the_git_bed.a_card_repository(git_bed, tmp_path / "repo")
 
 
 class _RealSandbox:
@@ -303,19 +303,13 @@ def test_a_hook_that_rejects_the_commit_is_a_failure(repo):
     assert _git(repo, "rev-parse", "HEAD") == head
 
 
-def test_a_dirty_submodule_is_nothing_to_commit(repo, tmp_path):
+def test_a_dirty_submodule_is_nothing_to_commit(tmp_path, git_bed):
     """`git add -A` does not stage what changed INSIDE a submodule, so the commit exits 1 while
     `git status --porcelain` still prints ` M sub`: nothing was staged, git refused nothing."""
-    lib = tmp_path / "lib"
-    lib.mkdir()
-    _git(lib, "init", "-q")
-    (lib / "f").write_text("f\n")
-    _git(lib, "add", "-A")
-    _git(lib, "commit", "-qm", "lib")
-    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "sub")
-    _git(repo, "commit", "-qm", "sub")
+    repo = the_git_bed.a_repository_with_a_submodule(git_bed, tmp_path / "bed")
+    assert _git(repo, "status", "--porcelain") == "", "the copied submodule is not clean"
     (repo / "sub" / "build.out").write_text("z\n")
-    with (repo / "sub" / "f").open("a") as f:
+    with (repo / "sub" / "README.md").open("a") as f:
         f.write("dirty\n")
     assert _git(repo, "status", "--porcelain") == "M sub", "the submodule is not dirty"
     head = _git(repo, "rev-parse", "HEAD")
