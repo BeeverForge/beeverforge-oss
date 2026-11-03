@@ -127,8 +127,9 @@ def _codex(**kw: object):
 def _kimi(**kw: object):
     from beeverforge.adapters.agent.kimi import KimiAdapter
 
+    # the role reaches the refusal it runs before every pass: it names the entry to change (#173)
     return KimiAdapter(model=kw.get("model"), log_dir=kw.get("log_dir"),
-                        language=kw.get("language"))
+                       language=kw.get("language"), role=str(kw.get("role") or "executor"))
 
 
 def _opencode(**kw: object):

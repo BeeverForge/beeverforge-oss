@@ -313,6 +313,7 @@ def test_an_unauthorised_REJECT_cannot_destroy_the_proposal():
 
 
 # ── 4. one implementation ──────────────────────────────────────────────────────────────────────
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_an_approved_click_runs_the_SAME_path_as_a_typed_yes(monkeypatch):
     """A second copy of "what a confirmation does" would drift from the first, so both paths must
     end in the same function.

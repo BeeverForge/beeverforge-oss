@@ -69,8 +69,9 @@ MUTATIONS = [
      ""),
 
     ("a card that enters a column keeps no place there: the triggers are never created", DB,
-     "        for statement in _TRIGGERS:\n            conn.execute(statement)\n",
-     "        for statement in ():\n            conn.execute(statement)\n"),
+     # RE-PINNED 2026-11-02 (#199): the loop moved into `board_db._prepare`, one indent out
+     "    for statement in _TRIGGERS:\n        conn.execute(statement)\n",
+     "    for statement in ():\n        conn.execute(statement)\n"),
 
     ("a board file from before the position never gains it", DB,
      '    ("cards", "position", "INTEGER NOT NULL DEFAULT 0"),\n',

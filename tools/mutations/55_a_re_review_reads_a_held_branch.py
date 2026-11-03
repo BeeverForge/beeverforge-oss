@@ -40,17 +40,21 @@ MUTATIONS = [
     ("the re-review publishes the branch after it republishes its verdict", MACHINE,
      "            self._republish_review(pr_url, review=review)\n",
      "            self._republish_review(pr_url, review=review)\n"
-     "            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())\n"),
+     "            self.sandbox.publish_branch(workspace=ws, "
+     "remote_url=self.forge.push_remote())\n"),
 
     ("a failed forge read on the tip deletes the person's branch on the way out", BOX,
      "                remote_url=remote_url, from_base=False, drop_branch=False)\n",
      "                remote_url=remote_url, from_base=False, drop_branch=True)\n"),
 
     ("on a hosted forge the review reads the base instead of the pull request's tip", BOX,
-     '                             f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)\n'
+     # Re-pinned for the transport wrapper added after PR #283 met the new review door.
+     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
+     'timeout=180)\n'
      "            if rc == 0:\n"
      '                start = f"origin/{branch}"\n',
-     '                             f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)\n'
+     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
+     'timeout=180)\n'
      "            if rc == 0:\n"
      "                start = base_branch\n"),
 

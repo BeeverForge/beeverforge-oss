@@ -41,8 +41,12 @@ from tests.the_tree_read_once import parsed
 
 SPAWN = multiprocessing.get_context("spawn")
 #: How long a pinned moment waits for the others. On a publish that does not queue they all
-#: arrive within milliseconds; on one that does, only the first waits, and for this long.
-TRY_SECONDS = 3
+#: arrive together; on one that does, only the first waits, and for this long. Measured with four
+#: runs side by side on four cores (#362, which took this from 3 s): three members reach their
+#: publish within 0.141 s of each other and a clone takes 0.119 s at most, and a publish nothing
+#: holds up clones and pushes in 0.210 s at most. READ IN THE SPAWNED PROCESSES TOO, which import
+#: this module afresh: it is set here, never patched.
+TRY_SECONDS = 1.2
 #: An upper bound on anything that should happen at once. Reached only when something is broken.
 BOUND = 120
 CONTEXT_REPO = "acme/reservas-context"
@@ -214,7 +218,7 @@ def test_a_publish_that_cannot_have_the_semaphore_in_time_is_busy(tmp_path, cont
         got = pipeline.publish_dir(_bundle(tmp_path / "bundle", MEMBERS[0]), str(context),
                                    project=_member(MEMBERS[0]),
                                    subpath=pipeline.okf_subpath(MEMBERS[0]), message="m",
-                                   what="module map @ c1", timeout=0.5)
+                                   what="module map @ c1", timeout=0.2)
     finally:
         release.set()
         holder.join(BOUND)

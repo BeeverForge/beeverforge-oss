@@ -123,6 +123,7 @@ def test_a_requirement_delivery_still_uses_the_requirement_sentence(wired, monke
     assert any("requisito 7" in p for p in channel.posts), channel.posts
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_ask_pass_caps_and_names_the_ticket(wired):
     """Live board findings become at most MAX_QUESTIONS_PER_PASS questions, each naming the card
     by TITLE — 'sobre o #412' alone, to an audience that never opens the board, is a question
@@ -144,6 +145,7 @@ def test_the_ask_pass_caps_and_names_the_ticket(wired):
     assert "(Card 400)" in asks[0], asks[0]
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_the_chase_pass_wears_the_same_cap(wired):
     """Thirteen pre-cap questions went out in one real burst (2026-07-28). Uncapped, the 48h chase
     would replay all thirteen as one burst of reminders a week later — the flood arriving twice."""
@@ -166,6 +168,7 @@ def test_the_chase_pass_wears_the_same_cap(wired):
     assert "há 2 dias" not in chases[0], "the interval must be computed, never the old hardcode"
 
 
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_a_resolved_finding_closes_its_question_without_a_word(wired):
     """The board fixed it → the loop closes as observed; nobody needs a message about it."""
     channel, store = wired

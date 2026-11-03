@@ -282,21 +282,58 @@ def test_no_door_starts_a_harness_while_the_account_declares_what_it_cannot_leav
             path.unlink()
 
 
+#: (the role an adapter is built for, how the registry builds it, the door knocked on). The planner
+#: has no harness of its own: it is the executor adapter's `plan` door (#173).
+_REFUSED_ROWS = [
+    ("executor", lambda p: registry.build_executor(p), "plan"),
+    ("executor", lambda p: registry.build_executor(p), "ask"),
+    ("reviewer", lambda p: registry.build_asker(p, role="reviewer"), "ask"),
+    ("techlead", lambda p: registry.build_asker(p), "ask"),
+    ("product", lambda p: registry.build_product(p), "ask"),
+]
+
+
+@pytest.mark.parametrize(("role", "build", "door"), _REFUSED_ROWS,
+                         ids=[f"{role}-{door}" for role, _, door in _REFUSED_ROWS])
 @pytest.mark.parametrize("kind", sorted(k for k, r in ISOLATION.items() if r.refused_when))
-def test_the_person_is_told_which_file_held_the_role_back_and_what_to_do(kind, box):
+def test_the_person_is_told_which_file_held_the_role_back_and_what_to_do(
+        kind, role, build, door, box):
+    """A remedy that offers another harness names the entry to change: the role the adapter was
+    built for, in the project's `harness` setting in the deployment's project registry. The planner
+    reads `executor`, the card judge `reviewer`, the context ask `techlead` (#173)."""
     sandbox, ws, calls, home, _ = box
-    adapter = registry.HARNESSES[kind]()
+    adapter = build(_project(kind))
 
     for declared in ISOLATION[kind].refused_when:
         path = home / declared
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{}")
-        result = adapter.ask(sandbox=sandbox, workspace=ws, prompt="which module owns /health?")
-        path.unlink()
+        try:
+            fn, kw = _knock(adapter, door)
+            result = fn(sandbox=sandbox, workspace=ws, **kw)
+        finally:
+            path.unlink()
 
         assert not result.ok and _made(calls) == [], result
         said = result.summary or ""
         assert str(path) in said and "MCP" in said and "remove" in said.lower(), said
+        if "another harness" in said:
+            where = f"{kind}/{role}.{door}"
+            assert f"the {role} entry" in said, f"{where}: the entry to change is not named: {said}"
+            others = [r for r in registry.known_roles() if r != role and f"the {r} entry" in said]
+            assert not others, f"{where}: names the {others} entry, not the {role} one: {said}"
+            assert "harness setting" in said and "project registry" in said, (
+                f"{where}: the person is not told where the setting is: {said}")
+
+
+@pytest.mark.parametrize("role", ['q"a', "q$a", "q`a`", "q!a", "q a"])
+def test_a_role_name_the_kimi_refusal_cannot_echo_is_refused_when_the_adapter_is_built(role):
+    """Kimi's refusal names the role inside shell double quotes, so a name that is not a plain word
+    is refused by name at build time rather than spliced into the shell (#173)."""
+    from beeverforge.adapters.agent.kimi import KimiAdapter
+
+    with pytest.raises(ValueError, match="not a plain word"):
+        KimiAdapter(role=role)
 
 
 def test_what_one_opencode_role_leaves_in_its_configuration_reaches_no_later_role(box):

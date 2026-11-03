@@ -280,8 +280,9 @@ def test_a_scope_jira_refuses_is_named_and_the_read_stays_unreadable(site, tmp_p
     """Q3: a scope Jira cannot parse answers 400 (the existing "unreadable" branch). The warning
     names `scope_jql` and the condition, so the person reading it sees the cause, and the read is
     still unreadable — `None` from `columns` and `list_tickets` — never an empty board. On main the
-    warnings said only "could not search DAR"."""
-    broken = 'labels = "bf-api'
+    warnings said only "could not search DAR". (An unclosed quote, the example here before
+    #121, is now refused when the tracker is built, so the 400 is an `ORDER BY` inside it.)"""
+    broken = 'labels = "bf-api" ORDER BY Rank ASC'
     site(broken, strict=False, refuse=True)
     tracker, board = _built(_project(tmp_path, scope_jql=broken))
 

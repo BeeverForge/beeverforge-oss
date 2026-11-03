@@ -248,6 +248,7 @@ def test_closing_happens_BEFORE_her_new_reply_can_open_more(wired):
 
 
 # ── chasing ────────────────────────────────────────────────────────────────────────────────────
+@pytest.mark.usefixtures("a_remote_that_never_answers")
 def test_an_unanswered_decision_is_chased_ONCE_and_repeats_the_question(wired):
     """A reminder days later must carry the decision with it: "voltando naquilo que te perguntei"
     is a reminder only for somebody who already remembers — exactly who does not need one."""

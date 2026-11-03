@@ -284,13 +284,18 @@ class CardReference:
 #: in a sentence — `#37`, and the tail of a qualified `owner/name#37`. The same test the card's own
 #: id is held to below.
 _A_MENTION = re.compile(r"#(?=\d)")
+#: GitHub's other issue reference, `GH-<number>` in any case, as a whole word (#111).
+_A_GH_MENTION = re.compile(r"\bGH-(?=\d+\b)", re.IGNORECASE)
 
 
 def without_mentions(text: str) -> str:
     """`text` with every `#<number>` written `card <number>` — readable, traceable, and naming
     nothing in a forge (#167). A `#` glued to a word (`owner/name#37`) gets its own space, so the
     number does not run into the name; one after a space or an opening bracket or quote does not
-    need one. `C#`, `issue # 4` and `PROJ-12` are not mentions and are left as they are."""
+    need one. `GH-12` (any case) is a mention too and reads `card 12`. `C#`, `issue # 4`,
+    `PROJ-12`, `GH-less`, `XGH-12` and `GH-12a` are not mentions and are left as they are."""
+    text = _A_GH_MENTION.sub("card ", text or "")
+
     def word(found: re.Match) -> str:
         before = found.string[found.start() - 1] if found.start() else " "
         return "card " if before.isspace() or before in "([{\"'`" else " card "

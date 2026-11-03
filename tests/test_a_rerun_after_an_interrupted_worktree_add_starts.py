@@ -162,7 +162,7 @@ _CHILD = textwrap.dedent("""\
     def run(cmd, **kw):
         is_add = cmd[3:5] == ["worktree", "add"]
         if is_add and shape == "add_timed_out":
-            kw["timeout"] = 2
+            kw["timeout"] = 0.3   # the add reaches the smudge in 11.9 ms at most (#362; was 2)
         answer = real(cmd, **kw)
         if is_add and shape == "python_killed_after_the_add_returned":
             os.kill(os.getpid(), signal.SIGKILL)

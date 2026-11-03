@@ -50,6 +50,15 @@ def test_on_by_default_every_page_address_serves_the_panel(client):
         assert answer.text.startswith("<!doctype html>"), path
 
 
+@pytest.mark.parametrize("path", ["/p/acme/card/acme%2Fweb%231", "/p/acme/preview/acme%2Fweb%231",
+                                  "/p/acme/card/PROJ%2F7"])
+def test_repository_qualified_card_addresses_serve_the_panel(client, path):
+    # The server decodes %2F before routing; repository-qualified refs need a path converter.
+    answer = client.get(path)
+    assert answer.status_code == 200
+    assert answer.text.startswith("<!doctype html>")
+
+
 @pytest.mark.parametrize("off", ["off", "OFF", "false", "no", "0"])
 def test_off_every_page_address_answers_404_and_says_why(client, monkeypatch, off):
     monkeypatch.setenv(SETTING, off)
