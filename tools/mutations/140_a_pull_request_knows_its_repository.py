@@ -111,7 +111,8 @@ MUTATIONS = [
     # ── 3. the file that was already running ───────────────────────────────────────────────────
     ("the column is never added to a file that already exists, so every running deployment's "
      "first proposal fails with `no column named repo`", DB,
-     "        _add_columns(conn)\n",
+     # RE-PINNED 2026-11-02 (#199): the call moved into `board_db._prepare`, one indent out
+     "    _add_columns(conn)\n",
      ""),
 
     ("a LOST race to add the column raises out of `connect`, taking down whichever of the worker "

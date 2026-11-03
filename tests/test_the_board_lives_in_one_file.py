@@ -17,6 +17,7 @@ row through its own table; this file covers what is specific to it.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 
@@ -94,7 +95,7 @@ def test_two_writers_never_take_the_same_number(db):
     #: property: if the first writer finishes before the second starts, both take a number
     #: correctly under a DEFERRED lock too and the mutation survives. And round ONE is the only
     #: one that opens a BRAND-NEW file, which is a second race entirely — the WAL conversion the
-    #: busy handler does not cover (`board_db._to_wal`). Eight rounds cover both, and the
+    #: busy handler does not cover (`board_db._open`). Eight rounds cover both, and the
     #: assertion is over all of them at once so one unlucky schedule cannot fail it either.
     rounds = 8
     failed: list[BaseException] = []
@@ -171,6 +172,208 @@ def test_two_openers_of_a_BRAND_NEW_file_both_get_in(tmp_path):
     assert not failed, (
         f"{len(failed)} of {2 * rounds} openers were refused the brand-new file: {failed[0]} — "
         f"the WAL conversion is the one lock the busy handler does not cover")
+
+
+# ── a lock held from another connection, for a counted number of pauses (#166, #199) ───────────
+#
+# THE TWO TESTS ABOVE ARE PROBABILISTIC, and a mutation aimed at them goes red one run in a few.
+# These hold the lock from a second connection for a COUNTED number of the board's own retry
+# pauses: `board_db.time` is replaced by `_Pauses`, whose `sleep` moves a pretend clock forward
+# instead of waiting and lets go of the lock on the k-th call. Nothing here reads a real clock;
+# each test asserts an outcome — a card written, a refusal's words, a log record.
+
+
+class _Pauses:
+    """`board_db`'s `time`: `sleep` counts the retry pauses and moves `monotonic` forward by what
+    it was asked to wait, without waiting.
+
+    `release` runs on pause number `at`. Past `ceiling` pauses the retry is not bounded by what
+    the code states, and the test says so instead of spinning forever."""
+
+    def __init__(self, at: int = 0, release=None, ceiling: int = 1000):
+        self.calls, self.at, self.release, self.ceiling, self.now = 0, at, release, ceiling, 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.calls += 1
+        self.now += seconds
+        if self.calls > self.ceiling:
+            raise AssertionError(f"{self.calls} retry pauses — the retry is not bounded")
+        if self.calls == self.at and self.release is not None:
+            self.release()
+
+
+def _one_sentence(text: str) -> bool:
+    return "\n" not in text and text.endswith(".") and ". " not in text
+
+
+def _board_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.name == "beeverforge.adapters.board_db" and r.levelno == logging.WARNING]
+
+
+def _a_neighbour_reading_a_brand_new_file(path):
+    """A raw connection in the default rollback journal, holding a SHARED lock on a file nobody
+    has put in WAL yet — the neighbour the WAL conversion has to wait out."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("CREATE TABLE neighbour(x)")
+    holder.execute("BEGIN")
+    holder.execute("SELECT * FROM neighbour").fetchall()
+    return holder
+
+
+def test_a_brand_new_file_waits_out_a_neighbour_holding_it_before_WAL(tmp_path, monkeypatch):
+    """#166, deterministically: the conversion is asked again for as long as the busy timeout.
+
+    The neighbour lets go on the 60th pause, past the 0.4 s (40 pauses) the conversion used to
+    stop at and well inside the board's five seconds."""
+    from beeverforge.adapters import board_db
+
+    path = tmp_path / "board.db"
+    holder = _a_neighbour_reading_a_brand_new_file(path)
+    try:
+        probe = sqlite3.connect(path, timeout=0, isolation_level=None)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            probe.execute("PRAGMA journal_mode = WAL")
+        probe.close()
+        pauses = _Pauses(at=60, release=lambda: holder.execute("ROLLBACK"))
+        monkeypatch.setattr(board_db, "time", pauses)
+        with connect(path, write=True) as conn:
+            conn.execute("INSERT INTO cards(project, ref, created_at, updated_at) "
+                         "VALUES (?,?,?,?)", ("acme", next_ref(conn, "acme"), now_iso(), now_iso()))
+    finally:
+        holder.close()
+    with connect(path) as conn:
+        assert [r["ref"] for r in conn.execute("SELECT ref FROM cards")] == [1]
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert pauses.calls == 60
+
+
+def test_the_schema_step_waits_out_a_writer_that_took_the_file_after_WAL(tmp_path, monkeypatch):
+    """THE MEASURED CAUSE of #166 under load: the WAL conversion went through, and then
+    `CREATE TABLE IF NOT EXISTS cards` lost the lock to the other opener (`database is locked`
+    after a 6.389 s wait). Here the file is already in WAL and has none of the board's tables, and
+    a neighbour holds its write lock for three pauses — so the conversion succeeds and the schema
+    step is the one that has to be asked again."""
+    from beeverforge.adapters import board_db
+
+    path = tmp_path / "board.db"
+    holder = sqlite3.connect(path, isolation_level=None)
+    assert holder.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("CREATE TABLE neighbour(x)")
+    pauses = _Pauses(at=3, release=lambda: holder.execute("COMMIT"))
+    monkeypatch.setattr(board_db, "time", pauses)
+    try:
+        with connect(path, write=True) as conn:
+            conn.execute("INSERT INTO cards(project, ref, created_at, updated_at) "
+                         "VALUES (?,?,?,?)", ("acme", next_ref(conn, "acme"), now_iso(), now_iso()))
+    finally:
+        holder.close()
+    with connect(path) as conn:
+        assert [r["ref"] for r in conn.execute("SELECT ref FROM cards")] == [1]
+    assert pauses.calls == 3
+
+
+def test_a_file_held_past_the_bound_is_refused_in_one_sentence_naming_it(
+        tmp_path, monkeypatch, caplog):
+    from beeverforge.adapters import board_db
+    from beeverforge.adapters.board_db import BoardLocked
+
+    path = tmp_path / "board.db"
+    holder = _a_neighbour_reading_a_brand_new_file(path)
+    monkeypatch.setattr(board_db, "time", _Pauses())
+    caplog.set_level(logging.WARNING, logger="beeverforge.adapters.board_db")
+    try:
+        with pytest.raises(BoardLocked) as caught, connect(path, write=True):
+            pytest.fail("the body ran over a file that was never put in WAL")
+    finally:
+        holder.close()
+    message = str(caught.value)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert str(path) in message
+    assert "stop" in message and "try again" in message, message
+    assert _one_sentence(message), message
+    warned = _board_warnings(caplog)
+    assert len(warned) == 1 and str(path) in warned[0], warned
+
+
+def test_a_refusal_a_wait_cannot_cure_is_raised_at_once_and_as_itself(db, monkeypatch):
+    """Only `database is locked` is asked again. A statement SQLite cannot run is raised on the
+    first try in SQLite's own words — never waited on for five seconds and then called a lock."""
+    from beeverforge.adapters import board_db
+    from beeverforge.adapters.board_db import BoardLocked
+
+    pauses = _Pauses()
+    monkeypatch.setattr(board_db, "time", pauses)
+    monkeypatch.setattr(board_db, "_SCHEMA", ("CREATE TABLE IF NOT EXISTS (",))
+    with pytest.raises(sqlite3.OperationalError, match="syntax error") as caught, connect(db):
+        pytest.fail("the body ran over a schema that never ran")
+    assert not isinstance(caught.value, BoardLocked)
+    assert pauses.calls == 0
+
+
+def _a_writer_holding(path, monkeypatch):
+    """The file exists and is in WAL; a second connection holds its write lock, and the board's
+    busy timeout is cut to a few milliseconds so each of the writer's attempts fails fast."""
+    from beeverforge.adapters import board_db
+
+    with connect(path):
+        pass
+    monkeypatch.setattr(board_db, "BUSY_TIMEOUT_MS", 5)
+    holder = sqlite3.connect(path, isolation_level=None, timeout=0)
+    holder.execute("BEGIN IMMEDIATE")
+    return holder
+
+
+def test_a_writer_waits_out_a_lock_held_past_one_busy_timeout(db, monkeypatch):
+    """#199, deterministically: the holder keeps the lock through one whole busy timeout and lets
+    go on the first pause, so the writer's card lands only if `BEGIN IMMEDIATE` is asked again."""
+    from beeverforge.adapters import board_db
+
+    holder = _a_writer_holding(db, monkeypatch)
+    holder.execute("INSERT INTO cards(project, ref, created_at, updated_at) VALUES (?,?,?,?)",
+                   ("acme", 1, now_iso(), now_iso()))
+    pauses = _Pauses(at=1, release=lambda: holder.execute("COMMIT"))
+    monkeypatch.setattr(board_db, "time", pauses)
+    try:
+        with connect(db, write=True) as conn:
+            conn.execute("INSERT INTO cards(project, ref, created_at, updated_at) "
+                         "VALUES (?,?,?,?)", ("acme", next_ref(conn, "acme"), now_iso(), now_iso()))
+    finally:
+        holder.close()
+    with connect(db) as conn:
+        assert [r["ref"] for r in conn.execute("SELECT ref FROM cards ORDER BY ref")] == [1, 2]
+    assert pauses.calls == 1
+
+
+def test_a_writer_that_never_gets_the_lock_fails_in_one_sentence_and_is_logged(
+        db, monkeypatch, caplog):
+    from beeverforge.adapters import board_db
+    from beeverforge.adapters.board_db import BoardLocked
+
+    holder = _a_writer_holding(db, monkeypatch)
+    monkeypatch.setattr(board_db, "time", _Pauses(ceiling=50))
+    caplog.set_level(logging.WARNING, logger="beeverforge.adapters.board_db")
+    try:
+        with pytest.raises(BoardLocked) as caught, connect(db, write=True) as conn:
+            conn.execute("INSERT INTO cards(project, ref, created_at, updated_at) "
+                         "VALUES (?,?,?,?)", ("acme", 1, now_iso(), now_iso()))
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    message = str(caught.value)
+    assert isinstance(caught.value, sqlite3.OperationalError)
+    assert str(db) in message
+    assert "stop" in message and "try again" in message, message
+    assert _one_sentence(message), message
+    warned = _board_warnings(caplog)
+    assert len(warned) == 1 and str(db) in warned[0], warned
+    with connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
 
 
 def test_a_failed_write_leaves_nothing_behind(db):
