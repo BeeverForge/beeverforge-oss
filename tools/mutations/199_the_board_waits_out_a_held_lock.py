@@ -20,11 +20,10 @@ red one run in a few hundred. Each row here is aimed at the deterministic test t
 from a second connection for a COUNTED number of the board's own pauses (`_Pauses` replaces
 `board_db.time`), and asserts an outcome rather than a time.
 
-NOT A ROW: the busy handler switched back on during the opening (`timeout=0` in `connect`). With
-it on, each refused try waits a real busy timeout before the same outcome, so the deterministic
-tests would only get slower; the cause it removes (two openers each waiting out the other's lock,
-5.004 s for one conversion, 6.389 s for the schema statement that lost) is held by the
-measurement in the PR, not by a test.
+THE BUSY HANDLER OFF DURING THE OPENING is read, not timed (#383's review): with it back on, the
+deterministic tests do not go red, they hang (still running after 300 s, 3.8 s unmutated), so
+`test_the_busy_handler_is_off_while_the_file_is_opened_and_on_after` asks SQLite for the setting
+while `_prepare` runs, and a row turns it back on.
 """
 
 TEST = "tests/test_the_board_lives_in_one_file.py"
@@ -39,7 +38,19 @@ NEVER = _T + "test_a_writer_that_never_gets_the_lock_fails_in_one_sentence_and_i
 
 DB = "beeverforge/adapters/board_db.py"
 
+HANDLER = f"{TEST}::test_the_busy_handler_is_off_while_the_file_is_opened_and_on_after"
+
 MUTATIONS = [
+    ("the busy handler is on during the opening, so two openers each wait out the other's busy "
+     "timeout (#166's cause)", DB,
+     "    conn = sqlite3.connect(target, timeout=0, isolation_level=None)",
+     "    conn = sqlite3.connect(target, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)",
+     HANDLER),
+
+    ("the connection is handed out with no busy timeout, so every write fails at the first lock",
+     DB, "        conn.execute(f\"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}\")\n",
+     "        pass\n", HANDLER),
+
     # ── 1. the opening sequence is asked again as one ──────────────────────────────────────────
     ("a locked opening is raised at once, so a brand-new file a neighbour is reading cannot be "
      "put in WAL", DB,

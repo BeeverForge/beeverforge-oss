@@ -46,9 +46,16 @@ log = logging.getLogger(__name__)
 #: nothing and gets the operator's own directory.
 PATH_ENV = "BEEVERFORGE_BOARD_DB"
 
-#: How long a writer waits for another process's lock before giving up. Five seconds is the
-#: registry's own flock timeout, and the operations here are single-statement — a wait that long
-#: means another process is wedged, not busy, and the caller should hear about it.
+#: SQLite's busy timeout for this file, and the unit of the module's two bounds. Five seconds is
+#: the registry's own flock timeout. It bounds two different waits, and they are NOT the same on
+#: purpose (#199, #383's review):
+#:   - the OPENING (`_open`): `BUSY_TIMEOUT_MS` in all, with the busy handler off, because two
+#:     openers each waiting out the other's busy timeout is what failed #166 (one conversion waited
+#:     5.004 s, the schema statement that then lost waited 6.389 s, measured under load);
+#:   - the WRITE LOCK (`_begin`): `_BEGIN_TRIES` x `BUSY_TIMEOUT_MS`, about 15 s, because one lost
+#:     busy timeout under load is a slow neighbour, not a wedged one. Measured under load, the
+#:     other writer held the lock 2.315 s at most and `BEGIN IMMEDIATE` waited 1.833 s at most;
+#:     #199's loss was not reproduced in 920 runs, so tries two and three are headroom, not a cure.
 BUSY_TIMEOUT_MS = 5000
 
 #: THE OPENING SEQUENCE'S BOUND — the WAL conversion, the schema, the columns and the triggers,

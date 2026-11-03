@@ -225,6 +225,28 @@ def _a_neighbour_reading_a_brand_new_file(path):
     return holder
 
 
+def test_the_busy_handler_is_off_while_the_file_is_opened_and_on_after(tmp_path, monkeypatch):
+    """#166's cause was two openers each waiting out the other's busy timeout, so the opening runs
+    with the handler OFF and the loop's own deadline bounds it. Read, not timed (#383's review):
+    with the handler back on during the opening, the retries below wait a real 5 s each and the
+    file hangs instead of failing, so this asks SQLite what the setting is while `_prepare` runs."""
+    import beeverforge.adapters.board_db as board_db
+
+    seen: list[int] = []
+    prepare = board_db._prepare
+
+    def recorded(conn):
+        seen.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        return prepare(conn)
+
+    monkeypatch.setattr(board_db, "_prepare", recorded)
+    with connect(tmp_path / "board.db") as conn:
+        after = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert seen == [0], f"the opening ran with a busy timeout of {seen} ms"
+    assert after == board_db.BUSY_TIMEOUT_MS, f"the connection was handed out with {after} ms"
+
+
 def test_a_brand_new_file_waits_out_a_neighbour_holding_it_before_WAL(tmp_path, monkeypatch):
     """#166, deterministically: the conversion is asked again for as long as the busy timeout.
 
