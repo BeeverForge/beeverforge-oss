@@ -33,7 +33,6 @@ a test that says "the verdict at §2" and silently also measures whether this la
 from __future__ import annotations
 
 import dataclasses
-import time
 from typing import Any
 
 from beeverforge import doctor
@@ -65,6 +64,12 @@ def _no_product_module():
     return ProductLink(active=False, kind="off", reason="no product module")
 
 
+#: The pinned budget's refill moment: ONE fixed epoch, never the clock (#155). Read from
+#: `time.time()` at each `diagnose`, two renders of one deployment that straddled a minute said
+#: two different "refills at HH:MM" — and a test comparing them went red on the wall clock.
+RESET_EPOCH = 1_800_000_000
+
+
 def _a_budget_with_room():
     """`api_budget`'s green answer: a real `Budget` well above the ADAPTER's own floor.
 
@@ -76,7 +81,7 @@ def _a_budget_with_room():
     from beeverforge.adapters.tracker.base import Budget
 
     return Budget(resource="graphql", remaining=4800, limit=5000, floor=200,
-                  reset_epoch=int(time.time()) + 3600, vendor="a tracker")
+                  reset_epoch=RESET_EPOCH, vendor="a tracker")
 
 
 #: One green answer per member of `doctor.Probes`, by field name. The KEYS are the contract: they
