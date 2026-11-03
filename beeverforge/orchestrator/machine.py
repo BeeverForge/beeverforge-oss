@@ -429,7 +429,7 @@ def _ampersands_escaped(words: str) -> str:
     never closes, and the rest of the paragraph after it, and all of `words` if a row may open an
     HTML block."""
     if _AN_HTML_ROW.search(words):
-        return _escaped_ampersands(words)
+        return _escaped_ampersands(_AN_AUTOLINK.sub(_unlinked, words))
     rows, out, paragraph, i = words.split("\n"), [], [], 0
 
     def ended() -> list[str]:
@@ -488,18 +488,17 @@ def _autolinked(link: str, before: str, after: str) -> bool:
     `before` and `after` (empty at an end of the paragraph). `_A_URL` also finds what GitHub does
     not link, where an `&` is text and an entity mentions or links (reviews of #323, measured on
     `POST /markdown`). A `www.` link, by GFM's extended rule: after the start, whitespace, `*`,
-    `_`, `~` or `(`, never after `<` (an angle autolink needs a scheme). A scheme link: an angle
-    autolink (`<https://…>`), or one after any character but an ASCII letter or `[`, whose host
-    starts with a letter or a digit (one label is enough). Either way no label is empty but the
-    last and none of the last two holds a `_`. In doubt, it is not."""
+    `_`, `~` or `(`, never after `<` (an angle autolink needs a scheme). A scheme link: after any
+    character but an ASCII letter or `[`, whose host starts with a letter or a digit (one label
+    is enough). Either way no label is empty but the last and none of the last two holds a `_`.
+    In doubt, it is not. An angle autolink (`<https://…>`) never reaches here: `_outside_links`
+    reads it first (`_AN_AUTOLINK`)."""
     scheme, domain = _A_LINK_DOMAIN.findall(link)[0]  # `link` opens with its scheme
     labels = domain.split(".")
     if scheme == "www.":
         if before and not before.isspace() and before not in "*_~(":
             return False
         labels = ["www", *labels]
-    elif before == "<" and after == ">":
-        return True
     elif before == "[" or (before.isascii() and before.isalpha()):
         return False
     elif not domain[:1].isalnum():
@@ -507,15 +506,45 @@ def _autolinked(link: str, before: str, after: str) -> bool:
     return all(labels[:-1]) and not any("_" in label for label in labels[-2:])
 
 
+#: CommonMark's autolink, `<scheme:…>`, any scheme of 2 to 32 characters in any case, after no
+#: backslash (or after escaped pairs, kept in group 1). A backslash inside it is no escape, so
+#: `\&` there is a literal `\` and the entity after it still decoded: `<ftp://ex.com/&#x40;name>`
+#: mentioned and `<a+b:&#x23;1>` linked (review of #323 at 208035c, measured on `POST /markdown`).
+_AN_AUTOLINK = re.compile(r"(?<!\\)((?:\\\\)*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")
+#: The autolinks GitHub keeps as links, where an entity is part of the address and mentions no one.
+_LINKED_SCHEMES = ("http", "https")
+
+
+def _unlinked(autolink: re.Match) -> str:
+    """An `_AN_AUTOLINK` GitHub keeps (`_LINKED_SCHEMES`, any case) as written; any other with its
+    `<` escaped, so it is no autolink and a backslash before its `&` is an escape again. Breaking
+    the link, not the entity, because no character inside an autolink is an escape: `ftp:`,
+    `irc:` and the rest render as text on GitHub anyway (the plain `<ftp://ex.com/@name>` linked
+    nothing), so only a `\\` before them is new."""
+    if autolink[2].lower() in _LINKED_SCHEMES:
+        return autolink[0]
+    return f"{autolink[1]}\\{autolink[0][len(autolink[1]):]}"
+
+
 def _outside_links(text: str, before: str = "") -> str:
     """`text`, after the character `before`, with every bare `&` escaped outside the links GitHub
-    makes of its bare links (`_autolinked`), which keep theirs."""
+    makes of its autolinks (`_unlinked`) and bare links (`_autolinked`), which keep theirs. A bare
+    link inside an autolink is the autolink's."""
     out, start = [], 0
-    for link in _A_URL.finditer(text):
+    links = sorted([*_AN_AUTOLINK.finditer(text), *_A_URL.finditer(text)], key=lambda m: m.start())
+    for link in links:
         prior = text[link.start() - 1:link.start()] or before
-        if _autolinked(link[0], prior, text[link.end():link.end() + 1]):
-            out += [_escaped_ampersands(text[start:link.start()]), link[0]]
-            start = link.end()
+        if link.start() < start:
+            continue
+        if link.re is _AN_AUTOLINK:
+            kept = _unlinked(link)
+            piece = kept if kept == link[0] else _escaped_ampersands(kept)
+        elif _autolinked(link[0], prior, text[link.end():link.end() + 1]):
+            piece = link[0]
+        else:
+            continue
+        out += [_escaped_ampersands(text[start:link.start()]), piece]
+        start = link.end()
     return "".join(out) + _escaped_ampersands(text[start:])
 
 

@@ -73,9 +73,9 @@ MUTATIONS = [
      "                out, paragraph, i = out + ended() + rows[i:end + 1], [], end + 1",
      "                out, paragraph, i = out + ended() + [_escaped_ampersands(r) for r in rows[i:end + 1]], [], end + 1"),
 
-    ("an `&` in a bare link is escaped", MACHINE,
-     "        if _autolinked(link[0], prior, text[link.end():link.end() + 1]):",
-     "        if False:"),
+    ("an `&` in a bare link is escaped", MACHINE,  # re-pinned: an `elif` after the autolink's branch
+     "        elif _autolinked(link[0], prior, text[link.end():link.end() + 1]):",
+     "        elif False:"),
 
     # ── which bare links GitHub makes, and so keep their `&` (reviews of #323) ─────────────────
     ("a bare link keeps its `&` whatever its domain", MACHINE,
@@ -114,13 +114,38 @@ MUTATIONS = [
      '''    if scheme == "www.":''',
      '''    if True:'''),
 
-    ("the angle shortcut takes a `www.` link too", MACHINE,
+    ("a `www.` link after `<` is read by the scheme rule", MACHINE,
      '''    if scheme == "www.":''',
      '''    if scheme == "www." and not (before == "<" and after == ">"):'''),
 
-    ("an angle autolink's `&` is escaped when its host is not one", MACHINE,
-     '''    elif before == "<" and after == ">":''',
-     '''    elif False:'''),
+    # RETIRED 2026-11-03: "an angle autolink's `&` is escaped when its host is not one" pinned
+    # `_autolinked`'s `<…>` shortcut, which `_AN_AUTOLINK` replaced (review of #323 at 208035c);
+    # "an http autolink's `&` is escaped" below holds the same claim.
+
+    # ── an autolink, `<scheme:…>`, where no backslash is an escape (review of #323 at 208035c) ──
+    ("an autolink not `http(s)` keeps its `<`, so its `\\&` is no escape", MACHINE,
+     '''    return f"{autolink[1]}\\\\{autolink[0][len(autolink[1]):]}"''',
+     '''    return autolink[0].replace("&", "\\\\&")'''),
+
+    ("every scheme's autolink is kept as written", MACHINE,
+     "    if autolink[2].lower() in _LINKED_SCHEMES:",
+     "    if True:"),
+
+    ("the `http(s)` autolink is matched in lower case only", MACHINE,
+     "    if autolink[2].lower() in _LINKED_SCHEMES:",
+     "    if autolink[2] in _LINKED_SCHEMES:"),
+
+    ("an http autolink's `&` is escaped", MACHINE,
+     "            piece = kept if kept == link[0] else _escaped_ampersands(kept)",
+     "            piece = _escaped_ampersands(kept)"),
+
+    ("a bare link inside an autolink is read again on its own", MACHINE,
+     "        if link.start() < start:\n            continue",
+     "        if False:\n            continue"),
+
+    ("where a row may open an HTML block, an autolink is left whole", MACHINE,
+     "        return _escaped_ampersands(_AN_AUTOLINK.sub(_unlinked, words))",
+     "        return _escaped_ampersands(words)"),
 
     ("a `[` no longer blocks a scheme link", MACHINE,
      '''    elif before == "[" or (before.isascii() and before.isalpha()):''',

@@ -35,7 +35,14 @@ NOT_LINKS = ["https://&#x40;someone", "http://&#x40;someone x", "(https://&#x40;
              "http://a_b/&#x40;someone", "http://-x/&#x40;someone",
              "xhttps://ex.com/&#x40;someone", "[https://ex.com/&#x40;someone", "https://&#x23;1",
              "see <www.&#x40;someone> x", "see <www.ex.com/&#x40;someone> x", "see <www.&#x23;1> x"]
-WORDS = f"Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone {ENTITIES} {' '.join(NOT_LINKS)}"
+#: An autolink whose scheme is not `http(s)`: no backslash inside one is an escape, so `\&` left
+#: the entity live (review of #323 at 208035c, measured on `POST /markdown`). Its `<` is escaped,
+#: so it is no autolink and `\&` is an escape again.
+NOT_AUTOLINKS = ["see <ftp://ex.com/&#x40;someone> x", "see <irc://&#x40;someone> x",
+                 "see <ftp://ex.com/&commat;someone> x", "see <ftp://ex.com/&#x23;1> x",
+                 "see <ftp://ex.com/&num;1> x", "see <a+b:&#x23;1> x"]
+WORDS = (f"Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone {ENTITIES} {' '.join(NOT_LINKS)} "
+         f"{' '.join(NOT_AUTOLINKS)}")
 ZWSP = "​"
 
 #: What a forge would link or notify: an issue number, a `GH-N`, a cross-repository reference
@@ -66,7 +73,8 @@ def _assert_dead(text: str) -> None:
     for kept in ("card 1", "owner/repo card 3", f"@{ZWSP}someone", f"GH{ZWSP}-2", f"gh{ZWSP}-4",
                  "\\&#x40;someone", "\\&commat;someone", "\\&#x23;1", "GH\\&#x2D;1",
                  " \\&commat;dee", "see `x \\&#x40;github",
-                 *(link.replace("&", "\\&") for link in NOT_LINKS)):
+                 *(link.replace("&", "\\&") for link in NOT_LINKS),
+                 *(link.replace("<", "\\<").replace("&", "\\&") for link in NOT_AUTOLINKS)):
         assert kept in text, f"{kept!r} not in {text!r}"
 
 
@@ -127,8 +135,8 @@ VERBATIM = ["use `a && b` here", "x && y", "see https://ex.com/?a=1&b=2 now",
             "http://x/y?a=1&b=2",
             # GitHub decodes no entity inside an autolink: it is part of the address
             '"https://ex.com/&#x40;someone"', "http://localhost:8080/&#x40;someone",
-            # an angle autolink takes any host after its scheme (CommonMark)
-            "or <http://a_b/?a=1&b=2> too"]
+            # an angle autolink takes any host after its scheme (CommonMark), in any case
+            "or <http://a_b/?a=1&b=2> too", "see <HTTPS://ex.com/?a=1&b=2> x"]
 FENCED = "\n".join([VERBATIM[0], "```sh", VERBATIM[1], "```", *VERBATIM[2:]])
 
 
@@ -164,6 +172,9 @@ def test_where_the_code_is_in_doubt_an_ampersand_is_escaped() -> None:
                         # an empty label is no domain GFM describes
                         ("see https://.ex.com/&#x40;x", "see https://.ex.com/\\&#x40;x"),
                         ("see https://ex..com/&#x40;x", "see https://ex..com/\\&#x40;x"),
-                        ("see www..ex.com/&#x40;x", "see www..ex.com/\\&#x40;x")]:
+                        ("see www..ex.com/&#x40;x", "see www..ex.com/\\&#x40;x"),
+                        # where a row may open an HTML block, a later paragraph's autolink is
+                        # still broken, or its `\&` is no escape
+                        ("<div>\n\nsee <ftp://ex.com/&#x40;x> y", "see \\<ftp://ex.com/\\&#x40;x> y")]:
         rows = _review_rows(ReviewResult(decision="approved", score=90, summary=words))
         assert kept in rows, f"{kept!r} not in {rows!r}"
