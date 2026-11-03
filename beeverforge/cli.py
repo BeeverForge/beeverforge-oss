@@ -3097,6 +3097,15 @@ NO_ENGINE_DECLARED = (
     "`TEMPORAL_NAMESPACE` and `TEMPORAL_API_KEY` for a hosted engine — and start it again; on a "
     "machine that should run its own engine, use `beeverforge up` instead.")
 
+#: Said when `worker --with-panel` would serve an OPEN panel off the loopback (review of #406).
+OPEN_PANEL_OFF_THE_LOOPBACK = (
+    "the worker and the panel cannot start: the panel would listen on {host} with no sign-in — "
+    "neither `BEEVERFORGE_PANEL_TOKEN` nor `BEEVERFORGE_PANEL_TOKENS` is set — so anybody who "
+    "can reach that port could manage this factory, and in this mode the panel's process holds "
+    "the worker's credentials. Pass `BEEVERFORGE_PANEL_TOKEN` (or per-person "
+    "`BEEVERFORGE_PANEL_TOKENS`) into the container and start it again, or hold the panel to the "
+    "container with `--panel-host 127.0.0.1`.")
+
 
 @app.command("worker")
 def worker_cmd(
@@ -3105,8 +3114,9 @@ def worker_cmd(
         help="Also serve the panel, supervised with the worker: one container command against a "
              "remote engine"),
     panel_host: str | None = typer.Option(
-        None, help="With --with-panel: the interface the panel listens on (default 0.0.0.0; "
-                   "127.0.0.1 keeps it to the container, for a sidecar)"),
+        None, help="With --with-panel: the interface the panel listens on (default 0.0.0.0, "
+                   "which needs a panel sign-in such as BEEVERFORGE_PANEL_TOKEN; 127.0.0.1 "
+                   "keeps it to the container, for a sidecar)"),
     panel_port: int | None = typer.Option(
         None, help=f"With --with-panel: where the panel listens (default: the port "
                    f"`{_PANEL.reach_vars[0]}` or `{_PANEL.port_var}` names, else "
@@ -3120,7 +3130,9 @@ def worker_cmd(
 
     With `--with-panel` it also serves the panel and stops both together: the published worker
     image's command for one long-lived container against an engine run elsewhere. It ends with
-    the status of whichever process ended, and SIGTERM stops both.
+    the status of whichever process ended, and SIGTERM stops both. The panel shares the worker's
+    environment, credentials included, so off the loopback it refuses to start a panel that
+    asks for no sign-in (set `BEEVERFORGE_PANEL_TOKEN` or `BEEVERFORGE_PANEL_TOKENS`).
 
     Without the durable engine's client library (the `runtime` extra) it refuses in one sentence
     that names the install, instead of starting."""
@@ -3157,7 +3169,44 @@ def _worker_with_panel(*, panel_host: str, panel_port: int | None) -> None:
     """`worker --with-panel`: the worker and the panel under `host.run`, which supervises (#363).
 
     NOT `up --no-engine`, which plans the panel alone and never a worker — a worker there, beside
-    the `localhost` engine address `init` writes, would exit at once and take the panel down."""
+    the `localhost` engine address `init` writes, would exit at once and take the panel down.
+
+    A DEPLOYMENT PROCESS, so its lines are the log's (review of #406): it is the worker image's
+    container command, and what it says sits in the container's log beside the worker's and the
+    panel's lines. Its log is set up first, and every line it and `host.run` say goes through
+    `logs.announce` — printed as it always was, or a JSON line at its level. Only a refusal before
+    anything starts speaks to the terminal, from `_the_set_or_a_refusal`."""
+    from beeverforge.observability import logs
+    from beeverforge.runtime import host
+
+    logs.configure()
+    planned = _the_set_or_a_refusal(panel_host=panel_host, panel_port=panel_port)
+
+    def say(line: str) -> None:
+        # THE LEVEL IS THE LINE'S MARK: `✗` a process of the set that ended it or never started —
+        # the container exits with its status next — and `!` what did not go as declared. Each
+        # mark is its own call site, so the guard that classes every line for a person by its
+        # first words (`LINE_LEVELS`) classes each.
+        if line.startswith("✗ "):
+            logs.announce(log, f"✗ {line.removeprefix('✗ ')}", logging.ERROR)
+        elif line.startswith("! "):
+            logs.announce(log, f"! {line.removeprefix('! ')}", logging.WARNING)
+        else:
+            logs.announce(log, line)
+
+    for line in planned.said:
+        say(f"! {line}")
+    say(f"the panel will be at {planned.reach[_PANEL.name]} (listening on {panel_host})")
+    code = host.run(planned.plan, say=say, env=planned.env)
+    if code:
+        raise typer.Exit(code)
+
+
+def _the_set_or_a_refusal(*, panel_host: str, panel_port: int | None):
+    """The worker and the panel, planned — or a refusal, before anything starts (#363).
+
+    Like `_refuse_without_the_client`, each refusal here answers before the command becomes the
+    supervisor of anything, so it speaks to the terminal, on stderr."""
     from beeverforge import listeners
     from beeverforge.runtime import host
 
@@ -3166,17 +3215,34 @@ def _worker_with_panel(*, panel_host: str, panel_port: int | None) -> None:
     if not listeners.ENGINE.declared():
         typer.echo(f"✗ {NO_ENGINE_DECLARED}", err=True)
         raise typer.Exit(code=1)
+    # AN OPEN PANEL OFF THE LOOPBACK IS NOT STARTED (review of #406). The documented command
+    # served one on every interface: `0.0.0.0` and no token. In this mode it would also be the
+    # process that holds the worker's GitHub App key and model credential. On the loopback it may
+    # start open, for a sidecar in the container's own network namespace.
+    if panel_host not in listeners.THIS_MACHINE and _the_panel_would_be_open():
+        typer.echo(f"✗ {OPEN_PANEL_OFF_THE_LOOPBACK.format(host=panel_host)}", err=True)
+        raise typer.Exit(code=1)
     try:
-        planned = host.worker_and_panel(panel_host=panel_host, panel_port=panel_port)
+        return host.worker_and_panel(panel_host=panel_host, panel_port=panel_port)
     except listeners.CannotHonour as exc:
         typer.echo(f"worker: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    for line in planned.said:
-        typer.echo(f"! {line}")
-    typer.echo(f"the panel will be at {planned.reach[_PANEL.name]} (listening on {panel_host})")
-    code = host.run(planned.plan, say=typer.echo, env=planned.env)
-    if code:
-        raise typer.Exit(code)
+
+
+def _the_panel_would_be_open() -> bool:
+    """Whether the panel, started from this environment, would let everybody in — asked as the
+    panel's own gate asks it (`api.app._admission`): the deployment's identity provider, and its
+    `open_to_everyone`. So a per-person token, a product or board credential, single sign-on or a
+    person registered by invitation closes it here exactly as it closes the panel.
+
+    A provider that cannot be built is NOT open: the panel then refuses every request."""
+    from beeverforge.identity import build_identity
+
+    try:
+        provider = build_identity()
+    except (ValueError, TypeError):
+        return False
+    return bool(getattr(provider, "open_to_everyone", lambda: False)())
 
 
 @app.command("up")
