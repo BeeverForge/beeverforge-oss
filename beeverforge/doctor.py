@@ -1006,6 +1006,15 @@ def _api_budget(p: Probes, *, pickup_held: bool = False) -> Finding:
                    f"{resource} budget {share} (refills at {when})")
 
 
+def _the_wait() -> str:
+    """How long the doctor waited for each listener, and what sets it (#407) — said only where a
+    listener was asked and did not answer."""
+    from beeverforge.runtime.temporal.deadlines import read_deadline
+
+    return (f"; the doctor waited {read_deadline():g}s for each answer — on a loaded machine "
+            f"that answers later, raise `BEEVERFORGE_ENGINE_DEADLINE`")
+
+
 def _processes(p: Probes) -> Finding:
     """Which of the three processes answer — asked only where they are the operator's to start.
 
@@ -1051,7 +1060,7 @@ def _processes(p: Probes) -> Finding:
             f"panel draws opens an address nothing is listening on",
             f"`beeverforge up` starts the UI beside the engine and tells the panel where it put "
             f"it; with an engine started separately, set `{var}` to where its UI answers "
-            f"(`temporal server start-dev --ui-port <port>` is what moves it)")
+            f"(`temporal server start-dev --ui-port <port>` is what moves it){_the_wait()}")
     if engine_up and panel_up:
         return Finding("processes", True,
                        f"the durable engine answers on {engine_where}"
@@ -1068,12 +1077,14 @@ def _processes(p: Probes) -> Finding:
             f"human merge gate, park/resume and every deadline are waiting on a process nobody "
             f"started",
             "run `beeverforge up` (it starts the engine, the worker and the panel together), or "
-            "`temporal server start-dev` if you would rather run them separately")
+            "`temporal server start-dev` if you would rather run them separately"
+            f"{_the_wait()}")
     return Finding(
         "processes", False,
         f"neither the durable engine ({engine_where}) nor the panel ({panel_where}) answers on "
         f"this machine",
-        "run `beeverforge up` — the engine, the worker and the panel, in one window")
+        f"run `beeverforge up` — the engine, the worker and the panel, in one window"
+        f"{_the_wait()}")
 
 
 def _traits(p: Probes):
@@ -2823,10 +2834,14 @@ def probes_for(project) -> Probes:
             CannotHonour,
             started_by_up,
         )
+        from beeverforge.runtime.temporal.deadlines import read_deadline
 
         def _answers(host: str, port: int) -> bool:
+            # AS LONG AS THE ENGINE'S DEADLINE (#407), read per call: a fixed 1.5 s reported a
+            # listener that answers late on a loaded host as down, while every read of the same
+            # engine waits `BEEVERFORGE_ENGINE_DEADLINE`.
             try:
-                with socket.create_connection((host, port), timeout=1.5):
+                with socket.create_connection((host, port), timeout=read_deadline()):
                     return True
             except OSError:
                 return False
