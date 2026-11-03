@@ -157,7 +157,7 @@ def qualify_ref(repo: str, ref: object, default_repo: str = "") -> str:
     in the forge's own spelling, so `Acme/api` read back for a registry that says `acme/api` is
     the project's own card, bare — never a second identity for one ticket."""
     bare = canonical_ref(ref)
-    if not repo or repo.casefold() == default_repo.casefold():
+    if not repo or repo.casefold() == (default_repo or "").casefold():
         return bare
     return f"{repo}#{bare}"
 

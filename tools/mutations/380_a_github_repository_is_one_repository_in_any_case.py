@@ -26,7 +26,7 @@ _NONE = '            if False:\n'
 
 MUTATIONS = [
     ("qualify_ref compares by spelling, so the project's own card leaves as `Acme/api#12`", REFS,
-     "    if not repo or repo.casefold() == default_repo.casefold():",
+     '    if not repo or repo.casefold() == (default_repo or "").casefold():',
      "    if not repo or repo == default_repo:",
      f"{TEST}::test_a_card_in_the_projects_repository_spelled_otherwise_is_bare"),
 
@@ -39,7 +39,7 @@ MUTATIONS = [
      f"{TEST}::test_a_rank_finds_the_anchor_github_spells_otherwise"),
 
     ("qualify_ref takes every repository for the project's own, so a foreign card is bare", REFS,
-     "    if not repo or repo.casefold() == default_repo.casefold():",
+     '    if not repo or repo.casefold() == (default_repo or "").casefold():',
      "    if True:",
      f"{TEST}::test_a_card_in_another_repository_is_still_qualified"),
 
