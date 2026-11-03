@@ -3132,19 +3132,25 @@ def worker_cmd(
     if with_panel:
         _worker_with_panel(panel_host=panel_host or "0.0.0.0", panel_port=panel_port)
         return
-    # A PANEL FLAG WITHOUT THE PANEL IS REFUSED, not dropped: a container command that names
-    # `--panel-host 127.0.0.1` and forgets `--with-panel` would otherwise run a worker alone and
-    # serve no panel, in silence (#363's review of the flags).
-    if panel_host is not None or panel_port is not None:
-        typer.echo("worker: --panel-host and --panel-port only say where the panel listens, and "
-                   "without --with-panel no panel is started; add --with-panel to serve it "
-                   "beside the worker, or drop the panel flags.", err=True)
-        raise typer.Exit(code=2)
+    _refuse_panel_flags_without_the_panel(panel_host, panel_port)
     # `born`, not `main`: the same door the module's own `-m` entry uses, so an engine that never
     # started listening is a sentence here too rather than a traceback (#135).
     from beeverforge.runtime.temporal.worker import born as worker_born
 
     asyncio.run(worker_born())
+
+
+def _refuse_panel_flags_without_the_panel(panel_host: str | None, panel_port: int | None) -> None:
+    """A panel flag without `--with-panel` is refused, not dropped (#363).
+
+    A container command that names `--panel-host 127.0.0.1` and forgets `--with-panel` would
+    otherwise run a worker alone and serve no panel, in silence. Like `_refuse_without_the_client`,
+    this answers before the command becomes the worker process, so it speaks to the terminal."""
+    if panel_host is not None or panel_port is not None:
+        typer.echo("worker: --panel-host and --panel-port only say where the panel listens, and "
+                   "without --with-panel no panel is started; add --with-panel to serve it "
+                   "beside the worker, or drop the panel flags.", err=True)
+        raise typer.Exit(code=2)
 
 
 def _worker_with_panel(*, panel_host: str, panel_port: int | None) -> None:
