@@ -69,4 +69,10 @@ MUTATIONS = [
     ("the operations page shows the container command apart from the compose stack's", DOCS,
      "own container:\n\n```bash\ndocker compose --env-file .env.compose up -d --build\n```\n",
      "own container.\n"),
+
+    ("a panel flag without --with-panel is dropped, and the worker runs alone with no panel",
+     "beeverforge/cli.py",
+     "    if panel_host is not None or panel_port is not None:\n",
+     "    if False:\n",
+     f"{TEST}::test_a_panel_flag_without_with_panel_is_refused_not_dropped"),
 ]

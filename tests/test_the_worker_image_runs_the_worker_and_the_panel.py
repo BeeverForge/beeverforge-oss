@@ -201,6 +201,25 @@ def test_worker_without_the_flag_still_runs_the_worker_alone(engine_only, monkey
     assert "plan" not in engine_only, "plain `worker` started the panel too"
 
 
+@pytest.mark.parametrize("flags", [["--panel-host", "127.0.0.1"], ["--panel-port", "8090"]])
+def test_a_panel_flag_without_with_panel_is_refused_not_dropped(engine_only, monkeypatch, flags):
+    import beeverforge.runtime.temporal.worker as worker
+
+    ran: list[str] = []
+
+    async def born():
+        ran.append("worker")
+
+    monkeypatch.setattr(worker, "born", born)
+
+    result = CliRunner().invoke(app, ["worker", *flags])
+
+    assert result.exit_code == 2, result.output
+    assert "--with-panel" in result.output and "no panel is started" in result.output
+    assert ran == [], "the worker started alone, and the panel flag was dropped"
+    assert "plan" not in engine_only
+
+
 def _container_section() -> str:
     text = (ROOT / "docs" / "operations.md").read_text()
     sections = re.split(r"(?m)^(?=#{2,3} )", text)
