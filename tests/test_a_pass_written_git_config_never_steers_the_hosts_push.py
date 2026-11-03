@@ -31,6 +31,7 @@ old shape, so the proofs below are not proving an absence that would hold anyway
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -583,3 +584,81 @@ def test_a_box_that_could_not_read_its_git_directory_at_prepare_says_so(scene, w
     assert said.startswith("push failed:") and "could not be read when the box was prepared" in said
     assert "run the job again" in said
     assert list(own_tmp.iterdir()) == []
+
+
+# ── a job-written alternates chain (review of #403) ─────────────────────────────────────────────
+
+def _a_job_borrowing_from_elsewhere(scene, git_dir: Path, shape: str) -> str:
+    """What a job can do to the objects directory it can write: name another object directory on
+    the host (here a decoy repository's, standing in for another project's cache), and point its
+    branch at a commit only that directory holds. Returns the decoy's commit."""
+    decoy = _a_decoy_branch(scene, "elsewhere")
+    theirs = _git(decoy, "rev-parse", "HEAD").stdout.strip()
+    objects = git_dir / "objects"
+    elsewhere = f"{decoy / '.git' / 'objects'}\n"
+    if shape == "alternates":
+        (objects / "info" / "alternates").write_text(elsewhere)
+    elif shape == "http-alternates":
+        (objects / "info" / "http-alternates").write_text("https://example.invalid/objects\n")
+    elif shape == "info-symlink":
+        planted = scene["root"] / "planted-info"
+        planted.mkdir()
+        (planted / "alternates").write_text(elsewhere)
+        shutil.rmtree(objects / "info")
+        (objects / "info").symlink_to(planted)
+    else:  # objects-symlink
+        moved = scene["root"] / "moved-objects"
+        objects.rename(moved)
+        objects.symlink_to(moved)
+    return theirs
+
+
+@pytest.mark.parametrize("shape", ["alternates", "http-alternates", "info-symlink",
+                                   "objects-symlink"])
+def test_the_worktree_boxs_push_refuses_a_job_that_borrows_objects_from_elsewhere(
+        scene, worktree_box, own_tmp, shape):
+    box, repo = worktree_box
+    ws = box.prepare(repo_path=repo, base_branch="main", branch="sdlc/1",
+                     remote_url=str(scene["forge"]))
+    _commit(Path(ws.path), "print('two')\n")
+    theirs = _a_job_borrowing_from_elsewhere(scene, repo / ".git", shape)
+    if shape == "alternates":
+        (repo / ".git" / "refs" / "heads" / "sdlc" / "1").write_text(f"{theirs}\n")
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    said = str(refused.value)
+    assert said.startswith("push failed:")
+    cause = "is a symlink" if shape.endswith("symlink") else "borrows objects from elsewhere"
+    assert cause in said and "then publish again" in said, said
+    assert _git(scene["forge"], "cat-file", "-e", theirs, check=False).returncode != 0
+    assert _git(scene["forge"], "rev-parse", "--verify", "--quiet", "refs/heads/sdlc/1",
+                check=False).returncode != 0
+    assert list(own_tmp.iterdir()) == []
+
+
+def test_the_container_boxs_push_never_sends_objects_from_a_directory_the_box_cannot_see(scene):
+    """The box sees only /workspace, but an alternates entry is resolved by the host's git, on
+    the host's filesystem: a job that names another project's cache there would have that
+    project's objects pushed to this project's forge."""
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.container import ContainerSandbox, _materialize_workspace
+
+    host_clone = scene["root"] / "host-clone"
+    _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
+                           branch="sdlc/2", checkout_existing=False,
+                           remote_url=str(scene["forge"]))
+    box = ContainerSandbox(image="unused")
+    box._host_clone, box._repo_path = host_clone, scene["repo"]
+    _commit(host_clone, "print('three')\n")
+    theirs = _a_job_borrowing_from_elsewhere(scene, host_clone / ".git", "alternates")
+    (host_clone / ".git" / "refs" / "heads" / "sdlc" / "2").write_text(f"{theirs}\n")
+    ws = Workspace(path=Path("/workspace"), host_path=host_clone, branch="sdlc/2",
+                   base_branch="main")
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    assert "borrows objects from elsewhere" in str(refused.value)
+    assert _git(scene["forge"], "cat-file", "-e", theirs, check=False).returncode != 0

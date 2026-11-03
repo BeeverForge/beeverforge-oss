@@ -71,7 +71,10 @@ interesting surface is well-defined:
   files, so what it writes there can redirect that push and name a program it runs; the push runs
   in the workload's own scrubbed environment, so that program runs as the job's user with the
   job's environment, and the credential the push carries is the person's own, which a worktree
-  workload running as that user can already read. With the local forge the push's target is a
+  workload running as that user can already read. On both doors the push borrows the job's
+  objects and nothing else: a job's repository whose objects directory names another one
+  (`info/alternates`, `info/http-alternates`, or a symlinked `objects`) is refused, so a job cannot
+  make the push send another repository's objects. With the local forge the push's target is a
   repository on this machine, whose receiving side runs under that repository's own config and
   hooks; that is tracked with the other host-side git calls in #400.
 

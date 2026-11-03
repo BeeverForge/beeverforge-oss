@@ -9,7 +9,8 @@ THE CLAIMS, each held by a row:
      borrows the pass's objects through `objects/info/alternates` and takes the branch's commit
      from the ref read as data — a plain object name, from the loose ref or `packed-refs`, never
      through a symbolic ref, a symlink or a reftable, and from the git directory the box settled
-     before the pass ran.
+     before the pass ran. An objects directory that borrows from another one (`info/alternates`,
+     `info/http-alternates`, a symlinked `objects` or `objects/info`) is refused.
   3. **The forge door reads no user-level, system or ssh configuration** (review of #403): on the
      worktree box the pass runs as the worker's user and can write them.
   4. **The ambient door keeps the person's own configuration, in the workload's own environment**,
@@ -70,6 +71,12 @@ MUTATIONS = [
      "        (own / \"objects\" / \"info\" / \"alternates\").write_text(f\"{git_dir / "
      "'objects'}\\n\")\n",
      "        pass\n"),
+
+    ("a job-written alternates chain is followed, so the push sends another repository's objects",
+     PUSH, "    _borrows_nothing(git_dir)\n", ""),
+
+    ("a symlinked `objects` or `objects/info` is followed to wherever it points", PUSH,
+     "        if path.is_symlink():\n", "        if False:\n"),
 
     ("whatever the ref file holds is taken as the commit, a symbolic ref or a word included",
      PUSH,

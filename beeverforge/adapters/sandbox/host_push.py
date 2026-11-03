@@ -29,10 +29,13 @@ holding its base, a repository of 1.4 GiB packed): 55 to 70 s per push with the 
 fetch's 180 s timeout, and 20 ms with the borrowing; 0.3 to 1.2 s and 17 ms on two of 11 and 16
 MiB.
 
-WHAT THE JOB'S `objects/info/alternates` CHAIN CAN DO. Git follows it as object directories only
-(an entry it cannot resolve is reported and skipped), so a job that writes it can make the push
-send objects from another object directory it names on the host — objects only, and only ones it
-can name. That is what the fetch, and the push before #386, allowed too.
+A JOB-WRITTEN ALTERNATES CHAIN IS REFUSED (review of #403). Git follows the borrowed directory's
+own `info/alternates` recursively, so a job that wrote one (on the container box, naming a host
+path the box cannot even see, such as another project's cache) could make the push send that
+directory's objects to this project's forge. No box makes one, so the push refuses a job's
+objects directory that carries `info/alternates` or `info/http-alternates`, or whose `objects` or
+`objects/info` is a symlink, before anything is borrowed. Before #386, and with the fetch, git
+followed such a chain.
 
 WHICH CONFIGURATION THE PUSH READS, PER DOOR:
 
@@ -106,6 +109,7 @@ def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: st
     temporary directory is removed either way."""
     ref = f"refs/heads/{branch}"
     commit = _the_branchs_commit(git_dir, branch)
+    _borrows_nothing(git_dir)
     scratch = Path(tempfile.mkdtemp(prefix="beeverforge-push-"))
     try:
         own = scratch / "repo.git"
@@ -148,6 +152,33 @@ def _own_configuration_only(scratch: Path) -> dict[str, str]:
         "GIT_SSH_COMMAND": "ssh -F /dev/null",
     })
     return env
+
+
+def _borrows_nothing(git_dir: Path) -> None:
+    """Refused, with a cause and a remedy, when the job's objects directory borrows from another
+    one: `info/alternates` or `info/http-alternates` present (looked at with `lstat`, never
+    followed), or `objects` or `objects/info` a symlink. Git follows an alternates chain
+    recursively, so a job that wrote one could make the push send objects from any object
+    directory on the host, another project's cache included. No box makes one (#403 review:
+    neither the cache, the worktree box nor the container clone, which is `--no-local`)."""
+    objects = git_dir / "objects"
+    for path in (objects, objects / "info"):
+        if path.is_symlink():
+            raise RuntimeError(
+                f"push failed: {path} in the job's repository is a symlink, which the host does "
+                "not follow — replace it with the directory itself (or run the job again), then "
+                "publish again")
+    for name in ("alternates", "http-alternates"):
+        borrowed = objects / "info" / name
+        try:
+            os.lstat(borrowed)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        raise RuntimeError(
+            f"push failed: the job's repository {git_dir} borrows objects from elsewhere "
+            f"({borrowed}), which the host's push never follows — make the repository hold its "
+            f"own objects (`git repack -a -d`, then remove {borrowed}), or run the job again, "
+            "then publish again")
 
 
 def _the_branchs_commit(git_dir: Path, branch: str) -> str:
