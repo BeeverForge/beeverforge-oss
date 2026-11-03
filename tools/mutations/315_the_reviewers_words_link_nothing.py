@@ -4,8 +4,10 @@
 request body as written, and `format_review` posted them the same way, so a `#1`, `GH-2`,
 `owner/repo#3` or `@someone` in them linked an unrelated issue or notified a stranger. Both now
 pass that text through `_without_reviewer_mentions`: every bare `&` escaped outside closed code
-and the links GitHub makes of bare ones (so no entity spells the others), main's `without_mentions` (which writes `#1` and `GH-2` as `card 1` and
-`card 2`, #111), then a zero-width space after a name's `@`.
+and the links GitHub makes of bare ones (so no entity spells the others), main's
+`without_mentions` (which writes `#1` and `GH-2` as `card 1` and `card 2`, #111), then a
+zero-width space after a name's `@`, and between `GH` and `-<number>` where that rewrite missed
+one (`_GH-1_`, `éGH-1`).
 """
 
 TEST = "tests/test_the_reviewers_words_link_nothing.py"
@@ -32,16 +34,29 @@ MUTATIONS = [
 
     # ── what the helper does ────────────────────────────────────────────────────────────────────
     ("the helper leaves `#<number>` live", MACHINE,
-     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", words)'''),
 
     ("the helper leaves a name live", MACHINE,
-     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
-     '''    return without_mentions(words)'''),
+     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    words = without_mentions(words)'''),
+
+    # restored (review of #323 at 12c5242): main's `\b`-bounded rewrite misses `_GH-1_` and `éGH-1`
+    ("the helper leaves `GH-<number>` live", MACHINE,
+     '''    return _A_GH_REFERENCE.sub("\\\\1\\u200b", words)''',
+     '''    return words'''),
+
+    ("`gh-<number>` is left live", MACHINE,
+     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)", re.IGNORECASE)''',
+     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)")'''),
+
+    ("a `GH` glued to a word is broken too", MACHINE,
+     '''_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\\d)", re.IGNORECASE)''',
+     '''_A_GH_REFERENCE = re.compile(r"(GH)(?=-\\d)", re.IGNORECASE)'''),
 
     ("an address's `@` is broken too", MACHINE,
-     '''    return _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
-     '''    return re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
+     '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
+     '''    words = re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
 
     ("an entity is left live: `&` is not escaped", MACHINE,
      '''    words = _ampersands_escaped(words)''',
@@ -111,9 +126,13 @@ MUTATIONS = [
     # "an http autolink's `&` is escaped" below holds the same claim.
 
     # ── an autolink, `<scheme:…>`, where no backslash is an escape (review of #323 at 208035c) ──
-    ("an autolink not `http(s)` keeps its `<`, so its `\\&` is no escape", MACHINE,
-     '''    return f"{autolink[1]}\\\\{autolink[0][len(autolink[1]):]}"''',
+    ("an autolink not `http(s)` is left an autolink, so its `\\&` is no escape", MACHINE,
+     '''    return f"{autolink[0][:colon]}\\\\{autolink[0][colon:]}"''',
      '''    return autolink[0].replace("&", "\\\\&")'''),
+
+    ("the autolink is broken at its `<`, which a bare link glued before it takes", MACHINE,
+     '''    return f"{autolink[0][:colon]}\\\\{autolink[0][colon:]}"''',
+     '''    return f"{autolink[1]}\\\\{autolink[0][len(autolink[1]):]}"'''),
 
     ("every scheme's autolink is kept as written", MACHINE,
      "    if autolink[2].lower() in _LINKED_SCHEMES:",

@@ -409,6 +409,11 @@ def _as_text(words: str) -> str:
     return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
 
 
+#: A `GH-<number>` GitHub links as an issue, any case, not glued to an ASCII letter or digit
+#: (`AGH-3` is not one). Main's `_A_GH_MENTION` writes most `card <number>`, but its `\b` on both
+#: sides misses `_GH-1_`, `__GH-1__` and `éGH-1`, which GitHub links (review of #323 at 12c5242,
+#: measured on `POST /markdown`); `_without_reviewer_mentions` breaks what is left.
+_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
 #: An `&` no backslash escapes: after none, or after escaped pairs (`\\&`). GitHub decodes an
 #: entity before it links, so `&#x40;name`, `&commat;name`, `&#x23;1` and `GH&#x2D;1` mentioned
 #: and linked (review of #323, measured on `POST /markdown`). One more backslash makes the `&`
@@ -518,14 +523,18 @@ _LINKED_SCHEMES = ("http", "https")
 
 
 def _unlinked(autolink: re.Match) -> str:
-    """An `_AN_AUTOLINK` GitHub keeps (`_LINKED_SCHEMES`, any case) as written; any other with its
-    `<` escaped, so it is no autolink and a backslash before its `&` is an escape again. Breaking
-    the link, not the entity, because no character inside an autolink is an escape: `ftp:`,
-    `irc:` and the rest render as text on GitHub anyway (the plain `<ftp://ex.com/@name>` linked
-    nothing), so only a `\\` before them is new."""
+    """An `_AN_AUTOLINK` GitHub keeps (`_LINKED_SCHEMES`, any case) as written; any other with the
+    `:` after its scheme escaped, so it is no autolink and a backslash before its `&` is an escape
+    again. Breaking the link, not the entity, because no character inside an autolink is an
+    escape: `ftp:`, `irc:` and the rest render as text on GitHub anyway (the plain
+    `<ftp://ex.com/@name>` linked nothing). Not its `<`: a bare link glued before it
+    (`https://ex.com/<ftp://…>`) took that backslash into its address, and the `<` opened the
+    autolink again (review of #323 at 12c5242, measured on `POST /markdown`). A scheme holds no
+    backslash, and a bare link ends at the `<`, so the `\\:` is the autolink's alone."""
     if autolink[2].lower() in _LINKED_SCHEMES:
         return autolink[0]
-    return f"{autolink[1]}\\{autolink[0][len(autolink[1]):]}"
+    colon = autolink.end(2) - autolink.start()
+    return f"{autolink[0][:colon]}\\{autolink[0][colon:]}"
 
 
 def _outside_links(text: str, before: str = "") -> str:
@@ -561,11 +570,13 @@ def _without_reviewer_mentions(words: str) -> str:
     Its summary and findings reached the pull request as written, so a `#12`, `owner/repo#12`,
     `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
     and `GH-<number>` (any case) are written `card <number>` (`without_mentions`, #111); a
-    zero-width space after the `@` of a name keeps it readable and makes it nothing a forge links.
-    Every bare `&` outside code and links is escaped first, so no entity spells one of them
+    zero-width space after the `@` of a name, and between `GH` and `-<number>` where main's
+    rewrite missed one (`_A_GH_REFERENCE`), keeps them readable and makes them nothing a forge
+    links. Every bare `&` outside code and links is escaped first, so no entity spells one of them
     (`_ampersands_escaped`). Applied before `_as_text`, so a `## ` row is still escaped."""
     words = _ampersands_escaped(words)
-    return _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    return _A_GH_REFERENCE.sub("\\1\u200b", words)
 
 
 def _sections_from(rows: list[str]) -> int:
