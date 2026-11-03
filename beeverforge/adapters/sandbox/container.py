@@ -53,6 +53,7 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 from beeverforge.adapters.sandbox.pull import PullCredential
 from beeverforge.observability import logs
 
@@ -865,12 +866,13 @@ class ContainerSandbox(SandboxAdapter):
             target = url.strip()
         # --force: the bot's dedicated beeverforge/<id> branch, unique per job, serial execution
         # — a retry after a partial failure must overwrite, not dead-lock on non-ff.
-        rc, out = _host(
-            gitpin.argv(["-C", str(self._host_clone), "push", "--force", "--", target,
-                         workspace.branch])
-        )
-        if rc != 0:
-            raise RuntimeError(f"push failed: {_redact(out)}")
+        #
+        # NEVER FROM THE HOST CLONE'S OWN GIT DIRECTORY (#386): the box sees that clone as
+        # /workspace, `.git/config` included, and a push run there reads what the job wrote —
+        # `insteadOf` sends the push elsewhere, `core.sshCommand` runs on the host. The push goes
+        # from a repository the host makes for it, outside the mount (`host_push`).
+        push_from_the_hosts_own_repository(source=self._host_clone, branch=workspace.branch,
+                                           target=target, run=_host, redact=_redact)
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
