@@ -34,7 +34,7 @@ NOT_LINKS = ["https://&#x40;someone", "http://&#x40;someone x", "(https://&#x40;
              "see:https://&#x40;someone", "https://a_b.c_d/&#x40;someone",
              "http://a_b/&#x40;someone", "http://-x/&#x40;someone",
              "xhttps://ex.com/&#x40;someone", "[https://ex.com/&#x40;someone", "https://&#x23;1",
-             "see <www.&#x40;someone> x", "see <www.&#x23;1> x"]
+             "see <www.&#x40;someone> x", "see <www.ex.com/&#x40;someone> x", "see <www.&#x23;1> x"]
 WORDS = f"Fixes #1, GH-2, gh-4, owner/repo#3, cc @someone {ENTITIES} {' '.join(NOT_LINKS)}"
 ZWSP = "​"
 
@@ -122,6 +122,11 @@ VERBATIM = ["use `a && b` here", "x && y", "see https://ex.com/?a=1&b=2 now",
             '"https://ex.com/?a=1&b=2"', "http://localhost:8080/?a=1&b=2",
             "see:https://ex.com/?a=1&b=2", "éhttps://ex.com/?a=1&b=2",
             "`a`https://ex.com/&#x40;x", "`a`https://ex.com/&#x40;x `b`",
+            "'https://ex.com/?a=1&b=2'", "=https://ex.com/?a=1&b=2", "/https://ex.com/?a=1&b=2",
+            "!https://ex.com/?a=1&b=2", "1https://ex.com/?a=1&b=2", "`a`https://ex.com/?a=1&b=2",
+            "http://x/y?a=1&b=2",
+            # GitHub decodes no entity inside an autolink: it is part of the address
+            '"https://ex.com/&#x40;someone"', "http://localhost:8080/&#x40;someone",
             # an angle autolink takes any host after its scheme (CommonMark)
             "or <http://a_b/?a=1&b=2> too"]
 FENCED = "\n".join([VERBATIM[0], "```sh", VERBATIM[1], "```", *VERBATIM[2:]])

@@ -78,6 +78,14 @@ MUTATIONS = [
      "        if False:"),
 
     # ── which bare links GitHub makes, and so keep their `&` (reviews of #323) ─────────────────
+    ("a bare link keeps its `&` whatever its domain", MACHINE,
+     "    return all(labels[:-1]) and not any(\"_\" in label for label in labels[-2:])",
+     "    return True"),
+
+    ("a scheme link keeps its `&` after any character", MACHINE,
+     '''    elif before == "[" or (before.isascii() and before.isalpha()):''',
+     '''    elif False:'''),
+
     ("a host that starts with neither a letter nor a digit is a host", MACHINE,
      "    elif not domain[:1].isalnum():",
      "    elif not domain:"),
