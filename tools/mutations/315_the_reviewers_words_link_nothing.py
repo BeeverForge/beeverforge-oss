@@ -130,6 +130,14 @@ MUTATIONS = [
      '''    return f"{autolink[0][:colon]}\\\\{autolink[0][colon:]}"''',
      '''    return autolink[0].replace("&", "\\\\&")'''),
 
+    ("an autolink after a reviewer's backslash is taken for no autolink", MACHINE,
+     r'''_AN_AUTOLINK = re.compile(r"(\\*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")''',
+     r'''_AN_AUTOLINK = re.compile(r"(?<!\\)((?:\\\\)*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")'''),
+
+    ("an `http(s)` autolink after an odd run of backslashes is kept as one", MACHINE,
+     "        if link.re is _AN_AUTOLINK and len(link[1]) % 2 and link[2].lower() in _LINKED_SCHEMES:",
+     "        if False:"),
+
     ("the autolink is broken at its `<`, which a bare link glued before it takes", MACHINE,
      '''    return f"{autolink[0][:colon]}\\\\{autolink[0][colon:]}"''',
      '''    return f"{autolink[1]}\\\\{autolink[0][len(autolink[1]):]}"'''),

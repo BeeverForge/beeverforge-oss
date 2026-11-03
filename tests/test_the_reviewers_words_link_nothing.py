@@ -35,7 +35,9 @@ NOT_LINKS = ["https://&#x40;someone", "http://&#x40;someone x", "(https://&#x40;
              "see:https://&#x40;someone", "https://a_b.c_d/&#x40;someone",
              "http://a_b/&#x40;someone", "http://-x/&#x40;someone",
              "xhttps://ex.com/&#x40;someone", "[https://ex.com/&#x40;someone", "https://&#x23;1",
-             "see <www.&#x40;someone> x", "see <www.ex.com/&#x40;someone> x", "see <www.&#x23;1> x"]
+             "see <www.&#x40;someone> x", "see <www.ex.com/&#x40;someone> x", "see <www.&#x23;1> x",
+             # an escaped `<` is no autolink, so the bare link in it is read on its own
+             "see \\<https://a_b.c_d/&#x40;someone> x"]
 #: An autolink whose scheme is not `http(s)`: no backslash inside one is an escape, so `\&` left
 #: the entity live (review of #323 at 208035c, measured on `POST /markdown`). The `:` after its
 #: scheme is escaped, so it is no autolink and `\&` is an escape again; not its `<`, whose `\` a
@@ -49,7 +51,15 @@ NOT_AUTOLINKS = ["see <ftp://ex.com/&#x40;someone> x", "see <irc://&#x40;someone
                  "see www.ex.com/<ftp://x/&#x40;someone> x", "see www.ex.com<a+b:&#x23;1> x",
                  "see ftp://ex.com/<ftp://x/&#x40;someone> x",
                  "see (https://ex.com/<ftp://x/&#x40;someone>) x",
-                 "see https://ex.com/?<ftp://x/&#x40;someone> x", "a@ex.com<ftp://x/&#x40;someone>"]
+                 "see https://ex.com/?<ftp://x/&#x40;someone> x", "a@ex.com<ftp://x/&#x40;someone>",
+                 # the reviewer's own backslash before the `<`, which a bare link glued before it
+                 # takes into its address all the same (review of #323 at 97001b1, measured), in
+                 # an odd run or an even one, and with no address before it
+                 "https://ex.com/\\<ftp://x/&#x40;someone>", "www.ex.com\\<ftp://x/&#x40;someone>",
+                 "see www.ex.com/\\<irc://x/&#x23;1> x", "http://localhost\\<ftp://x/&#x40;someone>",
+                 "ftp://ex.com/\\<ftp://x/&#x40;someone>", "https://ex.com/\\<a+b:&#x23;1>",
+                 "https://ex.com/\\\\\\<ftp://x/&#x40;someone>",
+                 "https://ex.com/\\\\<ftp://x/&#x40;someone>", "see \\<ftp://x/&#x40;someone> x"]
 #: A bare link glued to an autolink, alone on its row (review of #323 at 12c5242).
 A_GLUED_ROW = "https://ex.com/<ftp://x/&#x40;someone>"
 #: A `GH-N` main's `\b`-bounded rewrite misses but GitHub links (review of #323 at 12c5242,
@@ -64,8 +74,9 @@ ZWSP = "​"
 LIVE = [re.compile(r"#(?=\d)"),
         re.compile(r"(?<![A-Za-z0-9])GH-\d", re.IGNORECASE),
         re.compile(r"(?<![A-Za-z0-9])@[A-Za-z0-9]"),
-        # an autolink (`<scheme:`), in which no backslash is an escape
-        re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:"),
+        # an autolink (`<scheme:`) GitHub does not keep as a link, in which no backslash is an
+        # escape; whatever stands before its `<` (an `http(s)` one is an address, as written)
+        re.compile(r"<(?!https?:)[a-z][a-z0-9+.-]{1,31}:", re.IGNORECASE),
         # an `&` no backslash escapes: one after an even run of them (none, or escaped pairs)
         re.compile(r"(?<!\\)(?:\\\\)*&")]
 
@@ -166,7 +177,9 @@ VERBATIM = ["use `a && b` here", "x && y", "see https://ex.com/?a=1&b=2 now",
             # an angle autolink takes any host after its scheme (CommonMark), in any case
             "or <http://a_b/?a=1&b=2> too", "see <HTTPS://ex.com/?a=1&b=2> x",
             # an `http(s)` autolink glued to a bare link: GitHub links both, and no one is named
-            "see https://ex.com/<https://x/&#x40;someone> x"]
+            "see https://ex.com/<https://x/&#x40;someone> x",
+            # an `http(s)` autolink after a backslash is read as it was before
+            "see https://ex.com/\\<https://x/&#x40;someone> x", "see \\<https://ex.com/?a=1&b=2> x"]
 FENCED = "\n".join([VERBATIM[0], "```sh", VERBATIM[1], "```", *VERBATIM[2:]])
 
 

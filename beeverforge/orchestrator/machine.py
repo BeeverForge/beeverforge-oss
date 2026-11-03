@@ -513,11 +513,13 @@ def _autolinked(link: str, before: str, after: str) -> bool:
     return all(labels[:-1]) and not any("_" in label for label in labels[-2:])
 
 
-#: CommonMark's autolink, `<scheme:…>`, any scheme of 2 to 32 characters in any case, after no
-#: backslash (or after escaped pairs, kept in group 1). A backslash inside it is no escape, so
+#: CommonMark's autolink, `<scheme:…>`, any scheme of 2 to 32 characters in any case, with the run
+#: of backslashes before it in group 1. Read after any run: a bare link glued before `\<ftp:…>`
+#: takes the `\` into its address and the `<` opens the autolink after all (review of #323 at
+#: 97001b1, measured on `POST /markdown`). A backslash inside it is no escape, so
 #: `\&` there is a literal `\` and the entity after it still decoded: `<ftp://ex.com/&#x40;name>`
 #: mentioned and `<a+b:&#x23;1>` linked (review of #323 at 208035c, measured on `POST /markdown`).
-_AN_AUTOLINK = re.compile(r"(?<!\\)((?:\\\\)*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")
+_AN_AUTOLINK = re.compile(r"(\\*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")
 #: The autolinks GitHub keeps as links, where an entity is part of the address and mentions no one.
 _LINKED_SCHEMES = ("http", "https")
 
@@ -530,7 +532,8 @@ def _unlinked(autolink: re.Match) -> str:
     `<ftp://ex.com/@name>` linked nothing). Not its `<`: a bare link glued before it
     (`https://ex.com/<ftp://…>`) took that backslash into its address, and the `<` opened the
     autolink again (review of #323 at 12c5242, measured on `POST /markdown`). A scheme holds no
-    backslash, and a bare link ends at the `<`, so the `\\:` is the autolink's alone."""
+    backslash, and a bare link ends at the `<`, so the `\\:` is the autolink's alone, whatever
+    run of backslashes stands before the `<`; an autolink already broken so is no `_AN_AUTOLINK`."""
     if autolink[2].lower() in _LINKED_SCHEMES:
         return autolink[0]
     colon = autolink.end(2) - autolink.start()
@@ -547,6 +550,8 @@ def _outside_links(text: str, before: str = "") -> str:
         prior = text[link.start() - 1:link.start()] or before
         if link.start() < start:
             continue
+        if link.re is _AN_AUTOLINK and len(link[1]) % 2 and link[2].lower() in _LINKED_SCHEMES:
+            continue  # `\<https://…>`: its `<` is escaped, and the bare link in it is read as one
         if link.re is _AN_AUTOLINK:
             kept = _unlinked(link)
             piece = kept if kept == link[0] else _escaped_ampersands(kept)
