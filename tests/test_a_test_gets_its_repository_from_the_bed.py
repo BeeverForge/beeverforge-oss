@@ -13,7 +13,8 @@ What is pinned:
   1. a shape is built once — once for every process sharing the bed's root, as the xdist workers
      of one run do, under a lock no second process can take while the first builds — and handed
      out as a copy: never the template, and a change in one copy reaches neither the next copy
-     nor the template;
+     nor the template; every build of one shape is the same commit, since the `env` a builder
+     is handed pins the author's and committer's name, email and date (#375);
   2. a template a test changed in place is refused by name, at the next copy and at the end of
      the session — an order-dependent failure caught as what it is;
   3. a copy names its own path wherever the template named its own (a remote URL, a text file),
@@ -28,6 +29,7 @@ import fcntl
 import os
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,27 +131,28 @@ def test_a_shape_is_built_under_a_lock_no_other_process_can_take_meanwhile(tmp_p
     assert not failed, failed
 
 
-def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path, monkeypatch):
+def test_a_manifest_that_does_not_parse_is_built_again_not_refused_forever(tmp_path):
     """A worker killed in the middle of a manifest write left it truncated: the next ask for the
     shape builds it again, instead of every later request failing on the JSON.
 
-    THE TWO BUILDS LAND ON TWO DATES ON EVERY RUN, pinned, not left to the clock (#371): two
-    builds a second apart give two commits, so they are compared by what every build of the
-    shape shares, the tree."""
+    THE TWO BUILDS LAND ON TWO DATES ON EVERY RUN, set, not left to the clock (#371), so the
+    second commit tells the rebuild apart; they are compared by what every build of the shape
+    shares, the tree. The dates go through the `env` the build is handed, since the bed's own pin
+    there outranks the test's environment (#375)."""
     built: list[Path] = []
+    when = ["2026-01-01T00:00:00+0000"]
 
     def build(where, env):
         built.append(where)
+        for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+            env.setenv(name, when[0])
         _one_commit(where, env)
 
-    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
-        monkeypatch.setenv(name, "2026-01-01T00:00:00+0000")
     one = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "one", build)
     [manifest] = (tmp_path / "bed").glob("*/manifest.json")
     manifest.write_text(manifest.read_text(encoding="utf-8")[:20], encoding="utf-8")
 
-    for name in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
-        monkeypatch.setenv(name, "2026-01-02T00:00:00+0000")
+    when[0] = "2026-01-02T00:00:00+0000"
     two = Bed(tmp_path / "bed").copy("one-commit", tmp_path / "two", build)
 
     assert len(built) == 2, "the shape behind a truncated manifest was not built again"
@@ -214,6 +217,103 @@ def test_the_build_s_environment_is_undone(tmp_path, monkeypatch):
     assert (copy / "seen.txt").read_text() == "the build's"
     assert os.environ["BEEVERFORGE_GIT_BED_PROBE"] == "the test's"
     assert "BEEVERFORGE_GIT_BED_WRITTEN" not in os.environ
+
+
+#: Two ambient environments a test may run a build under, every pinned variable different in each
+#: and from the pin: a build that let any one of them through would differ between the two.
+AMBIENT = {
+    "A": {"GIT_AUTHOR_DATE": "2020-01-01T00:00:00+0000",
+          "GIT_COMMITTER_DATE": "2020-01-01T00:00:00+0000",
+          "GIT_AUTHOR_NAME": "ambient a", "GIT_AUTHOR_EMAIL": "a@ambient.invalid",
+          "GIT_COMMITTER_NAME": "ambient a", "GIT_COMMITTER_EMAIL": "a@ambient.invalid"},
+    "B": {"GIT_AUTHOR_DATE": "2021-06-15T12:34:56+0000",
+          "GIT_COMMITTER_DATE": "2021-06-15T12:34:56+0000",
+          "GIT_AUTHOR_NAME": "ambient b", "GIT_AUTHOR_EMAIL": "b@ambient.invalid",
+          "GIT_COMMITTER_NAME": "ambient b", "GIT_COMMITTER_EMAIL": "b@ambient.invalid"},
+}
+
+
+def _ambient(monkeypatch, which: str) -> None:
+    for key, value in AMBIENT[which].items():
+        monkeypatch.setenv(key, value)
+
+
+def test_every_builder_is_handed_an_env_that_pins_dates_and_identity(tmp_path, monkeypatch):
+    """The build sees the bed's pin whatever the test's environment holds, and the test finds its
+    own values again once the build is done (#375)."""
+    _ambient(monkeypatch, "A")
+    seen: list[dict] = []
+
+    def build(where, env):
+        seen.append({key: os.environ.get(key) for key in AMBIENT["A"]})
+        where.mkdir()
+
+    Bed(tmp_path / "bed").copy("probe", tmp_path / "copy", build)
+
+    assert set(the_git_bed.PINNED) == set(AMBIENT["A"])
+    assert seen == [the_git_bed.PINNED]
+    assert {key: os.environ.get(key) for key in AMBIENT["A"]} == AMBIENT["A"]
+
+
+def test_two_builds_of_one_shape_are_one_commit_whatever_the_ambient_date(tmp_path, monkeypatch):
+    """Two builds under two ambient dates and identities, on two roots so the second really
+    builds: one `HEAD`. No sleep and no clock: the dates differ because the test set them."""
+    built: list[Path] = []
+
+    def build(where, env):
+        built.append(where)
+        _one_commit(where, env)
+
+    _ambient(monkeypatch, "A")
+    one = Bed(tmp_path / "bed-one").copy("one-commit", tmp_path / "one", build)
+    _ambient(monkeypatch, "B")
+    two = Bed(tmp_path / "bed-two").copy("one-commit", tmp_path / "two", build)
+
+    assert len(built) == 2, "the second root did not build the shape again"
+    assert _git(two, "rev-parse", "HEAD") == _git(one, "rev-parse", "HEAD")
+
+
+#: Who and when a commit the bed made says it is, as `git log --format` prints it.
+WHO_AND_WHEN = "%an|%ae|%cn|%ce|%at|%ct"
+
+
+def _pinned_who_and_when() -> str:
+    pin = the_git_bed.PINNED
+    epoch = str(int(datetime.fromisoformat(pin["GIT_AUTHOR_DATE"]).timestamp()))
+    committed = str(int(datetime.fromisoformat(pin["GIT_COMMITTER_DATE"]).timestamp()))
+    return "|".join((pin["GIT_AUTHOR_NAME"], pin["GIT_AUTHOR_EMAIL"], pin["GIT_COMMITTER_NAME"],
+                     pin["GIT_COMMITTER_EMAIL"], epoch, committed))
+
+
+def _served(bed, dest):
+    src = dest.parent / "src"
+    src.mkdir(parents=True)
+    (src / "README.md").write_text("# served\n")
+    return the_git_bed.a_served_tree(bed, src, dest), ("HEAD",)
+
+
+def _card(bed, dest):
+    return the_git_bed.a_card_repository(bed, dest), ("main", the_git_bed.CARD_BRANCH)
+
+
+def _door(bed, dest):
+    the_git_bed.a_hosted_door(bed, dest)
+    return dest / "forge.git", ("main", the_git_bed.CARD_BRANCH)
+
+
+@pytest.mark.parametrize("shape", [_served, _card, _door], ids=["served-tree", "card", "door"])
+def test_the_bed_s_own_shapes_are_one_commit_and_commit_as_the_pin(tmp_path, monkeypatch, shape):
+    """The bed's own builders run git with the pinned `env`: under two ambient environments each
+    shape's refs are the same commits, and each commit says the pin's identity and date."""
+    _ambient(monkeypatch, "A")
+    one, refs = shape(Bed(tmp_path / "bed-one"), tmp_path / "one" / "shape")
+    _ambient(monkeypatch, "B")
+    two, _ = shape(Bed(tmp_path / "bed-two"), tmp_path / "two" / "shape")
+
+    for ref in refs:
+        assert _git(two, "rev-parse", ref) == _git(one, "rev-parse", ref), ref
+        assert _git(one, "log", f"--format={WHO_AND_WHEN}", ref).splitlines() == \
+            [_pinned_who_and_when()] * len(_git(one, "rev-list", ref).splitlines()), ref
 
 
 # ── 2. a template a test changed is refused by name ─────────────────────────────────────────────

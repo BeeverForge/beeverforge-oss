@@ -18,8 +18,10 @@ the test wants it:
 
 `build` is called the first time any worker of the run asks for the name, with a path that does
 not exist yet and a `pytest.MonkeyPatch` that is undone right after; the whole of `os.environ` is
-put back too, since a build that runs a CLI command may write it directly. So a shape that needs
-its own `HOME` or identity sets it there, and `_the_environment_is_restored_after_every_test`
+put back too, since a build that runs a CLI command may write it directly. The `env` comes with
+`PINNED` set: the author's and committer's name, email and date, so every build of one shape is
+the same commit whenever it runs (#375). So a shape that needs its own `HOME` or identity sets it
+there (`env.setenv` after the pin wins over it), and `_the_environment_is_restored_after_every_test`
 stays quiet. The copy is as disposable as a `tmp_path` repository: the test may commit, push and
 delete in it.
 
@@ -63,6 +65,19 @@ import pytest
 from tests.the_tree_read_once import could_say, parsed, source_text
 
 Build = Callable[[Path, pytest.MonkeyPatch], None]
+
+#: Who and when every commit a build makes says it is, set on the `env` each builder is handed
+#: (#375): two builds of one shape at two wall-clock times are then one commit, so a test that
+#: compares commits across builds cannot flake on a second boundary. A builder that needs its own
+#: identity or date sets it on `env` after, and wins.
+PINNED = {
+    "GIT_AUTHOR_DATE": "2001-02-03T04:05:06+0000",
+    "GIT_COMMITTER_DATE": "2001-02-03T04:05:06+0000",
+    "GIT_AUTHOR_NAME": "the git bed",
+    "GIT_AUTHOR_EMAIL": "bed@beeverforge.invalid",
+    "GIT_COMMITTER_NAME": "the git bed",
+    "GIT_COMMITTER_EMAIL": "bed@beeverforge.invalid",
+}
 
 
 class BedRefused(RuntimeError):
@@ -168,6 +183,8 @@ class Bed:
         try:
             try:
                 with pytest.MonkeyPatch.context() as env:
+                    for key, value in PINNED.items():
+                        env.setenv(key, value)
                     build(where, env)
             finally:
                 os.environ.clear()
@@ -264,8 +281,9 @@ def _served_tree(src: Path) -> Build:
 
 
 def a_served_tree(bed: Bed, src: Path, dest: Path) -> Path:
-    """`src` as a git repository at `dest`: one commit on `main` by `fixture`, serving partial
-    clones (`uploadpack.allowFilter`, `uploadpack.allowAnySHA1InWant`)."""
+    """`src` as a git repository at `dest`: one commit on `main` by the bed's `PINNED` identity
+    and date, which outrank the `fixture` config identity, serving partial clones
+    (`uploadpack.allowFilter`, `uploadpack.allowAnySHA1InWant`)."""
     return bed.copy(f"served-tree:{Path(src).resolve()}", dest, _served_tree(Path(src)))
 
 
