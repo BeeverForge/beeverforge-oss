@@ -175,10 +175,13 @@ def test_generating_is_fast_enough_to_do_every_time(capsys):
     the map of a repository the test builds — `FILES` Python files, each about the size of this
     repository's average one — and its budget is `FILES × PER_FILE_ALLOWANCE`. What it guards is
     the PER-FILE cost, which is what ADR-0023 rests on (a map of N files costs N small, linear
-    pieces of work), and adding files to this repository cannot fail it. The allowance is about
-    four times the per-file cost measured alone on a laptop, because CI's runner reads about 2.5
-    times slower. If generation gets several times dearer per file, this goes red — and the
-    answer is still not to raise the allowance."""
+    pieces of work), and adding files to this repository cannot fail it. MEASURED 2026-11-03 on
+    this input, alone: 0.83 s (2.08 ms a file, median of 5) on a laptop, and 0.760 s (1.90 ms a
+    file) in CI's `integration` job, so the 8 ms allowance leaves about 3.9 and 4.2 times of
+    margin. (The 2.5 times CI was slower on the whole repository does not carry over: git and the
+    size of the tree differ between machines, and this input has neither.) A heavily loaded
+    machine can still eat the margin, as it could the old one. If generation gets several times
+    dearer per file, this goes red — and the answer is still not to raise the allowance."""
     def cpu() -> float:
         t = os.times()
         return t.user + t.system + t.children_user + t.children_system
