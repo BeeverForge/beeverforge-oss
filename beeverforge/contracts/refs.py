@@ -151,9 +151,13 @@ def qualify_ref(repo: str, ref: object, default_repo: str = "") -> str:
 
     Qualified ONLY when it must be: the bare spelling is what every persisted key, workflow id
     and journal stem already uses, so qualifying the common case would split one ticket into two
-    identities — the exact defect `canonical_ref` exists to prevent, one level up."""
+    identities — the exact defect `canonical_ref` exists to prevent, one level up.
+
+    Compared WITHOUT CASE (#380): GitHub and Azure DevOps names ignore case, and a board answers
+    in the forge's own spelling, so `Acme/api` read back for a registry that says `acme/api` is
+    the project's own card, bare — never a second identity for one ticket."""
     bare = canonical_ref(ref)
-    if not repo or repo == default_repo:
+    if not repo or repo.casefold() == default_repo.casefold():
         return bare
     return f"{repo}#{bare}"
 
