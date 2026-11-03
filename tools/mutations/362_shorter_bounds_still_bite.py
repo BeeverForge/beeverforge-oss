@@ -143,17 +143,17 @@ MUTATIONS = [
      LOGS + "::test_a_second_caller_cannot_read_the_flight_until_the_first_has_set_it"),
 
     # ── the worker's wait for its engine: every number a third or less of what it was ───────
-    # RE-PINNED 2026-11-03 (#398): the birth probe is handed what is left of the birth's wait
-    # instead of a fixed 1.0 s of its own. Same cut.
+    # RE-PINNED 2026-11-03 (#398): the birth probe is handed `_birth_bound` (what is left of the
+    # birth's wait, at least the read deadline) instead of a fixed 1.0 s of its own. Same cut.
     ("the worker dials at once, before anything listens", CONNECTION,
-     "    while not await _listening(host, port, within=deadline - time.monotonic()):",
+     "    while not await _listening(host, port, within=_birth_bound(deadline)):",
      "    while False:",
      WORKER + "::test_a_listener_that_starts_LATE_is_waited_for_and_dialled_once"),
     ("the wait for an engine that never listens has no bound", CONNECTION,
      "        if time.monotonic() >= deadline:", "        if False:",
      WORKER + "::test_an_engine_that_NEVER_listens_is_a_bounded_wait_and_a_sentence"),
     ("the birth connect is given a read's deadline, not the start-up wait", CONNECTION,
-     "    within = max(deadline - time.monotonic(), read_deadline())\n",
+     "    within = _birth_bound(deadline)\n",
      "    within = read_deadline()\n",
      WORKER + "::test_an_engine_that_takes_the_socket_and_never_answers_is_given_the_start_up_wait"),
     ("the probe blocks the loop, so the wait cannot be cancelled", CONNECTION,

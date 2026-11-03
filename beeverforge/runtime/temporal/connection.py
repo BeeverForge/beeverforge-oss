@@ -492,8 +492,8 @@ async def _listening(host: str, port: int, within: float | None = None) -> bool:
     NO BOUND OF ITS OWN BY DEFAULT (#398): a fixed 1.0 s here was shorter than the attempt it
     guards, so a loaded host could say a listening engine was not listening. In `connect` the
     attempt's own `asyncio.timeout` bounds it, and a probe that runs out of that bound is said as
-    the attempt's timeout, not as nothing listening. `connect_at_birth` hands it what is left of
-    the birth's wait."""
+    the attempt's timeout, not as nothing listening. `connect_at_birth` hands it what its connect
+    is handed (`_birth_bound`): what is left of the birth's wait, and at least the read deadline."""
     try:
         _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
                                                  timeout=within)
@@ -503,6 +503,17 @@ async def _listening(host: str, port: int, within: float | None = None) -> bool:
     with contextlib.suppress(OSError):
         await writer.wait_closed()
     return True
+
+
+def _birth_bound(deadline: float) -> float:
+    """What a birth's probe and its connect may wait: what is left of the birth's wait, and at
+    least the read deadline.
+
+    THE PROBE WAITS AS LONG AS THE CONNECT IT GUARDS (#398), and at birth that connect is given
+    this same bound (#681). What is left of the wait alone was not enough: a birth wait of 0.01 s
+    gave its probe a hundredth of a second, so a socket that WAS listening, on a loaded runner,
+    was said as nothing listening (PR #408's integration run, the refused-connect case)."""
+    return max(deadline - time.monotonic(), read_deadline())
 
 
 async def connect_at_birth(*, within: float | None = None, every: float = 0.25) -> Client:
@@ -534,7 +545,7 @@ async def connect_at_birth(*, within: float | None = None, every: float = 0.25) 
     bound = engine_starts_in() if within is None else within
     host, port = _host_and_port(where)
     deadline = time.monotonic() + bound
-    while not await _listening(host, port, within=deadline - time.monotonic()):
+    while not await _listening(host, port, within=_birth_bound(deadline)):
         if time.monotonic() >= deadline:
             raise EngineNotListening(
                 f"the durable engine at {where} accepted no connection in {bound:.0f}s — this "
@@ -548,7 +559,7 @@ async def connect_at_birth(*, within: float | None = None, every: float = 0.25) 
     # its engine longer to answer than a read gives it (`BEEVERFORGE_ENGINE_STARTS_IN`). Until
     # #681 the connect after the socket accepted had no bound at all; now it has what is left of
     # the wait, and at least the read deadline.
-    within = max(deadline - time.monotonic(), read_deadline())
+    within = _birth_bound(deadline)
     try:
         return await connect(within=within)
     except TimeoutError:

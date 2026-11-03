@@ -186,3 +186,16 @@ def test_a_birth_probe_that_answers_after_the_old_second_is_listening(engine, cl
     assert engine.answered[0] == pytest.approx(1.5), (
         "the birth's first probe was answered, not given up after the old second and retried")
     assert len(engine.built) == 1
+
+
+def test_a_short_birth_wait_still_gives_its_probe_the_read_deadline(engine, clock):
+    """A birth wait shorter than the read deadline still lets its probe wait as long as the
+    connect after it (`_birth_bound`): with what was left of a 0.01 s wait, a socket that WAS
+    listening on a loaded runner was said as nothing listening (PR #408's integration run)."""
+    engine.answers_after(0.5)
+
+    got = _run(clock, lambda: connection.connect_at_birth(within=0.01, every=0.005))
+
+    assert got is engine.client
+    assert engine.answered[0] == pytest.approx(0.5), "the first probe was given up and retried"
+    assert len(engine.built) == 1
