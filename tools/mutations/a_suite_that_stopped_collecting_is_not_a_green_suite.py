@@ -126,11 +126,13 @@ MUTATIONS = [
      "            repair_census_before = self._take_census(ws)",
      "            repair_census_before = None"),
 
+    # re-pinned (#368): the condition now also reads `unread`, a name-only diff git refused; the
+    # cut is the same one — the census is dropped from the disarm
     ("the CI-repair disarm branch stops reading the census, so the measurement is taken, paid for, "
      "and thrown away at the one gate on that path",
      "beeverforge/orchestrator/machine.py",
-     "            if supp or hits or unreadable or lost_tests:",
-     "            if supp or hits or unreadable:"),
+     "            if supp or hits or unread or unreadable or lost_tests:",
+     "            if supp or hits or unread or unreadable:"),
 
     ("the gate holds the merge and the pull request says nothing about it, so the person deciding "
      "cannot see WHICH tests stopped being collected — the signal that survives a count the noise "

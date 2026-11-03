@@ -911,6 +911,28 @@ def _fit_to_forge(before: list[str], account: _Account, after: list[str],
     return rows
 
 
+#: Worded after the rehearsal's (`onboarding/firstrun.py`, #331), and kept here rather than
+#: imported: the orchestrator does not reach into onboarding.
+_GIT_REFUSED_REMEDY = "make git usable on this workspace in the box"
+
+
+class DiffPathsUnread(Exception):
+    """`git diff --name-only` exited non-zero in the box: nobody knows which paths changed (#368).
+
+    It used to read as `[]` — "nothing reached the verifier" — and git's own words (exit 128,
+    dubious ownership, a lock) reached nobody. `str()` is one clause: what failed, git's exit code,
+    its last lines joined on one line, and the remedy."""
+
+    def __init__(self, rc: int, out: str) -> None:
+        self.rc = rc
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        self.words = " / ".join(lines[-3:])[:300]
+        super().__init__(
+            f"`git diff --name-only` exited {rc} in the box"
+            + (f": {self.words}" if self.words else "")
+            + f" — {_GIT_REFUSED_REMEDY}")
+
+
 def _measured_from(ws: Workspace, base: str) -> str:
     """What `<this>..HEAD` names so that the diff is this job's own change (#168).
 
@@ -2385,7 +2407,13 @@ class JobRunner:
             # exactly the contract the suppression guard above states and, until review on #18,
             # honoured for suppressions alone. A deleted `.beeverforge/project.yaml` guard emits no
             # suppression token and sailed through.
-            hits = protected_violations(self._pr_diff_paths(ws, base), self.manifest)
+            # A NAME-ONLY READ GIT REFUSED IS NOT "NO PATHS" (#368): it holds through the one exit
+            # below, naming git's words, rather than leaving the arming standing on an unread diff.
+            try:
+                changed, unread = self._pr_diff_paths(ws, base), None
+            except DiffPathsUnread as exc:
+                changed, unread = [], exc
+            hits = protected_violations(changed, self.manifest)
             # AND THE WINDOW BETWEEN THE ARMING AND THIS PASS. `should_auto_merge` refused an
             # unreadable floor when this pull request was armed, so normally there is nothing to
             # disarm — but a redeploy between the two is exactly when the floor stops parsing, and
@@ -2400,7 +2428,7 @@ class JobRunner:
                                    if repair_census_before is not None else None)
             lost_tests = repair_census_before is not None and (
                 repair_census_after is None or len(repair_census_after) < len(repair_census_before))
-            if supp or hits or unreadable or lost_tests:
+            if supp or hits or unread or unreadable or lost_tests:
                 found = ", ".join(sorted(set(supp)))
                 # ONE EXIT AND ONE MESSAGE SHAPE for both reasons: a second disarm branch beside
                 # this one is a second place for the next guard to be forgotten.
@@ -2410,6 +2438,9 @@ class JobRunner:
                 if hits:
                     shown = ", ".join(hits[:protected_policy.MAX_SHOWN])
                     why.append(f"a change to the verifier's own inputs [{shown}]")
+                if unread is not None:
+                    why.append("a change whose paths git would not name, so the verifier's own "
+                               f"inputs could not be checked ({unread})")
                 if unreadable and not hits:
                     why.append("a protected-path floor this deployment can no longer read "
                                "(OUR install, not this repository)")
@@ -3431,10 +3462,10 @@ class JobRunner:
         from beeverforge.knowledge.gate import judge
         from beeverforge.knowledge.pipeline import discard_fetched_bundle
 
-        paths = self._pr_diff_paths(ws, base)
         bundle: Path | None = None
         authored = 0
         try:
+            paths = self._pr_diff_paths(ws, base)
             # THE FORGE'S REPOSITORY, NEVER `ticket.repo` (#403). The ticket's `repo` is where the
             # TRACKER keeps the card — the registry name on the local board, the Azure DevOps
             # project on Azure Boards — and the bundle is published under the repository the
@@ -3451,6 +3482,11 @@ class JobRunner:
                 # the concepts the dark files lack, publishes them, and judges again. Parking
                 # with the question is what is left when that did not cover the change.
                 report, authored = self._author_first(ticket, bundle, report, paths)
+        except DiffPathsUnread as exc:
+            # WHOLE, NOT CUT AT 120 CHARACTERS like the handler below: the remedy is at the end
+            log.warning("BEEVERFORGE_KNOWLEDGE_GATE_SKIPPED ticket=%s (%s)", ticket.id, exc)
+            result.knowledge_note = f"could not run — {exc}; nothing was judged"
+            return
         except Exception as exc:  # noqa: BLE001 — the gate informs or parks; it never crashes a job
             log.warning("BEEVERFORGE_KNOWLEDGE_GATE_SKIPPED ticket=%s (%s)", ticket.id,
                         str(exc)[:160])
@@ -3617,15 +3653,19 @@ class JobRunner:
 
         `sandbox.diff_paths` answers the same question against `workspace.base_branch`; this takes
         the base the caller is already holding, because the CI-repair path works on an open pull
-        request and must not assume the two agree. A failed read returns `[]` — the gate that uses
-        it treats an empty diff as "nothing reached the verifier", which is the honest reading of
-        "git could not say" here only because the suppression scan beside it fails the same way.
+        request and must not assume the two agree.
+
+        A FAILED READ RAISES `DiffPathsUnread` (#368), carrying git's exit code and words. It used
+        to return `[]`, which every caller reads as "nothing reached the verifier"; an empty list
+        now means only what git said with exit 0.
         """
         rc, out = self.sandbox.run(
             workspace=ws, command=f"git diff --name-only {_measured_from(ws, base)}..HEAD",
             timeout=120,
         )
-        return [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        if rc != 0:
+            raise DiffPathsUnread(rc, out)
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
     def _head(self, ws: Workspace) -> str:
         """The commit the workspace's branch points at — "" when git could not say.
