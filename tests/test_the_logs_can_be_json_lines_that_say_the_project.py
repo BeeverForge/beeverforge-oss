@@ -1753,6 +1753,99 @@ async def test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_a
         sys.setswitchinterval(before)
 
 
+async def test_a_second_caller_cannot_read_the_flight_until_the_first_has_set_it(monkeypatch):
+    """The lock around the held client and the flight, proved on EVERY run rather than by chance
+    (#373: the 32-thread test above caught a no-op `_HOLDING` in 4 to 5 of 6 runs on four busy
+    cores, because it needs 32 racing threads to happen to interleave).
+
+    THE FIRST CALLER IS PARKED between reading the flight and setting it: the flight's `get` holds
+    it until the second caller has read the flight too, or has been seen waiting for the lock the
+    first one holds. With the lock, the second caller can only read once the first has written, so
+    it finds the flight and queues behind it: one attempt. Without it, both read an empty flight
+    and two attempts are made, whatever the load. The lock's double takes the REAL lock for every
+    caller, the same lock and the same exclusion; it only says when a caller found it taken.
+
+    It waits on events, never on time: each 10 s is a backstop that fails the test if it runs out."""
+    from beeverforge.runtime.temporal import connection
+
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
+    connection.forget()
+    backstop = 10.0
+    first_read, go_on, second_read = threading.Event(), threading.Event(), threading.Event()
+    seen: list = []
+    attempts, counting = [], threading.Lock()
+    client = object()
+
+    class _ParkedFlight(dict):
+        """The flight, whose first read waits until a second caller has read or is held off."""
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            first = not seen
+            seen.append(value)
+            if first:
+                first_read.set()
+                if not go_on.wait(backstop):
+                    raise AssertionError("no second caller read the flight or met the lock")
+            else:
+                second_read.set()
+                go_on.set()
+            return value
+
+    class _SaysWhenTaken:
+        """The real lock, taken by every caller as it is; a caller that finds it held says so
+        before it waits for it. Under a mutant with no `acquire`, whatever `_HOLDING` became."""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            if not hasattr(self.inner, "acquire"):
+                return self.inner.__enter__()
+            if not self.inner.acquire(blocking=False):
+                go_on.set()
+                self.inner.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            if not hasattr(self.inner, "release"):
+                return self.inner.__exit__(*exc)
+            self.inner.release()
+            return False
+
+    async def _connect(*_args, **_kwargs):
+        with counting:
+            attempts.append(1)
+        if not await asyncio.to_thread(second_read.wait, backstop):
+            raise AssertionError("the attempt landed before a second caller read the flight")
+        return client
+
+    monkeypatch.setattr(connection, "_IN_FLIGHT", _ParkedFlight())
+    monkeypatch.setattr(connection, "_HOLDING", _SaysWhenTaken(connection._HOLDING))
+    monkeypatch.setattr(connection.Client, "connect", _connect)
+    said: list = []
+
+    def _ask() -> None:
+        try:
+            said.append(asyncio.run(connection.connect()))
+        except Exception as exc:  # read below like an answer: a failure is one
+            said.append(exc)
+
+    loop = asyncio.get_running_loop()
+    first = threading.Thread(target=_ask, daemon=True)
+    first.start()
+    assert await loop.run_in_executor(None, first_read.wait, backstop), "the first never read"
+    second = threading.Thread(target=_ask, daemon=True)
+    second.start()
+    for caller in (first, second):
+        await loop.run_in_executor(None, caller.join, backstop)
+        assert not caller.is_alive(), "a caller never answered"
+
+    assert said == [client, client], said
+    assert len(seen) == 2 and seen[0] is None and seen[1] is not None, seen
+    assert len(attempts) == 1, f"{len(attempts)} attempts for 2 callers"
+
+
 async def test_a_waiter_that_gives_up_cancels_nobody_elses_attempt(monkeypatch):
     """A caller queued behind an attempt is cancelled. Only its own wait ends: the attempt goes on,
     its owner is handed the client it made, and the callers still waiting are given it too."""

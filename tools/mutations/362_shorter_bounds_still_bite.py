@@ -134,11 +134,13 @@ MUTATIONS = [
      "                try:\n                    return self._sync(",
      CHECKOUT + "::test_a_sync_that_cannot_have_the_key_in_time_degrades[RepoCache]"),
 
-    # ── the engine's door: an attempt held until all 32 ask, a 0.01 s wait on a dead port ───
+    # ── the engine's door: a first caller parked between reading and setting the flight ─────
+    # (#373: the 32-thread test caught this row in 4 to 5 of 6 runs on four busy cores; the
+    # parked caller makes it red on every run), and a 0.01 s wait on a dead port
     ("the held client and the flight are read and written without their lock", CONNECTION,
      "_HOLDING = threading.Lock()",
      "_HOLDING = __import__('contextlib').nullcontext()",
-     LOGS + "::test_callers_who_arrive_at_the_same_instant_on_many_threads_make_one_attempt"),
+     LOGS + "::test_a_second_caller_cannot_read_the_flight_until_the_first_has_set_it"),
 
     # ── the worker's wait for its engine: every number a third or less of what it was ───────
     ("the worker dials at once, before anything listens", CONNECTION,
