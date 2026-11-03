@@ -10,7 +10,8 @@ The claims, each a row:
   2. every other host-side git call of the box carries the override, through its one runner
      `_run`, and the job mark's rev-parse names it itself;
   3. the repository cache's two runners carry it;
-  3a. the knowledge refresh's calls in the cache carry it, the bundle build's `status` too;
+  3a. the knowledge refresh's calls in the cache carry it: the bundle build's `status` and
+      the concept renewal's history reads too;
   4. the guards see a call that bypasses the runner, and check every call, not only the push.
 """
 
@@ -34,6 +35,11 @@ MUTATIONS = [
      '            ["git", *gitpin.HOOKLESS, "-C", str(repo), "status", "--porcelain", "--ignored",',
      '            ["git", "-C", str(repo), "status", "--porcelain", "--ignored",',
      TEST + "::test_the_knowledge_build_runs_no_hook_of_the_cache"),
+
+    ("the concept renewal reads the cache's history with its hooks (#384's review)",
+     "beeverforge/onboarding/history.py",
+     '            ["git", *gitpin.HOOKLESS, "-c", "core.quotePath=false", "-C", str(repo), *args],',
+     '            ["git", "-c", "core.quotePath=false", "-C", str(repo), *args],', CACHE_GUARD),
 
     ("`_head_of` runs with the shared cache's hooks", ACTIVITIES,
      "def _head_of(repo_path: Path) -> str:\n"
