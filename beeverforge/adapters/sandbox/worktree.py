@@ -715,7 +715,11 @@ def _redact(text: str) -> str:
 
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
          env: Mapping[str, str] | None = None) -> tuple[int, str]:
-    # `env=None` inherits the process environment, as every caller but the box's own add does
+    # `env=None` inherits the process environment, as every caller but the box's own add does.
+    # Every git call runs in the shared repo cache with its hooks off (#182): a hook a pass
+    # planted there would run here, on the host, with the host's credentials.
+    if cmd[:1] == ["git"]:
+        cmd = ["git", *gitpin.HOOKLESS, *cmd[1:]]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -1303,9 +1307,11 @@ class WorktreeSandbox(SandboxAdapter):
         # died) overwrites the bot's OWN dedicated beeverforge/<id> branch instead of dead-locking
         # on a non-fast-forward forever. Safe: this branch is unique per job and only ever
         # the bot's; execution is serial (idempotency, engineering.md #3).
+        # --no-verify beside `_run`'s hooks override: a pre-push hook in the shared cache would
+        # be handed the authenticated URL (#182).
         target = remote_url or "origin"
         rc, out = _run(
-            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--", target,
+            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--no-verify", "--", target,
                          workspace.branch])
         )
         if rc != 0:

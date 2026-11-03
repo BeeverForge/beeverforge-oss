@@ -12,6 +12,11 @@ A `-c` overrides only the same key: `protocol.allow=never` alone loses to a mach
 
 A `GIT_ALLOW_PROTOCOL` variable in the core's environment still overrides every one of these
 settings; that gap is named in docs/operations.md.
+
+HOOKS ARE OFF ON THE HOST (#182). The worktree box and the repo cache run git in the shared repo
+cache, whose hooks directory and config a pass can write and which survive `cleanup`. A
+`pre-push` hook planted there would run on the host and be handed the authenticated remote URL.
+`HOOKLESS` goes straight after "git" in each of their calls, so no hook in the cache runs.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ PIN: tuple[str, ...] = (
     "-c", "protocol.file.allow=user",
     *(w for name in REFUSED for w in ("-c", f"protocol.{name}.allow=never")),
 )
+
+HOOKLESS: tuple[str, ...] = ("-c", "core.hooksPath=/dev/null")
 
 
 def pinned(args: Sequence[str]) -> list[str]:
