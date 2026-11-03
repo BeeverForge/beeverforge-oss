@@ -871,8 +871,19 @@ class ContainerSandbox(SandboxAdapter):
         # /workspace, `.git/config` included, and a push run there reads what the job wrote —
         # `insteadOf` sends the push elsewhere, `core.sshCommand` runs on the host. The push goes
         # from a repository the host makes for it, outside the mount (`host_push`).
-        push_from_the_hosts_own_repository(source=self._host_clone, branch=workspace.branch,
-                                           target=target, run=_host, redact=_redact)
+        #
+        # THE CLONE'S `.git` MUST BE THE DIRECTORY THE MATERIALISER MADE: the box can replace it
+        # with a symlink or a `gitdir:` file naming another repository on the host. The ambient
+        # door keeps the worker's own git configuration, which no mount puts in the box's reach.
+        git_dir = self._host_clone / ".git"
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise RuntimeError(
+                f"push failed: {git_dir} is no longer the git directory the box was given (the "
+                "job replaced it with a link or a file) — the job's commits cannot be read from "
+                "it; run the job again")
+        push_from_the_hosts_own_repository(
+            git_dir=git_dir, branch=workspace.branch, target=target, run=_host, redact=_redact,
+            ambient_env=None if remote_url else dict(os.environ))
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None

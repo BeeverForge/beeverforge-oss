@@ -61,6 +61,20 @@ interesting surface is well-defined:
   as that user, so code that knows where to look can read them. The container box mounts none of
   them; a `box.env` name held in a file crosses into it exactly as a variable would, by name.
 
+  The **host's push** is a third reach, and it differs by door (`host_push.py`, #386). With a
+  forge URL, which carries the push credential, the push reads no git or ssh configuration a job
+  could write — not the job's repository's, not the user-level or system git config, not the ssh
+  config — so on both boxes a job cannot redirect it or make it run a program. With no forge URL
+  the push goes to the `origin` the repository had before the job ran, as the person's own push,
+  and keeps the user-level and system git config and the user's ssh config, because the person's
+  credential helper, keys and URL rewrites live there. On the worktree box a job can write those
+  files, so what it writes there can redirect that push and name a program it runs; the push runs
+  in the workload's own scrubbed environment, so that program runs as the job's user with the
+  job's environment, and the credential the push carries is the person's own, which a worktree
+  workload running as that user can already read. With the local forge the push's target is a
+  repository on this machine, whose receiving side runs under that repository's own config and
+  hooks; that is tracked with the other host-side git calls in #400.
+
   Anything that lets workload code reach a credential outside that set is a vulnerability — a
   spelling a deny list misses, a credential in a log line or a diff, a name crossing the
   container box without `box.env` naming it. So is that set growing while this table does not:

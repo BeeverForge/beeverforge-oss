@@ -757,6 +757,10 @@ class WorktreeSandbox(SandboxAdapter):
         #: `origin`'s URL as `prepare` read it, BEFORE the pass ran (#386): the push's target when
         #: no forge URL is given. Read at push time it would be whatever the pass wrote there.
         self._origin: str | None = None
+        #: The repository's common git directory as `prepare` read it, BEFORE the pass ran (#386):
+        #: where the push reads the branch's commit and borrows its objects from, as data. Asked
+        #: at push time, git would read the worktree's `.git` pointer and config the pass can write.
+        self._git_dir: Path | None = None
         #: What `stage_input` wrote for THIS box, so `cleanup` can remove it. Per instance rather
         #: than per directory: a deployment may raise `BEEVERFORGE_MAX_CONCURRENT_JOBS`, and
         #: sweeping the whole directory would delete another job's prompt mid-pass.
@@ -787,6 +791,7 @@ class WorktreeSandbox(SandboxAdapter):
     ) -> Workspace:
         self._repo_root = repo_path
         self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         wt = self.root / branch.replace("/", "-")
         # Re-running the same ticket must start clean, so the box's OWN worktree of this branch
@@ -991,6 +996,7 @@ class WorktreeSandbox(SandboxAdapter):
         it goes through `prepare`, which holds."""
         self._repo_root = repo_path
         self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         tip = self.root / branch.replace("/", "-")
         trees = self._clear_our_own(repo_path, tip)
@@ -1329,14 +1335,26 @@ class WorktreeSandbox(SandboxAdapter):
         # push run there reads it — `insteadOf` sends the push elsewhere, `core.sshCommand` runs.
         # The push goes from a repository the host makes for it (`host_push`), and `origin` is the
         # one this box read before the pass ran (`prepare`), never the one the pass may have set.
+        #
+        # THE FORGE DOOR READS NO CONFIGURATION BUT THE HOST REPOSITORY'S (review of #403): the job
+        # runs as this user, with this HOME, so the user's git and ssh configuration are its to
+        # write too. The ambient door is the person's own push and keeps them, in the workload's
+        # own environment, so whatever they name runs with nothing the job does not already hold.
         target = remote_url or self._origin
         if not target:
             raise RuntimeError(
                 f"push failed: {self._repo_root} has no origin to push {workspace.branch!r} to "
                 "and no forge URL was given — register the project with a forge, or add an "
                 "origin to the repository")
-        push_from_the_hosts_own_repository(source=Path(workspace.path), branch=workspace.branch,
-                                           target=target, run=_run, redact=_redact)
+        if self._git_dir is None:
+            raise RuntimeError(
+                f"push failed: the git directory of {self._repo_root} could not be read when the "
+                f"box was prepared, so there is nothing to push {workspace.branch!r} from — check "
+                "that the repository is a git repository the worker can read, then run the job "
+                "again")
+        push_from_the_hosts_own_repository(
+            git_dir=self._git_dir, branch=workspace.branch, target=target, run=_run,
+            redact=_redact, ambient_env=None if remote_url else _scrubbed_env(self.extra_env))
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
