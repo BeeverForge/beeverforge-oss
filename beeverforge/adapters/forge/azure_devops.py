@@ -352,6 +352,23 @@ class AzureReposForge(ForgeAdapter):
         org = (self.organization or "").strip()
         return ("azure_devops", org.lower()) if org else None
 
+    def _project_for(self, ref: str) -> str:
+        """The project a `project/repo` ref lives in: the one it names, else this adapter's own.
+
+        THE QUALIFIER IS OBEYED ONLY WHEN IT ADDRESSES A DIFFERENT REPOSITORY. A registry row
+        that filled the generic `owner/name` field on an Azure axis (a misconfiguration this
+        adapter's own constructor tolerates by reducing to the leaf) would otherwise have its
+        OWNER read as an ADO project and every clone and read aimed somewhere that does not exist.
+        Cross-project addressing is a real need (a shared documentation project); silently
+        re-reading the adapter's own coordinates is not. Azure DevOps names ignore case, so
+        `API` is this adapter's `api` (#399). `clone_url` and `_client_for` both ask here, so a
+        ref is read in the project it is cloned from (#410)."""
+        wanted = (ref or "").strip().strip("/")
+        head, _, leaf = wanted.rpartition("/")
+        name = leaf or wanted
+        own = name.casefold() == self.repo.casefold()
+        return head.strip() if (head.strip() and not own) else self.project
+
     def _client_for(self, repo: str) -> AzureDevOpsClient:
         """A client scoped to the PROJECT the ref names, falling back to this adapter's own.
 
@@ -362,8 +379,12 @@ class AzureReposForge(ForgeAdapter):
         deployment has both shapes at once — measured on a real enterprise organisation, where
         some projects keep a documentation repository and others do not. Aimed at the wrong
         project the call answers 404 — a repository somebody
-        can see in their browser, reported missing."""
-        where = (repo or "").strip().strip("/").rpartition("/")[0].strip() or self.project
+        can see in their browser, reported missing.
+
+        EXCEPT FOR THIS ADAPTER'S OWN REPOSITORY, whose qualifier is ignored: the project is the
+        one `clone_url` picks, from the same `_project_for`, so a ref is read where it is cloned
+        (#410)."""
+        where = self._project_for(repo)
         if where == self.project:
             return self._client()
         return AzureDevOpsClient(organization=self.organization, project=where,
@@ -546,17 +567,11 @@ class AzureReposForge(ForgeAdapter):
         # repository and projects without. Dropping the qualifier there clones a same-named one in
         # the wrong project, or 404s as if somebody forgot to create it.
         wanted = (repo or self.repo or "").strip().strip("/")
-        head, _, leaf = wanted.rpartition("/")
+        leaf = wanted.rpartition("/")[2]
         name = leaf or wanted
-        # THE QUALIFIER IS OBEYED ONLY WHEN IT ADDRESSES A DIFFERENT REPOSITORY. A registry row
-        # that filled the generic `owner/name` field on an Azure axis — a misconfiguration this
-        # adapter's own constructor tolerates by reducing to the leaf — would otherwise have its
-        # OWNER read as an ADO project and every clone aimed somewhere that does not exist.
-        # Cross-project addressing is a real need (a shared documentation project); silently
-        # re-reading the adapter's own coordinates is not. Azure DevOps names ignore case, so
-        # `API` is this adapter's `api` (#399); the URL still carries the spelling given.
-        own = name.casefold() == self.repo.casefold()
-        where = head.strip() if (head.strip() and not own) else self.project
+        # Which project: `_project_for`, the rule `_client_for` reads with too (#410). The URL
+        # carries the repository's spelling as given.
+        where = self._project_for(wanted)
         base = (f"dev.azure.com/{urllib.parse.quote(self.organization)}"
                 f"/{urllib.parse.quote(where)}/_git/{urllib.parse.quote(name)}")
         if token:
@@ -1823,7 +1838,9 @@ class AzureReposForge(ForgeAdapter):
             path = str(config.get("path") or "").strip().lstrip("/")
             named = ((config.get("repository") or {}).get("id")
                      or (full.get("repository") or {}).get("name") or "")
-            if path and (not named or str(named) == target):
+            # Azure DevOps names ignore case, so a pipeline of `API` is this adapter's `api`
+            # (found in #410's sweep, the comparison #399 fixed in `clone_url`).
+            if path and (not named or str(named).casefold() == target.casefold()):
                 out.append(path)
         return sorted(set(out))
 
