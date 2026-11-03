@@ -592,6 +592,54 @@ def test_an_unscoped_azure_boards_gate_asks_nothing_more(azure, tmp_path):
     assert site.link_queries == 0
 
 
+class _ClosedTracker:
+    """A tracker that reads every work item as closed and keeps every write it is asked for: the
+    reopen's state write and its note are these writes."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[str, str]] = []
+
+    def get_ticket(self, ref):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id=str(ref), title="a closed card", raw="", belongs_to="",
+                               state="closed", state_reason="completed")
+
+    def reopen_ticket(self, ref):
+        self.writes.append(("reopen", str(ref)))
+
+    def comment(self, ref, text):
+        self.writes.append(("comment", str(ref)))
+
+
+def test_a_card_under_another_epic_is_not_reopened_from_this_project(azure, tmp_path,
+                                                                    monkeypatch):
+    """Issue #156's sibling sweep: `card_reopen` reaches a closed card by key, and under a
+    `scope_epic` it asks the board's `holds` through `_stage`, as an edit does, so another Epic's
+    closed card is refused by name and nothing is written."""
+    import asyncio
+
+    from beeverforge import actions
+    from beeverforge.actions import catalog
+
+    board, site = azure(scope_epic="100")
+    site.items[202]["column"] = "Done"
+    project = _project(tmp_path, scope_epic="100")
+    tracker = _ClosedTracker()
+    monkeypatch.setenv("BEEVERFORGE_METRICS_SINK", "sqlite")
+    monkeypatch.setenv("BEEVERFORGE_METRICS_DB", str(tmp_path / "metrics.db"))
+    monkeypatch.setattr(catalog, "_board_pair", lambda name: (project, tracker, board, None))
+    by = actions.Actor(id="ana", display="Ana", via="panel", admin=True)
+
+    out = asyncio.run(catalog._card_reopen(project="acme", issue="202", by=by))
+
+    assert not out.ok, out
+    assert "acme's slice" in out.message, out.message
+    assert "(within scope_epic '100')" in out.message, out.message
+    assert tracker.writes == [], tracker.writes
+    assert site.patched == [], site.patched
+
+
 def test_the_remedy_for_an_unreadable_board_names_the_scope_when_there_is_one(tmp_path):
     """The board's own remedy points at the credential, because that is nearly always the cause
     ("Azure DevOps answers a wrong credential with HTTP 200 and a sign-in page"). With a

@@ -5826,6 +5826,18 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
                        f"{proj.name}'s tracker cannot reopen a card from here. Reopen it in the "
                        f"tracker's own screen — the card, its thread and its number are all still "
                        f"there, because closing never deleted anything.")
+    # ANOTHER PROJECT'S CLOSED CARD IS NOT REOPENED FROM THIS ONE (#156, review of
+    # openfactory-core#884 point 3). The door reaches a closed card by key, and this row went to it
+    # without `_stage`, so a board that reads only its project's slice (Jira's `scope_jql`, Azure's
+    # `scope_epic`) was never asked `holds`: api reopened web's closed card. `_stage` asks it of a
+    # card `columns()` did not return and answers in the sentences an edit is refused with. Only
+    # "unreadable" and "outside the slice" refuse here — those carry no column. A closed card INSIDE
+    # the slice is in `columns()`, which has no status filter, and one in a status nobody maps
+    # comes back with its column and keeps reaching the door as before. The cost is one board read
+    # per reopen: the door below still reads the card itself, unchanged.
+    place = await asyncio.to_thread(_stage, proj, _board, issue)
+    if place.cannot_tell and not place.column:
+        return refused(CONFLICT, place.cannot_tell)
     # THROUGH THE CARD'S DOOR (ADR-0055). Its table allows a reopen of a CLOSED card only: this row
     # once reopened an open one, and on the local board that threw a card in progress back into
     # Backlog. The note saying who reopened it is the door's comment, and the promise the close

@@ -238,8 +238,8 @@ each project may edit, close, remove, queue or rank it. Pick a field that takes 
 the issue has only one of, or a single label of a set), and give every project on the Jira project
 its own.
 
-**A scoped project refuses to edit, close, remove, queue or rank a card outside its slice.**
-Editing, closing, removing or queueing a card first asks where it sits, and a card outside the
+**A scoped project refuses to edit, close, remove, reopen, queue or rank a card outside its slice.**
+Editing, closing, removing, reopening or queueing a card first asks where it sits, and a card outside the
 slice is not on this project's board; ranking one in the product role's order writes by key. So
 the factory asks Jira once more, `project = "DAR" AND (<scope>) AND key = "<card>"`, and refuses a
 card that is not in the slice by name: it is another project's card, or one this project filed
@@ -248,11 +248,10 @@ on it — act on it from the project whose slice it is in, or put it in this one
 search cannot be made, the action is refused as for an unreadable board. A project without
 `scope_jql` makes no extra request.
 
-Three acts are **not** held to the slice yet, and reach any card of the Jira project by its key:
+Two acts are **not** held to the slice yet, and reach any card of the Jira project by its key:
 starting a job on a card (the floor's `start` and `beeverforge run <project> <card>`), which an
-operator does by naming the card; reopening a closed card, which the reopen reaches by key
-without asking the slice; and commenting on a card, which is written in the person's own name.
-Name only cards of this project's slice to them.
+operator does by naming the card; and commenting on a card, which is written in the person's own
+name. Name only cards of this project's slice to them.
 
 A condition that would escape its parentheses is refused when the tracker is built, naming the
 scope: a `)` it never opened, which would close the `AND (...)` and widen the read past the
