@@ -839,7 +839,8 @@ def test_a_commit_that_exits_1_on_a_dirty_tree_is_a_refusal():
     stage = next(s for s in run.stages if s.name == "diff")
     assert not stage.ok
     assert "exited 1" in stage.message and "pre-commit hook" in stage.message
-    assert "make git usable on this workspace in the box" in stage.remedy
+    assert "commit hooks pass there" in stage.remedy, stage.remedy
+    assert "git itself refused" not in stage.remedy, "a hook's refusal is blamed on git"
     assert built["reviewer"].calls == 0
 
 

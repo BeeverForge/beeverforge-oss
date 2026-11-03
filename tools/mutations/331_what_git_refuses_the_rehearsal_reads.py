@@ -11,7 +11,8 @@ The claims, each held by a test in `tests/test_onboarding_firstrun.py`:
   - a commit git refuses fails the diff step with git's exit code and words, and the remedy
     "make git usable on this workspace in the box", before `diff_paths` is asked;
   - exit 1 on a clean tree is nothing to commit, and the round goes on quietly;
-  - exit 1 on a dirty tree (a refusing hook) is a refusal, not nothing to commit;
+  - exit 1 on a dirty tree (a refusing hook) is a refusal, not nothing to commit, and its remedy
+    names the repository's commit hooks beside git, never "git itself refused it" (#369's review);
   - after an empty diff, a `git status --porcelain` that git refused is not an agent that wrote
     nothing (the sibling at the old firstrun.py:1166).
 
@@ -39,11 +40,20 @@ MUTATIONS = [
 
     ("the commit's refusal branch falls through to `diff_paths`, and the old remedy comes back",
      FIRSTRUN,
-     "                _GIT_REFUSED_REMEDY, on=self.on), started)\n"
+     "                _COMMIT_REFUSED_REMEDY, on=self.on), started)\n"
      "            return False\n"
      "        read = box.diff_paths(workspace=ws)\n",
-     "                _GIT_REFUSED_REMEDY, on=self.on), started)\n"
+     "                _COMMIT_REFUSED_REMEDY, on=self.on), started)\n"
      "        read = box.diff_paths(workspace=ws)\n"),
+
+    ("a commit hook's refusal is blamed on git: the commit gets the git-only remedy (#369's review)",
+     FIRSTRUN,
+     "                _COMMIT_REFUSED_REMEDY, on=self.on), started)\n",
+     "                _GIT_REFUSED_REMEDY, on=self.on), started)\n"),
+
+    ("the commit's remedy no longer names the repository's commit hooks", FIRSTRUN,
+     '"let the repository\'s commit hooks pass there")',
+     '"check the box again")'),
 
     ("the commit's refusal is not told at all, and the round carries on past it", FIRSTRUN,
      "        if rc != 0 and not (rc == 1 and self._tree_is_clean()):\n",

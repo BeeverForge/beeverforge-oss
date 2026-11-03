@@ -1147,14 +1147,15 @@ class _Runner:
         # GIT'S EXIT CODE IS READ (#331). This ended in `|| true`, so a commit git REFUSED (exit
         # 128: dubious ownership, a lock it could not take) read as "nothing to commit", and the
         # person was then told to check for git and the base branch. Exit 0 is committed; exit 1
-        # on a clean tree is nothing to commit; anything else is git refusing, in its own words.
+        # on a clean tree is nothing to commit; anything else is git or a commit hook refusing,
+        # in its own words (exit 1 on a dirty tree is what a refusing pre-commit hook answers).
         rc, out = box.run(workspace=ws, command=f"git add -A && {author}git commit -m {msg}",
                           timeout=120)
         if rc != 0 and not (rc == 1 and self._tree_is_clean()):
             self.finish(_fail(
                 "diff", f"`git add -A && git commit` exited {rc} in the workspace\n"
                         f"{_tail(out, 8)}",
-                _GIT_REFUSED_REMEDY, on=self.on), started)
+                _COMMIT_REFUSED_REMEDY, on=self.on), started)
             return False
         read = box.diff_paths(workspace=ws)
         if read is None:
@@ -1413,6 +1414,13 @@ class _GateHost:
 
 _GIT_REFUSED_REMEDY = ("make git usable on this workspace in the box — git itself refused it, "
                        "so the round could not commit or read the agent's work")
+#: A commit is refused by git OR by one of the repository's own commit hooks (a pre-commit hook
+#: the client's `setup:` or husky installed answers exit 1 on a dirty tree), so its remedy names
+#: both; telling the person "git itself refused it" when their hook did is #331's misdirection
+#: again (#369's review).
+_COMMIT_REFUSED_REMEDY = ("git or one of the repository's commit hooks refused the commit (its "
+                          "words are above) — make git usable on this workspace in the box, or "
+                          "let the repository's commit hooks pass there")
 
 
 def _tail(text: str, lines: int = 20) -> str:
