@@ -211,8 +211,10 @@ OUTSIDE_THE_LOG = {
 }
 
 #: The commands of a module allowed whole above that become the deployment's own long-running
-#: processes — the panel's `serve` and `beeverforge worker` — where nothing may write past it.
-BECOME_A_PROCESS = {"beeverforge/cli.py": ("serve", "worker_cmd")}
+#: processes — the panel's `serve` and `beeverforge worker` — where nothing may write past it. And
+#: `worker --with-panel`'s supervisor, the worker image's container command (#363): its own lines
+#: sit in the container's log beside the two processes it starts (review of #406).
+BECOME_A_PROCESS = {"beeverforge/cli.py": ("serve", "worker_cmd", "_worker_with_panel")}
 
 _STREAMS = {"stdout", "stderr", "__stdout__", "__stderr__"}
 _ECHOES = {"typer", "click"}
@@ -483,8 +485,9 @@ def test_the_live_feed_keeps_its_envelope_inside_a_json_line(monkeypatch, capsys
 #: path must never be silent, so it is a WARNING: with `BEEVERFORGE_LOG_LEVEL=WARNING` an INFO line
 #: is dropped (fifth review of #818: the degraded pre-flight put back at INFO survived every test).
 #: The call sites are read off the package; one that is not here fails the case below, so a line
-#: added tomorrow is classed by whoever adds it.
-NEVER_SILENT, SAID_FOR_THE_RECORD = "WARNING", "INFO"
+#: added tomorrow is classed by whoever adds it. A line that says a process of the set ended it is
+#: an ERROR: the container exits with that process's status next (#363).
+NEVER_SILENT, SAID_FOR_THE_RECORD, ENDS_THE_SET = "WARNING", "INFO", "ERROR"
 LINE_LEVELS = {
     ("beeverforge/runtime/temporal/activities.py", "_do_preflight.degrade",
      "BEEVERFORGE_PREFLIGHT: DEGRADED for "): NEVER_SILENT,
@@ -516,6 +519,9 @@ LINE_LEVELS = {
     ("beeverforge/runtime/temporal/worker.py", "main",
      "beeverforge worker up · "): SAID_FOR_THE_RECORD,
     ("beeverforge/cli.py", "serve", "panel: http://"): SAID_FOR_THE_RECORD,
+    ("beeverforge/cli.py", "_worker_with_panel.say", "✗ "): ENDS_THE_SET,
+    ("beeverforge/cli.py", "_worker_with_panel.say", "! "): NEVER_SILENT,
+    ("beeverforge/cli.py", "_worker_with_panel.say", ""): SAID_FOR_THE_RECORD,
 }
 
 
@@ -565,7 +571,7 @@ def test_a_line_that_must_never_be_silent_is_said_at_warning():
     wrong = {where: levels for where, levels in said.items()
              if levels != [LINE_LEVELS[where]]}
     assert not wrong, f"said at another level than its class, or twice from one place: {wrong}"
-    assert {NEVER_SILENT, SAID_FOR_THE_RECORD} == set(LINE_LEVELS.values())
+    assert {NEVER_SILENT, SAID_FOR_THE_RECORD, ENDS_THE_SET} == set(LINE_LEVELS.values())
 
 
 # ── Python's own lines (fourth review of #818) ──────────────────────────────────────────────────

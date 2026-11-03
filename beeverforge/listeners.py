@@ -124,6 +124,9 @@ LISTENERS: tuple[Listener, ...] = (PANEL, ENGINE_UI, ENGINE)
 #: The spellings of "this machine" a declaration may use. A name `up` cannot prove is this machine
 #: (a proxy, a tunnel's far end) is not in here, and is treated as somewhere else.
 _THIS_MACHINE = frozenset({"localhost", "127.0.0.1", "::1"})
+#: The same spellings, for a reader outside this module: `worker --with-panel` starts an open panel
+#: only on one of these (#363).
+THIS_MACHINE = _THIS_MACHINE
 
 
 class CannotHonour(ValueError):
