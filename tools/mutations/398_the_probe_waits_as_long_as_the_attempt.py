@@ -29,4 +29,10 @@ MUTATIONS = [
      CONNECTION,
      "    return max(deadline - time.monotonic(), read_deadline())\n",
      "    return deadline - time.monotonic()\n"),
+    ("the birth probe is given no bound of its own, so an address that drops the SYN holds the birth",
+     CONNECTION,
+     "    while not await _listening(host, port, within=_birth_bound(deadline)):",
+     "    while not await _listening(host, port):"),
+    ("the probe waits with no timeout at all, whatever bound it is handed", CONNECTION,
+     "timeout=within)", "timeout=None)"),
 ]

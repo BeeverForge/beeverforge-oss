@@ -199,3 +199,19 @@ def test_a_short_birth_wait_still_gives_its_probe_the_read_deadline(engine, cloc
     assert got is engine.client
     assert engine.answered[0] == pytest.approx(0.5), "the first probe was given up and retried"
     assert len(engine.built) == 1
+
+
+def test_a_birth_against_an_address_that_never_answers_ends_at_its_bound(engine, clock):
+    """The birth's probe is BOUNDED by `_birth_bound`, now that its bound is a value passed in: an
+    address that drops the SYN, or a listener with a full backlog, would otherwise hold the birth
+    for as long as the OS connect waits (minutes on Linux), not `BEEVERFORGE_ENGINE_STARTS_IN`
+    (#408's review: a probe given no bound, or `timeout=None`, passed every other case)."""
+    engine.never_answers()
+
+    with pytest.raises(connection.EngineNotListening) as raised:
+        _run(clock, lambda: connection.connect_at_birth(within=2.0))
+
+    assert "accepted no connection in 2s" in str(raised.value)
+    assert engine.built == [], "a birth whose probe never answered built no runtime"
+    # One probe, floored at the read deadline (3 s by default), then the wait's own check.
+    assert clock.now == pytest.approx(3.0), clock.now
