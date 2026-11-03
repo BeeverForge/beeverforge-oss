@@ -65,6 +65,9 @@ MUTATIONS = [
     ("GitHub's message dropped from its refusal: only the bare status is said", CLI,
      "{message or exc.response.reason_phrase}", "", REFUSED),
 
+    ("GitHub's message read, then dropped for the 404's reason phrase (#372's review)",
+     CLI, "{message or exc.response.reason_phrase}", "{exc.response.reason_phrase}", REFUSED),
+
     ("the CLI's translation of an unreachable API removed: a ConnectError is a traceback", CLI,
      "    except httpx.TransportError as exc:\n", "    except ArithmeticError as exc:\n",
      UNREACHABLE),

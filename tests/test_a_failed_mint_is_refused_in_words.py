@@ -126,7 +126,10 @@ def test_a_key_that_cannot_sign_is_refused_naming_its_source_and_nothing_is_sent
 
 
 def _not_found(url):
-    return httpx.Response(404, json={"message": "Not Found"}, request=httpx.Request("POST", url))
+    # GITHUB'S OWN MESSAGE IS NOT THE REASON PHRASE (#372's review): with `"Not Found"` here the
+    # guard could not tell the message from the 404's phrase, and dropping it went unseen.
+    return httpx.Response(404, json={"message": "Integration not found"},
+                          request=httpx.Request("POST", url))
 
 
 def test_github_refusing_the_mint_is_one_sentence_naming_status_message_and_installation(
@@ -143,7 +146,8 @@ def test_github_refusing_the_mint_is_one_sentence_naming_status_message_and_inst
 
     stderr = _refused_in_one_sentence(result)
     assert posts == [TOKENS_URL.format(7)]
-    for word in ("404", "Not Found", "installation 7", "--app-id", "--installation-id"):
+    for word in ("404", "Integration not found", "installation 7", "--app-id",
+                 "--installation-id"):
         assert word in stderr, (word, stderr)
 
 
