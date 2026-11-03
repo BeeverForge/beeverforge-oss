@@ -6,8 +6,11 @@ WORKER = "beeverforge/runtime/temporal/worker.py"
 CLI = "beeverforge/cli.py"
 
 MUTATIONS = [
+    # RE-PINNED 2026-11-03 (#398): the birth probe is handed what is left of the birth's wait
+    # instead of a fixed 1.0 s of its own. Same cut.
     ("the worker dials at once again, and dies on the first refusal", CONN,
-     "    while not await _listening(host, port):", "    while False:"),
+     "    while not await _listening(host, port, within=deadline - time.monotonic()):",
+     "    while False:"),
 
     ("the wait has no bound: an engine that never starts holds the worker for ever", CONN,
      "        if time.monotonic() >= deadline:", "        if False:"),

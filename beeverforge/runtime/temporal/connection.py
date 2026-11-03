@@ -486,9 +486,17 @@ def _host_and_port(where: str) -> tuple[str, int]:
     return parts.hostname or where, parts.port or ENGINE.default_port
 
 
-async def _listening(host: str, port: int) -> bool:
+async def _listening(host: str, port: int, within: float | None = None) -> bool:
+    """Whether something accepts a connection at `host`:`port`, waiting at most `within` seconds.
+
+    NO BOUND OF ITS OWN BY DEFAULT (#398): a fixed 1.0 s here was shorter than the attempt it
+    guards, so a loaded host could say a listening engine was not listening. In `connect` the
+    attempt's own `asyncio.timeout` bounds it, and a probe that runs out of that bound is said as
+    the attempt's timeout, not as nothing listening. `connect_at_birth` hands it what is left of
+    the birth's wait."""
     try:
-        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=1.0)
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
+                                                 timeout=within)
     except (OSError, TimeoutError):
         return False
     writer.close()
@@ -526,7 +534,7 @@ async def connect_at_birth(*, within: float | None = None, every: float = 0.25) 
     bound = engine_starts_in() if within is None else within
     host, port = _host_and_port(where)
     deadline = time.monotonic() + bound
-    while not await _listening(host, port):
+    while not await _listening(host, port, within=deadline - time.monotonic()):
         if time.monotonic() >= deadline:
             raise EngineNotListening(
                 f"the durable engine at {where} accepted no connection in {bound:.0f}s — this "

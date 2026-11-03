@@ -143,8 +143,11 @@ MUTATIONS = [
      LOGS + "::test_a_second_caller_cannot_read_the_flight_until_the_first_has_set_it"),
 
     # ── the worker's wait for its engine: every number a third or less of what it was ───────
+    # RE-PINNED 2026-11-03 (#398): the birth probe is handed what is left of the birth's wait
+    # instead of a fixed 1.0 s of its own. Same cut.
     ("the worker dials at once, before anything listens", CONNECTION,
-     "    while not await _listening(host, port):", "    while False:",
+     "    while not await _listening(host, port, within=deadline - time.monotonic()):",
+     "    while False:",
      WORKER + "::test_a_listener_that_starts_LATE_is_waited_for_and_dialled_once"),
     ("the wait for an engine that never listens has no bound", CONNECTION,
      "        if time.monotonic() >= deadline:", "        if False:",
