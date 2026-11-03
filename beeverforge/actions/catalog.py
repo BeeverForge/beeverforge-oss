@@ -5149,6 +5149,34 @@ class _Stage:
     ref: str = ""
 
 
+def _reopen_refusal(proj, board, issue: str) -> str:
+    """Why `issue` may not be reopened from `proj`, or `""`: what the board's `holds` answers.
+
+    A REOPEN ASKS ONE QUESTION, whether the card is in the slice — not where it sits, which is
+    what `_stage` reads `columns()` for (#378's review). Through `_stage` every reopen paid a full
+    board read, on unscoped boards too, and refused whenever that read failed, though a closed
+    card's reopen never read the board before. `holds` answers `True` with no request where no
+    slice is declared, and with one `key =` search where one is. Read through `getattr`, so a
+    board without it, or no board, refuses nothing. `is False` / `is None`, not falsiness: only
+    the row's own answer refuses."""
+    from beeverforge.product.voice import card_outside_the_slice
+
+    holds = getattr(board, "holds", None) if board is not None else None
+    if not callable(holds):
+        return ""
+    inside = holds(issue)
+    if inside is False:
+        named = getattr(board, "scope_named", None)
+        return card_outside_the_slice(ref=issue, project=proj.name,
+                                      within=named() if callable(named) else "",
+                                      language=getattr(proj, "language", None))
+    if inside is None:
+        return (f"{proj.name}'s board could not be asked whether {issue} is in this project's "
+                f"slice, so it was not reopened. Nothing was changed — try again, and if the "
+                f"board stays unreadable, reopen it from the tracker's own screen.")
+    return ""
+
+
 def _stage(proj, board, issue: str) -> _Stage:
     """Read where `issue` is. One board read, shared by the refusal and by what a close records.
 
@@ -5828,16 +5856,11 @@ async def _card_reopen(*, project: str, issue: str, by: Actor) -> Outcome:
                        f"there, because closing never deleted anything.")
     # ANOTHER PROJECT'S CLOSED CARD IS NOT REOPENED FROM THIS ONE (#156, review of
     # openfactory-core#884 point 3). The door reaches a closed card by key, and this row went to it
-    # without `_stage`, so a board that reads only its project's slice (Jira's `scope_jql`, Azure's
-    # `scope_epic`) was never asked `holds`: api reopened web's closed card. `_stage` asks it of a
-    # card `columns()` did not return and answers in the sentences an edit is refused with. Only
-    # "unreadable" and "outside the slice" refuse here — those carry no column. A closed card INSIDE
-    # the slice is in `columns()`, which has no status filter, and one in a status nobody maps
-    # comes back with its column and keeps reaching the door as before. The cost is one board read
-    # per reopen: the door below still reads the card itself, unchanged.
-    place = await asyncio.to_thread(_stage, proj, _board, issue)
-    if place.cannot_tell and not place.column:
-        return refused(CONFLICT, place.cannot_tell)
+    # without asking the slice, so a board that reads only its project's slice (Jira's `scope_jql`,
+    # Azure's `scope_epic`) was never asked `holds`: api reopened web's closed card.
+    refusal = await asyncio.to_thread(_reopen_refusal, proj, _board, issue)
+    if refusal:
+        return refused(CONFLICT, refusal)
     # THROUGH THE CARD'S DOOR (ADR-0055). Its table allows a reopen of a CLOSED card only: this row
     # once reopened an open one, and on the local board that threw a card in progress back into
     # Backlog. The note saying who reopened it is the door's comment, and the promise the close

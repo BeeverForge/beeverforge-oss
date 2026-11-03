@@ -615,7 +615,7 @@ class _ClosedTracker:
 def test_a_card_under_another_epic_is_not_reopened_from_this_project(azure, tmp_path,
                                                                     monkeypatch):
     """Issue #156's sibling sweep: `card_reopen` reaches a closed card by key, and under a
-    `scope_epic` it asks the board's `holds` through `_stage`, as an edit does, so another Epic's
+    `scope_epic` it asks the board's `holds`, as an edit does, so another Epic's
     closed card is refused by name and nothing is written."""
     import asyncio
 
