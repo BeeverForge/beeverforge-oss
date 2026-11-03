@@ -197,6 +197,88 @@ def test_an_empty_collection_is_a_failure_not_a_pass(tmp_path):
     assert _the_proof().main([str(empty), str(empty)]) == 1
 
 
+# ── 2b. a re-run reads its newest attempt (#417) ──────────────────────────────────────────────
+
+def _artifact(root: Path, name: str, files: dict[str, str]) -> None:
+    """One downloaded artifact, as `download-artifact` lays it out without `merge-multiple`."""
+    (root / name).mkdir(parents=True)
+    for file, text in files.items():
+        (root / name / file).write_text(text, encoding="utf-8")
+
+
+def test_a_re_run_job_is_read_from_its_newest_attempt_alone(tmp_path):
+    """The run that showed it (main, 6632539): attempt 2's `integration` stopped before
+    `make test-alone`, attempt 3's ran it, and the proof still read attempt 2's files and called
+    the 153 `alone` tests missing. A job that was not re-run keeps its first attempt's files."""
+    got, into = tmp_path / "artifacts", tmp_path / "ids"
+    _artifact(got, "test-ids-collected-attempt-1", {"collected.txt": "a\nb\nc\n"})
+    _artifact(got, "test-ids-unit-1-attempt-1", {"ran-unit-1.txt": "a\n"})
+    _artifact(got, "test-ids-integration-attempt-2", {"ran-integration.txt": "b\n"})
+    _artifact(got, "test-ids-integration-attempt-3", {"ran-integration.txt": "b\n",
+                                                       "ran-alone.txt": "c\n"})
+    _artifact(got, "test-ids-integration-attempt-10", {"ran-integration.txt": "b\n",
+                                                        "ran-alone.txt": "c\n"})
+    proof = _the_proof()
+
+    assert proof.main(["--newest-attempts", str(got), str(into)]) == 0
+    assert sorted(p.name for p in into.iterdir()) == [
+        "collected.txt", "ran-alone.txt", "ran-integration.txt", "ran-unit-1.txt"]
+    assert proof.main([str(into / "collected.txt"),
+                       *(str(p) for p in sorted(into.glob("ran-*.txt")))]) == 0
+
+
+def test_an_older_attempt_is_never_read_even_when_it_holds_more(tmp_path):
+    """Attempt 10 sorts before attempt 2 as text; the newest is the larger number."""
+    got, into = tmp_path / "artifacts", tmp_path / "ids"
+    _artifact(got, "test-ids-integration-attempt-2", {"ran-integration.txt": "old\n",
+                                                       "ran-stale.txt": "x\n"})
+    _artifact(got, "test-ids-integration-attempt-10", {"ran-integration.txt": "new\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(into)]) == 0
+    assert sorted(p.name for p in into.iterdir()) == ["ran-integration.txt"]
+    assert (into / "ran-integration.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.parametrize("name", ["test-ids-integration", "test-ids-integration-attempt-x"])
+def test_an_artifact_without_its_attempt_is_refused_by_name(tmp_path, capsys, name):
+    """An upload renamed without its attempt would otherwise be read, or dropped, unseen."""
+    got = tmp_path / "artifacts"
+    _artifact(got, name, {"ran-integration.txt": "a\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(tmp_path / "ids")]) == 1
+    said = capsys.readouterr().err
+    assert name in said and "-attempt-<n>" in said, said
+
+
+def test_two_jobs_writing_one_file_name_is_refused_not_overwritten(tmp_path, capsys):
+    got = tmp_path / "artifacts"
+    _artifact(got, "test-ids-unit-1-attempt-1", {"ran-unit.txt": "a\n"})
+    _artifact(got, "test-ids-unit-2-attempt-1", {"ran-unit.txt": "b\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(tmp_path / "ids")]) == 1
+    said = capsys.readouterr().err
+    assert "ran-unit.txt" in said and "test-ids-unit-1" in said and "test-ids-unit-2" in said, said
+
+
+def test_every_upload_names_its_attempt_and_the_proof_reads_the_newest():
+    """CI's side of #417: each job's artifact carries `github.run_attempt`, and the `test` job
+    downloads them apart and keeps each job's newest before the proof runs."""
+    jobs = _jobs()
+    uploads = [step for job in jobs.values() for step in job.get("steps", [])
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    assert len(uploads) == 3, uploads
+    for step in uploads:
+        assert step["with"]["name"].endswith("-attempt-${{ github.run_attempt }}"), step["with"]
+    steps = jobs["test"]["steps"]
+    download = next(s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+    assert download["with"].get("merge-multiple") in (None, False), download["with"]
+    runs = _runs(jobs["test"])
+    pick = next(i for i, r in enumerate(runs) if "--newest-attempts" in r)
+    assert download["with"]["path"].split("/")[-1] in runs[pick], (download["with"], runs[pick])
+    assert "${{ runner.temp }}/beeverforge-test-ids" in runs[pick], runs[pick]
+    assert pick < runs.index("make test-ran-once"), "the proof runs before the newest are picked"
+
+
 # ── 3. CI wires it ──────────────────────────────────────────────────────────────────────────────
 
 def _jobs() -> dict:

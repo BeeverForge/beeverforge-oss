@@ -37,7 +37,7 @@ jobs:
           TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/collected.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: test-ids-collected
+          name: test-ids-collected-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/beeverforge-test-ids/
 
   unit:
@@ -61,7 +61,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-ids-unit-${{ matrix.shard }}
+          name: test-ids-unit-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/beeverforge-test-ids/
 
   integration:
@@ -88,7 +88,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-ids-integration
+          name: test-ids-integration-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/beeverforge-test-ids/
 
   test:
@@ -105,11 +105,14 @@ jobs:
         run: |
           echo "lint: ${{ needs.lint.result }}, unit: ${{ needs.unit.result }}, integration: ${{ needs.integration.result }}"
           exit 1
+      # each artifact apart, then each job's newest attempt alone (#417): a re-run job leaves its
+      # earlier attempt's artifact in the run, and merged together an earlier file could win
       - uses: actions/download-artifact@v4
         if: always()
         with:
           pattern: test-ids-*
-          path: ${{ runner.temp }}/beeverforge-test-ids
-          merge-multiple: true
+          path: ${{ runner.temp }}/test-id-artifacts
+      - if: always()
+        run: python scripts/every_test_ran_once.py --newest-attempts ${{ runner.temp }}/test-id-artifacts ${{ runner.temp }}/beeverforge-test-ids
       - if: always()
         run: make test-ran-once
