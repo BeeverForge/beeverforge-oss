@@ -20,6 +20,7 @@ No assertion message prints an argv's remote or a URL: only hook names and subco
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -39,7 +40,8 @@ from tests.the_tree_read_once import parsed
 ROOT = Path(__file__).resolve().parents[1]
 BOX_SOURCES = ("beeverforge/adapters/sandbox/worktree.py", "beeverforge/adapters/gitworktrees.py")
 OVERRIDE = ["-c", "core.hooksPath=/dev/null"]
-HOOKS = ("pre-push", "reference-transaction", "post-checkout", "post-rewrite", "post-merge")
+HOOKS = ("pre-push", "reference-transaction", "post-checkout", "post-rewrite", "post-merge",
+         "post-index-change")
 PLACEMENTS = ("hooks_dir", "hooks_path")
 REAL_RUN = subprocess.run
 
@@ -54,8 +56,9 @@ def _plant(repo: Path, placement: str, markers: Path) -> None:
     """Write a hook for each of `HOOKS` that touches `markers/<hook>`, where git of `repo` finds
     it: its own hooks directory, or a directory its config names as `core.hooksPath`."""
     if placement == "hooks_dir":
-        hooks = Path(_git("rev-parse", "--path-format=absolute", "--git-common-dir",
-                          cwd=repo)) / "hooks"
+        # resolved here, not with `--path-format=absolute`: that flag is Git 2.31, and 2.28 is
+        # the floor (CONTRIBUTING.md). Git 2.30 echoes it back as a path (#384's second review).
+        hooks = repo / _git("rev-parse", "--git-common-dir", cwd=repo) / "hooks"
     else:
         hooks = repo.parent / f"planted-hooks-{repo.name}"
         _git("config", "core.hooksPath", str(hooks), cwd=repo)
@@ -326,8 +329,10 @@ def test_no_host_git_call_in_the_box_bypasses_the_runner(source):
 
 
 #: Host code outside the box that runs git with a literal argv in a `RepoCache` path (#384's
-#: review: the knowledge refresh's `checkout -- knowledge` fired a planted `post-checkout`).
-CACHE_CALLERS = ("beeverforge/runtime/temporal/activities.py",)
+#: review: the knowledge refresh's `checkout -- knowledge` fired a planted `post-checkout`; its
+#: second review: the bundle build's `status` fired a planted `post-index-change`).
+CACHE_CALLERS = ("beeverforge/runtime/temporal/activities.py",
+                 "beeverforge/knowledge/generator.py")
 
 
 def _literal_git_calls(tree: ast.AST) -> list[ast.Call]:
@@ -346,6 +351,50 @@ def test_every_literal_git_call_in_a_cache_caller_turns_hooks_off(source):
     assert calls, f"{source} has no literal git call left to hold: drop it from CACHE_CALLERS"
     missing = [c.lineno for c in calls if not _carries_override(c)]
     assert missing == [], f"{source}: git calls without the hooks override at lines {missing}"
+
+
+# ── the knowledge build, run by the refresh in the shared cache ─────────────────────────────
+
+
+def _stale_index(repo: Path) -> None:
+    """Make the next `git status` in `repo` refresh the index and write it: the tracked files'
+    stat data no longer matches what the index recorded."""
+    for path in _git("ls-files", cwd=repo).splitlines():
+        (repo / path).touch()
+        os.utime(repo / path, (1_000_000_000, 1_000_000_000))
+
+
+@pytest.mark.parametrize("placement", PLACEMENTS)
+def test_the_planted_index_hook_is_live_at_a_plain_status(tmp_path, cache, placement):
+    """The control: a plain `git status` over a stale index runs a planted `post-index-change`."""
+    markers = tmp_path / "markers"
+    _plant(cache, placement, markers)
+    _stale_index(cache)
+    REAL_RUN(["git", "status", "--porcelain"], cwd=cache, capture_output=True, check=True,
+             timeout=60)
+    assert "post-index-change" in _fired(markers), "the planted hook did not run in the control"
+
+
+@pytest.mark.parametrize("placement", PLACEMENTS)
+def test_the_knowledge_build_runs_no_hook_of_the_cache(tmp_path, cache, placement, recorder):
+    """`build_bundle` is what the knowledge refresh runs in the cache; its `status` (through
+    `ignored_by_git`) still reads what git ignores, and runs no planted hook."""
+    from beeverforge.knowledge.bundle import build_bundle
+
+    (cache / ".gitignore").write_text("secret.env\n")
+    (cache / "secret.env").write_text("x\n")
+    markers = tmp_path / "markers"
+    _plant(cache, placement, markers)
+    _stale_index(cache)
+
+    build_bundle(cache, commit="", generated_at="")
+
+    from beeverforge.knowledge.generator import ignored_by_git
+
+    assert "secret.env" in ignored_by_git(cache), "the build no longer reads what git ignores"
+    assert _fired(markers) == [], f"hooks ran on the host: {_fired(markers)}"
+    assert recorder.gits(), "the build ran no git"
+    assert _offenders(recorder.gits()) == [], "git calls of the knowledge build run with hooks on"
 
 
 # ── the repository cache, the same shared cache ─────────────────────────────────────────────

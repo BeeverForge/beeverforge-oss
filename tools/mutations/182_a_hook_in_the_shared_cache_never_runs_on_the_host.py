@@ -10,6 +10,7 @@ The claims, each a row:
   2. every other host-side git call of the box carries the override, through its one runner
      `_run`, and the job mark's rev-parse names it itself;
   3. the repository cache's two runners carry it;
+  3a. the knowledge refresh's calls in the cache carry it, the bundle build's `status` too;
   4. the guards see a call that bypasses the runner, and check every call, not only the push.
 """
 
@@ -27,6 +28,12 @@ MUTATIONS = [
      ACTIVITIES,
      '            subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), *args],',
      '            subprocess.run(["git", "-C", str(repo_path), *args],', CACHE_GUARD),
+
+    ("the knowledge build's `status` runs with the shared cache's hooks (#384's second review)",
+     "beeverforge/knowledge/generator.py",
+     '            ["git", *gitpin.HOOKLESS, "-C", str(repo), "status", "--porcelain", "--ignored",',
+     '            ["git", "-C", str(repo), "status", "--porcelain", "--ignored",',
+     TEST + "::test_the_knowledge_build_runs_no_hook_of_the_cache"),
 
     ("`_head_of` runs with the shared cache's hooks", ACTIVITIES,
      "def _head_of(repo_path: Path) -> str:\n"
