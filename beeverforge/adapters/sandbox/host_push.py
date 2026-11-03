@@ -29,13 +29,16 @@ holding its base, a repository of 1.4 GiB packed): 55 to 70 s per push with the 
 fetch's 180 s timeout, and 20 ms with the borrowing; 0.3 to 1.2 s and 17 ms on two of 11 and 16
 MiB.
 
-A JOB-WRITTEN ALTERNATES CHAIN IS REFUSED (review of #403). Git follows the borrowed directory's
-own `info/alternates` recursively, so a job that wrote one (on the container box, naming a host
-path the box cannot even see, such as another project's cache) could make the push send that
-directory's objects to this project's forge. No box makes one, so the push refuses a job's
-objects directory that carries `info/alternates` or `info/http-alternates`, or whose `objects` or
-`objects/info` is a symlink, before anything is borrowed. Before #386, and with the fetch, git
-followed such a chain.
+AN OBJECTS DIRECTORY THAT REACHES ELSEWHERE IS REFUSED (review of #403). Git follows the borrowed
+directory's own `info/alternates` recursively, and follows any symlink inside it, so a job that
+wrote either (on the container box, naming a host path the box cannot even see, such as another
+project's cache) could make the push send that directory's objects to this project's forge. So
+before anything is borrowed the push walks the job's `objects` with `lstat`, following no link,
+and refuses a symlink anywhere in it (`objects` itself, `info`, `pack`, a fan-out directory, an
+object file), any entry that is neither a regular file nor a directory, and an
+`info/alternates` or `info/http-alternates`. No box makes any of these. The walk runs once, just
+before the push: a process the job left running could still plant one between the walk and
+git reading the objects. Before #386, and with the fetch, git followed all of them.
 
 WHICH CONFIGURATION THE PUSH READS, PER DOOR:
 
@@ -155,19 +158,51 @@ def _own_configuration_only(scratch: Path) -> dict[str, str]:
 
 
 def _borrows_nothing(git_dir: Path) -> None:
-    """Refused, with a cause and a remedy, when the job's objects directory borrows from another
-    one: `info/alternates` or `info/http-alternates` present (looked at with `lstat`, never
-    followed), or `objects` or `objects/info` a symlink. Git follows an alternates chain
-    recursively, so a job that wrote one could make the push send objects from any object
-    directory on the host, another project's cache included. No box makes one (#403 review:
-    neither the cache, the worktree box nor the container clone, which is `--no-local`)."""
+    """Refused, with a cause and a remedy, when the job's objects directory could hand the push
+    anything but its own objects:
+
+      * a symlink ANYWHERE under `objects` (and `objects` itself): the pack directory, a
+        loose-object fan-out directory, an object file, `info`. Git follows each one, so a link
+        reaches another directory's objects exactly as an alternates entry does (review of
+        #403). The walk uses `lstat` alone and follows no link;
+      * an entry that is neither a regular file nor a directory (a FIFO, a device, a socket),
+        which git would open;
+      * `info/alternates` or `info/http-alternates` present. Git follows an alternates chain
+        recursively, so a job that wrote one could make the push send objects from any object
+        directory on the host, another project's cache included. No box makes one (neither the
+        cache, the worktree box nor the container clone, which is `--no-local`).
+
+    ONCE, JUST BEFORE THE PUSH: a process the job left running could still plant one of these
+    between this walk and git reading the objects.
+
+    WHAT THE WALK COSTS, measured 2026-11-03 (warm cache, five runs each): this repository's
+    objects, 3,216 entries, 5 to 6 ms; a 1.38 GiB repository, 1,453 entries, 3 to 4 ms; two
+    others of 16 MiB and 570 MiB, 3,607 and 2,556 entries, 5 to 6 and 4 to 5 ms. The walk is over
+    the fan-out directories and the pack directory, so it grows with the loose objects, not with
+    the size of the history."""
     objects = git_dir / "objects"
-    for path in (objects, objects / "info"):
-        if path.is_symlink():
+    if objects.is_symlink():
+        raise _a_link(objects)
+    pending = [objects]
+    while pending:
+        where = pending.pop()
+        try:
+            entries = list(os.scandir(where))
+        except OSError as exc:
             raise RuntimeError(
-                f"push failed: {path} in the job's repository is a symlink, which the host does "
-                "not follow — replace it with the directory itself (or run the job again), then "
-                "publish again")
+                f"push failed: could not read {where} in the job's repository ({exc.strerror}) "
+                "— check that the host can read the job's repository, then publish again") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                raise _a_link(path)
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(path)
+            elif not entry.is_file(follow_symlinks=False):
+                raise RuntimeError(
+                    f"push failed: {path} in the job's repository is neither a file nor a "
+                    "directory, and git would open it — remove it (or run the job again), then "
+                    "publish again")
     for name in ("alternates", "http-alternates"):
         borrowed = objects / "info" / name
         try:
@@ -179,6 +214,12 @@ def _borrows_nothing(git_dir: Path) -> None:
             f"({borrowed}), which the host's push never follows — make the repository hold its "
             f"own objects (`git repack -a -d`, then remove {borrowed}), or run the job again, "
             "then publish again")
+
+
+def _a_link(path: Path) -> RuntimeError:
+    return RuntimeError(
+        f"push failed: {path} in the job's repository is a symlink, which the host does not "
+        "follow — replace it with what it points at (or run the job again), then publish again")
 
 
 def _the_branchs_commit(git_dir: Path, branch: str) -> str:

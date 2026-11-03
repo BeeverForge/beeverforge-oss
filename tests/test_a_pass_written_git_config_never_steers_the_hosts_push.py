@@ -31,6 +31,7 @@ old shape, so the proofs below are not proving an absence that would hold anyway
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -662,3 +663,103 @@ def test_the_container_boxs_push_never_sends_objects_from_a_directory_the_box_ca
 
     assert "borrows objects from elsewhere" in str(refused.value)
     assert _git(scene["forge"], "cat-file", "-e", theirs, check=False).returncode != 0
+
+
+# ── a link below `objects` (review of #403, at d2e1df4) ─────────────────────────────────────────
+
+_FAN_OUT = re.compile(r"[0-9a-f]{2}")
+
+
+def _a_job_linking_below_objects(scene, git_dir: Path, shape: str) -> str:
+    """A link the job plants BELOW `objects`, reaching a decoy repository's object storage, and
+    its branch pointed at a commit only the decoy holds. Returns that commit.
+
+      * `pack`: the job's `objects/pack` is a link to the decoy's, repacked to hold the commit;
+      * `fan-out`: each fan-out directory the decoy's loose objects use is a link to the
+        decoy's;
+      * `object-file`: each of the decoy's loose objects is linked file by file into real
+        fan-out directories of the job's."""
+    decoy = _a_decoy_branch(scene, "elsewhere")
+    theirs = _git(decoy, "rev-parse", "HEAD").stdout.strip()
+    mine, decoys = git_dir / "objects", decoy / ".git" / "objects"
+    if shape == "pack":
+        _git(decoy, "repack", "-q", "-a", "-d")
+        shutil.rmtree(mine / "pack")
+        (mine / "pack").symlink_to(decoys / "pack")
+    else:
+        for fan in sorted(p for p in decoys.iterdir() if _FAN_OUT.fullmatch(p.name)):
+            if shape == "fan-out":
+                shutil.rmtree(mine / fan.name, ignore_errors=True)
+                (mine / fan.name).symlink_to(fan)
+            else:
+                (mine / fan.name).mkdir(exist_ok=True)
+                for loose in fan.iterdir():
+                    (mine / fan.name / loose.name).unlink(missing_ok=True)
+                    (mine / fan.name / loose.name).symlink_to(loose)
+    return theirs
+
+
+def _the_link_was_refused_and_nothing_reached_the_forge(scene, refused, branch: str,
+                                                        theirs: str) -> None:
+    said = str(refused.value)
+    assert said.startswith("push failed:") and "is a symlink" in said, said
+    assert "then publish again" in said
+    assert _git(scene["forge"], "cat-file", "-e", theirs, check=False).returncode != 0
+    assert _git(scene["forge"], "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+                check=False).returncode != 0
+
+
+@pytest.mark.parametrize("shape", ["pack", "fan-out", "object-file"])
+def test_the_worktree_boxs_push_refuses_a_link_below_objects(scene, worktree_box, own_tmp,
+                                                            shape):
+    box, repo = worktree_box
+    ws = box.prepare(repo_path=repo, base_branch="main", branch="sdlc/1",
+                     remote_url=str(scene["forge"]))
+    _commit(Path(ws.path), "print('two')\n")
+    theirs = _a_job_linking_below_objects(scene, repo / ".git", shape)
+    (repo / ".git" / "refs" / "heads" / "sdlc" / "1").write_text(f"{theirs}\n")
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    _the_link_was_refused_and_nothing_reached_the_forge(scene, refused, "sdlc/1", theirs)
+    assert list(own_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("shape", ["pack", "fan-out", "object-file"])
+def test_the_container_boxs_push_refuses_a_link_below_objects(scene, shape):
+    from beeverforge.adapters.sandbox.base import Workspace
+    from beeverforge.adapters.sandbox.container import ContainerSandbox, _materialize_workspace
+
+    host_clone = scene["root"] / "host-clone"
+    _materialize_workspace(repo_path=scene["repo"], host_clone=host_clone, base_branch="main",
+                           branch="sdlc/2", checkout_existing=False,
+                           remote_url=str(scene["forge"]))
+    box = ContainerSandbox(image="unused")
+    box._host_clone, box._repo_path = host_clone, scene["repo"]
+    _commit(host_clone, "print('three')\n")
+    theirs = _a_job_linking_below_objects(scene, host_clone / ".git", shape)
+    (host_clone / ".git" / "refs" / "heads" / "sdlc" / "2").write_text(f"{theirs}\n")
+    ws = Workspace(path=Path("/workspace"), host_path=host_clone, branch="sdlc/2",
+                   base_branch="main")
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    _the_link_was_refused_and_nothing_reached_the_forge(scene, refused, "sdlc/2", theirs)
+
+
+def test_an_objects_entry_that_is_neither_a_file_nor_a_directory_is_refused(scene, worktree_box):
+    """A FIFO stands in for every kind git would open and nobody should hand it."""
+    box, repo = worktree_box
+    ws = box.prepare(repo_path=repo, base_branch="main", branch="sdlc/1",
+                     remote_url=str(scene["forge"]))
+    _commit(Path(ws.path), "print('two')\n")
+    os.mkfifo(repo / ".git" / "objects" / "info" / "a-fifo")
+
+    with pytest.raises(RuntimeError) as refused:
+        box.publish_branch(workspace=ws, remote_url=str(scene["forge"]))
+
+    said = str(refused.value)
+    assert said.startswith("push failed:") and "neither a file nor a directory" in said
+    assert "then publish again" in said

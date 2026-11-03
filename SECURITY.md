@@ -72,9 +72,12 @@ interesting surface is well-defined:
   in the workload's own scrubbed environment, so that program runs as the job's user with the
   job's environment, and the credential the push carries is the person's own, which a worktree
   workload running as that user can already read. On both doors the push borrows the job's
-  objects and nothing else: a job's repository whose objects directory names another one
-  (`info/alternates`, `info/http-alternates`, or a symlinked `objects`) is refused, so a job cannot
-  make the push send another repository's objects. With the local forge the push's target is a
+  objects directory, and refuses it when it carries `info/alternates` or `info/http-alternates`,
+  a symlink anywhere under `objects` (`objects` itself included), or an entry that is neither a
+  regular file nor a directory; so a job cannot make the push send another repository's objects
+  through any of those. The check runs once, just before the push: a process the job left
+  running could still plant one between the check and git reading the objects. With the local
+  forge the push's target is a
   repository on this machine, whose receiving side runs under that repository's own config and
   hooks; that is tracked with the other host-side git calls in #400.
 
