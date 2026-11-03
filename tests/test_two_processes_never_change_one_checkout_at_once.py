@@ -39,9 +39,10 @@ from beeverforge.runtime.repo_cache import RepoCache
 #: Every cache class, asked of the code: a cache added tomorrow falls under the rule without an edit
 CACHES = [RepoCache, *RepoCache.__subclasses__()]
 SPAWN = multiprocessing.get_context("spawn")
-#: How long the parent lets the second process try while the first waits. On a lock that does not
-#: hold it is in git as soon as it has started: 0.102 s at most from its start, measured with four
-#: of these runs side by side on four cores (#362, which took this from 3 s). On a lock that does
+#: How long the parent lets the second process try while the first waits, counted from the moment
+#: the second process is RUNNING (`_two` waits for that first, so its start-up is not counted). On
+#: a lock that does not hold it is in git as soon as it runs: 0.015 s at most from `running`, measured
+#: 20 times with four side by side on four cores (#367's review; #362 took this from 3 s). On a lock that does
 #: hold, no wait of any length lets it in.
 TRY_SECONDS = 0.6
 #: An upper bound on anything that should happen at once — a process starting, a sync finishing.
@@ -65,9 +66,12 @@ def origin(tmp_path):
 
 
 def _syncing(kind: str, root: str, key: str, url: str, events: str, counter,
-             entered, release, wait: float | None) -> None:
+             entered, release, wait: float | None, running=None) -> None:
     """One process syncing `key`: every git command it runs is written down, numbered; when
-    `release` is given, it stops at its first git command until released."""
+    `release` is given, it stops at its first git command until released. `running` is set as
+    soon as the process has started and imported this module, before it asks for the key."""
+    if running is not None:
+        running.set()
     me = os.getpid()
     held = [release is None]
 
@@ -134,14 +138,20 @@ def _two(tmp_path, kind: str, first_key: str, second_key: str, origin: str, *,
     run = _Run(tmp_path / "events")
     counter = SPAWN.Value("i", 0)
     first_in, first_go, second_in = SPAWN.Event(), SPAWN.Event(), SPAWN.Event()
+    second_running = SPAWN.Event()
     root = str(tmp_path / "cache")
     first = SPAWN.Process(target=_syncing, args=(kind, root, first_key, origin, str(run.path),
                                                  counter, first_in, first_go, None))
     first.start()
     assert first_in.wait(BOUND), "the first process never reached git"
     second = SPAWN.Process(target=_syncing, args=(kind, root, second_key, origin, str(run.path),
-                                                  counter, second_in, None, second_wait))
+                                                  counter, second_in, None, second_wait,
+                                                  second_running))
     second.start()
+    # THE WINDOW STARTS ONCE THE SECOND PROCESS RUNS, not when it is spawned: starting an
+    # interpreter and importing this module took 0.52-0.67 s under a `-n 4` suite (#367's review),
+    # which is not the lock's to answer for and would eat the window.
+    assert second_running.wait(BOUND), "the second process never started"
     reached = None
     if second_wait is not None:
         second.join(BOUND)      # it gives up while the first still holds the key
