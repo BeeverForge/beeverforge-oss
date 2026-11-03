@@ -49,12 +49,26 @@ def _app_jwt(app_id: str, private_key: str) -> str:
                       algorithm="RS256")
 
 
+class AppKeyDoesNotSign(Exception):
+    """The App's private key could not sign the App JWT, so nothing was sent to GitHub (#217).
+
+    Raised by `mint_installation_token` around the SIGNING STEP ONLY, chained from whatever PyJWT
+    or cryptography raised (a public key has no `sign`, whitespace does not parse). The type is
+    the answer, never the original's text; `args[0]` is only the original's type name."""
+
+
 def mint_installation_token(
     *, app_id: str, private_key: str, installation_id: str
 ) -> tuple[str, float]:
     """Sign an App JWT (RS256), exchange it for an installation token. Returns
-    (token, expires_at_epoch)."""
-    app_jwt = _app_jwt(app_id, private_key)
+    (token, expires_at_epoch).
+
+    A key that cannot sign is `AppKeyDoesNotSign`; GitHub's refusal and an unreachable API stay
+    httpx's own `HTTPStatusError` / `TransportError`, so each caller says them in its words."""
+    try:
+        app_jwt = _app_jwt(app_id, private_key)
+    except Exception as exc:  # every failure to sign is one answer: this key does not sign
+        raise AppKeyDoesNotSign(type(exc).__name__) from exc
     r = httpx.post(
         f"https://api.github.com/app/installations/{installation_id}/access_tokens",
         headers={"Authorization": f"Bearer {app_jwt}", "Accept": "application/vnd.github+json"},

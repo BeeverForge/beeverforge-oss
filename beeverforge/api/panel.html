@@ -6009,12 +6009,17 @@ function _bevents(p){
 }
 
 async function boardComment(){
-  const said = (_bd.draft||"").trim();
+  const board = _bd, project = board.project, card = board.card, selection = board.selection;
+  const draft = board.draft||"", said = draft.trim();
   if(!said) return;
-  const r = await act("card_comment", {project:_bd.project, issue:_bd.card, message:said});
+  const r = await act("card_comment", {project, issue:card, message:said});
   if(!r.ok){ toast("Not posted", r.message||"", "err"); return; }
-  _bd.draft = "";
-  await refreshBoard();
+  // Clear only the submitted draft. The person can type again, or open another card, while
+  // the request is pending; its response owns neither that newer text nor that other drawer.
+  if(_bd === board && board.project === project && board.card === card &&
+     board.selection === selection && board.draft === draft) board.draft = "";
+  // A reopened board is a new _bd. Its earlier read missed this post, and hosted boards do not poll.
+  if(_bd.project === project && _bd.card === card) await refreshBoard();
 }
 
 // A PREVIEW OPENS ON ITS OWN HOSTS, NEVER HERE (ADR-0050 D7). It runs code the agent wrote, and
