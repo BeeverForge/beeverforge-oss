@@ -211,8 +211,10 @@ OUTSIDE_THE_LOG = {
 }
 
 #: The commands of a module allowed whole above that become the deployment's own long-running
-#: processes — the panel's `serve` and `beeverforge worker` — where nothing may write past it.
-BECOME_A_PROCESS = {"beeverforge/cli.py": ("serve", "worker_cmd")}
+#: processes — the panel's `serve` and `beeverforge worker` — where nothing may write past it. And
+#: `worker --with-panel`'s supervisor, the worker image's container command (#363): its own lines
+#: sit in the container's log beside the two processes it starts (review of #406).
+BECOME_A_PROCESS = {"beeverforge/cli.py": ("serve", "worker_cmd", "_worker_with_panel")}
 
 _STREAMS = {"stdout", "stderr", "__stdout__", "__stderr__"}
 _ECHOES = {"typer", "click"}
@@ -483,8 +485,9 @@ def test_the_live_feed_keeps_its_envelope_inside_a_json_line(monkeypatch, capsys
 #: path must never be silent, so it is a WARNING: with `BEEVERFORGE_LOG_LEVEL=WARNING` an INFO line
 #: is dropped (fifth review of #818: the degraded pre-flight put back at INFO survived every test).
 #: The call sites are read off the package; one that is not here fails the case below, so a line
-#: added tomorrow is classed by whoever adds it.
-NEVER_SILENT, SAID_FOR_THE_RECORD = "WARNING", "INFO"
+#: added tomorrow is classed by whoever adds it. A line that says a process of the set ended it is
+#: an ERROR: the container exits with that process's status next (#363).
+NEVER_SILENT, SAID_FOR_THE_RECORD, ENDS_THE_SET = "WARNING", "INFO", "ERROR"
 LINE_LEVELS = {
     ("beeverforge/runtime/temporal/activities.py", "_do_preflight.degrade",
      "BEEVERFORGE_PREFLIGHT: DEGRADED for "): NEVER_SILENT,
@@ -516,6 +519,9 @@ LINE_LEVELS = {
     ("beeverforge/runtime/temporal/worker.py", "main",
      "beeverforge worker up · "): SAID_FOR_THE_RECORD,
     ("beeverforge/cli.py", "serve", "panel: http://"): SAID_FOR_THE_RECORD,
+    ("beeverforge/cli.py", "_worker_with_panel.say", "✗ "): ENDS_THE_SET,
+    ("beeverforge/cli.py", "_worker_with_panel.say", "! "): NEVER_SILENT,
+    ("beeverforge/cli.py", "_worker_with_panel.say", ""): SAID_FOR_THE_RECORD,
 }
 
 
@@ -565,7 +571,7 @@ def test_a_line_that_must_never_be_silent_is_said_at_warning():
     wrong = {where: levels for where, levels in said.items()
              if levels != [LINE_LEVELS[where]]}
     assert not wrong, f"said at another level than its class, or twice from one place: {wrong}"
-    assert {NEVER_SILENT, SAID_FOR_THE_RECORD} == set(LINE_LEVELS.values())
+    assert {NEVER_SILENT, SAID_FOR_THE_RECORD, ENDS_THE_SET} == set(LINE_LEVELS.values())
 
 
 # ── Python's own lines (fourth review of #818) ──────────────────────────────────────────────────
@@ -1397,6 +1403,32 @@ class _Runtimes:
         monkeypatch.setenv("TEMPORAL_ADDRESS", at)
 
 
+def _a_probe_that_answers(monkeypatch) -> list[tuple[str, int]]:
+    """The socket a JSON-lines connect asks before it builds a runtime (`connection._listening`),
+    stood in for: it says "listening" at once, and each `(host, port)` it was asked about is
+    recorded in the list returned. For the cases that read the CONNECT — the client held, the
+    runtime it is made on, the attempt that fails or is cancelled — and not the probe.
+
+    WHY NOT A REAL LISTENER (#396): the probe waits 1.0 s of its own for the handshake, a number in
+    `beeverforge/` that no `within` and no `BEEVERFORGE_ENGINE_DEADLINE` reaches, so a case that
+    asks it is bounded by elapsed time on the runner. A loaded `make test-unit` gave the
+    one-client case `EngineNotListening` at a `listening` address; measured on 4 cores at load
+    averages of 17 to 52, the probe answered in 0.2 ms at the median and 0.12 s at worst, so the
+    failure is rare, and no bound a case passes would reach it. The probe keeps its guards on
+    real sockets: `test_a_port_nobody_listens_on_costs_no_runtime_and_no_collection` (`refusing`)
+    and `test_an_attempt_that_fails_once_its_runtime_is_built_rests_its_target_at_every_door`."""
+    from beeverforge.runtime.temporal import connection
+
+    asked: list[tuple[str, int]] = []
+
+    async def _listening(host: str, port: int) -> bool:
+        asked.append((host, port))
+        return True
+
+    monkeypatch.setattr(connection, "_listening", _listening)
+    return asked
+
+
 @pytest.fixture
 def listening():
     """Addresses where a socket listens and never reads what it is sent — so the probe a connect
@@ -1455,18 +1487,22 @@ def _a_line_of_the_core(level: int, message: str):
 
 
 async def test_with_json_lines_the_one_engine_client_has_a_runtime_whose_core_writes_through_the_log(
-        monkeypatch, capsys, listening):
+        monkeypatch, capsys):
     """Read off what `connection.connect()` — the one door every engine client of the worker, the
     panel and the CLI is made through — does: the process's client is made ONCE, on a runtime of
     its own whose core forwards its lines to `CORE_LOGGER` at the library's own default filter,
     and handed back to every later caller, from this loop or another; a target that changes gets
-    a client and a runtime of its own. A line forwarded that way is a JSON line on stderr."""
+    a client and a runtime of its own. A line forwarded that way is a JSON line on stderr.
+
+    The socket asked first is stood in for (`_a_probe_that_answers`, #396), and read: it is asked
+    once for each client made, never for the one held."""
     from temporalio.runtime import LoggingConfig
 
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv(logs.FORMAT_VARIABLE, "json")
-    runtimes = _Runtimes(monkeypatch, at=listening())
+    runtimes = _Runtimes(monkeypatch, at="127.0.0.1:7233")
+    asked = _a_probe_that_answers(monkeypatch)
 
     first = await connection.connect()
     again = await connection.connect()
@@ -1476,6 +1512,8 @@ async def test_with_json_lines_the_one_engine_client_has_a_runtime_whose_core_wr
 
     assert again is first and elsewhere is first, "a second caller was given a client of its own"
     assert moved is not first, "a target that changed was served the old target's client"
+    assert asked == [("127.0.0.1", 7233)] * 2, (
+        "the socket is asked once for each client made, and not for the one held", asked)
     assert len(runtimes.built) == 2 and runtimes.clients == runtimes.built, (
         "the held client and the moved target's each on a runtime of their own",
         runtimes.clients, runtimes.built)
@@ -1498,7 +1536,7 @@ async def test_with_json_lines_the_one_engine_client_has_a_runtime_whose_core_wr
     assert "poll_activity_task_queue retried" in line["message"], line
 
 
-async def test_a_client_a_changed_target_lets_go_of_keeps_no_runtime(monkeypatch, listening):
+async def test_a_client_a_changed_target_lets_go_of_keeps_no_runtime(monkeypatch):
     """The SDK's client sits in a reference cycle, so a client let go of keeps its runtime — a
     thread per CPU with JSON lines — until a full collection. The one client a process lets go of
     is the one whose target changed (a moved address, a rotated key), and its runtime is gone the
@@ -1508,7 +1546,8 @@ async def test_a_client_a_changed_target_lets_go_of_keeps_no_runtime(monkeypatch
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv(logs.FORMAT_VARIABLE, "json")
-    runtimes = _Runtimes(monkeypatch, at=listening())
+    runtimes = _Runtimes(monkeypatch, at="127.0.0.1:7233")
+    _a_probe_that_answers(monkeypatch)
 
     class _InACycle:                       # as the SDK's client is: it refers to itself
         def __init__(self, runtime):
@@ -1523,14 +1562,14 @@ async def test_a_client_a_changed_target_lets_go_of_keeps_no_runtime(monkeypatch
     first = weakref.ref(runtimes.built[0])
     runtimes.built.clear()
     runtimes.clients.clear()
-    monkeypatch.setenv("TEMPORAL_ADDRESS", listening())
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "127.0.0.1:7234")
     await connection.connect()
 
     assert first() is None, "the client a changed target let go of still holds its runtime"
 
 
 async def test_a_runtime_that_cannot_be_built_is_a_failed_attempt_and_the_next_one_tries(
-        monkeypatch, listening):
+        monkeypatch):
     """Building a runtime can fail like a connect can — the bridge's "Failed initializing runtime",
     for one, when a thread cannot start under a pid limit. That attempt fails, is let go of, and the
     next connect to a healthy engine tries for itself (seventh review of #818: built before the
@@ -1538,7 +1577,8 @@ async def test_a_runtime_that_cannot_be_built_is_a_failed_attempt_and_the_next_o
     from beeverforge.runtime.temporal import connection
 
     monkeypatch.setenv(logs.FORMAT_VARIABLE, "json")
-    _Runtimes(monkeypatch, at=listening())
+    _Runtimes(monkeypatch)
+    _a_probe_that_answers(monkeypatch)
     making, failed = connection.core_runtime, []
 
     def _fails_once():
@@ -1669,7 +1709,7 @@ async def test_callers_who_arrive_together_share_one_attempt_and_its_outcome(mon
 
 @pytest.mark.parametrize("asked", ["json", None])
 async def test_a_cancelled_attempt_is_nobodys_failure_and_those_behind_it_try(monkeypatch,
-                                                                              listening, asked):
+                                                                              asked):
     """The caller whose attempt is in flight goes away — a bounded read that gave up, a request a
     browser closed. That says nothing about the engine, so the callers queued behind it try for
     themselves and are given a client, never the cancellation as if the engine had failed — and,
@@ -1679,7 +1719,8 @@ async def test_a_cancelled_attempt_is_nobodys_failure_and_those_behind_it_try(mo
     if asked:
         monkeypatch.setenv(logs.FORMAT_VARIABLE, asked)
         monkeypatch.setattr(connection, "Runtime", lambda **_kwargs: types.SimpleNamespace())
-    engine = _HeldEngine(monkeypatch, at=listening())
+    engine = _HeldEngine(monkeypatch)
+    _a_probe_that_answers(monkeypatch)
     arrivals = _Arrivals(monkeypatch)
     said: list = []
     owner = asyncio.create_task(connection.connect())
@@ -2119,7 +2160,7 @@ async def _until_no_target_rests() -> None:
 
 @pytest.mark.parametrize("door", CONNECT_DOORS)
 async def test_once_its_rest_ends_a_target_is_asked_again_and_a_client_that_lands_leaves_no_failed_runtime(
-        monkeypatch, listening, door):
+        monkeypatch, door):
     """A failed attempt's runtime sits in a cycle with the failure's traceback, so the collection run
     while that failure is handled frees the attempt before it, never its own, and the read side kept
     the last failure until a client landed (re-review on 3cd816ac, measured on the real panel: 26
@@ -2131,7 +2172,8 @@ async def test_once_its_rest_ends_a_target_is_asked_again_and_a_client_that_land
     monkeypatch.setenv(logs.FORMAT_VARIABLE, "json")
     monkeypatch.setenv("BEEVERFORGE_ENGINE_UNREACHABLE_FOR", "0.05")
     monkeypatch.setattr(connection, "RESTS_AT_MOST_S", 0.05)
-    runtimes = _Runtimes(monkeypatch, at=listening())
+    runtimes = _Runtimes(monkeypatch)
+    _a_probe_that_answers(monkeypatch)
     refusing, asked = [True], []
 
     async def _connect(*_args, **kwargs):

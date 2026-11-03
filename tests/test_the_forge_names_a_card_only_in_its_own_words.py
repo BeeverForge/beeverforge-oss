@@ -42,6 +42,9 @@ from tests.test_a_card_is_named_in_the_forge_only_where_the_forge_owns_it import
 _CLOSES_AN_ITEM = re.compile(
     r"\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s+\S*#\d", re.IGNORECASE)
 
+#: GitHub's other form of an issue reference, which it links in a body as it does `#<number>`.
+_GH_MENTION = re.compile(r"\bGH-\d+\b", re.IGNORECASE)
+
 #: The PARENT's ref on the board, as the splitter writes it into the child's title.
 _PARENT = "#37"
 
@@ -106,10 +109,18 @@ def test_the_cards_own_text_reaches_the_forge_only_in_its_words(
     ('the "#37" card', 'the "card 37" card'),
     ("acme/issues#37", "acme/issues card 37"),
     ("Fixes #36, #37", "Fixes card 36, card 37"),
+    # GitHub links `GH-<number>` too, in any case, and a qualified `owner/repo#<number>`
+    ("Fixes GH-1 and see GH-2.", "Fixes card 1 and see card 2."),
+    ("gh-12 first", "card 12 first"),
+    ("(GH-7)", "(card 7)"),
+    ("owner/repo#3", "owner/repo card 3"),
     # not a mention: no number after the sign, or no sign at all
     ("C# and F#", "C# and F#"),
     ("issue # 4", "issue # 4"),
     ("PROJ-12 and GH-less", "PROJ-12 and GH-less"),
+    ("XGH-12", "XGH-12"),
+    ("GH-12a", "GH-12a"),
+    ("GH- 4", "GH- 4"),
     ("", ""),
 ])
 def test_what_counts_as_a_mention(text, expected) -> None:
@@ -119,6 +130,7 @@ def test_what_counts_as_a_mention(text, expected) -> None:
 
     assert without_mentions(text) == expected
     assert not _MENTION.search(without_mentions(text))
+    assert not _GH_MENTION.search(without_mentions(text))
 
 
 def test_a_body_built_without_a_verdict_carries_no_mention_of_the_cards_text() -> None:

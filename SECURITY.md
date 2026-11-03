@@ -87,6 +87,15 @@ interesting surface is well-defined:
   repository on this machine, whose receiving side runs under that repository's own config and
   hooks; that is tracked with the other host-side git calls in #400.
 
+  The **worker image run as one container** (`beeverforge worker --with-panel`) starts the panel
+  from the worker's own environment, so the panel's HTTP process holds the worker's credentials —
+  the GitHub App key, the model credential — by design: the two run as one user in one container,
+  where either process can read the other's environment and files, so stripping the panel's would
+  separate nothing. That is why the command will not start an open panel off the loopback (it
+  requires a panel sign-in token), and why
+  [docs/operations.md](docs/operations.md) lists what to leave out of that container. The compose
+  stack runs them as separate containers, the Docker socket in the worker's alone.
+
   Anything that lets workload code reach a credential outside that set is a vulnerability — a
   spelling a deny list misses, a credential in a log line or a diff, a name crossing the
   container box without `box.env` naming it. So is that set growing while this table does not:
