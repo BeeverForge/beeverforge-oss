@@ -255,7 +255,10 @@ class AzureBoardsTracker:
         leaf = (repo or "").replace("\\", "/").strip("/").rsplit("/", 1)[-1].strip()
         if not leaf:
             return ""
-        area = next((a for a, r in self._areas.items() if r.rsplit("/", 1)[-1] == leaf), leaf)
+        # Azure DevOps names ignore case (#399): `API` is the `api` the map names. The area keeps
+        # the map's spelling, and the leaf fallback the ref's.
+        area = next((a for a, r in self._areas.items()
+                     if r.rsplit("/", 1)[-1].casefold() == leaf.casefold()), leaf)
         return f"{self.project}\\{area}"
 
     def _description_ops(self, body: str) -> list[dict]:
