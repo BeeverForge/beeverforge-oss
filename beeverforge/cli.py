@@ -3235,7 +3235,12 @@ def bot_token(
         export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)
     """
     from beeverforge.credentials import app_id as env_app_id
-    from beeverforge.credentials import app_installation_id, app_private_key, app_private_key_at
+    from beeverforge.credentials import (
+        app_installation_id,
+        app_private_key,
+        app_private_key_at,
+        app_private_key_source,
+    )
 
     # THE FLAGS FALL BACK TO THE COMPOSITION ROOT rather than reading the environment themselves
     # (#64). These carried `envvar=`, which made typer the FOURTH independent reader of
@@ -3281,8 +3286,10 @@ def bot_token(
                        ".pem GitHub gave you, or leave --key-path out to use the deployment's key",
                        err=True)
             raise typer.Exit(1)
+        source = f"--key-path {key_path}"
     else:
         key = app_private_key()
+        source = app_private_key_source() or "the deployment's App key"
     if not (app_id and key and installation_id):
         typer.echo(
             "need the App id (--app-id or BEEVERFORGE_GH_APP_ID), the installation id "
@@ -3292,11 +3299,40 @@ def bot_token(
             err=True,
         )
         raise typer.Exit(1)
-    from beeverforge.adapters.github_app import mint_installation_token
+    import httpx
 
-    token, _expires = mint_installation_token(
-        app_id=app_id, private_key=key, installation_id=installation_id
-    )
+    from beeverforge.adapters.github_app import AppKeyDoesNotSign, mint_installation_token
+
+    # A FAILED MINT IS A SENTENCE (#217): a key that cannot sign, GitHub's refusal and an
+    # unreachable API each ended in a traceback. Branched on TYPE only, never on an exception's
+    # text: `AppKeyDoesNotSign` is raised around the signing step alone, the rest are httpx's own.
+    ids = "check that --app-id and --installation-id name one App and one of its installations"
+    try:
+        token, _expires = mint_installation_token(
+            app_id=app_id, private_key=key, installation_id=installation_id
+        )
+    except AppKeyDoesNotSign as exc:
+        typer.echo(f"✗ the App key from {source} does not sign a JWT ({exc}) — nothing was sent "
+                   "to GitHub; it is not an RSA private key (a PEM beginning "
+                   "-----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----), and the "
+                   "App's private key is downloaded from the App's settings page on GitHub",
+                   err=True)
+        raise typer.Exit(1) from None
+    except httpx.HTTPStatusError as exc:
+        try:
+            body = exc.response.json()
+        except ValueError:
+            body = None
+        message = body.get("message") if isinstance(body, dict) else None
+        typer.echo(f"✗ GitHub refused to mint a token for installation {installation_id} of App "
+                   f"{app_id} ({exc.response.status_code} "
+                   f"{message or exc.response.reason_phrase}) — {ids}", err=True)
+        raise typer.Exit(1) from None
+    except httpx.TransportError as exc:
+        typer.echo(f"✗ GitHub could not be reached to mint a token for installation "
+                   f"{installation_id} of App {app_id} ({type(exc).__name__}) — {ids}, and that "
+                   "api.github.com is reachable from here", err=True)
+        raise typer.Exit(1) from None
     # THE TOKEN ON STDOUT, THE MEANING ON STDERR — so `$(beeverforge bot-token)` still captures
     # exactly the token while a human at a terminal is told what they are looking at. Without
     # this the printed value reads as a fourth credential to paste somewhere.
