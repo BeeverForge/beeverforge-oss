@@ -12,8 +12,9 @@ Eleven cuts, in four groups:
   * the LINE — the note goes back to the documents alone against the raw limit (the defect as
     filed), or measures the prompt against the raw limit and forgets the margin the pass holds back;
   * the FLOOR — `prompt_floor_bytes` stops being the prompt the passes build: it drops the role's
-    instructions, counts bytes instead of the quoted argument, reads one pass's instructions where
-    the larger is the planner's, or invents a card (the issue's own "not the fix");
+    instructions, counts bytes instead of the quoted argument, reads the executor's instructions
+    alone though the planner's can be the longer, or invents a card (the issue's own "not the
+    fix");
   * the CALLERS — `doctor` or `box prove` decides the note on the documents' sum again, or measures
     the floor without the profile the job runs under (#416's lesson, on the new measure);
   * the HEADROOM — the half that says how close the floor comes and what the card has left goes
@@ -51,8 +52,8 @@ MUTATIONS = [
      '    return max(_argv_bytes(f"{role_prompt(role)}\\n\\n{brief}")',
      '    return max(len(f"{role_prompt(role)}\\n\\n{brief}".encode())'),
 
-    ("the floor reads the executor's instructions only, while the planner's — the first pass a "
-     "pickup starts — are longer",
+    ("the floor reads the executor's instructions only, so a planner whose instructions are "
+     "longer — the first pass a pickup starts — is under-measured",
      CONTEXT,
      '_PASSES_THAT_INLINE_THE_DOCUMENTS = ("planner", "executor")',
      '_PASSES_THAT_INLINE_THE_DOCUMENTS = ("executor",)'),
