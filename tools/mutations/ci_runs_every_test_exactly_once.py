@@ -5,7 +5,10 @@ Run:  .venv/bin/python tools/mutate.py tools/mutations/ci_runs_every_test_exactl
 
 The claims, each a row:
   1. the slices of one selection hold every test exactly once, whatever process computes them,
-     and an xdist run writes each test it started once, a skipped one included;
+     on the probe and on the real tree, a file the duration table does not list included; a
+     shard never imports or skips by key a file it does not own, and the table's refresh credits
+     every test to its file; an xdist run writes each test it started once, a skipped one
+     included;
   2. the proof fails on a test missing, doubled or unknown, and on an empty collection;
   3. CI wires it: the `test` job needs every job and runs the proof, the slices are the matrix's,
      the three runs' markers split the suite without overlap, and the guard on CI's pytest follows
@@ -19,17 +22,48 @@ CONF = "tests/conftest.py"
 PROOF = "scripts/every_test_ran_once.py"
 CI = ".github/workflows/ci.yml"
 GUARD = "tests/test_ci_runs_what_we_run.py"
+TREE = "tests/test_every_shard_of_the_tree_is_part_of_its_collection.py"
+REFRESH = "tests/shard_durations.py"
 
 MUTATIONS = [
     # 1. the slices, and what a run records
+    # RE-AIMED 2026-11-02 (#356): the rule moved from a node id's CRC32 after collection to whole
+    # files skipped in `_Shard.pytest_ignore_collect`, so these three cut where it now lives.
     ("a slice keeps every test", CONF,
-     "        items[:] = kept\n", ""),
+     "                              self.count) != self.index):\n            return True\n",
+     "                              self.count) != self.index):\n            return None\n"),
     ("the slice rule is salted per process", CONF,
-     "    return zlib.crc32(nodeid.encode()) % count == index - 1",
-     "    return hash(nodeid) % count == index - 1"),
+     "    return zlib.crc32(key.encode()) % count + 1",
+     "    return hash(key) % count + 1"),
     ("a slice that does not exist is accepted", CONF,
      "    if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):",
      "    if not (index.isdigit() and count.isdigit()):"),
+    ("a shard imports the files other shards own", CONF,
+     "    def pytest_ignore_collect(self, collection_path, config):\n"
+     "        if (_is_a_test_module(collection_path, config.getini(\"python_files\"))\n"
+     "                and _shard_of(self.key(collection_path, config.rootpath), self.owners,\n"
+     "                              self.count) != self.index):\n"
+     "            return True\n"
+     "        return None\n",
+     "    def pytest_collection_modifyitems(self, config, items):\n"
+     "        kept = [item for item in items if _shard_of(\n"
+     "            self.key(item.path, config.rootpath), self.owners, self.count) == self.index]\n"
+     "        config.hook.pytest_deselected(items=[i for i in items if i not in kept])\n"
+     "        items[:] = kept\n"),
+    ("a file the table does not list is dropped", CONF,
+     "    return zlib.crc32(key.encode()) % count + 1",
+     "    return zlib.crc32(key.encode()) % (count + 1) + 1"),
+    ("the greedy split breaks ties by table order, not by path", CONF,
+     "key=lambda entry: (-entry[1], entry[0])):", "key=lambda entry: -entry[1]):"),
+    ("a shard skips a directory or a conftest by its own key", CONF,
+     '    return path.suffix == ".py" and path.is_file() and any(',
+     "    return True or any("),
+    ("the real tree's shards overlap", CONF,
+     "                              self.count) != self.index):\n            return True\n",
+     "                              self.count) != self.index):\n            return None\n",
+     TREE),
+    ("the refresh credits a class's tests to no file", REFRESH,
+     "    for end in range(len(parts), 0, -1):", "    for end in [len(parts)]:"),
     ("an xdist worker records too, so every test is written twice", CONF,
      '    if record and not hasattr(config, "workerinput"):', "    if record:"),
     ("a test is recorded when it is called, so a skipped one is missing", CONF,

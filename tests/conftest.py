@@ -622,10 +622,18 @@ def _the_environment_is_restored_after_every_test():
 #:
 #: CI RUNS THE SUITE AS PARALLEL JOBS, and a test that no job selected would leave the gate green
 #: over nothing. So the jobs take their part by an option rather than a list: `--shard I/N` keeps
-#: one slice of whatever the marker expression selected, fixed by the test's node id, so a test
-#: added tomorrow lands in exactly one slice with no file to edit. And every job writes the tests
-#: it STARTED (`--record-ids`), which CI compares with the whole collection
-#: (`scripts/every_test_ran_once.py`): missing, doubled or unknown fails the run.
+#: the test FILES of one slice, fixed by test file, so a test added tomorrow lands in exactly one
+#: slice with no file to edit. And every job writes the tests it STARTED (`--record-ids`), which CI
+#: compares with the whole collection (`scripts/every_test_ran_once.py`): missing, doubled or
+#: unknown fails the run.
+#:
+#: BY FILE, SKIPPED BEFORE IMPORT, BALANCED BY MEASURED TIME (#356). The rule used to keep a test by
+#: the CRC32 of its node id, after collection: every worker of every CI job imported and collected
+#: all ~880 files (9–10 s each) to throw three quarters away, and the hash left two shards a third
+#: heavier than the others. Now a shard never collects a file another shard owns: `_Shard` answers
+#: `pytest_ignore_collect`, which pytest asks before it imports the file. Ownership comes from
+#: `shard_durations.json` beside this file (`_shard_owners`), and a file the table does not list
+#: goes by the CRC32 of its path, so the table only ever costs balance, never a test.
 #:
 #: OUTSIDE THE TREE, or refused. Written into `test-ids/` at the repository's root, the ids file was
 #: read mid-run by `test_no_live_infrastructure_coordinate_is_published`, which scans the tree's
@@ -636,32 +644,106 @@ def _the_environment_is_restored_after_every_test():
 def pytest_addoption(parser) -> None:
     group = parser.getgroup("beeverforge", "the suite's own options")
     group.addoption("--shard", default="", metavar="I/N",
-                    help="run only the I-th of N slices of the selected tests, fixed by node id")
+                    help="run only the I-th of N slices of the selected tests, fixed by test file")
     group.addoption("--record-ids", default="", metavar="PATH",
                     help="append to PATH the node id of every test this run starts (with "
                          "--collect-only: every test it collects), one per line")
 
 
-def _in_slice(nodeid: str, index: int, count: int) -> bool:
-    """CRC32, NOT `hash()`: a string's hash is salted per process, and every xdist worker and
-    every CI job has to put a test in the same slice."""
+#: Beside this file, so a copied conftest reads the table beside the copy (or none at all).
+SHARD_TABLE = Path(__file__).with_name("shard_durations.json")
+SHARD_REFRESH = "python -m tests.shard_durations <junit.xml>"
+
+
+def _shard_table(path: Path) -> dict[str, float]:
+    """The measured seconds of each test file, keyed by its path relative to the rootdir. No table
+    is an empty one: every file then goes by its path's CRC32, which is balanced only by luck."""
+    import json
+
+    if not path.exists():
+        return {}
+    try:
+        table = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        table = None
+    if not (isinstance(table, dict) and all(
+            isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+            for seconds in table.values())):
+        raise pytest.UsageError(
+            f"{path} is not a table of test file to seconds, so --shard cannot split the suite; "
+            f"rebuild it with `{SHARD_REFRESH}`.")
+    return table
+
+
+def _shard_owners(table: dict[str, float], count: int) -> dict[str, int]:
+    """Which of `count` shards (1-based) owns each file the table lists: longest first, ties by
+    path, each to the least-loaded shard, ties by lowest index. A pure function of the table and
+    the count, so every xdist worker of every CI job computes the same answer, whatever order the
+    table, the filesystem or the process hands it over in."""
+    loads = [0.0] * count
+    owners = {}
+    for key, seconds in sorted(table.items(), key=lambda entry: (-entry[1], entry[0])):
+        least = min(range(count), key=lambda shard: (loads[shard], shard))
+        owners[key] = least + 1
+        loads[least] += seconds
+    return owners
+
+
+def _shard_of(key: str, owners: dict[str, int], count: int) -> int:
+    """CRC32, NOT `hash()`, for a file the table does not list: a string's hash is salted per
+    process, and every xdist worker and every CI job has to put a file in the same shard."""
     import zlib
 
-    return zlib.crc32(nodeid.encode()) % count == index - 1
+    if key in owners:
+        return owners[key]
+    return zlib.crc32(key.encode()) % count + 1
 
 
-def pytest_collection_modifyitems(config, items) -> None:
+def _is_a_test_module(path: Path, patterns: list[str]) -> bool:
+    """Only a file pytest would collect as a test module: a directory, a conftest or a helper is
+    never skipped, since a skipped conftest takes its fixtures with it."""
+    import fnmatch
+
+    return path.suffix == ".py" and path.is_file() and any(
+        fnmatch.fnmatch(path.as_posix() if "/" in pattern else path.name, pattern)
+        for pattern in patterns)
+
+
+class _Shard:
+    """Registered on every process of a `--shard` run (each xdist worker collects for itself), as
+    a plugin and not a conftest hook, so it answers for every test root: `tests/` and
+    `addons/*/tests` alike. A file another shard owns is ignored before pytest imports it; every
+    other path gets None, never False, because pytest takes the first answer and False would
+    override `--ignore`."""
+
+    def __init__(self, index: int, count: int, table: dict[str, float]) -> None:
+        self.index, self.count = index, count
+        self.owners = _shard_owners(table, count)
+
+    def key(self, path: Path, root: Path) -> str:
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def pytest_ignore_collect(self, collection_path, config):
+        if (_is_a_test_module(collection_path, config.getini("python_files"))
+                and _shard_of(self.key(collection_path, config.rootpath), self.owners,
+                              self.count) != self.index):
+            return True
+        return None
+
+
+def _the_shard(config) -> None:
     spec = config.getoption("--shard", default="")
     if not spec:
         return
     index, _, count = spec.partition("/")
     if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):
-        raise pytest.UsageError(f"--shard {spec}: expected I/N with 1 <= I <= N")
-    kept = [item for item in items if _in_slice(item.nodeid, int(index), int(count))]
-    left = [item for item in items if not _in_slice(item.nodeid, int(index), int(count))]
-    if left:
-        config.hook.pytest_deselected(items=left)
-        items[:] = kept
+        raise pytest.UsageError(
+            f"--shard {spec} names no slice: expected I/N with 1 <= I <= N, as in --shard=2/4.")
+    config.pluginmanager.register(_Shard(int(index), int(count), _shard_table(SHARD_TABLE)),
+                                  "beeverforge-suite-shard")
 
 
 def _without_the_group(nodeid: str) -> str:
@@ -723,6 +805,7 @@ def pytest_configure(config) -> None:
                 f"--record-ids {record}: write the ids outside the tree — a test that scans the "
                 f"tree reads the file while this run is still writing it")
         config.pluginmanager.register(_RecordIds(record), "beeverforge-suite-record-ids")
+    _the_shard(config)
 
 
 def pytest_unconfigure(config) -> None:
