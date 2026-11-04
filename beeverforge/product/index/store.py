@@ -46,6 +46,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from beeverforge.product.index.items import Item
+from beeverforge.util.private_file import create_private
 
 log = logging.getLogger("beeverforge.product.index")
 
@@ -57,6 +58,9 @@ FILENAME = "memory.sqlite"
 SCHEMA_VERSION = 2
 #: How long a statement waits for a writer's lock before it fails — a sync commits in batches.
 BUSY_SECONDS = 10.0
+#: What a symbolic link at the index's path is told to do (#308): the file is derived, so a regular
+#: one in its place is rebuilt by the next sync.
+_LINK_REMEDY = "remove the link; the next sync builds the index again as a regular file"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -182,6 +186,10 @@ class Index:
         return con
 
     def _opened(self) -> sqlite3.Connection:
+        """The file opened — created `0600` first, and an existing one narrowed to it (#308): it
+        holds client conversation text. Here rather than in `_connect`, so a file rebuilt after
+        `drop()` is private too."""
+        create_private(self.path, what="product index", remedy=_LINK_REMEDY, tighten=True)
         con = sqlite3.connect(str(self.path), timeout=BUSY_SECONDS)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA journal_mode=WAL")

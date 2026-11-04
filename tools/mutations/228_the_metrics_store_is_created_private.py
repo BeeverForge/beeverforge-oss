@@ -26,6 +26,9 @@ FORGET = "tests/test_a_project_is_forgotten_in_one_command.py"
 
 FRESH = "tests/test_a_fresh_install_reads_an_empty_store.py"
 
+#: Where `_create_private`'s body went when #308 shared it with the product index and the board.
+HELPER = "beeverforge/util/private_file.py"
+
 MUTATIONS = [
     ("THE DEFECT ITSELF on a write: the store is created by sqlite under the umask", SINK,
      "        if write:\n            self.path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -37,11 +40,13 @@ MUTATIONS = [
      "                _create_private(self.path)\n",
      "                self.path.parent.mkdir(parents=True, exist_ok=True)\n"),
 
-    ("no fchmod: the umask still narrows the mode it is created with", SINK,
+    # re-pinned (#308): the body moved from SINK to HELPER, the metrics tests still guard it.
+    ("no fchmod: the umask still narrows the mode it is created with", HELPER,
      "        os.fchmod(fd, 0o600)\n",
      "        pass\n"),
 
-    ("no O_EXCL skip: an existing store is opened and chmodded to 0600", SINK,
+    # re-pinned (#308): moved to HELPER.
+    ("no O_EXCL skip: an existing store is opened and chmodded to 0600", HELPER,
      "os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr",
      "os.O_WRONLY | os.O_CREAT | getattr"),
 
@@ -56,7 +61,8 @@ MUTATIONS = [
      "",
      FORGET + "::test_the_metrics_backup_forget_takes_is_private_whatever_the_umask"),
 
-    ("a symbolic link at the path is followed, not refused", SINK,
+    # re-pinned (#308): moved to HELPER.
+    ("a symbolic link at the path is followed, not refused", HELPER,
      "        if path.is_symlink():\n",
      "        if False:\n"),
 
