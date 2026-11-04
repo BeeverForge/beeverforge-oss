@@ -1,6 +1,7 @@
 """A review run that ended in error is not a verdict, and a limit is a pause (#131).
 
-Run:  .venv/bin/python tools/mutate.py tools/mutations/131_a_review_that_ended_in_error_is_not_a_verdict.py
+Run:  .venv/bin/python tools/mutate.py \
+        tools/mutations/131_a_review_that_ended_in_error_is_not_a_verdict.py
 
 The claims, each a row:
 
@@ -68,4 +69,8 @@ MUTATIONS = [
      "tests/test_onboarding_firstrun.py"),
     ("the reviewer does not mark a failed run as did-not-complete", REVIEWER,
      'decision="rejected", score=0, did_not_complete=True,', 'decision="rejected", score=0,'),
+    ("a review that says it never ran in capitals is headed as a rejection of the diff", CONTRACT,
+     '    summary = (getattr(review, "summary", "") or "").lower()\n',
+     '    summary = getattr(review, "summary", "") or ""\n',
+     "tests/test_an_unread_review_is_not_a_rejection.py"),
 ]

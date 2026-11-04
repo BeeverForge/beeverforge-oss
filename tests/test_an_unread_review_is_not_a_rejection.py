@@ -96,3 +96,17 @@ def test_an_approval_is_untouched():
     body = _body(ReviewResult(decision="approved", score=92, summary="meets every criterion"))
     assert "Review — approved (score 92)" in body
     assert "DID NOT COMPLETE" not in body
+
+
+def test_a_review_that_says_it_never_ran_in_capitals_is_not_a_verdict():
+    """Both reviewers write a run that never reached a verdict as "THE REVIEW NEVER RAN" — in
+    capitals — and the shared reader matched the lowercase phrase only, so the generic reviewer's
+    failure was headed as a plain rejection of the diff (#131's review of its own gap)."""
+    from beeverforge.contracts.review import ReviewResult, not_a_verdict
+
+    never_ran = ReviewResult(decision="rejected", score=0, summary=(
+        "THE REVIEW NEVER RAN (harness): the agent exited 1. This diff has NOT been reviewed."))
+    assert not_a_verdict(never_ran)
+    judged = ReviewResult(decision="rejected", score=0, summary="It never ran the migration.")
+    judged_with_finding = judged.model_copy(update={"score": 10})
+    assert not not_a_verdict(judged_with_finding), "a scored rejection is a verdict"

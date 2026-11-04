@@ -89,6 +89,8 @@ def not_a_verdict(review) -> bool:
     The structured fields are read first; the phrases stay for reviewers that set neither."""
     if getattr(review, "pause_reason", None) or getattr(review, "did_not_complete", False):
         return True
-    summary = getattr(review, "summary", "") or ""
+    # CASE-BLIND: both reviewers write the run that never reached a verdict as "THE REVIEW NEVER
+    # RAN", in capitals, and a lowercase-only match headed the generic reviewer's as a rejection
+    summary = (getattr(review, "summary", "") or "").lower()
     return (getattr(review, "score", None) == 0 and not getattr(review, "findings", None)
             and ("could not be parsed" in summary or "never ran" in summary))
