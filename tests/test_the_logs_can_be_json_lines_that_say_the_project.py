@@ -48,6 +48,7 @@ import logging
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -1459,8 +1460,15 @@ def refusing() -> str:
         return f"127.0.0.1:{nobody.getsockname()[1]}"
 
 
+def _refuse(taken) -> None:
+    """Close a connection `closing` took with a reset, not a FIN (#425): `SO_LINGER` on with 0 s
+    makes the close an RST, which the client sees as a refusal whatever it has sent or read."""
+    taken.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    taken.close()
+
+
 def _close_each(sock, stop: threading.Event, pause: float = 0.01) -> None:
-    """Take each connection `sock` is handed and close it at once, until `stop` is set.
+    """Take each connection `sock` is handed and refuse it at once (`_refuse`), until `stop` is set.
 
     AN ACCEPT THAT FAILS IS NOT THE END (#416): the loop left on any `OSError`, as if the socket
     had been closed. Linux hands a connection's pending error back from `accept` (accept(2)), and
@@ -1474,12 +1482,12 @@ def _close_each(sock, stop: threading.Event, pause: float = 0.01) -> None:
         except OSError:
             stop.wait(pause)
             continue
-        taken.close()
+        _refuse(taken)
 
 
 @contextlib.contextmanager
 def _a_socket_that_closes_what_it_takes():
-    """A loopback address whose socket takes each connection and closes it at once, from a thread
+    """A loopback address whose socket takes each connection and resets it at once, from a thread
     of its own (`_close_each`). Stopped and closed when the block ends."""
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1503,7 +1511,7 @@ def _a_socket_that_closes_what_it_takes():
 
 @pytest.fixture
 def closing():
-    """An address whose socket takes each connection and closes it at once, so the library's
+    """An address whose socket takes each connection and resets it at once, so the library's
     connect is refused after the socket took it — as a port a container publishes is taken while
     the engine behind it is not up, or an engine refuses the key it is given."""
     with _a_socket_that_closes_what_it_takes() as at:
@@ -1519,7 +1527,8 @@ class _AcceptsAsScripted:
     def __init__(self, stop: threading.Event):
         self._stop = stop
         self.calls = 0
-        self.taken = types.SimpleNamespace(closed=False)
+        self.taken = types.SimpleNamespace(closed=False, options=[])
+        self.taken.setsockopt = lambda *option: self.taken.options.append(option)
         self.taken.close = lambda: setattr(self.taken, "closed", True)
 
     def accept(self):
@@ -1545,6 +1554,41 @@ def test_the_closing_socket_keeps_closing_what_it_takes_after_an_accept_error():
 
     assert sock.calls == 3, f"the loop took {sock.calls} accept(s), not 3: it left on the error"
     assert sock.taken.closed, "the connection after a failed accept was never closed"
+
+
+class _TakesOnceThenStops:
+    """A real loopback listener whose `accept` takes one connection, on the calling thread, and
+    then ends the case by setting `stop`: no thread and no timeout."""
+
+    def __init__(self, listener: socket.socket, stop: threading.Event):
+        self._listener = listener
+        self._stop = stop
+        self.calls = 0
+
+    def accept(self):
+        self.calls += 1
+        if self.calls == 1:
+            return self._listener.accept()
+        self._stop.set()
+        raise OSError(errno.EBADF, "the case is over")
+
+
+def test_the_closing_socket_resets_what_it_takes():
+    """#425: `closing` closed what it took with a plain close, which sends a FIN when nothing
+    unread is waiting, and a refusal then rests on the peer reading its end of the stream. It was
+    not seen to hang (302 runs of the case under load, none past 0.28 s), but a reset is the one
+    refusal the client sees whatever it has sent and whenever it reads. So each connection taken
+    is closed with `SO_LINGER` 0: an RST. The client here sends nothing first, as a plain close
+    with unread data resets too, so a regression reads `b""` at once instead of a reset."""
+    stop = threading.Event()
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        with socket.create_connection(listener.getsockname()) as client:
+            _close_each(_TakesOnceThenStops(listener, stop), stop, pause=0)
+
+            with pytest.raises(ConnectionResetError):
+                client.recv(1)
 
 
 def _a_line_of_the_core(level: int, message: str):
@@ -2291,6 +2335,11 @@ async def test_a_connect_refused_once_the_socket_took_it_keeps_no_runtime_alive(
     monkeypatch.setattr(connection, "RESTS_AT_MOST_S", 0.01)
     _no_engine_credentials(monkeypatch)
     monkeypatch.setenv("TEMPORAL_ADDRESS", closing)
+    # THE PROBE IS STOOD IN FOR (#425): `closing` resets what it takes, and the library's probe,
+    # which only opens a connection and closes it, reads that reset as nothing listening (2 of
+    # 11 attempts in one run), so the attempt built no runtime. The probe is guarded elsewhere
+    # (`_a_probe_that_answers`); what this case reads is the connect that follows it.
+    _a_probe_that_answers(monkeypatch)
     costs = _Costs(monkeypatch)
 
     async def _refused() -> None:
