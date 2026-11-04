@@ -2218,11 +2218,18 @@ def test_a_rest_doubles_after_each_attempt_that_fails_again_up_to_a_minute(monke
     assert connection._RESTING[another].wait == starts, "a new target's first rest was doubled"
 
 
-async def _until_no_target_rests() -> None:
+def _end_the_rest() -> None:
+    """End the rest the attempt that just failed left on its target, without waiting for it: the
+    rest must have been recorded, and once its `until` is now the target must no longer be refused.
+    Its `at`, `wait` and `said` are kept, so the next failure still doubles the wait."""
     from beeverforge.runtime.temporal import connection
 
-    for rest in list(connection._RESTING.values()):
-        await asyncio.sleep(max(0.0, rest.until - time.monotonic()) + 0.01)
+    with connection._HOLDING:
+        assert len(connection._RESTING) == 1, "the failed attempt left no rest"
+        ((key, rest),) = connection._RESTING.items()
+        assert rest.wait > 0 and rest.until > rest.at, f"the rest was not recorded: {rest}"
+        connection._RESTING[key] = rest._replace(until=time.monotonic())
+        assert connection._resting(key) is None, "the rest did not end"
 
 
 @pytest.mark.parametrize("door", CONNECT_DOORS)
@@ -2253,13 +2260,12 @@ async def test_once_its_rest_ends_a_target_is_asked_again_and_a_client_that_land
 
     monkeypatch.setattr(connection.Client, "connect", _connect)
     for _ in range(3):
-        await _until_no_target_rests()
         with pytest.raises(RuntimeError):
             await _door(door)
+        _end_the_rest()
     failed = [weakref.ref(runtime) for runtime in runtimes.built]
     runtimes.built.clear()
     refusing[0] = False
-    await _until_no_target_rests()
     client = await _door(door)
 
     assert len(failed) == 3 and len(asked) == 4, (len(failed), len(asked))
@@ -2288,9 +2294,9 @@ async def test_a_connect_refused_once_the_socket_took_it_keeps_no_runtime_alive(
     costs = _Costs(monkeypatch)
 
     async def _refused() -> None:
-        await _until_no_target_rests()
         with pytest.raises(RuntimeError):
             await connection.connect(within=REFUSED_CONNECT_WITHIN_S)
+        _end_the_rest()
 
     await _refused()
     after_one = _threads_of_this_process()
