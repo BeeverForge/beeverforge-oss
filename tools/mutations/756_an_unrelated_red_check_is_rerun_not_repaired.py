@@ -143,8 +143,8 @@ MUTATIONS = [
      " runs\n",
      "    except ZeroDivisionError as exc:  # noqa: BLE001\n"),
 
-    ("the once-per-head bound is removed: every attempt re-runs, and a real regression in another "
-     "file never reaches an agent", ACTIVITIES,
+    ("the first-attempt-of-the-watch bound is removed: every attempt re-runs, and a real "
+     "regression in another file never reaches an agent", ACTIVITIES,
      '    if not callable(getattr(forge, "rerun_failed", None)) or inp.attempt != 1:\n',
      '    if not callable(getattr(forge, "rerun_failed", None)):\n'),
 

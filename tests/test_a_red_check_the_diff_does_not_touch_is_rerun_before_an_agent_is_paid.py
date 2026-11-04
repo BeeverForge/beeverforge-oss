@@ -413,13 +413,13 @@ def test_a_red_check_past_the_runs_read_is_named_as_not_rerun(on_the_worker, mon
     assert "c3 was not re-run" in (got.note or ""), got.note
 
 
-def test_a_second_attempt_on_the_same_head_launches_the_agent(on_the_worker):
+def test_a_second_attempt_of_the_watch_launches_the_agent(on_the_worker):
     """PO answer Q1(b): the re-run stands in for the agent only on the first repair attempt of the
     watch. A wrong "unrelated" (the commonest real regression: changed `invoice_totals.ts`, failing
     `checkout.spec.ts`) then spends one of the two repair attempts (`_CI_REPAIR_MAX`) on a CI
     re-run, and the next attempt reaches an agent (#258 review item 5).
 
-    Green on main by design. The cut "the once-per-head bound removed" turns it red."""
+    Green on main by design. The cut "the first-attempt-of-the-watch bound removed" turns it red."""
     forge = _Forge()
     agents = on_the_worker(forge)
     acts._run_ci_repair(SECOND, "run-r2")  # noqa: SLF001
