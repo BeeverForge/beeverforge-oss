@@ -18,11 +18,11 @@ TEST = CHECK
 
 MUTATIONS = [
     ("an accept that fails ends the thread, as if the socket were closed", LOGS,
-     "            stop.wait(0.01)\n            continue\n",
+     "            stop.wait(pause)\n            continue\n",
      "            return\n",
      CHECK),
     ("an accept that fails breaks out of the loop", LOGS,
-     "            stop.wait(0.01)\n            continue\n",
+     "            stop.wait(pause)\n            continue\n",
      "            break\n",
      CHECK),
 ]
