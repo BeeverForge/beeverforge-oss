@@ -38,6 +38,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import concurrent.futures
+import contextlib
+import errno
 import gc
 import inspect
 import io
@@ -1457,27 +1459,92 @@ def refusing() -> str:
         return f"127.0.0.1:{nobody.getsockname()[1]}"
 
 
+def _close_each(sock, stop: threading.Event, pause: float = 0.01) -> None:
+    """Take each connection `sock` is handed and close it at once, until `stop` is set.
+
+    AN ACCEPT THAT FAILS IS NOT THE END (#416): the loop left on any `OSError`, as if the socket
+    had been closed. Linux hands a connection's pending error back from `accept` (accept(2)), and
+    a process out of descriptors gets `EMFILE`, so one such accept left the socket listening with
+    nobody taking from it: the kernel still completed every later handshake, and the library's
+    request waited out its whole bound. So only `stop` ends the loop; an error that repeats waits
+    `pause` before the next accept rather than spinning."""
+    while not stop.is_set():
+        try:
+            taken, _peer = sock.accept()
+        except OSError:
+            stop.wait(pause)
+            continue
+        taken.close()
+
+
+@contextlib.contextmanager
+def _a_socket_that_closes_what_it_takes():
+    """A loopback address whose socket takes each connection and closes it at once, from a thread
+    of its own (`_close_each`). Stopped and closed when the block ends."""
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(64)
+    port = sock.getsockname()[1]
+    stop = threading.Event()
+    closer = threading.Thread(target=_close_each, args=(sock, stop), daemon=True)
+    closer.start()
+    try:
+        yield f"127.0.0.1:{port}"
+    finally:
+        stop.set()
+        # A THREAD BLOCKED IN `accept` IS NOT WOKEN BY `close` on Linux, so it is woken by one
+        # last connection, which it closes like any other before it reads `stop`.
+        with contextlib.suppress(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=5).close()
+        closer.join(5)
+        sock.close()
+
+
 @pytest.fixture
 def closing():
     """An address whose socket takes each connection and closes it at once, so the library's
     connect is refused after the socket took it — as a port a container publishes is taken while
     the engine behind it is not up, or an engine refuses the key it is given."""
-    sock = socket.socket()
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(64)
+    with _a_socket_that_closes_what_it_takes() as at:
+        yield at
 
-    def _close_each():
-        while True:
-            try:
-                taken, _peer = sock.accept()
-            except OSError:
-                return                      # the socket was closed: the case is over
-            taken.close()
 
-    threading.Thread(target=_close_each, daemon=True).start()
-    yield f"127.0.0.1:{sock.getsockname()[1]}"
-    sock.close()
+class _AcceptsAsScripted:
+    """A listening socket whose `accept` follows a script, on the calling thread: no socket, no
+    thread and no timeout, so a regression fails at once instead of waiting one out (#422's
+    review). Call 1 fails, as Linux hands a connection's pending error back from `accept`
+    (accept(2)); call 2 takes a connection; call 3 ends the case by setting `stop`."""
+
+    def __init__(self, stop: threading.Event):
+        self._stop = stop
+        self.calls = 0
+        self.taken = types.SimpleNamespace(closed=False)
+        self.taken.close = lambda: setattr(self.taken, "closed", True)
+
+    def accept(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionAbortedError(errno.ECONNABORTED, "a connection gone before it was taken")
+        if self.calls == 2:
+            return self.taken, ("127.0.0.1", 0)
+        self._stop.set()
+        raise OSError(errno.EBADF, "the case is over")
+
+
+def test_the_closing_socket_keeps_closing_what_it_takes_after_an_accept_error():
+    """#416: `closing`'s thread left on ANY `OSError`, not only once the case was over, and a
+    socket nobody takes from still completes every handshake. Made to meet one, the library sent
+    its request into a connection nobody closed and waited out the attempt's whole bound: the
+    `TimeoutError ... within 30s` the case failed with on CI. So an accept that fails leaves the
+    loop taking and closing what comes after it, and only `stop` ends it."""
+    stop = threading.Event()
+    sock = _AcceptsAsScripted(stop)
+
+    _close_each(sock, stop, pause=0)
+
+    assert sock.calls == 3, f"the loop took {sock.calls} accept(s), not 3: it left on the error"
+    assert sock.taken.closed, "the connection after a failed accept was never closed"
 
 
 def _a_line_of_the_core(level: int, message: str):
