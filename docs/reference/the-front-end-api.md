@@ -89,6 +89,13 @@ or converse — `product_pending`, `product_needs_action`, `product_say` and `pr
 not carry one yet. A row whose implementation raised answers `code: "failed"` with
 `data.reason: "raised"`, and its `data.reference` names the `action … raised` log line.
 
+**`product_answer` says whether the staged write happened (#187).** An approval whose write the
+product role refused answers the table's code for its word (403, 404, 409 or 400), with the role's
+sentence and the word in `data.refusal`; one whose write broke answers 500 `failed`, with the
+"something broke" sentence the person heard and a `data.reference`. Only a write that was made
+answers `ok: true`, with `data.outcome: "done"`; a rejection still answers `ok: true` with
+`data.outcome: "rejected"`.
+
 A socket is refused before it is accepted: the upgrade is answered with a 403 and closed with code
 **1008** for a refusal, **1011** when nobody could be judged.
 

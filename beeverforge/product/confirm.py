@@ -176,6 +176,34 @@ def _still_to_say(text: str, result, lang, *, project=None) -> str:
     return f"{text}\n\n{_client_detail(detail, lang, project=project)}"
 
 
+class Refused(str):
+    """The sentence an executor says for a write the module did NOT make, carrying its word (#187).
+
+    A `str`, so every caller that says it — the typed path, the Slack click — still says it as it
+    did. What it adds is `refusal`, the module's word for why (`WriteResult.refusal`, `""` when it
+    named none), so `answer_staged` can name the outcome `refused` instead of `done`, and the row
+    that maps it onto a code reads the word rather than the prose."""
+
+    refusal: str
+
+    def __new__(cls, sentence: str, *, refusal: str = ""):
+        said = super().__new__(cls, sentence)
+        said.refusal = str(refusal or "")
+        return said
+
+
+def _refused(result, lang, *, project=None, head: str = "") -> Refused:
+    """What a write the module did not make says: its detail, sanitised like every other one, and
+    its refusal word. For a list of results, the one word every failed result shares, or `""` —
+    the `_none_done` rule, so mixed words are nobody's single decision."""
+    results = list(result) if isinstance(result, list | tuple) else [result]
+    failed = [r for r in results if not getattr(r, "ok", False)]
+    words = {str(getattr(r, "refusal", "") or "") for r in failed}
+    word = next(iter(words)) if len(words) == 1 else ""
+    detail = getattr(failed[0], "detail", "") if failed else ""
+    return Refused(head + _client_detail(detail, lang, project=project), refusal=word)
+
+
 # ── provenance and the receipt ───────────────────────────────────────────────────────────────────
 
 def _where_it_came_from(project, channel: str) -> str:
@@ -303,7 +331,7 @@ def _confirm_queue(project, entry, *, module, user, lang) -> str:
     landed = list(dict.fromkeys(canonical_ref(r.ref) for r in results if r.ok and r.ref))
     failed = [r for r in results if not r.ok]
     if not landed:
-        return (_client_detail(failed[0].detail, lang, project=project) if failed
+        return (_refused(results, lang, project=project) if failed
                 else _said(lang)["not_queued"])
     from beeverforge.product.voice import queued
 
@@ -342,7 +370,7 @@ def _confirm_defect(project, entry, *, module, user, lang) -> str:
         source=entry.get("source", ""), **_checked(module.file_defect, entry),
         **_whose(module.file_defect, entry), **shown)
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import defect_filed
 
     # the sibling of the close below: `file_defect` returns ok with a sentence when the card
@@ -402,7 +430,7 @@ def _confirm_ticket(project, entry, *, module, user, lang) -> str:
         # hears every event about it, as a defect's is
         **_whose(module.file_ticket, entry))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import ticket_filed
     return _still_to_say(
         ticket_filed(ref=result.ref, url=getattr(result, "url", ""), language=lang,
@@ -421,7 +449,7 @@ def _confirm_reorder(project, entry, *, module, user, lang) -> str:
     placed = [str(r.ref).lstrip("#") for r in results if r.ok and r.ref]
     failed = [r for r in results if not r.ok]
     if not placed:
-        return (_client_detail(failed[0].detail, lang, project=project) if failed
+        return (_refused(results, lang, project=project) if failed
                 else _said(lang)["not_ordered"])
     from beeverforge.product.voice import reordered
     cfg = getattr(project, "product", None)
@@ -440,7 +468,7 @@ def _confirm_accept(project, entry, *, module, user, lang) -> str:
     # the id itself, only where a human-readable record is written.
     result = module.accept(entry["number"], actor=user)
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import accepted
 
     cfg = getattr(project, "product", None)
@@ -479,7 +507,7 @@ def _confirm_drop(project, entry, *, module, user, lang) -> str:
     """the act that takes something OFF the table."""
     result = module.drop(entry["number"], actor=user, reason=entry.get("reason", ""))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import dropped
 
     cfg = getattr(project, "product", None)
@@ -496,7 +524,7 @@ def _confirm_decision(project, entry, *, module, user, lang) -> str:
         where=_where_it_came_from(project, entry.get("channel", "")),
         **_checked(module.record_decision, entry))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import decision_recorded
 
     cfg = getattr(project, "product", None)
@@ -513,7 +541,7 @@ def _confirm_close(project, entry, *, module, user, lang) -> str:
                               in_favour_of=entry.get("in_favour_of"),
                               reason=entry.get("reason", ""))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import card_closed
 
     cfg = getattr(project, "product", None)
@@ -535,7 +563,7 @@ def _confirm_correct(project, entry, *, module, user, lang) -> str:
     result = module.correct_card(entry["number"], actor=user, text=entry.get("text", ""),
                                  title=entry.get("new_title", ""))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import card_corrected
 
     cfg = getattr(project, "product", None)
@@ -555,7 +583,7 @@ def _confirm_adjust(project, entry, *, module, user, lang) -> str:
                               instruction=entry.get("instruction", ""),
                               criteria=list(entry.get("criteria") or ()))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.adjust import headline
 
     # WHICH PASS OF HOW MANY AND WHETHER THE BAR MOVED, from the act's own facts — then whatever
@@ -573,7 +601,7 @@ def _confirm_accept_change(project, entry, *, module, user, lang) -> str:
                                   pr_url=entry.get("pr_url", ""),
                                   where=str(entry.get("conversation") or ""))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.accept import headline
 
     # WHETHER IT IS GOING IN, from the act's own facts — then whatever did not land after the
@@ -585,7 +613,7 @@ def _confirm_align(project, entry, *, module, user, lang) -> str:
     """the act that changes what gets BUILT."""
     result = module.align_card(entry["number"], requirement=entry["requirement"], actor=user)
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import card_aligned
 
     cfg = getattr(project, "product", None)
@@ -640,7 +668,7 @@ def _confirm_fact(project, entry, *, module, user, lang) -> str:
                               where=entry.get("source", ""),
                               **_checked(module.note_fact, entry))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     from beeverforge.product.voice import fact_noted
 
     return fact_noted(term=entry["term"], language=lang)
@@ -655,7 +683,7 @@ def _confirm_draft(project, entry, *, module, user, lang) -> str:
                             asked_by=entry.get("asked_by", ""), date=entry.get("date", ""),
                             source=entry.get("source", ""), **_checked(module.propose, entry))
     if not result.ok:
-        return _client_detail(result.detail, lang, project=project)
+        return _refused(result, lang, project=project)
     number = getattr(result, "number", 0) or entry.get("number") or 0
     said = written_up(title=entry["answer"].draft.title, url=result.url,
                       # "landed in the base" and "still a proposal nobody merged" are different
@@ -1045,7 +1073,7 @@ def _refine_reply(result, number: str, name: str, lang=None, project=None) -> st
     """
     head = f"{name}: " if name else ""
     if not result.ok:
-        return f"{head}{_client_detail(result.detail, lang, project=project)}"
+        return _refused(result, lang, project=project, head=head)
     if getattr(result, "existed", False):
         from beeverforge.product.voice import refine_refused
 
@@ -1265,7 +1293,9 @@ def answer_staged(project, *, token: str, approved: bool, user: str, module=None
     done; the panel's answer route has to map the outcome onto an HTTP status and decide whether
     to record anything — and telling "unauthorized" apart from "done" by comparing prose is how a
     refusal gets recorded as a decision. Outcomes: `done`, `rejected`, `unauthorized`, `gone`,
-    `replaced`, `expired`.
+    `replaced`, `expired` — and, for an approval whose write did not happen (#187), `refused` (the
+    module declined it; the sentence is a `Refused` carrying the word) and `failed` (the write
+    raised; the person still hears `broke()`).
 
     IT NO LONGER ROUTES THROUGH THE SLACK `handle` (#105). That indirection existed for a good
     reason — "exactly one implementation of what a confirmation does, a second one would drift" —
@@ -1371,7 +1401,7 @@ def answer_staged(project, *, token: str, approved: bool, user: str, module=None
     # distillation from ever reading it as something the role said.
     from beeverforge.memory import transcript
 
-    kind = transcript.ANSWER
+    kind, outcome = transcript.ANSWER, "done"
     try:
         sentence = confirm(project, key=key, entry=entry, fingerprint=verified, module=module,
                            user=user, lang=lang, via=via,
@@ -1384,11 +1414,15 @@ def answer_staged(project, *, token: str, approved: bool, user: str, module=None
                   "answer", name, key)
         from beeverforge.product.voice import broke
 
-        sentence, kind = broke(language=lang), "broke"
+        sentence, kind, outcome = broke(language=lang), "broke", "failed"
+    if isinstance(sentence, Refused):
+        # THE MODULE DID NOT MAKE THE WRITE (#187): the person is told why in the role's words,
+        # and the caller is told it was not done — never `done` for a write that did not happen
+        outcome = "refused"
     try:
         if sentence:
             transcript.record(project, thread=where, role="agent", text=str(sentence),
                               channel=where, in_reply_to=said_id, kind=kind)
     except Exception:  # noqa: BLE001 — the reply is already earned; the record must not eat it
         log.warning("[%s] could not record the answer to the confirmation", name, exc_info=True)
-    return "done", sentence
+    return outcome, sentence
