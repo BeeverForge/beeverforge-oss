@@ -65,13 +65,17 @@ MUTATIONS = [
      "retunes the gate in the file that names it lands on an ALREADY-ARMED auto-merge with nothing "
      "in its way — and rows 1-3 all cut the other path, so every one of them stays red",
      "beeverforge/orchestrator/machine.py",
-     "            hits = protected_violations(self._pr_diff_paths(ws, base), self.manifest)",
+     # re-pinned (#368): the paths are read first, so a read git refused can hold by name; the
+     # cut is the same one — the paths are never checked against the protected list
+     "            hits = protected_violations(changed, self.manifest)",
      "            hits = ()"),
 
+    # re-pinned (#368): the condition now also reads `unread`, a name-only diff git refused; the
+    # cut is the same one — the disarm fires on suppressions (and the census) alone
     ("the CI-repair disarm fires on suppressions alone again, which is how it shipped: a `# noqa` "
      "is caught and a deleted gate — which emits no suppression token at all — is not",
      "beeverforge/orchestrator/machine.py",
-     "            if supp or hits or unreadable or lost_tests:",
+     "            if supp or hits or unread or unreadable or lost_tests:",
      "            if supp or lost_tests:"),
 
     # ── the floor evaporates, per-install and in silence ─────────────────────────────────────────
