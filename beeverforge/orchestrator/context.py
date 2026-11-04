@@ -425,7 +425,14 @@ def _operator_open_at(operator_root: str | None) -> OpenAt:
 def _doc_summary(path: Path) -> str:
     # `utf-8-sig`: a document saved with a byte-order mark puts U+FEFF in front of `---` or `#`,
     # and it would be named by its file name instead of its summary or heading (#321).
-    text = path.read_text(encoding="utf-8-sig")
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # A DOCUMENT THAT IS NOT UTF-8 COSTS ITS SUMMARY, NOT THE BRIEF (#325): a UTF-16 file, or
+        # one in Latin-1, is indexed by its file name, and the log names it and its remedy.
+        _log.warning("%s is not UTF-8 (%s) — it is indexed by its file name; save it as UTF-8",
+                     path.name, exc.reason)
+        return path.stem
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) == 3:
