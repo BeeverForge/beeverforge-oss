@@ -102,3 +102,104 @@ def test_the_helper_gives_the_declared_minutes_in_seconds_else_the_default():
     assert gate_timeout({"command": "x", "timeout_minutes": 60}, 1800) == 3600
     assert gate_timeout(Gate(command="x"), 1234) == 1234
     assert gate_timeout("x", 1234) == 1234
+
+
+# ── a gate stopped at its limit says so (review of #434, finding 1) ─────────────────────────────
+
+#: Longer than the tail the finding keeps, so the `BEEVERFORGE_TIMEOUT:` head the box writes is cut
+#: off — the case the finding has to name the limit for itself.
+_LONG_RUN = "".join(f"tests/test_{i:02d}.py ........\n" for i in range(50))
+
+
+def _stopped_suite(cmd, timeout, on_line):
+    from beeverforge.adapters.sandbox.timeouts import timeout_result
+
+    if cmd == "pytest -q":
+        return timeout_result(cmd, timeout, _LONG_RUN)
+    return 0, ""
+
+
+def test_a_gate_stopped_at_its_limit_names_the_limit_and_the_setting_to_raise():
+    proof = prove("acme", "mycorp/ci:1", _probes(run_gate=_stopped_suite))
+
+    (finding,) = [f for f in proof.findings if f.check == "validate"]
+    assert not finding.ok
+    assert "3600s" in finding.message, finding.message
+    assert "validate.suite.timeout_minutes" in finding.message, finding.message
+    assert "timeout_minutes" in finding.remedy, finding.remedy
+    assert "cannot reproduce your build" not in finding.remedy, finding.remedy
+
+
+def test_a_gate_no_declaration_covers_does_not_offer_a_setting_it_does_not_have():
+    def run_in_box(cmd):
+        from beeverforge.adapters.sandbox.timeouts import timeout_result
+
+        if cmd == "pytest -q":
+            return timeout_result(cmd, 1800, _LONG_RUN)
+        return 0, ""
+
+    # an older probe set: no declared gates, no gate runner — the box's own limit applies
+    proof = prove("acme", "mycorp/ci:1", _probes(run_in_box=run_in_box,
+                                                 validation_gates=dict))
+
+    (finding,) = [f for f in proof.findings if f.check == "validate"]
+    assert not finding.ok
+    assert "1800s" in finding.message, finding.message
+    assert "validate.suite.timeout_minutes" not in finding.message, finding.message
+    assert "cannot reproduce your build" not in finding.remedy, finding.remedy
+
+
+# ── the production probe set is wired to the manifest and the box (finding 2) ───────────────────
+
+def _box_probes_over_a_fake_box(tmp_path, monkeypatch):
+    """The REAL `box_probes`, over a box that records the limit each `run` was given."""
+    from types import SimpleNamespace
+
+    from beeverforge import box_prove
+    from beeverforge.adapters.sandbox import registry as sandboxes
+
+    limits: list[tuple[str, int]] = []
+
+    class _Box:
+        def prepare(self, **_kw):
+            return SimpleNamespace(path=str(tmp_path))
+
+        def cleanup(self, **_kw):
+            pass
+
+        def harness_path(self, name):
+            return name
+
+        def run(self, workspace, command, timeout, on_output=None):
+            limits.append((command, timeout))
+            return 0, ""
+
+    monkeypatch.setattr(box_prove, "PROOF_DIR", tmp_path / "proofs")
+    monkeypatch.setattr(sandboxes, "installed_box_traits",
+                        lambda _kind: SimpleNamespace(honours_image=True))
+    monkeypatch.setattr(sandboxes, "build_sandbox", lambda *_a, **_kw: _Box())
+    manifest = SimpleNamespace(base_branch="main", setup=[],
+                               validation={"suite": Gate(command="pytest -q", timeout_minutes=60)})
+    probes = box_prove.box_probes(SimpleNamespace(name="someone", box=None), "img",
+                                  repo_path=tmp_path, manifest=manifest, key="someone",
+                                  sandbox="container")
+    return probes, manifest, limits
+
+
+def test_the_real_probe_set_reads_the_declared_gates_off_the_manifest(tmp_path, monkeypatch):
+    held, manifest, _ = _box_probes_over_a_fake_box(tmp_path, monkeypatch)
+
+    with held as probes:
+        assert probes.validation_gates() == manifest.validation
+
+
+def test_the_real_probe_set_hands_the_gate_limit_to_the_box(tmp_path, monkeypatch):
+    from beeverforge.orchestrator.validation import gate_timeout
+
+    held, manifest, limits = _box_probes_over_a_fake_box(tmp_path, monkeypatch)
+
+    with held as probes:
+        limit = gate_timeout(manifest.validation["suite"], machine._VALIDATION_TIMEOUT)
+        assert probes.run_gate("pytest -q", limit, None) == (0, "")
+
+    assert limits == [("pytest -q", 3600)]

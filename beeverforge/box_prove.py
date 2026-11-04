@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from beeverforge import namespace
+from beeverforge.adapters.sandbox.timeouts import TIMEOUT_MARKER, timed_out
 from beeverforge.observability.job_record import record_one_pass
 from beeverforge.orchestrator.validation import advisory_gates, gate_commands, gate_timeout
 from beeverforge.util.filelock import FileLock, Waited
@@ -816,6 +817,8 @@ def prove(project: str, image: str, p: Probes, *,
     #: (command, output) — the OUTPUT rides along because the remedy reads the binary's name out
     #: of it; carrying the command alone is what forced `_missing_tool_remedy` to guess.
     cannot_run: list[tuple[str, str]] = []
+    #: gates the box stopped at their limit: they did not fail, they ran out of time
+    stopped: list[str] = []
     # EACH GATE GETS THE LIMIT A JOB GIVES IT (#70): its `timeout_minutes`, else the job's own
     # default — one formula, `gate_timeout`, shared with `machine`. A name the probe set did not
     # declare a gate for keeps the box's limit, as an older probe set always did.
@@ -828,6 +831,16 @@ def prove(project: str, image: str, p: Probes, *,
         if rc == 0:
             continue
         line = f"{name}: `{cmd}` exited {rc}\n{_tail(out)}"
+        if timed_out(rc, out):
+            # THE LIMIT IS NAMED IN THE LINE, because the box writes it at the HEAD of the output
+            # and `_tail` keeps the end: a long suite stopped at its limit read as a plain
+            # `exited 124` (review of #434). A gate no declaration covers has no setting to raise.
+            stopped_at = limit if limit is not None else _killed_after(out)
+            raise_it = (f"raise validate.{name}.timeout_minutes" if limit is not None else
+                        "no gate is declared for it, so it ran with the box's own limit")
+            line = (f"{name}: `{cmd}` was stopped at its limit of {stopped_at}s "
+                    f"(exit {rc}); {raise_it}\n{_tail(out)}")
+            stopped.append(name)
         # A COMMAND THE BOX CANNOT EXECUTE IS NOT ADVISORY, whatever the project declared. The
         # flag says "a finding here should not stop the work"; it cannot say "this image has the
         # tool" when the shell just said it does not. That is the same asymmetry the per-component
@@ -853,6 +866,16 @@ def prove(project: str, image: str, p: Probes, *,
         remedy = ("these are YOUR gates, on untouched `main`, inside the box. Failing here "
                   "means the box cannot reproduce your build — fix that before a ticket does "
                   "it for you")
+        # A GATE THAT RAN OUT OF TIME IS NOT A BUILD THE BOX CANNOT REPRODUCE, and the generic
+        # remedy sent the reader looking for a broken build that was never there.
+        timeout_remedy = ("a gate stopped at its limit did not fail, it ran out of time; if it "
+                          "passes in your CI given longer, give that gate a longer "
+                          "`timeout_minutes` under `validate:` — a job gives the gate the same "
+                          "limit")
+        if stopped and len(stopped) == len(failed_gates):
+            remedy = timeout_remedy
+        elif stopped:
+            remedy = f"{remedy}. And {timeout_remedy}"
         if cannot_run:
             remedy = _missing_tool_remedy(cannot_run[0][0], image, cannot_run[0][1],
                                           honours_image=p.honours_image)
@@ -1125,6 +1148,12 @@ def _route_names(route) -> tuple[str, ...]:
 
 def _tail(out: str, lines: int = 20) -> str:
     return "\n".join((out or "").splitlines()[-lines:])
+
+
+def _killed_after(out: str) -> str:
+    """The seconds the box's own timeout line says it stopped a command at, else `?`."""
+    found = re.search(rf"{re.escape(TIMEOUT_MARKER)} killed after (\d+)s", out or "")
+    return found.group(1) if found else "?"
 
 
 def is_valid(proof: Proof, *, digest: str, toolbox: str, commands_hash: str) -> bool:
