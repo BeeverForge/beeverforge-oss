@@ -21,7 +21,7 @@ from beeverforge.adapters.agent.base import (
     result_event,
     stage_prompt,
 )
-from beeverforge.adapters.agent.claude_code import NO_MCP_SERVERS
+from beeverforge.adapters.agent.claude_code import NO_MCP_SERVERS, _detect_pause, _pause_from
 from beeverforge.adapters.reviewer.base import (
     ACCEPTANCE_SHAPE,
     EVIDENCE_RULE,
@@ -102,8 +102,16 @@ class ClaudeCodeReviewer(ReviewerAdapter):
             # an older CLI) still reads through `json_envelope`, which skips the diagnostics a CLI
             # prints above it — a bare `json.loads` dies on character one of a banner.
             envelope = result_event(out) or json_envelope(out)
-            if envelope is None:
+            # `json_envelope` answers a stream with no result event with its INIT event, which
+            # carries no outcome: that is no envelope, and the failed-run guard must not judge it.
+            if envelope is None or envelope.get("type", "result") != "result":
                 raise ValueError("no JSON envelope in the reviewer's output")
+            # A RUN THAT ENDED IN ERROR IS NOT A VERDICT (#131), whatever its text parses as: the
+            # CLI said `is_error: true`, or exited non-zero, and `_parse_stream` reads either as a
+            # failed run. Measured on openfactory-core: an approving `result` on an error envelope
+            # answered approved / 88. Checked before the text is parsed, so it never is.
+            if envelope.get("is_error") is True or rc != 0:
+                return self._did_not_complete(rc, envelope)
             review = ReviewResult(**json.loads(_extract_json(str(envelope.get("result", "")))))
             # WHAT IT COST. The CLI reports it in the object this already parses — the stream's
             # result event carries the same keys as the `--output-format json` envelope
@@ -121,6 +129,11 @@ class ClaudeCodeReviewer(ReviewerAdapter):
                 "model": self.model, "harness": "claude_code",
             })
         except (json.JSONDecodeError, ValueError, TypeError):
+            # A STREAM THAT DIED ON A LIMIT, with no result event: what the CLI itself said, read
+            # by the executor's `_pause_from` — only on a run that failed, as `_parse_stream` does.
+            reason, retry = _pause_from(out) if rc != 0 else (None, None)
+            if reason:
+                return self._paused(reason, retry)
             # A REVIEW THAT COULD NOT RUN IS NOT A REJECTION, and the two used to read the same.
             # `rejected / score 0 / "could not be parsed"` sends somebody to look for what is
             # wrong with the code when nothing reviewed it at all. The DECISION stays rejected —
@@ -141,6 +154,34 @@ class ClaudeCodeReviewer(ReviewerAdapter):
                 f"reviewer output could not be parsed (rc={rc})"
             )
             return ReviewResult(decision="rejected", score=0, summary=summary)
+
+    def _did_not_complete(self, rc: int, event: dict) -> ReviewResult:
+        """A failed run's answer: a pause when the executor's `_detect_pause` reads one in the
+        result event (the same text `_parse_stream` reads), otherwise a rejection saying the
+        review did not complete. Either way still charged what the run reported."""
+        reason, retry = _detect_pause(f"{event.get('result', '')} {event.get('subtype', '')}")
+        if reason:
+            review = self._paused(reason, retry)
+        else:
+            review = ReviewResult(
+                decision="rejected", score=0, did_not_complete=True,
+                summary=(f"the review did not complete: the reviewer's run ended in error "
+                         f"(rc={rc}), so this diff has NOT been reviewed. Nothing here is a "
+                         "judgement about the code."))
+        spent = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+        return review.model_copy(update={
+            "cost_usd": event.get("total_cost_usd"), "num_turns": event.get("num_turns"),
+            "input_tokens": spent.get("input_tokens"), "output_tokens": spent.get("output_tokens"),
+            "model": self.model, "harness": self.name,
+        })
+
+    def _paused(self, reason: str, retry_at: str | None) -> ReviewResult:
+        """A review the account's limit or credential stopped, worded as `HarnessReviewer` words
+        it. Rejected, so nothing proceeds as reviewed; the pause reason is what the job acts on."""
+        return ReviewResult(
+            decision="rejected", score=0, pause_reason=reason, retry_at=retry_at,
+            summary=(f"THE REVIEW NEVER RAN ({self.name}): {reason}. This diff has NOT been "
+                     "reviewed — it is not a rejection of the code."))
 
     def _prompt(self, ri: ReviewInput) -> str:
         t = ri.ticket

@@ -47,6 +47,7 @@ from beeverforge.contracts import (
 from beeverforge.contracts.bot import BotIdentity
 from beeverforge.contracts.item_space import closing_keyword, forge_owns_the_card
 from beeverforge.contracts.refs import canonical_ref
+from beeverforge.contracts.review import not_a_verdict
 from beeverforge.contracts.run import (
     AGENT_ACCOUNT_HEADING,
     AGENT_ACCOUNT_MAX,
@@ -441,8 +442,9 @@ def _review_lines(r: ReviewResult) -> list[str]:
         A score of 0 is likewise reported only when one was given. Printing `(score 0)` for a
         review that produced no score is the same lie in smaller type.
         """
-        unread = r.score == 0 and not r.findings and (
-            "could not be parsed" in (r.summary or "") or "never ran" in (r.summary or ""))
+        # read from the review's own fields first, its sentence second (#131): one reading,
+        # shared with the first round's review stage
+        unread = not_a_verdict(r)
         from beeverforge.review import verdict as _verdict
 
         # NOT VERIFIED OUTRANKS THE DECISION WORD (#447): "## Review — approved_with_findings"
@@ -1977,6 +1979,12 @@ class JobRunner:
                     ),
                 )
                 self._count_review(result.review)
+                # A REVIEW THE LIMIT OR THE CREDENTIAL STOPPED IS A PAUSE, NOT A VERDICT (#131):
+                # counted first (#262), then out the way an executor pause goes, before the
+                # journal records a "rejected (score 0)" nobody made.
+                if result.review.pause_reason:
+                    return self._paused(ticket, result.review.pause_reason,
+                                        result.review.retry_at, branch=branch, ws=ws)
                 advisory = self.manifest.review_mode != "blocking"
                 # ITS PRICE ON ITS LINE, like every other pass's (#310). `_count_review` put the
                 # review in the result, and this line — the one `/api/jobs` and the panel sum —
@@ -2053,6 +2061,9 @@ class JobRunner:
                     # branch that exists precisely because something went wrong, and therefore the
                     # expensive one — the cheapest-looking part of the ticket.
                     self._count_review(result.review)
+                    if result.review.pause_reason:  # the re-review's limit too (#131)
+                        return self._paused(ticket, result.review.pause_reason,
+                                            result.review.retry_at, branch=branch, ws=ws)
                     self._emit(
                         ticket, "review",
                         f"{result.review.decision} (score {result.review.score})"

@@ -47,6 +47,18 @@ class ReviewResult(BaseModel):
     #: stance is read the old way, from `decision`, because a missing `executed_by` on such a
     #: verdict says nothing about what ran.
     evidence_checked: bool = False
+    #: WHY THE REVIEW PAUSED, read by the executor's own pause detection (#131): `rate_limit` or
+    #: `auth`, as `AgentRunResult.pause_reason`. Set only on a run that failed, and then the job
+    #: pauses or holds the way an executor pause does, instead of recording a rejection of the
+    #: diff. The decision stays `rejected`, so a reader that ignores this still never proceeds as
+    #: reviewed. None on every verdict.
+    pause_reason: str | None = None
+    #: When a `rate_limit` pause resets, as `_detect_pause` read it; None when it did not say.
+    retry_at: str | None = None
+    #: THE REVIEW DID NOT COMPLETE (#131): the reviewer's run ended in error (`is_error`, or a
+    #: non-zero exit) and its text was not read as a verdict. A rejection that judged nothing, so
+    #: every surface that heads or reports a review says so instead of "rejected".
+    did_not_complete: bool = False
 
     # WHAT THE REVIEW COST. Not decoration: review is ON by default, and it is a whole independent
     # agent pass over the entire diff — frequently the same order of magnitude as writing the code.
@@ -64,3 +76,19 @@ class ReviewResult(BaseModel):
     output_tokens: int | None = None
     model: str | None = None
     harness: str | None = None
+
+
+def not_a_verdict(review) -> bool:
+    """Whether this review is a rejection that judged nothing: it paused, it did not complete, or
+    it is one of the reviewers' older sentences for an unread review ("could not be parsed",
+    "never ran") with no score and no finding.
+
+    THE ONE READING, for every surface that must not present an unread review as a rejection of
+    the code (the pull request's heading, the first round's review stage). Each kept its own
+    phrase match, so a new sentence for the same outcome read as a plain rejection in both (#131).
+    The structured fields are read first; the phrases stay for reviewers that set neither."""
+    if getattr(review, "pause_reason", None) or getattr(review, "did_not_complete", False):
+        return True
+    summary = getattr(review, "summary", "") or ""
+    return (getattr(review, "score", None) == 0 and not getattr(review, "findings", None)
+            and ("could not be parsed" in summary or "never ran" in summary))

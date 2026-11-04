@@ -60,6 +60,21 @@ def test_a_review_that_did_not_happen_is_not_headed_rejected(summary):
     assert "not a judgement about the diff" in body
 
 
+@pytest.mark.parametrize("review", [
+    ReviewResult(decision="rejected", score=0, did_not_complete=True,
+                 summary="the review did not complete: the reviewer's run ended in error (rc=1)"),
+    ReviewResult(decision="rejected", score=0, pause_reason="rate_limit",
+                 summary="THE REVIEW NEVER RAN (claude_code): rate_limit."),
+], ids=["did-not-complete", "paused"])
+def test_a_review_that_ended_in_error_is_not_headed_rejected(review):
+    """#131's outcomes are read from the review's fields, not its sentence: neither holds "could
+    not be parsed" or a lower-case "never ran", and a phrase match alone headed them rejected."""
+    body = _body(review)
+
+    assert "DID NOT COMPLETE" in body
+    assert "Review — rejected" not in body
+
+
 def test_a_REAL_rejection_still_says_so_loudly():
     """The positive twin. A guard that softened every rejection would be worse than the bug —
     a reviewer that genuinely refused a diff must not be reported as "did not complete"."""
