@@ -91,6 +91,16 @@ def advisory_gates(gates: dict) -> frozenset[str]:
     return frozenset(name for name, g in (gates or {}).items() if as_gate(g).advisory)
 
 
+def gate_timeout(value, default: int) -> int:
+    """The seconds ONE gate is given: its declared `timeout_minutes`, else `default`.
+
+    One formula for the job and the proof (#70). `box prove` used to run every gate with the box's
+    own default and ignore the declaration, so a suite that needed longer passed in every job and
+    could never be proven — and pickup stayed held behind a proof nobody could take."""
+    minutes = as_gate(value).timeout_minutes
+    return minutes * 60 if minutes else default
+
+
 #: What a POSIX shell answers when the command itself never ran: 127 = not found, 126 = found and
 #: not executable. Both are the shell's verdict on the COMMAND, produced before the gate had a
 #: chance to say anything about the code.
