@@ -153,7 +153,11 @@ class ClaudeCodeReviewer(ReviewerAdapter):
                 if never_ran else
                 f"reviewer output could not be parsed (rc={rc})"
             )
-            return ReviewResult(decision="rejected", score=0, summary=summary)
+            # A RUN THAT EXITED NON-ZERO DID NOT COMPLETE (#131), result event or not: a timeout
+            # (124) or a kill dies before it prints one, and this answer used to be told from a
+            # rejection only by its sentence. At exit 0 the output is unreadable, not unfinished.
+            return ReviewResult(decision="rejected", score=0, summary=summary,
+                                did_not_complete=rc != 0)
 
     def _did_not_complete(self, rc: int, event: dict) -> ReviewResult:
         """A failed run's answer: a pause when the executor's `_detect_pause` reads one in the

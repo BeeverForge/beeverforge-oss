@@ -295,3 +295,29 @@ def test_a_review_stream_that_died_on_a_rejected_rate_limit_event_pauses():
 
     assert review.pause_reason == "rate_limit", review
     assert review.decision == "rejected"
+
+
+# ── a stream that died before its result event (#131) ─────────────────────────────────────────
+
+
+def test_a_stream_with_no_result_event_at_exit_0_is_not_an_approval():
+    """The approving text is in an assistant message, and an assistant message is not the review:
+    with no result event nothing reached a verdict, whatever the reviewer was saying on the way."""
+    out = cli.stdout(cli.init_event(), cli.assistant_event(APPROVAL))
+
+    review = _review(out, rc=0)
+
+    assert review.decision != "approved", review.summary
+    assert review.score == 0, review.summary
+
+
+def test_a_stream_that_died_with_no_result_event_and_a_non_zero_exit_did_not_complete():
+    """A timeout (124) or a kill: the run ended in error before its result event. On a796cde it
+    answered `did_not_complete=False` and "could not be parsed (rc=124)", caught only by the
+    phrase fallback — a reworded sentence would have read as a rejection of the code."""
+    out = cli.stdout(cli.init_event(), cli.assistant_event(APPROVAL))
+
+    review = _review(out, rc=124)
+
+    assert review.decision != "approved", review.summary
+    assert review.did_not_complete is True, review.summary

@@ -94,3 +94,14 @@ def not_a_verdict(review) -> bool:
     summary = (getattr(review, "summary", "") or "").lower()
     return (getattr(review, "score", None) == 0 and not getattr(review, "findings", None)
             and ("could not be parsed" in summary or "never ran" in summary))
+
+
+def unread_words(review) -> str:
+    """What a surface says in place of `rejected (score 0)` for a review `not_a_verdict` answers
+    true for (#131): the journal's `review` line and the pull request review's heading. "never
+    ran" for one that paused or says it never ran, "did not complete" for every other — a review
+    that ended in error, or whose output could not be read. No score: nobody gave one."""
+    said = (getattr(review, "summary", "") or "").lower()
+    if getattr(review, "pause_reason", None) or "never ran" in said:
+        return "the review never ran"
+    return "the review did not complete"

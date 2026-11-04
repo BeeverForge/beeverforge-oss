@@ -17,7 +17,18 @@ The claims, each a row:
   * `HarnessReviewer` carries its agent's pause onto the review (row 9);
   * the pull request (row 10) and the first round's review stage (row 11) read a review that did
     not complete, or paused, from its fields — the "did not complete" sentence holds neither of
-    the phrases they matched on before — and the reviewer sets that field (row 12).
+    the phrases they matched on before — and the reviewer sets that field (row 12);
+  * (review of a796cde, hermesfelipe) a review that did not complete, with no pause, HOLDS the job
+    at the first review (row 14) and at the re-review after a repair (row 15), with one sentence
+    built from the review's summary (row 16); `should_auto_merge` reads one as no review whatever
+    the mode (rows 17-18) — its pragma branch reads the same `reviewed`, and row 18 cuts both, as
+    the upfront hold answers first for every input the pragma branch would;
+  * every surface says the review did not complete, with no score: the journal at the first
+    review (row 19), after a review-repair (row 20), after a CI repair (row 21) and on a re-review
+    a person asked for (row 22); the pull request review's heading (rows 23-24) and its event,
+    a comment rather than request-changes (row 25);
+  * a stream that died with no result event and a non-zero exit (a timeout, a kill) did not
+    complete (row 26).
 """
 
 TEST = "tests/test_the_review_is_read_from_the_last_result_event_of_its_stream.py"
@@ -26,6 +37,8 @@ REVIEWER = "beeverforge/adapters/reviewer/claude_code.py"
 HARNESS = "beeverforge/adapters/reviewer/harness.py"
 MACHINE = "beeverforge/orchestrator/machine.py"
 CONTRACT = "beeverforge/contracts/review.py"
+POLICY = "beeverforge/orchestrator/merge_policy.py"
+HELD = "tests/test_a_review_that_did_not_complete_holds_the_job.py"
 
 MUTATIONS = [
     ("THE DEFECT: an error result event is read as a verdict at exit 0", REVIEWER,
@@ -73,4 +86,49 @@ MUTATIONS = [
      '    summary = (getattr(review, "summary", "") or "").lower()\n',
      '    summary = getattr(review, "summary", "") or ""\n',
      "tests/test_an_unread_review_is_not_a_rejection.py"),
+    # ── review of a796cde (hermesfelipe): a review that did not complete holds the job ─────────
+    ("THE REVIEWER'S FINDING 1: a first review that did not complete carries on as a rejection, "
+     "and advisory mode auto-merges it", MACHINE,
+     "                if not_a_verdict(result.review):\n"
+     "                    return self._unfinished_review_hold(",
+     "                if False:\n"
+     "                    return self._unfinished_review_hold(", HELD),
+    ("a re-review after a repair that did not complete carries on", MACHINE,
+     "if not_a_verdict(result.review):  # the re-review judged nothing too (#131)",
+     "if False:", HELD),
+    ("the hold says nothing about why the review did not complete", MACHINE,
+     '    why = first[:300] or "the reviewer gave no reason"\n',
+     '    why = "the reviewer gave no reason"\n', HELD),
+    ("the policy merges a change whose review did not complete", POLICY,
+     "    if result.review is not None and reviewed is None:\n        return False\n",
+     "    if False:\n        return False\n", HELD),
+    ("the policy reads a review that did not complete as a review, a pragma's vetting included",
+     POLICY,
+     "reviewed = None if result.review is None or not_a_verdict(result.review) else result.review",
+     "reviewed = result.review", HELD),
+    ("THE REVIEWER'S FINDING 2: the first review is journalled `rejected (score 0)`", MACHINE,
+     '                    _review_said(result.review) + (" · advisory" if advisory else ""),',
+     '                    f"{result.review.decision} (score {result.review.score})"'
+     ' + (" · advisory" if advisory else ""),', HELD),
+    ("the re-review after a repair is journalled `rejected (score 0)`", MACHINE,
+     '_review_said(result.review) + f" [after repair {rev_attempts}]",',
+     'f"{result.review.decision} (score {result.review.score})"'
+     ' f" [after repair {rev_attempts}]",', HELD),
+    ("the review after a CI repair is journalled `rejected (score 0)`", MACHINE,
+     '_review_said(review) + " [after repair]",',
+     'f"{review.decision} (score {review.score}) [after repair]",', HELD),
+    ("a re-review a person asked for is journalled `rejected (score 0)`", MACHINE,
+     '_review_said(review) + " [re-reviewed]",',
+     'f"{review.decision} (score {review.score}) [re-reviewed]",', HELD),
+    ("the pull request review is headed `**rejected** — score 0`", POLICY,
+     "nothing here is a judgement about the code\" if not_a_verdict(review)",
+     "nothing here is a judgement about the code\" if False", HELD),
+    ("a paused review is headed as one that did not complete, not one that never ran", CONTRACT,
+     '    if getattr(review, "pause_reason", None) or "never ran" in said:\n',
+     "    if False:\n", HELD),
+    ("the bot requests changes on a diff nobody read", POLICY,
+     "    if review is None or not_a_verdict(review):\n",
+     "    if review is None:\n", HELD),
+    ("THE REVIEWER'S FINDING 3: a stream killed before its result event is not did-not-complete",
+     REVIEWER, "did_not_complete=rc != 0)", "did_not_complete=False)"),
 ]
