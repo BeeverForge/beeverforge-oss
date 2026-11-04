@@ -456,7 +456,9 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, _as_text(r.summary)]
+        # A CREDENTIAL THE REVIEWER QUOTES IS WITHHELD, on the raw text before `_as_text` (#196):
+        # the same order as the agent's account, for the reasons above `_CLAIM` (#885).
+        out = [first, _as_text(_without_credentials(r.summary))]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -467,7 +469,8 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
+            out.append(f"- **{f.severity}**{loc}: "
+                       f"{_as_text(_without_credentials(f.description))}")
         return out
 
 
@@ -1191,6 +1194,11 @@ def _review_sentence(result) -> str:
 
     review = getattr(result, "review", None)
     verdict = review.model_dump() if hasattr(review, "model_dump") else (review or {})
+    if isinstance(verdict, dict) and verdict.get("findings"):
+        # a credential a finding quotes is withheld before `headline` cuts it at 220 (#196)
+        verdict = {**verdict, "findings": [
+            {**f, "description": _without_credentials(f.get("description") or "")}
+            if isinstance(f, dict) else f for f in verdict["findings"]]}
     head = headline(verdict if isinstance(verdict, dict) else {})
     out = f"\n{head['word']} — {head['clause']}"
     for point in (head.get("points") or [])[:3]:
@@ -2097,7 +2105,7 @@ class JobRunner:
                 self.forge.review_pr(
                     pr=pr,
                     event=review_event(result.review, self.manifest.review_mode),
-                    body=format_review(result.review),
+                    body=_without_credentials(format_review(result.review)),
                 )
 
             # merge posture (D-12): auto-merge only when policy allows and it's safe;

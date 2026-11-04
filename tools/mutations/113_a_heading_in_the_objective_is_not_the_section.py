@@ -46,13 +46,15 @@ MUTATIONS = [
      '''            "", "## Objective", _as_text(card.text(ticket.objective)), "", "## Validations",''',
      '''            "", "## Objective", card.text(ticket.objective), "", "## Validations",'''),
 
+    # RE-PINNED for #196: the reviewer's words are withheld from first, then escaped; each cut
+    # drops the escaping and keeps the withholding.
     ("the reviewer's summary is written raw, so a stale verdict outlives a fresh one", MACHINE,
-     "        out = [first, _as_text(r.summary)]",
-     "        out = [first, r.summary]"),
+     "        out = [first, _as_text(_without_credentials(r.summary))]",
+     "        out = [first, _without_credentials(r.summary)]"),
 
     ("a finding is written raw, so a stale verdict outlives a fresh one", MACHINE,
-     '            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")',
-     '            out.append(f"- **{f.severity}**{loc}: {f.description}")'),
+     '                       f"{_as_text(_without_credentials(f.description))}")',
+     '                       f"{_without_credentials(f.description)}")'),
 
     ("the escaping escapes nothing", MACHINE,
      '''    return "\\n".join(f"\\\\{row}" if row.startswith("## ") else row for row in words.split("\\n"))''',
