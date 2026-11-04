@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING
 
 from beeverforge import namespace
 from beeverforge.observability.job_record import record_one_pass
-from beeverforge.orchestrator.validation import advisory_gates, gate_commands
+from beeverforge.orchestrator.validation import advisory_gates, gate_commands, gate_timeout
 from beeverforge.util.filelock import FileLock, Waited
 
 if TYPE_CHECKING:
@@ -388,6 +388,16 @@ class Probes:
     #: checkout/manifest this call could not read; the station is skipped rather than invented.
     inlined_documents: (Callable[[], tuple[dict[str, int], str, DocumentFit | None] | None]
                         | None) = None
+    #: The repo-wide gates AS DECLARED, `{name: gate}` — from the same source as
+    #: `validate_commands` (`manifest.validation`), so the proof can read each gate's
+    #: `timeout_minutes` the way a job does (#70). Defaults to nothing: an older `Probes` gives
+    #: every gate the box's own limit, exactly as before.
+    validation_gates: Callable[[], dict] = dict
+    #: Run ONE GATE inside the box with an explicit limit: `(command, timeout_s, on_line)`, where
+    #: `on_line` is None when nobody is watching. None = an older probe set, which keeps running
+    #: gates through `run_in_box`/`run_streaming` with the box's default. A separate entry rather
+    #: than a widened `run_in_box`, so every single-argument test double stays valid.
+    run_gate: Callable[[str, int, Callable[[str], None] | None], tuple[int, str]] | None = None
 
 
 def component_gates(manifest) -> dict[str, str]:
@@ -650,14 +660,21 @@ def prove(project: str, image: str, p: Probes, *,
         proof.findings.append(Finding(
             "documents", True, message + (f"\n{note}" if note else "")))
 
-    def _run(command: str, *, label: str) -> tuple[int, str]:
+    def _run(command: str, *, label: str, timeout: int | None = None) -> tuple[int, str]:
         """One command inside the box, streamed when there is somebody watching.
 
         The fallback is EXPLICIT rather than a `TypeError` handler around a wider call: a probe
         set that cannot stream is an ordinary, correct thing (every test double is one), and
         catching the exception a wrong signature would raise is how a real defect gets to look
-        like a supported configuration."""
+        like a supported configuration.
+
+        `timeout` is given to GATES only, and only reaches a probe set that can take one
+        (`run_gate`); everything else keeps the box's own limit (#70)."""
         _say("start", label)
+        watched = on_stage is not None and p.run_streaming is not None
+        if timeout is not None and p.run_gate is not None:
+            relay = (lambda line: _say("line", line)) if watched else None
+            return p.run_gate(command, timeout, relay)
         if on_stage is not None and p.run_streaming is not None:
             return p.run_streaming(command, lambda line: _say("line", line))
         return p.run_in_box(command)
@@ -799,8 +816,15 @@ def prove(project: str, image: str, p: Probes, *,
     #: (command, output) — the OUTPUT rides along because the remedy reads the binary's name out
     #: of it; carrying the command alone is what forced `_missing_tool_remedy` to guess.
     cannot_run: list[tuple[str, str]] = []
+    # EACH GATE GETS THE LIMIT A JOB GIVES IT (#70): its `timeout_minutes`, else the job's own
+    # default — one formula, `gate_timeout`, shared with `machine`. A name the probe set did not
+    # declare a gate for keeps the box's limit, as an older probe set always did.
+    from beeverforge.orchestrator.machine import _VALIDATION_TIMEOUT
+
+    gates = p.validation_gates()
     for name, cmd in sorted(validate.items()):
-        rc, out = _run(cmd, label=f"{name}: {cmd}")
+        limit = gate_timeout(gates[name], _VALIDATION_TIMEOUT) if name in gates else None
+        rc, out = _run(cmd, label=f"{name}: {cmd}", timeout=limit)
         if rc == 0:
             continue
         line = f"{name}: `{cmd}` exited {rc}\n{_tail(out)}"
@@ -1551,6 +1575,8 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             setup_commands=lambda: list(manifest.setup),
             validate_commands=lambda: gate_commands(manifest.validation),
             advisory_gates=lambda: advisory_gates(manifest.validation),
+            validation_gates=lambda: dict(manifest.validation),
+            run_gate=lambda cmd, timeout, on_line: _in_box(cmd, on_line, timeout=timeout),
             component_gate_commands=lambda: component_gates(manifest),
             # THROUGH THE BOX'S OWN SEAM, exactly as the executor does. `harness_path` (ADR-0037
             # D2a) exists because `PATH` cannot be relied on inside a CLIENT's image, and this

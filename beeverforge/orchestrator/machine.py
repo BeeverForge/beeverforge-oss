@@ -73,6 +73,7 @@ from beeverforge.orchestrator.validation import (
     applicable_validations,
     as_gate,
     could_not_run,
+    gate_timeout,
     scope_explosion,
 )
 from beeverforge.policy import census as census_policy
@@ -3931,7 +3932,7 @@ class JobRunner:
             cmd = gate.command
             # A scan measured in minutes must not borrow the test suite's wall, and a scanner that
             # hangs must not hold the floor for the test timeout.
-            timeout = (gate.timeout_minutes * 60) if gate.timeout_minutes else _VALIDATION_TIMEOUT
+            timeout = gate_timeout(gate, _VALIDATION_TIMEOUT)
             rc, out = self.sandbox.run(workspace=ws, command=cmd, timeout=timeout)
             # THE SHELL'S VERDICT ON THE COMMAND, kept apart from the gate's verdict on the code.
             unrunnable = could_not_run(rc, out)
