@@ -63,4 +63,13 @@ MUTATIONS += [
     ("the real gate runner drops the limit on the way into the box", SRC,
      "            run_gate=lambda cmd, timeout, on_line: _in_box(cmd, on_line, timeout=timeout),",
      "            run_gate=lambda cmd, timeout, on_line: _in_box(cmd, on_line),"),
+
+    ("an advisory gate that ran out of time re-words the blocking failure's remedy beside it",
+     SRC,
+     "        if name in advisory and not _cannot_run(rc, out):\n"
+     "            advisory_gates_failed.append(line)\n",
+     "        if name in advisory and not _cannot_run(rc, out):\n"
+     "            advisory_gates_failed.append(line)\n"
+     "            if timed_out(rc, out):\n"
+     "                stopped.append(name)\n"),
 ]

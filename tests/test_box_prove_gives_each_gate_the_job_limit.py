@@ -149,6 +149,26 @@ def test_a_gate_no_declaration_covers_does_not_offer_a_setting_it_does_not_have(
     assert "cannot reproduce your build" not in finding.remedy, finding.remedy
 
 
+def test_an_advisory_gate_that_ran_out_of_time_leaves_a_blocking_failure_its_own_remedy():
+    """An ADVISORY gate stopped at its limit is reported with the advisory finding; it is not
+    what the blocking finding is about. So a blocking gate that failed outright beside it keeps
+    the generic remedy, with no talk of time limits it did not hit."""
+    def run_gate(cmd, timeout, on_line):
+        from beeverforge.adapters.sandbox.timeouts import timeout_result
+
+        if cmd == "pytest -q":
+            return timeout_result(cmd, timeout, _LONG_RUN)
+        return 1, "lint: 3 errors"
+
+    proof = prove("acme", "mycorp/ci:1", _probes(run_gate=run_gate,
+                                                 advisory_gates=lambda: frozenset({"suite"})))
+
+    (blocking,) = [f for f in proof.findings if f.check == "validate" and not f.advisory]
+    assert "ruff check" in blocking.message, blocking.message
+    assert "cannot reproduce your build" in blocking.remedy, blocking.remedy
+    assert "timeout_minutes" not in blocking.remedy, blocking.remedy
+
+
 # ── the production probe set is wired to the manifest and the box (finding 2) ───────────────────
 
 def _box_probes_over_a_fake_box(tmp_path, monkeypatch):

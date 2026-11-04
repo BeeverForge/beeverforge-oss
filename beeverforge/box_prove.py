@@ -817,7 +817,7 @@ def prove(project: str, image: str, p: Probes, *,
     #: (command, output) — the OUTPUT rides along because the remedy reads the binary's name out
     #: of it; carrying the command alone is what forced `_missing_tool_remedy` to guess.
     cannot_run: list[tuple[str, str]] = []
-    #: gates the box stopped at their limit: they did not fail, they ran out of time
+    #: BLOCKING gates the box stopped at their limit: they did not fail, they ran out of time
     stopped: list[str] = []
     # EACH GATE GETS THE LIMIT A JOB GIVES IT (#70): its `timeout_minutes`, else the job's own
     # default — one formula, `gate_timeout`, shared with `machine`. A name the probe set did not
@@ -840,7 +840,6 @@ def prove(project: str, image: str, p: Probes, *,
                         "no gate is declared for it, so it ran with the box's own limit")
             line = (f"{name}: `{cmd}` was stopped at its limit of {stopped_at}s "
                     f"(exit {rc}); {raise_it}\n{_tail(out)}")
-            stopped.append(name)
         # A COMMAND THE BOX CANNOT EXECUTE IS NOT ADVISORY, whatever the project declared. The
         # flag says "a finding here should not stop the work"; it cannot say "this image has the
         # tool" when the shell just said it does not. That is the same asymmetry the per-component
@@ -850,6 +849,10 @@ def prove(project: str, image: str, p: Probes, *,
             advisory_gates_failed.append(line)
             continue
         failed_gates.append(line)
+        if timed_out(rc, out):
+            # counted only HERE, among the blocking failures: an advisory gate that ran out of
+            # time is the advisory finding's, not a reason to re-word the blocking one's remedy
+            stopped.append(name)
         if _cannot_run(rc, out):
             cannot_run.append((cmd, out))
     if advisory_gates_failed:
