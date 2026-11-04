@@ -225,6 +225,44 @@ def test_the_floor_is_the_prompt_the_planner_and_executor_passes_hand_their_cli(
     assert prompt_floor_bytes(manifest, tmp_path) == max(_argv_bytes(p) for p in box.prompts)
 
 
+def test_the_floor_is_the_planners_prompt_when_the_planners_instructions_are_longer(
+        tmp_path: Path, monkeypatch):
+    """The planner is the first pass a pickup starts, so the floor reads ITS instructions too. With
+    the shipped role files the executor's are the longer, so a floor read on the executor alone
+    gives the same number; here the planner's are made longer, and the floor must follow them."""
+    from beeverforge.adapters.agent import claude_code, roles
+    from beeverforge.adapters.agent.base import _argv_bytes
+    from beeverforge.contracts import Ticket
+    from beeverforge.orchestrator.context import build_context, prompt_floor_bytes
+
+    monkeypatch.delenv(og.ENV_VAR, raising=False)
+    monkeypatch.setenv("BEEVERFORGE_PROMPT_BUDGET", "off")
+    real_role_prompt = roles.role_prompt
+
+    def longer_planner(role: str) -> str:
+        text = real_role_prompt(role)
+        return text + "\n" + "p" * 20_000 if role == "planner" else text
+
+    monkeypatch.setattr(roles, "role_prompt", longer_planner)
+    monkeypatch.setattr(claude_code, "role_prompt", longer_planner)
+    (tmp_path / "adr").mkdir()
+    (tmp_path / "adr" / "0001.md").write_text("Keep the domain free of adapters.\n")
+    manifest = Manifest(docs={"constraints": "adr/*.md"})
+
+    blank = Ticket(id="", title="", objective="", repo="")
+    context = build_context(manifest, tmp_path, blank, knowledge_map="")
+    planner_box, executor_box = _CapturesThePrompt(), _CapturesThePrompt()
+    agent = claude_code.ClaudeCodeAdapter(model="opus")
+    for run, box in ((agent.plan, planner_box), (agent.execute, executor_box)):
+        with pytest.raises(_Captured):
+            run(sandbox=box, workspace=None, context=context)
+    planner, executor = _argv_bytes(planner_box.prompts[0]), _argv_bytes(executor_box.prompts[0])
+
+    assert planner > executor, "the planner's prompt is the longer one here"
+    assert prompt_floor_bytes(manifest, tmp_path) == planner, (
+        "the floor is the planner's prompt, the first pass a pickup starts")
+
+
 def test_a_corpus_the_documents_alone_call_fitting_but_the_pass_refuses_is_reported(
         tmp_path: Path, monkeypatch):
     """The test #418 asks for. Documents under the raw limit — under the pass's own line, even —
