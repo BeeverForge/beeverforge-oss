@@ -8,12 +8,18 @@ this is its helper, moved here so the index and the board use the same lines (#3
 
 SQLITE GIVES `-wal`, `-shm` AND `-journal` THE MAIN FILE'S MODE, so a main file that is `0600`
 before the first connect is enough for the files SQLite makes beside it.
+
+A STORE OR SIDECAR THAT IS NOT A REGULAR FILE IS REFUSED BY NAME when an existing store is narrowed:
+a symbolic link (followed by SQLite, to wherever it points) with `LinkedPath`, and any other
+special file (a FIFO, a socket, a device, a directory) with `NotRegularFile`.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import stat
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -25,6 +31,12 @@ SIDECARS = ("-wal", "-shm", "-journal")
 class LinkedPath(Exception):
     """A symbolic link where a private store or its backup is to be created (#228) — refused, not
     followed. Not an `OSError`, so a read's "could not create it" logging does not swallow it."""
+
+
+class NotRegularFile(Exception):
+    """A special file — a FIFO, a socket, a device, a directory — where a private store or one of
+    its sidecars is to be opened (#308): refused, not opened. `LinkedPath`'s sibling, and for the
+    same reason not an `OSError`."""
 
 
 def create_private(path: Path, *, what: str, remedy: str, tighten: bool = False) -> None:
@@ -39,7 +51,8 @@ def create_private(path: Path, *, what: str, remedy: str, tighten: bool = False)
     is the operator's, not ours. With `tighten` (the index and the board, #308), an existing file
     and each sidecar beside it lose their group and other bits — a `0644` left by an older release
     becomes `0600`. A file this process may not chmod (another user's) is logged, not raised: the
-    open goes on, as it did before.
+    open goes on, as it did before. A link or a special file at the store's path or a sidecar's is
+    refused by name (`LinkedPath`, `NotRegularFile`), as a link at the main path always is.
 
     A SYMBOLIC LINK AT THE PATH IS REFUSED, dangling or not, with `LinkedPath`. `O_EXCL` fails on
     a link without following it, but `sqlite3.connect` would then follow it — to a file made under
@@ -53,7 +66,7 @@ def create_private(path: Path, *, what: str, remedy: str, tighten: bool = False)
             raise LinkedPath(f"the {what} at {path} is a symbolic link, which is refused rather "
                              f"than followed — {remedy}") from None
         if tighten:
-            _tighten(path, what)
+            _tighten(path, what, remedy)
         return
     try:
         os.fchmod(fd, 0o600)
@@ -61,26 +74,37 @@ def create_private(path: Path, *, what: str, remedy: str, tighten: bool = False)
         os.close(fd)
 
 
-def _tighten(path: Path, what: str) -> None:
+def _tighten(path: Path, what: str, remedy: str) -> None:
     """Clear the group and other bits of `path` and of each sidecar beside it that exists.
 
     Opened without `O_CREAT` and read-only, so a file in a read-only directory, or one this
-    process may only read, is still checked; and with `O_NOFOLLOW`, so a link is never chmodded
-    through."""
+    process may only read, is still checked; with `O_NOFOLLOW`, so a link is never chmodded
+    through but refused (`LinkedPath`, with the store's `remedy`); and with `O_NONBLOCK`, so a
+    FIFO is opened at once rather than waited on, and then refused like any file that is not
+    regular (`NotRegularFile`)."""
     for name in ("", *SIDECARS):
-        _narrow(Path(f"{path}{name}"), what)
+        _narrow(Path(f"{path}{name}"), what, remedy)
 
 
-def _narrow(path: Path, what: str) -> None:
+def _narrow(path: Path, what: str, remedy: str) -> None:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, flags)
     except FileNotFoundError:
         return
     except OSError as exc:
+        if exc.errno == errno.ELOOP:   # what O_NOFOLLOW answers for a link, dangling or not
+            raise LinkedPath(f"the {what} file {path} is a symbolic link, which is refused "
+                             f"rather than followed — {remedy}") from None
         log.warning("the %s file %s could not be opened to make it private — %s", what, path, exc)
         return
     try:
-        mode = os.fstat(fd).st_mode & 0o7777
+        found = os.fstat(fd).st_mode
+        if not stat.S_ISREG(found):
+            raise NotRegularFile(f"the {what} file {path} is not a regular file, which SQLite "
+                                 f"cannot keep a store in, so it is refused rather than opened "
+                                 f"— move it out of the way and a regular file is made there")
+        mode = found & 0o7777
         if mode & 0o077:
             try:
                 os.fchmod(fd, mode & ~0o077)

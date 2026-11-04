@@ -21,7 +21,7 @@ import pytest
 
 from beeverforge.adapters import board_db
 from beeverforge.product.index.store import Index
-from beeverforge.util.private_file import LinkedPath
+from beeverforge.util.private_file import SIDECARS, LinkedPath, NotRegularFile, create_private
 
 UMASKS = pytest.mark.parametrize("umask", [0o000, 0o022, 0o277], ids=["000", "022", "277"])
 
@@ -133,9 +133,9 @@ def test_a_new_board_and_its_sidecars_are_private_whatever_the_umask(tmp_path, u
         assert conn.execute("SELECT count(*) FROM cards").fetchone()[0] == 0
 
 
-def test_an_existing_0644_board_and_its_wal_are_tightened_when_opened(tmp_path):
+def test_an_existing_0644_board_and_its_wal_and_shm_are_tightened_when_opened(tmp_path):
     db = tmp_path / "board.db"
-    wal = db.with_name("board.db-wal")
+    wal, shm = db.with_name("board.db-wal"), db.with_name("board.db-shm")
     old = os.umask(0o022)
     try:
         with board_db.connect(db, write=True):
@@ -146,13 +146,46 @@ def test_an_existing_0644_board_and_its_wal_are_tightened_when_opened(tmp_path):
             # by itself, and only a `-wal` with content shows whether the open narrows it.
             held.execute("CREATE TABLE someone (x)")
             held.commit()
-            assert wal.stat().st_size > 0
-            db.chmod(0o644)
-            wal.chmod(0o644)
+            # The `-shm` holds the wal-index of those frames, so it is not empty either.
+            assert wal.stat().st_size > 0 and shm.stat().st_size > 0
+            for path in (db, wal, shm):
+                path.chmod(0o644)
             with board_db.connect(db) as conn:
                 conn.execute("SELECT count(*) FROM cards").fetchone()
-            assert _mode(db) == 0o600
-            assert _mode(wal) == 0o600
+            assert {p.name: _mode(p) for p in (db, wal, shm)} == _private(db)
+        finally:
+            held.close()
+    finally:
+        os.umask(old)
+
+
+def test_an_existing_0644_journal_beside_a_board_backup_is_tightened(tmp_path):
+    """The board backup's copy is written under SQLite's default `journal_mode=DELETE` — a fresh
+    file's — so the sidecar beside it while it is written is a `-journal`, and a copy cut short
+    leaves one. The finished copy carries the board's WAL header, so the test puts it back in
+    DELETE; a connection held inside a write transaction keeps the journal on disk with the
+    original page in it. The helper is called as `board_db.backup` calls it, because the backup
+    itself would wait on that held lock."""
+    db, copy = tmp_path / "board.db", tmp_path / "copy.db"
+    journal = copy.with_name("copy.db-journal")
+    with board_db.connect(db, write=True):
+        pass
+    old = os.umask(0o022)
+    try:
+        assert board_db.backup(copy, db) == copy
+        held = sqlite3.connect(copy, isolation_level=None)
+        try:
+            assert held.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            held.execute("BEGIN IMMEDIATE")
+            held.execute("CREATE TABLE someone (x)")
+            assert journal.stat().st_size > 0
+            copy.chmod(0o644)
+            journal.chmod(0o644)
+            create_private(copy, what="board backup",
+                           remedy="remove the link, or back up to another path", tighten=True)
+            assert {p.name: _mode(p) for p in (copy, journal)} == {
+                "copy.db": 0o600, "copy.db-journal": 0o600}
+            held.execute("ROLLBACK")
         finally:
             held.close()
     finally:
@@ -206,3 +239,54 @@ def test_a_link_at_the_board_backup_s_path_is_refused_by_name(tmp_path):
         board_db.backup(copy, db)
     assert f"{copy} is a symbolic link" in str(refused.value)
     assert not elsewhere.exists(), "the link was followed"
+
+
+@pytest.mark.parametrize("sidecar", SIDECARS)
+def test_a_link_at_a_sidecar_s_path_is_refused_by_name_and_its_target_is_untouched(tmp_path,
+                                                                                    sidecar):
+    db, elsewhere = tmp_path / "board.db", tmp_path / "elsewhere"
+    with board_db.connect(db, write=True):
+        pass
+    old = os.umask(0o022)
+    try:
+        elsewhere.write_bytes(b"someone's file")
+        elsewhere.chmod(0o644)
+        link = Path(f"{db}{sidecar}")
+        link.symlink_to(elsewhere)
+        with pytest.raises(LinkedPath) as refused, board_db.connect(db):
+            pass
+    finally:
+        os.umask(old)
+    said = str(refused.value)
+    assert f"{link} is a symbolic link" in said and "BEEVERFORGE_BOARD_DB" in said, said
+    assert link.is_symlink(), "the link was replaced"
+    assert _mode(elsewhere) == 0o644, "the link was followed and its target chmodded"
+    assert elsewhere.read_bytes() == b"someone's file", "the link was followed and written"
+
+
+@pytest.mark.parametrize("name", ["", "-journal"], ids=["main", "journal"])
+def test_a_fifo_at_the_board_or_its_journal_is_refused_by_name(tmp_path, name):
+    """A FIFO, like any file that is not a regular one, is refused before SQLite opens the store.
+
+    The test holds the FIFO open for reading and writing itself, so no other open of it waits for
+    a partner — not the check's, and not SQLite's when the check is cut away — and the test fails
+    rather than blocks whatever code it runs against. That the check opens it without blocking
+    even with nobody holding it is the `O_NONBLOCK` in `_narrow`."""
+    db = tmp_path / "board.db"
+    if name:
+        with board_db.connect(db, write=True):
+            pass
+    special = Path(f"{db}{name}")
+    old = os.umask(0o022)
+    try:
+        os.mkfifo(special)
+        both_ends = os.open(special, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            with pytest.raises(NotRegularFile) as refused, board_db.connect(db):
+                pass
+        finally:
+            os.close(both_ends)
+    finally:
+        os.umask(old)
+    assert f"{special} is not a regular file" in str(refused.value), str(refused.value)
+    assert stat.S_ISFIFO(special.lstat().st_mode), "the FIFO was replaced"
