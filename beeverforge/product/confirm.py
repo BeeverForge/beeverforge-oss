@@ -192,6 +192,14 @@ class Refused(str):
         return said
 
 
+class NotDone(str):
+    """The sentence an executor says for a write that BROKE before it was made (review of #440).
+
+    `Refused`'s sibling, for the act the executor itself caught raising: the person hears the
+    executor's own sentence (`breakdown_not_begun`, not `broke()`), and `answer_staged` names the
+    outcome `failed` — never `done` for a yes after which nothing was filed."""
+
+
 def _refused(result, lang, *, project=None, head: str = "") -> Refused:
     """What a write the module did not make says: its detail, sanitised like every other one, and
     its refusal word. For a list of results, the one word every failed result shares, or `""` —
@@ -646,7 +654,7 @@ def _confirm_breakdown(project, entry, *, module, user, lang) -> str:
     except Exception:  # noqa: BLE001 — an engine that does not answer is a sentence
         log.exception("BEEVERFORGE_PRODUCT_BREAKDOWN_NOT_STARTED project=%s req=%s — a person "
                       "said yes and nothing was filed", getattr(project, "name", "?"), number)
-        return breakdown_not_begun(number=number, language=lang)
+        return NotDone(breakdown_not_begun(number=number, language=lang))
     if how == breaking.WAITS:
         from beeverforge.product.voice import breakdown_waits_for_code
 
@@ -1295,7 +1303,7 @@ def answer_staged(project, *, token: str, approved: bool, user: str, module=None
     refusal gets recorded as a decision. Outcomes: `done`, `rejected`, `unauthorized`, `gone`,
     `replaced`, `expired` — and, for an approval whose write did not happen (#187), `refused` (the
     module declined it; the sentence is a `Refused` carrying the word) and `failed` (the write
-    raised; the person still hears `broke()`).
+    raised; the person still hears `broke()`, or the executor's own `NotDone` sentence).
 
     IT NO LONGER ROUTES THROUGH THE SLACK `handle` (#105). That indirection existed for a good
     reason — "exactly one implementation of what a confirmation does, a second one would drift" —
@@ -1415,7 +1423,11 @@ def answer_staged(project, *, token: str, approved: bool, user: str, module=None
         from beeverforge.product.voice import broke
 
         sentence, kind, outcome = broke(language=lang), "broke", "failed"
-    if isinstance(sentence, Refused):
+    if isinstance(sentence, NotDone):
+        # THE EXECUTOR CAUGHT ITS WRITE RAISING (review of #440): the person hears its sentence,
+        # and the caller is told it failed
+        outcome = "failed"
+    elif isinstance(sentence, Refused):
         # THE MODULE DID NOT MAKE THE WRITE (#187): the person is told why in the role's words,
         # and the caller is told it was not done — never `done` for a write that did not happen
         outcome = "refused"

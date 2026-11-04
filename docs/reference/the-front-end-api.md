@@ -92,9 +92,13 @@ not carry one yet. A row whose implementation raised answers `code: "failed"` wi
 **`product_answer` says whether the staged write happened (#187).** An approval whose write the
 product role refused answers the table's code for its word (403, 404, 409 or 400), with the role's
 sentence and the word in `data.refusal`; one whose write broke answers 500 `failed`, with the
-"something broke" sentence the person heard and a `data.reference`. Only a write that was made
-answers `ok: true`, with `data.outcome: "done"`; a rejection still answers `ok: true` with
-`data.outcome: "rejected"`.
+sentence the person heard — "something broke", or for a breakdown whose engine did not answer,
+that the breakdown did not begin — and a `data.reference`. An approval answers `ok: true` with
+`data.outcome: "done"` when the write was made, and in one case where it was not: a write that
+waited for the product's other writes and did not get its turn (#269) is staged again as it was,
+and the answer is `ok: true`, `data.outcome: "done"`, with the role's sentence telling the person
+nothing was recorded and to ask again — their next yes finds the proposal and writes it. A
+rejection answers `ok: true` with `data.outcome: "rejected"`.
 
 A socket is refused before it is accepted: the upgrade is answered with a 403 and closed with code
 **1008** for a refusal, **1011** when nobody could be judged.

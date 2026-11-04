@@ -291,3 +291,51 @@ def test_the_panels_answer_route_answers_a_crashed_staged_write_500(monkeypatch,
 
     assert r.status_code == 500, r.text
     assert r.json()["detail"] == "Something broke on my side.", r.json()
+
+
+@pytest.fixture
+def staged_breakdown(deployment, monkeypatch):  # noqa: F811 — the imported fixture
+    """A `breakdown` proposal staged by hand for the deployment, and its token."""
+    from beeverforge.memory import transcript
+    from beeverforge.product import staging
+
+    monkeypatch.setattr(transcript, "record", lambda *a, **k: "")
+    staging._PENDING.clear()
+    try:
+        staging.remember(KEY, {"kind": "breakdown", "number": 7, "channel": "",
+                               "conversation": ""},
+                         lang="en", project=deployment)
+        yield staging.proposal_token(KEY, staging.pending_for(KEY, project=deployment))
+    finally:
+        staging._PENDING.clear()
+
+
+def test_a_staged_breakdown_whose_engine_raised_answers_500_failed_with_a_reference(
+        client, staged_breakdown, on_the_worker, deployment,  # noqa: F811 — fixtures
+        monkeypatch, caplog):
+    """Review of PR #440 (hermesfelipe): `_confirm_breakdown` catches `breaking.start_now` raising,
+    logs "a person said yes and nothing was filed", and answered it with `breakdown_not_begun` as a
+    plain `str` — so the gate said `done` and the row `ok: true`. It is a failure now, with a
+    reference, and the person still hears that the breakdown did not begin."""
+    from beeverforge.product import breaking, voice
+
+    tried = []
+
+    def _start_now(project, number, **_kw):
+        tried.append(number)
+        raise RuntimeError("the engine did not answer")
+
+    monkeypatch.setattr(breaking, "start_now", _start_now)
+    on_the_worker(_Module(None))
+
+    with caplog.at_level(logging.INFO):
+        r = _answer(client, staged_breakdown)
+
+    said = r.json()
+    assert tried == [7], "the staged breakdown was never tried"
+    assert said["ok"] is False, said
+    _a_reference_its_line_names(r, caplog)
+    assert said["message"] == voice.strip_markup(
+        voice.breakdown_not_begun(number=7, language=deployment.language)), said
+    assert any("BEEVERFORGE_PRODUCT_BREAKDOWN_NOT_STARTED" in rec.getMessage()
+               for rec in caplog.records), "the breakdown that did not start is no longer logged"

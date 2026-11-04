@@ -8,8 +8,10 @@ write and when it raised, and `catalog._product_answer` answered `done(...)`: `/
 product_answer` said `ok: true` for a write that did not happen, the CLI's `--propose --yes` exited
 0, and the panel's answer route returned its 200 decision payload. The claims, each a row:
 
-  1. the gate names the outcome: a `Refused` sentence is `refused`, a crash is `failed`;
-  2. the executor says a refusal as a `Refused`, carrying the module's word;
+  1. the gate names the outcome: a `Refused` sentence is `refused`, a crash — or a `NotDone`
+     sentence, an executor's own caught crash — is `failed`;
+  2. the executor says a refusal as a `Refused`, carrying the module's word, and the breakdown
+     whose engine raised as a `NotDone` (review of #440);
   3. the word crosses the worker in the activity's dict;
   4. the row maps `refused` through `_not_done` (the word's code, `data.refusal`) and `failed`
      through `_failed` (500 with a reference its line names) — and the CLI exits non-zero for both;
@@ -24,6 +26,8 @@ CLI = (TEST + "::test_product_ask_propose_yes_exits_non_zero_for_a_refused_and_a
 PANEL_REFUSED = (TEST + "::test_the_panels_answer_route_answers_a_refused_staged_write_with_its_"
                  "refusal_status")
 PANEL_FAILED = TEST + "::test_the_panels_answer_route_answers_a_crashed_staged_write_500"
+BREAKDOWN = (TEST + "::test_a_staged_breakdown_whose_engine_raised_answers_500_failed_with_a_"
+             "reference")
 
 CONFIRM = "beeverforge/product/confirm.py"
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
@@ -41,6 +45,11 @@ MUTATIONS = [
      '        sentence, kind, outcome = broke(language=lang), "broke", "done"\n',
      RAISED),
 
+    ("REVIEW OF #440: a `NotDone` sentence is answered `done`", CONFIRM,
+     '        outcome = "failed"\n',
+     '        outcome = "done"\n',
+     BREAKDOWN),
+
     # 2. the executor says a refusal as a `Refused`, with its word
     ("the fact's refusal is a plain sentence again", CONFIRM,
      "                              **_checked(module.note_fact, entry))\n"
@@ -54,6 +63,11 @@ MUTATIONS = [
      "    return Refused(head + _client_detail(detail, lang, project=project), refusal=word)\n",
      "    return Refused(head + _client_detail(detail, lang, project=project), refusal=\"\")\n",
      REFUSED),
+
+    ("REVIEW OF #440: the breakdown that did not start is a plain sentence again", CONFIRM,
+     "        return NotDone(breakdown_not_begun(number=number, language=lang))\n",
+     "        return breakdown_not_begun(number=number, language=lang)\n",
+     BREAKDOWN),
 
     # 3. the word crosses the worker
     ("the answer activity's dict drops the refusal", ACTIVITIES,
