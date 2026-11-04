@@ -15,9 +15,9 @@ SIX CLAIMS:
      changed files are read off git's own `diff -M`: both sides of a rename, quoted UTF-8 names,
      names with spaces, and never a list a header's missing rename lines left short.
   2. **"Could not see" is never "unrelated"**: a diff that could not be read, or one that was cut,
-     launches the agent; so does any later attempt on the head (PO answer Q1: once per head), and
-     a forge without the capability is not even asked for its diff (lesson §2). A diff read
-     that raises is caught and launches the agent; `[]` from the forge is not a re-run.
+     launches the agent; so does any later attempt of the watch (PO answer Q1: first attempt of the
+     watch only), and a forge without the capability is not even asked for its diff (lesson §2).
+     A diff read that raises is caught and launches the agent; `[]` from the forge is not a re-run.
   3. **#184 still decides first** (F): an empty log is held for a person before the rule is
      weighed, and the agent is handed the log the decision was made from, read once — also after
      a refused re-run, which falls through to the agent and is said (Q3). No clock of its own (E).
