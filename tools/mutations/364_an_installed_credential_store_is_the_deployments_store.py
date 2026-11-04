@@ -12,7 +12,9 @@ a row:
   2. its refusal is final: a refused name is never answered by the variable;
   3. it is asked before the environment;
   4. a kind nobody installed refuses by name, listing the installed kinds, add-on ones included;
-  5. the configuration reference says an add-on kind is a supported value and names the
+  5. a built-in kind wins a collision: an installed `credential_store.env` or `.file` is never
+     the store built for that kind;
+  6. the configuration reference says an add-on kind is a supported value and names the
      credentials the worker's start path asks for.
 """
 
@@ -46,10 +48,21 @@ MUTATIONS = [
      'f"unknown credential store {key!r} — known:',
      'f"unknown credential store — known:'),
 
-    # 5. the reference
+    # 5. a built-in wins a collision: both guards on the line go, and an installed row comes first
+    ("an installed store replaces a shipped kind of the same name", REGISTRY,
+     "    builder = STORES.get(key) or plugins.builder(AXIS, key, builtin=STORES)\n",
+     "    builder = plugins._load().get(AXIS, {}).get(key) or STORES.get(key)\n"),
+
+    # 6. the reference
     ("the reference drops the TLS key from what a worker asks for at start", DOCS,
      ", and `TEMPORAL_TLS_KEY` when no API key answers;",
      ";"),
+    ("the reference names `GH_TOKEN` as the forge's credential again", DOCS,
+     "the forge's `BEEVERFORGE_FORGE_TOKEN` / `BEEVERFORGE_BOT_TOKEN`",
+     "the forge's `GH_TOKEN`"),
+    ("the reference drops the pool from the harness's credentials", DOCS,
+     "`BEEVERFORGE_AGENT_TOKENS` / ",
+     ""),
     ("the reference drops that an add-on kind is a supported value", DOCS,
      "An installed add-on's kind is a supported value: its package registers "
      "`credential_store.<kind>` in the `beeverforge.adapters` entry-point group, the store is "

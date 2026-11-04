@@ -27,8 +27,12 @@ import pathlib
 import pytest
 import vendor_addons
 
+from beeverforge import credentials
+from beeverforge.adapters.agent import claude_code
 from beeverforge.adapters.credential_store import registry
 from beeverforge.adapters.credential_store.base import CredentialRefused
+from beeverforge.adapters.credential_store.env import EnvStore
+from beeverforge.adapters.credential_store.file import DIR_VAR, FileStore
 from beeverforge.adapters.credential_store.registry import (
     STORE_VAR,
     build_store,
@@ -46,8 +50,11 @@ KIND = "someone"
 POINT_NAME = f"credential_store.{KIND}"
 #: The names the task asks of the store; the worker's own start set is read from `_auth`.
 NAMES = ("TEMPORAL_API_KEY", "GH_TOKEN", "ANTHROPIC_API_KEY")
-#: Every name the fake store holds.
-HELD = (*NAMES, "TEMPORAL_TLS_KEY")
+#: The forge's deployment token, in the order `credentials.forge_token` walks it.
+FORGE = ("BEEVERFORGE_FORGE_TOKEN", "BEEVERFORGE_BOT_TOKEN")
+#: Every name the fake store holds: the task's, the engine's TLS key, the forge's and the
+#: harness's own (`claude_code.CREDENTIALS`, read from the harness rather than written twice).
+HELD = tuple(dict.fromkeys((*NAMES, "TEMPORAL_TLS_KEY", *FORGE, *claude_code.CREDENTIALS)))
 
 
 def _from_store(name: str) -> str:
@@ -79,10 +86,8 @@ class SomeoneStore:
 class Point:
     """The entry point the add-on's package declares, as `importlib.metadata` hands it over."""
 
-    name = POINT_NAME
-
-    def __init__(self, builder) -> None:
-        self._builder = builder
+    def __init__(self, builder, name: str = POINT_NAME) -> None:
+        self._builder, self.name = builder, name
 
     def load(self):
         return self._builder
@@ -176,22 +181,83 @@ def test_an_unknown_store_kind_refuses_by_name_and_lists_the_installed_kinds(mon
     assert str(raised.value) == found.refused
 
 
+def test_the_forge_token_is_the_installed_stores(monkeypatch):
+    asked = _install(monkeypatch)
+
+    assert credentials.forge_token() == _from_store("BEEVERFORGE_FORGE_TOKEN")
+    assert asked == ["BEEVERFORGE_FORGE_TOKEN"], asked
+
+
+#: What a shipped kind's impostor answers: a value no shipped store could hold.
+def _from_impostor(name: str) -> str:
+    return f"fictitious-from-an-impostor-{name}"
+
+
+class ImpostorStore:
+    """An installed store that claims a shipped kind's name."""
+
+    def resolve(self, name: str) -> str | None:
+        return _from_impostor(name)
+
+
+@pytest.mark.parametrize("kind, shipped", [("env", EnvStore), ("file", FileStore)])
+def test_an_installed_store_never_replaces_a_shipped_kind(monkeypatch, tmp_path, kind, shipped):
+    """A BUILT-IN WINS A COLLISION (CONTRIBUTING, "Extending a provider axis"). On this axis that
+    rule is what keeps an installed package from naming itself `env` or `file` and becoming the
+    store every deployment credential is read from."""
+    _install(monkeypatch, declare=kind)
+    vendor_addons.install(monkeypatch, declared_rows=False, extra=(
+        Point(ImpostorStore, name="credential_store.env"),
+        Point(ImpostorStore, name="credential_store.file"),
+    ))
+    monkeypatch.setenv(DIR_VAR, str(tmp_path))  # an empty directory: the file store holds nothing
+
+    store = build_store(kind)
+
+    assert type(store) is shipped, f"`{kind}` was built as {type(store).__name__}"
+    for name in NAMES:
+        for found in (lookup(name), registry.look(f"{kind}:{name}")):
+            assert found.value != _from_impostor(name), (
+                f"{found.reference} was answered by an installed store claiming `{kind}`")
+    assert lookup("TEMPORAL_API_KEY").value == _from_env("TEMPORAL_API_KEY")
+
+
+def _asked_with_nothing_held(monkeypatch, ask) -> list[str]:
+    """The names `ask` asks the installed store, in order, when nothing answers."""
+    asked = _install(monkeypatch, held=())
+    for name in HELD:
+        monkeypatch.delenv(name)
+    ask()
+    return asked
+
+
 def _start_credentials(monkeypatch) -> list[str]:
     """The names the worker's start path asks the store, in order, when nothing answers."""
-    asked = _install(monkeypatch, held=())
-    monkeypatch.delenv("TEMPORAL_API_KEY")
-    monkeypatch.delenv("TEMPORAL_TLS_KEY")
-    connection._auth()
-    return asked
+    return _asked_with_nothing_held(monkeypatch, connection._auth)
+
+
+def test_the_reference_names_the_forge_and_harness_credentials_the_code_asks_for(monkeypatch):
+    forge = _asked_with_nothing_held(monkeypatch, credentials.forge_token)
+    assert forge == list(FORGE), forge
+    row = _row()
+
+    for name in (*forge, *claude_code.CREDENTIALS):
+        assert f"`{name}`" in row, f"the row does not name the credential {name}: {row}"
+    assert "`GH_TOKEN`" not in row, (
+        f"the row names `GH_TOKEN`, which the core exports to `gh` and never asks for: {row}")
+
+
+def _row() -> str:
+    rows = [line for line in REFERENCE.read_text().splitlines() if line.startswith(ROW)]
+    assert len(rows) == 1, f"{REFERENCE.name} holds {len(rows)} rows for {STORE_VAR}"
+    return rows[0]
 
 
 def test_the_configuration_reference_names_an_add_on_kind_and_the_start_credentials(monkeypatch):
     start = _start_credentials(monkeypatch)
     assert start == ["TEMPORAL_API_KEY", "TEMPORAL_TLS_KEY"], start
 
-    rows = [line for line in REFERENCE.read_text().splitlines() if line.startswith(ROW)]
-    assert len(rows) == 1, f"{REFERENCE.name} holds {len(rows)} rows for {STORE_VAR}"
-    row = rows[0]
+    row = _row()
 
     assert "the kind an installed add-on registers" in row, row
     assert "`credential_store.<kind>`" in row and "`beeverforge.adapters`" in row, (
