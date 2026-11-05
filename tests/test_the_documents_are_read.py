@@ -1276,13 +1276,18 @@ def test_a_reader_who_may_not_see_internal_documents_is_never_listed_one(lark, t
     (tree / "client" / "terms.md").write_text("# Terms\n")
     (tree / "internal").mkdir(exist_ok=True)
     (tree / "internal" / "plano.md").write_text("# O plano\n")
+    # and one this reader may not see that could not be read: `overview` files the unreadable
+    # ones by audience too (`listed[may_read(label, CLIENT)]`), and hands this reader a count
+    (tree / "internal" / "old.odt").write_bytes(b"PK\x03\x04 a word processor's zip")
     ingest(lark, root=tree, reader=bed.StubReader())
     seen = overview(bed.KEY)
     assert "client/terms.md" in [d["path"] for d in seen["documents"]]
     assert {d["audience"] for d in seen["documents"]} == {"client"}
     assert "documents_internal" not in seen
+    assert seen["internal_withheld"] == 1
     said = json.dumps(seen, ensure_ascii=False)
     assert "internal/plano.md" not in said
+    assert "internal/old.odt" not in said
     assert "O plano" not in said
     floor = overview(bed.KEY, internal=True)  # it was read: a floor reader is listed it
     assert "internal/plano.md" in [d["path"] for d in floor["documents_internal"]]
