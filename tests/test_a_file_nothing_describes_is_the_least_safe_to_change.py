@@ -490,7 +490,8 @@ def test_the_station_judges_the_final_diff_before_the_push():
     run = src[src.index("    def run("):src.index("    def repair_ci(")]
     gate = run.index("self._knowledge_gate(ticket, ws, base, result)")
     assert run.rindex("self._review(", 0, gate) > 0, "the gate runs before the re-review"
-    assert run.index("self.sandbox.publish_branch(", gate) > gate, "judged after the push"
+    # every push of the job's branch goes through `_publish` (#11)
+    assert run.index("self._publish(", gate) > gate, "judged after the push"
 
 
 # --- the CLI ---------------------------------------------------------------------------------

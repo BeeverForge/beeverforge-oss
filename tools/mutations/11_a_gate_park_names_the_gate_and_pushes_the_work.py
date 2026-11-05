@@ -24,8 +24,11 @@ AND SIX MORE, FROM THE REVIEW OF THE FIRST CUT:
      the worktree box, with "push it by hand before resuming" and a handle that makes that Resume
      start from the forge's copy; "discarded" where nothing survives.
   7. **Each step that fails is named as itself**: a commit that fails is not a push that failed.
-  8. **A push replaces only the tip the workspace saw** (`--force-with-lease`, both boxes), and a
-     refused push holds the job, naming the branch; a run's own second push still lands.
+  8. **A push replaces only the tip the workspace saw** (`--force-with-lease`, both boxes); a run's
+     own second push still lands. A refused lease first keeps the forge's tip on
+     `<branch>-kept-<sha>` (never forced), says so on the card and in the journal, and pushes again
+     leased on that tip, at every push of the job's branch (`_publish`); only when the keep fails
+     or the branch moves again does the job hold, naming the branch.
   9. **What a gate printed notifies nobody**: indented, and with `#12` written `card 12`.
  10. **Resume continues from the forge's branch**, a person's fix on it included.
 
@@ -184,8 +187,8 @@ MUTATIONS = [
     # ── claim 7: each step is named as itself ─────────────────────────────────────────────────
     ("THE FINDING: any failure is recorded as a failed push",
      MACHINE,
-     '        self._preserve_outcome = "not-committed"\n',
-     '        self._preserve_outcome = "push-failed"\n'),
+     '        self._preserve_outcome, self._preserve_refusal = "not-committed", ""\n',
+     '        self._preserve_outcome, self._preserve_refusal = "push-failed", ""\n'),
 
     # ── claim 8: the lease ────────────────────────────────────────────────────────────────────
     ("THE FINDING: the push is a plain `--force` again, on both boxes",
@@ -240,13 +243,6 @@ MUTATIONS = [
      "        if workspace.lease is not None:\n"
      "            workspace.lease = _tip(workspace.path"),
 
-    ("THE FINDING: the refused pull-request push is not held, and the run goes on to open it",
-     MACHINE,
-     "                return self._hold(ticket, owner, _lease_refused_said(branch), "
-     "JobState.ON_HOLD,\n"
-     "                                  branch=branch, resume_handle=_FROM_THE_FORGE)",
-     "                pass"),
-
     ("the refused pull-request push holds with no handle, so its Resume starts from the base again",
      MACHINE,
      "                                  branch=branch, resume_handle=_FROM_THE_FORGE)",
@@ -254,8 +250,74 @@ MUTATIONS = [
 
     ("a gate park whose push was refused says the push failed",
      MACHINE,
-     '            self._preserve_outcome = "lease-refused"\n',
+     '                self._preserve_outcome, self._preserve_refusal = "lease-refused", refused\n',
+     '                self._preserve_outcome = "push-failed"\n'),
+
+    # ── claim 8b: a refused lease keeps the forge's commits, then pushes (the maintainer's call) ──
+    ("THE DECISION: the keep is skipped, so the second push is refused and the job parks",
+     MACHINE,
+     "            kept = keep(workspace=ws, remote_url=remote)\n",
+     "            kept = \"\"\n"),
+
+    ("the kept branch is pushed with force, so a branch already at its name is replaced",
+     WORKTREE,
+     '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--", target,\n',
+     '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--force", "--", target,\n'),
+
+    ("the card is not told where the forge's commits went",
+     MACHINE,
+     "        self._say_on_ticket(ticket.id, said)\n",
      ""),
+
+    ("the journal is not told where the forge's commits went",
+     MACHINE,
+     "        self._emit(ticket, \"note\", said, kept=kept)\n",
+     ""),
+
+    ("the lease does not move to the kept tip, so the push after the keep is refused",
+     WORKTREE,
+     "    workspace.lease = tip\n    return kept\n",
+     "    return kept\n"),
+
+    ("a keep that failed lets the run go on as if it had pushed",
+     MACHINE,
+     "            return _lease_refused_said(branch, keeping_failed=True)",
+     "            return None"),
+
+    ("a push refused again after the keep lets the run go on as if it had pushed",
+     MACHINE,
+     "            return _lease_refused_said(branch, kept=kept)",
+     "            return None"),
+
+    ("the pull request's push goes around `_publish`",
+     MACHINE,
+     "            if (refused := self._publish(ticket, ws, branch)) is not None:\n"
+     "                return self._hold(ticket, owner, refused, JobState.ON_HOLD,\n"
+     "                                  branch=branch, resume_handle=_FROM_THE_FORGE)",
+     "            if (refused := self.sandbox.publish_branch(workspace=ws)) is not None:\n"
+     "                return self._hold(ticket, owner, refused, JobState.ON_HOLD,\n"
+     "                                  branch=branch, resume_handle=_FROM_THE_FORGE)"),
+
+    ("the CI repair's push goes around `_publish`",
+     MACHINE,
+     "            if (refused := self._publish(ticket, ws, branch)) is not None:\n"
+     "                return as_left(",
+     "            if (refused := self.sandbox.publish_branch(workspace=ws)) is not None:\n"
+     "                return as_left("),
+
+    ("the auto-merge's push after a rebase goes around `_publish`",
+     MACHINE,
+     "            if (refused := self._publish(ticket, ws, branch)) is not None:\n"
+     "                return self._hold(ticket, owner, refused, JobState.ON_HOLD,\n"
+     "                                  branch=branch, pr_url=pr)",
+     "            if (refused := self.sandbox.publish_branch(workspace=ws)) is not None:\n"
+     "                return self._hold(ticket, owner, refused, JobState.ON_HOLD,\n"
+     "                                  branch=branch, pr_url=pr)"),
+
+    ("the gate park's preserve goes around `_publish`",
+     MACHINE,
+     "            refused = self._publish(ticket, ws, ws.branch)\n",
+     "            refused = self.sandbox.publish_branch(workspace=ws)\n"),
 
     # ── claim 9: nobody is notified ───────────────────────────────────────────────────────────
     ("THE FINDING: the indent goes, so an `@someone` the gate printed notifies them",

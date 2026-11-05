@@ -893,6 +893,23 @@ class ContainerSandbox(SandboxAdapter):
         if workspace.lease is not None:
             workspace.lease = _tip(self._host_clone, f"refs/heads/{workspace.branch}")
 
+    def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
+        """The remote's tip of the branch, kept on a branch of its own before a push replaces it
+        (`worktree.keep_the_remote_tip`, #11) — from the host clone, as the push is."""
+        assert self._host_clone and self._repo_path, "prepare() must be called first"
+        from beeverforge.adapters.sandbox.worktree import keep_the_remote_tip
+
+        return keep_the_remote_tip(self._host_clone, workspace, self._push_target(remote_url))
+
+    def _push_target(self, remote_url: str | None) -> str:
+        """Where this box pushes: the forge's authenticated URL, else the repository's origin."""
+        if remote_url:
+            return remote_url
+        rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
+        if rc != 0:
+            raise RuntimeError(f"could not resolve origin remote: {url}")
+        return url.strip()
+
     def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
         """Nothing (#11): the commits live in the host clone `prepare` made for this job, and
         `cleanup` deletes it with the container, so a branch that was never pushed is gone."""

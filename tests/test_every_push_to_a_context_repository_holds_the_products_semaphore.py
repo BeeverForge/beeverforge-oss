@@ -262,6 +262,9 @@ BIRTHS = {
         "created, before any role runs",
     ("beeverforge/onboarding/onboard.py", "onboard_product_context"):
         "onboarding's first commit to a born-empty context repository (no base to propose to)",
+    ("beeverforge/adapters/sandbox/worktree.py", "keep_the_remote_tip"):
+        "a job branch's tip copied to `<branch>-kept-<sha>`, a branch it creates and never forces "
+        "(#11): a ref already there with other content refuses the push",
 }
 
 

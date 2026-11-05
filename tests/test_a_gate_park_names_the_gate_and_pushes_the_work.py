@@ -29,6 +29,7 @@ from beeverforge.contracts import (
     AgentRunResult,
     JobState,
     Manifest,
+    RunResult,
     Ticket,
     ValidationResult,
 )
@@ -381,33 +382,184 @@ def _origin_tip(tmp_path, branch: str) -> str:
     return _git(tmp_path / "origin.git", "rev-parse", f"refs/heads/{branch}")
 
 
-def test_a_fresh_run_holds_rather_than_push_over_a_commit_it_did_not_make(repo, tmp_path):
-    """A later run of the card without the handle starts from the base; its pull-request push
-    used to replace whatever a park had left on the branch, and the person's fix with it."""
+def _kept(tmp_path, branch: str, tip: str) -> str:
+    """The commit the kept branch for `tip` holds on the origin, or "" when there is none."""
+    p = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "rev-parse", "--verify", "-q",
+                        f"refs/heads/{branch}-kept-{tip[:12]}"], capture_output=True, text=True)
+    return p.stdout.strip()
+
+
+def _holds_the_runs_work(tmp_path, branch: str) -> bool:
+    """Whether the origin's `branch` carries the agent's `feature.py`."""
+    p = subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "cat-file", "-e",
+                        f"refs/heads/{branch}:feature.py"], capture_output=True)
+    return p.returncode == 0
+
+
+def _names_the_kept_branch(surfaces, branch: str, tip: str) -> bool:
+    return any(f"`{branch}-kept-{tip[:12]}`" in s for s in surfaces)
+
+
+def test_a_fresh_run_keeps_a_commit_it_did_not_make_and_pushes_its_own(repo, tmp_path):
+    """A later run of the card without the handle starts from the base. Its pull-request push used
+    to replace whatever a park had left on the branch, and the person's fix with it; now the
+    forge's tip is kept on a branch of its own first, the card says where, and the run lands."""
     theirs = _a_person_pushes(tmp_path, "beeverforge/1114", "person")
     forge = spine.FakeForge()
+    events = InMemoryEventSink()
     tracker = _tracker("1114")
     runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
-                           forge=forge)
+                           forge=forge, events=events)
     result = runner.run("#1114")
 
-    assert _origin_tip(tmp_path, "beeverforge/1114") == theirs, "the person's commit was replaced"
-    assert result.state is JobState.ON_HOLD, result.note
-    assert forge.opened is None, "a pull request was opened from a push that was refused"
-    note = result.note or ""
-    assert "`beeverforge/1114` on the forge has commits this run did not start from" in note, note
-    assert "Resume continues from the forge's `beeverforge/1114`" in note, note
-    assert result.resume_handle, "the Resume the note offers would start from the base again"
+    assert result.state is not JobState.ON_HOLD, result.note
+    assert forge.opened is not None, "the run did not reach its pull request"
+    assert _kept(tmp_path, "beeverforge/1114", theirs) == theirs, "the person's commit is lost"
+    assert _holds_the_runs_work(tmp_path, "beeverforge/1114"), "the run's own work did not land"
+    assert _names_the_kept_branch(tracker.comments, "beeverforge/1114", theirs), tracker.comments
+    assert _names_the_kept_branch([e.message for e in events.events], "beeverforge/1114", theirs)
 
 
-def test_a_gate_park_holds_rather_than_push_over_a_commit_it_did_not_make(repo, tmp_path):
+def test_a_gate_park_keeps_a_commit_it_did_not_make_and_pushes_its_own(repo, tmp_path):
     theirs = _a_person_pushes(tmp_path, "beeverforge/1115", "person")
-    result, _ = _run(repo, tmp_path, "1115", {"test": _TEST_GATE})
+    result, tracker = _run(repo, tmp_path, "1115", {"test": _TEST_GATE})
 
-    assert _origin_tip(tmp_path, "beeverforge/1115") == theirs, "the person's commit was replaced"
+    assert _kept(tmp_path, "beeverforge/1115", theirs) == theirs, "the person's commit is lost"
+    assert _holds_the_runs_work(tmp_path, "beeverforge/1115")
+    assert "The work is on branch `beeverforge/1115`" in (result.note or ""), result.note
+    assert _names_the_kept_branch(tracker.comments, "beeverforge/1115", theirs), tracker.comments
+
+
+class _ARaceAfterTheKeep(WorktreeSandbox):
+    """The real sandbox, with a person pushing again right after the box kept the forge's tip."""
+
+    def __init__(self, *args, again, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.again = again
+
+    def keep_remote_tip(self, *, workspace, remote_url=None) -> str:
+        kept = super().keep_remote_tip(workspace=workspace, remote_url=remote_url)
+        self.again()
+        return kept
+
+
+def test_a_commit_landing_between_the_keep_and_the_push_is_refused_and_the_job_holds(
+        repo, tmp_path):
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1119", "person")
+    later: list[str] = []
+
+    def again() -> None:
+        later.append(_a_person_pushes(tmp_path, "beeverforge/1119", "again",
+                                      start="origin/beeverforge/1119"))
+
+    forge = spine.FakeForge()
+    runner = spine._runner(repo, _tracker("1119"), Manifest(validate={"test": "true"}), tmp_path,
+                           forge=forge, sandbox=_ARaceAfterTheKeep(root=tmp_path / "wt",
+                                                                   again=again))
+    result = runner.run("#1119")
+
+    assert later, "the race never ran"
+    assert _origin_tip(tmp_path, "beeverforge/1119") == later[0], "the later commit was replaced"
+    assert _kept(tmp_path, "beeverforge/1119", theirs) == theirs
+    assert result.state is JobState.ON_HOLD, result.note
+    assert forge.opened is None
     note = result.note or ""
-    assert "Nothing was pushed: `beeverforge/1115` on the forge has commits" in note, note
+    assert f"kept them on `beeverforge/1119-kept-{theirs[:12]}`" in note, note
+    assert "moved again" in note, note
     assert result.resume_handle
+
+
+def test_a_kept_name_already_holding_something_else_is_never_replaced(repo, tmp_path):
+    """The keep is never forced: a branch already at its name holding another commit stays as it
+    is, nothing is replaced, and the job holds naming the branch."""
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1120", "person")
+    planted = _a_person_pushes(tmp_path, f"beeverforge/1120-kept-{theirs[:12]}", "planted")
+    forge = spine.FakeForge()
+    runner = spine._runner(repo, _tracker("1120"), Manifest(validate={"test": "true"}), tmp_path,
+                           forge=forge)
+    result = runner.run("#1120")
+
+    assert _kept(tmp_path, "beeverforge/1120", theirs) == planted, "the kept name was forced"
+    assert _origin_tip(tmp_path, "beeverforge/1120") == theirs, "the person's commit was replaced"
+    assert result.state is JobState.ON_HOLD and forge.opened is None, result.note
+    assert "keeping a copy of them first failed" in (result.note or ""), result.note
+
+
+def test_a_gate_park_that_cannot_keep_the_forges_commits_says_nothing_was_pushed(
+        repo, tmp_path):
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1123", "person")
+    planted = _a_person_pushes(tmp_path, f"beeverforge/1123-kept-{theirs[:12]}", "planted")
+    result, _ = _run(repo, tmp_path, "1123", {"test": _TEST_GATE})
+
+    assert _origin_tip(tmp_path, "beeverforge/1123") == theirs, "the person's commit was replaced"
+    assert _kept(tmp_path, "beeverforge/1123", theirs) == planted
+    note = result.note or ""
+    assert "Nothing was pushed: `beeverforge/1123` on the forge has commits" in note, note
+    assert "keeping a copy of them first failed" in note, note
+    assert result.resume_handle
+
+
+class _APersonPushesDuringTheRepair:
+    """A CI-repair agent that fixes the check while a person pushes to the same branch."""
+
+    def __init__(self, push) -> None:
+        self.push, self.pushed = push, []
+
+    def execute(self, *, sandbox, workspace, context) -> AgentRunResult:
+        (workspace.path / "feature.py").write_text("VALUE = 42\n")
+        return AgentRunResult(ok=True, cost_usd=0.01)
+
+    def repair(self, *, sandbox, workspace, context, failure_log) -> AgentRunResult:
+        self.pushed.append(self.push())
+        (workspace.path / "repaired.txt").write_text("repaired\n")
+        return AgentRunResult(ok=True, cost_usd=0.01, summary="repaired the check")
+
+
+def test_a_ci_repair_keeps_a_commit_pushed_during_its_pass(repo, tmp_path):
+    branch = "beeverforge/1121"
+    agent = _APersonPushesDuringTheRepair(
+        lambda: _a_person_pushes(tmp_path, branch, "person", start=f"origin/{branch}"))
+    forge, tracker = spine.FakeForge(), _tracker("1121")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
+                           forge=forge, agent=agent)
+    first = runner.run("#1121")
+    assert forge.opened is not None, first.note
+
+    runner.repair_ci("#1121", "CI failed: test_x broke", pr_url="https://forge/pr/1")
+
+    theirs = agent.pushed[0]
+    assert _kept(tmp_path, branch, theirs) == theirs, "the person's commit is lost"
+    tip = _origin_tip(tmp_path, branch)
+    assert subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "cat-file", "-e",
+                           f"{tip}:repaired.txt"]).returncode == 0, "the repair did not land"
+    assert _names_the_kept_branch(tracker.comments, branch, theirs), tracker.comments
+
+
+def test_the_auto_merge_rebase_push_keeps_a_commit_pushed_after_the_pull_request(
+        repo, tmp_path):
+    """The push after a rebase leases on the tip the pull request's push left; a person's commit
+    since then is kept before the rebased branch replaces it, and the merge goes on."""
+    branch = "beeverforge/1122"
+    forge, tracker = spine.FakeForge(), _tracker("1122")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
+                           forge=forge)
+    ws = runner.sandbox.prepare(repo_path=repo, base_branch="main", branch=branch)
+    (ws.path / "feature.py").write_text("VALUE = 42\n")
+    _git(ws.path, "add", "-A")
+    _git(ws.path, "-c", "user.email=bot@example.invalid", "-c", "user.name=bot", "commit", "-qm",
+         "the run's own")
+    runner.sandbox.publish_branch(workspace=ws)
+    theirs = _a_person_pushes(tmp_path, branch, "person", start=f"origin/{branch}")
+    _a_person_pushes(tmp_path, "main", "moved-main")  # the base moves, so the branch is rebased
+    result = RunResult(ticket_id="#1122", state=JobState.VALIDATING, branch=branch)
+    held = runner._auto_merge(_ticket("1122"), ws, "https://forge/pr/1", "main", branch, result,
+                              None)
+
+    assert held is None, held and held.note
+    assert forge.merge_calls == 1
+    assert _kept(tmp_path, branch, theirs) == theirs, "the person's commit is lost"
+    assert _holds_the_runs_work(tmp_path, branch)
+    assert _names_the_kept_branch(tracker.comments, branch, theirs), tracker.comments
 
 
 # ── 9. Resume continues the parked work, with a person's fix on top ─────────────────────────────

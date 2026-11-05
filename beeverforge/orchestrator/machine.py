@@ -317,16 +317,33 @@ def _failing_gates_said(validations: list[ValidationResult],
 _FROM_THE_FORGE = "worktree-only"
 
 
-def _lease_refused_said(branch: str) -> str:
-    """Why a push was refused rather than made (#11, `Workspace.lease`), and the two ways on."""
+def _kept_said(branch: str, kept: str) -> str:
+    """What a push that kept the forge's commits first says on the card and in the journal (#11):
+    the branch they are on now, so a person can get them back."""
+    return (f"`{branch}` on the forge had commits this run did not start from — a person's fix, "
+            f"or the work an earlier attempt left there — so they were kept on the branch "
+            f"`{kept}` before this run's work replaced them on `{branch}`.")
+
+
+def _lease_refused_said(branch: str, *, kept: str = "", keeping_failed: bool = False) -> str:
+    """Why a push was refused rather than made (#11, `Workspace.lease`), and the two ways on:
+    the forge's commits could not be kept first, or the branch moved again after they were."""
+    if kept:
+        why = (f"this run kept them on `{kept}`, and the branch moved again before its push "
+               f"landed, so the push was refused rather than replace what arrived")
+    elif keeping_failed:
+        why = ("keeping a copy of them first failed (the journal has git's words), so this "
+               "run's push was refused rather than replace them")
+    else:
+        why = "so this run's push was refused rather than replace them"
     return (f"`{branch}` on the forge has commits this run did not start from — a person's fix, "
-            f"or the work an earlier park left there — so this run's push was refused rather "
-            f"than replace them. Resume continues from the forge's `{branch}`, dropping this "
-            f"run's own commits; if nothing on it is wanted, delete `{branch}` on the forge "
-            f"first, and Resume starts fresh from the base.")
+            f"or the work an earlier park left there — {why}. Resume continues from the "
+            f"forge's `{branch}`, dropping this run's own commits; if nothing on it is wanted, "
+            f"delete `{branch}` on the forge first, and Resume starts fresh from the base.")
 
 
-def _where_the_work_is(branch: str, outcome: str, kept: Path | None = None) -> str:
+def _where_the_work_is(branch: str, outcome: str, kept: Path | None = None,
+                       refusal: str = "") -> str:
     """The park note's last sentence: where the agent's work is, and what Resume then does.
 
     `kept` is the repository that still holds the branch once the workspace is gone, as the box
@@ -343,7 +360,7 @@ def _where_the_work_is(branch: str, outcome: str, kept: Path | None = None) -> s
                 "fresh from the base. The box did not run `git commit`: check that it runs "
                 "commands (`beeverforge box prove`) before resuming.")
     if outcome == "lease-refused":
-        return "Nothing was pushed: " + _lease_refused_said(branch)
+        return "Nothing was pushed: " + (refusal or _lease_refused_said(branch))
     if kept is not None:
         return (f"Nothing was pushed: the push of `{branch}` to the forge failed (the journal has "
                 f"git's words). The work is committed on the local branch `{branch}` in the "
@@ -1987,7 +2004,8 @@ class JobRunner:
                 result.resume_handle = self._preserve_for_hold(
                     ticket, ws, rep.resume_handle if attempts else agent_result.resume_handle)
                 reason += "\n\n" + _where_the_work_is(branch, self._preserve_outcome,
-                                                       self._kept_after_cleanup(ws))
+                                                       self._kept_after_cleanup(ws),
+                                                       self._preserve_refusal)
                 result.state, result.note = JobState.ON_HOLD, reason
                 mention = f"@{owner} " if owner else ""
                 self._say_on_ticket(ticket.id, f"{mention}On hold — {reason}")
@@ -2196,13 +2214,11 @@ class JobRunner:
             # carries, and before the push, because its stance goes into the body.
             self._knowledge_gate(ticket, ws, base, result)
             # push the branch to the forge (as the bot, host credentials) before the PR
-            try:
-                self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
-            except PushRefused:
-                # SOMEBODY ELSE'S COMMITS ARE ON THE BRANCH (#11): a person's fix after a park,
-                # or the work a park preserved, and this run started from the base. Held, so they
-                # are not replaced; Resume starts from them.
-                return self._hold(ticket, owner, _lease_refused_said(branch), JobState.ON_HOLD,
+            # SOMEBODY ELSE'S COMMITS MAY BE ON THE BRANCH (#11): a person's fix after a park, the
+            # work a park preserved, a re-run's leftover. `_publish` keeps them on a branch of
+            # their own before replacing them, and holds only when it cannot.
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return self._hold(ticket, owner, refused, JobState.ON_HOLD,
                                   branch=branch, resume_handle=_FROM_THE_FORGE)
             card = card_reference_for(self, ticket)
             # CHARGED BEFORE THE BODY IS WRITTEN (#310). Every pass of this walk has run by now —
@@ -2528,12 +2544,10 @@ class JobRunner:
                     # way a pass reaches the forge. Its `Cost:` line still catches up.
                     self._republish_review(pr_url)
                     return held.model_copy(update={"code_changed": False})
-            try:
-                self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
-            except PushRefused:
-                # THE BRANCH MOVED UNDER THIS PASS (#11): it started from the tip it fetched, and
-                # somebody pushed since. Their commits stay; the pass is held, naming the branch.
-                return as_left(self._hold(ticket, owner, _lease_refused_said(branch),
+            # THE BRANCH MAY HAVE MOVED UNDER THIS PASS (#11): it started from the tip it
+            # fetched. What somebody pushed since is kept, or the pass holds, naming the branch.
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return as_left(self._hold(ticket, owner, refused,
                                           JobState.ON_HOLD, branch=branch, pr_url=pr_url))
             # Gate-suppression guard (engineering.md #12) on the CI-repair path too: if the fix
             # SILENCED a gate (a noqa / pragma-no-cover / type-ignore / nosec suppression), a
@@ -3292,7 +3306,7 @@ class JobRunner:
         from the forge's copy, where without one it would start from the base and the branch they
         pushed would refuse the next push (`Workspace.lease`). Where nothing survives (the
         container box) there is nothing to continue, and no handle."""
-        self._preserve_outcome = "not-committed"
+        self._preserve_outcome, self._preserve_refusal = "not-committed", ""
         try:
             self._commit(ws, ticket)  # no-ops on an empty tree
             try:
@@ -3310,17 +3324,16 @@ class JobRunner:
                 self._preserve_outcome = "nothing-written"
                 return None  # nothing was written → plain hold, fresh restart on resume
             self._preserve_outcome = "push-failed"
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            # a sentence or None, read by truth: `is not None` above is the diff's alone (#251)
+            refused = self._publish(ticket, ws, ws.branch)
+            if refused:
+                self._preserve_outcome, self._preserve_refusal = "lease-refused", refused
+                return _FROM_THE_FORGE
             self._preserve_outcome = "pushed"
             self._emit(ticket, "note", "partial work pushed — Resume will continue it")
             # No session known → a non-empty sentinel: it still signals "restore the branch"
             # (bool-truthy) while decoding to nothing in any adapter (cold session, warm code).
             return resume_handle or _FROM_THE_FORGE
-        except PushRefused as exc:
-            self._preserve_outcome = "lease-refused"
-            self._emit(ticket, "warning", f"couldn't preserve partial work "
-                       f"({_withheld(str(exc), self._in_the_gates_reach())[:120]})")
-            return _FROM_THE_FORGE
         except Exception as exc:  # noqa: BLE001 — preserving is opportunistic; never fail the hold
             # git's words can carry the push URL's userinfo: withheld before the cut (#11)
             self._emit(ticket, "warning", f"couldn't preserve partial work "
@@ -3328,6 +3341,43 @@ class JobRunner:
             if self._preserve_outcome == "push-failed" and self._kept_after_cleanup(ws):
                 return resume_handle or _FROM_THE_FORGE
             return None
+
+    def _publish(self, ticket: Ticket, ws: Workspace, branch: str) -> str | None:
+        """Push the job's branch, keeping whatever the push would replace that this run did not
+        start from (#11). None when it landed; otherwise the sentence the caller holds on.
+
+        THE ONE DOOR EVERY PUSH OF THE JOB'S BRANCH GOES THROUGH — the pull request's, a CI
+        repair's, the auto-merge's after a rebase, and a park's preserve — so they cannot come to
+        treat a refused lease differently. A refused lease (`PushRefused`) is somebody else's
+        commits on the branch. Parking on it stopped every unattended way back into a card with a
+        leftover branch: a self-heal resume, a card moved back to the queue. So the forge's tip is
+        first copied to a branch of its own (`keep_remote_tip`), the journal and the card say where,
+        and the push is made again with its lease on that tip — a commit landing in between is
+        still refused. Only when the copy fails, or that second push is refused too, does the job
+        hold, naming the branch. Any other failure of the push is raised, as it always was."""
+        remote = self.forge.push_remote()
+        try:
+            self.sandbox.publish_branch(workspace=ws, remote_url=remote)
+            return None
+        except PushRefused:
+            pass
+        keep = getattr(self.sandbox, "keep_remote_tip", None)
+        if not callable(keep):
+            return _lease_refused_said(branch)
+        try:
+            kept = keep(workspace=ws, remote_url=remote)
+        except Exception as exc:  # noqa: BLE001 — nothing kept is nothing replaced: the job holds
+            self._emit(ticket, "warning", f"could not keep what is on `{branch}` before pushing "
+                       f"over it ({_withheld(str(exc), self._in_the_gates_reach())[:200]})")
+            return _lease_refused_said(branch, keeping_failed=True)
+        said = _kept_said(branch, kept)
+        self._emit(ticket, "note", said, kept=kept)
+        self._say_on_ticket(ticket.id, said)
+        try:
+            self.sandbox.publish_branch(workspace=ws, remote_url=remote)
+        except PushRefused:
+            return _lease_refused_said(branch, kept=kept)
+        return None
 
     def _kept_after_cleanup(self, ws: Workspace) -> Path | None:
         """The repository that still holds the job's branch once its workspace is gone, as the box
@@ -3488,12 +3538,10 @@ class JobRunner:
                     f"PR {pr} rebased onto {base} but validations then failed — needs a human",
                     JobState.ON_HOLD, branch=branch,
                 )
-            try:
-                self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
-            except PushRefused:
-                # the lease is the tip this run pushed for the pull request: only somebody else's
-                # push since then refuses it (#11)
-                return self._hold(ticket, owner, _lease_refused_said(branch), JobState.ON_HOLD,
+            # the lease is the tip this run pushed for the pull request: only somebody else's
+            # push since then refuses it, and `_publish` keeps that before replacing it (#11)
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return self._hold(ticket, owner, refused, JobState.ON_HOLD,
                                   branch=branch, pr_url=pr)
         try:
             self.forge.merge_pr(pr=pr)

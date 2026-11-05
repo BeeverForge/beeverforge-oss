@@ -59,9 +59,9 @@ class Workspace(BaseModel):
     # every push, and `""` on a fresh start, which says the branch must not be on the remote at
     # all. `publish_branch` pushes with `--force-with-lease=<branch>:<this>`, so a commit somebody
     # else put on the branch — a person's fix, or the work an earlier park preserved there — is
-    # refused (`PushRefused`) rather than replaced. None → nothing to lease: the remote is this
-    # repository and the branch is its own ref, or a box outside this tree made the workspace;
-    # the push is the plain `--force` it always was.
+    # refused (`PushRefused`), and kept before it is replaced (`keep_remote_tip`). None → nothing
+    # to lease: the remote is this repository and the branch is its own ref, or a box outside
+    # this tree made the workspace; the push is the plain `--force` it always was.
     lease: str | None = None
 
     @property
@@ -107,8 +107,9 @@ class PushRefused(RuntimeError):
     workspace last saw (`Workspace.lease`, #11): somebody else's commits are on it.
 
     IN THE PORT MODULE, like `BranchHeldElsewhere`, because the machine catches it whatever the
-    box is, and holds the job naming the branch. A `RuntimeError`, so a caller that does not catch
-    it reports it the way it reported any failed push before."""
+    box is: it keeps the commits on a branch of their own and pushes again (`JobRunner._publish`),
+    and holds the job, naming the branch, only when it cannot. A `RuntimeError`, so a caller that
+    does not catch it reports it the way it reported any failed push before."""
 
     def __init__(self, message: str, *, branch: str) -> None:
         super().__init__(message)

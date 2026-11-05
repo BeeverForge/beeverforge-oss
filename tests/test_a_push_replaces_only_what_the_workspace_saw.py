@@ -175,3 +175,34 @@ def test_the_container_box_resumes_from_the_fetched_tip_and_pushes_over_it(tmp_p
     box.publish_branch(workspace=ws, remote_url=str(remote))
 
     assert _tip(remote) == ours
+
+
+# ── keeping the remote's tip before replacing it ────────────────────────────────────────────────
+
+def test_the_worktree_box_keeps_the_remote_tip_then_pushes_over_it(tmp_path, remote):
+    theirs = _a_person_pushes(tmp_path, remote)
+    box, ws = _worktree(tmp_path, remote)
+    ours = _commit(ws.path, "the run's own")
+    with pytest.raises(PushRefused):
+        box.publish_branch(workspace=ws, remote_url=str(remote))
+
+    kept = box.keep_remote_tip(workspace=ws, remote_url=str(remote))
+    box.publish_branch(workspace=ws, remote_url=str(remote))
+
+    assert kept == f"{BRANCH}-kept-{theirs[:12]}"
+    assert _git(remote, "rev-parse", f"refs/heads/{kept}") == theirs
+    assert _tip(remote) == ours
+
+
+def test_the_container_box_keeps_the_remote_tip_then_pushes_over_it(tmp_path, remote):
+    theirs = _a_person_pushes(tmp_path, remote)
+    box, ws, clone = _container(tmp_path, remote)
+    ours = _commit(clone, "the run's own")
+    with pytest.raises(PushRefused):
+        box.publish_branch(workspace=ws, remote_url=str(remote))
+
+    kept = box.keep_remote_tip(workspace=ws, remote_url=str(remote))
+    box.publish_branch(workspace=ws, remote_url=str(remote))
+
+    assert _git(remote, "rev-parse", f"refs/heads/{kept}") == theirs
+    assert _tip(remote) == ours

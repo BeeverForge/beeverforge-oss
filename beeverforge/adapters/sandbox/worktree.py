@@ -726,6 +726,34 @@ def _force(workspace: Workspace) -> list[str]:
     return [f"--force-with-lease=refs/heads/{workspace.branch}:{workspace.lease}"]
 
 
+def keep_the_remote_tip(where: Path, workspace: Workspace, target: str) -> str:
+    """Copy the remote's tip of `workspace.branch` to a branch of its own on the remote, and lease
+    the next push on that tip (#11). Answers the kept branch's name.
+
+    WHAT A REFUSED LEASE DOES NEXT. The branch holds commits this workspace did not start from — a
+    person's fix, the work a park preserved, a re-run's leftover — and the run must still land its
+    own work there unattended (a self-heal resume, a card moved back). So the commits are copied
+    first, to `<branch>-kept-<12 hex>`, and only then replaced. NEVER FORCED: a ref already at that
+    name holding the same commit is "up to date"; one holding anything else refuses, and the caller
+    holds the job rather than replace it. The lease moves to the kept tip, so a commit landing
+    between this copy and the push is refused again. `where` is the checkout git runs in: the
+    worktree itself, or the container box's host clone."""
+    branch = workspace.branch
+    rc, out = _run(gitpin.argv(["-C", str(where), "fetch", "--", target, f"refs/heads/{branch}"]),
+                   timeout=180)
+    tip = _tip(where, "FETCH_HEAD") if rc == 0 else ""
+    if not tip:
+        raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
+                           f"{_redact(out).strip()[:300]}")
+    kept = f"{branch}-kept-{tip[:12]}"
+    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--", target,
+                                f"{tip}:refs/heads/{kept}"]))
+    if rc != 0:
+        raise RuntimeError(f"could not keep {branch!r} on {kept!r}: {_redact(out).strip()[:300]}")
+    workspace.lease = tip
+    return kept
+
+
 def _redact(text: str) -> str:
     """Strip any embedded credential from an authenticated URL before logging."""
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
@@ -1326,7 +1354,8 @@ class WorktreeSandbox(SandboxAdapter):
         # pass's second push, is not a fast-forward, so the push must be able to replace. What it
         # may replace is the lease — the tip `prepare` started from, then the tip it pushed itself
         # — so a commit a person put on the branch, or one an earlier park preserved there for a
-        # Resume, is refused by name (`PushRefused`) instead of replaced. A plain `--force` was
+        # Resume, is refused by name (`PushRefused`) instead of replaced; the machine then keeps
+        # it (`keep_remote_tip`) and pushes again (`JobRunner._publish`). A plain `--force` was
         # written for "this branch is only ever the bot's", and a park that pushes and names the
         # branch for a person to fix by hand made that false.
         target = remote_url or "origin"
@@ -1340,6 +1369,11 @@ class WorktreeSandbox(SandboxAdapter):
             raise RuntimeError(f"push failed: {_redact(out)}")
         if workspace.lease is not None:
             workspace.lease = _tip(workspace.path, f"refs/heads/{workspace.branch}")
+
+    def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
+        """The remote's tip of the branch, kept on a branch of its own before a push replaces it
+        (`keep_the_remote_tip`, #11). OPTIONAL BY DESIGN: a box without it holds on a refusal."""
+        return keep_the_remote_tip(workspace.path, workspace, remote_url or "origin")
 
     def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
         """The repository that still holds `workspace`'s branch once `cleanup` has run (#11): the
