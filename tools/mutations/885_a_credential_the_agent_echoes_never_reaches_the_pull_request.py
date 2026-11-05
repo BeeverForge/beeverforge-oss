@@ -23,8 +23,10 @@ Claims:
   - an `Authorization` value with NO scheme is withheld only when it is 16 token68 characters
     with a digit, and never `AWS4-HMAC-SHA256`, the SigV4 scheme word (#198);
   - the value under a secret-named name (`_SECRET_NAME`'s words plus a header's `API-KEY`) is
-    withheld after `=` or `:`, read to its natural end (its closing quote, or whitespace, `,`,
-    `;`, a quote, a backtick or an `&` before another `name=`), the floor of the header form's
+    withheld after `=` or `:`, read to its natural end (its closing quote, its `\\` escapes
+    read as part of it, or its closing backtick when a backtick opened it and a value starts right
+    after that backtick; else whitespace, `,`, `;`, a quote, a backtick or an `&` before another
+    `name=`, a `%` included), the floor of the header form's
     credential's mark on the whole value, and withheld whole — never through the header value's
     alphabet (review of PR #445) — never a value that starts with `$` or a URL scheme, the name and
     separator kept; SigV4's `Credential` and `X-Amz-Credential` are quoted as written (#198);
@@ -170,21 +172,44 @@ MUTATIONS = [
     ("a hyphenated Api-Key header is not secret-named", MODEL, "|API-KEY)", ")"),
     ("a secret-named value is quoted", MODEL,
      "    text = _SECRET_NAMED_VALUE.sub(_secret_named_value_withheld, text)\n", ""),
-    # re-pinned on the review of PR #445: the value is `_WHOLE_VALUE`, read to its natural end
+    # re-pinned on the review of PR #445: the value is `_WHOLE_VALUE`, read to its natural end;
+    # re-pinned again: the separator accepts a backtick as an opening quote
     ("a secret-named value needs no credential's mark", MODEL,
-     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
-     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)(?![$])(?![a-z][a-z0-9+.-]{0,31}://)" + _VALUE_CHAR\n'
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)(?![$])(?![a-z][a-z0-9+.-]{0,31}://)" + _VALUE_CHAR\n'
      '    + r"{8,}", re.IGNORECASE)\n', PROSE),
     # review of PR #445: a password is written with punctuation, and is read to its natural end
     ("a secret-named value is read through the header value's alphabet", MODEL,
-     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
-     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)" + _MARKED_VALUE, re.IGNORECASE)\n'),
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _MARKED_VALUE, re.IGNORECASE)\n'),
+    # re-pinned on the review of PR #445: each quoted branch reads its escapes
     ("a double-quoted value is read to its first space, not its closing quote", MODEL,
-     '    r"(?<=\\")(?=[^\\"\\n]{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\\"))[^\\"\\n]{8,}(?=\\")"\n',
+     '    r"(?<=\\")(?=" + _DOUBLE_QUOTED_CHAR + r"{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\\"))"\n'
+     '    + _DOUBLE_QUOTED_CHAR + r"{8,}(?=\\")"\n',
      '    r"(?<=\\")(?!)"\n'),
     ("a single-quoted value is read to its first space, not its closing quote", MODEL,
-     '    r"|(?<=\')(?=[^\'\\n]{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\'))[^\'\\n]{8,}(?=\')"\n',
+     '    r"|(?<=\')(?=" + _SINGLE_QUOTED_CHAR + r"{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\'))"\n'
+     '    + _SINGLE_QUOTED_CHAR + r"{8,}(?=\')"\n',
      '    r"|(?<=\')(?!)"\n'),
+    # review of PR #445: a quoted value reads its escapes, and a backtick opens a value
+    ("a double-quoted value does not read its escapes", MODEL,
+     '_DOUBLE_QUOTED_CHAR = r"(?:[^\\"\\\\\\n]|\\\\.)"\n',
+     '_DOUBLE_QUOTED_CHAR = r"[^\\"\\n]"\n'),
+    ("a single-quoted value does not read its escapes", MODEL,
+     '_SINGLE_QUOTED_CHAR = r"(?:[^\'\\\\\\n]|\\\\.)"\n',
+     '_SINGLE_QUOTED_CHAR = r"[^\'\\n]"\n'),
+    ("the mark is looked for without a double-quoted value's escapes", MODEL,
+     'r"(?<=\\")(?=" + _DOUBLE_QUOTED_CHAR + r"{0,64}?',
+     'r"(?<=\\")(?=[^\\"\\n]{0,64}?'),
+    ("a backtick opens no value", MODEL,
+     '    r"|(?<=`)(?=[^`\\s])(?=[^`\\n]{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}`))[^`\\n]{8,}(?=`)"\n', ""),
+    ("a backtick is no opening quote after the separator", MODEL,
+     '[ \\t]*[:=][ \\t]*[\\"\'`]?)', '[ \\t]*[:=][ \\t]*[\\"\']?)'),
+    ("a code span's closing backtick opens a value", MODEL, 'r"|(?<=`)(?=[^`\\s])(?=',
+     'r"|(?<=`)(?=', PROSE),
+    ("a percent sign ends an unquoted value", MODEL,
+     '_VALUE_CHAR = r"(?:[^\\s,;\\"\'`&]|&(?![\\w-]{1,64}=))"\n',
+     '_VALUE_CHAR = r"(?:[^\\s,;\\"\'`&%]|&(?![\\w-]{1,64}=))"\n'),
     ("a value that starts with $ is read", MODEL, 'r"(?![$])(?![a-z]', 'r"(?![a-z]', PROSE),
     ("a value that starts with a URL scheme is read", MODEL,
      '(?![a-z][a-z0-9+.-]{0,31}://)(?:"', '(?:"', PROSE),

@@ -87,6 +87,17 @@ LINK_PASSWORD = "q7" + "linkpw" * 3
 PUNCTUATED_PASSWORD = "Pa55word" + "!Secret#xyz"
 AMPERSAND_PASSWORD = "Tr0ub4dor" + "&3horse"
 QUOTED_PASSWORD = "hunter2" + "!Abcdef9"
+#: A quoted value with an escaped quote inside it, as JSON writes one (review of PR #445): at
+#: 04790d2 the quoted value ended at the `\"`, so the tail after it was shown — or, with fewer than
+#: 8 characters before it, nothing was withheld.
+ESCAPED_TAIL = "Abc123xyz" + '\\"' + "rest-of-it"
+ESCAPED_HEAD = "abc" + '\\"' + "Def123xyz"
+ESCAPED_SINGLE = "Abc123xyz" + "\\'" + "rest-of-it"
+#: A password in a Markdown code span (review of PR #445): at 04790d2 a backtick was no opening
+#: quote, so the value came back unchanged.
+SPANNED_PASSWORD = "Pa55word" + "!Spanned"
+#: A percent-encoded value, withheld whole: `%` is part of an unquoted value.
+PERCENT_ENCODED = "Abc123def" + "%2Fghi"
 #: A passphrase, read to its closing quote, spaces included.
 PASSPHRASE = "correct horse " + "battery 9staple"
 #: A key of this process, PEM-shaped: three lines, its body a line no shape would catch alone.
@@ -288,6 +299,38 @@ def test_a_secret_named_value_in_the_agents_message_is_withheld_and_the_body_say
         assert not part or part not in _shown(quote), f"part of the value was shown, {part!r}: {quote}"
 
 
+@pytest.mark.parametrize("said, kept, pieces", [
+    (f'{SENTINEL}: the client sends {{"password": "{ESCAPED_TAIL}"}}', '"password":',
+     ["Abc123xyz", "rest-of-it"]),
+    (f'{SENTINEL}: the client sends {{"client_secret": "{ESCAPED_HEAD}"}}', '"client_secret":',
+     ["abc", "Def123xyz"]),
+    (f"{SENTINEL}: the client sends {{'password': '{ESCAPED_SINGLE}'}}", "'password':",
+     ["Abc123xyz", "rest-of-it"]),
+    (f"{SENTINEL}: ran export DB_PASSWORD=`{SPANNED_PASSWORD}` first", "DB_PASSWORD=",
+     ["Pa55word", "Spanned"]),
+    (f"{SENTINEL}: ran export DB_PASSWORD=`{PASSPHRASE}` first", "DB_PASSWORD=",
+     ["correct horse", "9staple"]),
+    (f"{SENTINEL}: fetched it with token={PERCENT_ENCODED} today", "token=",
+     ["Abc123def", "2Fghi"]),
+], ids=["escaped-quote-tail", "escaped-quote-head", "escaped-single-quote", "code-span-password",
+        "code-span-passphrase", "percent-encoded"])
+def test_a_secret_named_value_is_withheld_whole_through_its_escapes_and_code_spans(
+        repo: Path, tmp_path: Path, said: str, kept: str, pieces: list[str]):
+    """Review of PR #445, measured at 04790d2: `"password": "Abc123xyz\\"rest-of-it"` was quoted as
+    `"password": "[credential withheld]"rest-of-it"`, the tail shown; `"abc\\"Def123xyz"` under a
+    secret name, and a password in a Markdown code span, came back unchanged. A quoted value reads
+    `\\` and the character after it as part of it, and a backtick opens a value read to the closing
+    backtick on its line. No piece of the value is shown, as written or as rendered."""
+    body = _opened(repo, tmp_path, _Says(said))
+    quote = _shown(_rendered("\n".join(_quoted_block(body))))
+    assert WITHHELD_CREDENTIAL in quote and SENTINEL in quote, quote
+    assert kept in quote, f"the name the value was under was not quoted: {quote}"
+    whole = html_lib.unescape(_rendered(body))
+    for piece in pieces:
+        assert piece not in quote and piece not in whole, (
+            f"part of the value was shown, {piece!r}: {quote}")
+
+
 def test_a_secret_named_name_is_read_from_where_a_name_starts_and_within_its_bound():
     """#198: the name around the secret word is read from where a name can start, at most 64
     characters on each side, so a long hyphenated line is read once, not from every character
@@ -441,6 +484,11 @@ NEAR_MISSES = [
     "the token: https://docs.example.test/auth2 explains it",
     "the login form (password: required).",
     'password: "required for login"',
+    # review of PR #445: a backtick opens a value only when a value starts after it, so a code span
+    # naming a variable, or a span's closing backtick after a name, stays prose
+    "set `API_KEY` in your env",
+    "the `password:` field takes 12 characters",
+    "set `TOKEN=` in step 2 of `setup`",
     # #198: the presigned URL's parameter named, and a value too short to be a signature
     "the SDK appends X-Amz-Signature= to the query string",
     "X-Amz-Signature=deadbeef is too short to be one",

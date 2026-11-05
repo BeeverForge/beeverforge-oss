@@ -426,25 +426,52 @@ _SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|PRIVATE|CREDENTIAL|KEY_C
 #: `password=` repeated with nothing between (every occurrence a name, no mark): 0.13 s for 200 KB,
 #: 0.26 s for 400 KB, 0.51 s for 800 KB (best of three; 0.04 / 0.08 / 0.15 s through the old
 #: alphabet); an unclosed quote before 400 KB, 0.05 s.
-#: THE COST, ACCEPTED: a secret-named value with no mark in its first 64 characters is quoted as
-#: written; a value with one is withheld even when it is no secret (an 8-digit count under
-#: `max_tokens:`, quoted prose with a digit in it such as `password: "at least 8 characters"`, a
-#: Windows path); an unquoted value is withheld up to its natural end, so text written against it
-#: with no space (`secret:Abc12345.Next`, `password=Secret12&next` with no `=` after the `&`'s
-#: word) is withheld with it, and so is a sentence's full stop or `)` after it; a name longer than
-#: the bound is not read; a value that starts with `$` or a URL scheme is not read; an unquoted
-#: value with a space in it is read to its first space only.
+#:
+#: A QUOTED VALUE READS ITS ESCAPES, and a BACKTICK OPENS A VALUE (review of PR #445). Measured at
+#: 04790d2: `"password": "Abc123xyz\"rest-of-it"` came back as `"password": "[credential
+#: withheld]"rest-of-it"`, the tail shown, and `"abc\"Def123xyz"` under a secret name — 3
+#: characters before the `\"` — and `export DB_PASSWORD=`Pa55word!Secret`` came back unchanged.
+#: Now a double- or single-quoted value reads `\` and the character after it as one character of
+#: the value, in its body and in the mark's 64-character look; a value after a backtick is read to
+#: the closing backtick on its line, spaces included (`DB_PASSWORD=`correct horse battery 9staple``
+#: was unchanged at 04790d2 too), with the same floor, and only when a value starts right after
+#: it (no whitespace): so a code span naming a variable (`set `API_KEY` in your env`) and a span's
+#: closing backtick after a name (`set `TOKEN=` in step 2 of `setup``) stay prose. Still linear:
+#: each step of a quoted value consumes one character or an escape pair, the two never start alike,
+#: and a later value's opening quote follows `=`, `:` or a blank, never a `\`, so it ends an earlier
+#: scan rather than being read inside it. Measured on this change with `.venv/bin/python`, best of
+#: three, `_SECRET_NAMED_VALUE.sub` (04790d2 → now): `password=` repeated 0.11 → 0.11 s at 200 KB,
+#: 0.21 → 0.21 s at 400 KB (still the worst case); `password="` unclosed, repeated, 0.014 → 0.022 s
+#: at 400 KB; `password=`` repeated 0.039 → 0.015 s; `password="\\` repeated 0.022 → 0.030 s;
+#: `password="\"` repeated 0.045 → 0.019 s; one name and a 400 KB unclosed value of `\\` runs
+#: 0.055 → 0.061 s, of text after a backtick 0.004 → 0.061 s; each doubled from 200 KB.
+#: THE COST, ACCEPTED: a quoted value ending in a backslash (`'C:\dir\'`) reads its closing quote as
+#: escaped, so it closes only at a later quote on its line or is read as an unquoted value; a
+#: backticked NAME (`` `API_KEY`: … ``) is not read, only a backticked value; a secret-named value
+#: with no mark in its first 64 characters is quoted as written; a value with one is withheld even
+#: when it is no secret (an 8-digit count under `max_tokens:`, quoted prose with a digit in it such
+#: as `password: "at least 8 characters"`, a Windows path); an unquoted value is withheld up to its
+#: natural end, so text written against it with no space (`secret:Abc12345.Next`,
+#: `password=Secret12&next` with no `=` after the `&`'s word) is withheld with it, and so is a
+#: sentence's full stop or `)` after it; a name longer than the bound is not read; a value that
+#: starts with `$` or a URL scheme is not read; an unquoted value with a space in it is read to its
+#: first space only.
 _VALUE_CHAR = r"(?:[^\s,;\"'`&]|&(?![\w-]{1,64}=))"
+_DOUBLE_QUOTED_CHAR = r"(?:[^\"\\\n]|\\.)"
+_SINGLE_QUOTED_CHAR = r"(?:[^'\\\n]|\\.)"
 _WHOLE_VALUE = (
     r"(?![$])(?![a-z][a-z0-9+.-]{0,31}://)(?:"
-    r"(?<=\")(?=[^\"\n]{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}\"))[^\"\n]{8,}(?=\")"
-    r"|(?<=')(?=[^'\n]{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}'))[^'\n]{8,}(?=')"
+    r"(?<=\")(?=" + _DOUBLE_QUOTED_CHAR + r"{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}\"))"
+    + _DOUBLE_QUOTED_CHAR + r"{8,}(?=\")"
+    r"|(?<=')(?=" + _SINGLE_QUOTED_CHAR + r"{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}'))"
+    + _SINGLE_QUOTED_CHAR + r"{8,}(?=')"
+    r"|(?<=`)(?=[^`\s])(?=[^`\n]{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}`))[^`\n]{8,}(?=`)"
     r"|(?=" + _VALUE_CHAR + r"{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}[.)]{0,2}(?!" + _VALUE_CHAR
     + r")))" + _VALUE_CHAR + r"{8,})"
 )
 _SECRET_NAMED_VALUE = re.compile(
     r"(?<![\w-])([\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\w-]{0,64})"
-    r"([\"']?[ \t]*[:=][ \t]*[\"']?)" + _WHOLE_VALUE, re.IGNORECASE)
+    r"([\"']?[ \t]*[:=][ \t]*[\"'`]?)" + _WHOLE_VALUE, re.IGNORECASE)
 WITHHELD_CREDENTIAL = "[credential withheld]"
 
 
