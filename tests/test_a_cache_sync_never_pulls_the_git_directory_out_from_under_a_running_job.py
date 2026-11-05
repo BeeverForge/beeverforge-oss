@@ -341,3 +341,28 @@ def test_a_held_sparse_sync_opens_no_freshness_window(tmp_path, origin):
     now[0] += 10                        # inside the window a held sync would have opened
     cache.sync("p", origin.url, "main")
     assert _head(served) == tip, "the held tree was served again from its freshness window"
+
+
+@pytest.mark.parametrize("cls", CACHES, ids=lambda c: c.__name__)
+def test_a_held_sync_decides_before_it_stages_a_snapshot(tmp_path, origin, monkeypatch, cls):
+    """`_needs_publish` decides the hold before `_publish` copies anything, for every cache class.
+    `_publish` asks for the marks once more just before its rename (#91), so a first decision
+    that ignored them would still keep the job's tree, but only after a whole snapshot was
+    hard-link-copied and thrown away on every sync while a job stands. This holds the first
+    decision to its docstring: a held sync stages nothing."""
+    cache = cls(root=tmp_path / "cache")
+    served = cache.sync("p", origin.url, "main")
+    assert served is not None, getattr(cache, "failure", "")
+    _job(tmp_path, served, origin)
+    origin.advance()
+    staged: list[str] = []
+    real_copy = shutil.copytree
+
+    def copy(src, dst, *a, **kw):
+        staged.append(str(dst))
+        return real_copy(src, dst, *a, **kw)
+
+    monkeypatch.setattr(repo_cache.shutil, "copytree", copy)
+    cache.sync("p", origin.url, "main")
+
+    assert staged == [], f"{cls.__name__} staged a snapshot over a held tree: {staged}"

@@ -60,15 +60,17 @@ MUTATIONS = [
      "            os.mkdir(wt)\n",
      "            os.makedirs(wt, exist_ok=True)\n"),
 
+    # RE-PINNED (#91): the add and the mark now run under the cache key's lock
     ("any other failure to make the path is passed over, and git is handed the path", BOX,
      "        except OSError as exc:\n"
      "            raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc\n"
-     "        mark = _write_mark(repo_path, wt)\n",
+     "        # UNDER THE CACHE KEY'S LOCK, the add and the mark (#91, `_cache_key_held`).\n",
      "        except OSError:\n"
      "            pass\n"
-     "        mark = _write_mark(repo_path, wt)\n"),
+     "        # UNDER THE CACHE KEY'S LOCK, the add and the mark (#91, `_cache_key_held`).\n"),
 
+    # RE-PINNED (#91): the add now runs under the cache key's lock, one indent deeper
     ("the empty directory the box made is left behind when the add fails", BOX,
-     "            if made:\n                _remove_if_empty(wt)\n",
+     "                if made:\n                    _remove_if_empty(wt)\n",
      ""),
 ]

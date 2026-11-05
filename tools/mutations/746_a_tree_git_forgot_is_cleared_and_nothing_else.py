@@ -164,15 +164,16 @@ MUTATIONS = [
      "            return None\n",
      INTERRUPTED),
 
+    # RE-PINNED (#91): the add now runs under the cache key's lock, one indent deeper
     ("the mark is unlinked in a `finally`, also when the add timed out", BOX,
-     "        mark = _write_mark(repo_path, wt)\n"
-     '        rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())\n'
-     "        _unlink_mark(mark)\n",
-     "        mark = _write_mark(repo_path, wt)\n"
-     "        try:\n"
+     "            mark = _write_mark(repo_path, wt)\n"
      '            rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())\n'
-     "        finally:\n"
      "            _unlink_mark(mark)\n",
+     "            mark = _write_mark(repo_path, wt)\n"
+     "            try:\n"
+     '                rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())\n'
+     "            finally:\n"
+     "                _unlink_mark(mark)\n",
      INTERRUPTED),
 
     ("the mark is not unlinked after the add returned", BOX,
