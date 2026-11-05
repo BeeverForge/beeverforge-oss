@@ -1278,7 +1278,40 @@ class JobRunner:
         if stop is not None and stop.confirm():
             log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
                         step, stop.why or "a person stopped the job")
+            # WHAT ALREADY LANDED IS SAID, ONCE, and then the job stops (review of #453): an open
+            # pull request or a merge the stop arrived too late to prevent is otherwise mentioned
+            # by nothing — the card the stop put in the backlog says the work stopped
+            landed = vars(self).pop("_landed_here", None)
+            if landed is not None:
+                self._say_what_landed(*landed)
             raise JobStopped(step, stop.why)
+
+    #: What may have landed on the forge before a stop reached the job: an opened pull request,
+    #: an armed auto-merge, a merge. The keys are the only sentences `_say_what_landed` says.
+    _WHAT_LANDED = {"opened": "job.stopped.landed.opened", "armed": "job.stopped.landed.armed",
+                    "merged": "job.stopped.landed.merged"}
+
+    def _landed(self, ticket: Ticket, kind: str, *, pr: str, base: str) -> None:
+        """An irreversible forge call returned (#44, review of #453): from here on a stop says what
+        it left behind (`_unless_stopped`), because nothing the stop does can take it back."""
+        assert kind in self._WHAT_LANDED, kind
+        vars(self)["_landed_here"] = (ticket, kind, pr, base)
+
+    def _say_what_landed(self, ticket: Ticket, kind: str, pr: str, base: str) -> None:
+        """THE ONE COMMENT A STOPPED JOB STILL WRITES, and the journal line beside it.
+
+        NOT `_say_on_ticket`, which refuses after a stop and must go on refusing: this takes no
+        text, only which of `_WHAT_LANDED`'s facts landed, so it cannot become a way to say
+        anything else after a stop. Best-effort, like every comment: a tracker that refuses loses
+        the comment, never the stop."""
+        body = self._say(self._WHAT_LANDED[kind], pr=pr, base=base)
+        self._emit(ticket, "note", f"stopped after the forge took it: {body}", url=pr, landed=kind)
+        try:
+            self.tracker.comment(ticket.id, body)
+        except Exception as exc:  # noqa: BLE001 — the stop stands; only the telling failed
+            log.error("BEEVERFORGE_TICKET_COMMENT_LOST ticket=%s (%s) — the tracker refused the "
+                      "comment saying what landed before the stop: %s", ticket.id,
+                      str(exc)[:160], body[:160])
 
     def _review(self, *, sandbox, workspace, review_input: ReviewInput) -> ReviewResult:
         """The reviewer's verdict with its evidence checked against the gates that ran (#447).
@@ -2123,6 +2156,7 @@ class JobRunner:
                 body=self._pr_body(ticket, result, card=card),
             )
             result.pr_url = pr
+            self._landed(ticket, "opened", pr=pr, base=base)
             self._emit(ticket, "pr", f"opened {pr}", url=pr)
 
             # the reviewer's verdict on the PR (D-5). ADR-0014: in advisory mode review_event()
@@ -2184,6 +2218,7 @@ class JobRunner:
             return self._charged(result)
         finally:
             self.sandbox.cleanup(workspace=ws)
+            vars(self).pop("_landed_here", None)  # this walk's fact, never the next one's
             # the fetched knowledge bundle is a temp checkout — one leaked per job
             # would fill the worker's finite disk.
             self._drop_published_bundle()
@@ -3346,7 +3381,9 @@ class JobRunner:
         # (required CI still pending). Only claim MERGED when it truly is; otherwise hand the
         # durable workflow the CI-watch/repair/merge loop (ADR-0004) — a red CI gets fixed,
         # not left armed forever.
-        if self.forge.pr_merged(pr=pr):
+        merged = self.forge.pr_merged(pr=pr)
+        self._landed(ticket, "merged" if merged else "armed", pr=pr, base=base)
+        if merged:
             self._emit(ticket, "pr", "auto-merge complete", url=pr)
             result.state = JobState.MERGED
             self._set_state(ticket, JobState.MERGED)

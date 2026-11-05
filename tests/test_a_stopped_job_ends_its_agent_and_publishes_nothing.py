@@ -251,8 +251,12 @@ class _Box(WorktreeSandbox):
         super().cleanup(workspace=workspace)
 
 
-def _fakes(hooks: _Hooks):
+def _fakes(hooks: _Hooks, *, arm_only: bool = False):
     class Forge(skeleton.FakeForge):
+        def merge_pr(self, **kw) -> None:
+            super().merge_pr(**kw)
+            hooks.fire("merge_pr")
+
         def open_pr(self, **kw) -> str:
             pr = super().open_pr(**kw)
             hooks.fire("open_pr")
@@ -278,7 +282,7 @@ def _fakes(hooks: _Hooks):
             hooks.fire("review")
             return verdict
 
-    return Forge(), Tracker(_ticket()), Reviewer()
+    return Forge(arm_only=arm_only), Tracker(_ticket()), Reviewer()
 
 
 _A_DECISION = ('```json\n{"question": "which way?", "options": ['
@@ -323,8 +327,11 @@ _STEPS = [
      lambda box, forge, tracker, runner: box.pushes == 0),
     ("publish_branch", "publish_branch", "ok", "auto",
      lambda box, forge, tracker, runner: forge.opened is None),
+    # THE PULL REQUEST IS OPEN, and the stop cannot take it back: the review is skipped, and the
+    # ticket is told what landed (review of #453)
     ("open_pr", "open_pr", "ok", "auto",
-     lambda box, forge, tracker, runner: forge.reviews == []),
+     lambda box, forge, tracker, runner: forge.reviews == [] and any(
+         "was opened before the stop reached this job" in c for c in tracker.comments)),
     ("review_pr_auto", "review_pr", "ok", "auto",
      lambda box, forge, tracker, runner: forge.merge_calls == 0),
     ("review_pr_human", "review_pr", "ok", "human",
@@ -796,3 +803,89 @@ def test_a_jobs_temporary_files_go_with_its_worktree(tmp_path):
     finally:
         if written is not None and written.exists():
             written.unlink()
+
+
+# ── 8. what landed on the forge before the stop reached the job ─────────────────────────────────
+
+@pytest.mark.parametrize("at,arm_only,kind,said", [
+    ("open_pr", False, "opened", "was opened before the stop reached this job"),
+    ("merge_pr", False, "merged", "was merged into"),
+    ("merge_pr", True, "armed", "Auto-merge was armed on the pull request"),
+], ids=["inside_open_pr", "inside_merge_pr", "inside_merge_pr_armed"])
+def test_what_landed_before_the_stop_is_said_and_nothing_after_it_runs(
+        origin_and_repo, tmp_path, at, arm_only, kind, said):
+    """A STOP THAT ARRIVES DURING AN IRREVERSIBLE FORGE CALL. The pull request opens, or the merge
+    lands, and nothing the stop does takes it back — while the card the stop put in the backlog says
+    the work stopped. So the job says on the ticket what landed and what a person does about it,
+    journals the same fact, and then stops: no review, no reviewers, no card move."""
+    from beeverforge.contracts import Manifest
+    from beeverforge.observability import InMemoryEventSink
+    from beeverforge.orchestrator import JobRunner
+
+    _, repo = origin_and_repo
+    stop = Stop()
+    hooks = _Hooks(stop, at)
+    forge, tracker, reviewer = _fakes(hooks, arm_only=arm_only)
+    box = _Box(root=tmp_path / "wt", hooks=hooks)
+    events = InMemoryEventSink()
+    runner = JobRunner(
+        tracker=tracker, forge=forge, agent=_Agent(hooks), sandbox=box,
+        manifest=Manifest(merge_policy="auto", validate={"test": "true", "security": "true"},
+                          recovery_max_attempts=0),
+        repo_path=repo, reviewer=reviewer, events=events)
+    runner.stop = stop
+    seen_states: list = []
+
+    real_fire = hooks.fire
+
+    def fire(event: str) -> None:
+        real_fire(event)
+        if event == at:
+            seen_states[:] = list(tracker.states)
+
+    hooks.fire = fire
+
+    with pytest.raises(JobStopped):
+        runner.run("#1")
+
+    assert stop.requested, f"the walk never reached {at!r}: the case proves nothing"
+    landed = [c for c in tracker.comments if "before the stop reached this job" in c]
+    assert len(landed) == 1 and said in landed[0] and "https://forge/pr/1" in landed[0], (
+        tracker.comments)
+    notes = [e for e in events.events if e.kind == "note" and e.data.get("landed") == kind]
+    assert len(notes) == 1 and said in notes[0].message, [e.message for e in events.events]
+    assert tracker.comments[-1] == landed[0], "the job said more after what landed"
+    assert tracker.states == seen_states, "the stopped job moved its card after the stop"
+    assert runner._handed_back == [], "the stopped job handed an outcome back"
+    assert forge.reviews == [] if at == "open_pr" else forge.merge_calls == 1
+    assert forge.requested == []
+    assert box.cleanups == 1
+
+
+def test_a_stop_before_anything_landed_says_nothing_of_a_landing(origin_and_repo, tmp_path):
+    """THE LANDED SENTENCE IS NOT A BYPASS: a job stopped before any forge call returned writes no
+    comment at all, and `_say_on_ticket` goes on refusing after a stop."""
+    from beeverforge.contracts import Manifest
+    from beeverforge.observability import NullEventSink
+    from beeverforge.orchestrator import JobRunner
+
+    _, repo = origin_and_repo
+    stop = Stop()
+    hooks = _Hooks(stop, "review")
+    forge, tracker, reviewer = _fakes(hooks)
+    runner = JobRunner(
+        tracker=tracker, forge=forge, agent=_Agent(hooks), sandbox=_Box(root=tmp_path / "wt",
+                                                                          hooks=hooks),
+        manifest=Manifest(merge_policy="auto", validate={"test": "true", "security": "true"},
+                          recovery_max_attempts=0),
+        repo_path=repo, reviewer=reviewer, events=NullEventSink())
+    runner.stop = stop
+
+    with pytest.raises(JobStopped):
+        runner.run("#1")
+    said = list(tracker.comments)
+    with pytest.raises(JobStopped):
+        runner._say_on_ticket("#1", "anything at all")
+
+    assert not any("before the stop reached this job" in c for c in said), said
+    assert tracker.comments == said, "a comment went through after the stop"

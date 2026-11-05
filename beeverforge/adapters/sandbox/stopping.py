@@ -30,7 +30,10 @@ with `pid == pgid == sid`, a session of its own, outside the harness's group. So
   be handed to anybody else while any member of it lives.
 - EVERY PROCESS THE JOB STARTED CARRIES `MARK` IN ITS ENVIRONMENT (`MARK_VAR=<this stop's mark>`,
   set by the box), which every descendant inherits through `setsid` and a detached spawn alike;
-  `request` kills each process whose `/proc/<pid>/environ` carries it. LINUX ONLY: elsewhere there
+  `request` kills each process whose `/proc/<pid>/environ` carries it. It reaches the agent's own
+  tool commands: measured with claude 2.1.317 and `BEEVERFORGE_JOB_MARK` set in its environment, a
+  Bash tool command it ran saw the variable (`env | grep -c` gave 1) while being its own session
+  leader (`pid == sid == pgid`), out of the group's reach. LINUX ONLY: elsewhere there
   is no `/proc` to read, and the stop degrades to the group kill. Not airtight even on Linux: a
   process started with a cleared environment (`env -i`) drops the mark, and only a per-job cgroup
   would hold that one — which a worker without cgroup delegation cannot create.

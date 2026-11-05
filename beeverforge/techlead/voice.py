@@ -518,6 +518,33 @@ NARRATION: dict[str, dict[str, str]] = {
     "job.pr-ready": {"en": "PR ready for review: {pr}{review}",
                      "pt-BR": "PR pronto para revisão: {pr}{review}"},
     "job.merged": {"en": "{ticket} merged: {pr}", "pt-BR": "{ticket} mergeado: {pr}"},
+    # ── what landed on the forge before a person's stop reached the job (#44, review of #453) ──
+    #
+    # THE ONLY SENTENCES A STOPPED JOB STILL SAYS. A pull request opened, or a merge made, while
+    # the stop was arriving cannot be taken back, and the card the stop put in the backlog says
+    # nothing about it — so the job says what landed and what a person does about it, then stops.
+    "job.stopped.landed.opened": {
+        "en": "The pull request {pr} was opened before the stop reached this job, and nothing more "
+              "was done on it: no review was posted and no reviewers were asked. Close it if the "
+              "work should not go on; otherwise it stays open for a person to take up.",
+        "pt-BR": "O pull request {pr} foi aberto antes de a parada chegar a este job, e nada mais "
+                 "foi feito nele: nenhuma revisão foi publicada e ninguém foi chamado para "
+                 "revisar. Feche-o se o trabalho não deve seguir; senão ele fica aberto para "
+                 "alguém assumir."},
+    "job.stopped.landed.armed": {
+        "en": "Auto-merge was armed on the pull request {pr} before the stop reached this job, so "
+              "it still merges into {base} when its checks pass. Turn auto-merge off or close the "
+              "pull request if the work should not land.",
+        "pt-BR": "O auto-merge foi armado no pull request {pr} antes de a parada chegar a este "
+                 "job, então ele ainda entra em {base} quando as verificações passarem. Desligue o "
+                 "auto-merge ou feche o pull request se o trabalho não deve entrar."},
+    "job.stopped.landed.merged": {
+        "en": "The pull request {pr} was merged into {base} before the stop reached this job, so "
+              "the code is on {base}. Move this card to Done by hand so it is not picked up "
+              "again.",
+        "pt-BR": "O pull request {pr} foi mergeado em {base} antes de a parada chegar a este job, "
+                 "então o código está em {base}. Mova este cartão para Done à mão para que ele não "
+                 "seja pego de novo."},
     # ── the pull request's OWN review section, when a pass has rewritten the code under it ──────
     #
     # THE SAME FACT THE GATE SHOWS, ON THE OTHER SURFACE (#187). `review.verdict.headline` says

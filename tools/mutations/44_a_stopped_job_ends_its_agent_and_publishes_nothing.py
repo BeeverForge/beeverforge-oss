@@ -28,6 +28,8 @@ WEDGED = "tests/test_a_wedged_job_has_an_exit.py"
 WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
 LEFT = TEST + "::test_a_stop_kills_what_a_returned_command_left_running"
 EMPTIED = TEST + "::test_a_group_is_let_go_of_once_it_is_empty_and_never_signalled_after"
+LANDED = TEST + "::test_what_landed_before_the_stop_is_said_and_nothing_after_it_runs"
+NO_BYPASS = TEST + "::test_a_stop_before_anything_landed_says_nothing_of_a_landing"
 UNHEARD = TEST + "::test_a_stop_the_heartbeat_has_not_heard_yet_publishes_nothing"
 ASKED = TEST + "::test_the_runner_asks_the_engine_through_the_heartbeat_loop"
 TMP = TEST + "::test_a_jobs_temporary_files_go_with_its_worktree"
@@ -170,4 +172,30 @@ MUTATIONS = [
     ("`cleanup` leaves the job's TMPDIR behind", WORKTREE,
      "        shutil.rmtree(job_tmpdir(workspace), ignore_errors=True)\n",
      "", TMP),
+
+    # ── what landed on the forge before the stop reached the job (review of #453, option A) ──
+    ("a stop after the pull request opened or the merge landed says nothing of it", MACHINE,
+     "            if landed is not None:\n                self._say_what_landed(*landed)\n",
+     "            pass\n", LANDED),
+
+    ("what landed is said on the ticket and not journalled", MACHINE,
+     '        self._emit(ticket, "note", f"stopped after the forge took it: {body}", url=pr, '
+     "landed=kind)\n", "", LANDED),
+
+    ("what landed is journalled and not said on the ticket", MACHINE,
+     "        try:\n            self.tracker.comment(ticket.id, body)\n"
+     "        except Exception as exc:  # noqa: BLE001 — the stop stands",
+     "        try:\n            pass\n"
+     "        except Exception as exc:  # noqa: BLE001 — the stop stands", LANDED),
+
+    ("the opened pull request is not recorded as landed", MACHINE,
+     '            self._landed(ticket, "opened", pr=pr, base=base)\n', "", _case("open_pr")),
+
+    ("a merge is said to be merged when it was only armed", MACHINE,
+     '        self._landed(ticket, "merged" if merged else "armed", pr=pr, base=base)\n',
+     '        self._landed(ticket, "merged", pr=pr, base=base)\n', LANDED),
+
+    ("the general comment goes through after a stop (the bypass widened)", MACHINE,
+     '        self._unless_stopped("say_on_ticket")  # outside the `try`: a stop is not a lost '
+     "comment\n", "", NO_BYPASS),
 ]
