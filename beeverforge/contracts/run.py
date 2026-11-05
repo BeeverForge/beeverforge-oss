@@ -330,7 +330,12 @@ class RunResult(BaseModel):
     #: reads them, no gate does, and the reviewer is never handed them (ADR-0001 D-5, D-11).
     #: Empty on a result from before them, which the body says as "wrote nothing" — nothing was
     #: carried. RAW HERE, credentials and all: a credential in them is withheld when they are
-    #: quoted into the body (`_quoted`, `_pass_words`, #885), not on this payload.
+    #: quoted into the body (`_quoted`, `_pass_words`, #885), not on this payload. DELIBERATELY
+    #: (#197, the maintainer's choice of 2026-11-04): `_pr_body` is composed from these fields,
+    #: and withholding here would make the body's withholding depend on the payload. The payload
+    #: is kept in the workflow history, which only an operator reads; every place the agent's
+    #: words are quoted for a person (the body, the journal and panel events, the ticket's hold
+    #: notes) withholds credentials itself (ADR-0001, D-5).
     agent_account: str = ""
     agent_account_chars: int = 0
     agent_passes: list[PassAccount] = Field(default_factory=list)
