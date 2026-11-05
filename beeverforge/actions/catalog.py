@@ -2673,6 +2673,15 @@ async def _product_answer(*, project: str, token: str, answer: str, by: Actor,
         return _failed("I could not tell what happened to that proposal, so treat it as "
                        "unanswered and look again.", did="answer the staged proposal",
                        project=proj.name)
+    if outcome == "refused":
+        # THE MODULE DECLINED THE WRITE (#187): the role's sentence, with its word's code — never
+        # `done` for a write that did not happen
+        return _not_done(text, str(raw.get("refusal") or ""), did="answer the staged proposal",
+                         project=proj.name)
+    if outcome == "failed":
+        # THE WRITE RAISED ON THE WORKER (#187): the person heard "something broke", and the
+        # caller gets a failure with a reference its own line names
+        return _failed(text, did="answer the staged proposal", project=proj.name)
     return done(text, project=proj.name, token=tok, answer=said, outcome=outcome)
 
 

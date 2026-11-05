@@ -4195,10 +4195,12 @@ async def _tell_the_breakdown(project, inp: ProductBreakdownInput, results) -> N
 async def product_role_answer(inp: ProductAnswerInput) -> dict:
     """Resolve a staged proposal by token — on the worker, where the agent runs.
 
-    THE OUTCOME TRAVELS BESIDE THE SENTENCE, never inferred from it. `answer_staged` names six
-    (`done`, `rejected`, `unauthorized`, `gone`, `replaced`, `expired`) and the caller maps them
-    onto a refusal code; telling them apart by comparing Portuguese prose is how a refusal gets
-    recorded as a decision — the reason the gate started returning a pair at all (C-33)."""
+    THE OUTCOME TRAVELS BESIDE THE SENTENCE, never inferred from it. `answer_staged` names eight
+    (`done`, `rejected`, `unauthorized`, `gone`, `replaced`, `expired`, `refused`, `failed`) and
+    the caller maps them onto a refusal code; telling them apart by comparing Portuguese prose is
+    how a refusal gets recorded as a decision — the reason the gate started returning a pair at
+    all (C-33). A `refused` write carries the module's word in `refusal` (#187), so the row answers
+    that word's code rather than a guess."""
     project = ProjectRegistry().get(inp.project)
 
     def _run():
@@ -4217,7 +4219,8 @@ async def product_role_answer(inp: ProductAnswerInput) -> dict:
                              message_id=inp.message_id)
 
     code, sentence = await asyncio.to_thread(_run)
-    return {"outcome": str(code or ""), "message": str(sentence or "")}
+    return {"outcome": str(code or ""), "message": str(sentence or ""),
+            "refusal": str(getattr(sentence, "refusal", "") or "")}
 
 
 @activity.defn
