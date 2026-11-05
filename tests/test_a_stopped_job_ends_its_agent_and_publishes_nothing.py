@@ -19,7 +19,13 @@ WHAT IS HELD HERE:
    before it;
 3. only an ended workflow, a cancel request or a shutting worker ends the work — a timeout, a pause
    or a reset is not a stop (#259 handles those);
-4. the adoption race: a command started after the stop is killed the moment it is adopted.
+4. the adoption race: a command started after the stop is killed the moment it is adopted;
+5. (review of #453) what a command leaves behind is killed too — a background child still in its
+   group, and a descendant in a session of its own, reached by the mark its environment carries;
+6. (review of #453) the runner asks the engine before it publishes, so a stop the heartbeat has not
+   heard yet still publishes nothing;
+7. (review of #453) a job's commands write their temporary files beside the worktree, and
+   `cleanup` removes them with it.
 """
 
 from __future__ import annotations
@@ -34,8 +40,10 @@ from pathlib import Path
 import pytest
 from temporalio.activity import ActivityCancellationDetails
 
-from beeverforge.adapters.sandbox import WorktreeSandbox
-from beeverforge.adapters.sandbox.stopping import JobStopped, Stop
+from beeverforge.adapters.sandbox import WorktreeSandbox, stopping
+from beeverforge.adapters.sandbox.base import Workspace
+from beeverforge.adapters.sandbox.stopping import MARK_VAR, JobStopped, Stop
+from beeverforge.adapters.sandbox.worktree import job_tmpdir
 from tests import test_walking_skeleton as skeleton
 
 # ── helpers: real processes, ended deterministically ────────────────────────────────────────────
@@ -132,19 +140,44 @@ def test_a_stop_kills_every_group_it_adopted_and_is_said_once():
             p.wait()
 
 
-def test_a_released_group_is_not_killed_by_a_later_stop():
-    """A command that finished gives its group back: a stop must not signal a group id the system
-    may already have handed to somebody else."""
+def _sigkills(monkeypatch) -> list[int]:
+    """Every group id `stopping` sends SIGKILL to, recorded and sent."""
+    sent: list[int] = []
+    real = os.killpg
+
+    def killpg(pgid, sig):
+        if sig == signal.SIGKILL:
+            sent.append(pgid)
+        return real(pgid, sig)
+
+    monkeypatch.setattr(stopping.os, "killpg", killpg)
+    return sent
+
+
+def test_a_group_is_let_go_of_once_it_is_empty_and_never_signalled_after(monkeypatch):
+    """A group whose command returned is kept while anything lives in it — and let go of once
+    nothing does, the first moment its id may be handed to somebody else, so a later stop never
+    signals it."""
+    sent = _sigkills(monkeypatch)
     stop = Stop()
-    proc = _a_group_sleeping()
+    lives = _a_group_sleeping()
+    other = subprocess.Popen(["true"], process_group=0)
     try:
-        stop.adopt(proc)
-        stop.release(proc)
+        stop.adopt(lives)
+        stop.settle(lives)  # its command returned, and a member (here, the leader) still lives
+        assert lives.pid in stop._groups, "a group with a member alive was let go of"
+        _kill_quietly(lives.pid)
+        lives.wait()
+        stop.adopt(other)
+        other.wait()
+        stop.settle(other)
+        assert stop._groups == set(), "an emptied group is still the job's to kill"
         stop.request("someone stopped it")
-        assert proc.poll() is None, "a released group was killed"
+        assert lives.pid not in sent and other.pid not in sent, "an emptied group was signalled"
     finally:
-        _kill_quietly(proc.pid)
-        proc.wait()
+        for p in (lives, other):
+            _kill_quietly(p.pid)
+            p.wait()
 
 
 def test_job_stopped_is_not_an_exception_a_best_effort_handler_swallows():
@@ -541,3 +574,225 @@ def test_do_run_job_tells_the_runner_and_its_box(monkeypatch):
 
     assert runner.stop is stop, "the runner never heard the stop"
     assert runner.sandbox.stop is stop, "the box starts its commands where no stop can kill them"
+
+
+# ── 5. what a command leaves behind: a background child, and a session of its own ──────────────
+
+def _carrying(mark: str) -> set[int]:
+    """The pids whose environment carries this mark — read here, not through `stopping`, so a
+    test that fails still finds what to kill."""
+    needle = f"{MARK_VAR}={mark}".encode()
+    found = set()
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                if needle in (entry / "environ").read_bytes().split(b"\0"):
+                    found.add(int(entry.name))
+            except OSError:
+                continue
+    return found
+
+
+def _cmdline(pid: int) -> list[str]:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
+    except OSError:
+        return []
+
+
+def _until_it_is_sleep(pid: int) -> bool:
+    import time
+
+    deadline = time.monotonic() + 10
+    while _cmdline(pid)[:1] != ["sleep"]:
+        if time.monotonic() > deadline or not _cmdline(pid):
+            return False
+        time.sleep(0.01)
+    return True
+
+
+@pytest.mark.skipif(not _LINUX, reason="reads environments and pending signals from /proc")
+def test_a_stop_kills_what_a_returned_command_left_running(tmp_path):
+    """MEASURED ON THE REAL HARNESS: Claude Code runs every Bash tool command in a session of its
+    own (`pid == pgid == sid`), outside the group the box started it in. So the command here
+    returns at once and leaves three `sleep`s behind:
+
+    - one in a SESSION OF ITS OWN (`setsid`): only the mark its environment carries reaches it;
+    - one in the command's group WITHOUT the mark (`env -u`): only the group, kept adopted after
+      its leader returned, reaches it;
+    - one in the group with the mark, as a background child usually is.
+
+    The stop must end all three."""
+    stop = Stop()
+    box = WorktreeSandbox(root=tmp_path / "wt")
+    box.stop = stop
+    path = tmp_path / "wt" / "beeverforge-1"
+    path.mkdir(parents=True)
+    ws = Workspace(path=path, branch="beeverforge/1", base_branch="main")
+    command = (f"setsid sleep 600 >/dev/null 2>&1 & echo $!; "
+               f"env -u {MARK_VAR} sleep 600 >/dev/null 2>&1 & echo $!; "
+               f"sleep 600 >/dev/null 2>&1 & echo $!")
+    pids: list[int] = []
+    groups: set[int] = set()
+    try:
+        rc, out = box.run(workspace=ws, command=command, timeout=60)
+        assert rc == 0, out
+        pids = [int(line) for line in out.split() if line.strip().isdigit()]
+        assert len(pids) == 3, out
+        session, unmarked, plain = pids
+        groups = set(stop._groups)
+        # the case is what it says, or it proves nothing: each one is `sleep` by now (`setsid` and
+        # `env` exec it in place; a deadline that only fails, never a measured wait)
+        assert all(_until_it_is_sleep(p) for p in pids), [_cmdline(p) for p in pids]
+        assert os.getsid(session) == session, "the setsid'd sleep is not in a session of its own"
+        assert os.getpgid(unmarked) in groups and os.getpgid(plain) in groups, (
+            "the command's group was let go of while its background children lived")
+        assert unmarked not in _carrying(stop.mark) and {session, plain} <= _carrying(stop.mark)
+        assert not any(_ended_or_killed(p) for p in pids), "a sleep ended before the stop"
+
+        stop.request("someone stopped it")
+
+        assert _ended_or_killed(session), "a descendant in a session of its own outlived the stop"
+        assert _ended_or_killed(unmarked), "a background child in the command's group outlived it"
+        assert _ended_or_killed(plain), "a background child outlived the stop"
+    finally:
+        for pid in set(pids) | _carrying(stop.mark):
+            _kill_quietly(pid)
+        for pgid in groups:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+# ── 6. a stop the heartbeat has not heard yet ───────────────────────────────────────────────────
+
+def test_a_stop_the_heartbeat_has_not_heard_yet_publishes_nothing(origin_and_repo, tmp_path):
+    """The heartbeat reaches the server at most once a throttled minute (temporalio 1.35), so a
+    terminate can be in the engine while `stop.requested` is still False. The runner asks the
+    engine (`Stop.ask`) before it publishes: here the engine says the workflow ended during the
+    review, and nothing ever requests the stop."""
+    from beeverforge.contracts import Manifest
+    from beeverforge.observability import NullEventSink
+    from beeverforge.orchestrator import JobRunner
+
+    origin, repo = origin_and_repo
+    stop = Stop()
+    ended: list[str] = []
+
+    class _Engine(_Hooks):
+        def fire(self, event: str) -> None:
+            if event == "review":
+                ended.append("terminated")
+
+    hooks = _Engine(stop, at="")
+    stop.ask = lambda: "its workflow was terminated in the engine (a stop)" if ended else None
+    forge, tracker, reviewer = _fakes(hooks)
+    box = _Box(root=tmp_path / "wt", hooks=hooks)
+    runner = JobRunner(
+        tracker=tracker, forge=forge, agent=_Agent(hooks), sandbox=box,
+        manifest=Manifest(merge_policy="auto", validate={"test": "true", "security": "true"},
+                          recovery_max_attempts=0),
+        repo_path=repo, reviewer=reviewer, events=NullEventSink())
+    runner.stop = stop
+
+    with pytest.raises(JobStopped):
+        runner.run("#1")
+
+    assert ended, "the walk never reached the review: the case proves nothing"
+    assert box.pushes == 0 and forge.opened is None and forge.merge_calls == 0
+    assert _never_pushed(origin), "a stop the heartbeat had not heard still pushed"
+    assert stop.requested and "terminated" in stop.why, "the engine's answer did not stop the job"
+
+
+class _Described:
+    def __init__(self, status) -> None:
+        self.status = status
+
+
+class _Client:
+    """The activity's client, answering `describe` with `answer` (a status or an exception)."""
+
+    def __init__(self, answer) -> None:
+        self.answer = answer
+        self.asked: list[tuple[str, str | None]] = []
+
+    def get_workflow_handle(self, workflow_id, *, run_id=None):
+        client = self
+
+        class _Handle:
+            async def describe(self):
+                client.asked.append((workflow_id, run_id))
+                if isinstance(client.answer, BaseException):
+                    raise client.answer
+                return _Described(client.answer)
+
+        return _Handle()
+
+
+def _rpc(code):
+    from temporalio.service import RPCError
+
+    return RPCError("said the engine", code, b"")
+
+
+@pytest.mark.parametrize("answer,stopped", [
+    ("TERMINATED", True),
+    ("CANCELED", True),
+    ("RUNNING", False),
+    ("NOT_FOUND", True),
+    ("UNAVAILABLE", False),
+], ids=["terminated", "canceled", "running", "not_found", "unreachable"])
+async def test_the_runner_asks_the_engine_through_the_heartbeat_loop(answer, stopped):
+    """`_heartbeat_while` gives the stop an `ask` the RUNNER'S THREAD calls, answered on the
+    activity's loop through the activity's own client: a run that is not running is a stop, and so
+    is a run the engine no longer has; an engine that cannot be reached is no answer."""
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCStatusCode
+    from temporalio.testing import ActivityEnvironment
+
+    from beeverforge.runtime.temporal.activities import _heartbeat_while
+
+    if answer in ("NOT_FOUND", "UNAVAILABLE"):
+        said = _rpc(getattr(RPCStatusCode, answer))
+    else:
+        said = getattr(WorkflowExecutionStatus, answer)
+    client = _Client(said)
+    stop = Stop()
+
+    confirmed = await ActivityEnvironment(client=client).run(
+        _heartbeat_while, stop.confirm, "p#1", stop=stop)
+
+    assert client.asked, "the runner's thread never asked the engine"
+    assert confirmed is stopped and stop.requested is stopped
+
+
+# ── 7. a job's temporary files ──────────────────────────────────────────────────────────────────
+
+def test_a_jobs_temporary_files_go_with_its_worktree(tmp_path):
+    """A test run SIGKILLed by a stop never reaches its own `finally`, so whatever it made under
+    `$TMPDIR` stays — in `/tmp`, for good, unless `$TMPDIR` is the job's. The box names one beside
+    the worktree, makes it before the first command, and `cleanup` removes it."""
+    stop = Stop()
+    box = WorktreeSandbox(root=tmp_path / "wt")
+    box.stop = stop
+    path = tmp_path / "wt" / "beeverforge-1"
+    path.mkdir(parents=True)
+    ws = Workspace(path=path, branch="beeverforge/1", base_branch="main")
+    written: Path | None = None
+    try:
+        rc, out = box.run(workspace=ws, timeout=60,
+                          command='f="$TMPDIR/left-by-a-test"; echo x > "$f" && echo "$f"')
+        assert rc == 0, out
+        written = Path(out.strip().splitlines()[-1])
+        assert written.parent == job_tmpdir(ws), f"the command's TMPDIR was {written.parent}"
+        assert not written.is_relative_to(ws.path), "the job's TMPDIR is inside its worktree"
+        assert written.exists()
+
+        stop.request("someone stopped it")
+        box.cleanup(workspace=ws)
+
+        assert not job_tmpdir(ws).exists(), "the stopped job's TMPDIR outlived its cleanup"
+    finally:
+        if written is not None and written.exists():
+            written.unlink()

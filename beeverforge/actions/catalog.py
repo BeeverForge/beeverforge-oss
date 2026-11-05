@@ -1387,8 +1387,11 @@ def _what_the_worker_hears(described, *, now) -> tuple[str, str]:
         return "none", "No step of it was reported running on a worker"
     beat = _when(getattr(pending[0], "last_heartbeat_time", None))
     if beat is not None and (now - beat).total_seconds() <= _HEARD_WITHIN_SECONDS:
+        # ITS RUNNER ASKS THE ENGINE BEFORE EACH PUBLISHING STEP (review of #453), so "publish
+        # nothing" holds from the terminate on; only the agent's END waits for the heartbeat
         return "heard", (f"Its worker was heard at {_said(beat)} and is told at its next heartbeat "
-                         f"to end the agent, remove the worktree and publish nothing")
+                         f"to end the agent and remove the worktree; it asks the engine before "
+                         f"each step that would publish, so it will publish nothing")
     since = _said(beat) if beat is not None else "it started"
     return "silent", (f"Its worker has not been heard from since {since}, so whether its agent is "
                       f"still running there is not known; a worker that comes back is told at its "

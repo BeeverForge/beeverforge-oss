@@ -1269,9 +1269,13 @@ class JobRunner:
         review, reviewers, a merge, a card's move, a comment on the ticket — because those are what
         a stopped job did on a deployment, 46 minutes after `stop` said it was over. Raised, not
         returned: a `BaseException` that the best-effort handlers do not swallow, out through
-        `run()`'s `finally`, which removes the worktree as a job that ends normally does."""
+        `run()`'s `finally`, which removes the worktree as a job that ends normally does.
+
+        `confirm`, NOT `requested` (review of #453): the heartbeat hears a terminate up to a
+        throttled minute late, so each of these steps also asks the engine whether the job's
+        workflow is still running (`Stop.ask`, set by the activity's heartbeat loop)."""
         stop = getattr(self, "stop", None)
-        if stop is not None and stop.requested:
+        if stop is not None and stop.confirm():
             log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
                         step, stop.why or "a person stopped the job")
             raise JobStopped(step, stop.why)

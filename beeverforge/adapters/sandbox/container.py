@@ -812,6 +812,9 @@ class ContainerSandbox(SandboxAdapter):
         # A JOB'S `docker exec` CLIENT IN A GROUP OF ITS OWN (#44), as on the worktree box: a
         # person's stop kills the client at once, and `cleanup`'s `docker rm -f` — which `run()`'s
         # `finally` reaches as soon as the pass returns — takes the process inside the container.
+        # So this box needs neither the worktree box's mark nor its `TMPDIR` (review of #453):
+        # `docker rm -f` ends every process in the container, a `setsid`'d one included, and the
+        # container's `/tmp` goes with it.
         stop = self.stop
         proc = subprocess.Popen(
                 # `sh -c`, NEVER `sh -lc`. A login shell sources the CLIENT IMAGE's /etc/profile

@@ -9,7 +9,10 @@ the work:
 - the process-group kill skipped (a no-op, the leader only, the box in the worker's own group, the
   activity that never tells the runner, a command started after the stop left running);
 - the worktree's cleanup skipped;
-- a timeout read as a stop (#259 keeps those apart), and a silent worker said to be heard.
+- a timeout read as a stop (#259 keeps those apart), and a silent worker said to be heard;
+- (review of #453) a group let go of when its leader returns, the mark dropped from the kill or
+  from the box's environment, an emptied group never let go of; the runner that no longer asks
+  the engine, or an engine answer misread; the job's `TMPDIR` dropped, made late or left behind.
 """
 
 MACHINE = "beeverforge/orchestrator/machine.py"
@@ -22,6 +25,12 @@ TEST = "tests/test_a_stopped_job_ends_its_agent_and_publishes_nothing.py"
 _STEP = TEST + "::test_a_stop_arriving_during_a_step_skips_the_next"
 MID_AGENT = TEST + "::test_a_job_stopped_mid_agent_pass_never_reaches_publish"
 WEDGED = "tests/test_a_wedged_job_has_an_exit.py"
+WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
+LEFT = TEST + "::test_a_stop_kills_what_a_returned_command_left_running"
+EMPTIED = TEST + "::test_a_group_is_let_go_of_once_it_is_empty_and_never_signalled_after"
+UNHEARD = TEST + "::test_a_stop_the_heartbeat_has_not_heard_yet_publishes_nothing"
+ASKED = TEST + "::test_the_runner_asks_the_engine_through_the_heartbeat_loop"
+TMP = TEST + "::test_a_jobs_temporary_files_go_with_its_worktree"
 
 
 def _case(name: str) -> str:
@@ -65,18 +74,21 @@ MUTATIONS = [
      _case("the_revalidation_after_a_rebase")),
 
     # ── the process-group kill ──
-    ("the stop kills nothing", STOPPING,
+    # RE-PINNED (review of #453): the mid-agent `sleep` carries the job's mark, so the mark's kill
+    # alone ends it; the group's kill is what reaches the unmarked child in LEFT
+    ("the stop kills no group", STOPPING,
      "        os.killpg(pgid, signal.SIGKILL)\n",
-     "        pass\n", MID_AGENT),
+     "        pass\n", LEFT),
 
     ("the stop kills the shell it started and leaves what the harness spawned running", STOPPING,
      "        os.killpg(pgid, signal.SIGKILL)\n",
-     "        os.kill(pgid, signal.SIGKILL)\n", MID_AGENT),
+     "        os.kill(pgid, signal.SIGKILL)\n", LEFT),
 
+    # RE-PINNED (review of #453): the mid-agent `sleep` is reached by its mark wherever its group is
     ("a job's box starts its commands in the worker's own group, where no stop reaches them",
      STOPPING,
      '    return {"process_group": 0} if stop is not None else {}',
-     "    return {}", MID_AGENT),
+     "    return {}", LEFT),
 
     ("the container box starts a job's `docker exec` in the worker's own group", CONTAINER,
      "                **own_group(stop),\n", "", TEST),
@@ -107,4 +119,55 @@ MUTATIONS = [
     ("a worker silent past its heartbeat window is said to be heard", CATALOG,
      "    if beat is not None and (now - beat).total_seconds() <= _HEARD_WITHIN_SECONDS:",
      "    if beat is not None:", WEDGED),
+
+    # ── what a returned command left behind (review of #453) ──
+    ("a group is let go of as soon as its leader returns", STOPPING,
+     "            if _group_is_empty(proc.pid):\n                self._groups.discard(proc.pid)\n",
+     "            self._groups.discard(proc.pid)\n", LEFT),
+
+    ("the stop does not kill what carries the job's mark", STOPPING,
+     "            _kill_group(pgid)\n        _kill_marked(",
+     "            _kill_group(pgid)\n        (lambda _n: None)(", LEFT),
+
+    ("a job's box does not mark its commands", WORKTREE,
+     "            env.update(stop.env(), TMPDIR=str(tmp))\n",
+     "            env.update(TMPDIR=str(tmp))\n", LEFT),
+
+    ("an emptied group is never let go of", STOPPING,
+     "        self._groups = {g for g in self._groups if not _group_is_empty(g)}\n",
+     "        pass\n", EMPTIED),
+
+    # ── a stop the heartbeat has not heard yet (review of #453) ──
+    ("the runner asks only the heartbeat's flag, never the engine", MACHINE,
+     "        if stop is not None and stop.confirm():\n",
+     "        if stop is not None and stop.requested:\n", UNHEARD),
+
+    ("the heartbeat loop gives the runner nothing to ask the engine with", ACTIVITIES,
+     "        stop.ask = _the_engine_asked(asyncio.get_running_loop())\n",
+     "        pass\n", ASKED),
+
+    ("a workflow the engine no longer has is read as running", ACTIVITIES,
+     '                return "its workflow is no longer in the engine (a stop)"\n',
+     "                return None\n", ASKED),
+
+    ("a running workflow is read as stopped", ACTIVITIES,
+     "        if described.status == WorkflowExecutionStatus.RUNNING:\n            return None\n",
+     "", ASKED),
+
+    ("an engine that cannot be reached is read as a stop", ACTIVITIES,
+     "            return _unasked(info.workflow_id, exc)\n        except Exception",
+     '            return "unreachable"\n        except Exception', ASKED),
+
+    # ── the job's temporary files (review of #453) ──
+    ("a job's commands get no TMPDIR of their own", WORKTREE,
+     "            env.update(stop.env(), TMPDIR=str(tmp))\n",
+     "            env.update(stop.env())\n", TMP),
+
+    ("the job's TMPDIR is not made before its first command", WORKTREE,
+     "            tmp.mkdir(parents=True, exist_ok=True)\n",
+     "", TMP),
+
+    ("`cleanup` leaves the job's TMPDIR behind", WORKTREE,
+     "        shutil.rmtree(job_tmpdir(workspace), ignore_errors=True)\n",
+     "", TMP),
 ]

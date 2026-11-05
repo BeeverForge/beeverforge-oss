@@ -269,6 +269,65 @@ async def _end_the_work(work: asyncio.Task, stop, detail: str, details) -> None:
         work.exception()
 
 
+#: The runner's thread logs here: `activity.logger` belongs to the activity's own context.
+_log = logging.getLogger("beeverforge.runtime.activities")
+
+#: How long the runner's thread waits for the engine's answer before a publishing step. An answer
+#: that does not come in time is no answer: the step goes on, as it did before the engine was asked.
+_THE_ENGINE_ANSWERS_WITHIN = 15.0
+
+
+def _the_engine_asked(loop):
+    """What the runner's thread calls before each publishing step (`Stop.ask`): a reason when this
+    activity's workflow run is no longer running, None while it is or when the engine cannot say.
+
+    WHY ASK AT ALL. `stop` terminates the workflow and the heartbeat loop hears it only when a
+    heartbeat reaches the server. temporalio throttles those to `min(0.8 × heartbeat_timeout,
+    max_heartbeat_throttle_interval)` — 60 s here (the job's 120 s timeout, the SDK's 60 s default,
+    temporalio 1.35 `worker/_worker.py`) — so for up to a minute after `stop` answered, a runner
+    whose agent finished would push, open and merge. The engine is the one record both the person's
+    stop and this worker can read, wherever each of them runs.
+
+    ON THE ACTIVITY'S OWN LOOP, which is awake (it is awaiting the thread), through the activity's
+    own client. NOT FOUND is an answer — the run is gone; any other failure is not, and is logged:
+    an engine this worker cannot reach is one a stop could not have reached either."""
+    try:
+        client = engine_client()  # the one seam (#217): the client this worker already holds
+        info = activity.info()
+    except NoEngineClientHere:  # a test environment built with no client: nothing to ask
+        return None
+
+    def ask() -> str | None:
+        from temporalio.client import WorkflowExecutionStatus
+        from temporalio.service import RPCError, RPCStatusCode
+
+        asked = None
+        try:
+            handle = client.get_workflow_handle(info.workflow_id, run_id=info.workflow_run_id)
+            asked = asyncio.run_coroutine_threadsafe(handle.describe(), loop)
+            described = asked.result(timeout=_THE_ENGINE_ANSWERS_WITHIN)
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                return "its workflow is no longer in the engine (a stop)"
+            return _unasked(info.workflow_id, exc)
+        except Exception as exc:  # noqa: BLE001 — a timeout or a closed loop: no answer
+            if asked is not None:
+                asked.cancel()
+            return _unasked(info.workflow_id, exc)
+        if described.status == WorkflowExecutionStatus.RUNNING:
+            return None
+        status = getattr(described.status, "name", str(described.status)).lower()
+        return f"its workflow was {status} in the engine (a stop)"
+
+    return ask
+
+
+def _unasked(workflow_id: str, exc: BaseException) -> None:
+    _log.warning("BEEVERFORGE_JOB_STOP_UNASKED could not ask the engine whether %s is still "
+                 "running (%s) — the step goes on", workflow_id,
+                 str(exc)[:160] or type(exc).__name__)
+
+
 async def _heartbeat_while(fn, detail: str, *, tick=None, stop=None) -> RunResult:
     """Run blocking work in a thread while heartbeating every ~30s, so Temporal sees the
     activity is alive (a dead worker trips heartbeat_timeout instead of the full ceiling).
@@ -284,6 +343,10 @@ async def _heartbeat_while(fn, detail: str, *, tick=None, stop=None) -> RunResul
     IT MUST NEVER BE ABLE TO END THE WORK. A watcher raising here would cancel a pass that was
     perfectly healthy, so it is called defensively — the heartbeat is what keeps the activity
     alive, and it is issued whether or not the tick succeeded."""
+    if stop is not None:
+        # THE RUNNER ASKS THE ENGINE BEFORE IT PUBLISHES (review of #453): a heartbeat reaches the
+        # server at most once a throttled minute, and a terminate is heard only then
+        stop.ask = _the_engine_asked(asyncio.get_running_loop())
     work = asyncio.create_task(asyncio.to_thread(fn))
     try:
         while not work.done():

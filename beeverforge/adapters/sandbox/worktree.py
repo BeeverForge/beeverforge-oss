@@ -709,6 +709,12 @@ def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:
     return env
 
 
+def job_tmpdir(workspace: Workspace) -> Path:
+    """A job's `TMPDIR`: beside its worktree, under the box's root, named so that no worktree can
+    be — a git branch component never starts with a dot, and a worktree is named by its branch."""
+    return workspace.path.parent / f".{workspace.path.name}.tmp"
+
+
 def _redact(text: str) -> str:
     """Strip any embedded credential from an authenticated URL before logging."""
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
@@ -1231,13 +1237,26 @@ class WorktreeSandbox(SandboxAdapter):
         the worker's own cancel, which the activity treats as a stop
         (`activities._the_work_must_end`); a worker killed with SIGKILL orphans the harness, as a
         box in the shared group always could. A box with no stop (every judging role) is unchanged.
+
+        …AND MARKED, AND GIVEN A TEMPORARY DIRECTORY OF ITS OWN (review of #453). A job's command
+        carries its stop's mark (`stopping.MARK_VAR`), which a descendant in a session of its own
+        still inherits and the stop kills by; and `TMPDIR` names `job_tmpdir(workspace)`, beside
+        the worktree, which `cleanup` removes with it — so a test run SIGKILLed by a stop, whose
+        own `finally` never runs, leaves nothing in `/tmp`. Made here, before the command, so it
+        exists for the first one. A tool that ignores `TMPDIR`, or a harness that sets its own for
+        the commands it runs (Claude Code does, measured), writes where it always did.
         """
         stop = self.stop
+        env = _scrubbed_env(self.extra_env)
+        if stop is not None:
+            tmp = job_tmpdir(workspace)
+            tmp.mkdir(parents=True, exist_ok=True)
+            env.update(stop.env(), TMPDIR=str(tmp))
         proc = subprocess.Popen(
                 command, shell=True, cwd=workspace.path,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1,
-                env=_scrubbed_env(self.extra_env), **own_group(stop),
+                env=env, **own_group(stop),
         )
         with adopted(stop, proc):
             return run_and_stream(
@@ -1378,3 +1397,6 @@ class WorktreeSandbox(SandboxAdapter):
             log.warning("the box's own tree %s is locked — left as it is", workspace.path)
         elif workspace.path.exists():
             shutil.rmtree(workspace.path, ignore_errors=True)
+        # THE JOB'S `TMPDIR` GOES WITH ITS TREE (review of #453), locked or not: it is never a
+        # person's, and it holds what a killed test run never got to remove
+        shutil.rmtree(job_tmpdir(workspace), ignore_errors=True)
