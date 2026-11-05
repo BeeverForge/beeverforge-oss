@@ -84,6 +84,14 @@ LINK_PASSWORD = "q7" + "linkpw" * 3
 #: A key of this process, PEM-shaped: three lines, its body a line no shape would catch alone.
 KEY_BODY = "MIIEv" + "q7KEYBODY" * 6
 PEM = "-----BEGIN " + "PRIVATE KEY-----\n" + KEY_BODY + "\n-----END " + "PRIVATE KEY-----"
+#: A model vendor's key written without its `sk-` prefix, as another machine holds it (#198).
+UNPREFIXED_KEY = "q7" + "OPENAIKEY" * 3
+#: A SigV4 header's `SignedHeaders=` list longer than the 1,000 characters the scan once read
+#: (#198): one name of no whitespace or comma, as SigV4 writes it.
+LONG_SIGNED_HEADERS = "host;" + ";".join(f"x-amz-meta-q{i}" for i in range(90))
+#: A Digest `uri=` longer than 1,000 characters with a comma inside its quotes (#198): a pair
+#: scan that read the comma as a separator would lose its place.
+LONG_URI = "/x?" + "q" * 750 + "," + "q" * 750
 
 
 @pytest.fixture(autouse=True)
@@ -155,9 +163,12 @@ def test_a_github_token_in_the_agents_message_is_withheld_and_the_body_says_so(
     # review on c0bb69c0: a value whose only mark is ONE lowercase letter followed by ONE capital
     # (`eV`); every other case's pair is followed by a second capital, so `[a-z][A-Z]{2}` survived
     (f"{SENTINEL}: sent Authorization: Basic {CASE_PAIR} once", CASE_PAIR),
+    # #198: a value another machine holds, written with no scheme at all
+    (f"{SENTINEL}: I called it with Authorization: {JWT} and it answered 200", JWT),
+    (f'{SENTINEL}: the client sends {{"Authorization": "{JWT}"}}', JWT),
 ], ids=["bearer-jwt", "curl-token-hex", "bare-bearer", "lowercase-header", "json-key", "equals",
         "bot", "negotiate", "ntlm", "padding-only-mark", "padding-before-a-full-stop",
-        "one-case-pair-mark"])
+        "one-case-pair-mark", "schemeless-jwt", "schemeless-json-key"])
 def test_the_value_of_an_authorization_header_in_the_agents_message_is_withheld_and_the_body_says_so(
         repo: Path, tmp_path: Path, said: str, secret: str):
     """At 620bb577 none of these values carries a vendor prefix, and `scrub_credentials` returned
@@ -185,8 +196,20 @@ def test_the_value_of_an_authorization_header_in_the_agents_message_is_withheld_
     # bound would leave after the marker (`response="[credential withheld]<the last 32 hex>"`).
     (f'{SENTINEL}: it sent Authorization: Digest username="ann", algorithm=SHA-256, '
      f'response="{DIGEST_SHA256}"', DIGEST_SHA256[32:], "algorithm=SHA-256"),
+    # #198: a presigned URL carries the signature in its query string, with no space after a scheme
+    (f"{SENTINEL}: fetched https://bucket.s3.example.test/k?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+     f"&X-Amz-Credential=AKIDEXAMPLE%2F20261021%2Fus-east-1%2Fs3%2Faws4_request"
+     f"&X-Amz-Date=20261021T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature={AWS_SIGNATURE}",
+     AWS_SIGNATURE, "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE"),
+    # #198: parameters before the secret one that run past 1,000 characters
+    (f'{SENTINEL}: it sent Authorization: Digest username="ann", realm="api", uri="{LONG_URI}", '
+     f'response="{DIGEST_RESPONSE}", qop=auth', DIGEST_RESPONSE, 'Digest username="ann"'),
+    (f"{SENTINEL}: it sent Authorization: AWS4-HMAC-SHA256 "
+     f"Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request, "
+     f"SignedHeaders={LONG_SIGNED_HEADERS}, Signature={AWS_SIGNATURE}", AWS_SIGNATURE,
+     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request"),
 ], ids=["digest", "aws4-hmac-sha256", "digest-lowercase", "aws4-signedheaders-first",
-        "digest-sha256"])
+        "digest-sha256", "presigned-url", "digest-past-1000", "aws4-past-1000"])
 def test_a_signed_header_withholds_its_secret_parameter_and_keeps_the_rest(
         repo: Path, tmp_path: Path, said: str, secret: str, kept: str):
     """Review on 5fe330d2, decision 3: a `Digest` or SigV4 header is a parameter list. At d892b0a3
@@ -196,6 +219,61 @@ def test_a_signed_header_withholds_its_secret_parameter_and_keeps_the_rest(
     quoted as written."""
     quote = _assert_withheld_and_said(_opened(repo, tmp_path, _Says(said)), secret)
     assert kept in _shown(quote), f"the header's other parameters were not quoted as written: {quote}"
+
+
+def test_a_signed_headers_parameter_list_is_read_pair_by_pair_not_scanned():
+    """#198: the scan from `Digest` to its `response=` reads `name=value` pairs separated by
+    commas, not any run of characters. Unbounded, a free scan read to the end of the line from
+    every `Digest` (11.29 s on a 400 KB line, review on cfe48e02); bounded at 1,000 characters it
+    left a longer header's response raw. A `response=` after a prose word is no header's, so the
+    400 KB line comes back unchanged — a free scan would withhold every one of them; and a header
+    of a thousand-odd characters of pairs is matched from its scheme to its secret's end. No
+    clock: the span is what is compared."""
+    line = (f'the Digest scheme is how it signs, and its response="{DIGEST_RESPONSE}" is echoed. '
+            * 5000)
+    assert len(line) >= 400_000, "the line is shorter than the one measured — wrong case"
+    assert model.scrub_credentials(line) == line
+
+    header = 'Digest username="ann", ' + 'realm="api", ' * 100 + f'response="{DIGEST_RESPONSE}"'
+    assert len(header) > 1000, "the header is within the old bound — wrong case"
+    found = model._SIGNED_PARAMETER.search(header)
+    assert found is not None and found.span() == (0, len(header) - len('"')), found
+
+
+# ── criterion 1: a value under a secret-named name (#198) ───────────────────────────────────────
+
+@pytest.mark.parametrize("said, secret, kept", [
+    (f'{SENTINEL}: ran curl -H "X-Api-Key: {HEX_TOKEN}" https://api.example.test/x', HEX_TOKEN,
+     "X-Api-Key:"),
+    (f"{SENTINEL}: the gateway wants Api-Key: {OPAQUE} on each call", OPAQUE, "Api-Key:"),
+    (f"{SENTINEL}: ran export OPENAI_API_KEY={UNPREFIXED_KEY} first", UNPREFIXED_KEY,
+     "OPENAI_API_KEY="),
+    (f"{SENTINEL}: the bed connects with password={DB_PASSWORD} today", DB_PASSWORD, "password="),
+    (f"{SENTINEL}: the config reads passwd: {DB_PASSWORD} now", DB_PASSWORD, "passwd:"),
+    (f'{SENTINEL}: the client sends {{"api_key": "{OPAQUE}"}}', OPAQUE, '"api_key":'),
+], ids=["x-api-key", "api-key", "export-openai", "password-equals", "passwd-colon",
+        "json-api-key"])
+def test_a_secret_named_value_in_the_agents_message_is_withheld_and_the_body_says_so(
+        repo: Path, tmp_path: Path, said: str, secret: str, kept: str):
+    """#198, measured at an older commit: none of these values carries a vendor prefix or follows
+    a named `Authorization` scheme, and each came back unchanged. The value is withheld; its name
+    and its `=` or `:` are quoted as written."""
+    quote = _assert_withheld_and_said(_opened(repo, tmp_path, _Says(said)), secret)
+    assert kept in _shown(quote), f"the name the value was under was not quoted: {quote}"
+
+
+def test_a_secret_named_name_is_read_from_where_a_name_starts_and_within_its_bound():
+    """#198: the name around the secret word is read from where a name can start, at most 64
+    characters on each side, so a long hyphenated line is read once, not from every character
+    of it. Compared by span, never by clock: a name within the bound is matched from its first
+    character; one past it is not matched at all — not from its start, and not from a later
+    character of it either."""
+    within = "q-" * 30 + "TOKEN"
+    found = model._SECRET_NAMED_VALUE.search(f"{within}={OPAQUE}")
+    assert found is not None and found.span(1) == (0, len(within)), found
+
+    beyond = "q-" * 40 + "TOKEN"
+    assert model._SECRET_NAMED_VALUE.search(f"{beyond}={OPAQUE}") is None
 
 
 # ── criterion 1: the password of a URL ──────────────────────────────────────────────────────────
@@ -318,6 +396,21 @@ NEAR_MISSES = [
     "Authorization: Basic username/password pairs are refused now",  # review on cfe48e02
     "Authorization: requires OAuth2.0 scopes on every route",  # a word, not a scheme, before a mark
     "Authorization: Basic username=admin is refused",  # an `=` inside prose is no padding (review on 34209477)
+    # #198: no scheme — a word with a digit under 16 characters, and a long word with no digit
+    "Authorization: OAuth2.0 is required",
+    "Authorization: authenticationMiddleware decides it",
+    # #198: a secret-named name with no value after it, a variable where the value would stand, a
+    # value with no credential's mark, and SigV4's Credential (a key id and a scope, no secret)
+    "password= is required",
+    "password: required for login",
+    "export OPENAI_API_KEY=$OPENAI_API_KEY",
+    "X-Api-Key: required on every call",
+    "token_env: ADO_FOR_THIS_CLIENT",
+    "X-Amz-Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request",
+    # #198: the presigned URL's parameter named, and a value too short to be a signature
+    "the SDK appends X-Amz-Signature= to the query string",
+    "X-Amz-Signature=deadbeef is too short to be one",
+    "Digest authentication sends a response= field",
     "ghp_ is the prefix of a personal token",
     "sk-learn",
     "https://octocat.github.io/x",

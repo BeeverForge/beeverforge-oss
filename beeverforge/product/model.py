@@ -327,10 +327,30 @@ _USERINFO = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/@]+@")
 #: (seed 885, 200,000 values per length): 1.52% of 8-character values carry no mark (0.88% had a
 #: `+` or `/`), 0.12% of 12-character ones, 0.007% of 16, 0.0005% of 20, none of 32. Hex with a
 #: digit and JWTs always carry one.
+#: The same floor is read by a secret-named value (`_SECRET_NAMED_VALUE`, #198), so it is written
+#: once.
+_MARKED_VALUE = (
+    r"(?=[\w.~+/-]*(?:\d|=+(?!\.?[\w~+/-])|(?-i:[a-z][A-Z])))[\w.~+/-]{8,}=*"
+)
 _AUTHORIZATION = re.compile(
     r"(\bAuthorization[\"']?\s*[:=]\s*[\"']?(?:Bearer|Basic|token|Bot|Negotiate|NTLM)[ \t]+)"
-    r"(?=[\w.~+/-]*(?:\d|=+(?!\.?[\w~+/-])|(?-i:[a-z][A-Z])))[\w.~+/-]{8,}=*"
+    + _MARKED_VALUE +
     r"|(\bBearer[ \t]+)(?=[\w.~+/-]*\d)[\w.~+/-]{16,}=*", re.IGNORECASE)
+#: The value of an `Authorization` header written with NO scheme, as another machine's client
+#: holds a JWT or an opaque token (#198): 16 characters of the token68 alphabet with a digit in
+#: them, the floor a bare `Bearer` value meets. Measured before this shape, on this file's
+#: synthetic values: `Authorization: <JWT>` and `{"Authorization": "<JWT>"}` came back unchanged.
+#: Read after `_AUTHORIZATION`, so a named scheme's value is withheld first and its scheme word
+#: (`Bearer`, no digit) is no value here. `AWS4-HMAC-SHA256` is 16 characters with a digit, so it
+#: is excluded by name: read as a value, the SigV4 header lost its scheme and its signature with it.
+#: The 16 and the digit are what keep prose: "Authorization: OAuth2.0 is required" (a digit, 8
+#: characters) and "Authorization: authenticationMiddleware decides it" (24, no digit) stay as
+#: written. THE COST, ACCEPTED: a scheme-less value under 16 characters, or without a digit, is
+#: quoted as written; a 16-character word with a digit after `Authorization:` (a file name like
+#: `middleware2fa.py`) is withheld.
+_SCHEMELESS_AUTHORIZATION = re.compile(
+    r"(\bAuthorization[\"']?[ \t]*[:=][ \t]*[\"']?)(?!AWS4-HMAC-SHA256\b)"
+    r"(?=[\w.~+/-]*\d)[\w.~+/-]{16,}=*", re.IGNORECASE)
 #: The SECRET PARAMETER of a header whose value is a parameter list, not one token: `response=`
 #: after `Digest` (RFC 7616) and `Signature=` after `AWS4-HMAC-SHA256` (AWS SigV4). Only that
 #: parameter is withheld; the username, realm, nonce, URI, `Credential=` and `SignedHeaders=` are
@@ -339,25 +359,65 @@ _AUTHORIZATION = re.compile(
 #: FIRST parameter's name (`Digest [credential withheld]"ann", … response="6629fae4…"`) and the
 #: response stayed — a withholding claimed where none happened (decision on the review of 5fe330d2).
 #: THE COST, ACCEPTED: a second, parameter-level shape to keep beside the scheme shape; a scheme
-#: with a parameter list not named here is not read. The scan from the scheme to its parameter is
-#: BOUNDED at 1,000 characters (a header is far shorter): unbounded, it read to the end of the line
-#: from every `Digest`, and one 400 KB line of prose with `Digest` every ~80 characters took 11.29 s
-#: (0.09 s bounded; review on cfe48e02). THE BOUND'S COST, ACCEPTED: a header whose parameters
-#: before `response=` / `Signature=` run past 1,000 characters is quoted whole, secret included —
-#: measured at 04c620b9, a `uri="/x?<973 q>"` (1,000 characters after `Digest `) is withheld and
-#: `<974 q>` leaves the response raw (review on 34209477).
+#: with a parameter list not named here is not read. From the scheme to its secret parameter the
+#: list is READ AS PAIRS (`_PARAMETER_PAIRS`), `name=value` or `name="value"` each followed by a
+#: comma, as both RFCs write it — not scanned. A free scan read to the end of the line from every
+#: `Digest`: one 400 KB line of prose with `Digest` every ~80 characters took 11.29 s (review on
+#: cfe48e02). Bounded at 1,000 characters it took 0.09 s, and a header whose parameters before
+#: `response=` / `Signature=` ran past 1,000 characters was quoted whole, secret included (review on
+#: 34209477; #198). Read as pairs there is no bound: a quoted value stops at its closing quote, an
+#: unquoted one at whitespace, a comma or a quote, and the scan from a `Digest` ends at the first
+#: token that is not a pair — on prose, the word after the scheme. Measured on this commit with
+#: `.venv/bin/python`, on a 400 KB line of prose with `Digest ` every 80 characters: 0.01 s read
+#: as pairs, 0.055 s with the 1,000-character bound (three runs each), and a 1,500-character
+#: `uri=` (a comma inside its quotes) before the response is withheld. THE COST, ACCEPTED: a
+#: header written without commas between its parameters, or with a parameter that is not
+#: `name=value`, is not read past that point, and its secret is quoted as written.
+_PARAMETER_PAIRS = (
+    r"(?:[\w-]+[ \t]*=[ \t]*(?:\"[^\"\n]*\"|[^\s,\"]*)[ \t]*,[ \t]*)*?"
+)
 _SIGNED_PARAMETER = re.compile(
-    r"(\bDigest[ \t]+[^\n]{0,1000}?\bresponse[ \t]*=[ \t]*\"?)[0-9a-f]{32,}"
-    r"|(\bAWS4-HMAC-SHA256[ \t]+[^\n]{0,1000}?\bSignature[ \t]*=[ \t]*)[0-9a-f]{64}", re.IGNORECASE)
+    r"(\bDigest[ \t]+" + _PARAMETER_PAIRS + r"\bresponse[ \t]*=[ \t]*\"?)[0-9a-f]{32,}"
+    r"|(\bAWS4-HMAC-SHA256[ \t]+" + _PARAMETER_PAIRS
+    + r"\bSignature[ \t]*=[ \t]*)[0-9a-f]{64}", re.IGNORECASE)
+#: A SigV4 PRESIGNED URL's signature, which rides in the query string (`…&X-Amz-Signature=<64
+#: hex>`), where `_SIGNED_PARAMETER`'s space after the scheme never stands (#198). Measured before
+#: this shape on a synthetic presigned URL: the signature came back unchanged. Exactly 64 hex, so
+#: "X-Amz-Signature=deadbeef is too short to be one" and "appends X-Amz-Signature= to the query"
+#: are prose. `X-Amz-Credential=` is a key id and a scope, quoted as written (see
+#: `_SECRET_NAMED_VALUE`). THE COST, ACCEPTED: a signature that is not 64 hex is not read.
+_PRESIGNED_SIGNATURE = re.compile(r"(\bX-Amz-Signature=)[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
 #: An environment variable whose value is a secret, by its name.
 _SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|PRIVATE|CREDENTIAL|KEY_CONTENT", re.I)
+#: The value after a SECRET-NAMED name — an assignment (`export OPENAI_API_KEY=…`, `password=…`),
+#: a header (`X-Api-Key: …`, `Api-Key: …`) or a JSON key (`"api_key": "…"`), after `=` or `:` —
+#: when it carries a credential's mark (`_MARKED_VALUE`, the header form's floor). The name is
+#: `_SECRET_NAME`'s words (`PASSW` reads `password` and `passwd`) plus the hyphenated `API-KEY` a
+#: header writes; `_SECRET_NAME` itself is not widened, because it also picks this process's own
+#: variables. Only the value is withheld. Measured before this shape on this file's synthetic
+#: values (#198): each of those forms came back unchanged, since no vendor prefix was in it. The
+#: floor is what keeps prose: "password= is required", "password: required for login",
+#: "X-Api-Key: required on every call" and "token_env: ADO_FOR_THIS_CLIENT" carry no mark, and
+#: `$` is outside the alphabet, so "export OPENAI_API_KEY=$OPENAI_API_KEY" names a variable. A
+#: name that is `Credential` or ends in `Amz-Credential` is quoted as written: SigV4's credential
+#: is an access-key id and a scope (`AKIDEXAMPLE/20261021/…`), no secret, and its digits would
+#: carry the mark. The name is BOUNDED at 64 characters on each side of the secret word and must
+#: start where a name can, so a long hyphenated line is read once, not once per character. THE
+#: COST, ACCEPTED: a secret-named value with no mark is quoted as written; a value with one is
+#: withheld even when it is no secret (an 8-digit count under `max_tokens:`); a name longer than
+#: the bound is not read; a URL-encoded value (`X-Amz-Security-Token=…%2F…`) is withheld only up to
+#: its first `%`; a value written with a space or `$` in it is not read.
+_SECRET_NAMED_VALUE = re.compile(
+    r"(?<![\w-])([\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\w-]{0,64})"
+    r"([\"']?[ \t]*[:=][ \t]*[\"']?)" + _MARKED_VALUE, re.IGNORECASE)
 WITHHELD_CREDENTIAL = "[credential withheld]"
 
 
 def scrub_credentials(text: str, *, userinfo: str = "") -> str:
     """`text` with every credential this process holds, and every credential-shaped string —
-    a token by its prefix, the value of an `Authorization` header, a `Digest` response or a SigV4
-    signature — withheld. A facts file is read
+    a token by its prefix, the value of an `Authorization` header (after a named scheme or none), a
+    `Digest` response, a SigV4 signature (in a header or a presigned URL), and the value under a
+    secret-named name (`password=…`, `X-Api-Key: …`) — withheld. A facts file is read
     by a model and written to a workspace; a token in one is a token handed to whatever reads that
     directory. The pull request body quotes the agent through it too (#885).
 
@@ -372,12 +432,24 @@ def scrub_credentials(text: str, *, userinfo: str = "") -> str:
     text = _USERINFO.sub(lambda m: m.group(0) if userinfo and m.group(0)[len(m.group(1)):] == "git@"
                          else m.group(1) + userinfo, text)
     text = _AUTHORIZATION.sub(lambda m: (m.group(1) or m.group(2)) + WITHHELD_CREDENTIAL, text)
+    text = _SCHEMELESS_AUTHORIZATION.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)
     text = _SIGNED_PARAMETER.sub(lambda m: (m.group(1) or m.group(2)) + WITHHELD_CREDENTIAL, text)
+    text = _PRESIGNED_SIGNATURE.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)
+    text = _SECRET_NAMED_VALUE.sub(_secret_named_value_withheld, text)
     text = _CREDENTIAL_SHAPES.sub(WITHHELD_CREDENTIAL, text)
     for secret in _secrets_of_this_process():
         if secret in text:
             text = text.replace(secret, WITHHELD_CREDENTIAL)
     return text
+
+
+def _secret_named_value_withheld(m: re.Match) -> str:
+    """A secret-named name and its separator, the value withheld — unless the name is SigV4's
+    `Credential`, a key id and a scope, quoted as written."""
+    name = m.group(1).lower()
+    if name == "credential" or name.endswith("amz-credential"):
+        return m.group(0)
+    return m.group(1) + m.group(2) + WITHHELD_CREDENTIAL
 
 
 def _secrets_of_this_process() -> list[str]:

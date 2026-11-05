@@ -20,6 +20,15 @@ Claims:
   - a `Digest` or SigV4 header withholds its `response=` / `Signature=` only, and keeps the rest
     of its parameter list as written (never the marker on the first parameter's name), and a
     SHA-256 response (64 hex) whole, not its first 32;
+  - an `Authorization` value with NO scheme is withheld only when it is 16 token68 characters
+    with a digit, and never `AWS4-HMAC-SHA256`, the SigV4 scheme word (#198);
+  - the value under a secret-named name (`_SECRET_NAME`'s words plus a header's `API-KEY`) is
+    withheld after `=` or `:`, with the header form's credential's mark (`_MARKED_VALUE`, written
+    once), the name and separator kept; SigV4's `Credential` and `X-Amz-Credential` are quoted as
+    written (#198);
+  - a presigned URL's `X-Amz-Signature=<64 hex>` is withheld (#198);
+  - a `Digest` / SigV4 parameter list is read as comma-separated `name=value` pairs, so a header
+    longer than 1,000 characters is withheld and a `response=` after a prose word is not (#198);
   - the userinfo pattern needs its `@`, so a URL with no userinfo keeps its host, and a userinfo of
     exactly `git` (an SSH remote's user) is no credential;
   - the platform's `_redact` regex (https userinfo only) is no substitute;
@@ -77,7 +86,9 @@ MUTATIONS = [
      '    r"|(\\bBearer[ \\t]+)[\\w.~+/-]+=*", re.IGNORECASE)\n', PROSE),
     # re-pinned 2026-10-21: the header value moved to its own line with the credential's mark;
     # re-pinned again: `+` and `/` left the mark set (review on cfe48e02); and again: `=` counts
-    # only as trailing padding (review on 34209477)
+    # only as trailing padding (review on 34209477). #198: the same line is now `_MARKED_VALUE`,
+    # which the secret-named shape reads too; the anchor is unchanged, so this cut and the two
+    # below cut both shapes at once
     ("a variable reference is read as a value", MODEL,
      '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/-]{8,}=*"\n',
      '    r"(?=[\\w.~+/$-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/$-]{8,}=*"\n', PROSE),
@@ -141,6 +152,46 @@ MUTATIONS = [
     ("AWS4-HMAC-SHA256 is read as a one-token scheme, its first parameter's name withheld", MODEL,
      '(?:Bearer|Basic|token|Bot|Negotiate|NTLM)',
      '(?:Bearer|Basic|token|Bot|Negotiate|NTLM|AWS4-HMAC-SHA256)'),
+    # ── #198: the shapes another machine's credential takes ──────────────────────────────────────
+    ("a scheme-less Authorization value is quoted", MODEL,
+     "    text = _SCHEMELESS_AUTHORIZATION.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)\n",
+     ""),
+    ("a scheme-less Authorization value needs no digit", MODEL,
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{16,}=*", re.IGNORECASE)\n',
+     '    r"[\\w.~+/-]{16,}=*", re.IGNORECASE)\n', PROSE),
+    ("a scheme-less Authorization value needs 8 characters, not 16", MODEL,
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{16,}=*", re.IGNORECASE)\n',
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{8,}=*", re.IGNORECASE)\n', PROSE),
+    ("the SigV4 scheme word is read as a scheme-less value", MODEL,
+     "(?!AWS4-HMAC-SHA256\\b)", ""),
+    ("a hyphenated Api-Key header is not secret-named", MODEL, "|API-KEY)", ")"),
+    ("a secret-named value is quoted", MODEL,
+     "    text = _SECRET_NAMED_VALUE.sub(_secret_named_value_withheld, text)\n", ""),
+    ("a secret-named value needs no credential's mark", MODEL,
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)" + _MARKED_VALUE, re.IGNORECASE)\n',
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\']?)[\\w.~+/-]{8,}=*", re.IGNORECASE)\n', PROSE),
+    ("a secret-named name is read with no bound on its length", MODEL,
+     '    r"(?<![\\w-])([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n',
+     '    r"([\\w-]*?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]*)"\n'),
+    ("a secret-named name is read from any character, not where a name starts", MODEL,
+     '    r"(?<![\\w-])([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n',
+     '    r"([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n'),
+    ("SigV4's Credential header parameter is withheld", MODEL,
+     'if name == "credential" or name.endswith("amz-credential"):',
+     'if name.endswith("amz-credential"):'),
+    ("a presigned URL's X-Amz-Credential is withheld", MODEL,
+     'if name == "credential" or name.endswith("amz-credential"):',
+     'if name == "credential":', PROSE),
+    ("a presigned URL's signature is quoted", MODEL,
+     "    text = _PRESIGNED_SIGNATURE.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)\n", ""),
+    ("a parameter list is scanned to 1,000 characters, not read as pairs", MODEL,
+     '    r"(?:[\\w-]+[ \\t]*=[ \\t]*(?:\\"[^\\"\\n]*\\"|[^\\s,\\"]*)[ \\t]*,[ \\t]*)*?"\n',
+     '    r"[^\\n]{0,1000}?"\n'),
+    ("a parameter list is scanned freely, not read as pairs", MODEL,
+     '    r"(?:[\\w-]+[ \\t]*=[ \\t]*(?:\\"[^\\"\\n]*\\"|[^\\s,\\"]*)[ \\t]*,[ \\t]*)*?"\n',
+     '    r"[^\\n]*?"\n'),
+    ("a quoted parameter value ends at a comma inside its quotes", MODEL,
+     '(?:\\"[^\\"\\n]*\\"|', '(?:\\"[^\\",\\n]*\\"|'),
     ("a URL with no userinfo loses its host", MODEL,
      '_USERINFO = re.compile(r"(\\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\\s/@]+@")\n',
      '_USERINFO = re.compile(r"(\\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\\s/@]+")\n', PROSE),
