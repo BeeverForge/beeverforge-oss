@@ -493,9 +493,21 @@ def _cache_key_held(repo_path: Path):
     from beeverforge.runtime.repo_cache import _key_lock
 
     lock = _key_lock(repo_path.parent, repo_path.name)
-    if not os.path.isfile(lock.path):
+    # ABSENT IS NOT UNREADABLE (docs/engineering-lessons.md §2). `isfile` answered False for both,
+    # so a `.locks` this process could not search (the panel and the worker sharing a volume, as
+    # `_key_lock`'s docstring says) let the add run unlocked, silently. Only "no such file" means
+    # this is not a cache checkout; anything else refuses the add by name.
+    try:
+        os.stat(lock.path)
+    except (FileNotFoundError, NotADirectoryError):
         yield
         return
+    except OSError as exc:
+        raise RuntimeError(
+            f"the worktree was not added to {repo_path}: whether it is a repository cache "
+            f"checkout could not be read, because its lock {lock.path} could not be checked "
+            f"({exc.strerror or exc}). Give this process permission to search "
+            f"{Path(lock.path).parent} and read {lock.path}, then retry.") from exc
     try:
         lock.acquire(timeout=_CACHE_LOCK_WAIT_SECONDS)
     except Waited as exc:

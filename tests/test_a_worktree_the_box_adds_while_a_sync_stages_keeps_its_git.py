@@ -289,6 +289,34 @@ def test_a_repository_registered_by_path_takes_no_cache_lock(
     assert not (repo.parent / repo_cache._LOCKS_DIRNAME).exists()
 
 
+def test_a_lock_that_cannot_be_checked_refuses_the_add_rather_than_run_it_unlocked(
+        tmp_path, origin, monkeypatch):
+    """Absent is not unreadable (review of #456): a served checkout whose key lock this process
+    cannot stat — a `.locks` it may not search, on a volume the panel and the worker share — is
+    refused by name, with the lock's path and the permission to give, and nothing is added. It is
+    never taken for a repository registered by path and added unlocked."""
+    cache = RepoCache(root=tmp_path / "cache")
+    served = cache.sync("p", origin.url, "main")
+    assert served is not None
+    lock_path = str(repo_cache._key_lock(served.parent, served.name).path)
+    assert os.path.isfile(lock_path), "the setup is a served checkout with its key lock"
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path) == lock_path:
+            raise PermissionError(13, "Permission denied", lock_path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree.os, "stat", stat)
+    with pytest.raises(RuntimeError) as refused:
+        WorktreeSandbox(root=tmp_path / "jobs").prepare(
+            repo_path=served, base_branch="main", branch=BRANCH)
+    said = str(refused.value)
+    assert lock_path in said and "permission" in said.lower(), said
+    assert not (served / ".git" / "worktrees").exists() or not any(
+        (served / ".git" / "worktrees").iterdir()), "a worktree was added unlocked"
+
+
 def test_a_cache_key_held_past_the_wait_refuses_the_add_and_says_why(
         tmp_path, origin, monkeypatch):
     """No deadlock and no silent unlocked add: a key lock somebody else holds past the wait refuses
