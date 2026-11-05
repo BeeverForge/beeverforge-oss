@@ -28,7 +28,8 @@ AND SIX MORE, FROM THE REVIEW OF THE FIRST CUT:
      own second push still lands. A refused lease first keeps the forge's tip on
      `<branch>-kept-<sha>` (never forced), says so on the card and in the journal, and pushes again
      leased on that tip, at every push of the job's branch (`_publish`); only when the keep fails
-     or the branch moves again does the job hold, naming the branch.
+     or the branch moves again does the job hold, naming the branch. The rate-limit pause's
+     preserve goes through it too; a pause whose push was refused carries no handle and says so.
   9. **What a gate printed notifies nobody**: indented, and with `#12` written `card 12`.
  10. **Resume continues from the forge's branch**, a person's fix on it included.
 
@@ -264,10 +265,11 @@ MUTATIONS = [
      '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--", target,\n',
      '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--force", "--", target,\n'),
 
+    # re-pinned with the line above it: the pause's refusal says itself on the card too
     ("the card is not told where the forge's commits went",
      MACHINE,
-     "        self._say_on_ticket(ticket.id, said)\n",
-     ""),
+     "        self._emit(ticket, \"note\", said, kept=kept)\n        self._say_on_ticket(ticket.id, said)\n",
+     "        self._emit(ticket, \"note\", said, kept=kept)\n"),
 
     ("the journal is not told where the forge's commits went",
      MACHINE,
@@ -318,6 +320,31 @@ MUTATIONS = [
      MACHINE,
      "            refused = self._publish(ticket, ws, ws.branch)\n",
      "            refused = self.sandbox.publish_branch(workspace=ws)\n"),
+
+    ("THE FINDING: the rate-limit pause's preserve goes around `_publish`, so a branch an earlier "
+     "park left refuses it and the partial work is lost",
+     MACHINE,
+     "            if refused := self._publish(ticket, ws, ws.branch):\n",
+     "            if refused := self.sandbox.publish_branch(workspace=ws,\n"
+     "                                                      remote_url=self.forge.push_remote()):\n"),
+
+    ("a pause whose push was refused still hands back the handle, for a branch it never pushed",
+     MACHINE,
+     "                return None  # no branch pushed → the resume must NOT try to check it out\n"
+     "            self._emit(ticket, \"note\", \"partial work pushed — resume will continue it\")",
+     "                return resume_handle\n"
+     "            self._emit(ticket, \"note\", \"partial work pushed — resume will continue it\")"),
+
+    ("a pause whose push was refused says its resume continues from the forge's branch",
+     MACHINE,
+     "{refused.removesuffix(_resume_from_the_forge(branch))} The \"",
+     "{refused} The \""),
+
+    ("a pause whose push was refused says nothing on the card",
+     MACHINE,
+     "                self._say_on_ticket(ticket.id, said)\n"
+     "                return None  # no branch pushed",
+     "                return None  # no branch pushed"),
 
     # ── claim 9: nobody is notified ───────────────────────────────────────────────────────────
     ("THE FINDING: the indent goes, so an `@someone` the gate printed notifies them",

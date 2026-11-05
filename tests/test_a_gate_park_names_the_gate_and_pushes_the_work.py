@@ -499,6 +499,60 @@ def test_a_gate_park_that_cannot_keep_the_forges_commits_says_nothing_was_pushed
     assert result.resume_handle
 
 
+class _WritesThenHitsTheLimit:
+    """Writes part of the feature, then pauses on a rate limit with a session to continue."""
+
+    def execute(self, *, sandbox, workspace, context) -> AgentRunResult:
+        (workspace.path / "feature.py").write_text("HALF_DONE = 1\n")
+        return AgentRunResult(ok=False, pause_reason="rate_limit", retry_at="16:00",
+                              resume_handle="sess-abc")
+
+    def repair(self, *, sandbox, workspace, context, failure_log) -> AgentRunResult:
+        return AgentRunResult(ok=True)
+
+
+def test_a_rate_limit_pause_keeps_a_commit_it_did_not_make_and_pushes_its_own(repo, tmp_path):
+    """The pause's preserve pushed around `_publish`: on a fresh start its lease refused a branch
+    an earlier park had left, the pause returned no handle, and the resume prepared from the base
+    with `branch -D` — the agent's partial work gone. It goes through the one door now."""
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1124", "person")
+    tracker = _tracker("1124")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
+                           agent=_WritesThenHitsTheLimit())
+    result = runner.run("#1124")
+
+    assert result.state is JobState.PAUSED, result.note
+    assert _kept(tmp_path, "beeverforge/1124", theirs) == theirs, "the person's commit is lost"
+    assert _holds_the_runs_work(tmp_path, "beeverforge/1124"), "the partial work was not pushed"
+    assert result.resume_handle == "sess-abc", "the pause carries no way back into its work"
+    assert _names_the_kept_branch(tracker.comments, "beeverforge/1124", theirs), tracker.comments
+
+
+def test_a_rate_limit_pause_that_cannot_keep_the_forges_commits_hands_back_no_handle(
+        repo, tmp_path):
+    """Nothing pushed is nothing to continue: the pause says why, and carries no handle that would
+    make the resume check out a branch this run never pushed."""
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1125", "person")
+    planted = _a_person_pushes(tmp_path, f"beeverforge/1125-kept-{theirs[:12]}", "planted")
+    events = InMemoryEventSink()
+    tracker = _tracker("1125")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
+                           agent=_WritesThenHitsTheLimit(), events=events)
+    result = runner.run("#1125")
+
+    assert result.state is JobState.PAUSED, result.note
+    assert _origin_tip(tmp_path, "beeverforge/1125") == theirs, "the person's commit was replaced"
+    assert _kept(tmp_path, "beeverforge/1125", theirs) == planted
+    assert result.resume_handle is None
+    said = [e.message for e in events.events]
+    assert not any("partial work pushed" in m for m in said), said
+    warned = [m for m in said if "couldn't preserve partial work" in m]
+    assert warned and "keeping a copy of them first failed" in warned[0], said
+    assert "the resume starts fresh from the base" in warned[0], warned
+    assert "Resume continues from the forge" not in warned[0], warned
+    assert any("Nothing was pushed" in c for c in tracker.comments), tracker.comments
+
+
 class _APersonPushesDuringTheRepair:
     """A CI-repair agent that fixes the check while a person pushes to the same branch."""
 

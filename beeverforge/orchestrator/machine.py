@@ -337,9 +337,22 @@ def _lease_refused_said(branch: str, *, kept: str = "", keeping_failed: bool = F
     else:
         why = "so this run's push was refused rather than replace them"
     return (f"`{branch}` on the forge has commits this run did not start from — a person's fix, "
-            f"or the work an earlier park left there — {why}. Resume continues from the "
-            f"forge's `{branch}`, dropping this run's own commits; if nothing on it is wanted, "
-            f"delete `{branch}` on the forge first, and Resume starts fresh from the base.")
+            f"or the work an earlier park left there — {why}.{_resume_from_the_forge(branch)}")
+
+
+def _resume_from_the_forge(branch: str) -> str:
+    """What a Resume of a hold refused by the lease does (#11) — not what a pause's does, whose
+    resume carries no handle and starts from the base (`_preserve_partial`)."""
+    return (f" Resume continues from the forge's `{branch}`, dropping this run's own commits; if "
+            f"nothing on it is wanted, delete `{branch}` on the forge first, and Resume starts "
+            f"fresh from the base.")
+
+
+def _pause_refused_said(branch: str, refused: str) -> str:
+    """What a rate-limit pause whose push `_publish` refused says (#11): why, and that its resume
+    starts from the base — it carries no handle, so not what a refused hold's Resume does."""
+    return (f"Nothing was pushed: {refused.removesuffix(_resume_from_the_forge(branch))} The "
+            f"partial work is not on the forge, so the resume starts fresh from the base.")
 
 
 def _where_the_work_is(branch: str, outcome: str, kept: Path | None = None,
@@ -3419,12 +3432,22 @@ class JobRunner:
         (a fresh, ephemeral container) can restore it via checkout_existing. Returns the opaque
         resume_handle to round-trip — but only if the partial was actually preserved, so a
         resume never checks out a branch that was never pushed. Best-effort: any failure just
-        degrades to a fresh restart (today's behaviour), never crashes the pause."""
+        degrades to a fresh restart (today's behaviour), never crashes the pause.
+
+        THE PUSH GOES THROUGH `_publish` (#11), like every other push of the job's branch. On a
+        fresh start the lease is the empty tip, so a branch an earlier park left on the forge
+        refused this push; the pause handed back no handle and the resume prepared from the base,
+        dropping the agent's partial work. Now the forge's tip is kept on a branch of its own and
+        the push lands; only when that fails too is nothing pushed — said, and no handle."""
         if ws is None:
             return resume_handle  # local/test path with no real git remote — nothing to push
         try:
             self._commit(ws, ticket)  # commit the partial tree (no-op if the agent wrote nothing)
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            if refused := self._publish(ticket, ws, ws.branch):
+                said = _pause_refused_said(ws.branch, refused)
+                self._emit(ticket, "warning", f"couldn't preserve partial work — {said}")
+                self._say_on_ticket(ticket.id, said)
+                return None  # no branch pushed → the resume must NOT try to check it out
             self._emit(ticket, "note", "partial work pushed — resume will continue it")
             return resume_handle
         except Exception as exc:  # noqa: BLE001 — preserving is opportunistic; never fail the pause
