@@ -81,6 +81,14 @@ AWS_SIGNATURE = "5d672d79" + "c15b1316" + "2d9279b0" + "855cfba6" * 2 + "789a8ed
 DB_PASSWORD = "q7" + "hunter" * 3
 OPAQUE = "q7" + "OPAQUE" * 5
 LINK_PASSWORD = "q7" + "linkpw" * 3
+#: Passwords written with punctuation, as a password usually is (review of PR #445): at d32308a the
+#: value was read only through a header value's alphabet, `[\w.~+/-]`, so the run before the first
+#: `!` or `&` was withheld and the rest published — or, under 8 characters, nothing was withheld.
+PUNCTUATED_PASSWORD = "Pa55word" + "!Secret#xyz"
+AMPERSAND_PASSWORD = "Tr0ub4dor" + "&3horse"
+QUOTED_PASSWORD = "hunter2" + "!Abcdef9"
+#: A passphrase, read to its closing quote, spaces included.
+PASSPHRASE = "correct horse " + "battery 9staple"
 #: A key of this process, PEM-shaped: three lines, its body a line no shape would catch alone.
 KEY_BODY = "MIIEv" + "q7KEYBODY" * 6
 PEM = "-----BEGIN " + "PRIVATE KEY-----\n" + KEY_BODY + "\n-----END " + "PRIVATE KEY-----"
@@ -251,15 +259,33 @@ def test_a_signed_headers_parameter_list_is_read_pair_by_pair_not_scanned():
     (f"{SENTINEL}: the bed connects with password={DB_PASSWORD} today", DB_PASSWORD, "password="),
     (f"{SENTINEL}: the config reads passwd: {DB_PASSWORD} now", DB_PASSWORD, "passwd:"),
     (f'{SENTINEL}: the client sends {{"api_key": "{OPAQUE}"}}', OPAQUE, '"api_key":'),
+    (f"{SENTINEL}: the bed connects with password={PUNCTUATED_PASSWORD} today",
+     PUNCTUATED_PASSWORD, "password="),
+    (f"{SENTINEL}: the config reads passwd: {AMPERSAND_PASSWORD} now", AMPERSAND_PASSWORD,
+     "passwd:"),
+    (f'{SENTINEL}: the env file sets DB_PASSWORD="{QUOTED_PASSWORD}" for the bed', QUOTED_PASSWORD,
+     'DB_PASSWORD="'),
+    (f'{SENTINEL}: the env file sets DB_PASSWORD="{PASSPHRASE}" for the bed', PASSPHRASE,
+     'DB_PASSWORD="'),
+    (f"{SENTINEL}: the client sends {{'password': '{PASSPHRASE}'}}", PASSPHRASE, "'password':"),
+    # a query string's next `name=` ends the value before it, so SigV4's credential (quoted as
+    # written) does not carry the session token after it into the quote
+    (f"{SENTINEL}: fetched https://bucket.s3.example.test/k?X-Amz-Credential=AKIDEXAMPLE"
+     f"&X-Amz-Security-Token={OPAQUE}&X-Amz-Date=20261021T000000Z", OPAQUE,
+     "X-Amz-Credential=AKIDEXAMPLE&X-Amz-Security-Token="),
 ], ids=["x-api-key", "api-key", "export-openai", "password-equals", "passwd-colon",
-        "json-api-key"])
+        "json-api-key", "punctuated-password", "ampersand-passwd", "quoted-short-run-password",
+        "double-quoted-passphrase", "single-quoted-passphrase", "presigned-security-token"])
 def test_a_secret_named_value_in_the_agents_message_is_withheld_and_the_body_says_so(
         repo: Path, tmp_path: Path, said: str, secret: str, kept: str):
     """#198, measured at an older commit: none of these values carries a vendor prefix or follows
     a named `Authorization` scheme, and each came back unchanged. The value is withheld; its name
-    and its `=` or `:` are quoted as written."""
+    and its `=` or `:` are quoted as written. The WHOLE value is withheld: no run of it between
+    its punctuation is shown either (review of PR #445)."""
     quote = _assert_withheld_and_said(_opened(repo, tmp_path, _Says(said)), secret)
     assert kept in _shown(quote), f"the name the value was under was not quoted: {quote}"
+    for part in re.split(r"[^A-Za-z0-9]+", secret):
+        assert not part or part not in _shown(quote), f"part of the value was shown, {part!r}: {quote}"
 
 
 def test_a_secret_named_name_is_read_from_where_a_name_starts_and_within_its_bound():
@@ -407,6 +433,14 @@ NEAR_MISSES = [
     "X-Api-Key: required on every call",
     "token_env: ADO_FOR_THIS_CLIENT",
     "X-Amz-Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request",
+    # review of PR #445: a secret-named value is read to its natural end, `$`, `(`, `:` and `)`
+    # included — so a variable or a command whose name has a mark, a link, and a closing `)` or a
+    # full stop after a value with no mark stay prose
+    "export OPENAI_API_KEY=$OPENAI_API_KEY_2",
+    "TOKEN=$(cat ~/.token2)",
+    "the token: https://docs.example.test/auth2 explains it",
+    "the login form (password: required).",
+    'password: "required for login"',
     # #198: the presigned URL's parameter named, and a value too short to be a signature
     "the SDK appends X-Amz-Signature= to the query string",
     "X-Amz-Signature=deadbeef is too short to be one",

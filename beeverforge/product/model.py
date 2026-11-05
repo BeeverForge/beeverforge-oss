@@ -327,10 +327,11 @@ _USERINFO = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/@]+@")
 #: (seed 885, 200,000 values per length): 1.52% of 8-character values carry no mark (0.88% had a
 #: `+` or `/`), 0.12% of 12-character ones, 0.007% of 16, 0.0005% of 20, none of 32. Hex with a
 #: digit and JWTs always carry one.
-#: The same floor is read by a secret-named value (`_SECRET_NAMED_VALUE`, #198), so it is written
-#: once.
+#: The case pair is shared with a secret-named value (`_SECRET_NAMED_VALUE`, #198), which reads
+#: the same floor over a wider value, so it is written once.
+_CASE_PAIR = r"(?-i:[a-z][A-Z])"
 _MARKED_VALUE = (
-    r"(?=[\w.~+/-]*(?:\d|=+(?!\.?[\w~+/-])|(?-i:[a-z][A-Z])))[\w.~+/-]{8,}=*"
+    r"(?=[\w.~+/-]*(?:\d|=+(?!\.?[\w~+/-])|" + _CASE_PAIR + r"))[\w.~+/-]{8,}=*"
 )
 _AUTHORIZATION = re.compile(
     r"(\bAuthorization[\"']?\s*[:=]\s*[\"']?(?:Bearer|Basic|token|Bot|Negotiate|NTLM)[ \t]+)"
@@ -391,25 +392,59 @@ _PRESIGNED_SIGNATURE = re.compile(r"(\bX-Amz-Signature=)[0-9a-f]{64}(?![0-9a-f])
 _SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|PRIVATE|CREDENTIAL|KEY_CONTENT", re.I)
 #: The value after a SECRET-NAMED name — an assignment (`export OPENAI_API_KEY=…`, `password=…`),
 #: a header (`X-Api-Key: …`, `Api-Key: …`) or a JSON key (`"api_key": "…"`), after `=` or `:` —
-#: when it carries a credential's mark (`_MARKED_VALUE`, the header form's floor). The name is
-#: `_SECRET_NAME`'s words (`PASSW` reads `password` and `passwd`) plus the hyphenated `API-KEY` a
-#: header writes; `_SECRET_NAME` itself is not widened, because it also picks this process's own
-#: variables. Only the value is withheld. Measured before this shape on this file's synthetic
-#: values (#198): each of those forms came back unchanged, since no vendor prefix was in it. The
-#: floor is what keeps prose: "password= is required", "password: required for login",
-#: "X-Api-Key: required on every call" and "token_env: ADO_FOR_THIS_CLIENT" carry no mark, and
-#: `$` is outside the alphabet, so "export OPENAI_API_KEY=$OPENAI_API_KEY" names a variable. A
-#: name that is `Credential` or ends in `Amz-Credential` is quoted as written: SigV4's credential
-#: is an access-key id and a scope (`AKIDEXAMPLE/20261021/…`), no secret, and its digits would
-#: carry the mark. The name is BOUNDED at 64 characters on each side of the secret word and must
-#: start where a name can, so a long hyphenated line is read once, not once per character. THE
-#: COST, ACCEPTED: a secret-named value with no mark is quoted as written; a value with one is
-#: withheld even when it is no secret (an 8-digit count under `max_tokens:`); a name longer than
-#: the bound is not read; a URL-encoded value (`X-Amz-Security-Token=…%2F…`) is withheld only up to
-#: its first `%`; a value written with a space or `$` in it is not read.
+#: when it carries a credential's mark. The name is `_SECRET_NAME`'s words (`PASSW` reads
+#: `password` and `passwd`) plus the hyphenated `API-KEY` a header writes; `_SECRET_NAME` itself is
+#: not widened, because it also picks this process's own variables. Only the value is withheld.
+#: Measured before this shape on this file's synthetic values (#198): each of those forms came
+#: back unchanged, since no vendor prefix was in it. A name that is `Credential` or ends in
+#: `Amz-Credential` is quoted as written: SigV4's credential is an access-key id and a scope
+#: (`AKIDEXAMPLE/20261021/…`), no secret, and its digits would carry the mark. The name is BOUNDED
+#: at 64 characters on each side of the secret word and must start where a name can, so a long
+#: hyphenated line is read once, not once per character.
+#:
+#: The value is read TO ITS NATURAL END (`_WHOLE_VALUE`), not through a header value's alphabet: a
+#: password is written with punctuation. Measured at d32308a, read through `_MARKED_VALUE`'s
+#: `[\w.~+/-]` (review of PR #445): `password=Pa55word!Secret#xyz` came back as
+#: `password=[credential withheld]!Secret#xyz`, `passwd: Tr0ub4dor&3horse` as
+#: `passwd: [credential withheld]&3horse`, and `DB_PASSWORD="hunter2!Abcdef9"` unchanged — the run
+#: before `!` is 7 characters. Now a value that opened with a quote is read to the matching closing
+#: quote on the same line (spaces included); any other value — or one whose quote never closes on
+#: its line — to whitespace, `,`, `;`, a quote or a backtick (a Markdown code span's end), or an
+#: `&` that starts another `name=` (a query string's next parameter, so `X-Amz-Credential=…&X-Amz-
+#: Security-Token=…` still reads the token). The floor is the header form's, on the WHOLE value: 8
+#: characters at least, and a digit, a lowercase letter followed by an uppercase one, or one or
+#: two `=` of padding at its end; the whole value is withheld. What keeps prose: "password= is
+#: required", "password: required for login", "X-Api-Key: required on every call" and "token_env:
+#: ADO_FOR_THIS_CLIENT" carry no mark; a value that starts with `$` is a variable or a command
+#: (`export OPENAI_API_KEY=$OPENAI_API_KEY_2`, `TOKEN=$(cat ~/.token2)`), and one that starts with
+#: a URL scheme is a link (`token: https://docs.example.test/auth2`), whose userinfo `_USERINFO`
+#: reads. A sentence's full stop or a closing `)` right after an unquoted value is READ AS PART OF
+#: IT and withheld with it: a password may end in either, and showing its last character is
+#: showing part of it, so the prose loses its stop instead. The scan stays linear: the mark is
+#: looked for in the value's first 64 characters, a quoted value never crosses a line, and no
+#: unbounded quantifier is nested in another. Measured on this change with `.venv/bin/python`, on
+#: `password=` repeated with nothing between (every occurrence a name, no mark): 0.13 s for 200 KB,
+#: 0.26 s for 400 KB, 0.51 s for 800 KB (best of three; 0.04 / 0.08 / 0.15 s through the old
+#: alphabet); an unclosed quote before 400 KB, 0.05 s.
+#: THE COST, ACCEPTED: a secret-named value with no mark in its first 64 characters is quoted as
+#: written; a value with one is withheld even when it is no secret (an 8-digit count under
+#: `max_tokens:`, quoted prose with a digit in it such as `password: "at least 8 characters"`, a
+#: Windows path); an unquoted value is withheld up to its natural end, so text written against it
+#: with no space (`secret:Abc12345.Next`, `password=Secret12&next` with no `=` after the `&`'s
+#: word) is withheld with it, and so is a sentence's full stop or `)` after it; a name longer than
+#: the bound is not read; a value that starts with `$` or a URL scheme is not read; an unquoted
+#: value with a space in it is read to its first space only.
+_VALUE_CHAR = r"(?:[^\s,;\"'`&]|&(?![\w-]{1,64}=))"
+_WHOLE_VALUE = (
+    r"(?![$])(?![a-z][a-z0-9+.-]{0,31}://)(?:"
+    r"(?<=\")(?=[^\"\n]{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}\"))[^\"\n]{8,}(?=\")"
+    r"|(?<=')(?=[^'\n]{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}'))[^'\n]{8,}(?=')"
+    r"|(?=" + _VALUE_CHAR + r"{0,64}?(?:\d|" + _CASE_PAIR + r"|={1,2}[.)]{0,2}(?!" + _VALUE_CHAR
+    + r")))" + _VALUE_CHAR + r"{8,})"
+)
 _SECRET_NAMED_VALUE = re.compile(
     r"(?<![\w-])([\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\w-]{0,64})"
-    r"([\"']?[ \t]*[:=][ \t]*[\"']?)" + _MARKED_VALUE, re.IGNORECASE)
+    r"([\"']?[ \t]*[:=][ \t]*[\"']?)" + _WHOLE_VALUE, re.IGNORECASE)
 WITHHELD_CREDENTIAL = "[credential withheld]"
 
 
