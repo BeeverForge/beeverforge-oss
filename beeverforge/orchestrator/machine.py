@@ -493,10 +493,12 @@ def _review_lines(r: ReviewResult) -> list[str]:
 # cut break a secret that spans lines or straddles character 200. The claim says so.
 #
 # AND EVERYWHERE ELSE THE AGENT'S WORDS ARE QUOTED FOR A PERSON (#197): every journal note, every
-# `agent_action`, a review event's finding detail, and every hold, decision and assumption note
-# `_hold` and `_record_decision` post on the ticket pass the text through `_without_credentials`
-# whole, BEFORE their `[:N]`: `ghp_` and ten characters match no shape, so a scrub after the cut
-# shows the head of a token that straddles it. The activity payload (`agent_account`,
+# `agent_action`, a review event's finding detail, and every hold and assumption note `_hold`
+# posts on the ticket pass the text through `_without_credentials` whole, BEFORE their `[:N]`:
+# `ghp_` and ten characters match no shape, so a scrub after the cut shows the head of a token
+# that straddles it. The agent's DecisionRequest is withheld field by field as soon as it is
+# parsed (`_decision_withheld`), so the decision comment, the hold's reason and
+# `RunResult.decision` all carry it withheld. The activity payload (`agent_account`,
 # `agent_passes`) stays raw, because the body above is composed from it (ADR-0001, D-5).
 
 #: Withholding credentials made "as it wrote it." false on its own (#885): it says what was changed.
@@ -649,6 +651,21 @@ def _without_credentials(text: str) -> str:
     prefix, an `Authorization` value, a secret this process holds, and a URL's userinfo — replaced
     by the marker, not dropped, so the reader is told (#885)."""
     return scrub_credentials(text, userinfo=WITHHELD_CREDENTIAL + "@")
+
+
+def _decision_withheld(dr: DecisionRequest) -> DecisionRequest:
+    """The agent's DecisionRequest with every free-text field withheld, whole (#197): the question,
+    its context, and each option's label and consequence. It becomes `RunResult.decision`, which
+    the impediment payload, the panel's needs-you API and the coordinator's channel item quote, and
+    `_record_decision` posts it on the ticket. Each option's `key` and the `default` stay as
+    written: an answer is matched on them. `stage` is the machine's; `advice` is attached later."""
+    return dr.model_copy(update={
+        "question": _without_credentials(dr.question),
+        "context": _without_credentials(dr.context),
+        "options": [o.model_copy(update={"label": _without_credentials(o.label),
+                                         "consequence": _without_credentials(o.consequence)})
+                    for o in dr.options],
+    })
 
 
 def _quoted(text: str) -> list[str]:
@@ -1739,6 +1756,7 @@ class JobRunner:
             if not agent_result.ok and agent_result.pause_reason is None:
                 dr = parse_decision(agent_result.raw_output or agent_result.summary)
                 if dr is not None:
+                    dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
                     dr.stage = dr.stage or "execute"
                     self._record_decision(ticket, dr)
                     # ADR-0013 D1: the executor was told to leave the workspace continuable, and
@@ -1746,7 +1764,7 @@ class JobRunner:
                     handle = self._preserve_for_hold(ticket, ws, agent_result.resume_handle)
                     return self._hold(
                         ticket, owner,
-                        f"decision needed — {_without_credentials(dr.question)[:200]}",
+                        f"decision needed — {dr.question[:200]}",
                         JobState.BLOCKED, branch=branch, decision=dr, resume_handle=handle,
                         spent_turns=self._turns,
                     )
@@ -3236,10 +3254,11 @@ class JobRunner:
                 return self._hold(
                     ticket, owner, "the planner blocked but proposed no options — refine the "
                     "ticket or split it", JobState.NEEDS_REFINEMENT, branch=branch)
+            dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
             dr.stage = dr.stage or "plan"
             self._record_decision(ticket, dr)
             return self._hold(
-                ticket, owner, f"decision needed — {_without_credentials(dr.question)[:200]}",
+                ticket, owner, f"decision needed — {dr.question[:200]}",
                 JobState.BLOCKED, branch=branch, decision=dr)
         if status == "assume":
             am = re.search(r'"assumption"\s*:\s*"((?:[^"\\]|\\.){1,400})"', plan)
@@ -3268,8 +3287,6 @@ class JobRunner:
             + "\n".join(lines)
             + "\n\nAnswer on the panel, or in the project channel with `decision: <key>`."
         )
-        # the agent's question, context and options, whole: withheld as one text (#197)
-        body = _without_credentials(body)
         try:
             self.tracker.comment(ticket.id, body)
         except Exception as exc:  # noqa: BLE001 — recording is best-effort; the park still holds

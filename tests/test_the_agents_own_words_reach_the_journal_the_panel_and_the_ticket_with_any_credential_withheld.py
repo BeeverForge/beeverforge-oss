@@ -182,10 +182,14 @@ def _approved() -> ReviewResult:
 
 
 def _decision(question: str) -> str:
+    """A DecisionRequest with the token in every free-text field: the question, its context, and
+    each option's label and consequence. The keys carry none: an answer is matched on them."""
     return "```json\n" + json.dumps({
         "question": question,
-        "options": [{"key": "A", "label": "keep it", "consequence": "nothing moves"},
-                    {"key": "B", "label": "split it", "consequence": "two cards"}],
+        "context": f"the deploy key is {TOKEN}",
+        "options": [{"key": "A", "label": f"keep it ({TOKEN})",
+                     "consequence": f"nothing moves; {TOKEN} stays"},
+                    {"key": "B", "label": "split it", "consequence": f"two cards, {TOKEN}"}],
         "default": "A"}) + "\n```"
 
 
@@ -309,6 +313,26 @@ def test_a_hold_note_on_the_ticket_withholds_the_agents_credential(repo, tmp_pat
     (result, events, tracker), said = case(repo, tmp_path)
     _withheld(events, tracker, result, said=said)
     assert any(said in c for c in tracker.comments), f"no {said!r} on the ticket: {tracker.comments}"
+
+
+@pytest.mark.parametrize("case", [_executor_decision, _planner_decision],
+                         ids=["executor-decision", "planner-decision"])
+def test_the_decision_the_result_carries_withholds_the_agents_credential(repo, tmp_path, case):
+    """At 5055c6b `_hold(..., decision=dr)` carried the agent's DecisionRequest as written: it
+    becomes `RunResult.decision`, which the impediment payload, the panel's needs-you API and the
+    coordinator's channel item quote. Every free-text field withholds; the keys stay as written,
+    so an answer still matches."""
+    (result, events, tracker), _ = case(repo, tmp_path)
+    dr = result.decision
+    assert dr is not None, "the hold carried no decision — this case measures nothing"
+    assert HEAD not in dr.model_dump_json(), f"the agent's credential is on the decision: {dr}"
+    assert dr.question.startswith("x" * 100), dr.question
+    assert model.WITHHELD_CREDENTIAL in dr.question
+    assert dr.context == f"the deploy key is {model.WITHHELD_CREDENTIAL}", dr.context
+    assert [o.key for o in dr.options] == ["A", "B"] and dr.default == "A"
+    assert [o.label for o in dr.options] == [f"keep it ({model.WITHHELD_CREDENTIAL})", "split it"]
+    assert all(model.WITHHELD_CREDENTIAL in o.consequence for o in dr.options)
+    assert dr.option("b") is not None, "an answer no longer matches its option"
 
 
 def test_the_decision_comment_withholds_the_question_whole(repo, tmp_path):

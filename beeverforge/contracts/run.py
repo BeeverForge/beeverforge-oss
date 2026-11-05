@@ -335,7 +335,8 @@ class RunResult(BaseModel):
     #: and withholding here would make the body's withholding depend on the payload. The payload
     #: is kept in the workflow history, which only an operator reads; every place the agent's
     #: words are quoted for a person (the body, the journal and panel events, the ticket's hold
-    #: notes) withholds credentials itself (ADR-0001, D-5).
+    #: notes) withholds credentials itself (ADR-0001, D-5). `agent_account` and `agent_passes`
+    #: are the raw ones: `decision` below is NOT raw (#197).
     agent_account: str = ""
     agent_account_chars: int = 0
     agent_passes: list[PassAccount] = Field(default_factory=list)
@@ -422,6 +423,11 @@ class RunResult(BaseModel):
     # question + concrete options travel here so the workflow can surface them (panel/API) and
     # inject the picked option back on resume. None on a normal outcome. "No park without
     # options" (owner) — a bare state is never enough. See beeverforge/contracts/decision.py.
+    # WITHHELD, NOT RAW (#197): the agent writes the question, the context and each option's
+    # label and consequence, and from here they reach the impediment payload, the panel's
+    # needs-you API and the coordinator's channel item. `_decision_withheld` shows a credential
+    # in each as `[credential withheld]` before the hold; the keys and `default` stay as written,
+    # so an answer still matches.
     decision: DecisionRequest | None = None
     #: THE OUTCOMES THE BOX REACHED ON THE CARD, IN ORDER, AND DID NOT WRITE (ADR-0055 D7, #414):
     #: a pull request opened, a merge, a delivery, a refusal, a park. The worker that receives this

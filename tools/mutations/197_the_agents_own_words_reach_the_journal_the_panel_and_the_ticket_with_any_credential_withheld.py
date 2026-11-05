@@ -5,12 +5,14 @@ Claims:
   - every journal note that quotes the planner's, the executor's or a repair's words withholds a
     credential in them, on the whole text, BEFORE its `[:N]` cut;
   - every `agent_action` the harness reports reaches the journal withheld;
-  - every hold, decision and assumption note `_hold` and `_record_decision` post on the ticket
-    withholds it;
+  - every hold and assumption note `_hold` posts on the ticket withholds it;
+  - the agent's DecisionRequest is withheld field by field (question, context, each option's label
+    and consequence) before `_record_decision` posts it and `_hold` carries it into
+    `RunResult.decision`; its keys stay as written, so an answer still matches;
   - a review event's finding detail withholds it, in the description before its cut and in the file;
   - the activity payload (`agent_account`) stays raw.
 
-One row removes each new `_without_credentials` call; four rows move a scrub after its cut, which a
+One row removes each new `_without_credentials` call; three rows move a scrub after its cut, which a
 token straddling the cut survives as `ghp_` and ten characters.
 
 The guard is `tests/test_the_agents_own_words_reach_the_journal_the_panel_and_the_ticket_with_any_
@@ -116,24 +118,36 @@ MUTATIONS = [
     ("the CI repair's stop is posted on the ticket as written", MACHINE,
      'f"ci-repair agent stopped: {_without_credentials(rep.summary)}"',
      'f"ci-repair agent stopped: {rep.summary}"'),
-    ("the executor's question is held on the ticket as written", MACHINE,
-     '                        f"decision needed — {_without_credentials(dr.question)[:200]}",\n',
-     '                        f"decision needed — {dr.question[:200]}",\n'),
-    ("the executor's question is withheld after its cut", MACHINE,
-     '                        f"decision needed — {_without_credentials(dr.question)[:200]}",\n',
-     '                        f"decision needed — {_without_credentials(dr.question[:200])}",\n'),
-    ("the planner's question is held on the ticket as written", MACHINE,
-     'ticket, owner, f"decision needed — {_without_credentials(dr.question)[:200]}",',
-     'ticket, owner, f"decision needed — {dr.question[:200]}",'),
+    # ── the decision: the comment, the hold's reason and `RunResult.decision` ─────────────────
+    ("the executor's decision is held, posted and returned as written", MACHINE,
+     '                    dr = _decision_withheld(dr)  # the ticket, the result and the panel '
+     '(#197)\n                    dr.stage = dr.stage or "execute"\n',
+     '                    dr.stage = dr.stage or "execute"\n'),
+    ("the planner's decision is held, posted and returned as written", MACHINE,
+     '            dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)\n'
+     '            dr.stage = dr.stage or "plan"\n',
+     '            dr.stage = dr.stage or "plan"\n'),
+    ("the decision's question is kept as written", MACHINE,
+     '        "question": _without_credentials(dr.question),\n',
+     '        "question": dr.question,\n'),
+    ("the decision's context is kept as written", MACHINE,
+     '        "context": _without_credentials(dr.context),\n',
+     '        "context": dr.context,\n'),
+    ("an option's label is kept as written", MACHINE,
+     '{"label": _without_credentials(o.label),',
+     '{"label": o.label,'),
+    ("an option's consequence is kept as written", MACHINE,
+     '"consequence": _without_credentials(o.consequence)})',
+     '"consequence": o.consequence})'),
+    ("an option's key is rewritten too, so an answer no longer matches it", MACHINE,
+     '"options": [o.model_copy(update={"label": _without_credentials(o.label),',
+     '"options": [o.model_copy(update={"key": f"[{o.key}]", "label": _without_credentials(o.label),'),
     ("the planner's too-large verdict is held on the ticket as written", MACHINE,
      'f"ticket too large — {_without_credentials(split.group()).strip()[:400]}"',
      'f"ticket too large — {split.group().strip()[:400]}"'),
     ("the planner's assumption is posted and journalled as written", MACHINE,
      "            note = _without_credentials(note)",
      "            note = note"),
-    ("the decision's options are posted on the ticket with its question whole", MACHINE,
-     "        body = _without_credentials(body)\n",
-     ""),
 
     # ── the review event's detail ──────────────────────────────────────────────────────────────
     ("a finding's description reaches the panel as written", MACHINE,

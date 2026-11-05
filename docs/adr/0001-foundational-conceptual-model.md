@@ -140,11 +140,22 @@ the maintainer's choice of 2026-11-04). What the executor says it did travels ra
 in the activity payload (`RunResult.agent_account`, `agent_passes`), so it is
 stored in the Temporal workflow history, which only an operator reads. It is not
 withheld there: the pull request body is composed from it, and withholding in the
-payload would make the body's withholding depend on the payload. Every place the
-agent's or the reviewer's words are quoted for a person withholds credentials as
-`[credential withheld]` before any cut: the pull request body, the journal notes
-and `agent_action` events the panel shows, a review event's finding detail, and
-the hold, decision and assumption notes posted on the ticket.
+payload would make the body's withholding depend on the payload. Those two
+fields are the only raw ones. A credential is withheld as `[credential withheld]`,
+on the whole text before any cut, at these sites and no others: the pull request
+body; the journal notes and `agent_action` events the panel shows; a review
+event's finding detail; the hold reasons `_hold` posts on the ticket; the
+decision and assumption comments posted on the ticket; and `RunResult.decision`,
+whose question, context and option labels and consequences are withheld as soon
+as the agent's decision is parsed (its option keys stay as written, so an answer
+still matches), so the impediment payload, the panel's needs-you API and the
+channel item built from it carry it withheld.
+
+The following are **not yet withheld** (#447): the reviewer's words reach the
+panel through `review/verdict.py` `of_result`, and the channel through the
+coordinator's narration of a rejected or critical review
+(`runtime/temporal/workflow.py`); and the tech-lead's advice comment on the ticket
+(`runtime/temporal/activities.py`) is posted as the tech-lead wrote it.
 
 Multi-agent decomposition (planner/architect/tester/security/… as separate
 agents) is explicitly **not** adopted for v1: it multiplies cost, latency,
