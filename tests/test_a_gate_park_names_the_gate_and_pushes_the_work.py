@@ -18,6 +18,8 @@ bare origin, and gates that are real shell commands failing after the repairs.
 from __future__ import annotations
 
 import subprocess
+import sys
+from types import SimpleNamespace
 
 import test_walking_skeleton as spine
 
@@ -254,15 +256,242 @@ def test_a_push_that_fails_is_said_and_carries_no_credential(repo, tmp_path):
 
     note = result.note or ""
     assert sandbox.published, "no push was attempted"
-    assert not result.resume_handle
     assert "nothing was pushed" in note.lower(), note
-    assert "push" in note and "credential" in note, f"no cause and remedy for the push:\n{note}"
     assert "unable to access" not in note, "git's raw words reached the note"
     assert any("unable to access" in e.message for e in events.events), (
         "the journal does not keep git's words")
     for surface in [note, *tracker.comments, *(e.message for e in events.events),
                     *(repr(e.data) for e in events.events)]:
         assert token not in surface, surface
+
+
+# ── 7. a failed push says where the work is, on each box, and the Resume keeps the promise ─────
+
+def _git(cwd, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+class _WatchingSandbox(_RecordingSandbox):
+    """The real sandbox, recording the commit each workspace starts from."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.started_at: list[str] = []
+
+    def prepare(self, **kwargs):
+        ws = super().prepare(**kwargs)
+        self.started_at.append(_git(ws.path, "rev-parse", "HEAD"))
+        return ws
+
+
+class _RefusingContainerLike(_RefusingSandbox):
+    """A refused push on a box that keeps nothing once the job ends, as the container box says."""
+
+    def kept_after_cleanup(self, *, workspace):
+        return None
+
+
+def test_on_the_worktree_box_a_failed_push_names_the_local_branch_and_resume_keeps_it(
+        repo, tmp_path):
+    """The remedy the note gives — push the local branch by hand, then Resume — is followed, and
+    the resumed workspace starts from that work, not from the base."""
+    refusing = _RefusingSandbox(root=tmp_path / "wt")
+    result, tracker = _run(repo, tmp_path, "1111", {"test": _TEST_GATE}, sandbox=refusing)
+
+    branch = result.branch
+    local_tip = _git(repo, "rev-parse", f"refs/heads/{branch}")
+    assert local_tip != _git(repo, "rev-parse", "main"), "the agent's commit is not on the branch"
+    for surface in (result.note or "", _hold_comment(tracker)):
+        assert f"local branch `{branch}`" in surface, surface
+        assert f"`{repo}`" in surface, surface
+        assert "push it to the forge by hand before resuming" in surface, surface
+        assert "credential" not in surface, f"the remedy sends the reader elsewhere:\n{surface}"
+    assert result.resume_handle, "a Resume after the push by hand would start from the base"
+
+    _git(repo, "push", "origin", f"{branch}:{branch}")  # what the note asks of its reader
+    watching = _WatchingSandbox(root=tmp_path / "wt")
+    tracker2 = _tracker("1111")
+    runner = spine._runner(repo, tracker2, Manifest(validate={"test": _TEST_GATE},
+                                                     repair_max_attempts=1), tmp_path,
+                           agent=spine.FakeRepairAgent(), sandbox=watching)
+    runner.run("#1111", resume_handle=result.resume_handle)
+
+    assert watching.started_at == [local_tip], (
+        f"the resume started from {watching.started_at}, not the work at {local_tip}")
+
+
+def test_on_a_box_that_keeps_nothing_a_failed_push_says_the_work_was_discarded(repo, tmp_path):
+    sandbox = _RefusingContainerLike(root=tmp_path / "wt")
+    result, _ = _run(repo, tmp_path, "1112", {"test": _TEST_GATE}, sandbox=sandbox)
+
+    note = result.note or ""
+    assert "nothing was pushed" in note.lower(), note
+    assert "discarded" in note and "the work is lost" in note, note
+    assert "by hand" not in note, note
+    assert not result.resume_handle, "a Resume would promise to continue work that is gone"
+
+
+def test_a_commit_that_fails_is_said_as_a_commit_and_not_as_a_push(repo, tmp_path):
+    tracker = _tracker("1113")
+    sandbox = _RecordingSandbox(root=tmp_path / "wt")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": _TEST_GATE},
+                                                    repair_max_attempts=1), tmp_path,
+                           agent=spine.FakeRepairAgent(), sandbox=sandbox)
+    commit = runner._commit
+
+    def _commit(ws, ticket):
+        # only the preserve's commit fails: the ones before the gates must land for a park
+        if sys._getframe(1).f_code.co_name == "_preserve_for_hold":
+            raise RuntimeError("the box did not answer")
+        commit(ws, ticket)
+
+    runner._commit = _commit
+    result = runner.run("#1113")
+
+    note = result.note or ""
+    assert result.state is JobState.ON_HOLD
+    assert sandbox.published == [], "a push was attempted after the commit failed"
+    assert "could not be committed" in note, note
+    assert "box prove" in note, f"no remedy for the commit:\n{note}"
+    assert "push of" not in note and "credential" not in note, note
+    assert not result.resume_handle
+
+
+# ── 8. a push replaces only what the run started from ───────────────────────────────────────────
+
+def _a_person_pushes(tmp_path, branch: str, name: str, *, start: str = "main") -> str:
+    """A person's commit on `branch` in the origin, made from a clone of their own."""
+    clone = tmp_path / f"person-{name}"
+    if not clone.exists():
+        subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(clone)],
+                       check=True, capture_output=True)
+        _git(clone, "config", "user.email", "someone@example.invalid")
+        _git(clone, "config", "user.name", "someone")
+    _git(clone, "fetch", "-q", "origin")
+    _git(clone, "checkout", "-q", "-B", branch, start)
+    (clone / f"{name}.txt").write_text("fixed by hand\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", f"{name} by hand")
+    _git(clone, "push", "-q", "origin", f"{branch}:{branch}")
+    return _git(clone, "rev-parse", "HEAD")
+
+
+def _origin_tip(tmp_path, branch: str) -> str:
+    return _git(tmp_path / "origin.git", "rev-parse", f"refs/heads/{branch}")
+
+
+def test_a_fresh_run_holds_rather_than_push_over_a_commit_it_did_not_make(repo, tmp_path):
+    """A later run of the card without the handle starts from the base; its pull-request push
+    used to replace whatever a park had left on the branch, and the person's fix with it."""
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1114", "person")
+    forge = spine.FakeForge()
+    tracker = _tracker("1114")
+    runner = spine._runner(repo, tracker, Manifest(validate={"test": "true"}), tmp_path,
+                           forge=forge)
+    result = runner.run("#1114")
+
+    assert _origin_tip(tmp_path, "beeverforge/1114") == theirs, "the person's commit was replaced"
+    assert result.state is JobState.ON_HOLD, result.note
+    assert forge.opened is None, "a pull request was opened from a push that was refused"
+    note = result.note or ""
+    assert "`beeverforge/1114` on the forge has commits this run did not start from" in note, note
+    assert "Resume continues from the forge's `beeverforge/1114`" in note, note
+    assert result.resume_handle, "the Resume the note offers would start from the base again"
+
+
+def test_a_gate_park_holds_rather_than_push_over_a_commit_it_did_not_make(repo, tmp_path):
+    theirs = _a_person_pushes(tmp_path, "beeverforge/1115", "person")
+    result, _ = _run(repo, tmp_path, "1115", {"test": _TEST_GATE})
+
+    assert _origin_tip(tmp_path, "beeverforge/1115") == theirs, "the person's commit was replaced"
+    note = result.note or ""
+    assert "Nothing was pushed: `beeverforge/1115` on the forge has commits" in note, note
+    assert result.resume_handle
+
+
+# ── 9. Resume continues the parked work, with a person's fix on top ─────────────────────────────
+
+def test_resume_starts_from_the_forge_branch_with_the_persons_fix(repo, tmp_path):
+    """The note promises "Resume continues it, or fix the gate there by hand". Both, in turn: the
+    park pushes, a person commits the fix on that branch, and the resumed run starts from the
+    forge's tip — their commit included — goes green and opens the pull request over it."""
+    gate = {"test": "test -f person.txt"}
+    sandbox = _WatchingSandbox(root=tmp_path / "wt")
+    first, _ = _run(repo, tmp_path, "1116", gate, sandbox=sandbox)
+    assert first.state is JobState.ON_HOLD and first.resume_handle, first.note
+    parked = _origin_tip(tmp_path, first.branch)
+
+    theirs = _a_person_pushes(tmp_path, first.branch, "person", start=f"origin/{first.branch}")
+    assert _git(tmp_path / "origin.git", "rev-parse", f"{theirs}~1") == parked
+
+    forge = spine.FakeForge()
+    runner = spine._runner(repo, _tracker("1116"), Manifest(validate=gate, repair_max_attempts=1),
+                           tmp_path, agent=spine.FakeRepairAgent(), forge=forge, sandbox=sandbox)
+    second = runner.run("#1116", resume_handle=first.resume_handle)
+
+    assert sandbox.started_at[-1] == theirs, (
+        f"the resume started from {sandbox.started_at[-1]}, not the forge's tip {theirs}")
+    assert second.state is not JobState.ON_HOLD, second.note
+    assert forge.opened is not None, "no pull request after the resumed run went green"
+    tip = _origin_tip(tmp_path, first.branch)
+    subprocess.run(["git", "-C", str(tmp_path / "origin.git"), "merge-base", "--is-ancestor",
+                    theirs, tip], check=True)
+
+
+# ── 10. a credential no name gives away reaches no surface ──────────────────────────────────────
+
+def test_a_pat_under_a_name_no_scrub_reads_is_withheld_from_every_surface(
+        repo, tmp_path, monkeypatch):
+    """SECURITY.md's two: the shipped `AZURE_DEVOPS_PAT`, which the worktree box passes to its
+    workloads, and a project's `token_env`, which can be called anything. Neither value has a
+    prefix, and neither name matched the scrub's (`TOKEN|SECRET|…`), so a gate that printed its
+    environment put both in full on the card."""
+    pat = "q7" * 26  # 52 characters, no prefix
+    theirs = "m3" * 20  # 40 characters, under a name nothing reads as a credential's
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", pat)
+    monkeypatch.setenv("ACME_ADO_AUTH", theirs)
+    events = InMemoryEventSink()
+    tracker = _tracker("1117")
+    runner = spine._runner(
+        repo, tracker, Manifest(validate={"test": "printenv AZURE_DEVOPS_PAT; "
+                                                  "echo ACME_ADO_AUTH=$ACME_ADO_AUTH; exit 1"},
+                                repair_max_attempts=1),
+        tmp_path, agent=spine.FakeRepairAgent(), events=events,
+        sandbox=_RefusingSandbox(root=tmp_path / "wt"))
+    runner.project = SimpleNamespace(forge=SimpleNamespace(options={"token_env": "ACME_ADO_AUTH"}))
+
+    def _refused(*, workspace, remote_url=None):
+        raise RuntimeError(f"push failed: remote said {pat} and {theirs}")
+
+    runner.sandbox.publish_branch = _refused
+    result = runner.run("#1117")
+
+    note = result.note or ""
+    assert WITHHELD_CREDENTIAL in note and "ACME_ADO_AUTH=" in note, note
+    for surface in [note, *tracker.comments, *(e.message for e in events.events),
+                    *(repr(e.data) for e in events.events)]:
+        assert pat not in surface, surface
+        assert theirs not in surface, surface
+
+
+# ── 11. what the gate printed cannot notify anybody ─────────────────────────────────────────────
+
+def test_a_mention_and_a_card_number_the_gate_printed_sit_in_the_code_block(repo, tmp_path):
+    tracker = spine.FakeTracker(_ticket("1118"), assignees=[])  # no owner to mention
+    runner = spine._runner(repo, tracker, Manifest(
+        validate={"test": "printf '@%s pinged\\n#%s failed\\n' someone 12; exit 1"},
+        repair_max_attempts=1), tmp_path, agent=spine.FakeRepairAgent())
+    runner.run("#1118")
+
+    comment = _hold_comment(tracker)
+    mentioned = [ln for ln in comment.splitlines() if "@someone" in ln]
+    assert mentioned, comment
+    assert all(ln.startswith("    ") for ln in mentioned), (
+        f"an `@someone` the gate printed is outside the code block:\n{comment}")
+    assert "#12" not in comment, f"`#12` names a card on a tracker that reads it:\n{comment}"
+    numbered = [ln for ln in comment.splitlines() if "card 12 failed" in ln]
+    assert numbered and all(ln.startswith("    ") for ln in numbered), comment
 
 
 # ── 6. the memory recognises the same failure twice ──────────────────────────────────────────────

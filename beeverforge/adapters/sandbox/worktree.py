@@ -37,8 +37,10 @@ from pathlib import Path
 from beeverforge import gitpin
 from beeverforge.adapters import gitworktrees
 from beeverforge.adapters.sandbox.base import (
+    LEASE_REFUSED,
     BranchHeldElsewhere,
     OutputBuffer,
+    PushRefused,
     SandboxAdapter,
     Workspace,
     run_and_stream,
@@ -708,6 +710,22 @@ def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:
     return env
 
 
+def _tip(repo, ref: str) -> str:
+    """The commit `ref` names in `repo`, or `""` when it names none — which, as a lease, refuses
+    a push over any branch, rather than letting one through unread."""
+    rc, out = _run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                    f"{ref}^{{commit}}"])
+    return out.strip() if rc == 0 else ""
+
+
+def _force(workspace: Workspace) -> list[str]:
+    """How `publish_branch` may replace the remote's branch: over the lease, or plainly when
+    there is none (`Workspace.lease`). One spelling for both boxes."""
+    if workspace.lease is None:
+        return ["--force"]
+    return [f"--force-with-lease=refs/heads/{workspace.branch}:{workspace.lease}"]
+
+
 def _redact(text: str) -> str:
     """Strip any embedded credential from an authenticated URL before logging."""
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
@@ -838,6 +856,10 @@ class WorktreeSandbox(SandboxAdapter):
         # "the remote has no such ref" raises, naming the real git error (credential scrubbed).
         # Same asymmetry the impediment classifier uses: unknown never degrades toward acting.
         start = base_branch
+        # WHAT THE FIRST PUSH MAY REPLACE (#11, `Workspace.lease`): nothing on a fresh start, the
+        # fetched tip on a resume. None when the remote is this repository: the branch is its own
+        # ref, and a push of it to itself replaces nothing.
+        lease: str | None = None if _is_this_repo(remote_url, repo_path) else ""
         if keep:
             # NOTHING IS FETCHED. The branch is in this repository already, and a fetch would write
             # `refs/remotes/origin/<branch>` into a repository that has no `origin` — inventing a
@@ -853,6 +875,7 @@ class WorktreeSandbox(SandboxAdapter):
                                         f"+{branch}:refs/remotes/origin/{branch}"]), timeout=180)
             if rc == 0:
                 start = f"origin/{branch}"
+                lease = _tip(repo_path, f"refs/remotes/origin/{branch}")
             elif _remote_has_no_such_branch(out):
                 log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this resume starts "
                             "fresh "
@@ -948,7 +971,7 @@ class WorktreeSandbox(SandboxAdapter):
                 remote_url=remote_url, from_base=start == base_branch or placeholder)
         # host_path == path here: the worktree IS on the orchestrator's filesystem.
         return Workspace(path=wt, host_path=wt, branch=branch, base_branch=base_branch,
-                         base_commit=base_commit)
+                         base_commit=base_commit, lease=lease)
 
     def prepare_tip(
         self, *, repo_path: Path, base_branch: str, branch: str, remote_url: str | None = None,
@@ -1299,17 +1322,50 @@ class WorktreeSandbox(SandboxAdapter):
 
     def publish_branch(self, *, workspace: Workspace, remote_url: str | None = None) -> None:
         # push to the authenticated bot remote if given, else the shared origin.
-        # --force so a retry after a partial failure (branch already pushed, then the task
-        # died) overwrites the bot's OWN dedicated beeverforge/<id> branch instead of dead-locking
-        # on a non-fast-forward forever. Safe: this branch is unique per job and only ever
-        # the bot's; execution is serial (idempotency, engineering.md #3).
+        # FORCED, BUT ONLY OVER WHAT THIS WORKSPACE SAW (#11): a rebased branch, or a repair
+        # pass's second push, is not a fast-forward, so the push must be able to replace. What it
+        # may replace is the lease — the tip `prepare` started from, then the tip it pushed itself
+        # — so a commit a person put on the branch, or one an earlier park preserved there for a
+        # Resume, is refused by name (`PushRefused`) instead of replaced. A plain `--force` was
+        # written for "this branch is only ever the bot's", and a park that pushes and names the
+        # branch for a person to fix by hand made that false.
         target = remote_url or "origin"
         rc, out = _run(
-            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--", target,
+            gitpin.argv(["-C", str(workspace.path), "push", *_force(workspace), "--", target,
                          workspace.branch])
         )
         if rc != 0:
+            if LEASE_REFUSED in out:
+                raise PushRefused(f"push refused: {_redact(out)}", branch=workspace.branch)
             raise RuntimeError(f"push failed: {_redact(out)}")
+        if workspace.lease is not None:
+            workspace.lease = _tip(workspace.path, f"refs/heads/{workspace.branch}")
+
+    def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
+        """The repository that still holds `workspace`'s branch once `cleanup` has run (#11): the
+        one the worktree was added to. `cleanup` removes the worktree and not the branch, so the
+        commits on it stay there — until the next `prepare` of the same branch deletes it
+        (`branch -D`). OPTIONAL BY DESIGN, as `guidelines_path`: asked through `getattr`, and a box
+        without it is one where nothing survives."""
+        return self._repo_root
+
+    def credentials_in_reach(self, *, named: tuple[str, ...] = ()) -> dict[str, str]:
+        """`{name: value}` of every variable a command this box runs can read that may hold a
+        credential (#11), for a caller that prints what such a command said.
+
+        THIS BOX STARTS FROM THE WORKER'S WHOLE ENVIRONMENT (`_scrubbed_env`), so what reaches a
+        gate is everything its deny lists do not carry — and the scrub of a printed line reads only
+        credential-shaped NAMES (`product.model._SECRET_NAME`), so `AZURE_DEVOPS_PAT` or a
+        project's `token_env: ACME_ADO_PAT` was printed in full. Here: the harness's own model
+        credential, the project's `box.env`, every name shaped like a credential's
+        (`environ.holds_a_credential`), and whatever `named` adds — the project's `token_env`
+        names, which can be called anything. OPTIONAL BY DESIGN, as `kept_after_cleanup`."""
+        from beeverforge.adapters.sandbox.container import _AUTH_ENV_VARS
+        from beeverforge.environ import holds_a_credential
+
+        asked = {*named, *self.extra_env, *_AUTH_ENV_VARS}
+        return {name: value for name, value in _scrubbed_env(self.extra_env).items()
+                if value and (name in asked or holds_a_credential(name))}
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None

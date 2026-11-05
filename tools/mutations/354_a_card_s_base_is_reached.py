@@ -76,8 +76,9 @@ MUTATIONS = [
      "    return None"),
 
     ("the container box's workspace drops the commit its job started from", CONTAINER,
-     "branch=branch, base_branch=base_branch, base_commit=base_commit)",
-     "branch=branch, base_branch=base_branch)"),
+     # re-pinned for #11: the lease follows the base commit on the same call
+     "branch=branch, base_branch=base_branch, base_commit=base_commit,\n",
+     "branch=branch, base_branch=base_branch,\n"),
 
     ("the container box's diff is spelled from the base's name, which its clone does not hold",
      CONTAINER,

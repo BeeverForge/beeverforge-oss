@@ -327,6 +327,11 @@ class _Code:
                 words = [p.value for p in parts if isinstance(p, ast.Constant)]
                 if "push" not in words or "--force" in words:
                     continue
+                # A JOB BRANCH'S PUSH (#11): forced over the tip its workspace saw, spelled by
+                # `sandbox.worktree._force` for both boxes — a branch of its own, as `--force` is.
+                if any(isinstance(p, ast.Starred) and isinstance(p.value, ast.Call)
+                       and self.callee(p.value) == "_force" for p in parts):
+                    continue
                 if isinstance(node, ast.Call) and any(
                         isinstance(p, (ast.List, ast.Tuple)) for p in parts):
                     continue   # the list inside is the push, and is read on its own
