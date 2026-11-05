@@ -83,7 +83,7 @@ from beeverforge.policy.census import vanished as census_vanished
 from beeverforge.policy.protected import violations as protected_violations
 from beeverforge.product.model import WITHHELD_CREDENTIAL, scrub_credentials
 from beeverforge.techlead import voice as tl_voice
-from beeverforge.techlead.classify import ENVIRONMENT, TREE, UNKNOWN
+from beeverforge.techlead.classify import CODE, ENVIRONMENT, TREE, UNKNOWN
 
 _SETUP_TIMEOUT = 1800
 #: The census ENUMERATES; it does not build. `_SETUP_TIMEOUT` is sized for `dotnet restore`
@@ -244,6 +244,61 @@ def _never_ran_reason(validations: list[ValidationResult]) -> str:
     return (f"a gate could not run, so nothing was proven about this diff: {named}{more}. "
             f"No repair was attempted — the command is missing where the gates run, which is not "
             f"something the code can fix.")
+
+
+#: How much of a failing gate a park note shows (#11): the card holds the short form, the journal
+#: the whole tail. Gates past `_GATES_NAMED` are counted, not shown.
+_GATES_NAMED = 3
+_GATE_TAIL_LINES = 5
+_GATE_LINE_CHARS = 160
+_GATE_TAIL_CHARS = 400
+
+
+def _failing_gates(validations: list[ValidationResult]) -> list[ValidationResult]:
+    """The BLOCKING gates that ran and failed: the cause of a gate park. An advisory gate reports
+    and never decides, and a gate that never ran is `_never_ran_reason`'s."""
+    return [v for v in validations if v.passed is False and not v.advisory and not v.unrunnable]
+
+
+def _gate_tail(v: ValidationResult) -> list[str]:
+    """The last lines a gate printed, credentials withheld on the RAW text before any cut — a
+    token split by the cut would no longer match its prefix."""
+    lines = [ln[:_GATE_LINE_CHARS] for ln in _without_credentials(v.output_tail).splitlines()
+             if ln.strip()][-_GATE_TAIL_LINES:]
+    while len(lines) > 1 and sum(len(ln) + 1 for ln in lines) > _GATE_TAIL_CHARS:
+        lines.pop(0)
+    return lines
+
+
+def _failing_gates_said(validations: list[ValidationResult]) -> str:
+    """Each failing blocking gate for a park note (#11): its role, its exit code, its command and
+    the last lines it printed, as an indented code block — so an `@name` or a `#12` in the output
+    notifies nobody, and a backtick in it cannot end a span."""
+    failing = _failing_gates(validations)
+    blocks = []
+    for v in failing[:_GATES_NAMED]:
+        command = [f"$ {ln}"[:_GATE_LINE_CHARS] for ln in
+                   (_without_credentials(v.command).splitlines() or [""])]
+        printed = _gate_tail(v) or ["(it printed nothing)"]
+        body = "\n".join(f"    {ln}" for ln in [*command, *printed])
+        blocks.append(f"`{v.name}` exited {v.exit_code}:\n\n{body}")
+    if len(failing) > _GATES_NAMED:
+        blocks.append(f"…and {len(failing) - _GATES_NAMED} more failing gate(s); the journal "
+                      f"holds every one.")
+    return "\n\n".join(blocks)
+
+
+def _where_the_work_is(branch: str, outcome: str) -> str:
+    """The park note's last sentence: where the agent's work is, and what Resume then does."""
+    if outcome == "pushed":
+        return (f"The work is on branch `{branch}`: Resume continues it, or fix the gate there by "
+                f"hand.")
+    if outcome == "nothing-written":
+        return ("Nothing was pushed: the agent left no change on the branch, so a Resume starts "
+                "fresh.")
+    return (f"Nothing was pushed: the push of `{branch}` to the forge failed (the journal has "
+            f"git's words), so the work is only in this worker's worktree and a Resume starts "
+            f"fresh. Check the forge's push credential before resuming.")
 
 
 @dataclass(frozen=True)
@@ -1859,6 +1914,23 @@ class JobRunner:
                 # is wrong.
                 reason = (_never_ran_reason(validations)
                           or f"validations failed after {attempts} repair attempt(s)")
+                if not _never_ran(validations):
+                    # THE FIRST LINE STAYS THE SENTENCE, ALONE (#11): `classify` reads it as the
+                    # change and `memory.signature` signs only it, so a tail that differs on every
+                    # run still lands on one recognised failure. The gates follow it, and the park
+                    # declares its own cause, so what the project printed cannot steer the verdict.
+                    self._emit(ticket, "note", f"{reason} — the failing gates", gates=[
+                        {"name": v.name, "command": v.command,
+                         "exit_code": v.exit_code,
+                         "output_tail": _without_credentials(v.output_tail)}
+                        for v in _failing_gates(validations)])
+                    reason += "\n\n" + _failing_gates_said(validations)
+                    result.hold_cause = CODE
+                # ADR-0013 D1, ON THIS PARK TOO (#11): the agent's commits are pushed, or they
+                # live only in a worktree `cleanup` removes. The latest pass's handle continues it.
+                result.resume_handle = self._preserve_for_hold(
+                    ticket, ws, rep.resume_handle if attempts else agent_result.resume_handle)
+                reason += "\n\n" + _where_the_work_is(branch, self._preserve_outcome)
                 result.state, result.note = JobState.ON_HOLD, reason
                 mention = f"@{owner} " if owner else ""
                 self._say_on_ticket(ticket.id, f"{mention}On hold — {reason}")
@@ -3137,7 +3209,10 @@ class JobRunner:
         commit + push whatever the agent wrote, and return the handle ONLY when there was real
         work to preserve. A hold that carries a handle is a RESUMABLE hold (the operator's
         Resume continues the attempt); no work → None → today's fresh-restart semantics (a
-        spec-style hold must not turn into a bogus 'continue')."""
+        spec-style hold must not turn into a bogus 'continue').
+
+        What happened is left in `_preserve_outcome` — "pushed", "nothing-written" or
+        "push-failed" — for a park that tells its reader where the work is (#11)."""
         try:
             self._commit(ws, ticket)  # no-ops on an empty tree
             written = self.sandbox.diff_paths(workspace=ws)
@@ -3147,14 +3222,19 @@ class JobRunner:
             # the work. `onboarding/firstrun.py` used to take a second `git status` read here for
             # exactly this reason, alone in the tree.
             if written is not None and not written:
+                self._preserve_outcome = "nothing-written"
                 return None  # nothing was written → plain hold, fresh restart on resume
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            self._preserve_outcome = "pushed"
             self._emit(ticket, "note", "partial work pushed — Resume will continue it")
             # No session known → a non-empty sentinel: it still signals "restore the branch"
             # (bool-truthy) while decoding to nothing in any adapter (cold session, warm code).
             return resume_handle or "worktree-only"
         except Exception as exc:  # noqa: BLE001 — preserving is opportunistic; never fail the hold
-            self._emit(ticket, "warning", f"couldn't preserve partial work ({str(exc)[:120]})")
+            self._preserve_outcome = "push-failed"
+            # git's words can carry the push URL's userinfo: withheld before the cut (#11)
+            self._emit(ticket, "warning",
+                       f"couldn't preserve partial work ({_without_credentials(str(exc))[:120]})")
             return None
 
     def _preserve_partial(
