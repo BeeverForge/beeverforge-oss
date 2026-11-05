@@ -1295,16 +1295,37 @@ class JobRunner:
         """An irreversible forge call returned (#44, review of #453): from here on a stop says what
         it left behind (`_unless_stopped`), because nothing the stop does can take it back."""
         assert kind in self._WHAT_LANDED, kind
-        vars(self)["_landed_here"] = (ticket, kind, pr, base)
+        done = vars(self).get("_landed_here", (None, None, None, None, frozenset()))[4]
+        vars(self)["_landed_here"] = (ticket, kind, pr, base, done)
 
-    def _say_what_landed(self, ticket: Ticket, kind: str, pr: str, base: str) -> None:
+    #: What else reached the opened pull request, and so what the "opened" sentence says of it
+    #: (review of #453): a stop during `review_pr` lands the review, one during
+    #: `request_reviewers` asks them, and a sentence saying neither happened would be false.
+    _DONE_ON_IT = ("reviewed", "asked")
+
+    def _landed_also(self, what: str) -> None:
+        """Another forge call on the opened pull request returned: the sentence says it."""
+        assert what in self._DONE_ON_IT, what
+        landed = vars(self).get("_landed_here")
+        if landed is not None:
+            vars(self)["_landed_here"] = (*landed[:4], landed[4] | {what})
+
+    def _say_what_landed(self, ticket: Ticket, kind: str, pr: str, base: str,
+                         done: frozenset = frozenset()) -> None:
         """THE ONE COMMENT A STOPPED JOB STILL WRITES, and the journal line beside it.
 
         NOT `_say_on_ticket`, which refuses after a stop and must go on refusing: this takes no
         text, only which of `_WHAT_LANDED`'s facts landed, so it cannot become a way to say
         anything else after a stop. Best-effort, like every comment: a tracker that refuses loses
         the comment, never the stop."""
-        body = self._say(self._WHAT_LANDED[kind], pr=pr, base=base)
+        # BUILT FROM WHAT WAS RECORDED, so it never says a review or a reviewer request that did
+        # happen did not
+        review = self._say("job.stopped.landed.reviewed" if "reviewed" in done
+                           else "job.stopped.landed.not-reviewed")
+        reviewers = self._say("job.stopped.landed.asked" if "asked" in done
+                              else "job.stopped.landed.not-asked")
+        body = self._say(self._WHAT_LANDED[kind], pr=pr, base=base, review=review,
+                         reviewers=reviewers)
         self._emit(ticket, "note", f"stopped after the forge took it: {body}", url=pr, landed=kind)
         try:
             self.tracker.comment(ticket.id, body)
@@ -2168,6 +2189,7 @@ class JobRunner:
                     event=review_event(result.review, self.manifest.review_mode),
                     body=format_review(result.review),
                 )
+                self._landed_also("reviewed")
 
             # merge posture (D-12): auto-merge only when policy allows and it's safe;
             # otherwise hand to humans — request reviewers + comment the ticket.
@@ -2181,6 +2203,7 @@ class JobRunner:
             else:
                 self._unless_stopped("request_reviewers")
                 self.forge.request_reviewers(pr=pr, reviewers=self.manifest.reviewers)
+                self._landed_also("asked")
                 if (getattr(self.manifest, "okf_gate", "advise") == "enforce"
                         and result.knowledge_stance == "dark"):
                     # DARK IS REFUSED WITH THE QUESTION ASKED (ADR-0046). The pull request exists,

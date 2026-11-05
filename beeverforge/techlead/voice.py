@@ -524,13 +524,21 @@ NARRATION: dict[str, dict[str, str]] = {
     # the stop was arriving cannot be taken back, and the card the stop put in the backlog says
     # nothing about it — so the job says what landed and what a person does about it, then stops.
     "job.stopped.landed.opened": {
-        "en": "The pull request {pr} was opened before the stop reached this job, and nothing more "
-              "was done on it: no review was posted and no reviewers were asked. Close it if the "
-              "work should not go on; otherwise it stays open for a person to take up.",
-        "pt-BR": "O pull request {pr} foi aberto antes de a parada chegar a este job, e nada mais "
-                 "foi feito nele: nenhuma revisão foi publicada e ninguém foi chamado para "
-                 "revisar. Feche-o se o trabalho não deve seguir; senão ele fica aberto para "
-                 "alguém assumir."},
+        "en": "The pull request {pr} was opened before the stop reached this job: {review}, and "
+              "{reviewers}. Nothing more was done on it after the stop. Close it if the work "
+              "should not go on; otherwise it stays open for a person to take up.",
+        "pt-BR": "O pull request {pr} foi aberto antes de a parada chegar a este job: {review}, e "
+                 "{reviewers}. Nada mais foi feito nele depois da parada. Feche-o se o trabalho "
+                 "não deve seguir; senão ele fica aberto para alguém assumir."},
+    # what else reached it before the stop, read from what the job recorded (review of #453)
+    "job.stopped.landed.reviewed": {"en": "the review was posted on it",
+                                    "pt-BR": "a revisão foi publicada nele"},
+    "job.stopped.landed.not-reviewed": {"en": "no review was posted",
+                                        "pt-BR": "nenhuma revisão foi publicada"},
+    "job.stopped.landed.asked": {"en": "its reviewers were asked",
+                                 "pt-BR": "os revisores foram chamados"},
+    "job.stopped.landed.not-asked": {"en": "no reviewers were asked",
+                                     "pt-BR": "ninguém foi chamado para revisar"},
     "job.stopped.landed.armed": {
         "en": "Auto-merge was armed on the pull request {pr} before the stop reached this job, so "
               "it still merges into {base} when its checks pass. Turn auto-merge off or close the "

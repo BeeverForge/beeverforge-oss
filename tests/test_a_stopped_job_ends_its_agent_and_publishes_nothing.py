@@ -321,6 +321,12 @@ def _never_pushed(origin: Path) -> bool:
     return "beeverforge/" not in refs
 
 
+def _landed_says(tracker, *clauses: str) -> bool:
+    """The one "what landed" comment exists and says each of `clauses`."""
+    said = [c for c in tracker.comments if "was opened before the stop reached this job" in c]
+    return len(said) == 1 and all(clause in said[0] for clause in clauses)
+
+
 #: (case, where the stop arrives, how the pass ends, merge policy, what must not have happened)
 _STEPS = [
     ("the_review", "review", "ok", "auto",
@@ -330,15 +336,19 @@ _STEPS = [
     # THE PULL REQUEST IS OPEN, and the stop cannot take it back: the review is skipped, and the
     # ticket is told what landed (review of #453)
     ("open_pr", "open_pr", "ok", "auto",
-     lambda box, forge, tracker, runner: forge.reviews == [] and any(
-         "was opened before the stop reached this job" in c for c in tracker.comments)),
+     lambda box, forge, tracker, runner: forge.reviews == [] and _landed_says(
+         tracker, "no review was posted", "no reviewers were asked")),
+    # …AND WHAT ELSE REACHED IT IS SAID AS IT HAPPENED (review of #453): a stop during the review
+    # lands the review, and one during the reviewers' request asks them
     ("review_pr_auto", "review_pr", "ok", "auto",
-     lambda box, forge, tracker, runner: forge.merge_calls == 0),
+     lambda box, forge, tracker, runner: forge.merge_calls == 0 and _landed_says(
+         tracker, "the review was posted on it", "no reviewers were asked")),
     ("review_pr_human", "review_pr", "ok", "human",
      lambda box, forge, tracker, runner: forge.requested == []),
     ("request_reviewers", "request_reviewers", "ok", "human",
      lambda box, forge, tracker, runner: not any("ready for review" in c
-                                                 for c in tracker.comments)),
+                                                 for c in tracker.comments) and _landed_says(
+         tracker, "the review was posted on it", "its reviewers were asked")),
     ("the_ready_comment", "ready_comment", "ok", "human",
      lambda box, forge, tracker, runner: runner._handed_back == []),
     ("a_decision", "execute", "decision", "auto",
@@ -600,22 +610,20 @@ def _carrying(mark: str) -> set[int]:
     return found
 
 
-def _cmdline(pid: int) -> list[str]:
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
-    except OSError:
-        return []
+def _announced(fifo: Path) -> int:
+    """The pid a child writes into `fifo` once it is what the case needs. A blocking read, and a
+    deadline that only fails the test: a child that never announces itself is a broken case."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as Late
 
-
-def _until_it_is_sleep(pid: int) -> bool:
-    import time
-
-    deadline = time.monotonic() + 10
-    while _cmdline(pid)[:1] != ["sleep"]:
-        if time.monotonic() > deadline or not _cmdline(pid):
-            return False
-        time.sleep(0.01)
-    return True
+    with ThreadPoolExecutor(1) as pool:
+        reading = pool.submit(fifo.read_text)
+        try:
+            return int(reading.result(timeout=30).strip())
+        except Late:
+            with open(fifo, "w"):  # unblocks the read, so the pool can close
+                pass
+            pytest.fail(f"no child announced itself through {fifo}")
 
 
 @pytest.mark.skipif(not _LINUX, reason="reads environments and pending signals from /proc")
@@ -636,21 +644,30 @@ def test_a_stop_kills_what_a_returned_command_left_running(tmp_path):
     path = tmp_path / "wt" / "beeverforge-1"
     path.mkdir(parents=True)
     ws = Workspace(path=path, branch="beeverforge/1", base_branch="main")
-    command = (f"setsid sleep 600 >/dev/null 2>&1 & echo $!; "
-               f"env -u {MARK_VAR} sleep 600 >/dev/null 2>&1 & echo $!; "
+    # READINESS IS AN EVENT, NOT A WAIT: the two children whose case depends on a step taken after
+    # they started — the new session, the dropped mark — announce themselves through a fifo once
+    # that step is taken, then exec `sleep`. The plain one carries the mark and sits in the group
+    # from its first instruction, so it needs no announcement.
+    in_a_session, unmarked_fifo = tmp_path / "session.fifo", tmp_path / "unmarked.fifo"
+    os.mkfifo(in_a_session)
+    os.mkfifo(unmarked_fifo)
+    command = (f"setsid sh -c 'echo $$ > {in_a_session}; exec sleep 600' >/dev/null 2>&1 & "
+               f"env -u {MARK_VAR} sh -c 'echo $$ > {unmarked_fifo}; exec sleep 600' "
+               f">/dev/null 2>&1 & "
                f"sleep 600 >/dev/null 2>&1 & echo $!")
     pids: list[int] = []
     groups: set[int] = set()
     try:
         rc, out = box.run(workspace=ws, command=command, timeout=60)
-        assert rc == 0, out
-        pids = [int(line) for line in out.split() if line.strip().isdigit()]
-        assert len(pids) == 3, out
-        session, unmarked, plain = pids
         groups = set(stop._groups)
-        # the case is what it says, or it proves nothing: each one is `sleep` by now (`setsid` and
-        # `env` exec it in place; a deadline that only fails, never a measured wait)
-        assert all(_until_it_is_sleep(p) for p in pids), [_cmdline(p) for p in pids]
+        assert rc == 0, out
+        plain = int(out.split()[-1])
+        pids = [plain]
+        session = _announced(in_a_session)
+        pids.append(session)
+        unmarked = _announced(unmarked_fifo)
+        pids.append(unmarked)
+        # the case is what it says, or it proves nothing
         assert os.getsid(session) == session, "the setsid'd sleep is not in a session of its own"
         assert os.getpgid(unmarked) in groups and os.getpgid(plain) in groups, (
             "the command's group was let go of while its background children lived")

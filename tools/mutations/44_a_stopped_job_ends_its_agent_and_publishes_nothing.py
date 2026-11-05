@@ -198,4 +198,11 @@ MUTATIONS = [
     ("the general comment goes through after a stop (the bypass widened)", MACHINE,
      '        self._unless_stopped("say_on_ticket")  # outside the `try`: a stop is not a lost '
      "comment\n", "", NO_BYPASS),
+
+    # ── the "opened" sentence says what else reached the pull request (re-review of #453) ──
+    ("a review posted before the stop is said not to have been", MACHINE,
+     '                self._landed_also("reviewed")\n', "", _case("review_pr_auto")),
+
+    ("reviewers asked before the stop are said not to have been", MACHINE,
+     '                self._landed_also("asked")\n', "", _case("request_reviewers")),
 ]
