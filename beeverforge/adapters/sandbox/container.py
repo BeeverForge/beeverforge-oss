@@ -54,6 +54,7 @@ from beeverforge.adapters.sandbox.base import (
     run_and_stream,
 )
 from beeverforge.adapters.sandbox.pull import PullCredential
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 from beeverforge.observability import logs
 
 log = logging.getLogger("beeverforge.sandbox.container")
@@ -410,6 +411,8 @@ class ContainerSandbox(SandboxAdapter):
         #: What the command currently running has written — the buffer `tail()` reads (C-39). One
         #: per box for the same reason as the handle above: one job at a time.
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
 
     def guidelines_path(self, host_dir: Path) -> str | None:
@@ -806,8 +809,11 @@ class ContainerSandbox(SandboxAdapter):
         passing = self._passthrough()
         for var in passing:
             env_flags += ["-e", var]
-        return run_and_stream(
-            subprocess.Popen(
+        # A JOB'S `docker exec` CLIENT IN A GROUP OF ITS OWN (#44), as on the worktree box: a
+        # person's stop kills the client at once, and `cleanup`'s `docker rm -f` — which `run()`'s
+        # `finally` reaches as soon as the pass returns — takes the process inside the container.
+        stop = self.stop
+        proc = subprocess.Popen(
                 # `sh -c`, NEVER `sh -lc`. A login shell sources the CLIENT IMAGE's /etc/profile
                 # and /etc/profile.d/* before the command — arbitrary third-party code running
                 # ahead of everything the platform issues, with the harness token already in the
@@ -825,9 +831,12 @@ class ContainerSandbox(SandboxAdapter):
                  "sh", "-c", command],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1, env=self._client_env(passing),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: `docker exec` is a local subprocess and the daemon relays the container

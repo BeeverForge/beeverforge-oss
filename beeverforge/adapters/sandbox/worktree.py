@@ -43,6 +43,7 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 
 log = logging.getLogger("beeverforge.sandbox.worktree")
 
@@ -744,6 +745,8 @@ class WorktreeSandbox(SandboxAdapter):
         self._staged: list[Path] = []
         #: What the command currently running has written — the buffer `tail()` reads (C-39).
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
     def guidelines_path(self, host_dir: Path) -> str | None:
         """Where the operator's guidelines directory is readable FROM INSIDE THIS BOX (#318).
@@ -1217,16 +1220,29 @@ class WorktreeSandbox(SandboxAdapter):
 
         `errors="replace"` is new and deliberate: `text=True` alone decodes strictly, so a single
         stray byte anywhere in four hours of agent output raised `UnicodeDecodeError` out of the
-        sandbox — losing the entire pass to a mojibake character in a filename."""
-        return run_and_stream(
-            subprocess.Popen(
+        sandbox — losing the entire pass to a mojibake character in a filename.
+
+        A JOB'S BOX STARTS EACH COMMAND IN A PROCESS GROUP OF ITS OWN (#44), and only a job's: the
+        one exception to the same-group rule `base.run_and_stream` states at its wall. A person's
+        `stop` has to end the agent pass and everything the harness spawned, and only a group of
+        its own can be killed whole without killing the worker; `self.stop` kills it
+        (`stopping.Stop.request`). What the shared group gave — a signal sent to the worker's whole
+        group (a terminal's Ctrl-C) reaching the harness — is given back on a graceful shutdown by
+        the worker's own cancel, which the activity treats as a stop
+        (`activities._the_work_must_end`); a worker killed with SIGKILL orphans the harness, as a
+        box in the shared group always could. A box with no stop (every judging role) is unchanged.
+        """
+        stop = self.stop
+        proc = subprocess.Popen(
                 command, shell=True, cwd=workspace.path,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1,
-                env=_scrubbed_env(self.extra_env),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                env=_scrubbed_env(self.extra_env), **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: a local subprocess's pipe is the shortest read there is, and this box says

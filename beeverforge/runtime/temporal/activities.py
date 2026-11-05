@@ -30,6 +30,7 @@ from temporalio.exceptions import ApplicationError
 from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
 from beeverforge.adapters.channel.registry import channel_destination
 from beeverforge.adapters.sandbox.registry import installed_box_traits, remote_box
+from beeverforge.adapters.sandbox.stopping import Stop
 from beeverforge.contracts import JobState, RunResult
 from beeverforge.contracts.checks import NOTHING_RAN, CiDecision, decide, declares_no_checks
 from beeverforge.contracts.checks import read as read_checks
@@ -213,7 +214,62 @@ def _judge_for(project_name: str):
         return build_techlead(None)
 
 
-async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
+# ── a stop reaches the work, not only its workflow (#44) ─────────────────────────────────────────
+#
+# MEASURED IN THE INSTALLED SDK (temporalio 1.35), and it decided the shape. `stop` terminates the
+# job's workflow (`catalog._stop`). Nothing tells a running activity that directly: its next
+# heartbeat is answered NotFound by the server, core turns that into a Cancel with
+# `is_not_found`, and `worker/_activity.py::_handle_cancel_activity_task` sets
+# `activity.cancellation_details()` and cancels the async activity's task — so `_heartbeat_while`
+# gets a CancelledError at its next beat (every ~30 s). `stop` keeps TERMINATING rather than asking
+# for a cancel first: a cancel request is acted on only by the workflow, and a wedged workflow —
+# the case `stop` exists for — never acts on it, so a cancel-first stop would end nothing there.
+#
+# WHAT ENDS THE WORK, AND WHAT DOES NOT. An ended workflow (`not_found`), a cancel the workflow
+# asked for (`cancel_requested`) and a worker shutting down (`worker_shutdown`) end it: the agent's
+# process groups are killed and nothing more is published. `worker_shutdown` is among them because
+# a stoppable box starts its commands in a process group of their own (`stopping.own_group`), so a
+# signal sent to the worker's whole group no longer reaches the harness; the shutdown's cancel is
+# what reaches it instead. A heartbeat TIMEOUT, a PAUSE and a RESET are not a person ending the
+# work, and they are left exactly as they were (#259 decides what a timed-out attempt keeps).
+_THE_WORK_ENDS = ("not_found", "cancel_requested", "worker_shutdown")
+
+#: How long the activity waits, after telling the runner, for its thread to end — the agent's
+#: groups are already killed, so what is left is a `git worktree remove`; bounded because nothing
+#: heartbeats for it any more.
+_A_STOPPED_JOB_ENDS_WITHIN = 60.0
+
+_WHY_THE_WORK_ENDS = {
+    "not_found": "its workflow was ended in the engine (a stop)",
+    "cancel_requested": "its workflow cancelled it",
+    "worker_shutdown": "its worker is shutting down",
+}
+
+
+def _the_work_must_end(details) -> bool:
+    """Whether a cancellation with these `ActivityCancellationDetails` ends the job's work."""
+    return details is not None and any(getattr(details, k, False) for k in _THE_WORK_ENDS)
+
+
+async def _end_the_work(work: asyncio.Task, stop, detail: str, details) -> None:
+    """Tell the runner thread, kill what it started, and wait (bounded) for it to clean up."""
+    why = next((_WHY_THE_WORK_ENDS[k] for k in _THE_WORK_ENDS if getattr(details, k, False)), "")
+    activity.logger.warning("BEEVERFORGE_JOB_STOPPED %s — %s: the agent's processes are killed, "
+                            "its worktree is removed and nothing more is published", detail, why)
+    stop.request(why)
+    await asyncio.wait({work}, timeout=_A_STOPPED_JOB_ENDS_WITHIN)
+    if not work.done():
+        activity.logger.warning("BEEVERFORGE_JOB_STOPPED_LATE %s — the runner thread had not ended "
+                                "%ss after it was told; it publishes nothing when it does",
+                                detail, _A_STOPPED_JOB_ENDS_WITHIN)
+        return
+    # RETRIEVED, so nothing logs "exception never retrieved": a `JobStopped`, or whatever the
+    # pass raised on its way out; the activity's own answer is the cancellation either way
+    if not work.cancelled():
+        work.exception()
+
+
+async def _heartbeat_while(fn, detail: str, *, tick=None, stop=None) -> RunResult:
     """Run blocking work in a thread while heartbeating every ~30s, so Temporal sees the
     activity is alive (a dead worker trips heartbeat_timeout instead of the full ceiling).
     On cancellation/timeout the pending thread-task is cancelled, never leaked (H7).
@@ -241,6 +297,12 @@ async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
             activity.heartbeat(f"{detail} — {note}" if note else detail)
             await asyncio.wait({work}, timeout=30)
         return work.result()
+    except asyncio.CancelledError:
+        # `stop` IS WHAT THE THREAD HEARS (#44): cancelling `work` below ends only the wrapper
+        details = activity.cancellation_details() if stop is not None else None
+        if _the_work_must_end(details):
+            await _end_the_work(work, stop, detail, details)
+        raise
     finally:
         # the underlying Fargate task is stopped by the workflow's cleanup compensation
         if not work.done():
@@ -464,11 +526,15 @@ async def run_job(inp: RunJobInput) -> RunResult:
     # `_watch_for` says so in the log rather than attaching a watcher that would see nothing.
     watch = _watch_for(inp)
     applied = _this_activitys_event("handed-back")
+    # WHAT THE RUNNER THREAD HEARS WHEN THE JOB IS STOPPED (#44): the loop below requests it on a
+    # cancel that ends the work, and `_do_run_job` hands it to the runner and its box
+    stop = Stop()
     result = await _heartbeat_while(
         lambda: _the_worker_applies(inp.project, inp.issue, applied,
-                                    _do_run_job(inp, run_id, watch=watch)),
+                                    _do_run_job(inp, run_id, watch=watch, stop=stop)),
         f"{inp.project}#{inp.issue} via {inp.sandbox}",
         tick=watch.tick if watch else None,
+        stop=stop,
     )
     try:
         # BOUNDED, BECAUSE NOTHING BEATS FOR IT: the loop above stopped beating when the job
@@ -657,7 +723,7 @@ def _running_previews(kind: str):
 
 
 def _do_run_job(inp: RunJobInput, run_id: str | None = None,
-                watch: HarnessWatch | None = None) -> RunResult:
+                watch: HarnessWatch | None = None, stop: Stop | None = None) -> RunResult:
     # BY TRAIT, NOT BY NAME. `if inp.sandbox == "fargate"` stood here, and it meant a third box
     # declaring `remote=True` was built as a LOCAL adapter by this line while `stop_job` ignored
     # it — the two halves of one lifecycle disagreeing about where the job is (measured with an
@@ -680,6 +746,10 @@ def _do_run_job(inp: RunJobInput, run_id: str | None = None,
     # (which lives one frame up, in the loop that stays awake) is given them.
     if watch is not None:
         watch.attach(runner)
+    # …and the stop, beside it: the runner checks it before each step that reaches the forge or the
+    # board, and its box starts each command in a group the stop can kill (#44)
+    if stop is not None:
+        runner.hears(stop)
     result = runner.run(inp.issue, resume_handle=inp.resume_handle,
                         spent_turns=inp.spent_turns, decision=inp.decision,  # C2 + D4 + a choice
                         another_pass=inp.another_pass)  # #448 slice 4: the card's next change
