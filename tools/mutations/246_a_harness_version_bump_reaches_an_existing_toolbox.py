@@ -7,10 +7,14 @@ Row 1 is the defect as it shipped: a populated stamp of the right variant is tak
 whatever the versions. Row 2 is the boot not handing its source over, so the check never compares.
 Row 3 stops recording the versions. Row 4 takes a stamp written before versions were recorded as
 current. Row 5 stops reading scoped packages, which is where `claude` lives. Rows 6-7 break the
-proof's line: no versions printed, and no word when none were recorded.
+proof's line: no versions printed, and no word when none were recorded. Rows 8-12 break the staged
+swap (#461's review): the old toolbox removed before the new one is copied, a failed copy's staging
+left on the volume, the stamp kept until after the swap, a dead swap's debris never cleared, and a
+harness the new toolbox dropped left in place.
 """
 
 TEST = "tests/test_a_harness_version_bump_reaches_an_existing_toolbox.py"
+TOOLBOX = "tests/test_the_toolbox.py"
 
 TB = "beeverforge/runtime/toolbox.py"
 PROVE = "beeverforge/box_prove.py"
@@ -43,4 +47,26 @@ MUTATIONS = [
     ("the proof says nothing when no version was recorded", PROVE,
      '            recorded = versions(stamp) or "versions not recorded"\n',
      '            recorded = versions(stamp)\n'),
+
+    ("the old toolbox is removed before the new one is copied", TB,
+     '    staging = dst / f"{_STAGING}{os.getpid()}"\n',
+     '    staging = dst / f"{_STAGING}{os.getpid()}"\n'
+     "    for gone in list(dst.iterdir()):\n"
+     "        _remove(gone)\n"),
+
+    ("a failed copy leaves its staging on the volume", TB,
+     "        shutil.rmtree(staging, ignore_errors=True)\n        raise\n",
+     "        raise\n"),
+
+    ("the stamp stays until after the swap", TB,
+     "    (dst / STAMP).unlink(missing_ok=True)\n    old = staging / _OLD\n",
+     "    old = staging / _OLD\n", TOOLBOX),
+
+    ("a dead swap's debris is never cleared", TB,
+     "        _remove(debris)\n",
+     "        pass\n", TOOLBOX),
+
+    ("a harness the new toolbox dropped stays in place", TB,
+     "        if entry.name != STAMP and not entry.name.startswith(_STAGING):\n",
+     "        if entry.name in fresh:\n"),
 ]

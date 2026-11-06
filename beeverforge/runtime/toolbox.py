@@ -145,9 +145,17 @@ def populate(*, source: Path | None = None, live: Path | None = None,
     left alone. A harness version bump changes those versions, so it is copied without being asked
     (#246); `force` is an operator's override, for a live copy changed by hand.
 
-    THE STAMP IS WRITTEN LAST, and that is the whole crash-safety story. A worker killed mid-copy
-    leaves a directory with some binaries and no stamp; the next boot reads no stamp, calls it
-    unpopulated, and copies again. There is no state in which a partial toolbox looks complete.
+    THE STAMP IS WRITTEN LAST, and that is the whole crash-safety story. The new toolbox is copied
+    into a staging directory beside the live one, so a copy that dies leaves the live toolbox and
+    its stamp untouched: the same harness keeps running, and the next boot tries again. The stamp
+    is removed before the staged entries are renamed into place and written after the last one, so
+    a worker killed during that swap leaves no stamp, and the next boot copies again. There is no
+    state in which a partial or mixed toolbox looks complete.
+
+    A BOX OF A PREVIOUS WORKER CAN STILL BE RUNNING when this runs: a deploy's SIGTERM leaves the
+    container box on the host daemon (`adapters/sandbox/container.py`, #165). Its harness keeps the
+    files it has open across the swap; a file it opens afterwards comes from the new toolbox.
+    The staging copy needs room for a second toolbox on the volume while it is built.
     """
     src = source or SOURCE
     dst = live or LIVE
@@ -172,37 +180,70 @@ def populate(*, source: Path | None = None, live: Path | None = None,
     harnesses = sorted(e.name for e in src.iterdir()
                        if not e.is_dir() and e.name != STAMP)
     dst.mkdir(parents=True, exist_ok=True)
-    (dst / STAMP).unlink(missing_ok=True)  # invalidate FIRST: a stale stamp over new bytes lies
-    for entry in src.iterdir():
-        target = dst / entry.name
-        # REPLACE, never merge onto what is there. A crashed run leaves entries behind, and
-        # `shutil.copy2(..., follow_symlinks=False)` raises FileExistsError when the target symlink
-        # already exists — which is exactly what the real worker hit: the `claude` entry is a
-        # symlink into `pkg/`, so every boot failed on the first entry and the volume sat at 95 MB
-        # of a 701 MB toolbox for ever, with `codex`, `kimi` and `pkg` never copied at all.
-        #
-        # Removing first also makes a version bump exact rather than a merge, so a file dropped
-        # from a newer toolbox does not linger from the older one.
-        if target.is_symlink() or target.is_file():
-            target.unlink()
-        elif target.is_dir():
-            shutil.rmtree(target)
-        if entry.is_dir():
-            shutil.copytree(entry, target, symlinks=True)
-        else:
-            # `follow_symlinks=False` keeps the entry a LINK. Following it would copy a 260 MB
-            # binary to the top level and leave `pkg` unreferenced — twice the disk, and an entry
-            # that no longer points at the package it came from. The link targets the IN-BOX mount
-            # point, so it is dangling here and resolves where it is mounted.
-            shutil.copy2(entry, target, follow_symlinks=False)
-            if not target.is_symlink():
-                target.chmod(target.stat().st_mode | 0o111)
+    # STAGED, THEN SWAPPED (#246's review). A bump now replaces a toolbox that WORKS, so the new
+    # one is copied beside it first, on the same volume, and only then renamed into place. A copy
+    # that fails (a full disk, a killed worker) leaves the old toolbox and its stamp exactly as they
+    # were, so the boxes keep a harness that runs and the next boot tries again; it does not leave
+    # them with none.
+    for debris in dst.glob(f"{_STAGING}*"):  # what a boot killed mid-copy or mid-swap left
+        _remove(debris)
+    staging = dst / f"{_STAGING}{os.getpid()}"
+    try:
+        for entry in src.iterdir():
+            if entry.name != STAMP:
+                _copy(entry, staging / entry.name)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    # THE SWAP: the stamp goes first, so a crash between two renames leaves no stamp over a mix of
+    # old and new entries, and the next boot copies again. Each entry moves with one rename on one
+    # filesystem. An entry the new toolbox no longer has moves aside too, so a bump is exact rather
+    # than a merge. A box running at the swap keeps every file it already has open (a rename and a
+    # removal leave an open file readable); a path it opens afterwards resolves to the new toolbox.
+    (dst / STAMP).unlink(missing_ok=True)
+    old = staging / _OLD
+    old.mkdir()
+    fresh = {e.name for e in staging.iterdir()} - {_OLD}
+    for entry in list(dst.iterdir()):
+        if entry.name != STAMP and not entry.name.startswith(_STAGING):
+            os.rename(entry, old / entry.name)
+    for name in fresh:
+        os.rename(staging / name, dst / name)
 
     stamp = {"variant": variant(), "harnesses": harnesses, "packages": packages(src)}
     (dst / STAMP).write_text(json.dumps(stamp, indent=2, sort_keys=True))
+    shutil.rmtree(staging, ignore_errors=True)  # the old toolbox, now aside
     log.info("toolbox populated at %s — %s (%s)%s", dst, ", ".join(harnesses) or "nothing",
              stamp["variant"], _changed(was, stamp["packages"]))
     return stamp
+
+
+#: The staging directory a copy is built in, beside the live toolbox on the same volume, and where
+#: the old toolbox is moved aside during the swap. Hidden, so it is never taken for a harness.
+_STAGING = ".toolbox-staging-"
+_OLD = ".old"
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _copy(entry: Path, target: Path) -> None:
+    """One baked entry into the staging directory, which starts empty."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if entry.is_dir() and not entry.is_symlink():
+        shutil.copytree(entry, target, symlinks=True)
+        return
+    # `follow_symlinks=False` keeps the entry a LINK. Following it would copy a 260 MB binary to the
+    # top level and leave `pkg` unreferenced — twice the disk, and an entry that no longer points at
+    # the package it came from. The link targets the IN-BOX mount point, so it is dangling here and
+    # resolves where it is mounted.
+    shutil.copy2(entry, target, follow_symlinks=False)
+    if not target.is_symlink():
+        target.chmod(target.stat().st_mode | 0o111)
 
 
 def _changed(was: dict, now: dict) -> str:

@@ -147,12 +147,14 @@ def test_a_directory_with_binaries_but_no_stamp_is_not_populated(baked, tmp_path
     assert toolbox.is_populated(live) is True
 
 
-def test_the_stamp_is_invalidated_before_the_copy_starts(baked, tmp_path, monkeypatch):
-    """A stale stamp sitting over freshly-written bytes is the one arrangement that LIES. So the
-    stamp goes first and is rewritten last — if the copy dies in between, the next boot sees no
-    stamp and redoes it."""
+def test_a_copy_that_fails_leaves_the_old_toolbox_and_its_stamp(baked, tmp_path, monkeypatch):
+    """The copy is built in a staging directory beside the live toolbox (#246's review), so a copy
+    that dies has written nothing into it: the old bytes and the old stamp still agree, the boxes
+    keep a harness that runs, and nothing half-copied is left on the volume."""
     live = tmp_path / "live"
     toolbox.populate(source=baked, live=live)
+    before = (live / toolbox.STAMP).read_text()
+    (live / "codex").write_text("#!/bin/sh\nexec true OLD\n")
 
     import shutil as _shutil
 
@@ -163,8 +165,38 @@ def test_the_stamp_is_invalidated_before_the_copy_starts(baked, tmp_path, monkey
     with pytest.raises(OSError):
         toolbox.populate(source=baked, live=live, force=True)
 
-    assert not (live / toolbox.STAMP).exists(), "a stamp survived a failed copy"
+    assert (live / toolbox.STAMP).read_text() == before, "the stamp changed over the old bytes"
+    assert "OLD" in (live / "codex").read_text(), "the old toolbox was touched by a failed copy"
+    assert not list(live.glob(".toolbox-staging-*")), "a failed copy left its staging behind"
+
+
+def test_the_stamp_is_gone_before_the_swap_starts(baked, tmp_path, monkeypatch):
+    """A stale stamp sitting over a mix of old and new entries is the one arrangement that LIES.
+    So the stamp goes before the first rename and is rewritten after the last — if the swap dies in
+    between, the next boot sees no stamp and redoes it."""
+    live = tmp_path / "live"
+    toolbox.populate(source=baked, live=live)
+
+    real = toolbox.os.rename
+    calls = []
+
+    def _die_on_the_third(a, b):
+        calls.append(a)
+        if len(calls) == 3:
+            raise OSError("killed mid-swap")
+        return real(a, b)
+
+    monkeypatch.setattr(toolbox.os, "rename", _die_on_the_third)
+    with pytest.raises(OSError):
+        toolbox.populate(source=baked, live=live, force=True)
+    monkeypatch.setattr(toolbox.os, "rename", real)
+
+    assert not (live / toolbox.STAMP).exists(), "a stamp survived a swap that died"
     assert toolbox.is_populated(live) is False
+
+    toolbox.populate(source=baked, live=live)
+    assert toolbox.is_populated(live, source=baked) is True
+    assert not list(live.glob(".toolbox-staging-*")), "the next boot left the dead swap's debris"
 
 
 def test_a_toolbox_built_for_another_variant_is_not_populated(baked, tmp_path, monkeypatch):

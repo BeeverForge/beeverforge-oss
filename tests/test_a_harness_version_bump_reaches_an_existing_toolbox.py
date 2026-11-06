@@ -10,12 +10,16 @@ which version the boxes ran.
 WHAT IS HELD HERE: the stamp records the version of every package the toolbox copied, read from
 each package's own `package.json`. A boot whose baked versions differ from the live stamp's copies
 again; equal versions do not; a stamp written before versions were recorded is copied once.
-`box prove` prints the versions.
+A bump that fails midway leaves the old toolbox working, and a box that has the old toolbox open
+keeps what it opened. `box prove` prints the versions.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+
+import pytest
 
 from beeverforge.box_prove import Probes, prove
 from beeverforge.runtime import toolbox
@@ -131,3 +135,46 @@ def test_box_prove_says_when_no_version_was_recorded():
 
     line = next(f.message for f in proof.findings if f.check == "toolbox")
     assert line == "linux-arm64-glibc — claude (versions not recorded)", line
+
+
+def test_a_bump_that_fails_midway_leaves_the_old_harness_working(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    toolbox.populate(source=_baked(tmp_path / "old", "2.1.219"), live=live)
+    new = _baked(tmp_path / "new", "2.1.309")
+
+    def _die(*a, **k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(shutil, "copytree", _die)
+    with pytest.raises(OSError):
+        toolbox.populate(source=new, live=live)
+
+    assert _live_version(live) == "2.1.219", "a failed bump left the boxes with no harness"
+    assert toolbox.read_stamp(live)["packages"][CLAUDE] == "2.1.219", (
+        "the stamp claims a version the volume does not hold")
+    assert toolbox.is_populated(live, source=new) is False, "the next boot would not try again"
+    assert not list(live.glob(".toolbox-staging-*"))
+
+
+def test_a_box_with_the_old_toolbox_open_keeps_what_it_opened(tmp_path):
+    live = tmp_path / "live"
+    toolbox.populate(source=_baked(tmp_path / "old", "2.1.219"), live=live)
+
+    with open(live / toolbox.PACKAGES / CLAUDE / "package.json") as held:  # a running harness
+        toolbox.populate(source=_baked(tmp_path / "new", "2.1.309"), live=live)
+        assert json.loads(held.read())["version"] == "2.1.219"
+
+    assert _live_version(live) == "2.1.309"
+
+
+def test_a_file_the_new_toolbox_dropped_is_gone_and_no_staging_is_left(tmp_path):
+    live = tmp_path / "live"
+    old = _baked(tmp_path / "old", "2.1.219")
+    (old / "kimi").write_text("#!/bin/sh\nexec true kimi\n")
+    toolbox.populate(source=old, live=live)
+
+    stamp = toolbox.populate(source=_baked(tmp_path / "new", "2.1.309"), live=live)
+
+    assert not (live / "kimi").exists(), "a harness the new toolbox dropped lingered"
+    assert stamp["harnesses"] == ["claude", "opencode"]
+    assert sorted(e.name for e in live.iterdir()) == ["claude", "opencode", "pkg", toolbox.STAMP]
