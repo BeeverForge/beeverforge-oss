@@ -6,10 +6,11 @@ drop and accept a requirement kept the old pattern on its Status, Asked by and D
 pattern searched for a close from every `<!--` to the end of the value, so a value of n unclosed
 openings cost n² steps there while the reader of the same file took linear time.
 
-WHAT IS HELD HERE: each writer grows linearly on a value of many `<!--`, MEASURED, NOT BOUNDED,
-with the n against 4n processor-time ratio of #76's own test; and on ordinary values (the
-template's own comments, and a value with none) the shared helper and the writers give exactly
-what the old pattern gave.
+WHAT IS HELD HERE: each writer passes the value it reads through `corpus._without_comments`, the
+reader's own one-pass helper, whose linearity #76's test already measures. That is checked by
+recording the helper's arguments, with no clock, so the result depends on the code alone (#322 AC 1:
+not by a fixed time bound). On ordinary values (the template's own comments, and a value with none)
+the shared helper and the writers give exactly what the old pattern gave.
 """
 
 from __future__ import annotations
@@ -17,55 +18,64 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+from beeverforge.product import authoring
 from beeverforge.product.authoring import (
     _is_dropped,
     _set_status_accepted,
     _set_status_dropped,
 )
 from beeverforge.product.corpus import _without_comments
-from tests.test_a_requirement_is_read_in_time_linear_in_its_size import N, _linear
 
 DAY = "2026-01-01"
 TEMPLATE = (Path(__file__).resolve().parents[1]
             / "beeverforge/org_defaults/requirements/0000-template.md")
 
 
-def _many_openings_in_status(n: int) -> str:
-    return "# REQ-0001 — t\n\n- **Status:** " + "<!--" * n + "\n"
+@pytest.fixture
+def stripped(monkeypatch) -> list[str]:
+    """Every value a writer hands to `_without_comments`, which still does the real work."""
+    seen: list[str] = []
+    real = authoring._without_comments
+
+    def recording(value: str) -> str:
+        seen.append(value)
+        return real(value)
+
+    monkeypatch.setattr(authoring, "_without_comments", recording)
+    return seen
 
 
-def test_a_status_of_many_comment_openings_is_checked_for_dropped_linearly():
-    assert _is_dropped(_many_openings_in_status(N)) is False
-    _linear(_is_dropped, _many_openings_in_status)
+def _status(value: str) -> str:
+    return f"# REQ-0001 — t\n\n- **Status:** {value}\n"
 
 
-def test_a_status_of_many_comment_openings_is_dropped_linearly():
-    text = _many_openings_in_status(N)
-    new, outcome = _set_status_dropped(text, dropped_by="someone", day=DAY)
-    assert new == text
-    assert outcome.endswith("which is not a state anything can be dropped from")
-    _linear(lambda t: _set_status_dropped(t, dropped_by="someone", day=DAY),
-            _many_openings_in_status)
+def test_the_dropped_check_strips_the_status_with_the_readers_helper(stripped):
+    assert _is_dropped(_status("dropped <!-- c1 -->")) is True
+    assert any("<!-- c1 -->" in v for v in stripped), stripped
 
 
-def test_a_status_of_many_comment_openings_is_accepted_linearly():
-    text = _many_openings_in_status(N)
+def test_the_drop_strips_the_status_with_the_readers_helper(stripped):
+    text = _status("dropped <!-- c2 -->")
+    assert _set_status_dropped(text, dropped_by="someone", day=DAY) == (text, "already")
+    assert any("<!-- c2 -->" in v for v in stripped), stripped
+
+
+def test_the_accept_strips_the_status_with_the_readers_helper(stripped):
+    text = _status("accepted <!-- c3 -->")
+    assert _set_status_accepted(text, accepted_by="someone", day=DAY) == (text, "already")
+    assert any("<!-- c3 -->" in v for v in stripped), stripped
+
+
+def test_the_accept_strips_an_existing_asker_and_date_with_the_readers_helper(stripped):
+    text = ("- **Status:** proposed\n- **Asked by:** someone <!-- c4 -->\n"
+            f"- **Date:** {DAY} <!-- c5 -->\n")
     new, outcome = _set_status_accepted(text, accepted_by="someone", day=DAY)
-    assert new == text
-    assert outcome.endswith("which is not a pre-promise state")
-    _linear(lambda t: _set_status_accepted(t, accepted_by="someone", day=DAY),
-            _many_openings_in_status)
-
-
-def test_an_asker_of_many_comment_openings_is_kept_on_accept_linearly():
-    def make(n: int) -> str:
-        return ("- **Status:** proposed\n- **Asked by:** " + "<!--" * n
-                + f"\n- **Date:** {DAY}\n")
-    new, outcome = _set_status_accepted(make(N), accepted_by="someone", day=DAY)
     assert outcome == "flipped"
-    assert new == ("- **Status:** accepted\n- **Asked by:** " + "<!--" * N
-                   + f"\n- **Date:** {DAY}\n")
-    _linear(lambda t: _set_status_accepted(t, accepted_by="someone", day=DAY), make)
+    assert new == text.replace("proposed", "accepted")
+    assert any("<!-- c4 -->" in v for v in stripped), stripped
+    assert any("<!-- c5 -->" in v for v in stripped), stripped
 
 
 def _template_values() -> list[str]:

@@ -3,7 +3,7 @@
 `authoring.py` checked, dropped and accepted a requirement with `re.sub(r"<!--.*?-->", "", value)`
 on its Status, Asked by and Date values, which searched for a close from every `<!--` to the end of
 the value: n unclosed openings cost n². Each row below puts one site back the way it was, and the
-guard, which measures how each writer's processor time grows from n to 4n, must go red.
+guard, which records the values each writer hands to the reader's helper, must go red.
 """
 
 TEST = "tests/test_the_writers_strip_comments_in_time_linear_in_its_size.py"
