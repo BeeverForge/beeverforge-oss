@@ -237,8 +237,11 @@ def _not_verified(review: ReviewResult) -> bool:
 
 
 def format_review(review: ReviewResult) -> str:
-    lines = [f"**{review.decision}** — score {review.score}", "", review.summary]
+    """The review posted on the pull request; the reviewer's words link nothing (#315)."""
+    from beeverforge.orchestrator.machine import _without_reviewer_mentions as quiet
+
+    lines = [f"**{review.decision}** — score {review.score}", "", quiet(review.summary)]
     for f in review.findings:
         loc = f" (`{f.file}:{f.line}`)" if f.file else ""
-        lines.append(f"- **{f.severity}**{loc}: {f.description}")
+        lines.append(f"- **{f.severity}**{loc}: {quiet(f.description)}")
     return "\n".join(lines)

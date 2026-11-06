@@ -410,6 +410,187 @@ def _as_text(words: str) -> str:
     return "\n".join(f"\\{row}" if row.startswith("## ") else row for row in words.split("\n"))
 
 
+#: A `GH-<number>` GitHub links as an issue, any case, not glued to an ASCII letter or digit
+#: (`AGH-3` is not one). Main's `_A_GH_MENTION` writes most `card <number>`, but its `\b` on both
+#: sides misses `_GH-1_`, `__GH-1__` and `éGH-1`, which GitHub links (review of #323 at 12c5242,
+#: measured on `POST /markdown`); `_without_reviewer_mentions` breaks what is left.
+_A_GH_REFERENCE = re.compile(r"(?<![A-Za-z0-9])(GH)(?=-\d)", re.IGNORECASE)
+#: An `&` no backslash escapes: after none, or after escaped pairs (`\\&`). GitHub decodes an
+#: entity before it links, so `&#x40;name`, `&commat;name`, `&#x23;1` and `GH&#x2D;1` mentioned
+#: and linked (review of #323, measured on `POST /markdown`). One more backslash makes the `&`
+#: text, as `_MARKUP` does for the agent's own; an `&` already escaped (`\&`) is left alone, as a
+#: second backslash would escape the first and leave the entity live.
+_A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
+#: A fence line, `` ``` `` or `~~~` and longer, at most three spaces in; a backtick fence's info
+#: string holds no backtick (CommonMark).
+_A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+#: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
+#: autolink (`<https://…>`) is not one.
+_AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]", re.MULTILINE)
+
+
+def _ampersands_escaped(words: str) -> str:
+    """The reviewer's `words` with every bare `&` escaped, except in a CLOSED fence, a CLOSED code
+    span and a link GitHub makes (`_autolinked`), where a backslash is not an escape: it showed in
+    the code and moved the link (review of #323, measured on `POST /markdown`). An entity there
+    renders as written and mentions no one. When in doubt it escapes: a fence or a span that
+    never closes, and the rest of the paragraph after it, and all of `words` if a row may open an
+    HTML block."""
+    if _AN_HTML_ROW.search(words):
+        return _escaped_ampersands(_AN_AUTOLINK.sub(_unlinked, words))
+    rows, out, paragraph, i = words.split("\n"), [], [], 0
+
+    def ended() -> list[str]:
+        return [_outside_spans("\n".join(paragraph))] if paragraph else []
+
+    while i < len(rows):
+        fence = _A_FENCE.match(rows[i])
+        if fence:
+            closing = re.compile(rf" {{0,3}}{re.escape(fence[1][0])}{{{len(fence[1])},}}[ \t]*$")
+            end = next((j for j in range(i + 1, len(rows)) if closing.match(rows[j])), None)
+            if end is not None:
+                out, paragraph, i = out + ended() + rows[i:end + 1], [], end + 1
+                continue
+        if rows[i].strip():
+            paragraph.append(rows[i])
+        else:
+            out, paragraph = out + ended() + [rows[i]], []
+        i += 1
+    return "\n".join(out + ended())
+
+
+def _outside_spans(text: str) -> str:
+    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and the
+    links GitHub makes of its bare ones. A span here closes on its own row: one that does not, or
+    a `<` that reaches past its row or over a backtick (an HTML tag or an autolink outranks a
+    span), ends the guessing, and the rest of the paragraph is escaped whole."""
+    out, start, i = [], 0, 0
+    while i < len(text):
+        row_end = len(text) if (n := text.find("\n", i)) < 0 else n
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "<":
+            close = text.find(">", i, row_end)
+            if close < 0 or "`" in text[i:close]:
+                break
+        elif text[i] == "`":
+            run = len(text[i:]) - len(text[i:].lstrip("`"))
+            span = re.compile(rf"(?<!`){'`' * run}(?!`)").search(text, i + run, row_end)
+            if span is None:
+                break
+            out += [_outside_links(text[start:i], text[start - 1:start]), text[i:span.end()]]
+            start = i = span.end()
+            continue
+        i += 1
+    return "".join(out) + _outside_links(text[start:], text[start - 1:start])
+
+
+#: A bare link's scheme (or `www.`) and the domain after it, as GFM reads one: labels of
+#: `[A-Za-z0-9_-]` separated by dots.
+_A_LINK_DOMAIN = re.compile(r"((?i:https?)://|www\.)([A-Za-z0-9_.-]*)")
+#: `_A_URL` as GitHub reads the reviewer's words: its scheme in any case, as `HTTPS://…` and
+#: `Https://…` are linked (review of #323 at 7fcf99b, measured on `POST /markdown`), so their `&`
+#: is not escaped into the address; `www.` in lower case only, as `WWW.ex.com/&#x40;name` is not
+#: linked and mentions (measured too). `_A_URL` itself, the agent's path, is left as it is.
+_A_BARE_LINK = re.compile(r"(?<!\]\()((?:(?i:https?)://|www\.)[^\s`<>\\()]*[^\s`<>\\.,;:!?'\")\]()])")
+
+
+def _autolinked(link: str, before: str, after: str) -> bool:
+    """Whether GitHub makes a link of `link`, a bare link `_A_BARE_LINK` found between the
+    characters `before` and `after` (empty at an end of the paragraph). It also finds what GitHub
+    does not link, where an `&` is text and an entity mentions or links (reviews of #323, measured
+    on `POST /markdown`). A `www.` link, by GFM's extended rule: after the start, whitespace, `*`,
+    `_`, `~` or `(`, never after `<` (an angle autolink needs a scheme). A scheme link: after any
+    character but an ASCII letter or `[`, whose host starts with a letter or a digit (one label
+    is enough). Either way no label is empty but the last and none of the last two holds a `_`.
+    In doubt, it is not. An angle autolink (`<https://…>`) never reaches here: `_outside_links`
+    reads it first (`_AN_AUTOLINK`)."""
+    scheme, domain = _A_LINK_DOMAIN.findall(link)[0]  # `link` opens with its scheme
+    labels = domain.split(".")
+    if scheme == "www.":
+        if before and not before.isspace() and before not in "*_~(":
+            return False
+        labels = ["www", *labels]
+    elif before == "[" or (before.isascii() and before.isalpha()):
+        return False
+    elif not domain[:1].isalnum():
+        return False
+    return all(labels[:-1]) and not any("_" in label for label in labels[-2:])
+
+
+#: CommonMark's autolink, `<scheme:…>`, any scheme of 2 to 32 characters in any case, with the run
+#: of backslashes before it in group 1. Read after any run: a bare link glued before `\<ftp:…>`
+#: takes the `\` into its address and the `<` opens the autolink after all (review of #323 at
+#: 97001b1, measured on `POST /markdown`). A backslash inside it is no escape, so
+#: `\&` there is a literal `\` and the entity after it still decoded: `<ftp://ex.com/&#x40;name>`
+#: mentioned and `<a+b:&#x23;1>` linked (review of #323 at 208035c, measured on `POST /markdown`).
+_AN_AUTOLINK = re.compile(r"(\\*)<([A-Za-z][A-Za-z0-9+.-]{1,31}):[^\s<>\x00-\x1f]*>")
+#: The autolinks GitHub keeps as links, where an entity is part of the address and mentions no one.
+_LINKED_SCHEMES = ("http", "https")
+
+
+def _unlinked(autolink: re.Match) -> str:
+    """An `_AN_AUTOLINK` GitHub keeps (`_LINKED_SCHEMES`, any case) as written; any other with the
+    `:` after its scheme escaped, so it is no autolink and a backslash before its `&` is an escape
+    again. Breaking the link, not the entity, because no character inside an autolink is an
+    escape: `ftp:`, `irc:` and the rest render as text on GitHub anyway (the plain
+    `<ftp://ex.com/@name>` linked nothing). Not its `<`: a bare link glued before it
+    (`https://ex.com/<ftp://…>`) took that backslash into its address, and the `<` opened the
+    autolink again (review of #323 at 12c5242, measured on `POST /markdown`). A scheme holds no
+    backslash, and a bare link ends at the `<`, so the `\\:` is the autolink's alone, whatever
+    run of backslashes stands before the `<`; an autolink already broken so is no `_AN_AUTOLINK`."""
+    if autolink[2].lower() in _LINKED_SCHEMES:
+        return autolink[0]
+    colon = autolink.end(2) - autolink.start()
+    return f"{autolink[0][:colon]}\\{autolink[0][colon:]}"
+
+
+def _outside_links(text: str, before: str = "") -> str:
+    """`text`, after the character `before`, with every bare `&` escaped outside the links GitHub
+    makes of its autolinks (`_unlinked`) and bare links (`_autolinked`), which keep theirs. A bare
+    link inside an autolink is the autolink's."""
+    out, start = [], 0
+    links = sorted([*_AN_AUTOLINK.finditer(text), *_A_BARE_LINK.finditer(text)],
+                   key=lambda m: m.start())
+    for link in links:
+        prior = text[link.start() - 1:link.start()] or before
+        if link.start() < start:
+            continue
+        if link.re is _AN_AUTOLINK and len(link[1]) % 2 and link[2].lower() in _LINKED_SCHEMES:
+            continue  # `\<https://…>`: its `<` is escaped, and the bare link in it is read as one
+        if link.re is _AN_AUTOLINK:
+            kept = _unlinked(link)
+            piece = kept if kept == link[0] else _escaped_ampersands(kept)
+        elif _autolinked(link[0], prior, text[link.end():link.end() + 1]):
+            piece = link[0]
+        else:
+            continue
+        out += [_escaped_ampersands(text[start:link.start()]), piece]
+        start = link.end()
+    return "".join(out) + _escaped_ampersands(text[start:])
+
+
+def _escaped_ampersands(text: str) -> str:
+    """`text` with every bare `&` escaped (`_A_BARE_AMPERSAND`)."""
+    return _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", text)
+
+
+def _without_reviewer_mentions(words: str) -> str:
+    """The reviewer's `words`, linking no issue and notifying no one (#315).
+
+    Its summary and findings reached the pull request as written, so a `#12`, `owner/repo#12`,
+    `GH-12` or `@someone` in them linked an unrelated issue or notified a stranger. `#<number>`
+    and `GH-<number>` (any case) are written `card <number>` (`without_mentions`, #111); a
+    zero-width space after the `@` of a name, and between `GH` and `-<number>` where main's
+    rewrite missed one (`_A_GH_REFERENCE`), keeps them readable and makes them nothing a forge
+    links. Every bare `&` outside code and links is escaped first, so no entity spells one of them
+    (`_ampersands_escaped`). Applied before `_as_text`, so a `## ` row is still escaped."""
+    words = _ampersands_escaped(words)
+    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    return _A_GH_REFERENCE.sub("\\1\u200b", words)
+
+
 def _sections_from(rows: list[str]) -> int:
     """The first row a platform section can be in: the one after the LAST `## Validations` row.
 
@@ -456,7 +637,7 @@ def _review_lines(r: ReviewResult) -> list[str]:
                      f"score {r.score})")
         else:
             first = f"{_REVIEW_HEADING}{r.decision} (score {r.score})"
-        out = [first, _as_text(r.summary)]
+        out = [first, _as_text(_without_reviewer_mentions(r.summary))]
         if unread:
             out.append("> This is not a judgement about the diff — nothing reviewed it. "
                        "The gates above are the only automated evidence here.")
@@ -467,7 +648,8 @@ def _review_lines(r: ReviewResult) -> list[str]:
             out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]
         for f in r.findings:
             loc = f" ({f.file}:{f.line})" if f.file else ""
-            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")
+            words = _as_text(_without_reviewer_mentions(f.description))
+            out.append(f"- **{f.severity}**{loc}: {words}")
         return out
 
 
