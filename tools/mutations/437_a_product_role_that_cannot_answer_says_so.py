@@ -9,6 +9,8 @@ break the draft: a harness failure read as nothing to draft, and every refused d
 failure. Row 9 hands the platform's sentences back to the model. Rows 10-11 are the role no longer
 saying which failure it was. Rows 12-14 are #463's review: no lock around the check and the create,
 the waiting occurrence not trusting the one that filed, and the cause logged and filed unscrubbed.
+Rows 15-16 are its second review: a recheck that searches by title instead of reading the ticket it
+filed, and a turn that gave up on the lock claiming an alert anyway.
 """
 
 TEST = "tests/test_a_product_role_that_cannot_answer_says_so.py"
@@ -69,9 +71,9 @@ MUTATIONS = [
      "        if not res.ok:\n"
      '            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res))\n'),
 
-    ("the board's check and create run with no lock", IMP,
-     "    with _lock_for(key):\n",
-     "    if True:\n"),
+    ("the board's check and create run with no lock shared between occurrences", IMP,
+     "    lock = _lock_for(key)\n",
+     "    lock = threading.Lock()\n"),
 
     ("an occurrence that waited files again instead of trusting the one that filed", IMP,
      "        if seen is not False and _LAST.get(key) is False:\n",
@@ -80,4 +82,12 @@ MUTATIONS = [
     ("the cause is logged and filed unscrubbed", ENGINE,
      '    detail = scrub_credentials((error or "").strip())[:400] or "no cause declared"\n',
      '    detail = (error or "").strip()[:400] or "no cause declared"\n'),
+
+    ("a recheck searches by title instead of reading the ticket it filed", IMP,
+     "        if known and _still_open(trk, known):\n",
+     "        if False:\n"),
+
+    ("a turn that gave up waiting for the board says the team was alerted", IMP,
+     "                    _WAIT_FOR_LOCK_S, detail[:200])\n        return \"\"\n",
+     "                    _WAIT_FOR_LOCK_S, detail[:200])\n        return _FILED.get(key, \"\") or \"held\"\n"),
 ]

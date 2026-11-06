@@ -66,6 +66,11 @@ _FILED: BoundedDict[str, str] = BoundedDict(256)
 #: first's create.
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+#: HOW LONG AN OCCURRENCE WAITS FOR THE ONE AHEAD OF IT (#463's review). The lock is held across
+#: the board's calls, so a forge that hangs would queue every later failing turn behind it, and
+#: `report` never blocks the reply. One that waits this long gives up and files nothing, and its
+#: caller then says nothing was alerted, which is true of that turn.
+_WAIT_FOR_LOCK_S = 30.0
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -274,15 +279,39 @@ def report(project, cause: str, detail: str = "", *, tracker=None, recheck: bool
     seen = _LAST.get(key)
     if seen is False and not recheck:
         return ""          # already known broken; the ticket is open and already says this
-    with _lock_for(key):
+    lock = _lock_for(key)
+    if not lock.acquire(timeout=_WAIT_FOR_LOCK_S):
+        log.warning("BEEVERFORGE_OPS_REPORT_WAITED project=%s cause=%s — another occurrence held "
+                    "the board for %ss, so this one filed nothing: %s", name, cause,
+                    _WAIT_FOR_LOCK_S, detail[:200])
+        return ""
+    try:
         if seen is not False and _LAST.get(key) is False:
             # filed by an occurrence that held the lock first while this one waited: trusted
             # without asking the board, whose search may not show a ticket created a moment ago
             return _FILED.get(key, "")
-        return _report(project, name, key, cause, detail, tracker)
+        # ON A RECHECK, THE TICKET THIS PROCESS FILED IS READ BY ITS REF (#463's review), not
+        # searched for by title: a search that lags behind the create would find nothing and file
+        # a second one. Only a ticket read as closed, or one that cannot be read, is filed again.
+        known = _FILED.get(key, "") if seen is False else ""
+        return _report(project, name, key, cause, detail, tracker, known=known)
+    finally:
+        lock.release()
 
 
-def _report(project, name: str, key: str, cause: str, detail: str, tracker) -> str:
+def _still_open(trk, ref: str) -> bool:
+    """Whether the ticket `ref` reads as open — False when it reads as closed or cannot be read
+    (deleted, or the forge refused), so the caller files again rather than promise a ticket that
+    may not be there."""
+    try:
+        ticket = trk.get_ticket(ref)
+    except Exception:  # noqa: BLE001 — unreadable is not open
+        return False
+    return (getattr(ticket, "state", None) or "open") != "closed"
+
+
+def _report(project, name: str, key: str, cause: str, detail: str, tracker, *,
+            known: str = "") -> str:
     try:
         trk = _tracker_for(project, tracker)
         if trk is None:
@@ -293,6 +322,9 @@ def _report(project, name: str, key: str, cause: str, detail: str, tracker) -> s
                         "factory board, so the impediment has nowhere to go and only this line "
                         "records it: %s", name, cause, detail[:200])
             return ""
+        if known and _still_open(trk, known):
+            log.info("BEEVERFORGE_OPS_STILL_OPEN project=%s cause=%s ref=%s", name, cause, known)
+            return known
         existing = _open(trk, name, cause)
         if existing:
             _LAST[key] = False                    # the board HAS it; a repeat adds nothing

@@ -56,6 +56,12 @@ class _Board:
     def find_ticket(self, *, title):
         return self.tickets.get(title)
 
+    def get_ticket(self, ref):
+        """A ticket by its ref: open while it is on the board, closed once a person took it off."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id=ref, state="open" if ref in self.tickets.values() else "closed")
+
     def create_ticket(self, *, title, body):
         ref = str(100 + len(self.created))
         self.created.append(title)
@@ -148,13 +154,13 @@ def test_two_turns_failing_at_once_file_one_impediment(board, monkeypatch):
         def __init__(self, lock):
             self.lock = lock
 
-        def __enter__(self):
+        def acquire(self, *args, **kwargs):
             if threading.current_thread().name == "second":
                 second_here.set()
-            return self.lock.__enter__()
+            return self.lock.acquire(*args, **kwargs)
 
-        def __exit__(self, *exc):
-            return self.lock.__exit__(*exc)
+        def release(self):
+            return self.lock.release()
 
     monkeypatch.setattr(impediment, "_lock_for", lambda key: _Watched(real_lock(key)))
     said: dict[str, str] = {}
@@ -188,6 +194,38 @@ def test_a_ticket_a_person_closed_is_filed_again(board):
 
     assert board.created == [TITLE, TITLE], "a closed ticket was taken as still open"
     assert reply == voice.cannot_answer(alerted=True, language=LANG)
+
+
+def test_a_board_whose_search_lags_is_not_filed_twice_by_later_turns(board):
+    """After the first ticket, each failing turn asks the board again (`recheck`). A search that
+    lags behind the create finds nothing by title, so the ticket this process filed is read by its
+    ref instead, and found open (#463's second review)."""
+    board.find_ticket = lambda *, title: None               # the search has not caught up yet
+    talk = _Conversation(_project(), _Module(_project(), replies={"extrato": FAILED}))
+
+    for n in range(2):
+        reply = talk.say(f"o extrato pode ser editado? ({n})", user=CLIENT)
+        assert reply == voice.cannot_answer(alerted=True, language=LANG)
+
+    assert board.created == [TITLE], "a lagging search filed the same impediment twice"
+
+
+def test_a_turn_that_cannot_get_the_board_in_time_promises_no_alert(board, monkeypatch):
+    """The lock is held across the board's calls; a forge that hangs must not queue every later
+    turn behind it (#463's second review). A turn that waits out `_WAIT_FOR_LOCK_S` files nothing
+    and says nothing was alerted. Here the lock is simply held, and the wait is zero."""
+    from beeverforge.product import engine
+
+    monkeypatch.setattr(impediment, "_WAIT_FOR_LOCK_S", 0)
+    lock = impediment._lock_for(f"{_project().name}|{impediment.PRODUCT_CANNOT_ANSWER}")
+    lock.acquire()
+    try:
+        said = engine._could_not(_project(), REFUSED, step="answer", language=LANG)
+    finally:
+        lock.release()
+
+    assert said == voice.cannot_answer(alerted=False, language=LANG)
+    assert board.created == []
 
 
 #: A credential-shaped string in the harness's own text: the shape, not a credential.
