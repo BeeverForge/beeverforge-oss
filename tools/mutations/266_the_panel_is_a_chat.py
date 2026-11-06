@@ -53,7 +53,7 @@ MUTATIONS = [
      "    if said and said != name:\n",
      "    if False:\n"),
     ("a card of another repository is read as this board's", PAGE,
-     "    if repo != mine:\n",
+     "    if repo.casefold() != mine.casefold():     # GitHub names ignore case (#385)\n",
      "    if False:\n"),
     ("a credential the board is refused has a card read to the role on its behalf", PAGE,
      "    if not may_read_board:\n",

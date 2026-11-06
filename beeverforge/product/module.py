@@ -2010,10 +2010,11 @@ class ProductModule:
         out = []
         for repo, path in where.items():
             mapped, why = module_map(docs, repo, Path(path))
-            out.append(Mount(repo=repo, path=os.path.relpath(path, root), own=repo == own,
+            out.append(Mount(repo=repo, path=os.path.relpath(path, root),
+                             own=repo.casefold() == own.casefold(),
                              left_out=tuple(left.get(repo, ())),
                              map=os.path.relpath(mapped, root) if mapped else "", map_why=why))
-        out += [Mount(repo=repo, why=why, own=repo == own)
+        out += [Mount(repo=repo, why=why, own=repo.casefold() == own.casefold())
                 for repo, why in (getattr(self, "_missing_sources", {}) or {}).items()]
         out.sort(key=lambda m: not m.own)       # stable: the project's own first, then as declared
         self._mount_list = out
