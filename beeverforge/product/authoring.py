@@ -46,6 +46,7 @@ from beeverforge.product.corpus import (
     SUPERSEDED,
     UNRECORDED,
     Corpus,
+    _without_comments,
     find_decisions_table,
 )
 from beeverforge.product.role import IssueDraft, RequirementDraft
@@ -1598,7 +1599,7 @@ def _is_dropped(text: str) -> bool:
     a hand-edited variant the parser tolerates is not silently overwritten by a writer that is
     stricter than the reader."""
     m = _STATUS_RE.search(text)
-    value = re.sub(r"<!--.*?-->", "", m.group("value") if m else "").strip().lower()
+    value = _without_comments(m.group("value") if m else "").strip().lower()
     return value.split()[0] == DROPPED if value else False
 
 
@@ -2526,7 +2527,7 @@ def _set_status_dropped(text: str, *, dropped_by: str, day: str,
     if idx is None:
         return text, "no status line the corpus parser could read either"
     raw = _STATUS_RE.match(lines[idx]).group("value")
-    value = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    value = _without_comments(raw).strip().lower()
     word = value.split()[0] if value else ""
     if word == DROPPED:
         return text, "already"
@@ -2568,7 +2569,7 @@ def _set_status_accepted(text: str, *, accepted_by: str, day: str) -> tuple[str,
     if idx is None:
         return text, "no status line the corpus parser could read either"
     raw = _STATUS_RE.match(lines[idx]).group("value")
-    value = re.sub(r"<!--.*?-->", "", raw).strip().lower()
+    value = _without_comments(raw).strip().lower()
     word = value.split()[0] if value else ""
     if word.startswith("accepted"):
         return text, "already"
@@ -2595,7 +2596,7 @@ def _set_status_accepted(text: str, *, accepted_by: str, day: str) -> tuple[str,
         if j is None:
             extra.append(f"- **{label}:** {fresh}")
             continue
-        existing = re.sub(r"<!--.*?-->", "", pattern.match(lines[j]).group("value")).strip()
+        existing = _without_comments(pattern.match(lines[j]).group("value")).strip()
         if not existing or existing.lower() == UNRECORDED:
             lines[j] = f"- **{label}:** {fresh}"
     if extra:
