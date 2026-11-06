@@ -9,12 +9,12 @@ forge's own seam (`base.rerun_failed_of`, criterion D, in
 `test_rerunning_failed_jobs_is_a_capability_a_forge_declares.py`), and let the watch read the
 checks again.
 
-    A  the first attempt on a head whose failing log names no file the pull request changes
-       (not even its basename with its extension) re-runs the failed jobs, says so on the
-       pull request naming what the forge re-ran, and launches no agent, on either door (the
-       inline runner and a remote box). A log that names a changed file, a diff that could not be
-       read, a diff that was cut, and any later attempt (PO answer Q1: once per head) launch the
-       agent as before
+    A  the first repair attempt of the watch, when the failing log names no file the pull
+       request changes (not even its basename with its extension), re-runs the failed jobs,
+       says so on the pull request naming what the forge re-ran, and launches no agent, on
+       either door (the inline runner and a remote box). A log that names a changed file, a
+       diff that could not be read, a diff that was cut, and any later attempt of the watch (PO
+       answer Q1: first attempt of the watch only) launch the agent as before
     C  the re-run is counted against the watch's existing repair cap, and one attempt never
        re-runs twice
     E  the re-run waits on no clock of its own
@@ -413,12 +413,13 @@ def test_a_red_check_past_the_runs_read_is_named_as_not_rerun(on_the_worker, mon
     assert "c3 was not re-run" in (got.note or ""), got.note
 
 
-def test_a_second_attempt_on_the_same_head_launches_the_agent(on_the_worker):
-    """PO answer Q1(b): the re-run stands in for the agent once per head, on the first attempt.
-    A wrong "unrelated" (the commonest real regression: changed `invoice_totals.ts`, failing
-    `checkout.spec.ts`) then costs one CI re-run, not the whole repair budget (#258 review item 5).
+def test_a_second_attempt_of_the_watch_launches_the_agent(on_the_worker):
+    """PO answer Q1(b): the re-run stands in for the agent only on the first repair attempt of the
+    watch. A wrong "unrelated" (the commonest real regression: changed `invoice_totals.ts`, failing
+    `checkout.spec.ts`) then spends one of the two repair attempts (`_CI_REPAIR_MAX`) on a CI
+    re-run, and the next attempt reaches an agent (#258 review item 5).
 
-    Green on main by design. The cut "the once-per-head bound removed" turns it red."""
+    Green on main by design. The cut "the first-attempt-of-the-watch bound removed" turns it red."""
     forge = _Forge()
     agents = on_the_worker(forge)
     acts._run_ci_repair(SECOND, "run-r2")  # noqa: SLF001
