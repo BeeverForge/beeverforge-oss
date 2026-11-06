@@ -72,8 +72,9 @@ HOW THE CUTS DIFFER FROM THE PLAN'S SKETCH (task 17), because the code differs f
     HEAD moved: a planner that commits a file and then deletes it. Since round 2 the job's branch
     moves with HEAD there and still holds the job under F2; the row goes red because the hold no
     longer says "a commit made during the pass" (a branch that moves with HEAD is said by HEAD).
-  - F3 hashes the porcelain rather than printing it raw, so the mark stays two hashes. Raw
-    porcelain would make every mark `Unreadable`, not unseen.
+  - F3 hashes the porcelain rather than printing it raw, so the mark stays four well-formed
+    lines, with the porcelain's hash in the tree's place. Raw porcelain would make every mark
+    `Unreadable`, not unseen.
   - U2, U3, U4 and U5 are not in the sketch. U2 and U3/U4 hold the two `Unreadable` branches the
     check grew in task 13 (the hold before the pass, the hold after it). U5 holds task 16's fix.
   - H5 calls the `_preserve_for_hold(ticket, ws, resume_handle)` that exists, and H6 moves the
@@ -90,7 +91,7 @@ PAUSE = TEST + "::test_a_planner_that_writes_and_then_pauses_pushes_nothing"
 UNASKABLE = TEST + ("::test_a_workspace_that_cannot_be_asked_holds_the_job_rather_than_reading_as"
                     "_clean")
 UNASKABLE_AFTER = TEST + "::test_a_workspace_that_cannot_be_asked_after_the_pass_holds_the_job"
-WALLED = TEST + "::test_a_fingerprint_the_box_walled_is_not_read_even_with_both_hashes_printed"
+WALLED = TEST + "::test_a_fingerprint_the_box_walled_is_not_read_even_with_all_four_lines_printed"
 GIT_REFUSES = TEST + ("::test_a_workspace_git_refuses_holds_the_job_with_gits_exit_and_its_words"
                       "_once")
 SETUP_NOT_CHARGED = TEST + "::test_what_setup_leaves_in_the_tree_is_not_charged_to_the_planner"
@@ -234,7 +235,8 @@ MUTATIONS = [
      REWRITE_SETUP),
 
     # ── 3. could not see is never clean ──────────────────────────────────────────────────────────
-    ("U1 the exit code is ignored: a walled answer ending in two hashes reads as a mark", PASS,
+    ("U1 the exit code is ignored: a walled answer ending in the four lines reads as a mark",
+     PASS,
      "    if rc == 0 and len(lines) >= 4:\n",
      "    if len(lines) >= 4:\n",
      WALLED),

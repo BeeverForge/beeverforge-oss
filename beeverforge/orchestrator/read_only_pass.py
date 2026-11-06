@@ -140,7 +140,9 @@ def fingerprint(sandbox: SandboxAdapter, ws: Workspace) -> Mark | Unreadable:
         if _well_formed(mark):
             return mark
     if rc == 0:
-        # exit 0 without two hashes: the box answered something that is not git's fingerprint
+        # exit 0 without four well-formed lines (a tree, a HEAD, the ref HEAD is on or `DETACHED`,
+        # and the branch's commit or `ABSENT`; see `_well_formed`): the box answered something
+        # that is not git's fingerprint
         rc = -1
     words = out or ""
     if len(words) > _CARRIED:
