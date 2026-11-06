@@ -49,13 +49,14 @@ MUTATIONS = [
      '        done = subprocess.run(["git", "ls-remote", "--heads", "--", remote,\n'
      '                               f"refs/heads/{branch}"],'),
     ("the review workspace's fetch reads the machine's transports again", WORKTREE,
-     '            rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",\n'
-     '                                         remote_url or "origin",\n'
-     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
-     'timeout=180)',
-     '            rc, said = _run(["git", "-C", str(repo_path), "fetch", "--",\n'
-     '                              remote_url or "origin",\n'
-     '                              f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)',
+     # RE-PINNED (#91): the review's fetch now runs under the cache key's lock, one indent deeper
+     '                rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",\n'
+     '                                             remote_url or "origin",\n'
+     '                                             f"+{branch}:refs/remotes/origin/{branch}"]),\n'
+     '                                timeout=180)',
+     '                rc, said = _run(["git", "-C", str(repo_path), "fetch", "--",\n'
+     '                                  remote_url or "origin",\n'
+     '                                  f"+{branch}:refs/remotes/origin/{branch}"], timeout=180)',
      TEST + "::test_the_review_workspaces_fetch_never_runs_an_ext_remote"),
 
     # 3. the guard and subcommand

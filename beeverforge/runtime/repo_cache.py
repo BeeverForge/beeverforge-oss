@@ -383,7 +383,7 @@ class RepoCache:
         return not self.held
 
     @staticmethod
-    def _held_by_a_job(served: Path, why: str) -> bool:
+    def _held_by_a_job(served: Path, why: str, *, again: bool = False) -> bool:
         """Whether a running job's worktree stands on `served`, said when it does.
 
         A JOB ON THE WORKTREE BOX LIVES IN THIS TREE'S `.git` (#747). For a project registered by
@@ -403,6 +403,10 @@ class RepoCache:
                         "job may stand on it. Check the permissions of %s.",
                         served, why, served / ".git" / "worktrees")
             return True
+        if again:
+            # ASKED A SECOND TIME BY ONE SYNC (#91, `_publish`): the first ask already said each
+            # expired hold, and a sync says it once
+            marks = gitworktrees.JobMarks(live=marks.live, stale=[])
         for stale in marks.stale:
             log.warning("BEEVERFORGE_CACHE_HOLD_EXPIRED the job worktree %s was marked %d h ago, "
                         "past the %d h a job may hold %s, so it no longer holds it — a job that "
@@ -442,6 +446,16 @@ class RepoCache:
             self._say_linkless(exc)
             shutil.copytree(master, stage, symlinks=True)
         if os.path.lexists(served):
+            # ASKED AGAIN, RIGHT BEFORE THE SWAP (#91). `_needs_publish` read the marks before the
+            # copy above, and a job's add and mark that landed during it (a box on this thread,
+            # which the re-entrant key lock lets through, or one that took no lock) wrote its
+            # admin directory into the tree the rename below takes away. Asked here, only the two
+            # renames are left as the window; the box's lock on the key closes it.
+            if RepoCache._held_by_a_job(served, "a newer snapshot was staged to replace it",
+                                     again=True):
+                shutil.rmtree(stage, ignore_errors=True)
+                self.held = True
+                return
             trash_root = self.root / _TRASH_DIRNAME
             trash_root.mkdir(parents=True, exist_ok=True)
             slot = trash_root / f"{project}{_SLOT_SEP}{uuid.uuid4().hex[:8]}"
