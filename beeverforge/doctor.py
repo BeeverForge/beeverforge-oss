@@ -1006,6 +1006,33 @@ def _api_budget(p: Probes, *, pickup_held: bool = False) -> Finding:
                    f"{resource} budget {share} (refills at {when})")
 
 
+#: How an engine nobody declared is reported in `probes_for`'s answers: it was never dialled, so
+#: no wait is named beside it (#407).
+NOT_DECLARED = "not declared"
+
+
+class TimedOut(str):
+    """Where a listener was asked and did not answer within the deadline, in `probes_for`'s
+    answers (#407). The same text as the address, so every reader of `where` reads what it read;
+    the type is what tells a connect that WAITED apart from one that was refused at once — a port
+    nothing listens on refuses in milliseconds, and raising the deadline cannot help it."""
+
+    __slots__ = ()
+
+
+def _the_wait(asked: dict[str, str]) -> str:
+    """How long the doctor waited, for which of `asked` (name → where), and what sets it (#407) —
+    said only of a listener that timed out: one that refused, or that nobody declared, was not
+    waited on."""
+    from beeverforge.runtime.temporal.deadlines import read_deadline
+
+    waited = [name for name, where in asked.items() if isinstance(where, TimedOut)]
+    if not waited:
+        return ""
+    return (f"; the doctor waited {read_deadline():g}s for {' and '.join(waited)} to answer — on "
+            f"a loaded machine that answers later, raise `BEEVERFORGE_ENGINE_DEADLINE`")
+
+
 def _processes(p: Probes) -> Finding:
     """Which of the three processes answer — asked only where they are the operator's to start.
 
@@ -1051,7 +1078,8 @@ def _processes(p: Probes) -> Finding:
             f"panel draws opens an address nothing is listening on",
             f"`beeverforge up` starts the UI beside the engine and tells the panel where it put "
             f"it; with an engine started separately, set `{var}` to where its UI answers "
-            f"(`temporal server start-dev --ui-port <port>` is what moves it)")
+            f"(`temporal server start-dev --ui-port <port>` is what moves it)"
+            + _the_wait({"the engine's UI": ui_where}))
     if engine_up and panel_up:
         return Finding("processes", True,
                        f"the durable engine answers on {engine_where}"
@@ -1068,12 +1096,14 @@ def _processes(p: Probes) -> Finding:
             f"human merge gate, park/resume and every deadline are waiting on a process nobody "
             f"started",
             "run `beeverforge up` (it starts the engine, the worker and the panel together), or "
-            "`temporal server start-dev` if you would rather run them separately")
+            "`temporal server start-dev` if you would rather run them separately"
+            f"{_the_wait({'the durable engine': engine_where})}")
     return Finding(
         "processes", False,
         f"neither the durable engine ({engine_where}) nor the panel ({panel_where}) answers on "
         f"this machine",
-        "run `beeverforge up` — the engine, the worker and the panel, in one window")
+        f"run `beeverforge up` — the engine, the worker and the panel, in one window"
+        f"{_the_wait({'the durable engine': engine_where, 'the panel': panel_where})}")
 
 
 def _traits(p: Probes):
@@ -2823,13 +2853,19 @@ def probes_for(project) -> Probes:
             CannotHonour,
             started_by_up,
         )
+        from beeverforge.runtime.temporal.deadlines import read_deadline
 
-        def _answers(host: str, port: int) -> bool:
+        def _answers(host: str, port: int, where: str) -> tuple[bool, str]:
+            # AS LONG AS THE ENGINE'S DEADLINE (#407), read per call: a fixed 1.5 s reported a
+            # listener that answers late on a loaded host as down, while every read of the same
+            # engine waits `BEEVERFORGE_ENGINE_DEADLINE`.
             try:
-                with socket.create_connection((host, port), timeout=1.5):
-                    return True
-            except OSError:
-                return False
+                with socket.create_connection((host, port), timeout=read_deadline()):
+                    return True, where
+            except TimeoutError:  # `socket.timeout` is this: the doctor WAITED, and said so
+                return False, TimedOut(where)
+            except OSError:  # refused or unreachable: the deadline is not what ended it
+                return False, where
 
         def _engine_ui_the_panel_infers() -> str:
             try:
@@ -2865,7 +2901,7 @@ def probes_for(project) -> Probes:
                 # dial one nobody named, so "it answers on the default port" would be a pass
                 # about an engine nothing will connect to.
                 answered[listener.name] = (
-                    False, f"not declared — set `{ENGINE.reach_vars[0]}={ENGINE.local()}`")
+                    False, f"{NOT_DECLARED} — set `{ENGINE.reach_vars[0]}={ENGINE.local()}`")
                 continue
             where = listener.declared() or up_starts.get(listener.name, "")
             if not where and listener is ENGINE_UI:
@@ -2879,8 +2915,7 @@ def probes_for(project) -> Probes:
                 continue
             try:
                 host, port = listener.where(where)
-                answered[listener.name] = (
-                    _answers(host, port or listener.default_port), where)
+                answered[listener.name] = _answers(host, port or listener.default_port, where)
             except ValueError:
                 answered[listener.name] = (False, f"{where} — not an address")
         return answered
