@@ -52,6 +52,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from beeverforge import gitpin
 from beeverforge.knowledge.flows import FLOWS_DIRNAME, observe, read_flows, write_flows
 from beeverforge.knowledge.system.derive import derive
 from beeverforge.knowledge.system.render import (
@@ -91,9 +92,11 @@ def cache_key(project_name: str, repo: str) -> str:
 
 def _head(path: Path) -> str:
     """The commit a checkout is on — asked of git by the caller, never inside the derivation."""
+    # hooks off (#182, #384's review): `path` is a repository-cache checkout, whose hooks a pass
+    # can write
     try:
-        p = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
-                           text=True, timeout=30, check=False)
+        p = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(path), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("system layer: could not read the commit of %s (%s) — its entries will cite "
                     "no commit", path, exc)
