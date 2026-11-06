@@ -60,6 +60,11 @@ they are what made the existing seams survive contact with production.
 6. **An axis is agnostic when it is *born with two*, not when it declares an interface**
    (ADR-0022).
 
+Principles 1 and 6 are aims the code does not fully meet yet. The vendor guard covers `contracts/`
+and `policy/` only, and the metrics sink is inferred as `dynamodb` from a variable's presence.
+Four axes ship one built-in row each, `box_runner` ships none, and no test holds the rule.
+[`docs/STATUS.md`](../STATUS.md), "Known gaps", keeps the list.
+
 ## 4. Why principle 5 is the whole design
 
 Take the channel axis. A chat connector is a large thing — sockets, threads, its own markup

@@ -1,6 +1,7 @@
 # ADR 0015 — The tech-lead: impediment diagnosis + Slack, one brain, two triggers
 
 - **Status:** **Accepted; v1 shipped** (proactive diagnosis → ticket + Slack). v2/v3 (conversational) planned.
+- **Note (2026-11-06, #1):** the title names Slack because it was the chat transport then. Chat transports are add-ons since [ADR-0038](./0038-the-platform-is-complete-channels-are-add-ons.md): the core ships the panel, and Slack comes with the `beeverforge-slack` package.
 - **Date:** 2026-07-22
 - **Relates to / amends:** ADR-0001 (Notifier port; the Coordinator), ADR-0004/0009/0010 (react-don't-block; single-line park). Gives the coordinator the ADR its docstring placeholdered as "ADR-00XX".
 

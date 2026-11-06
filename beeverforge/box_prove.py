@@ -12,8 +12,9 @@ an environment that cannot work.
 WHAT A PROOF IS. Resolve the image's tag to a digest; check the image contract item by item; check
 that the toolbox can even execute in that image; run the client's own `setup:` and then `validate:`
 against untouched `main`; check the harness endpoint is reachable through whatever network the box
-has. Green means *your tests passed inside the factory* — and it costs **zero harness tokens**,
-because nothing here asks an agent to do anything.
+has. Green means *your tests passed inside the factory* — and it costs **no agent work**: nothing
+here asks an agent to do anything. The one model call it can make is a one-word smoke (`_ONE_WORD`)
+on a box that runs no image of its own, to show the harness answers there.
 
 ORDER MATTERS AND STOPPING MATTERS. An unpullable image would make the next six checks fail for the
 same reason and report it six different ways; a `setup:` that fails makes `validate:` a second,
