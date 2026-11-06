@@ -1,6 +1,7 @@
 # ADR 0055 — A card has one lifecycle: one door for every change of its state, one table of what follows, one record of what happened
 
 - **Status:** Proposed (design only — no code changes with this ADR; the slices below implement it)
+- **Note (2026-11-06, #1):** the slices are being built: `beeverforge/lifecycle/` is the door (`card.py`, D1) and its executor (D3, D5).
 - **Date:** 2026-09-29
 - **Milestone:** 0.5.0. It is built on `main` after 0.4.2 is released: the slices touch the files
   the 0.4.2 fixes touch, and a lifecycle built beside unmerged fixes would be rebuilt on merge.

@@ -57,7 +57,7 @@ sequenceDiagram
     Task->>GH: open PR
     Task-->>Job: BEEVERFORGE_RESULT_JSON
     Job->>GH: merge (auto if policy=auto, else human)
-    Job->>Job: wait-for-merge (durable, poll 3 min, ≤14 d)
+    Job->>Job: wait-for-merge (durable, poll 2 min for 1 h then 15 min, ≤14 d)
     opt project declares environments
         Job->>Task: promote to staging (ephemeral task)
         Job->>Human: request prod approval (Telegram push)
@@ -81,7 +81,7 @@ sequenceDiagram
 | 9 | **Review** | `reviewing` | the box | An automated review pass over the diff; its notes are posted to the PR. (This is a second agent pass, so it adds a few minutes.) |
 | 10 | **PR** | `pr_open` | GitHub | Find-or-create the PR (idempotent — re-runs reuse the same PR). |
 | 11 | **Merge** | `merged` | GitHub | `merge_policy: auto` → **merge on the current base** (ADR-0003): rebase onto the latest base first; if it moved, **re-run every gate** on the rebased result + re-push, then squash-merge. A textual conflict or a failed re-validation → `on_hold` for a human; it never crashes. Otherwise waits for a human merge. |
-| 12 | **Wait-for-merge** | `ci_waiting` | Temporal | Durable poll of merge status every **3 min**, bounded by **`merge_deadline_days` = 14**. Not merged in time → `on_hold`. |
+| 12 | **Wait-for-merge** | `pr_open` | Temporal | Durable poll of merge status every **2 min** for the first hour, then every **15 min** (`workflow.py`: `_CI_POLL`, `_CI_FAST_WINDOW`, `_CI_SLOW_POLL`), bounded by **`merge_deadline_days` = 14**. Not merged in time → `on_hold`. |
 | 12b | **Knowledge refresh** | (no state — post-merge) | Worker | Only when the project sets `knowledge_map: true` (ADR-0017) AND has a context repository declared (`product.docs_repo`) — otherwise a no-op (`"no-context"`). Regenerates the module map from the base branch's new state and publishes one commit into the context repository's `.okf/repos/<source>/`. Bounded (**10 min**), single-attempt, result swallowed — a merged ticket is never held or failed by it. Writes nothing when no source changed. |
 | 12c | **Deploy watch** | (no state — post-merge) | Worker | Only when the project declares `post_merge_deploy:`. Follows YOUR deploy workflow's run on the merge commit and reports success/failure/timeout. It never gates: the ticket is already done. |
 | 13 | **Promote** | `staging_deploying` / `staging_verifying` | Worker | Only if the manifest declares `environments:`. **The platform does not deploy** — your pipeline does, with your secrets. Each stage of `promote:` before the last is OBSERVED: the deployment status of its `deploy_ref`, then a probe of its `health_url`. A deploy still `pending` is waited for (up to 20 min for the whole walk) and then holds the stage as *not reached* — it is never a reached stage. A stage counts as reached only on an observation — a green deploy of this ref, or a `health_url` that answered healthy: a deploy nothing recorded (`unknown`) goes to the `health_url`, and with none the stage is held as *not reached* (#518). On a project with no CI (`ci: none`), where nothing reads a deploy, every stage of the chain must declare a `health_url` or the manifest is refused when it loads. A stage with neither `deploy_ref` nor `health_url`, and environments the chain does not walk at all (no `promote:`, and neither `staging` nor `prod`), are refused when the manifest loads (#501). |
