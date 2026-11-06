@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -36,6 +35,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from beeverforge.observability.metrics import MetricRecord
+from beeverforge.util.private_file import LinkedPath as LinkedPath  # re-exported (#228's name)
+from beeverforge.util.private_file import create_private
 
 log = logging.getLogger("beeverforge.metrics")
 
@@ -74,41 +75,15 @@ CREATE INDEX IF NOT EXISTS metrics_expiry  ON metrics (expires_at);
 _SCHEMA_ENSURED: set[str] = set()
 
 
-class LinkedPath(Exception):
-    """A symbolic link where the store or its backup is to be created (#228) — refused, not
-    followed. Not an `OSError`, so a read's "could not create it" logging does not swallow it."""
-
-
 _STORE_REMEDY = "remove the link, or point BEEVERFORGE_METRICS_DB at a regular file"
 
 
 def _create_private(path: Path, *, what: str = "metrics store",
                     remedy: str = _STORE_REMEDY) -> None:
-    """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched.
-
-    THE STORE HOLDS CLIENTS' MESSAGES AND THE AUDIT TRAIL. Left to `sqlite3.connect`, the file
-    took the process's umask — `0644` under the usual `022`, readable by every user on the machine.
-    So it is created here first, exclusively, and `fchmod`ed so no umask can widen or narrow it;
-    SQLite then opens a private file, and gives its `-wal` and `-shm` files the same mode.
-
-    `O_EXCL` is what leaves an existing store alone: its mode is the operator's, not ours.
-
-    A SYMBOLIC LINK AT THE PATH IS REFUSED, dangling or not, with `LinkedPath`. `O_EXCL` fails on
-    a link without following it, but `sqlite3.connect` would then follow it — to a file made under
-    the umask, wherever the link points. What this does not close: a link planted between this
-    check and SQLite's own open, by somebody who can already write the store's directory."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        if path.is_symlink():
-            raise LinkedPath(f"the {what} at {path} is a symbolic link, which is refused rather "
-                             f"than followed — {remedy}") from None
-        return
-    try:
-        os.fchmod(fd, 0o600)
-    finally:
-        os.close(fd)
+    """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched:
+    its mode is the operator's. The body is the shared `util.private_file.create_private` (#308),
+    which the product index and the board use too."""
+    create_private(path, what=what, remedy=remedy)
 
 
 class SqliteMetricsSink:
