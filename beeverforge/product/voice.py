@@ -1098,7 +1098,53 @@ def broke(*, language: str | None = None) -> str:
 #: transcript — a hand-off and a busy acknowledgement are presence, published and never recorded, so
 #: they need no recognition here. These take no interpolation, so a recorded line IS one of them
 #: when it ends with it: the one thing that can precede it is an agent-name prefix (`on_it` et al.).
-_OWN_VOICE = {"broke": _BROKE, "unavailable": _UNAVAILABLE}
+#: When the role's own model call failed (#437): a harness that crashed, refused the model, or is
+#: not logged in. NOT `_UNAVAILABLE`: the requirements were read, and saying they could not be
+#: sends the reader to the wrong place. It promises an alert only in the `_ALERTED` form, which is
+#: said only when an impediment is open on the board.
+_CANNOT_ANSWER = {
+    "pt-BR": ("Não consegui montar uma resposta agora — o problema é do meu lado, não do que você "
+              "perguntou. Tente de novo daqui a pouco, que eu tento outra vez."),
+    "en": ("I couldn't put an answer together just now — the problem is on my side, not in what "
+           "you asked. Try again shortly and I'll have another go."),
+}
+_CANNOT_ANSWER_ALERTED = {
+    "pt-BR": ("Não consegui montar uma resposta agora — o problema é do meu lado, não do que você "
+              "perguntou. O time já foi avisado. Tente de novo daqui a pouco, que eu tento outra "
+              "vez."),
+    "en": ("I couldn't put an answer together just now — the problem is on my side, not in what "
+           "you asked. The team has been alerted. Try again shortly and I'll have another go."),
+}
+#: The same, for the draft that follows an answer (#437): the answer was given, the draft of what
+#: was asked for could not be written.
+_CANNOT_DRAFT = {
+    "pt-BR": ("Não consegui escrever o rascunho agora — o problema é do meu lado. Peça de novo "
+              "daqui a pouco, que eu escrevo."),
+    "en": ("I couldn't write the draft just now — the problem is on my side. Ask again shortly and "
+           "I'll write it."),
+}
+_CANNOT_DRAFT_ALERTED = {
+    "pt-BR": ("Não consegui escrever o rascunho agora — o problema é do meu lado. O time já foi "
+              "avisado. Peça de novo daqui a pouco, que eu escrevo."),
+    "en": ("I couldn't write the draft just now — the problem is on my side. The team has been "
+           "alerted. Ask again shortly and I'll write it."),
+}
+
+
+def cannot_answer(*, alerted: bool, language: str | None = None) -> str:
+    """The role's own model call failed (#437). Names no cause the person could act on, never the
+    requirements, and says the team was alerted only when it was."""
+    return _pick(_CANNOT_ANSWER_ALERTED if alerted else _CANNOT_ANSWER, language)
+
+
+def cannot_draft(*, alerted: bool, language: str | None = None) -> str:
+    """The draft's model call failed after the answer was given (#437)."""
+    return _pick(_CANNOT_DRAFT_ALERTED if alerted else _CANNOT_DRAFT, language)
+
+
+_OWN_VOICE = {"broke": _BROKE, "unavailable": _UNAVAILABLE,
+              "cannot_answer": _CANNOT_ANSWER, "cannot_answer_alerted": _CANNOT_ANSWER_ALERTED,
+              "cannot_draft": _CANNOT_DRAFT, "cannot_draft_alerted": _CANNOT_DRAFT_ALERTED}
 
 
 def own_voice_kind(text: str) -> str:
