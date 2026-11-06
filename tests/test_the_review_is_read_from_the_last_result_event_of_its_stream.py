@@ -6,7 +6,7 @@ wins)", "falling back to `json_envelope` for single-envelope output (older CLI, 
 
 WHY THE READER HAS TO CHANGE WITH THE FLAG. `json_envelope` returns the FIRST object in the output.
 For `--output-format json` that is the envelope; for `--output-format stream-json --verbose` it is
-`{"type":"system","subtype":"init",…}`, which carries no `result` — measured on the pinned 2.1.219
+`{"type":"system","subtype":"init",…}`, which carries no `result` — measured on 2.1.219
 (2026-10-19, no credential): init first, the result event last, and that result event the same
 object, with the same keys, as the json envelope. So a review that streams but is still read through
 `json_envelope` comes back `rejected / 0 / "reviewer output could not be parsed (rc=0)"` on every

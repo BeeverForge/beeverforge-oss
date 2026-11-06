@@ -16,23 +16,23 @@ CLI = "tests/claude_cli_output.py"
 
 MUTATIONS = [
     ("the box's copy stays on the refused 2.1.219", BASE,
-     "RUN npm install -g @anthropic-ai/claude-code@2.1.318",
+     "RUN npm install -g @anthropic-ai/claude-code@2.1.309",
      "RUN npm install -g @anthropic-ai/claude-code@2.1.219"),
 
     ("the toolbox's copy stays on the refused 2.1.219", WORKER,
-     "ARG HARNESS_CLAUDE=@anthropic-ai/claude-code@2.1.318",
+     "ARG HARNESS_CLAUDE=@anthropic-ai/claude-code@2.1.309",
      "ARG HARNESS_CLAUDE=@anthropic-ai/claude-code@2.1.219"),
 
     ("the worker's own copy stays on the refused 2.1.219", WORKER,
-     "RUN npm install -g @anthropic-ai/claude-code@2.1.318",
+     "RUN npm install -g @anthropic-ai/claude-code@2.1.309",
      "RUN npm install -g @anthropic-ai/claude-code@2.1.219"),
 
     ("the fixtures are declared on the refused 2.1.219", CLI,
-     'PINNED = "2.1.318"',
+     'PINNED = "2.1.309"',
      'PINNED = "2.1.219"'),
 
     ("the worker installs whatever version is latest", WORKER,
-     "RUN npm install -g @anthropic-ai/claude-code@2.1.318",
+     "RUN npm install -g @anthropic-ai/claude-code@2.1.309",
      "RUN npm install -g @anthropic-ai/claude-code"),
 
     ("the fixtures are read from a version no image installs", CLI,

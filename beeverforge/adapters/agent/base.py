@@ -525,7 +525,7 @@ def result_event(out: str) -> dict | None:
     `claude -p --output-format stream-json --verbose` prints an init event first, then assistant
     and user messages (tool output included), then the result event — the same object, with the
     same keys (`is_error`, `num_turns`, `total_cost_usd`, `usage`, `result`), that
-    `--output-format json` prints alone (measured on the pinned 2.1.219 and on 2.1.303,
+    `--output-format json` prints alone (measured on 2.1.219 and on 2.1.303,
     2026-10-19). Without `--verbose` the CLI refuses `stream-json` under `-p`
     (`Error: When using --print, --output-format=stream-json requires --verbose`, exit 1).
     `json_envelope` returns the first object, which in a stream is the init event; so a reader of

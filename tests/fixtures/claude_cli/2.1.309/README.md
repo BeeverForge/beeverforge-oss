@@ -1,8 +1,8 @@
-# What `claude` 2.1.318 printed on stdout, measured
+# What `claude` 2.1.309 printed on stdout, measured
 
-The pinned CLI (`docker/worker.Dockerfile`, `@anthropic-ai/claude-code@2.1.318`, #436), taken from
-`npm pack @anthropic-ai/claude-code-linux-x64@2.1.318` (sha256 of the tarball
-`2a4d5e3bd0f5bd2959bb1955bd99ea97f57af162681991dcae00fee82f9d554f`, `package/claude`) and run on
+The pinned CLI (`docker/worker.Dockerfile`, `@anthropic-ai/claude-code@2.1.309`, #436; published to npm 2026-10-22, past the two weeks a release is left to settle before it is adopted), taken from
+`npm pack @anthropic-ai/claude-code-linux-x64@2.1.309` (sha256 of the tarball
+`e960c4437f6f99648437784db43e04ad5f12711aecd710864f96876f94c2fc1a`, `package/claude`) and run on
 2026-11-06 with `echo ok |` on stdin, from a fresh empty directory, under
 `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin`: no credential, no configuration of this machine.
 The recipe is the one `../2.1.219/README.md` used.
@@ -37,7 +37,7 @@ prompt asked the model to create `wrote.txt` with any tool it had.
 |---|---|---|
 | `--tools Read,Grep,Glob --disallowedTools Edit,Write,Bash,NotebookEdit,Task --allowedTools Read,Grep,Glob` (a read-only role) | `Glob`, `Grep`, `Read` | absent |
 | `--tools Read,Grep,Glob --allowedTools Read,Grep,Glob` | `Glob`, `Grep`, `Read` | absent |
-| `--disallowedTools Edit,Write,Bash,NotebookEdit,Task` | the deny list's five gone; 22 others left, among them `Workflow`, `SendMessage`, `RemoteTrigger`, `CronCreate` | absent |
+| `--disallowedTools Edit,Write,Bash,NotebookEdit,Task` | the deny list's five gone; 23 others left, among them `Workflow`, `SendMessage`, `RemoteTrigger`, `CronCreate` | absent |
 | `--allowedTools Write,Bash` (the control) | 25, `Write` and `Bash` among them | present |
 
 So `--tools` alone still restricts, and so does the deny list for the tools it names. On this

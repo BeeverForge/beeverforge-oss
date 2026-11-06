@@ -14,7 +14,7 @@ from pathlib import Path
 
 #: The version every image pins (`docker/*.Dockerfile`, held by
 #: `tests/test_every_image_pins_one_claude_current_models_accept.py`), and the fixtures' folder.
-PINNED = "2.1.318"
+PINNED = "2.1.309"
 FIXTURES = Path(__file__).parent / "fixtures" / "claude_cli" / PINNED
 
 
