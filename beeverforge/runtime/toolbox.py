@@ -243,8 +243,10 @@ _OLD = ".old"
 def _put_back(dst: Path, staging: Path, old: Path, moved: list[str], aside: list[str],
               stamp: bytes | None) -> None:
     """Undo a swap that raised: the new entries back to staging, the old ones back in place, and
-    the old stamp over them. Best effort: a step that fails here is logged, and what is left has
-    no stamp, so the next boot copies again."""
+    the old stamp over them. Staging is removed only when the undo completed. When a step of the
+    undo fails, staging and its `.old` are left where they are, because they hold whatever of the
+    two toolboxes is not in place; the live toolbox has no stamp, so the next boot clears them
+    and copies again."""
     try:
         for name in reversed(moved):
             os.rename(dst / name, staging / name)
@@ -252,10 +254,12 @@ def _put_back(dst: Path, staging: Path, old: Path, moved: list[str], aside: list
             os.rename(old / name, dst / name)
         if stamp is not None:
             (dst / STAMP).write_bytes(stamp)
-        log.warning("the toolbox swap at %s failed — the previous toolbox is back in place", dst)
     except OSError as exc:
         log.warning("the toolbox swap at %s failed and the previous toolbox could not be put back "
-                    "(%s) — it has no stamp, so the next boot copies it again", dst, exc)
+                    "(%s) — what was not put back stays in %s, and with no stamp the next boot "
+                    "copies the toolbox again", dst, exc, staging)
+        return
+    log.warning("the toolbox swap at %s failed — the previous toolbox is back in place", dst)
     shutil.rmtree(staging, ignore_errors=True)
 
 
