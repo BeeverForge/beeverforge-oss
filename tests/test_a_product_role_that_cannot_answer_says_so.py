@@ -51,6 +51,7 @@ class _Board:
     def __init__(self) -> None:
         self.tickets: dict[str, str] = {}
         self.created: list[str] = []
+        self.bodies: list[str] = []
 
     def find_ticket(self, *, title):
         return self.tickets.get(title)
@@ -58,6 +59,7 @@ class _Board:
     def create_ticket(self, *, title, body):
         ref = str(100 + len(self.created))
         self.created.append(title)
+        self.bodies.append(body)
         self.tickets[title] = ref
         return ref
 
@@ -71,6 +73,8 @@ class _Board:
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
     monkeypatch.setattr(impediment, "_LAST", {})
+    monkeypatch.setattr(impediment, "_FILED", {})
+    monkeypatch.setattr(impediment, "_LOCKS", {})
     monkeypatch.setattr(impediment, "_born_in_the_queue", lambda project, trk: "")
 
 
@@ -110,6 +114,100 @@ def test_many_failed_turns_file_one_impediment(board):
         assert reply == voice.cannot_answer(alerted=True, language=LANG)
 
     assert board.created == [TITLE]
+
+
+def test_two_turns_failing_at_once_file_one_impediment(board, monkeypatch):
+    """Two people, or a thread and its retry, failing at the same moment (#463's review): the
+    board's check and create run under one lock per cause, so the second waits for the first's
+    create instead of filing its own. The first create is held open until the second turn has
+    reached the lock (or, without one, the board), so the race is forced, not hoped for.
+
+    THE BOARD'S SEARCH LAGS HERE, as a forge's search index does behind a create: the waiting turn
+    cannot find the ticket filed a moment ago, so what stops the second create is the lock and
+    the memory of the occurrence that held it first, not a lookup."""
+    import threading
+
+    from beeverforge.product import engine
+
+    first_in, second_here, go = threading.Event(), threading.Event(), threading.Event()
+    create = board.create_ticket
+
+    def held_create(*, title, body):
+        if threading.current_thread().name == "second":
+            second_here.set()
+        else:
+            first_in.set()
+            go.wait()
+        return create(title=title, body=body)
+
+    board.create_ticket = held_create
+    board.find_ticket = lambda *, title: None               # the search has not caught up yet
+    real_lock = impediment._lock_for
+
+    class _Watched:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            if threading.current_thread().name == "second":
+                second_here.set()
+            return self.lock.__enter__()
+
+        def __exit__(self, *exc):
+            return self.lock.__exit__(*exc)
+
+    monkeypatch.setattr(impediment, "_lock_for", lambda key: _Watched(real_lock(key)))
+    said: dict[str, str] = {}
+
+    def fail(name):
+        said[name] = engine._could_not(_project(), REFUSED, step="answer", language=LANG)
+
+    first = threading.Thread(target=fail, args=("first",), name="first")
+    second = threading.Thread(target=fail, args=("second",), name="second")
+    first.start()
+    assert first_in.wait(30), "the first turn never reached the board"   # a hang guard only
+    second.start()
+    assert second_here.wait(30), "the second turn never reached the lock"
+    go.set()
+    first.join()
+    second.join()
+
+    assert board.created == [TITLE], "two turns failing at once filed two tickets"
+    assert said == {name: voice.cannot_answer(alerted=True, language=LANG)
+                    for name in ("first", "second")}
+
+
+def test_a_ticket_a_person_closed_is_filed_again(board):
+    """This process remembers it filed the impediment; a person may have closed it since (#463's
+    review). The person is about to be told the team knows, so the board is asked again."""
+    talk = _Conversation(_project(), _Module(_project(), replies={"extrato": FAILED}))
+    talk.say("o extrato pode ser editado?", user=CLIENT)
+    board.tickets.clear()                                   # closed on the board by a person
+
+    reply = talk.say("o extrato pode ser editado? de novo", user=CLIENT)
+
+    assert board.created == [TITLE, TITLE], "a closed ticket was taken as still open"
+    assert reply == voice.cannot_answer(alerted=True, language=LANG)
+
+
+#: A credential-shaped string in the harness's own text: the shape, not a credential.
+SHAPED = "ghp_" + "Aa0" * 12
+
+
+def test_the_cause_is_scrubbed_before_the_log_and_the_ticket(board, caplog):
+    leaky = ProductAnswer(ok=False, harness_failed=True,
+                          error=f"the harness run failed: auth header token {SHAPED} refused")
+    talk = _Conversation(_project(), _Module(_project(), replies={"extrato": leaky}))
+
+    with caplog.at_level(logging.DEBUG):
+        talk.say("o extrato pode ser editado?", user=CLIENT)
+
+    assert board.created == [TITLE]
+    assert SHAPED not in board.bodies[0], "the ticket carries the credential-shaped string"
+    assert not [r for r in caplog.records if SHAPED in r.getMessage()], (
+        "a log line carries the credential-shaped string")
+    assert any("the harness run failed: auth header token" in r.getMessage()
+               for r in caplog.records), "the scrubbed cause was not logged at all"
 
 
 def test_with_no_board_it_promises_no_alert():

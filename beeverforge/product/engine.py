@@ -958,18 +958,29 @@ def _could_not(project, error: str, *, step: str, language: str | None) -> str:
     was dropped, nothing was logged, and no impediment was filed.
 
     So the cause is logged, an impediment is opened for it (once per cause: `impediment.report`
-    files one and remembers it), and the person is told a sentence that names no requirement and
-    promises an alert only when one is open on the board. Any failure of the role reaches here,
-    whatever the harness printed."""
+    files one, under a lock, and asks the board again on every later occurrence), and the person is
+    told a sentence that names no requirement and promises an alert only when one is open on the
+    board. Any failure of the role reaches here, whatever the harness printed.
+
+    ONE FAILED TURN IS ENOUGH TO FILE, and the next answered turn closes it: the corpus and mount
+    seams (`module._tell_the_factory`) behave the same way, so a harness that fails once and then
+    answers leaves one ticket opened and closed, with the cause and the evidence on it. Waiting for
+    a second failure would leave the first person told nothing reached the team."""
     from beeverforge.ops import impediment
     from beeverforge.product import voice
+    from beeverforge.product.model import scrub_credentials
 
     cause = impediment.PRODUCT_CANNOT_ANSWER
-    detail = (error or "").strip()[:400] or "no cause declared"
+    # SCRUBBED, THEN CUT (#437's review): the harness's own text can echo the prompt, a path or a
+    # credential, and this goes to the log AND to a ticket on the factory board, which may be a
+    # tracker other people read. Truncation is not redaction (`util/causes.scrubbed`).
+    detail = scrub_credentials((error or "").strip())[:400] or "no cause declared"
     log.warning("BEEVERFORGE_PRODUCT_CANNOT_ANSWER project=%s step=%s — the product role's model "
                 "call failed: %s", getattr(project, "name", "?"), step, detail)
-    ref = impediment.report(project, cause, f"{step}: {detail}")
-    alerted = bool(ref) or impediment.is_open(project, cause)
+    # RECHECKED: the person is about to be told the team knows, so the board is asked again rather
+    # than this process's memory, which a person closing the ticket would have made a lie
+    ref = impediment.report(project, cause, f"{step}: {detail}", recheck=True)
+    alerted = bool(ref)
     said = voice.cannot_draft if step == "draft" else voice.cannot_answer
     return said(alerted=alerted, language=language)
 

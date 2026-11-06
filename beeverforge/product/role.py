@@ -2383,9 +2383,10 @@ def _full_answer(res) -> str:
 def _failure_reason(res) -> str:
     """Why a run failed, for the TEAM's log — never for the channel.
 
-    The caller turns any failure into "I can't see the product right now", because the difference
-    between an expired token and a crashed CLI is not something a client can act on, and the raw
-    text is where infrastructure leaks into a business conversation."""
+    The caller tells the person only that the role could not answer (#437), because the
+    difference between an expired token and a crashed CLI is not something a client can act on,
+    and the raw text is where infrastructure leaks into a business conversation. This text goes to
+    the log and the factory's impediment, after `scrub_credentials`."""
     if getattr(res, "pause_reason", None) == "auth":
         return "the harness could not authenticate"
     if getattr(res, "pause_reason", None) == "rate_limit":
