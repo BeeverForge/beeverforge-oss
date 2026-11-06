@@ -56,6 +56,9 @@ LIVE = Path(os.environ.get("BEEVERFORGE_TOOLBOX") or "/var/lib/beeverforge-toolb
 #: without running anything in it.
 STAMP = "toolbox.json"
 
+#: Where the toolbox stage's `npm install -g --prefix <toolbox>/pkg` puts every harness package.
+PACKAGES = Path("pkg") / "lib" / "node_modules"
+
 
 def variant() -> str:
     """The `<os>-<arch>-<libc>` this toolbox was built for.
@@ -87,13 +90,50 @@ def read_stamp(root: Path | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def is_populated(root: Path | None = None) -> bool:
+def packages(root: Path) -> dict[str, str]:
+    """`{package: version}` for every harness package installed in the toolbox at `root`.
+
+    READ FROM THE PACKAGES THEMSELVES (#246), each one's own `package.json`, so it names what was
+    installed rather than what a build argument asked for. A scoped package (`@openai/codex`) is
+    one level further down. An entry with no readable `package.json` is skipped, never raised:
+    this runs on the worker's boot path."""
+    found: dict[str, str] = {}
+    base = root / PACKAGES
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        dirs = sorted(entry.iterdir()) if entry.name.startswith("@") and entry.is_dir() else [entry]
+        for pkg in dirs:
+            try:
+                meta = json.loads((pkg / "package.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(meta, dict) and meta.get("name") and meta.get("version"):
+                found[str(meta["name"])] = str(meta["version"])
+    return found
+
+
+def is_populated(root: Path | None = None, *, source: Path | None = None) -> bool:
     """Whether a usable toolbox is already in place, so a restart is not a re-copy.
 
     Checks the STAMP rather than the directory: a half-finished copy has files in it and is not a
-    toolbox. The stamp is written last, so its presence means the copy completed."""
+    toolbox. The stamp is written last, so its presence means the copy completed.
+
+    AND IT IS THE SAME TOOLBOX AS THE ONE BAKED IN `source` (#246). The stamp records the version
+    of every package it copied; when the worker image is rebuilt with a new harness pin, the baked
+    versions differ and the toolbox is copied again on the next boot. Before this, the stamp held
+    the harness NAMES alone, so a bump never reached a deployment that already had a toolbox: the
+    boxes kept the old CLI, and current models refused it. A stamp written before versions were
+    recorded holds none, so it differs from any baked toolbox that has packages, and is copied
+    once."""
     stamp = read_stamp(root)
-    return bool(stamp.get("harnesses")) and stamp.get("variant") == variant()
+    if not (stamp.get("harnesses") and stamp.get("variant") == variant()):
+        return False
+    if source is not None and source.is_dir():
+        return stamp.get("packages") == packages(source)
+    return True
 
 
 def populate(*, source: Path | None = None, live: Path | None = None,
@@ -101,8 +141,9 @@ def populate(*, source: Path | None = None, live: Path | None = None,
     """Copy the baked toolbox into the volume the boxes mount. Idempotent; returns the stamp.
 
     CALLED ON THE WORKER'S BOOT PATH, so it must be quiet and safe to run every time: an already
-    populated volume of the right variant is left alone. `force` is for a harness version bump,
-    where the stamp differs and the copy should happen.
+    populated volume of the right variant, holding the same package versions as the baked one, is
+    left alone. A harness version bump changes those versions, so it is copied without being asked
+    (#246); `force` is an operator's override, for a live copy changed by hand.
 
     THE STAMP IS WRITTEN LAST, and that is the whole crash-safety story. A worker killed mid-copy
     leaves a directory with some binaries and no stamp; the next boot reads no stamp, calls it
@@ -119,9 +160,10 @@ def populate(*, source: Path | None = None, live: Path | None = None,
                  src)
         return {}
 
-    if not force and is_populated(dst):
+    if not force and is_populated(dst, source=src):
         log.debug("toolbox already present at %s (%s)", dst, variant())
         return read_stamp(dst)
+    was = read_stamp(dst).get("packages") or {}
 
     # A TOP-LEVEL NON-DIRECTORY ENTRY, not "an executable file". The real `claude` entry is a
     # symlink to the IN-BOX mount point, so at copy time it is DANGLING — `is_file()` and
@@ -156,8 +198,27 @@ def populate(*, source: Path | None = None, live: Path | None = None,
             if not target.is_symlink():
                 target.chmod(target.stat().st_mode | 0o111)
 
-    stamp = {"variant": variant(), "harnesses": harnesses}
+    stamp = {"variant": variant(), "harnesses": harnesses, "packages": packages(src)}
     (dst / STAMP).write_text(json.dumps(stamp, indent=2, sort_keys=True))
-    log.info("toolbox populated at %s — %s (%s)", dst, ", ".join(harnesses) or "nothing",
-             stamp["variant"])
+    log.info("toolbox populated at %s — %s (%s)%s", dst, ", ".join(harnesses) or "nothing",
+             stamp["variant"], _changed(was, stamp["packages"]))
     return stamp
+
+
+def _changed(was: dict, now: dict) -> str:
+    """What this copy did to the recorded versions, for the boot log: nothing when they are equal,
+    every version when none was recorded, and `<package> <old> → <new>` for each one that moved."""
+    if was == now:
+        return ""
+    if not was:
+        return " — versions recorded: " + ", ".join(f"{n} {v}" for n, v in sorted(now.items()))
+    return " — " + ", ".join(f"{n} {was.get(n) or 'absent'} → {v}"
+                             for n, v in sorted(now.items()) if was.get(n) != v)
+
+
+def versions(stamp: dict) -> str:
+    """The package versions a stamp records, as `box prove` prints them, or `""` for none."""
+    recorded = stamp.get("packages") or {}
+    if not isinstance(recorded, dict):
+        return ""
+    return ", ".join(f"{name} {version}" for name, version in sorted(recorded.items()))
