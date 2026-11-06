@@ -6,13 +6,13 @@ wins)", "falling back to `json_envelope` for single-envelope output (older CLI, 
 
 WHY THE READER HAS TO CHANGE WITH THE FLAG. `json_envelope` returns the FIRST object in the output.
 For `--output-format json` that is the envelope; for `--output-format stream-json --verbose` it is
-`{"type":"system","subtype":"init",…}`, which carries no `result` — measured on the pinned 2.1.219
+`{"type":"system","subtype":"init",…}`, which carries no `result` — measured on 2.1.219
 (2026-10-19, no credential): init first, the result event last, and that result event the same
 object, with the same keys, as the json envelope. So a review that streams but is still read through
 `json_envelope` comes back `rejected / 0 / "reviewer output could not be parsed (rc=0)"` on every
 diff, and its cost is lost with it.
 
-Every stream here starts from 2.1.219's own lines (`tests/fixtures/claude_cli/2.1.219/`), with only
+Every stream here starts from the pinned CLI's own lines (`tests/claude_cli_output.py`), with only
 the values a review is read from changed. The box is a double that hands back `(rc, out)`, as
 `test_the_REVIEWER_uses_it` (`tests/test_a_banner_line_does_not_kill_the_review.py`) does.
 """
@@ -167,7 +167,7 @@ def test_a_single_envelope_without_a_type_is_still_read_through_json_envelope():
 
 
 def test_the_envelope_the_pinned_cli_prints_for_json_is_still_read():
-    """2.1.219's `--output-format json` output, verbatim but for an approving `result` and its cost.
+    """The pinned CLI's `--output-format json` output, verbatim but for an approving `result` and its cost.
     It carries `type: "result"`, so the result-event reader and the fallback both read it. Green on
     main; its cost assertion is turned red by the cut that stops reading `total_cost_usd` (cut 7)."""
     review = _review(cli.stdout(cli.envelope(APPROVAL, cost=0.05, turns=2, tokens=(40, 9))))
@@ -178,7 +178,7 @@ def test_the_envelope_the_pinned_cli_prints_for_json_is_still_read():
 
 
 def test_a_failed_result_event_is_still_a_rejection_that_says_it_could_not_be_read():
-    """2.1.219's stream with no credential, verbatim, exit 1: its result event is
+    """The pinned CLI's stream with no credential, verbatim, exit 1: its result event is
     `is_error: true`, `"Not logged in · Please run /login"` — prose, not a verdict. That stays a
     REJECTION (an unread review never proceeds as reviewed) whose sentence says it could not be
     read, not that the reviewer never ran. Green on main (it said "could not be parsed (rc=1)" too,
