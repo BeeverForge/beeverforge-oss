@@ -200,15 +200,31 @@ def populate(*, source: Path | None = None, live: Path | None = None,
     # filesystem. An entry the new toolbox no longer has moves aside too, so a bump is exact rather
     # than a merge. A box running at the swap keeps every file it already has open (a rename and a
     # removal leave an open file readable); a path it opens afterwards resolves to the new toolbox.
+    # A box that STARTS during the swap, between the first rename and the last, finds entries
+    # missing: the window is one rename per top-level entry, but it is not empty.
+    #
+    # A RENAME THAT RAISES puts the old toolbox back (#461's review): the worker's boot swallows
+    # the error, so leaving the swap half done would leave the boxes a partial toolbox until the
+    # next boot. The new entries already moved in go back to staging, the old ones come back from
+    # `.old`, and the old stamp is rewritten over the bytes it describes.
+    stamp_was = (dst / STAMP).read_bytes() if (dst / STAMP).is_file() else None
     (dst / STAMP).unlink(missing_ok=True)
     old = staging / _OLD
     old.mkdir()
-    fresh = {e.name for e in staging.iterdir()} - {_OLD}
-    for entry in list(dst.iterdir()):
-        if entry.name != STAMP and not entry.name.startswith(_STAGING):
-            os.rename(entry, old / entry.name)
-    for name in fresh:
-        os.rename(staging / name, dst / name)
+    fresh = sorted({e.name for e in staging.iterdir()} - {_OLD})
+    aside: list[str] = []
+    moved: list[str] = []
+    try:
+        for entry in sorted(dst.iterdir()):
+            if entry.name != STAMP and not entry.name.startswith(_STAGING):
+                os.rename(entry, old / entry.name)
+                aside.append(entry.name)
+        for name in fresh:
+            os.rename(staging / name, dst / name)
+            moved.append(name)
+    except BaseException:
+        _put_back(dst, staging, old, moved, aside, stamp_was)
+        raise
 
     stamp = {"variant": variant(), "harnesses": harnesses, "packages": packages(src)}
     (dst / STAMP).write_text(json.dumps(stamp, indent=2, sort_keys=True))
@@ -222,6 +238,25 @@ def populate(*, source: Path | None = None, live: Path | None = None,
 #: the old toolbox is moved aside during the swap. Hidden, so it is never taken for a harness.
 _STAGING = ".toolbox-staging-"
 _OLD = ".old"
+
+
+def _put_back(dst: Path, staging: Path, old: Path, moved: list[str], aside: list[str],
+              stamp: bytes | None) -> None:
+    """Undo a swap that raised: the new entries back to staging, the old ones back in place, and
+    the old stamp over them. Best effort: a step that fails here is logged, and what is left has
+    no stamp, so the next boot copies again."""
+    try:
+        for name in reversed(moved):
+            os.rename(dst / name, staging / name)
+        for name in reversed(aside):
+            os.rename(old / name, dst / name)
+        if stamp is not None:
+            (dst / STAMP).write_bytes(stamp)
+        log.warning("the toolbox swap at %s failed — the previous toolbox is back in place", dst)
+    except OSError as exc:
+        log.warning("the toolbox swap at %s failed and the previous toolbox could not be put back "
+                    "(%s) — it has no stamp, so the next boot copies it again", dst, exc)
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _remove(path: Path) -> None:

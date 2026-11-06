@@ -170,12 +170,15 @@ def test_a_copy_that_fails_leaves_the_old_toolbox_and_its_stamp(baked, tmp_path,
     assert not list(live.glob(".toolbox-staging-*")), "a failed copy left its staging behind"
 
 
-def test_the_stamp_is_gone_before_the_swap_starts(baked, tmp_path, monkeypatch):
-    """A stale stamp sitting over a mix of old and new entries is the one arrangement that LIES.
-    So the stamp goes before the first rename and is rewritten after the last — if the swap dies in
-    between, the next boot sees no stamp and redoes it."""
+def test_a_swap_that_fails_puts_the_old_toolbox_back(baked, tmp_path, monkeypatch):
+    """The worker's boot swallows a populate error, so a swap left half done would leave the boxes
+    a partial toolbox until the next boot (#461's review). A rename that raises puts the old
+    entries and the old stamp back, and leaves no staging behind."""
     live = tmp_path / "live"
     toolbox.populate(source=baked, live=live)
+    before = (live / toolbox.STAMP).read_text()
+    (live / "codex").write_text("#!/bin/sh\nexec true OLD\n")
+    entries = sorted(e.name for e in live.iterdir())
 
     real = toolbox.os.rename
     calls = []
@@ -183,7 +186,7 @@ def test_the_stamp_is_gone_before_the_swap_starts(baked, tmp_path, monkeypatch):
     def _die_on_the_third(a, b):
         calls.append(a)
         if len(calls) == 3:
-            raise OSError("killed mid-swap")
+            raise OSError("rename failed mid-swap")
         return real(a, b)
 
     monkeypatch.setattr(toolbox.os, "rename", _die_on_the_third)
@@ -191,7 +194,36 @@ def test_the_stamp_is_gone_before_the_swap_starts(baked, tmp_path, monkeypatch):
         toolbox.populate(source=baked, live=live, force=True)
     monkeypatch.setattr(toolbox.os, "rename", real)
 
-    assert not (live / toolbox.STAMP).exists(), "a stamp survived a swap that died"
+    assert (live / toolbox.STAMP).read_text() == before, "the old stamp was not put back"
+    assert "OLD" in (live / "codex").read_text(), "the old toolbox was not put back"
+    assert sorted(e.name for e in live.iterdir()) == entries
+    assert not list(live.glob(".toolbox-staging-*")), "a failed swap left its staging behind"
+
+
+def test_a_swap_killed_midway_leaves_no_stamp(baked, tmp_path, monkeypatch):
+    """A worker KILLED during the swap runs nothing after the rename it died on, so nothing is put
+    back: what it leaves is a mix of old and new entries. The stamp went before the first rename,
+    so nothing says that mix is complete, and the next boot clears the debris and copies again.
+    The kill is the swap raising with the undo switched off."""
+    live = tmp_path / "live"
+    toolbox.populate(source=baked, live=live)
+
+    real = toolbox.os.rename
+    calls = []
+
+    def _killed_on_the_third(a, b):
+        calls.append(a)
+        if len(calls) == 3:
+            raise OSError("killed mid-swap")
+        return real(a, b)
+
+    monkeypatch.setattr(toolbox.os, "rename", _killed_on_the_third)
+    monkeypatch.setattr(toolbox, "_put_back", lambda *a, **k: None)
+    with pytest.raises(OSError):
+        toolbox.populate(source=baked, live=live, force=True)
+    monkeypatch.undo()
+
+    assert not (live / toolbox.STAMP).exists(), "a stamp survived a swap that was killed"
     assert toolbox.is_populated(live) is False
 
     toolbox.populate(source=baked, live=live)

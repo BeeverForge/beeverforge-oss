@@ -10,7 +10,8 @@ current. Row 5 stops reading scoped packages, which is where `claude` lives. Row
 proof's line: no versions printed, and no word when none were recorded. Rows 8-12 break the staged
 swap (#461's review): the old toolbox removed before the new one is copied, a failed copy's staging
 left on the volume, the stamp kept until after the swap, a dead swap's debris never cleared, and a
-harness the new toolbox dropped left in place.
+harness the new toolbox dropped left in place. Rows 13-14 break the undo of a swap whose rename
+raised: nothing put back, and the old stamp not rewritten.
 """
 
 TEST = "tests/test_a_harness_version_bump_reaches_an_existing_toolbox.py"
@@ -69,4 +70,12 @@ MUTATIONS = [
     ("a harness the new toolbox dropped stays in place", TB,
      "        if entry.name != STAMP and not entry.name.startswith(_STAGING):\n",
      "        if entry.name in fresh:\n"),
+
+    ("a swap whose rename raised is left half done", TB,
+     "        _put_back(dst, staging, old, moved, aside, stamp_was)\n        raise\n",
+     "        raise\n", TOOLBOX),
+
+    ("the undo puts the old entries back but not their stamp", TB,
+     "        if stamp is not None:\n            (dst / STAMP).write_bytes(stamp)\n",
+     "", TOOLBOX),
 ]
