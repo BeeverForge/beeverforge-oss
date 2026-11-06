@@ -53,6 +53,7 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 from beeverforge.adapters.sandbox.pull import PullCredential
 from beeverforge.observability import logs
 
@@ -865,12 +866,64 @@ class ContainerSandbox(SandboxAdapter):
             target = url.strip()
         # --force: the bot's dedicated beeverforge/<id> branch, unique per job, serial execution
         # — a retry after a partial failure must overwrite, not dead-lock on non-ff.
-        rc, out = _host(
-            gitpin.argv(["-C", str(self._host_clone), "push", "--force", "--", target,
-                         workspace.branch])
-        )
+        #
+        # NEVER FROM THE HOST CLONE'S OWN GIT DIRECTORY (#386): the box sees that clone as
+        # /workspace, `.git/config` included, and a push run there reads what the job wrote —
+        # `insteadOf` sends the push elsewhere, `core.sshCommand` runs on the host. The push goes
+        # from a repository the host makes for it, outside the mount (`host_push`).
+        #
+        # THE CLONE'S `.git` MUST BE THE DIRECTORY THE MATERIALISER MADE: the box can replace it
+        # with a symlink or a `gitdir:` file naming another repository on the host. The ambient
+        # door keeps the worker's own git configuration, which no mount puts in the box's reach.
+        #
+        # AND THE BOX IS FROZEN WHILE THE HOST READS IT (review of #403): the container, and
+        # anything the job left running in it, lives until `cleanup()`, which comes after this,
+        # so a process the job started could plant a link under `objects` after the walk. From
+        # `docker pause` until the push's git calls are done, nothing in the box runs. The host
+        # reads the clone through its own filesystem, which a paused container does not hold, and
+        # nothing here needs the box running (no `docker exec`). No freeze, no push.
+        if not self._container:
+            raise RuntimeError(
+                f"push failed: the box for {workspace.branch!r} has no container to freeze while "
+                "the host reads the job's commits — prepare the box again (run the job again)")
+        try:
+            rc, out = _host(["docker", "pause", self._container])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc, out = -1, str(exc)
         if rc != 0:
-            raise RuntimeError(f"push failed: {_redact(out)}")
+            raise RuntimeError(
+                f"push failed: could not freeze the box {self._container} before reading the "
+                f"job's commits (docker pause exited {rc}): {out.strip()[:300]} — a process the "
+                "job left running could change the repository while the host reads it, so "
+                "nothing was pushed; check that the container is still running (`docker ps`), "
+                "then run the job again")
+        try:
+            git_dir = self._host_clone / ".git"
+            if git_dir.is_symlink() or not git_dir.is_dir():
+                raise RuntimeError(
+                    f"push failed: {git_dir} is no longer the git directory the box was given "
+                    "(the job replaced it with a link or a file) — the job's commits cannot be "
+                    "read from it; run the job again")
+            push_from_the_hosts_own_repository(
+                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
+                redact=_redact, ambient_env=None if remote_url else dict(os.environ))
+        finally:
+            self._thaw()
+
+    def _thaw(self) -> None:
+        """`docker unpause`, after the push. A failure is said and not raised: the branch is
+        pushed, or the push's own failure is already on its way out. `cleanup()`'s `docker rm -f`
+        removes the container paused or not; a box left paused is frozen until then, and a later
+        `docker exec` in it fails saying it is paused (`docker unpause <name>` frees it)."""
+        try:
+            rc, out = _host(["docker", "unpause", self._container])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc, out = -1, str(exc)
+        if rc != 0:
+            log.warning("could not unfreeze the box %s after the push (docker unpause exited %s):"
+                        " %s — it stays frozen until cleanup removes it; until then a command run "
+                        "in it fails, and `docker unpause %s` frees it", self._container, rc,
+                        (out or "").strip()[:200], self._container)
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
