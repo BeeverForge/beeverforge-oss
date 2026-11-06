@@ -332,10 +332,11 @@ def test_no_host_git_call_in_the_box_bypasses_the_runner(source):
 #: review: the knowledge refresh's `checkout -- knowledge` fired a planted `post-checkout`; its
 #: second review: the bundle build's `status` fired a planted `post-index-change`; and the
 #: concept renewal reads the cache's history through `history._git`; and the system layer reads
-#: each source checkout's commit through `refresh._head`).
+#: each source checkout's commit through `refresh._head`; and the job-time map reads the commit of
+#: a job's tree, a linked worktree of the cache, through `pipeline._head_commit`).
 CACHE_CALLERS = ("beeverforge/runtime/temporal/activities.py",
                  "beeverforge/knowledge/generator.py", "beeverforge/onboarding/history.py",
-                 "beeverforge/knowledge/system/refresh.py")
+                 "beeverforge/knowledge/system/refresh.py", "beeverforge/knowledge/pipeline.py")
 
 
 def _literal_git_calls(tree: ast.AST) -> list[ast.Call]:

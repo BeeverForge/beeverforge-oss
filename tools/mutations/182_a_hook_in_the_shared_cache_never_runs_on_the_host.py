@@ -11,7 +11,8 @@ The claims, each a row:
      `_run`, and the job mark's rev-parse names it itself;
   3. the repository cache's two runners carry it;
   3a. the knowledge refresh's calls in the cache carry it: the bundle build's `status` and
-      the concept renewal's history reads and the system layer's commit read too;
+      the concept renewal's history reads and the system layer's commit read too, and the
+      job-time map's commit read of a job's tree, a linked worktree of the cache;
   4. the guards see a call that bypasses the runner, and check every call, not only the push.
 """
 
@@ -45,6 +46,11 @@ MUTATIONS = [
      "beeverforge/knowledge/system/refresh.py",
      '        p = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(path), "rev-parse", "HEAD"],',
      '        p = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],', CACHE_GUARD),
+
+    ("the job-time map reads a job tree's commit with the cache's hooks (#384's review)",
+     "beeverforge/knowledge/pipeline.py",
+     '        p = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],',
+     '        p = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],', CACHE_GUARD),
 
     ("`_head_of` runs with the shared cache's hooks", ACTIVITIES,
      "def _head_of(repo_path: Path) -> str:\n"
