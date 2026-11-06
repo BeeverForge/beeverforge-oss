@@ -3,9 +3,10 @@
 Run:  .venv/bin/python tools/mutate.py \
         tools/mutations/201_expired_metrics_rows_are_deleted_from_the_file_on_a_schedule.py
 
-Rows 1-2 break the purge itself: the delete leaves its text in the free pages, and the log is never
-checkpointed. Rows 3-4 break the activity: it purges nothing, and a store with no purge passes in
-silence. Rows 5-7 break the schedule: another interval, never reconciled at boot, and the
+Rows 1-5 break the purge itself: the delete leaves its text in the free pages, the log is never
+checkpointed, a checkpoint a reader refused is not said, a refused checkpoint is never finished
+because the next purge deletes nothing, and a row at its expiry is kept (#466's review). Rows 6-7 break the activity: it purges nothing, and a store with no purge passes in
+silence. Rows 8-10 break the schedule: another interval, never reconciled at boot, and the
 workflow never registered on the worker.
 """
 
@@ -21,8 +22,22 @@ MUTATIONS = [
      ""),
 
     ("the write-ahead log is never checkpointed after a purge", STORE,
-     '                if purged:\n                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")\n',
-     ""),
+     '                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()\n',
+     "                checkpoint = None\n"),
+
+    ("a checkpoint a reader refused is not said", STORE,
+     "                if checkpoint and checkpoint[0]:\n",
+     "                if False:\n"),
+
+    ("the checkpoint runs only on a purge that deleted something, so a refused one is never "
+     "finished", STORE,
+     '                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()\n',
+     '                checkpoint = (conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()\n'
+     "                              if purged else None)\n"),
+
+    ("a row whose expiry is now is kept", STORE,
+     '                                   " AND expires_at <= ?", (now if now is not None else\n',
+     '                                   " AND expires_at < ?", (now if now is not None else\n'),
 
     ("the scheduled activity purges nothing", ACT,
      "    purged = await asyncio.to_thread(purge)\n",

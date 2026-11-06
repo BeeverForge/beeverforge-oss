@@ -236,7 +236,12 @@ a deployment-wide schedule, `beeverforge-metrics-purge`, deletes those rows from
 **every six hours** (#201): a row outlives its period on disk by at most that long. The delete
 zeroes what it frees and the write-ahead log is checkpointed after it, so the row's text is in
 neither `BEEVERFORGE_METRICS_DB` nor its `-wal` file afterwards, whether or not SQLite was built to
-zero deleted bytes by itself. Each run writes one line to the worker's log:
+zero deleted bytes by itself. **One exception:** when another connection is reading at that moment
+(the panel, mid-request), SQLite refuses the checkpoint. The rows are gone from every read, but
+their text stays in the file until a later checkpoint. The purge then logs
+`BEEVERFORGE_METRICS_PURGE_PENDING`, and every purge checkpoints again, even one that deletes
+nothing new, so the next run that finds no reader finishes it. Each run writes one line to the
+worker's log:
 `BEEVERFORGE_METRICS_PURGED kind=sqlite rows=<n>`. A store with no purge of its own (`null` keeps
 nothing; a table with its own TTL deletes by itself) is said as `BEEVERFORGE_METRICS_PURGE kind=…`.
 

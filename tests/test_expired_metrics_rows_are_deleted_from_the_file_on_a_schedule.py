@@ -103,6 +103,59 @@ def test_a_purged_row_is_not_left_in_the_log_while_another_process_holds_the_sto
         held.close()
 
 
+def test_a_checkpoint_a_reader_refuses_is_said_and_finished_by_the_next_purge(
+        tmp_path, monkeypatch, caplog):
+    """The panel reads inside a transaction for the length of a request (#466's review). A
+    checkpoint then waits the busy timeout, copies nothing and returns `busy=1` without raising:
+    the deleted text is still on disk. That is logged, and the next purge, which deletes nothing
+    new, checkpoints again and finishes it. The store's busy timeout is 0 here, so the refused
+    checkpoint answers at once."""
+    import sqlite3
+
+    _a_build_that_keeps_deleted_bytes(monkeypatch)
+    path = tmp_path / "m.db"
+    _store_with_both(path)
+    sink = SqliteMetricsSink(path, timeout=0)
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM metrics").fetchone()          # mid-request
+
+    with caplog.at_level(logging.WARNING):
+        assert sink.purge_expired() == 1
+    assert any("BEEVERFORGE_METRICS_PURGE_PENDING" in r.getMessage() for r in caplog.records), (
+        "a refused checkpoint was not said")
+    assert GONE.encode() in _bytes(path), "nothing was refused: the case this test is for did not "\
+                                          "happen"
+
+    # the request ends, but the connection stays open, as the panel's next one may: SQLite
+    # checkpoints by itself only when the LAST connection closes, so only the purge can finish it
+    reader.execute("COMMIT")
+    try:
+        assert sink.purge_expired() == 0
+
+        assert GONE.encode() not in _bytes(path), "the next purge did not finish the checkpoint"
+    finally:
+        reader.close()
+
+
+def test_a_row_is_purged_at_its_expiry_and_not_a_second_before(tmp_path):
+    """The purge's boundary is the reads' (`expires_at > now` is live): a row whose `expires_at`
+    is `now` is gone, one a second later is kept. `now` is passed, so no clock is involved."""
+    import sqlite3
+
+    path = tmp_path / "m.db"
+    sink = SqliteMetricsSink(path)
+    now = 2_000_000_000
+    for name, at in (("before", now - 1), ("at", now), ("after", now + 1)):
+        assert sink.record(_message(name, at))
+
+    assert sink.purge_expired(now=now) == 2
+
+    with sqlite3.connect(path) as conn:
+        left = [r[0] for r in conn.execute("SELECT expires_at FROM metrics")]
+    assert left == [now + 1]
+
+
 def test_the_scheduled_activity_purges_the_deployments_own_store(tmp_path, monkeypatch, caplog):
     from beeverforge.runtime.temporal.activities import purge_expired_records
 
