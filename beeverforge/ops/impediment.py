@@ -305,7 +305,9 @@ def _still_open(trk, ref: str) -> bool:
     may not be there."""
     try:
         ticket = trk.get_ticket(ref)
-    except Exception:  # noqa: BLE001 — unreadable is not open
+    except Exception as exc:  # noqa: BLE001 — unreadable is not open
+        log.info("BEEVERFORGE_OPS_UNREADABLE ref=%s (%s) — read as closed, so it is filed again",
+                 ref, str(exc)[:160])
         return False
     return (getattr(ticket, "state", None) or "open") != "closed"
 
