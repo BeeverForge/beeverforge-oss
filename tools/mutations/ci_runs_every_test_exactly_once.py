@@ -110,8 +110,8 @@ MUTATIONS = [
      "          TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/ran-alone.txt\n", ""),
     # 4. a test that asserts its own CPU time runs alone
     ("the map's timing test loses its mark", "tests/test_knowledge_derived_not_cached.py",
-     "@pytest.mark.alone\ndef test_generating_is_fast_enough_to_do_every_time():",
-     "def test_generating_is_fast_enough_to_do_every_time():"),
+     "@pytest.mark.alone\ndef test_generating_is_fast_enough_to_do_every_time(capsys):",
+     "def test_generating_is_fast_enough_to_do_every_time(capsys):"),
     ("the sweep does not see os.times()", TEST,
      'CPU_CLOCKS = {("os", "times"), ', "CPU_CLOCKS = {"),
 
