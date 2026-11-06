@@ -192,7 +192,7 @@ def test_the_job_activity_hands_its_result_to_the_start(monkeypatch):
     """`run_job` itself — not a helper nobody calls — asks for the start with the job's result."""
     asked: list = []
 
-    async def returned(fn, label, tick=None):
+    async def returned(fn, label, tick=None, stop=None):
         return OPEN
 
     async def start(project, issue, result):
@@ -504,7 +504,8 @@ def the_job_returned(engine, monkeypatch):
     """`run_job` with its pass over at once — the real heartbeat loop, then the real tail."""
     from beeverforge.runtime.temporal.io import RunJobInput
 
-    monkeypatch.setattr(activities, "_do_run_job", lambda inp, run_id=None, watch=None: OPEN)
+    monkeypatch.setattr(activities, "_do_run_job",
+                        lambda inp, run_id=None, watch=None, stop=None: OPEN)
     monkeypatch.setattr(activities, "_watch_for", lambda inp: None)
     monkeypatch.setattr(activities, "_A_PREVIEW_STARTS_WITHIN", CUT)
     # THE STEPS BEFORE THE ONE UNDER TEST ARE INSTANT (review of #483). The tail reads the

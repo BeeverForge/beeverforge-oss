@@ -4945,9 +4945,9 @@ _CARD_NOTE = {
                       "cartão voltou para o backlog, e o branch e os commits dele estão intactos."),
         "skipped": ("_Pulado {by_who}._{why} A fábrica parou de trabalhar nele e a fila está "
                     "livre. Nada foi entregue: o cartão voltou para o backlog."),
-        "stopped": ("_Parado {by_who}._{why} O job foi encerrado no motor; nada foi mergeado e "
-                    "nenhum branch foi apagado. O cartão voltou para o backlog e pode ser "
-                    "retomado."),
+        "stopped": ("_Parado {by_who}._{why} O workflow dele foi encerrado no motor, e o worker "
+                    "que o roda é avisado para encerrar o agente e não publicar mais nada; nenhum "
+                    "branch foi apagado. O cartão voltou para o backlog e pode ser retomado."),
         "question_answered": "_Respondido {by_who}._{why}",
         "parked": "_Parado à espera de uma pessoa._{why}",
         "delivered": "_Entregue._{why}",
@@ -4973,9 +4973,10 @@ _CARD_NOTE = {
                       "untouched."),
         "skipped": ("_Skipped {by_who}._{why} The factory stopped working on it and the queue is "
                     "free. Nothing was delivered: the card is back in the backlog."),
-        "stopped": ("_Stopped {by_who}._{why} The job was terminated in the engine; nothing was "
-                    "merged and no branch was deleted. The card is back in the backlog and can be "
-                    "picked up again."),
+        "stopped": ("_Stopped {by_who}._{why} Its workflow was ended in the engine, and the "
+                    "worker running it is told to end the agent and publish nothing more; no "
+                    "branch was deleted. The card is back in the backlog and can be picked up "
+                    "again."),
         "question_answered": "_Answered {by_who}._{why}",
         "parked": "_Parked, waiting on a person._{why}",
         "delivered": "_Delivered._{why}",
