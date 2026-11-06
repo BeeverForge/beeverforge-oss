@@ -131,6 +131,12 @@ dev = [
     # 8 cores). Every gate run uses it; a fresh install without the plugin silently pays 3.7x the
     # wall clock on every commit, which is how a whole session was spent waiting on idle cores.
     "pytest-xdist>=3.6",
+    # THE SUITE'S COVERAGE IS A FLOOR, AND A FLOOR NEEDS A NUMBER (#334). Without a measurement,
+    # "no test is removed unless coverage stays as it is" was a rule nothing could hold. 7 OR
+    # LATER: the version `make coverage` and `[tool.coverage.*]` below were measured with (7.1.0,
+    # over coverage 7.17.0), whose xdist controller combines its workers into the one file
+    # COVERAGE_FILE names.
+    "pytest-cov>=7",
     # The suite reads real PDFs through the `ingest` extra's library (#269), at the same pin: a
     # PDF test that skipped where the library is absent would be green over nothing.
     "pypdf==6.19.0",
@@ -255,6 +261,40 @@ warn_unused_ignores = true
 
 [tool.bandit]
 exclude_dirs = ["tests"]
+
+# ── THE COVERAGE FLOOR (#334) ───────────────────────────────────────────────────────────────────
+# What `make coverage` measures and what CI's `test` job holds the suite to. THE PACKAGE ONLY:
+# `source` is `beeverforge`, so neither the suite nor the scripts count — a test file is 100%
+# covered by running it, and counting it would let a deleted test raise the figure. BRANCHES TOO:
+# a line coverage figure is green over an `if` whose other arm never ran.
+#
+# NOT `parallel`: pytest-cov suffixes its xdist workers' files whatever it says and combines them
+# into the one file COVERAGE_FILE names, so what keeps CI's four slices apart is the name the
+# Makefile gives each (`COVERAGE_RUN_DATA`), not this switch. `relative_files`: the data names
+# `beeverforge/…`, not the runner's checkout path, so slices from four machines combine onto the
+# one tree the report reads, and no home directory is written down.
+[tool.coverage.run]
+source = ["beeverforge"]
+branch = true
+relative_files = true
+
+# `fail_under` IS THE FLOOR, AND THIS IS THE ONE PLACE IT IS READ. It is set from the TOTAL (lines
+# and branches together, as coverage.py counts them) CI measured in the run docs/STATUS.md names,
+# and `tests/test_the_coverage_floor_is_the_published_baseline.py` holds that page's floor equal
+# to this one, so editing either alone is red. A pull request that raises coverage raises this line
+# and STATUS's together; one that lowers it fails `make coverage-report` until it either covers
+# what it dropped or lowers both, in the open, with the reason in its description.
+#
+# 89.36, FROM CI AND NOT FROM A LAPTOP (#344 review). The floor is enforced in four 4-core GitHub
+# slices, each in its own random order, so it is set from what THAT configuration measured: the
+# two attempts of run 41323669639 combined to 89.3875% and 89.3785% (88,937 and 88,928 of 99,496
+# lines and branches). The floor is the lower less the spread between them (9, 0.0090 points),
+# 89.3694, rounded down: 89.36. coverage.py fails a run whose total rounds below it — 88,904 or
+# fewer — so 23 lines or branches under the lower attempt are noise this floor absorbs, not a
+# reason no change made. An earlier figure set from local runs (89.37) left about five.
+[tool.coverage.report]
+fail_under = 89.36
+precision = 2
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

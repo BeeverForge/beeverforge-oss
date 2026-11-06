@@ -58,11 +58,31 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}
           TEST_SHARDS: 4
           TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/ran-unit-${{ matrix.shard }}.txt
+          # THE COVERAGE FLOOR IS MEASURED HERE, ON PUSHES TO MAIN ONLY (#334). Measured on these
+          # runners (2026-11-01, the Makefile has the table), it costs each slice 1.1x to 2.1x its
+          # `make test-unit` step, median 1.9x — the slowest slice 263 s unmeasured, 487–507 s
+          # measured — so a pull request keeps today's speed; a push to main is the merge itself,
+          # so the floor is held right after each one, and a red there names the merge that
+          # lowered it. `make coverage` runs the same before a merge. In these slices, because a job of its own would run the whole
+          # selection a second time to learn what these four already executed. Each slice writes
+          # one data file and is held to nothing; the job named `test` holds the four combined.
+          # Empty on a pull request: the Makefile reads an empty TEST_COVERAGE as unset.
+          TEST_COVERAGE: ${{ github.event_name == 'push' && '1' || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-ids-unit-${{ matrix.shard }}
           path: ${{ runner.temp }}/beeverforge-test-ids/
+      # ON A PUSH, AND ON SUCCESS ONLY (an `if` without a status function implies success()): a
+      # slice that failed is already red, and its partial data would only add a second, misleading
+      # red below the floor. `error` when a passing slice wrote nothing, or the floor would be held
+      # over three slices' data as if it were four.
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: coverage-unit-${{ matrix.shard }}
+          path: ${{ runner.temp }}/beeverforge-coverage/
+          if-no-files-found: error
 
   integration:
     runs-on: ubuntu-latest
@@ -113,3 +133,17 @@ jobs:
           merge-multiple: true
       - if: always()
         run: make test-ran-once
+      # THE FLOOR (#334), ON PUSHES TO MAIN ONLY, as the unit job says why: the four unit slices'
+      # data, combined, against `fail_under` in pyproject.toml. Only coverage.py is needed to read
+      # it, not the suite's dependencies, at the floor pytest-cov 7.1 itself requires. Skipped
+      # when a slice failed: that job's own red already names the failure.
+      - if: github.event_name == 'push' && needs.unit.result == 'success'
+        run: pip install 'coverage>=7.10.6'
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'push' && needs.unit.result == 'success'
+        with:
+          pattern: coverage-unit-*
+          path: ${{ runner.temp }}/beeverforge-coverage
+          merge-multiple: true
+      - if: github.event_name == 'push' && needs.unit.result == 'success'
+        run: make coverage-report

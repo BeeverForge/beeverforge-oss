@@ -7,6 +7,29 @@ This page describes the `v0.1.0` tag of `beeverforge-oss`. Its claims were check
 code at main at `171de5f` of `beeverforge-oss`, where CI ran 24,161 tests green (228 skipped) on
 2026-10-26.
 
+The unit tests' coverage of `beeverforge/` is held to a floor set from CI's own measurement. CI
+measured it twice on 2026-11-01, in the two attempts of run 41323669639 of pull request #344 — the
+four unit slices on GitHub's runners, each in its own random order, combined — with the coverage
+switched on for that run only:
+
+| attempt | missed lines (of 75,826) | missed branches (of 23,670) | line | branch | total |
+|---|---|---|---|---|---|
+| 1 | 7,142 | 3,417 | 90.5811% | 85.5640% | 89.3875% |
+| 2 | 7,148 | 3,420 | 90.5732% | 85.5513% | 89.3785% |
+
+The lower of the two is the coverage of `beeverforge/` this page publishes: line **90.5732%**,
+branch **85.5513%**, total **89.3785%**, measured on `b5f2742` of `beeverforge-oss` (the code that
+run tested) with the `make test-unit` selection, counting the code the test processes run
+themselves — not what a test reaches through a subprocess, and not the integration or alone runs.
+The two attempts differ by 9 of 99,496 lines and branches (0.0090 points), and the floor is the
+lower total less that spread, rounded down: floor **89.36%**, which leaves 23 lines or branches
+under attempt 2 before a run fails. It is `fail_under` in `pyproject.toml`, and
+`tests/test_the_coverage_floor_is_the_published_baseline.py` holds the two equal. CI's `test` job
+holds the four unit slices to it on every push to main — not on pull requests, which measuring
+would slow (1.1 to 2.1 times per slice on the runners, the Makefile has the timings) — so a drop
+shows on main right after the merge that caused it, and `make coverage` holds it before one. A pull
+request that raises coverage raises both.
+
 BeeverForge 0.1.0 is OpenFactory 0.7.0 under a new name; its earlier history is at
 <https://github.com/BeeverForge/openfactory-core>.
 

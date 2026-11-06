@@ -96,12 +96,14 @@ MUTATIONS = [
      "        run: make test-ran-once", "        run: echo the proof was skipped"),
     ("the unit job cuts fewer slices than its matrix runs", CI,
      "          TEST_SHARDS: 4", "          TEST_SHARDS: 3"),
+    # RE-PINNED (#334): the recipe line now opens with the TEST_COVERAGE switch, so these two
+    # anchor the pytest command without the tab that used to start the line.
     ("the unit job forgets one of the integration markers", "Makefile",
-     '	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15',
-     '	python -m pytest -q -n auto -m "not (owns_its_engine or $(ALONE_TESTS))" --durations=15'),
+     'python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15',
+     'python -m pytest -q -n auto -m "not (owns_its_engine or $(ALONE_TESTS))" --durations=15'),
     ("the unit job runs the alone tests too", "Makefile",
-     '	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15',
-     '	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS))" --durations=15'),
+     'python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15',
+     'python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS))" --durations=15'),
     ("the alone run has xdist neighbours", "Makefile",
      '	python -m pytest -q -p no:xdist -m "$(ALONE_TESTS) and not ($(INTEGRATION_TESTS))"',
      '	python -m pytest -q -n auto -m "$(ALONE_TESTS) and not ($(INTEGRATION_TESTS))"'),
