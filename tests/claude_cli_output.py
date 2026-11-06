@@ -1,6 +1,6 @@
 """What `claude` prints on stdout, for tests that read a review: built from the pinned CLI's own output.
 
-`tests/fixtures/claude_cli/2.1.219/` holds what 2.1.219 printed for the reviewer's command, with
+`tests/fixtures/claude_cli/<PINNED>/` holds what the pinned CLI printed for the reviewer's command, with
 `--output-format json` (one envelope) and with `--output-format stream-json --verbose` (init, an
 assistant message, the result event), measured with no credential — see its README. A test changes
 only the values a review is read from (`result`, `is_error`, `total_cost_usd`, `num_turns`,
@@ -12,7 +12,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-FIXTURES = Path(__file__).parent / "fixtures" / "claude_cli" / "2.1.219"
+#: The version every image pins (`docker/*.Dockerfile`, held by
+#: `tests/test_every_image_pins_one_claude_current_models_accept.py`), and the fixtures' folder.
+PINNED = "2.1.318"
+FIXTURES = Path(__file__).parent / "fixtures" / "claude_cli" / PINNED
 
 
 def measured(name: str) -> list[dict]:
@@ -35,18 +38,18 @@ def _with(event: dict, *, result: str, cost: float, turns: int, tokens: tuple[in
 
 def envelope(result: str, *, cost: float = 0.0, turns: int = 1,
              tokens: tuple[int, int] = (0, 0)) -> dict:
-    """2.1.219's `--output-format json` envelope, carrying this review and what it cost."""
+    """The pinned CLI's `--output-format json` envelope, carrying this review and what it cost."""
     [only] = measured("json.stdout.jsonl")
     return _with(only, result=result, cost=cost, turns=turns, tokens=tokens)
 
 
 def init_event() -> dict:
-    """The first line of 2.1.219's stream: `system/init`, which carries no `result`."""
+    """The first line of the pinned CLI's stream: `system/init`, which carries no `result`."""
     return measured("stream-json-verbose.stdout.jsonl")[0]
 
 
 def assistant_event(text: str, *, tokens: tuple[int, int] = (0, 0)) -> dict:
-    """An assistant message of 2.1.219's stream, saying `text`, with its own `message.usage`."""
+    """An assistant message of the pinned CLI's stream, saying `text`, with its own `message.usage`."""
     event = measured("stream-json-verbose.stdout.jsonl")[1]
     message = event["message"]
     return {**{k: v for k, v in event.items() if k not in ("error", "is_api_error_message")},
@@ -57,7 +60,7 @@ def assistant_event(text: str, *, tokens: tuple[int, int] = (0, 0)) -> dict:
 
 def result_event(result: str, *, cost: float = 0.0, turns: int = 1,
                  tokens: tuple[int, int] = (0, 0)) -> dict:
-    """The last line of 2.1.219's stream (`type: "result"`), carrying this review and its cost."""
+    """The last line of the pinned CLI's stream (`type: "result"`), carrying this review and its cost."""
     last = measured("stream-json-verbose.stdout.jsonl")[-1]
     return _with(last, result=result, cost=cost, turns=turns, tokens=tokens)
 
