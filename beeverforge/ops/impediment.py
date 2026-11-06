@@ -65,6 +65,9 @@ PRODUCT_MOUNT_EMPTY = "product-mount-empty"
 PRODUCT_CORPUS_UNREADABLE = "product-corpus-unreadable"
 PRODUCT_BOARD_UNREADABLE = "product-board-unreadable"
 PRODUCT_CANNOT_WRITE = "product-cannot-write"
+#: The product role's own model call failed: the harness crashed, refused the model, or is not
+#: logged in (#437). The requirements were read; the role could not answer from them.
+PRODUCT_CANNOT_ANSWER = "product-cannot-answer"
 #: A gate the project declares cannot RUN where the factory runs it — the command is not in the
 #: box, or is not executable. NOT a gate that ran and failed: that is the client's code, it is the
 #: repair loop's business, and it belongs on the client's own ticket. This one is the platform
@@ -109,6 +112,9 @@ _TITLES_SAID = {
                                "pt-BR": "o quadro de trabalho não pode ser lido"},
     PRODUCT_CANNOT_WRITE: {"en": "a write by the product agent failed",
                            "pt-BR": "uma escrita da agente de produto falhou"},
+    PRODUCT_CANNOT_ANSWER: {"en": "the product agent cannot answer: its model call fails",
+                            "pt-BR": "a agente de produto não consegue responder: a chamada ao "
+                                     "modelo falha"},
     GATE_CANNOT_RUN: {"en": "a gate this project declares cannot run in the box",
                       "pt-BR": "uma verificação que este projeto declara não consegue rodar no "
                                "box"},
@@ -280,6 +286,13 @@ def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
                     "this "
                     "log line and nowhere else", name, cause, str(exc)[:160])
         return ""
+
+
+def is_open(project, cause: str) -> bool:
+    """Whether this process knows an impediment for `cause` is open on the board: it filed one, or
+    found one already open. `report` returns "" for a cause it already knows is open, so a caller
+    that promises a person "the team has been told" asks this as well (#437)."""
+    return _LAST.get(f"{getattr(project, 'name', '?')}|{cause}") is False
 
 
 def resolved(project, cause: str, evidence: str = "", *, tracker=None) -> bool:

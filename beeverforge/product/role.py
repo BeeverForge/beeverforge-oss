@@ -554,6 +554,10 @@ class ProductAnswer(BaseModel):
     ok: bool = True
     text: str = ""
     error: str = ""
+    #: THE HARNESS CALL ITSELF FAILED (#437): it crashed, refused the model, or is not logged in,
+    #: so the model said nothing. Distinct from a reply that came back and was refused (an
+    #: unreadable shape, a draft with no testable outcome), which is `ok=False` with this False.
+    harness_failed: bool = False
     draft: RequirementDraft | None = None
     issues: list[IssueDraft] = Field(default_factory=list)
     baseline: object | None = None  # a brownfield.Baseline; typed loosely to avoid a cycle
@@ -1198,7 +1202,7 @@ class ProductRole:
         # first real conversation.
         if not res.ok:
             return ProductAnswer(ok=False, raw=res.raw_output or "",
-                                 error=_failure_reason(res))
+                                 error=_failure_reason(res), harness_failed=True)
         # THE FULL ANSWER, not the 1000-char summary. `_summarize` caps the agent's final message
         # because an operator scanning a job list wants a line, not an essay — but this text is a
         # REPLY TO A PERSON, and the product owner's first real conversation ended mid-word twice
@@ -1434,7 +1438,8 @@ class ProductRole:
         )
         res = self._ask(sandbox, workspace, prompt, "product_draft")
         if not res.ok:
-            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res))
+            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res),
+                                 harness_failed=True)
         raw = _full_answer(res)
         try:
             draft = RequirementDraft.model_validate_json(extract_json(raw))
@@ -1492,7 +1497,8 @@ class ProductRole:
         )
         res = self._ask(sandbox, workspace, prompt, "product_issues")
         if not res.ok:
-            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res))
+            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res),
+                                 harness_failed=True)
         raw = _full_answer(res)
         try:
             import json
@@ -1547,7 +1553,8 @@ class ProductRole:
         )
         res = self._ask(sandbox, workspace, prompt, "product_survey")
         if not res.ok:
-            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res))
+            return ProductAnswer(ok=False, raw=res.raw_output or "", error=_failure_reason(res),
+                                 harness_failed=True)
         raw = _full_answer(res)
         try:
             baseline = Baseline.model_validate_json(extract_json(raw))
