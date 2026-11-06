@@ -751,7 +751,13 @@ def prove(project: str, image: str, p: Probes, *,
             ))
         else:
             harnesses = ", ".join(stamp.get("harnesses") or []) or "nothing"
-            proof.findings.append(Finding("toolbox", True, f"{variant} — {harnesses}"))
+            # THE VERSIONS THE BOXES RUN (#246): what the toolbox copied, so a reader can tell a
+            # bumped harness from the old one without running anything in the box.
+            from beeverforge.runtime.toolbox import versions
+
+            recorded = versions(stamp) or "versions not recorded"
+            proof.findings.append(Finding("toolbox", True,
+                                          f"{variant} — {harnesses} ({recorded})"))
 
         # ── the image contract ───────────────────────────────────────────────────────────────────
         broken = p.contract(image)
