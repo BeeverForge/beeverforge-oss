@@ -54,6 +54,15 @@ class Workspace(BaseModel):
     # `<base_branch>..HEAD` against that stale local branch, is judged on the merged change as well
     # as its own. None → `base_branch` is where this checkout started, and the diff reads it.
     base_commit: str | None = None
+    # WHAT THE NEXT PUSH MAY REPLACE (#11): the branch's tip on the remote as this box last saw it
+    # — the tip `prepare` started from on a resume or a repair, the tip it pushed itself after
+    # every push, and `""` on a fresh start, which says the branch must not be on the remote at
+    # all. `publish_branch` pushes with `--force-with-lease=<branch>:<this>`, so a commit somebody
+    # else put on the branch — a person's fix, or the work an earlier park preserved there — is
+    # refused (`PushRefused`), and kept before it is replaced (`keep_remote_tip`). None → nothing
+    # to lease: the remote is this repository and the branch is its own ref, or a box outside
+    # this tree made the workspace; the push is the plain `--force` it always was.
+    lease: str | None = None
 
     @property
     def diff_base(self) -> str:
@@ -91,6 +100,32 @@ class BranchHeldElsewhere(RuntimeError):
         # required keyword-only argument: 'branch'`. So the fields travel with it.
         return (_rebuild_branch_held,
                 (str(self), self.branch, self.path, self.main, self.locked))
+
+
+class PushRefused(RuntimeError):
+    """`publish_branch` refused to replace the remote's branch, because its tip is not the one this
+    workspace last saw (`Workspace.lease`, #11): somebody else's commits are on it.
+
+    IN THE PORT MODULE, like `BranchHeldElsewhere`, because the machine catches it whatever the
+    box is: it keeps the commits on a branch of their own and pushes again (`JobRunner._publish`),
+    and holds the job, naming the branch, only when it cannot. A `RuntimeError`, so a caller that
+    does not catch it reports it the way it reported any failed push before."""
+
+    def __init__(self, message: str, *, branch: str) -> None:
+        super().__init__(message)
+        self.branch = branch
+
+    def __reduce__(self):
+        return (_rebuild_push_refused, (str(self), self.branch))
+
+
+def _rebuild_push_refused(message: str, branch: str) -> PushRefused:
+    return PushRefused(message, branch=branch)
+
+
+#: What git says when a `--force-with-lease` is refused: `! [rejected] <b> -> <b> (stale info)`
+#: (2.34.1, 2.43.0). Read by both boxes, so they cannot disagree about a refusal.
+LEASE_REFUSED = "(stale info)"
 
 
 def _rebuild_branch_held(message: str, branch: str, path: str, main: bool,

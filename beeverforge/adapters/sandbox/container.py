@@ -48,7 +48,9 @@ from pathlib import Path
 
 from beeverforge import gitpin
 from beeverforge.adapters.sandbox.base import (
+    LEASE_REFUSED,
     OutputBuffer,
+    PushRefused,
     SandboxAdapter,
     Workspace,
     run_and_stream,
@@ -281,6 +283,17 @@ def _materialize_workspace(*, repo_path: Path, host_clone: Path, base_branch: st
     # is measured from never depends on which refs its clone happens to carry.
     rc, out = _host(["git", "-C", str(host_clone), "rev-parse", "HEAD"])
     return out.strip() if rc == 0 else None
+
+
+def _lease_of(host_clone: Path, branch: str, checkout_existing: bool) -> str:
+    """What this box's first push may replace (`Workspace.lease`, #11): the branch's tip as
+    `_materialize_workspace` fetched it on a resume or a repair, and nothing — the branch must not
+    be on the remote — on a fresh start. The clone is never the remote, so there is always one."""
+    if not checkout_existing:
+        return ""
+    from beeverforge.adapters.sandbox.worktree import _tip
+
+    return _tip(host_clone, f"refs/remotes/origin/{branch}")
 
 
 def _the_base(host_clone: Path, base_branch: str, remote_url: str | None, repo_path: Path) -> str:
@@ -644,7 +657,8 @@ class ContainerSandbox(SandboxAdapter):
         # `path` is the IN-CONTAINER mount point; `host_path` is the same checkout as the
         # orchestrator sees it (the bind-mounted clone) — what host-side readers must use.
         return Workspace(path=Path(_WORKDIR), host_path=host_clone,
-                         branch=branch, base_branch=base_branch, base_commit=base_commit)
+                         branch=branch, base_branch=base_branch, base_commit=base_commit,
+                         lease=_lease_of(host_clone, branch, checkout_existing))
 
     def harness_path(self, name: str) -> str:
         """An absolute path into the mounted toolbox — never a bare name.
@@ -863,14 +877,50 @@ class ContainerSandbox(SandboxAdapter):
             if rc != 0:
                 raise RuntimeError(f"could not resolve origin remote: {url}")
             target = url.strip()
-        # --force: the bot's dedicated beeverforge/<id> branch, unique per job, serial execution
-        # — a retry after a partial failure must overwrite, not dead-lock on non-ff.
+        # FORCED, BUT ONLY OVER WHAT THIS WORKSPACE SAW (#11) — the worktree box's
+        # `publish_branch` says why. This clone is a fresh one per job, so its lease is the only
+        # memory of the remote's tip it has.
+        from beeverforge.adapters.sandbox.worktree import _force, _tip
+
         rc, out = _host(
-            gitpin.argv(["-C", str(self._host_clone), "push", "--force", "--", target,
+            gitpin.argv(["-C", str(self._host_clone), "push", *_force(workspace), "--", target,
                          workspace.branch])
         )
         if rc != 0:
+            if LEASE_REFUSED in out:
+                raise PushRefused(f"push refused: {_redact(out)}", branch=workspace.branch)
             raise RuntimeError(f"push failed: {_redact(out)}")
+        if workspace.lease is not None:
+            workspace.lease = _tip(self._host_clone, f"refs/heads/{workspace.branch}")
+
+    def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
+        """The remote's tip of the branch, kept on a branch of its own before a push replaces it
+        (`worktree.keep_the_remote_tip`, #11) — from the host clone, as the push is."""
+        assert self._host_clone and self._repo_path, "prepare() must be called first"
+        from beeverforge.adapters.sandbox.worktree import keep_the_remote_tip
+
+        return keep_the_remote_tip(self._host_clone, workspace, self._push_target(remote_url))
+
+    def _push_target(self, remote_url: str | None) -> str:
+        """Where this box pushes: the forge's authenticated URL, else the repository's origin."""
+        if remote_url:
+            return remote_url
+        rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
+        if rc != 0:
+            raise RuntimeError(f"could not resolve origin remote: {url}")
+        return url.strip()
+
+    def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
+        """Nothing (#11): the commits live in the host clone `prepare` made for this job, and
+        `cleanup` deletes it with the container, so a branch that was never pushed is gone."""
+        return None
+
+    def credentials_in_reach(self, *, named: tuple[str, ...] = ()) -> dict[str, str]:
+        """`{name: value}` of every variable a command this box runs can read that may hold a
+        credential (#11): exactly what crosses into it (`_passthrough`) — the harness's own model
+        credential and the project's `box.env`. Nothing else of the worker's environment reaches
+        the box, so `named` (the project's `token_env` names) adds nothing here."""
+        return self._passthrough()
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
