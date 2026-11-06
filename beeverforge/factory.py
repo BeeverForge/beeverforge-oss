@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 from pathlib import Path
 
 log = logging.getLogger("beeverforge.factory")
@@ -217,6 +219,18 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
     # this measurement worktree is cut from a local repository and needs no mark.)
     dest = default_root() / "worktrees" / key
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # NOT OURS, NOT TOUCHED (#317, the defect #124 fixed for the box's `prepare`). The path is
+    # fixed and reused, so whatever stands there is looked at before git is asked to change a
+    # worktree: `exists()` follows a link, `worktree remove --force <link>` removes the tree the
+    # link names, and `worktree add` checks out through it. A link (dangling too, so `is_symlink`
+    # first) or a file is refused, and the person moves it.
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        there = "a symbolic link" if dest.is_symlink() else "a file"
+        raise RuntimeError(
+            f"{dest} is {there}, not a checkout this made, so {ref!r} was not checked out there — "
+            f"move it aside (`mv {shlex.quote(str(dest))} <a path of yours>`) and run again. "
+            f"Nothing was changed"
+        )
     if dest.exists():
         # Left by the previous measurement of this key. `worktree remove` unregisters it with git,
         # which a plain rmtree does not — and a stale registration makes the next `add` fail on a
@@ -224,11 +238,70 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
         _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
-    _git(["-C", str(repo), "worktree", "prune"])
+        if dest.exists() or dest.is_symlink():
+            # `ignore_errors=True` says nothing when it fails, or when a link stands there now.
+            raise RuntimeError(
+                f"{dest} could not be removed to make way for {ref!r} and is still "
+                f"{_what_stands_at(dest)} — remove or move it yourself "
+                f"(`mv {shlex.quote(str(dest))} <a path of yours>`) and run again"
+            )
+        # A leftover git still lists but `remove` would not take (its `.git` gone: "validation
+        # failed") was only rmtree'd, so its registration stands and `add` would refuse the path.
+        # Now the directory is gone, this path's own `remove` drops it (the `else` branch's clear).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
+    else:
+        # The directory is gone but git may still list it (a cache wiped by hand), and `add`
+        # refuses a path it still believes in. THIS path's registration is dropped, never a
+        # blanket `worktree prune`: that drops every other registration whose directory is
+        # momentarily missing, other people's included (see adapters/sandbox/worktree.py).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
+    # THIS FUNCTION MAKES THE PATH ITSELF, RIGHT BEFORE THE ADD (the shape #124 / PR #312 settled).
+    # The guard above reads the path once and git creates it only at the add; in between run a
+    # `worktree remove` and an `rmtree`, so a link planted in that window was still checked out
+    # through. `os.mkdir` never follows a final link and fails on anything at the path, and git
+    # accepts the empty directory it makes. Not `makedirs(exist_ok=True)`: that follows a link to
+    # a directory and calls it fine.
+    try:
+        os.mkdir(dest)
+    except FileExistsError:
+        raise RuntimeError(_appeared_at(dest, ref)) from None
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not make {dest} to check {ref!r} out into ({exc.strerror or exc}) — fix that "
+            f"(permissions, free space, the directory above it) and run again"
+        ) from exc
     rc, out = _git(["-C", str(repo), "worktree", "add", "--detach", str(dest), ref])
     if rc != 0:
+        # Only the empty directory made above, so a rerun is not blocked: `rmdir`, never
+        # recursive, so whatever is in it now, or a link now at the path, stays.
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
         raise RuntimeError(f"could not check {ref!r} out of {repo}: {out.strip()[:300]}")
     return dest
+
+
+def _appeared_at(dest: Path, ref: str) -> str:
+    """The sentence for what `os.mkdir(dest)` met after the guard had read `dest` as free."""
+    return (
+        f"{dest} became {_what_stands_at(dest)} after it was read as free, so {ref!r} was not "
+        f"checked out there — move it aside (`mv {shlex.quote(str(dest))} <a path of yours>`) "
+        f"and run again"
+    )
+
+
+def _what_stands_at(path: Path) -> str:
+    """What is at `path`, read with `lstat` so a link is named and never followed."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as exc:
+        return f"unreadable ({exc.strerror or exc})"
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    return "a file"
 
 
 def _authenticated(project, url: str, token: str | None) -> str:
