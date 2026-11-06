@@ -88,7 +88,8 @@ moved, pull requests opened in Azure Repos, pipelines observed. The Azure DevOps
 ## Known gaps
 
 **Principles the documents state and the code does not yet meet.** These are aims, written here so
-nobody reads them as facts.
+nobody reads them as facts. None has a tracking issue yet, except that #351 covers the mutation
+rows no gate re-runs.
 
 - **"Born with two"** ([ADR-0022](adr/0022-provider-seams.md)). `channel`, `notifier`,
   `session_store` and `token_pool` have one built-in row each, `box_runner` has none, and no test

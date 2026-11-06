@@ -63,7 +63,7 @@ they are what made the existing seams survive contact with production.
 Principles 1 and 6 are aims the code does not fully meet yet. The vendor guard covers `contracts/`
 and `policy/` only, and the metrics sink is inferred as `dynamodb` from a variable's presence.
 Four axes ship one built-in row each, `box_runner` ships none, and no test holds the rule.
-[`docs/STATUS.md`](../STATUS.md), "Known gaps", keeps the list.
+[`docs/STATUS.md`](../STATUS.md), "Known gaps", keeps the list; none of these gaps has a tracking issue yet.
 
 ## 4. Why principle 5 is the whole design
 

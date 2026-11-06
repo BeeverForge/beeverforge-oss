@@ -3,7 +3,7 @@
 - **Status:** **Accepted** (design only; 2026-09-24) — the product owner accepted the design
   together with its review's recommendations, with slice 0 the first to be built. No code changes
   with this ADR.
-- **Note (2026-11-06, #1):** "design only" was true when accepted. It has since been built in #266's slices: `product/semaphore.py`, `paths.product_state_dir`, `util/filelock.py`, `adapters/channel/base.py`.
+- **Note (2026-11-06, #1):** "design only" was true when accepted. It has since been built in #266's slices: the code cites D1–D16 and D18 (among them `product/door.py`, `product/semaphore.py`, `util/filelock.py`, `adapters/channel/base.py`). D17 is a rule for the work itself. D18 was proposed after acceptance (2026-10-10, #563), and the code cites it too.
 - **Date:** 2026-09-23
 - **Amended:** 2026-10-10, from a run on a live deployment where one requirement got three cards
   through three doors at once (#563): **D18** makes a requirement's breakdown one piece of work
