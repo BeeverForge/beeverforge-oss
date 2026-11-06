@@ -331,9 +331,11 @@ def test_no_host_git_call_in_the_box_bypasses_the_runner(source):
 #: Host code outside the box that runs git with a literal argv in a `RepoCache` path (#384's
 #: review: the knowledge refresh's `checkout -- knowledge` fired a planted `post-checkout`; its
 #: second review: the bundle build's `status` fired a planted `post-index-change`; and the
-#: concept renewal reads the cache's history through `history._git`).
+#: concept renewal reads the cache's history through `history._git`; and the system layer reads
+#: each source checkout's commit through `refresh._head`).
 CACHE_CALLERS = ("beeverforge/runtime/temporal/activities.py",
-                 "beeverforge/knowledge/generator.py", "beeverforge/onboarding/history.py")
+                 "beeverforge/knowledge/generator.py", "beeverforge/onboarding/history.py",
+                 "beeverforge/knowledge/system/refresh.py")
 
 
 def _literal_git_calls(tree: ast.AST) -> list[ast.Call]:
