@@ -156,6 +156,9 @@ class HarnessReviewer(ReviewerAdapter):
             tail = (getattr(res, "summary", "") or "")[:400].strip()
             return with_telemetry(ReviewResult(
                 decision="rejected", score=0,
+                # the agent's own pause, so the job pauses on it as on an executor pause (#131)
+                pause_reason=getattr(res, "pause_reason", None),
+                retry_at=getattr(res, "retry_at", None),
                 summary=(f"THE REVIEW NEVER RAN ({self.name}): {why}. This diff has NOT been "
                          f"reviewed — it is not a rejection of the code."
                          + (f"\n{tail}" if tail else "")),

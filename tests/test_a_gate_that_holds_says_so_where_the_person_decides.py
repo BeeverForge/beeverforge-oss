@@ -214,8 +214,10 @@ def test_the_declaration_still_describes_a_function_that_exists():
     # selection were all taken on an empty list and all three reported nothing to find.
     # 15 SINCE #447: a review that is NOT VERIFIED — nothing executed the acceptance criteria —
     # holds whatever the review mode; it reads `review`, the row already declared.
-    assert len(holds) == 15, (
-        f"{len(holds)} branches of `should_auto_merge` hold a merge, not 15 — either a gate was "
+    # 16 SINCE #131: a review that JUDGED NOTHING (`not_a_verdict`: it paused or did not
+    # complete) holds whatever the review mode, as no review at all; it reads `review` too.
+    assert len(holds) == 16, (
+        f"{len(holds)} branches of `should_auto_merge` hold a merge, not 16 — either a gate was "
         f"added or removed (say which, here) or this guard no longer finds the branches it reads")
 
 

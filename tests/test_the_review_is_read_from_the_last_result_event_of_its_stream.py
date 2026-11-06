@@ -188,8 +188,11 @@ def test_a_failed_result_event_is_still_a_rejection_that_says_it_could_not_be_re
     review = _review(out, rc=1)
 
     assert (review.decision, review.score) == ("rejected", 0), review
-    assert review.summary == "reviewer output could not be parsed (rc=1)", review.summary
-    assert "never ran" not in review.summary
+    # NOT LOGGED IN IS A PAUSE THE EXECUTOR ALREADY KNOWS (#131): `_detect_pause` reads `Please
+    # run /login` as `auth`, so the job holds for a person to fix the credential instead of
+    # recording a rejection of the diff. The decision stays rejected for any reader that ignores
+    # the pause. On main this said "could not be parsed (rc=1)" and carried no pause.
+    assert review.pause_reason == "auth", review
 
 
 # ── "never ran" is read from what the CLI said, not from what the reviewer read ──────────────────
@@ -224,3 +227,97 @@ def test_a_cli_missing_from_the_box_says_the_reviewer_never_ran_whatever_the_exi
     review = _review(out, rc=1)
     assert review.decision == "rejected"
     assert review.summary.startswith("the reviewer never ran"), review.summary
+
+
+# ── a run that ended in error is not a verdict, and a limit is a pause (#131) ───────────────────
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_an_error_result_event_that_reads_as_an_approval_is_a_review_that_did_not_complete(rc):
+    """`is_error: true` is the CLI saying the run failed, whatever its `result` text parses as.
+    Measured on openfactory-core: this envelope answered approved / 88 on main, at either exit."""
+    out = cli.stdout(cli.init_event(), {**cli.result_event(APPROVAL, cost=0.3), "is_error": True})
+
+    review = _review(out, rc=rc)
+
+    assert (review.decision, review.score) == ("rejected", 0), review
+    assert review.pause_reason is None, review
+    assert review.did_not_complete is True, review
+    assert "did not complete" in review.summary, review.summary
+    assert review.cost_usd == 0.3, "the run that failed was still paid for"
+
+
+def test_a_run_that_exited_non_zero_is_not_read_as_a_verdict():
+    """A clean-looking result event from a run that exited 1 is a failed run, as
+    `ClaudeCodeAdapter._parse_stream` reads it. On main: approved / 88."""
+    out = cli.stdout(cli.init_event(), cli.result_event(APPROVAL))
+
+    review = _review(out, rc=1)
+
+    assert (review.decision, review.score) == ("rejected", 0), review
+    assert review.did_not_complete is True, review
+    assert "did not complete" in review.summary, review.summary
+
+
+def test_a_usage_limit_result_event_answers_a_pause_reason():
+    """The subscription's own sentence, on an error result event: the executor's `_detect_pause`
+    reads it as `rate_limit` with its reset, and so does the review now. On main: could not be
+    parsed (rc=1), with no pause."""
+    limit = "You've hit your usage limit \u00b7 resets 10:30pm (UTC)"
+    out = cli.stdout(cli.init_event(), {**cli.result_event(limit), "is_error": True})
+
+    review = _review(out, rc=1)
+
+    assert (review.pause_reason, review.retry_at) == ("rate_limit", "10:30pm"), review
+    assert (review.decision, review.score) == ("rejected", 0), review
+    assert "NOT been reviewed" in review.summary, review.summary
+
+
+def test_a_successful_review_that_talks_about_rate_limits_is_not_a_pause():
+    """A review's own prose about a diff that handles a 429 is a verdict, not a limit: the pause
+    is read only from a run that failed (the audit-CRITICAL reason in `_parse_stream`)."""
+    out = cli.stdout(cli.init_event(),
+                     cli.result_event(cli.verdict("approved", 90, "handles the 429 rate limit")))
+
+    review = _review(out, rc=0)
+
+    assert (review.decision, review.score) == ("approved", 90), review
+    assert review.pause_reason is None
+    assert review.did_not_complete is False
+
+
+def test_a_review_stream_that_died_on_a_rejected_rate_limit_event_pauses():
+    """No result event at all, exit 1, and the CLI's last `rate_limit_event` says `rejected`: the
+    executor's `_pause_from` reads that as a usage limit, and so does the review."""
+    out = cli.stdout(cli.init_event(), cli.rate_limit_event(status="rejected"))
+
+    review = _review(out, rc=1)
+
+    assert review.pause_reason == "rate_limit", review
+    assert review.decision == "rejected"
+
+
+# ── a stream that died before its result event (#131) ─────────────────────────────────────────
+
+
+def test_a_stream_with_no_result_event_at_exit_0_is_not_an_approval():
+    """The approving text is in an assistant message, and an assistant message is not the review:
+    with no result event nothing reached a verdict, whatever the reviewer was saying on the way."""
+    out = cli.stdout(cli.init_event(), cli.assistant_event(APPROVAL))
+
+    review = _review(out, rc=0)
+
+    assert review.decision != "approved", review.summary
+    assert review.score == 0, review.summary
+
+
+def test_a_stream_that_died_with_no_result_event_and_a_non_zero_exit_did_not_complete():
+    """A timeout (124) or a kill: the run ended in error before its result event. On a796cde it
+    answered `did_not_complete=False` and "could not be parsed (rc=124)", caught only by the
+    phrase fallback — a reworded sentence would have read as a rejection of the code."""
+    out = cli.stdout(cli.init_event(), cli.assistant_event(APPROVAL))
+
+    review = _review(out, rc=124)
+
+    assert review.decision != "approved", review.summary
+    assert review.did_not_complete is True, review.summary
