@@ -67,9 +67,11 @@ def test_a_failed_save_keeps_the_form_and_allows_a_retry(failure):
         "same": True, "saving": False, "disabled": False, "title": "Keep it",
     }
     assert got["count"] == 2 and got["opened"] == ["9"]
-    assert got["toasts"][0] == [
-        "Not opened", "network unavailable" if failure == "network" else "board unavailable", "err",
-    ]
+    assert got["toasts"][0] == (
+        ["Save not confirmed",
+         "The connection failed. Your draft is kept; check the board before retrying Save.", "err"]
+        if failure == "network" else ["Not opened", "board unavailable", "err"]
+    )
 
 
 @pytest.mark.parametrize("navigation", ["form", "project", "card"])
