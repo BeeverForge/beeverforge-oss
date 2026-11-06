@@ -2147,6 +2147,29 @@ async def check_pr_status(inp: MergeCheckInput) -> str:
 
 
 @activity.defn
+async def purge_expired_records() -> str:
+    """Delete what the metrics store holds past its period, from the file and not only from the
+    reads (#201): conversation messages kept under ADR-0024, invitations, staged suggestions.
+
+    The store's read path already hides an expired row; nothing deleted it, so on a `sqlite`
+    deployment every row stayed in the file for ever. A sink that deletes by itself (a table with
+    its own TTL) or keeps nothing has no `purge_expired`, and that is said rather than skipped in
+    silence. One line in the log either way, so an operator can see the sweep ran and what it did.
+    """
+    from beeverforge.observability.registry import deployment_metrics_sink, metrics_sink_kind
+
+    kind = metrics_sink_kind()
+    purge = getattr(deployment_metrics_sink(), "purge_expired", None)
+    if not callable(purge):
+        activity.logger.info("BEEVERFORGE_METRICS_PURGE kind=%s — this store deletes nothing "
+                             "itself (it keeps nothing, or its own TTL deletes expired rows)", kind)
+        return f"nothing to purge: the {kind} store does not keep expired rows itself"
+    purged = await asyncio.to_thread(purge)
+    activity.logger.info("BEEVERFORGE_METRICS_PURGED kind=%s rows=%d", kind, purged)
+    return f"purged {purged} expired row(s) from the {kind} store"
+
+
+@activity.defn
 async def reap_previews() -> list[str]:
     """End every preview that should not be up any more (ADR-0050 D10), through the deployment's
     preview runtime — `BEEVERFORGE_PREVIEW_RUNTIME`'s row — and say which, one line each.

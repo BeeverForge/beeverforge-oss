@@ -305,13 +305,24 @@ class SqliteMetricsSink:
 
     def purge_expired(self, *, now: int | None = None) -> int:
         """Delete rows past their TTL, returning how many went. Filtering on read keeps the answer
-        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone."""
+        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone.
+
+        AND GONE FROM THE FILE, NOT ONLY FROM THE TABLE (#201). A plain `DELETE` moves a row's
+        page to SQLite's free list with its text still in it, and in WAL mode the row's last
+        version also sits in the `-wal` file until a checkpoint copies it back. So the delete runs
+        with `secure_delete` on, which overwrites what it frees with zeros, and the log is then
+        checkpointed and truncated: what the period promised to delete is in neither file."""
         try:
             with self._connect(write=True) as conn:
+                conn.execute("PRAGMA secure_delete=ON")
                 cur = conn.execute("DELETE FROM metrics WHERE expires_at IS NOT NULL"
                                    " AND expires_at <= ?", (now if now is not None else
                                                             int(time.time()),))
-                return cur.rowcount or 0
+                purged = cur.rowcount or 0
+                conn.commit()
+                if purged:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                return purged
         except Exception as exc:  # noqa: BLE001
             log.warning("metrics purge failed: %s", exc)
             return 0
