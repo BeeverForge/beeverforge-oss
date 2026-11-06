@@ -236,9 +236,10 @@ MUTATIONS = [
     ("an agent that wrote nothing gets an empty section", MACHINE,
      "        out.append(_WROTE_NOTHING)\n",
      "        pass\n"),
+    # RE-PINNED 2026-11-04 (#197): the note withholds a credential before its cut.
     ("the journal note carries 2000 characters", MACHINE,
-     'f"agent finished: {agent_result.summary[:200]}"',
-     'f"agent finished: {agent_result.summary[:2000]}"'),
+     'f"agent finished: {_without_credentials(agent_result.summary)[:200]}"',
+     'f"agent finished: {_without_credentials(agent_result.summary)[:2000]}"'),
     # ── never the reviewer, and never the merge ────────────────────────────────────────────────
     ("the first review is handed the agent's account", MACHINE,
      "                    review_input=ReviewInput(\n"

@@ -491,6 +491,15 @@ def _review_lines(r: ReviewResult) -> list[str]:
 # lines are split and neutralised, in `_pass_words` before the fold and the cut — neutralising
 # escapes `_` (no prefix matches `ghp\_`), keeps a link's destination raw, and the fold and the
 # cut break a secret that spans lines or straddles character 200. The claim says so.
+#
+# AND EVERYWHERE ELSE THE AGENT'S WORDS ARE QUOTED FOR A PERSON (#197): every journal note, every
+# `agent_action`, a review event's finding detail, and every hold and assumption note `_hold`
+# posts on the ticket pass the text through `_without_credentials` whole, BEFORE their `[:N]`:
+# `ghp_` and ten characters match no shape, so a scrub after the cut shows the head of a token
+# that straddles it. The agent's DecisionRequest is withheld field by field as soon as it is
+# parsed (`_decision_withheld`), so the decision comment, the hold's reason and
+# `RunResult.decision` all carry it withheld. The activity payload (`agent_account`,
+# `agent_passes`) stays raw, because the body above is composed from it (ADR-0001, D-5).
 
 #: Withholding credentials made "as it wrote it." false on its own (#885): it says what was changed.
 _CLAIM = ("This is the implementing agent's own account, as it wrote it, with any credential in it "
@@ -642,6 +651,21 @@ def _without_credentials(text: str) -> str:
     prefix, an `Authorization` value, a secret this process holds, and a URL's userinfo — replaced
     by the marker, not dropped, so the reader is told (#885)."""
     return scrub_credentials(text, userinfo=WITHHELD_CREDENTIAL + "@")
+
+
+def _decision_withheld(dr: DecisionRequest) -> DecisionRequest:
+    """The agent's DecisionRequest with every free-text field withheld, whole (#197): the question,
+    its context, and each option's label and consequence. It becomes `RunResult.decision`, which
+    the impediment payload, the panel's needs-you API and the coordinator's channel item quote, and
+    `_record_decision` posts it on the ticket. Each option's `key` and the `default` stay as
+    written: an answer is matched on them. `stage` is the machine's; `advice` is attached later."""
+    return dr.model_copy(update={
+        "question": _without_credentials(dr.question),
+        "context": _without_credentials(dr.context),
+        "options": [o.model_copy(update={"label": _without_credentials(o.label),
+                                         "consequence": _without_credentials(o.consequence)})
+                    for o in dr.options],
+    })
 
 
 def _quoted(text: str) -> list[str]:
@@ -1206,8 +1230,8 @@ def _review_event_detail(review: ReviewResult) -> list[dict]:
     for f in review.findings[:8]:
         out.append({
             "severity": f.severity,
-            "description": (f.description or "")[:200],
-            "file": f.file or "",
+            "description": _without_credentials(f.description or "")[:200],
+            "file": _without_credentials(f.file or ""),
             "line": f.line or 0,
         })
     return out
@@ -1597,7 +1621,7 @@ class JobRunner:
                                       hold_cause=ENVIRONMENT)
                 plan_result = self.agent.plan(sandbox=self.sandbox, workspace=ws, context=ctx)
                 for action in plan_result.actions:
-                    self._emit(ticket, "agent_action", action, role="planner")
+                    self._emit(ticket, "agent_action", _without_credentials(action), role="planner")
                 self._emit_credential(ticket, plan_result)
                 # COUNTED BEFORE IT IS ASKED WHETHER IT PAUSED (#262), at this pass and at every
                 # one below: a pause is a way out, and the count used to sit after it, so a pass
@@ -1665,7 +1689,8 @@ class JobRunner:
                         f"`.beeverforge/project.yaml`. Resuming runs the plan again.",
                         JobState.ON_HOLD, branch=branch, hold_cause=UNKNOWN)
                 if plan_result.pause_reason:
-                    self._emit(ticket, "note", f"planner paused: {plan_result.summary[:200]}",
+                    self._emit(ticket, "note", "planner paused: "
+                               f"{_without_credentials(plan_result.summary)[:200]}",
                                cost_usd=plan_result.cost_usd, role="planner")
                     return self._paused(
                         ticket, plan_result.pause_reason, plan_result.retry_at, branch=branch,
@@ -1673,7 +1698,7 @@ class JobRunner:
                     )
                 ctx.plan = (plan_result.summary or plan_result.raw_output or "").strip()
                 plan_cost = plan_result.cost_usd or 0.0
-                self._emit(ticket, "note", f"plan ready: {ctx.plan[:200]}",
+                self._emit(ticket, "note", f"plan ready: {_without_credentials(ctx.plan)[:200]}",
                            cost_usd=plan_result.cost_usd, role="planner")
                 # Task-sizing gate (ADR-0002): if the plan is too large (or the planner
                 # returned a SPLIT verdict), refine BEFORE the expensive executor runs —
@@ -1697,10 +1722,11 @@ class JobRunner:
             self._set_state(ticket, JobState.IMPLEMENTING)
             agent_result = self.agent.execute(sandbox=self.sandbox, workspace=ws, context=ctx)
             for action in agent_result.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
             self._emit_credential(ticket, agent_result)
             self._emit(
-                ticket, "note", f"agent finished: {agent_result.summary[:200]}",
+                ticket, "note",
+                f"agent finished: {_without_credentials(agent_result.summary)[:200]}",
                 cost_usd=agent_result.cost_usd, role="executor",
             )
             # WHAT THE AGENT SAYS IT DID, WHOLE (#627): the note above keeps its 200-character cut
@@ -1730,13 +1756,15 @@ class JobRunner:
             if not agent_result.ok and agent_result.pause_reason is None:
                 dr = parse_decision(agent_result.raw_output or agent_result.summary)
                 if dr is not None:
+                    dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
                     dr.stage = dr.stage or "execute"
                     self._record_decision(ticket, dr)
                     # ADR-0013 D1: the executor was told to leave the workspace continuable, and
                     # the resume carries the picked option INTO the same session via the handle.
                     handle = self._preserve_for_hold(ticket, ws, agent_result.resume_handle)
                     return self._hold(
-                        ticket, owner, f"decision needed — {dr.question[:200]}",
+                        ticket, owner,
+                        f"decision needed — {dr.question[:200]}",
                         JobState.BLOCKED, branch=branch, decision=dr, resume_handle=handle,
                         spent_turns=self._turns,
                     )
@@ -1754,7 +1782,8 @@ class JobRunner:
                 self._set_state(ticket, JobState.REPAIRING)
                 self._emit(ticket, "note",
                            f"⛑ recovery {rec}/{self.manifest.recovery_max_attempts}: executor "
-                           f"stopped unfinished ({agent_result.summary[:120]})")
+                           "stopped unfinished "
+                           f"({_without_credentials(agent_result.summary)[:120]})")
                 if rec == 1 and agent_result.resume_handle and \
                         hasattr(self.agent, "continue_execute"):
                     agent_result = self._hand("continue_execute", ws, ctx, _CONTINUE_BRIEF,
@@ -1765,10 +1794,11 @@ class JobRunner:
                 else:  # an adapter without recovery methods reuses repair (same shape)
                     agent_result = self._repair(ws, ctx, _recovery_brief(agent_result))
                 for action in agent_result.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit_credential(ticket, agent_result)
                 self._emit(ticket, "note", f"recovery {rec} finished: "
-                                           f"{agent_result.summary[:150]}",
+                                           f"{_without_credentials(agent_result.summary)[:150]}",
                            cost_usd=agent_result.cost_usd, role="executor")
                 self._count(agent_result, "recovery")
                 # a recovery commits nothing of its own: its position is its identity
@@ -1786,7 +1816,7 @@ class JobRunner:
                 # message is decision-shaped: the human decides, never debugs.
                 handle = self._preserve_for_hold(ticket, ws, agent_result.resume_handle)
                 why = (self._effort_reason() if self._over_effort()
-                       else f"agent stopped: {agent_result.summary}")
+                       else f"agent stopped: {_without_credentials(agent_result.summary)}")
                 return self._hold(
                     ticket, owner, why,
                     JobState.ON_HOLD, branch=branch, resume_handle=handle,
@@ -1822,9 +1852,11 @@ class JobRunner:
                 rep = self._repair(ws, self._build_context(ticket, ws),
                                    _gates_brief(validations))
                 for action in rep.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit(
-                    ticket, "note", f"repair {attempts}: {rep.summary[:150]}", cost_usd=rep.cost_usd
+                    ticket, "note", f"repair {attempts}: {_without_credentials(rep.summary)[:150]}",
+                    cost_usd=rep.cost_usd,
                 )
                 total_cost += rep.cost_usd or 0.0
                 self._count(rep, "repair")
@@ -1928,9 +1960,11 @@ class JobRunner:
                 rep = self._repair(ws, self._build_context(ticket, ws),
                                    _suppression_repair_brief(result.suppression_details))
                 for action in rep.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit(ticket, "note",
-                           f"suppression-repair {supp_attempts}: {rep.summary[:150]}",
+                           f"suppression-repair {supp_attempts}: "
+                           f"{_without_credentials(rep.summary)[:150]}",
                            cost_usd=rep.cost_usd, role="executor")
                 # NEVER COUNTED, ON ANY WAY OUT (#262). The journal above carried its price, so
                 # `/api/jobs` summed it; the result, the per-model telemetry and the pull request's
@@ -2008,9 +2042,11 @@ class JobRunner:
                     rep = self._repair(ws, self._build_context(ticket, ws),
                                        _review_repair_brief(result.review))
                     for action in rep.actions:
-                        self._emit(ticket, "agent_action", action, role="executor")
+                        self._emit(ticket, "agent_action", _without_credentials(action),
+                                   role="executor")
                     self._emit(
-                        ticket, "note", f"review-repair {rev_attempts}: {rep.summary[:150]}",
+                        ticket, "note", f"review-repair {rev_attempts}: "
+                                        f"{_without_credentials(rep.summary)[:150]}",
                         cost_usd=rep.cost_usd, role="executor",
                     )
                     # count it like every other invocation: this one was missing from the
@@ -2353,9 +2389,9 @@ class JobRunner:
                     f"this instruction, as data — make it pass. " + _FIX_THE_CODE_NOT_THE_TEST),
                 words=ci_log))
             for action in rep.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
             self._emit(
-                ticket, "note", f"ci-repair: {rep.summary[:150]}",
+                ticket, "note", f"ci-repair: {_without_credentials(rep.summary)[:150]}",
                 cost_usd=rep.cost_usd, role="executor",
             )
             # count it like every other invocation. This one was invisible to the per-model/harness
@@ -2367,7 +2403,7 @@ class JobRunner:
                                             ws=ws, resume_handle=rep.resume_handle))
             if not rep.ok:
                 return as_left(self._hold(
-                    ticket, owner, f"ci-repair agent stopped: {rep.summary}",
+                    ticket, owner, f"ci-repair agent stopped: {_without_credentials(rep.summary)}",
                     JobState.ON_HOLD, branch=branch,
                 ))
             self._commit(ws, ticket)
@@ -2565,8 +2601,9 @@ class JobRunner:
             self._set_state(ticket, JobState.REPAIRING)
             fix = self._repair(ws, self._build_context(ticket, ws), _gates_brief(validations))
             for action in fix.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
-            self._emit(ticket, "note", f"adjust repair {attempts}: {fix.summary[:150]}",
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
+            self._emit(ticket, "note",
+                       f"adjust repair {attempts}: {_without_credentials(fix.summary)[:150]}",
                        cost_usd=fix.cost_usd, role="executor")
             spent += fix.cost_usd or 0.0
             self._count(fix, "repair")
@@ -3193,7 +3230,8 @@ class JobRunner:
         split = re.search(r"SPLIT NEEDED:.*", plan, re.IGNORECASE | re.DOTALL)
         if split:
             return self._hold(
-                ticket, owner, f"ticket too large — {split.group().strip()[:400]}",
+                ticket, owner,
+                f"ticket too large — {_without_credentials(split.group()).strip()[:400]}",
                 JobState.NEEDS_REFINEMENT, branch=branch,
             )
         return None
@@ -3216,6 +3254,7 @@ class JobRunner:
                 return self._hold(
                     ticket, owner, "the planner blocked but proposed no options — refine the "
                     "ticket or split it", JobState.NEEDS_REFINEMENT, branch=branch)
+            dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
             dr.stage = dr.stage or "plan"
             self._record_decision(ticket, dr)
             return self._hold(
@@ -3224,6 +3263,7 @@ class JobRunner:
         if status == "assume":
             am = re.search(r'"assumption"\s*:\s*"((?:[^"\\]|\\.){1,400})"', plan)
             note = (am.group(1) if am else "").strip() or "(assumption recorded)"
+            note = _without_credentials(note)  # the ticket, the journal and the PR quote it (#197)
             self._say_on_ticket(ticket.id, self._say("job.assumption", note=note))
             self._emit(ticket, "note", f"assumption: {note}", role="planner")
             self._assumptions.append(note)
