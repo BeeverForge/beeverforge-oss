@@ -17,6 +17,14 @@ turning *"the agent wrote the wrong code"* into *"the agent picked the machine"*
 
 ## The manifest
 
+**The folder has two names.** BeeverForge's is `.beeverforge/`; OpenFactory 0.7 called it
+`.openfactory/`, and a repository that keeps that folder is read there — the manifest, the
+product's `product.yaml`, the profiles, a preview's compose file — and what BeeverForge writes into
+it (`env apply`, `onboard`, `preview propose`, an import's record) lands there too. Nothing renames
+it for you. A repository that has neither gets `.beeverforge/`. When a repository has both,
+`.beeverforge/` is read, nothing under `.openfactory/` is, and `beeverforge doctor` names the stale
+one. The floor protects both (#265).
+
 38 fields, **all optional** — an empty file loads. The ones that matter:
 
 ```yaml
