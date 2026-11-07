@@ -65,7 +65,7 @@ MUTATIONS = [
 
     ("git too slow reaches the person as a traceback", CATALOG,
      "    except subprocess.TimeoutExpired as exc:\n        raise ValueError(\n",
-     "    except subprocess.TimeoutExpired as exc:\n        raise exc from ValueError(\n"),
+     "    except subprocess.TimeoutExpired as exc:\n        raise\n        raise ValueError(\n"),
 
     ("a checkout of any size is copied", CATALOG,
      "    if size > _ASK_COPY_LIMIT:\n",
@@ -73,7 +73,7 @@ MUTATIONS = [
 
     ("a file that cannot be read reaches the person as a traceback", CATALOG,
      "        except OSError as exc:\n            raise RuntimeError(\n",
-     "        except OSError as exc:\n            raise exc from RuntimeError(\n"),
+     "        except OSError as exc:\n            raise\n            raise RuntimeError(\n"),
 
     ("a harness that cannot judge is said only when it is asked", CATALOG,
      "    ctx.agent_ask(asker, sandbox=None, workspace=None)\n",
