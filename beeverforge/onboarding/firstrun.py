@@ -1568,7 +1568,12 @@ def probes_for(project, *, image: str | None = None, turn_cap: int = DEFAULT_TUR
         list is where a client names their forge token, their package-feed credential, their
         scanner key — every one of them readable by agent-written code inside the box, as
         `contracts/project.py` says in its own comment. A round whose safety rests on a removed git
-        remote while handing the agent a push token has one layer, not two."""
+        remote while handing the agent a push token has one layer, not two.
+
+        SO IT IS NOT `factory.box_knobs` (#191), which the job's box and the proof's are built
+        from: that adds `box.env`, which this box holds back for the reason above, and the image's
+        pull credential, which this list does not pass either. Whether the rehearsal also gets
+        what the job's box gets is #191's slice 2, still open."""
         knobs = {
             key: value
             for key in ("network", "cache_volume", "cpus", "memory")
