@@ -623,6 +623,14 @@ def diagnose(probes: Probes) -> Report:
     time would double the cost of the diagnostic AND put a second answer beside a question that
     already has one, which is the shape `_box_proof` was written to avoid.
     """
+    if probes.checkout:
+        # THE CHECKOUT IS RESOLVED ONCE: two checks read it (the guidelines, and whether it carries
+        # the folder under both names, #265), and resolving it may sync the repository.
+        import dataclasses
+        import functools
+
+        probes = dataclasses.replace(probes, checkout=functools.lru_cache(maxsize=1)(
+            probes.checkout))
     findings = [
         _guarded("docker", lambda: _docker(probes)),
         _guarded("harness", lambda: _harness(probes)),
@@ -643,6 +651,9 @@ def diagnose(probes: Probes) -> Report:
             "launcher_credentials",
             lambda: Finding("launcher_credentials", *probes.launcher_credentials())))
     findings.append(_guarded("manifest", lambda: _manifest(probes)))
+    stale = _guarded("folder", lambda: _folder(probes)) if probes.checkout else None
+    if stale is not None and stale.message:
+        findings.append(stale)
     findings.append(_guarded("guidelines", lambda: _guidelines(probes)))
     if probes.operator_guidelines:
         findings.append(_guarded("operator_guidelines",
@@ -1283,6 +1294,18 @@ def _settings_total(manifest: object) -> int | None:
     return len(fields) if isinstance(fields, dict) else None
 
 
+def _manifest_name(p: Probes) -> str:
+    """The default manifest's path as the checkout spells it (#265) — `.openfactory/project.yaml`
+    in a repository that keeps the former folder — or the current name when no checkout is at
+    hand to ask."""
+    try:
+        checkout = p.checkout() if p.checkout else None
+    except Exception:  # noqa: BLE001 — a name for a sentence; the checks say what failed
+        log.info("the checkout could not be resolved to name the manifest by", exc_info=True)
+        checkout = None
+    return namespace.in_repo(checkout, namespace.MANIFEST) if checkout else namespace.MANIFEST
+
+
 def _manifest(p: Probes) -> Finding:
     """Did the file load — and, once it has, did anybody FILL IT IN?
 
@@ -1292,6 +1315,8 @@ def _manifest(p: Probes) -> Finding:
     we ask them to run that their setup is fine. Misspelling a key is NOT this failure — that is
     caught, because `extra="forbid"` makes an unknown key a load error and it arrives below as a
     ValueError. The one that got through is the file nobody wrote anything in."""
+    # NAMED AS THE REPOSITORY SPELLS IT: `.openfactory/project.yaml` where that is its folder.
+    shown = _manifest_name(p)
     try:
         manifest = p.manifest()
     except namespace.RetiredNamespace as exc:
@@ -1326,7 +1351,7 @@ def _manifest(p: Probes) -> Finding:
         if proposed:
             return Finding(
                 "manifest", False,
-                f"{namespace.MANIFEST} is missing here because it is still PROPOSED, not "
+                f"{shown} is missing here because it is still PROPOSED, not "
                 f"merged: {proposed}",
                 "review that pull request and merge it — ONBOARDING §3, 'Then YOUR step'. It "
                 "is yours on purpose: the factory never merges its own declaration of what it "
@@ -1337,7 +1362,7 @@ def _manifest(p: Probes) -> Finding:
                 next_step=f"review and merge {proposed} — ONBOARDING §3's 'Then YOUR step'. "
                           f"The declaration is proposed and waiting for a human, which is the "
                           f"one step this platform will never take for you")
-        return Finding("manifest", False, f"{namespace.MANIFEST} is missing — {exc}",
+        return Finding("manifest", False, f"{shown} is missing — {exc}",
                        "the environment session named above reads your repository and PROPOSES "
                        "the file for a human to correct and merge (ONBOARDING §3); "
                        "`beeverforge onboard <project> --yes` is the same step done where the "
@@ -1345,7 +1370,7 @@ def _manifest(p: Probes) -> Finding:
                        next_step="the manifest gets written — ONBOARDING §3, or "
                                  "`beeverforge onboard <project> --yes` where the factory lives")
     except ValueError as exc:
-        return Finding("manifest", False, f"{namespace.MANIFEST} is invalid — {exc}",
+        return Finding("manifest", False, f"{shown} is invalid — {exc}",
                        "fix the file the message names; `version:` must be one this build supports")
 
     declared = _declared(manifest)
@@ -1360,7 +1385,7 @@ def _manifest(p: Probes) -> Finding:
         # rather than invented.
         return Finding(
             "manifest", True,
-            f"{namespace.MANIFEST} loads; this build cannot say which settings it declares "
+            f"{shown} loads; this build cannot say which settings it declares "
             f"({type(manifest).__name__} does not answer `declared_keys()`), so read nothing here "
             "as 'the manifest is filled in'",
         )
@@ -1368,7 +1393,7 @@ def _manifest(p: Probes) -> Finding:
     if not declared:
         return Finding(
             "manifest", False,
-            f"{namespace.MANIFEST} parses and declares nothing — "
+            f"{shown} parses and declares nothing — "
             f"{'all ' + str(total) if total else 'every one'} of its settings are the framework's "
             "defaults, `validate:` among them, so this project has no gates at all and a run with "
             "no gates reports green having proven nothing",
@@ -1378,8 +1403,30 @@ def _manifest(p: Probes) -> Finding:
         )
     ratio = f"{len(declared)} of {total}" if total else str(len(declared))
     return Finding("manifest", True,
-                   f"{namespace.MANIFEST} loads and declares {ratio} settings "
+                   f"{shown} loads and declares {ratio} settings "
                    f"({', '.join(declared)}); everything else is a framework default")
+
+
+def _folder(p: Probes) -> Finding:
+    """Whether the checkout carries the platform's folder under BOTH names (#265) — and an empty
+    message, which `diagnose` leaves out, when it does not, or when no checkout is at hand.
+
+    `.beeverforge/` WINS, AND THE OTHER IS STALE. Every reader takes `.beeverforge/` when it is
+    there (`namespace.dir_in`), so whatever `.openfactory/` still holds — a manifest, a profile,
+    a preview's compose file — is read by nothing. A person editing the stale copy would see no
+    effect and no error, so this line names it. A PASS with a note, not a failure: the project
+    runs, from the folder it names."""
+    checkout = p.checkout() if p.checkout else None
+    if checkout is None or not namespace.stale_former_dir(checkout):
+        return Finding("folder", True, "")
+    current, former = f"{namespace.DIR}/", f"{namespace.FORMER_DIR}/"
+    return Finding(
+        "folder", True,
+        f"the repository carries both `{current}` and `{former}` — `{current}` is read and "
+        f"`{former}` is stale: nothing under it is read",
+        note=f"remove `{former}` from the repository once you have checked nothing in it is "
+             f"newer than its twin under `{current}` — while both are there, `{former}` is "
+             f"never read")
 
 
 def _guidelines(p: Probes) -> Finding:

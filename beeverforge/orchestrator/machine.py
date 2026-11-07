@@ -3843,7 +3843,8 @@ class JobRunner:
         return ids
 
     #: The paths whose edit changes what a preview would RUN (ADR-0050 D3): the compose spec's
-    #: names at the root, and everything the factory keeps under `.beeverforge/`.
+    #: names at the root, and everything the factory keeps under `.beeverforge/` (or the former
+    #: `.openfactory/`, #265).
     _SHAPE_NAMES = frozenset({"compose.yaml", "compose.yml", "docker-compose.yaml",
                               "docker-compose.yml"})
 
@@ -3863,10 +3864,12 @@ class JobRunner:
         from beeverforge.util import yaml_io
 
         hits = tuple(getattr(self, "_protected", ()) or ())
-        manifest_rel = namespace.MANIFEST
-        if not any(h in self._SHAPE_NAMES or h.startswith(".beeverforge/") for h in hits):
+        if not any(h in self._SHAPE_NAMES or namespace.is_ours(h) for h in hits):
             return []
         root = Path(getattr(ws, "host_path", None) or ws.path)
+        # THE FOLDER THIS REPOSITORY USES — `.openfactory/` when that is its one (#265).
+        folder = namespace.dir_in(root)
+        manifest_rel = namespace.in_repo(root, namespace.MANIFEST)
         try:
             text = (root / manifest_rel).read_text(encoding="utf-8")
             block = (yaml_io.load(text) or {}).get("preview") or {}
@@ -3874,11 +3877,11 @@ class JobRunner:
             block = {}
         compose = block.get("compose") if isinstance(block, dict) else None
         files = [compose] if isinstance(compose, str) else list(compose or [])
-        extra = root / ".beeverforge" / "preview"
+        extra = root / folder / "preview"
         if extra.is_dir():
             files += sorted(str(p.relative_to(root)) for p in extra.rglob("*") if p.is_file())
-        if (root / ".beeverforge" / "preview.compose.yml").is_file():
-            files.append(".beeverforge/preview.compose.yml")
+        if (root / folder / "preview.compose.yml").is_file():
+            files.append(f"{folder}/preview.compose.yml")
         out: list[str] = []
         for rel in dict.fromkeys(str(f) for f in files if f):
             path = (root / rel)

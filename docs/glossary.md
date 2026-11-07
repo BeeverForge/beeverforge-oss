@@ -54,7 +54,7 @@ handing out work); a **job is a temp hire** brought in for one task, does it, le
 | **Schedule** | The engine's cron-like trigger (every 3 min, overlapping runs skipped) that starts the PollWorkflow. |
 | **Sandbox kind** | Which container runtime a box gets: `container` (Docker on your own machine — the default), `worktree` (local/test, no isolation), or a cloud task. It is one row in the registry; the workflow does not change with it. |
 
-| **Manifest** (`.beeverforge/project.yaml`) | The per-project config: environments, gates, validation commands, reviewers, `merge_policy`. A new project is **data, not code**. |
+| **Manifest** (`.beeverforge/project.yaml`) | The per-project config: environments, gates, validation commands, reviewers, `merge_policy`. A new project is **data, not code**. A repository that keeps OpenFactory's folder has it at `.openfactory/project.yaml`, and it is read there. |
 | **Forge / Tracker / Board** adapters | The seams onto whatever hosts your code (PRs/merges), your issues, and your board. Swapping one changes an adapter, not the workflow. |
 | **Promotion / environments** | Optional post-merge deploys (staging → prod), driven by the manifest's `environments`. Zero to N; prod is human-gated by default. |
 | **Approval gate** | The one mandatory human touch (only when prod is configured): a durable signal, deadline 3 days, you're notified by push. |

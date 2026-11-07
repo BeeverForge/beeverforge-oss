@@ -6409,10 +6409,12 @@ async def _preview_proposal(*, target: str, by: Actor, accept: object = None) ->
 
     def _read():
         from beeverforge.onboarding.preview_infer import infer_preview
-        from beeverforge.onboarding.preview_propose import draft
+        from beeverforge.onboarding.preview_propose import draft, relocated
 
         found = infer_preview(checkout, name=(repo.rsplit("/", 1)[-1] if repo else ""))
-        return found, draft(found, accept=_said_yes(accept))
+        # SHOWN WHERE IT WOULD BE WRITTEN: the folder this repository uses (#265).
+        return found, relocated(draft(found, accept=_said_yes(accept)),
+                                namespace.dir_in(checkout))
 
     try:
         found, drafted = await asyncio.to_thread(_read)
@@ -7165,7 +7167,10 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
     when = datetime.now(UTC).date().isoformat()
     body = _yaml_header(written, skipped, when=when, who=str(by)) + yaml_io.dump(
         document, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    destination = (Path(str(out)).expanduser() if out else checkout / found.manifest_path)
+    # INTO THE DIRECTORY THE REPOSITORY USES (#265): a repository that keeps `.openfactory/` gets
+    # its manifest written there, never a second one under `.beeverforge/` that would shadow it.
+    in_repo = namespace.in_repo(checkout, str(found.manifest_path))
+    destination = (Path(str(out)).expanduser() if out else checkout / in_repo)
 
     if not consented:
         return refused(
@@ -7216,7 +7221,7 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
         from beeverforge.onboarding.propose_manifest import propose
 
         outcome = propose(
-            checkout=clone_to_discard, manifest_path=str(found.manifest_path),
+            checkout=clone_to_discard, manifest_path=in_repo,
             repo=repo_of(found), clone_url=url, base=base, forge=forge,
             project_name=found.name,
             summary=f"{len(written)} field(s) proposed from the repository: {kept}")
@@ -7229,7 +7234,7 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
             + (f". {len(skipped)} field(s) were left out on purpose."
                if skipped else ". Nothing was left out.")
             + f" Merge it, then: `beeverforge env check {found.name}`.",
-            verb="apply", measured_on=where, wrote=str(found.manifest_path),
+            verb="apply", measured_on=where, wrote=in_repo,
             project=found.name, pull_request=outcome.url, ref=outcome.ref,
             existed=outcome.existed, written=written, skipped=skipped, content=body)
 
@@ -8318,13 +8323,15 @@ def _the_declaration_step(project, docs_repo: str, root: Path, *, sources: list[
                           capture_output=True, text=True, timeout=60, check=False)
     named = (head.stdout or "").strip()
     base_branch = named if (head.returncode == 0 and named and named != "HEAD") else "main"
-    target = root / PRODUCT_YAML
+    # WHERE THE CONTEXT REPOSITORY KEEPS IT (#265): `.openfactory/` when that is its folder.
+    product_yaml = namespace.in_repo(root, PRODUCT_YAML)
+    target = root / product_yaml
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(result.product_yaml, encoding="utf-8")
     branch = proposal_branch(name)
     bot = bot_identity()
     ident = ["-c", f"user.name={bot.name}", "-c", f"user.email={bot.email}"]
-    for args in (["checkout", "-b", branch], ["add", "--", PRODUCT_YAML],
+    for args in (["checkout", "-b", branch], ["add", "--", product_yaml],
                  ["commit", "-m", f"{name}: declare this product for BeeverForge"],
                  # --force: the bot's OWN onboarding branch, so a run after a partial failure
                  # (pushed, then the review request did not open) overwrites rather than
