@@ -6243,10 +6243,54 @@ def _semantic_pass(project, checkout: Path, ctx):
             f"`beeverforge env context <target> --ask` where the harness is installed. The "
             f"deterministic survey needs none of this and costs nothing — run it again "
             f"without `ask`.")
-    return ctx.agent_ask(
-        build_asker(project),
-        sandbox=judging_worktree(project, root=checkout),
-        workspace=Workspace(path=str(checkout), branch="main", base_branch="main"))
+    asker = build_asker(project)
+    # A HARNESS THAT CANNOT JUDGE IS SAID NOW, before the survey, as it always was: binding it
+    # raises `TypeError` and asks nothing
+    ctx.agent_ask(asker, sandbox=None, workspace=None)
+
+    def ask(prompt: str) -> str:
+        """ASKED IN A COPY OF THE CHECKOUT, NEVER IN THE CHECKOUT ITSELF (#167). The checkout is
+        the path the person typed or the project's registered `repo_path`, which on a local
+        deployment is the repository they commit from. A harness that is read-only by
+        instruction only (Kimi, `roles.py`) and disobeys it wrote there, and the file was left in
+        their working tree for them to commit. The copy holds what they see (the files git tracks
+        and the untracked ones it does not ignore, as they are now, uncommitted edits included)
+        and is removed when the question is answered, whatever the harness wrote into it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="beeverforge-ask-") as tmp:
+            room = _a_copy_of(checkout, Path(tmp) / (checkout.name or "checkout"))
+            return ctx.agent_ask(
+                asker,
+                sandbox=judging_worktree(project, root=room),
+                workspace=Workspace(path=str(room), branch="main", base_branch="main"))(prompt)
+
+    return ask
+
+
+def _a_copy_of(checkout: Path, room: Path) -> Path:
+    """`checkout` as the person sees it, copied to `room`: in a git working tree, the files git
+    tracks and the untracked ones it does not ignore (so `node_modules`, build output and the
+    `.git` directory stay behind); anywhere else, the whole tree but `.git`. Links are copied as
+    links. A tracked file deleted from the working tree is not copied, as it is not there."""
+    import shutil
+    import subprocess
+
+    listed = subprocess.run(
+        ["git", "-C", str(checkout), "ls-files", "-z", "--cached", "--others",
+         "--exclude-standard"], capture_output=True, check=False, timeout=60)
+    if listed.returncode != 0:
+        shutil.copytree(checkout, room, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        return room
+    room.mkdir(parents=True, exist_ok=True)
+    for name in sorted({n for n in listed.stdout.decode("utf-8", "surrogateescape").split("\0")
+                        if n}):
+        source, target = checkout / name, room / name
+        if not (source.is_symlink() or source.is_file()):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target, follow_symlinks=False)
+    return room
 
 
 async def _env_read(*, target: str, by: Actor) -> Outcome:

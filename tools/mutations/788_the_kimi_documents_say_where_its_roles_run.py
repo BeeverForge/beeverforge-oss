@@ -18,13 +18,15 @@ The claims, each held by a row of `TEST` (named per cut below):
   - C4. Each of those documents says where the judging roles run (`judging_worktree` or "on the
     host") and that nothing commits from that room. One cut per document drops "nothing commits
     from"; one more drops the configuration bullet's only "on the host", the other arm of the check.
-  - C5. `env context --ask` asks in the person's own checkout, and each document says so wherever
-    it says "nothing commits from" (review of e2b57dd1, 2026-10-20, point 2). The fact is held by
-    `test_a_kimi_question_asked_as_env_context_asks_leaves_its_file_in_the_persons_checkout`
-    (`judging_worktree(None, root=<a git checkout>)`, the real `KimiAdapter.ask`, the disobeying
-    stub, `?? wrote.txt`); the wording by
-    `test_each_document_names_env_context_ask_wherever_it_says_nothing_commits_from`. One cut
-    moves the room, one cut per document drops the exception clause.
+  - C5. `env context --ask` asked in the person's own checkout until #167, and each document named
+    it as the exception (review of e2b57dd1, 2026-10-20, point 2). Since #167 it asks in a copy,
+    and each document says so wherever it says "nothing commits from". RE-PINNED 2026-11-07
+    (#167): the fact is held by
+    `test_a_kimi_question_asked_as_env_context_asks_leaves_nothing_in_the_persons_checkout`
+    (`_semantic_pass(None, <a git checkout>, ctx)`, the disobeying stub, a clean `git status`);
+    the wording by `test_each_document_says_env_context_ask_asks_in_a_copy_wherever_it_says_
+    nothing_commits_from`. One cut asks in the checkout again, one cut per document drops the copy
+    sentence, and one puts the old exception back.
   - C6. The independent review is an `ask()` NOT handed `judging_worktree`: `JobRunner._review`
     passes the job's own box and workspace to `HarnessReviewer.review`, so a Kimi reviewer's
     committed write is in the pushed branch (review of dc0efac4, 2026-10-20, point 1). The fact is
@@ -56,9 +58,10 @@ NO_BOX = TEST + "::test_no_document_says_the_kimi_roles_are_kept_in_a_box[{}]"
 NAMES = TEST + "::test_each_document_names_where_the_kimi_judging_roles_run[{}]"
 FACT = TEST + "::test_a_judging_role_runs_on_the_host_even_where_the_project_boxes_its_jobs"
 WRITES = TEST + "::test_a_kimi_question_that_writes_leaves_its_file_in_the_host_room"
-CHECKOUT = (TEST + "::test_a_kimi_question_asked_as_env_context_asks_leaves_its_file_in_the_"
+CHECKOUT = (TEST + "::test_a_kimi_question_asked_as_env_context_asks_leaves_nothing_in_the_"
             "persons_checkout")
-EXCEPT = TEST + "::test_each_document_names_env_context_ask_wherever_it_says_nothing_commits_from[{}]"
+EXCEPT = (TEST + "::test_each_document_says_env_context_ask_asks_in_a_copy_wherever_it_says_"
+          "nothing_commits_from[{}]")
 REVIEW_FACT = TEST + "::test_a_kimi_review_that_writes_reaches_the_pushed_branch"
 REVIEW = (TEST + "::test_each_document_names_the_review_wherever_it_says_where_the_questions_"
           "run[{}]")
@@ -86,9 +89,12 @@ MUTATIONS = [
      _RUN_CWD, "                command, shell=True, cwd=self.root.parent,\n",
      WRITES),
 
-    ("C5 the host box runs a command somewhere other than the room: the question asked as "
-     "`env context --ask` asks leaves nothing in the person's checkout", WORKTREE,
-     _RUN_CWD, "                command, shell=True, cwd=self.root.parent,\n",
+    # RE-PINNED 2026-11-07 (#167): the row moved the host box's room, which left the person's
+    # checkout clean; since #167 a clean checkout is the fact, so the cut asks in it again
+    ("C5 `env context --ask` asks in the person's own checkout again",
+     "beeverforge/actions/catalog.py",
+     '            room = _a_copy_of(checkout, Path(tmp) / (checkout.name or "checkout"))\n',
+     "            room = checkout\n",
      CHECKOUT),
 
     ("C1 judging_worktree routes the judging roles into the project's container box", REGISTRY,
@@ -98,8 +104,9 @@ MUTATIONS = [
 
     # ── C3: a false clause back in each document ───────────────────────────────────────────────
     ("C3 kimi.__doc__ says again that no such edit outlives the run", KIMI,
-     "   and its edit reaches no pull request but stays where it was written, except `env context\n",
-     "   and no such edit outlives the run, except `env context\n",
+     "   and its edit reaches no pull request but stays where it was written (`env context --ask` "
+     "asks\n",
+     "   and no such edit outlives the run (`env context --ask` asks\n",
      NO_BOX.format("kimi.__doc__")),
 
     ("C3 KimiAdapter.__doc__ is main's again: 'through the sandbox (never on the host)'", KIMI,
@@ -141,13 +148,13 @@ MUTATIONS = [
      NAMES.format("kimi.__doc__")),
 
     ("C4 KimiAdapter.__doc__ no longer says nothing commits from the room", KIMI,
-     "project's box, in a room nothing commits from, except",
-     "project's box, in a room of its own, except",
+     "in a room nothing commits from (`env context --ask` asks in a copy\n    of",
+     "in a room of its own (`env context --ask` asks in a copy\n    of",
      NAMES.format("KimiAdapter.__doc__")),
 
     ("C4 KimiAdapter.ask.__doc__ no longer says nothing commits from the room", KIMI,
-     "in a room\n        nothing commits from, except",
-     "in a room\n        of its own, except",
+     "in a room\n        nothing commits from (`env",
+     "in a room\n        of its own (`env",
      NAMES.format("KimiAdapter.ask.__doc__")),
 
     ("C4 roles.__doc__ no longer says nothing commits from the room", ROLES,
@@ -164,8 +171,8 @@ MUTATIONS = [
      NAMES.format("ADR-0018 section 2")),
 
     ("C4 the configuration bullet no longer says nothing commits from the directory", CONF,
-     "in a directory\n  nothing commits from, except",
-     "in a directory\n  of their own, except",
+     "in a directory\n  nothing commits from (`env",
+     "in a directory\n  of their own (`env",
      NAMES.format("docs/configuration.md Kimi bullet")),
 
     ("C4 the configuration bullet no longer says the questions run on the host", CONF,
@@ -174,46 +181,48 @@ MUTATIONS = [
      NAMES.format("docs/configuration.md Kimi bullet")),
 
     # ── C5: each document drops the `env context --ask` exception beside "nothing commits from" ──
-    ("C5 kimi.__doc__ drops the env context --ask exception", KIMI,
-     "except `env context\n   --ask`, which asks in the checkout it is pointed at (the person's own "
-     "repository on a local\n   deployment), where a write is left in that working tree, and the "
-     "independent review",
-     "except the independent review",
+    ("C5 kimi.__doc__ drops the copy sentence", KIMI,
+     " (`env context --ask` asks\n   in a copy of the checkout it is pointed at, removed after it "
+     "answers, #167), except the\n",
+     ", except the\n",
      EXCEPT.format("kimi.__doc__")),
 
-    ("C5 KimiAdapter.__doc__ drops the env context --ask exception", KIMI,
-     "except `env context --ask`,\n    which asks in the checkout it is pointed at, and the "
-     "independent review",
-     "except the independent review",
+    ("C5 KimiAdapter.__doc__ drops the copy sentence", KIMI,
+     " (`env context --ask` asks in a copy\n    of the checkout it is pointed at, removed after "
+     "it answers, #167), except the independent\n",
+     ", except the independent\n",
      EXCEPT.format("KimiAdapter.__doc__")),
 
-    ("C5 KimiAdapter.ask.__doc__ drops the env context --ask exception", KIMI,
-     "except `env context --ask`, which asks in the checkout it is pointed\n        at, where a "
-     "write is left in that working tree, and the independent review",
-     "except the independent review",
+    ("C5 KimiAdapter.ask.__doc__ drops the copy sentence", KIMI,
+     " (`env context --ask` asks in a copy of the checkout it is pointed at,\n        removed "
+     "after it answers, #167), except the independent review",
+     ", except the independent review",
      EXCEPT.format("KimiAdapter.ask.__doc__")),
 
-    ("C5 roles.__doc__ drops the env context --ask exception", ROLES,
-     "except `env context --ask`, which asks in\nthe checkout it is pointed at, where a write is "
-     "left in that working tree, and the independent\nreview",
-     "except the independent\nreview",
+    ("C5 roles.__doc__ drops the copy sentence", ROLES,
+     "; `env context --ask` asks in a copy of the checkout it is pointed at, removed after it\n"
+     "answers, #167), so",
+     "), so",
      EXCEPT.format("roles.__doc__")),
 
     # RETIRED 2026-10-28: the C5 cut of `changes/362.limitation.md`. Assembling
     # 0.1.0's notes removes the fragment; its text is 0.1.0's frozen CHANGELOG.md section.
 
-    ("C5 the ADR-0018 amendment lists the target checkout among the rooms nothing commits from "
-     "again", ADR,
-     "pull request, except\n`env context --ask`, which asks in the target checkout it is "
-     "pointed at",
-     "pull request, and that includes\n`env context --ask`, which asks in the target checkout it "
-     "is pointed at",
+    ("C5 the ADR-0018 amendment of #167 no longer says `env context --ask` asks in a copy", ADR,
+     "**Amended 2026-11-07 (#167): `env context --ask` asks in a copy of the checkout it is "
+     "pointed at.**",
+     "**Amended 2026-11-07 (#167).**",
      EXCEPT.format("ADR-0018 section 2")),
 
-    ("C5 the configuration bullet drops the env context --ask exception", CONF,
-     "except `env context --ask`, which asks in the checkout it is pointed at\n"
-     "  and leaves a write in that working tree, and the independent review",
-     "except the independent review",
+    ("C5 the configuration bullet drops the copy sentence", CONF,
+     " (`env context --ask` asks in a copy of the checkout it is pointed at,\n  removed after it "
+     "answers, #167), except",
+     ", except",
+     EXCEPT.format("docs/configuration.md Kimi bullet")),
+
+    ("C5 the configuration bullet names the old exception again", CONF,
+     "nothing commits from (`env context --ask` asks in a copy",
+     "nothing commits from, except `env context --ask` (`env context --ask` asks in a copy",
      EXCEPT.format("docs/configuration.md Kimi bullet")),
 
     # ── C6: the review, the `ask()` that is not handed `judging_worktree` ──────────────────────────
@@ -229,32 +238,30 @@ MUTATIONS = [
      REVIEW.format("kimi.__doc__")),
 
     ("C6 kimi.__doc__ drops the review exception", KIMI,
-     ", and the independent review, which\n"
-     "   runs in the job's box on the job's workspace before the push (`JobRunner._review` hands\n"
-     "   `HarnessReviewer.review` both), where a write it commits, or one a review-repair pass then\n"
-     "   sweeps in, can reach the pull request (measured in the review of dc0efac4, 2026-10-20).\n",
-     ".\n",
+     "), except the\n   independent review, which runs in the job's box on the job's workspace "
+     "before the push\n   (`JobRunner._review` hands `HarnessReviewer.review` both), where a write "
+     "it commits, or one a\n   review-repair pass then sweeps in, can reach the pull request "
+     "(measured in the review of\n   dc0efac4, 2026-10-20).\n",
+     ").\n",
      REVIEW.format("kimi.__doc__")),
 
     ("C6 KimiAdapter.__doc__ drops the review exception", KIMI,
-     ", and the independent review, which runs in the\n"
-     "    job's box on the job's workspace before the push, where its write can reach the pull "
-     "request\n    (see",
-     "\n    (see",
+     "), except the independent\n    review, which runs in the job's box on the job's workspace "
+     "before the push, where its write can\n    reach the pull request (see",
+     ")\n    (see",
      REVIEW.format("KimiAdapter.__doc__")),
 
     ("C6 KimiAdapter.ask.__doc__ drops the review exception", KIMI,
-     ", and the independent review, which runs in\n"
-     "        the job's box on the job's workspace before the push (`HarnessReviewer.review`), "
-     "where a\n        write it commits, or one a review-repair pass then sweeps in, can reach "
-     "the pull request.\n",
-     ".\n",
+     "), except the independent review, which runs in the job's\n        box on the job's "
+     "workspace before the push (`HarnessReviewer.review`), where a\n        write it commits, "
+     "or one a review-repair pass then sweeps in, can reach the pull request.\n",
+     ").\n",
      REVIEW.format("KimiAdapter.ask.__doc__")),
 
     ("C6 roles.__doc__ drops the review exception", ROLES,
-     ", and the independent\nreview, which runs in the job's box on the job's workspace before "
-     "the push, where a write it\ncommits, or one a review-repair pass then sweeps in, can reach "
-     "the pull request (the same test\nfile holds it);",
+     ", except the independent review, which\nruns in the job's box on the job's workspace "
+     "before the push, where a write it\ncommits, or one a review-repair pass then sweeps in, can "
+     "reach the pull request (the same test\nfile holds it);",
      ";",
      REVIEW.format("roles.__doc__")),
 
@@ -268,9 +275,9 @@ MUTATIONS = [
      REVIEW.format("ADR-0018 section 2")),
 
     ("C6 the configuration bullet drops the review exception", CONF,
-     ", and the independent review, which runs in the job's\n"
-     "  box on the job's workspace before the push, where its write can reach the pull request "
-     "(review\n  is on by default).",
+     ", except the independent review, which runs in the job's box on\n"
+     "  the job's workspace before the push, where its write can reach the pull request (review\n"
+     "  is on by default).",
      ".",
      REVIEW.format("docs/configuration.md Kimi bullet")),
 ]
