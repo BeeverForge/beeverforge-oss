@@ -159,6 +159,13 @@ class RetiredNamespace(FileNotFoundError):
     never opened."""
 
 
+class TwoFolders(FileNotFoundError):
+    """A repository carrying BOTH folders, with the file asked for only under the former one
+    (#469's review). `.beeverforge/` is the one read when both are there, so the file is missing
+    from what is read while it sits next door: said by name, as the retired name is, never as a
+    plain "no manifest" that tells a person to create a file they already have."""
+
+
 def _retired_twin(relative: str) -> str:
     """The same path under the retired directory name, or `""` when it is not one of ours."""
     # `removeprefix("./")`, NOT `lstrip("./")`. `lstrip` takes a SET of characters and eats every
@@ -175,7 +182,8 @@ def resolve(root: Path, relative: str, *, project: str = "") -> Path:
     """The path to read — and a refusal, by name, when only the retired twin is there.
 
     A path under OUR default folder is read under the folder the repository uses (`in_repo`):
-    `.openfactory/` for a repository that has only that one (#265).
+    `.openfactory/` for a repository that has only that one (#265). A repository with both, whose
+    file is only under `.openfactory/`, is refused by name (`TwoFolders`).
 
     Returns `root / relative` whether or not it exists: "missing" is then reported in the name we
     use, and a client reading the error is told what to create. The one thing this never does is
@@ -184,6 +192,15 @@ def resolve(root: Path, relative: str, *, project: str = "") -> Path:
     new = root / in_repo(root, relative)
     if new.exists():
         return new
+    rel = str(relative).replace("\\", "/").removeprefix("./")
+    if stale_former_dir(root) and rel.startswith(f"{DIR}/"):
+        former = FORMER_DIR + rel[len(DIR):]
+        if (root / former).exists():
+            raise TwoFolders(
+                f"project {project or root.name!r} has no `{rel}` — the repository has both "
+                f"`{DIR}/` and `{FORMER_DIR}/`, only `{DIR}/` is read, and the file is at "
+                f"`{former}`. Move it to `{rel}` and remove `{FORMER_DIR}/`, or remove the "
+                f"empty `{DIR}/` so `{FORMER_DIR}/` is read.")
     old_rel = _retired_twin(relative)
     if old_rel and (root / old_rel).exists():
         raise RetiredNamespace(

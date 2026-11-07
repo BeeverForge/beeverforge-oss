@@ -114,6 +114,38 @@ def test_with_both_folders_the_current_one_is_read(tmp_path):
     assert namespace.resolve(repo, namespace.MANIFEST).read_text().endswith("current\n")
 
 
+def test_with_both_folders_and_the_file_only_in_the_former_one_it_is_refused_by_name(tmp_path):
+    """#469's review: `.beeverforge/` exists (half made, mid-migration) and the manifest is still
+    in `.openfactory/`. `.beeverforge/` is the one read, so the file is missing from what is read
+    while it sits next door: refused by name, both folders and the remedy in the sentence, never
+    a plain "no manifest" telling a person to create a file they already have."""
+    import pytest
+
+    repo = _repo(tmp_path / "acme", FORMER, manifest="version: 1\nbase_branch: main\n")
+    (repo / CURRENT).mkdir()
+
+    with pytest.raises(namespace.TwoFolders, match=r"has both `\.beeverforge/` and "
+                                                    r"`\.openfactory/`.*at `\.openfactory/"
+                                                    r"project\.yaml`.*Move it"):
+        namespace.resolve(repo, namespace.MANIFEST, project="acme")
+
+
+def test_the_two_folders_refusal_reaches_whoever_loads_the_manifest(tmp_path):
+    from beeverforge.contracts.project import Project
+    from beeverforge.loader import load_manifest
+
+    repo = _repo(tmp_path / "acme", FORMER, manifest="version: 1\nbase_branch: main\n")
+    (repo / CURRENT).mkdir()
+
+    try:
+        load_manifest(Project(name="acme", repo_path=str(repo)), repo_root=repo)
+    except FileNotFoundError as exc:
+        said = str(exc)
+    else:
+        raise AssertionError("a manifest only in the stale folder was read")
+    assert ".openfactory/project.yaml" in said and "only `.beeverforge/` is read" in said, said
+
+
 def test_a_missing_manifest_is_named_under_the_folder_the_repository_keeps(tmp_path):
     """`.openfactory/` without its `project.yaml`: the sentence names the file to create THERE —
     not one under `.beeverforge/`, which would then shadow the folder the client keeps."""

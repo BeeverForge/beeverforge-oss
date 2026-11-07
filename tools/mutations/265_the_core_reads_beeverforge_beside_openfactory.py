@@ -153,4 +153,10 @@ MUTATIONS = [
     ("doctor prints an empty folder line for every healthy repository", DOCTOR,
      "    if stale is not None and stale.message:",
      "    if stale is not None:"),
+
+    # #469's review: both folders, the file only in the former one
+    ("both folders with the file only in the former one reads as a plain missing manifest",
+     "beeverforge/namespace.py",
+     "    if stale_former_dir(root) and rel.startswith(f\"{DIR}/\"):\n",
+     "    if False:\n"),
 ]

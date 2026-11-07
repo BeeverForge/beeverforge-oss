@@ -23,7 +23,7 @@ product's `product.yaml`, the profiles, a preview's compose file — and what Be
 it (`env apply`, `onboard`, `preview propose`, an import's record) lands there too. Nothing renames
 it for you. A repository that has neither gets `.beeverforge/`. When a repository has both,
 `.beeverforge/` is read, nothing under `.openfactory/` is, and `beeverforge doctor` names the stale
-one. The floor protects both (#265).
+one. The floor protects both.
 
 38 fields, **all optional** — an empty file loads. The ones that matter:
 
