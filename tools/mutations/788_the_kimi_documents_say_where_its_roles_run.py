@@ -93,7 +93,7 @@ MUTATIONS = [
     # checkout clean; since #167 a clean checkout is the fact, so the cut asks in it again
     ("C5 `env context --ask` asks in the person's own checkout again",
      "beeverforge/actions/catalog.py",
-     '            room = _a_copy_of(checkout, Path(tmp) / (checkout.name or "checkout"))\n',
+     '            room = _copy_into(checkout, names, Path(tmp) / (checkout.name or "checkout"))\n',
      "            room = checkout\n",
      CHECKOUT),
 
