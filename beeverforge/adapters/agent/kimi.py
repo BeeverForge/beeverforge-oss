@@ -61,12 +61,12 @@ TWO DIFFERENCES FROM CODEX THAT SHAPE THIS ADAPTER
    `sandbox/registry.py::judging_worktree`, a `WorktreeSandbox` whose `run` is a host
    subprocess, so the question runs on the host whatever the project's box, in a room nothing
    commits from (a temporary directory, the repo cache's master clone, a module's cached view),
-   and its edit reaches no pull request but stays where it was written, except `env context
-   --ask`, which asks in the checkout it is pointed at (the person's own repository on a local
-   deployment), where a write is left in that working tree, and the independent review, which
-   runs in the job's box on the job's workspace before the push (`JobRunner._review` hands
-   `HarnessReviewer.review` both), where a write it commits, or one a review-repair pass then
-   sweeps in, can reach the pull request (measured in the review of dc0efac4, 2026-10-20).
+   and its edit reaches no pull request but stays where it was written (`env context --ask` asks
+   in a copy of the checkout it is pointed at, removed after it answers, #167), except the
+   independent review, which runs in the job's box on the job's workspace before the push
+   (`JobRunner._review` hands `HarnessReviewer.review` both), where a write it commits, or one a
+   review-repair pass then sweeps in, can reach the pull request (measured in the review of
+   dc0efac4, 2026-10-20).
    Review is on by default and that pass is not measured. The onboarding first run's review asks
    in its own rehearsal workspace, from which nothing is pushed.
 
@@ -167,10 +167,10 @@ class KimiAdapter:
 
     That is the job's box for `plan`, `execute` and `repair`, a directory on the host under
     `--sandbox worktree`; for a judging role's `ask()` it is `judging_worktree`, on the host
-    whatever the project's box, in a room nothing commits from, except `env context --ask`,
-    which asks in the checkout it is pointed at, and the independent review, which runs in the
-    job's box on the job's workspace before the push, where its write can reach the pull request
-    (see the module docstring, difference 2)."""
+    whatever the project's box, in a room nothing commits from (`env context --ask` asks in a copy
+    of the checkout it is pointed at, removed after it answers, #167), except the independent
+    review, which runs in the job's box on the job's workspace before the push, where its write can
+    reach the pull request (see the module docstring, difference 2)."""
 
     name = "kimi"
 
@@ -208,9 +208,9 @@ class KimiAdapter:
         `--agent-file` with a `tools:` list is reachable per run and not used yet (#785), so
         there is no enforcement until a per-run agent file is wired. A judging role's caller hands
         it `judging_worktree`, which runs it on the host whatever the project's box, in a room
-        nothing commits from, except `env context --ask`, which asks in the checkout it is pointed
-        at, where a write is left in that working tree, and the independent review, which runs in
-        the job's box on the job's workspace before the push (`HarnessReviewer.review`), where a
+        nothing commits from (`env context --ask` asks in a copy of the checkout it is pointed at,
+        removed after it answers, #167), except the independent review, which runs in the job's
+        box on the job's workspace before the push (`HarnessReviewer.review`), where a
         write it commits, or one a review-repair pass then sweeps in, can reach the pull request.
         An edit made while judging elsewhere reaches no pull request, and nothing confines it to
         its room either."""

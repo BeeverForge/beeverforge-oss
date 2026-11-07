@@ -23,9 +23,9 @@ room with `sandbox/registry.py::judging_worktree`, which always returns a `Workt
 the question runs on the host even for a project whose jobs run in a container (measured by
 `tests/test_where_a_kimi_judging_role_runs_is_what_its_documents_say.py`, 2026-10-20). That room
 is one nothing commits from (a temporary directory, the repo cache's master clone, a module's
-cached view), so an edit does not reach a pull request, except `env context --ask`, which asks in
-the checkout it is pointed at, where a write is left in that working tree, and the independent
-review, which runs in the job's box on the job's workspace before the push, where a write it
+cached view; `env context --ask` asks in a copy of the checkout it is pointed at, removed after it
+answers, #167), so an edit does not reach a pull request, except the independent review, which
+runs in the job's box on the job's workspace before the push, where a write it
 commits, or one a review-repair pass then sweeps in, can reach the pull request (the same test
 file holds it); the onboarding first run's review asks in its own rehearsal workspace, from which
 nothing is pushed. Nothing but the row above confines a write to any of them. On claude, codex and
