@@ -6,7 +6,7 @@ The claims, each a row:
 
   * the review asks `claude` for `--output-format stream-json --verbose`, so a wrapper in front of
     it sees the review's `rate_limit_event` (row 1 is the defect itself); and `--verbose` with it,
-    because the pinned 2.1.219 refuses `stream-json` under `-p` without it (row 2: the stand-in in
+    because 2.1.219 refuses `stream-json` under `-p` without it (row 2: the stand-in in
     test A refuses as the CLI does, measured 2026-10-19);
   * the verdict is the LAST `type == "result"` event (row 3), not the init event `json_envelope`
     returns first (row 5), not whatever object closes the output (row 6), and not a verdict the
