@@ -172,7 +172,8 @@ Decisions, each with an ADR.
   finishes, so the next ticket builds on a base that contains the last one
   ([ADR-0007](adr/0007-floor-frees-at-merge.md)). The slot count is
   `BEEVERFORGE_MAX_CONCURRENT_JOBS` (default 1), counted across all projects; raising it adds
-  parallelism with no per-project cap.
+  parallelism, and `BEEVERFORGE_JOBS_PER_PROJECT` caps how many of one project's jobs run at once
+  (unset, no cap).
 - **Cross-repository ordering does not exist.** Two repositories are two floors; nothing stops a
   front-end ticket merging before the API it depends on. Designed in
   [ADR-0036](adr/0036-cross-repo-ordering.md), not built.

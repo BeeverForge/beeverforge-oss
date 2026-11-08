@@ -332,7 +332,7 @@ async def _scan(*, project: str, by: Actor) -> Outcome:
     from beeverforge.adapters.sandbox.registry import durable_refusal
     from beeverforge.credentials import deployment_tracker_token, tracker_token_for
     from beeverforge.factory import resolve_box_image
-    from beeverforge.runtime.temporal import TASK_QUEUE, max_concurrent_jobs
+    from beeverforge.runtime.temporal import TASK_QUEUE, jobs_per_project, max_concurrent_jobs
     from beeverforge.runtime.temporal.io import JobParams, default_sandbox
 
     proj, bad = _project(project)
@@ -367,14 +367,28 @@ async def _scan(*, project: str, by: Actor) -> Outcome:
 
     # The floor is a single agent token (v1) — count ALL running JobWorkflows, not just this
     # project's, so a manual scan honours the same one-at-a-time floor as the poller.
-    running_all, running = 0, []
+    running_all, running, ids = 0, [], []
     async for wf in client.list_workflows(
             'WorkflowType="JobWorkflow" AND ExecutionStatus="Running"'):
         running_all += 1
+        ids.append(wf.id)
         p, iss = tv.parse_job_id(wf.id)
         if p == proj.name:
             running.append(iss)
     slots = max(0, max_concurrent_jobs() - running_all)
+    # THE PROJECT'S LANE HOLDS HERE TOO (#480). The poller cuts TO-DO to the lane
+    # (`activities._within_the_projects_lane`, #473); without the same cut here, pressing this
+    # button on an idle floor started a project's whole TO-DO at once. This project's jobs are
+    # counted as the poller counts them — the longest registered name first, so a job of
+    # `web-admin` is never `web`'s.
+    lane, mine = jobs_per_project(), 0
+    if lane > 0:
+        from beeverforge.registry import ProjectRegistry
+
+        names = [p.name for p in ProjectRegistry().list()]
+        mine = sum(1 for wf_id in ids
+                   if tv.parse_job_id(wf_id, known_projects=names)[0] == proj.name)
+        slots = min(slots, max(0, lane - mine))
 
     if not todo:
         msg = "Nothing in TO-DO to run."
@@ -382,9 +396,10 @@ async def _scan(*, project: str, by: Actor) -> Outcome:
             msg += f" (#{running[0]} is already running.)"
         return done(msg, started=[], skipped=[], todo=[], running=running)
     if slots <= 0:
+        held = (f"{proj.name} already runs {mine} of its lane of {lane}"
+                if lane > 0 and mine >= lane else f"Floor busy ({running_all} in flight)")
         return done(
-            f"Floor busy ({running_all} in flight) — TO-DO will be picked up one at a time as "
-            f"each finishes.",
+            f"{held} — TO-DO will be picked up one at a time as each finishes.",
             started=[], skipped=todo, todo=todo, running=running,
         )
 
