@@ -24,3 +24,26 @@ def max_concurrent_jobs() -> int:
         return max(0, int(os.environ.get("BEEVERFORGE_MAX_CONCURRENT_JOBS", "1")))
     except ValueError:
         return 1
+
+
+def jobs_per_project() -> int:
+    """The lane: how many jobs of ONE project may be in flight at once, inside the floor (#473).
+
+    The floor is shared by every project, and the poller takes TO-DO cards in board order until it
+    is full, so with a floor above 1 one project could take every slot, and cards of one project
+    that build on each other (create a record, then edit it) started together, each from a base the
+    earlier ones had not reached yet. Tunable via BEEVERFORGE_JOBS_PER_PROJECT; unset, empty, `0`,
+    below `0` or not a whole number (said in the log) is no lane, and the floor alone decides."""
+    import logging
+    import os
+
+    raw = (os.environ.get("BEEVERFORGE_JOBS_PER_PROJECT") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logging.getLogger("beeverforge.runtime.temporal").warning(
+            "BEEVERFORGE_JOBS_PER_PROJECT=%r is not a whole number of jobs; no lane per project",
+            raw)
+        return 0

@@ -555,7 +555,7 @@ Secrets and deployment coordinates. The ones you will actually set:
 | `BEEVERFORGE_REGISTRY` · `BEEVERFORGE_REGISTRY_SEED` | where the registry is read and what seeds it on first boot |
 | `BEEVERFORGE_TOOLBOX` · `BEEVERFORGE_TOOLBOX_VOLUME` | the harness toolbox: where the worker keeps it, and the docker volume name it mounts into boxes |
 | `TEMPORAL_ADDRESS` · `TEMPORAL_NAMESPACE` | the durable engine. Compose sets these to its own container |
-| `BEEVERFORGE_MAX_CONCURRENT_JOBS` · `BEEVERFORGE_MAX_TURNS` · `BEEVERFORGE_AGENT_TIMEOUT` | the floor and the job's limits: [below](#the-floor-the-limits-and-the-state-directory), with their defaults |
+| `BEEVERFORGE_MAX_CONCURRENT_JOBS` · `BEEVERFORGE_JOBS_PER_PROJECT` · `BEEVERFORGE_MAX_TURNS` · `BEEVERFORGE_AGENT_TIMEOUT` | the floor, the lane per project and the job's limits: [below](#the-floor-the-limits-and-the-state-directory), with their defaults |
 | `BEEVERFORGE_PREVIEW_RUNTIME` | which runtime runs a preview: `compose` \| `none` \| the kind an installed add-on registers. Unset → `none`; the compose stack's file sets `compose`. The deployment's to name, never a repository's ([setup/previews.md](../setup/previews.md)) |
 | `BEEVERFORGE_PREVIEW_REACH` · `BEEVERFORGE_PANEL_CONTAINER` · `BEEVERFORGE_PREVIEW_PORTS` | how the panel reaches a preview: `network` (unset means this) — the worker joins the panel's container, `beeverforge-panel` on the compose stack, to each preview's own network — or `loopback`, one machine: exposed services on 127.0.0.1 at ports within `lo-hi` |
 | `BEEVERFORGE_PREVIEW_DOMAIN` | the domain previews are served under; the worker and the panel must agree. Unset → no preview is served; the compose stack's file sets `preview.localhost`. Sharing a plain-http panel's registrable domain fails `beeverforge doctor` |
@@ -590,6 +590,7 @@ release it stops.
 | variable | what it sets | unset | a value it cannot read | `OPENFACTORY_*` spelling |
 |---|---|---|---|---|
 | `BEEVERFORGE_MAX_CONCURRENT_JOBS` | the floor: how many jobs may be in flight at once. The poller and a manual scan start at most this many minus those running. `0` pauses pickup | `1` | not a whole number → `1`; below `0` → `0` | not read |
+| `BEEVERFORGE_JOBS_PER_PROJECT` | the lane: how many jobs of one project may be in flight at once, inside the floor. While that many of a project's jobs run, its other TO-DO cards wait their turn in board order, and other projects' cards still start | `0` (no lane: the floor alone decides) | not a whole number → `0`, said in the log; below `0` → `0` | not read |
 | `BEEVERFORGE_MAX_TURNS` | how many turns one pass of the `claude_code` harness may take (`--max-turns`) | `200` | must be a whole number: anything else raises when the harness is built | not read |
 | `BEEVERFORGE_AGENT_TIMEOUT` | how many seconds one pass may run, on every harness, before it is stopped | `14400` (four hours) | must be a whole number of seconds: read once, when the sandbox code loads, and anything else raises there | not read |
 | `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once | `4` | not a positive whole number → `4`, said once in the log | not read |

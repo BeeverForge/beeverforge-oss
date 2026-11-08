@@ -3815,7 +3815,35 @@ async def scan_todo(inp: ScanInput) -> list[str]:
             continue
         clear_gate_announcement(key)
         admitted.append(ref)
-    return admitted
+    return await _within_the_projects_lane(inp.project, admitted)
+
+
+async def _within_the_projects_lane(project_name: str, admitted: list[str]) -> list[str]:
+    """`admitted`, cut to what this project's lane has room for, in board order (#473).
+
+    HERE, in the activity, for the reason the box gate above is here: a change to the workflow body
+    breaks replay for jobs in flight, an activity's does not. The lane sits inside the floor: the
+    poller still starts at most the floor's free slots of what this returns. A running job is this
+    project's by `view.parse_job_id`, which tries the longest registered name first, so a job of
+    `web-admin` is never `web`'s."""
+    from beeverforge.runtime.temporal import jobs_per_project
+    from beeverforge.runtime.temporal.view import parse_job_id
+
+    lane = jobs_per_project()
+    if lane <= 0 or not admitted:
+        return admitted
+    names = [p.name for p in ProjectRegistry().list()]
+    running = 0
+    async for wf in engine_client().list_workflows(
+            'WorkflowType = "JobWorkflow" AND ExecutionStatus = "Running"'):
+        if parse_job_id(wf.id, known_projects=names)[0] == project_name:
+            running += 1
+    room = max(0, lane - running)
+    if room < len(admitted):
+        activity.logger.info("BEEVERFORGE_PROJECT_LANE %s: %d of %d running; %d of %d TO-DO "
+                             "card(s) wait their turn", project_name, running, lane,
+                             len(admitted) - room, len(admitted))
+    return admitted[:room]
 
 
 def _taken_out_for_its_repository(project, tracker, board, ref: str) -> bool:

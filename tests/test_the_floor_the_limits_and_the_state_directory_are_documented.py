@@ -10,8 +10,9 @@ code:
   · every name in the table is read by the code: a string literal in `beeverforge/`, not a comment;
   · every name the code reads that is in scope is in the table. In scope means a floor or limit
     (`BEEVERFORGE_MAX_*`, `BEEVERFORGE_*_MAX`, `BEEVERFORGE_PRODUCT_TURNS_*`), the state directory
-    (`BEEVERFORGE_STATE_DIR`), and the pass's wall (`BEEVERFORGE_AGENT_TIMEOUT`, which the old
-    "throttles" row named beside the floor);
+    (`BEEVERFORGE_STATE_DIR`), the pass's wall (`BEEVERFORGE_AGENT_TIMEOUT`, which the old
+    "throttles" row named beside the floor), and the lane per project inside the floor
+    (`BEEVERFORGE_JOBS_PER_PROJECT`, #473);
   · each "unset" cell is what the code falls back to, read from the code with the variable unset;
   · each row says no `OPENFACTORY_*` spelling is read only while the code reads none.
 """
@@ -31,8 +32,9 @@ ROOT = Path(__file__).resolve().parent.parent
 REFERENCE = ROOT / "docs" / "reference" / "configuration.md"
 HEADING = "### The floor, the limits and the state directory"
 
-#: What is in scope beyond the patterns: the pass's wall, named beside the floor before #365.
-NAMED = {"BEEVERFORGE_AGENT_TIMEOUT"}
+#: What is in scope beyond the patterns: the pass's wall, named beside the floor before #365, and
+#: the lane per project inside the floor (#473).
+NAMED = {"BEEVERFORGE_AGENT_TIMEOUT", "BEEVERFORGE_JOBS_PER_PROJECT"}
 IN_SCOPE = re.compile(r"^BEEVERFORGE_(MAX_[A-Z0-9_]+|[A-Z0-9_]+_MAX|PRODUCT_TURNS_[A-Z0-9_]+"
                       r"|STATE_DIR)$")
 
@@ -93,6 +95,10 @@ def _default_of(name: str, monkeypatch) -> str:
         from beeverforge.runtime.temporal import max_concurrent_jobs
 
         return str(max_concurrent_jobs())
+    if name == "BEEVERFORGE_JOBS_PER_PROJECT":
+        from beeverforge.runtime.temporal import jobs_per_project
+
+        return str(jobs_per_project())
     if name == "BEEVERFORGE_MAX_TURNS":
         from beeverforge.adapters.agent.claude_code import ClaudeCodeAdapter
 
