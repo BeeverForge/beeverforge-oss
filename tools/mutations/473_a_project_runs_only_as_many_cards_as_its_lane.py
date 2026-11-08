@@ -13,6 +13,8 @@ each a row:
   4. no lane (unset, blank, `0`, below `0`, not a number) is the floor alone, and a value that is
      not a number is said in the log;
   5. the configuration reference lists the variable with its default, read from the code.
+  6. the panel's "Scan TO-DO now" button makes the same cut, counting this project's jobs as
+     the poller does, and says when the lane is what held the queue (#480).
 """
 
 TEST = "tests/test_a_project_runs_only_as_many_cards_as_its_lane.py"
@@ -21,6 +23,7 @@ DOCS = "tests/test_the_floor_the_limits_and_the_state_directory_are_documented.p
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
 FLOOR = "beeverforge/runtime/temporal/__init__.py"
 REFERENCE = "docs/reference/configuration.md"
+SCAN = "beeverforge/actions/catalog.py"
 
 MUTATIONS = [
     # 1. the poller's read goes through the lane
@@ -73,4 +76,21 @@ MUTATIONS = [
      "| `0` (no lane: the floor alone decides) |",
      "| `1` (no lane: the floor alone decides) |",
      DOCS),
+
+    # 6. the scan button (#480)
+    ("TODAY'S DEFECT (#480): the scan button counts the floor alone", SCAN,
+     "        slots = min(slots, max(0, lane - mine))\n",
+     "        pass\n"),
+    ("the button counts every running job as this project's", SCAN,
+     "                   if tv.parse_job_id(wf_id, known_projects=names)[0] == proj.name)\n",
+     "                   if True)\n"),
+    ("the button reads a job without the registered names", SCAN,
+     "                   if tv.parse_job_id(wf_id, known_projects=names)[0] == proj.name)\n",
+     "                   if tv.parse_job_id(wf_id, known_projects=[])[0] == proj.name)\n"),
+    ("the button's lane is one wider than it says", SCAN,
+     "        slots = min(slots, max(0, lane - mine))\n",
+     "        slots = min(slots, max(0, lane + 1 - mine))\n"),
+    ("the button blames the floor when the lane held the queue", SCAN,
+     "                if lane > 0 and mine >= lane else",
+     "                if False else"),
 ]

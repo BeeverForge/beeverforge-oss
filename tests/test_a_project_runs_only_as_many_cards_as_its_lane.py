@@ -190,3 +190,93 @@ def test_without_a_lane_the_poller_reads_the_whole_queue(monkeypatch, tmp_path):
     _engine(monkeypatch, ["beeverforge-shop-1"])
 
     assert _scan() == ["1", "2", "3"]
+
+
+# ── the panel's "Scan TO-DO now" button holds the same lane (#480) ──────────────────────────────
+#
+# The button (`actions/catalog.py::_scan`, `POST /api/projects/{project}/scan`) counted the floor
+# alone, so pressing it on an idle floor started a project's whole TO-DO at once — the dependent
+# cards the lane exists to keep apart. The doubles are the ones `test_the_action_layer.py` gives
+# `_scan`; the cut is the shipped action.
+
+from beeverforge import actions  # noqa: E402
+from tests.test_the_action_layer import (  # noqa: E402
+    _AsyncReturns,
+    _FakeBoard,
+    _FakeTemporalClient,
+    _scan_project,
+)
+
+
+@pytest.fixture
+def button(monkeypatch):
+    from beeverforge.registry import ProjectRegistry
+
+    project = _scan_project()  # registered as `demo`
+    monkeypatch.setattr(ProjectRegistry, "get", lambda self, name: project)
+    monkeypatch.setattr(ProjectRegistry, "list",
+                        lambda self: [SimpleNamespace(name=n) for n in ("demo", "demo-admin")])
+    monkeypatch.setattr("beeverforge.credentials.tracker_token", lambda: "tok")
+    monkeypatch.setattr("beeverforge.factory.resolve_box_image",
+                        lambda *_a, **_kw: "beeverforge-python")
+    monkeypatch.setattr("beeverforge.runtime.temporal.max_concurrent_jobs", lambda: 3)
+
+    def _set(todo: list[str], running: list[str], lane: str | None) -> _FakeTemporalClient:
+        client = _FakeTemporalClient(running=running)
+        monkeypatch.setattr("beeverforge.adapters.board.build_board",
+                            lambda *_a, **_kw: _FakeBoard(todo))
+        monkeypatch.setattr("beeverforge.runtime.temporal.view.connect",
+                            lambda: _AsyncReturns(client))
+        _lane(monkeypatch, lane)
+        return client
+    return _set
+
+
+async def test_the_button_starts_only_the_first_card_on_an_idle_floor(button):
+    client = button(["1", "2", "3"], [], "1")
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == ["1"] and out.data["skipped"] == ["2", "3"]
+    assert [wf_id for wf_id, _ in client.launched] == ["beeverforge-demo-1"]
+
+
+async def test_the_button_starts_nothing_while_the_projects_card_runs_and_says_why(button):
+    client = button(["2", "3"], ["beeverforge-demo-1"], "1")
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == [] and client.launched == []
+    assert "lane of 1" in out.message
+
+
+async def test_a_job_of_a_longer_name_does_not_take_the_buttons_lane(button):
+    button(["1", "2"], ["beeverforge-demo-admin-9"], "1")
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == ["1"]
+
+
+async def test_a_ref_with_a_hyphen_is_still_the_buttons_projects_job(button):
+    button(["1", "2"], ["beeverforge-demo-CONT-7"], "1")
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == []
+
+
+async def test_a_wider_lane_lets_the_button_start_that_many(button):
+    button(["2", "3", "4"], ["beeverforge-demo-1"], "3")
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == ["2", "3"]  # the lane has room for 2, and so has the floor
+
+
+async def test_without_a_lane_the_button_fills_the_floor(button):
+    button(["1", "2", "3"], [], None)
+
+    out = await actions.perform("scan", by=actions.SYSTEM, project="demo")
+
+    assert out.data["started"] == ["1", "2", "3"]
