@@ -639,6 +639,16 @@ _FORGE_CRED_VARS = (
 # (engineering.md #4 — creds mint-at-use, never ambient; the pool is the crown jewels.)
 _AGENT_CRED_VARS = ("BEEVERFORGE_AGENT_TOKENS",)
 
+# The switches that send Claude Code to a cloud provider instead of its default route (#472). Not
+# credentials, but they follow `box.env` like the credentials they point at. On a deployment where
+# one project reaches its model through Bedrock, the switch is set in the worker's environment for
+# that project, and every OTHER project's judging roles inherited it here: their harness chose
+# Bedrock, found no AWS credentials (stripped above, since their `box.env` names none) and failed
+# with "Could not load AWS credentials". A project that does use Bedrock or Vertex already names its
+# switch in `box.env`: the container box passes nothing else, and `routes.declared_route` reads the
+# route from there. A switch the routes do not read is left as it is.
+_PROVIDER_SWITCH_VARS = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+
 # The key the panel signs a card preview's entry tokens with (ADR-0050). Only the panel needs it;
 # a workload holding it could mint its own way into any preview on the deployment. Stripped for
 # the reason the token pool is: nothing the agent does needs it.
@@ -682,7 +692,8 @@ def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:
     """
     env = dict(os.environ)
     kept = {v for v in keep if v}
-    for var in _AWS_CRED_VARS + _FORGE_CRED_VARS + _AGENT_CRED_VARS:
+    # the provider switch follows `box.env` like the credentials (#472, `_PROVIDER_SWITCH_VARS`)
+    for var in _AWS_CRED_VARS + _FORGE_CRED_VARS + _AGENT_CRED_VARS + _PROVIDER_SWITCH_VARS:
         if var not in kept:
             env.pop(var, None)
     # never kept, whatever `box.env` says: no harness authenticates with the preview key

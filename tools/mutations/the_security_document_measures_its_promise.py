@@ -50,10 +50,11 @@ MUTATIONS = [
      "",
      '\n\nVAULT = os.environ.get("BEEVERFORGE_VAULT_TOKEN")\n'),
     # ── the scrub stops scrubbing, in the two ways that still read as a scrub ───────────────────
+    # re-pinned (#472): the loop's header now ends with `+ _PROVIDER_SWITCH_VARS`
     ("the scrub drops a whole credential family",
      WORKTREE,
-     "    for var in _AWS_CRED_VARS + _FORGE_CRED_VARS + _AGENT_CRED_VARS:",
-     "    for var in _AWS_CRED_VARS + _AGENT_CRED_VARS:"),
+     "    for var in _AWS_CRED_VARS + _FORGE_CRED_VARS + _AGENT_CRED_VARS + _PROVIDER_SWITCH_VARS:",
+     "    for var in _AWS_CRED_VARS + _AGENT_CRED_VARS + _PROVIDER_SWITCH_VARS:"),
     ("the scrub removes exactly what the project asked to keep",
      WORKTREE,
      "        if var not in kept:",
