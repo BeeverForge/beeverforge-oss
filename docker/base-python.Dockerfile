@@ -150,7 +150,7 @@ RUN pip install --no-cache-dir uv==0.8.6 \
 # unpinned install drifts silently between builds (a cached layer once shipped an older CLI
 # than local), and the read-only enforcement depends on how the CLI honours --tools /
 # --disallowedTools. Bump deliberately, after verifying the flags still restrict.
-RUN npm install -g @anthropic-ai/claude-code@2.1.219
+RUN npm install -g @anthropic-ai/claude-code@2.1.309
 
 WORKDIR /workspace
 
