@@ -128,9 +128,10 @@ MUTATIONS = [
      "            if _group_is_empty(proc.pid):\n                self._groups.discard(proc.pid)\n",
      "            self._groups.discard(proc.pid)\n", LEFT),
 
+    # RE-PINNED 2026-11-09 (#259 follow-up): the kill runs under the stop's `_killing` lock
     ("the stop does not kill what carries the job's mark", STOPPING,
-     "            _kill_group(pgid)\n        _kill_marked(",
-     "            _kill_group(pgid)\n        (lambda _n: None)(", LEFT),
+     "                _kill_group(pgid)\n            marked = _kill_marked(",
+     "                _kill_group(pgid)\n            marked = (lambda _n: True)(", LEFT),
 
     ("a job's box does not mark its commands", WORKTREE,
      "            env.update(stop.env(), TMPDIR=str(tmp))\n",

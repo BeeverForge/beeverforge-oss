@@ -315,6 +315,16 @@ def _failing_gates_said(validations: list[ValidationResult],
     return "\n\n".join(blocks)
 
 
+def _lock_kept_said(lock: Path, why: str) -> str:
+    """The one sentence a timed-out pass's card gets when its work was not kept because the
+    worktree's index lock could not be shown stale (#259, review of #504): the cause, the lock,
+    and the remedy."""
+    return (f"This attempt ran past its time limit and what it wrote was not kept: the git index "
+            f"lock `{lock}` was left in place because {why}, and committing over a lock a live "
+            "git holds can corrupt the repository. Check that no git process of this job is still "
+            "running, then Resume, which starts again from the job's branch or from the base.")
+
+
 #: `contracts.run.FROM_THE_FORGE`, which says what it is (#11).
 _FROM_THE_FORGE = FROM_THE_FORGE
 
@@ -3751,6 +3761,14 @@ class JobRunner:
             if not keep:
                 return
             try:
+                said = self._clear_the_lock_a_killed_git_left(ws)
+                if said is not None:
+                    # NOTHING IS COMMITTED OVER A LOCK NOT PROVEN STALE, and the card says so in one
+                    # sentence (review of #504): the park alone would read as work kept
+                    self._preserve_outcome = "lock-held"
+                    log.warning("BEEVERFORGE_ATTEMPT_LOCK_KEPT %s — %s", ws.branch, said)
+                    self._say_on_ticket(ticket.id, said)
+                    return
                 self._preserve_for_hold(ticket, ws, None)
             except JobStopped:
                 log.warning("BEEVERFORGE_ATTEMPT_KEEP_STOPPED %s — a person stopped the job while "
@@ -3763,6 +3781,55 @@ class JobRunner:
                 return
             log.warning("BEEVERFORGE_ATTEMPT_KEPT %s — the attempt ran past its time limit; what "
                         "its agent wrote: %s", ws.branch, self._preserve_outcome)
+
+    def _clear_the_lock_a_killed_git_left(self, ws: Workspace) -> str | None:
+        """Remove the worktree's `index.lock` before the keep commits (#259, found on main's CI
+        after #503), or answer the sentence that says why it was not, and then nothing is
+        committed. A git the kill ended mid-write — the agent's own, or the walk's commit after the
+        agent died — leaves the lock, and the keep's `git add` then refuses with "File exists".
+
+        ONLY WHEN ITS OWNER IS PROVEN GONE (review of #504), since removing a lock a live git holds
+        is the corruption the lock exists to prevent: the box's stop ends every process the job
+        started (`stop_ends_its_processes` — the container box's does not), the kill finished
+        clean (`Stop.kill_clean`: its sweeps found nothing new and everything it killed stopped
+        running, within a bound), and no process this worker can read holds the lock open
+        (`stopping.holders`; a git writing the index holds its lock open, a killed one holds
+        nothing). What neither sees — a process of
+        another user — is the limit #44's kill has too."""
+        rc, out = self.sandbox.run(workspace=ws, command="git rev-parse --git-path index.lock",
+                                   timeout=60)
+        if rc != 0 or not out.strip():
+            return None  # no git directory to read: the commit says what is wrong, as it would
+        inside = Path(out.strip().splitlines()[-1])
+        if not inside.is_absolute():
+            inside = Path(ws.path) / inside
+        try:
+            here = Path(ws.host_path) / inside.relative_to(ws.path)
+        except ValueError:
+            here = inside  # the worktree box: the box's paths are the host's
+        if not here.exists():
+            return None
+        if not getattr(self.sandbox, "stop_ends_its_processes", False):
+            # THE CONTAINER BOX (review of #504): its stop ends the `docker exec` client, not the
+            # process in the container, and the worker cannot see into it — nothing here is proof
+            return _lock_kept_said(here, "this box's stop does not end the processes inside it, "
+                                         "so a git there may still hold it")
+        stop = getattr(self, "stop", None)
+        if stop is None or not stop.kill_clean:
+            return _lock_kept_said(here, "a process of the job may still be running: the stop "
+                                         "could not confirm every one it killed had ended")
+        from beeverforge.adapters.sandbox.stopping import holders
+
+        held = holders(here)
+        if held:
+            return _lock_kept_said(here, f"process {', '.join(map(str, sorted(held)))} still "
+                                         "has it open")
+        rc, out = self.sandbox.run(workspace=ws, command=f"rm -f -- {shlex.quote(str(inside))}",
+                                   timeout=60)
+        if rc != 0:
+            return _lock_kept_said(here, f"it could not be removed (exit {rc}: "
+                                         f"{out.strip()[:120] or 'no output'})")
+        return None
 
     def _preserve_for_hold(
         self, ticket: Ticket, ws: Workspace, resume_handle: str | None

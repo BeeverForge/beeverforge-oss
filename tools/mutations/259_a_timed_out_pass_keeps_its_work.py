@@ -17,6 +17,7 @@ MACHINE = "beeverforge/orchestrator/machine.py"
 STOPPING = "beeverforge/adapters/sandbox/stopping.py"
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
 WORKFLOW = "beeverforge/runtime/temporal/workflow.py"
+CONTAINER = "beeverforge/adapters/sandbox/container.py"
 
 TEST = "tests/test_a_timed_out_pass_keeps_its_work.py"
 KEPT = TEST + "::test_a_timed_out_pass_is_ended_and_what_it_wrote_reaches_its_branch"
@@ -32,6 +33,18 @@ ASKED = TEST + "::test_the_workflow_parks_a_failed_run_job_through_it"
 SEAM = TEST + "::test_the_failed_run_jobs_park_is_the_timed_out_attempts_or_the_failure_named"
 REMOTE = TEST + "::test_a_remote_box_past_its_ceiling_parks_as_any_failure"
 TOLD = TEST + "::test_a_timed_out_attempt_is_told_from_a_stop"
+LOCK = TEST + "::test_a_lock_a_killed_git_left_does_not_cost_the_keep"
+OUTLIVES_STOP = (TEST + "::test_a_box_whose_stop_does_not_reach_its_processes_leaves_the_lock_and"
+                 "_says_so")
+SILENT = TEST + "::test_a_box_that_does_not_say_is_not_trusted_with_the_lock"
+BOXES = TEST + "::test_each_box_says_whether_its_stop_ends_its_processes"
+HELD = TEST + "::test_a_lock_a_live_process_holds_is_not_removed_and_the_card_says_so"
+RM_FAILS = TEST + "::test_a_lock_that_cannot_be_removed_stops_the_keep_and_the_card_says_so"
+UNCLEAN = TEST + "::test_a_kill_that_did_not_finish_clean_leaves_the_lock_and_the_card_says_so"
+OUTLIVES = TEST + "::test_a_kill_whose_process_outlives_the_bound_is_not_clean"
+RAN_OUT = TEST + "::test_a_kill_whose_sweeps_ran_out_is_not_clean"
+ZOMBIE = TEST + "::test_a_zombie_is_not_running_and_a_live_process_is"
+KILL_OVER = TEST + "::test_the_keeping_window_opens_only_once_the_kill_is_over"
 PERSON_LATE = (TEST + "::test_a_person_who_stops_the_job_while_it_keeps_its_work_gets_nothing"
                "_pushed")
 
@@ -67,6 +80,15 @@ MUTATIONS = [
      "            if not self._event.is_set() or self._keeping:\n",
      "            if not self._event.is_set():\n", KEPT),
 
+    ("FOUND ON MAIN'S CI: the window opens while the kill still sweeps, and the keep's own commit "
+     "is killed", STOPPING,
+     "        with self._killing, self._lock:\n            self._keeping = self.keep",
+     "        with self._lock:\n            self._keeping = self.keep", KILL_OVER),
+
+    ("the kill does not hold its lock, so the window does not wait for it", STOPPING,
+     "        with self._killing:\n            with self._lock:\n",
+     "        if True:\n            with self._lock:\n", KILL_OVER),
+
     ("the window opens for a stop that keeps nothing", STOPPING,
      "            self._keeping = self.keep\n", "            self._keeping = True\n", PERSON),
 
@@ -82,6 +104,64 @@ MUTATIONS = [
      "        return self._keeping\n", PERSON_LATE),
 
     # ── the runner keeps before its worktree goes ────────────────────────────────────────────
+    ("FOUND ON MAIN'S CI: a lock a killed git left stops the keep's commit", MACHINE,
+     "                said = self._clear_the_lock_a_killed_git_left(ws)\n",
+     "                said = None\n", LOCK),
+
+    # ── review of #504: the lock is cleared only when its owner is proven gone ─────────────────
+    ("a kill whose last sweep found nothing is clean whether or not what it killed has ended",
+     STOPPING, "            return _all_gone(killed)\n", "            return True\n", OUTLIVES),
+
+    ("a kill whose sweeps ran out still finding processes is called clean", STOPPING,
+     "                \"processes of the job; what started after the last sweep was not killed\", "
+     "_SWEEPS)\n    return False\n",
+     "                \"processes of the job; what started after the last sweep was not killed\", "
+     "_SWEEPS)\n    return True\n", RAN_OUT),
+
+    ("the stop calls every kill clean", STOPPING,
+     "            self.kill_clean = marked and _groups_gone(groups)\n",
+     "            self.kill_clean = True\n", UNCLEAN),
+
+    ("a zombie is read as running, so no kill of an unreaped child is ever clean", STOPPING,
+     '    return state not in ("Z", "X")\n', "    return True\n", ZOMBIE),
+
+    ("a zombie in a killed group is read as running", STOPPING,
+     '        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] not in ("Z", "X"):',
+     "        if len(fields) > 2 and fields[2] == str(pgid):", ZOMBIE),
+
+    ("THE REVIEW'S FINDING: the keep clears the lock after a kill that did not finish clean",
+     MACHINE, "        if stop is None or not stop.kill_clean:\n",
+     "        if stop is None:\n", UNCLEAN),
+
+    ("THE REVIEW'S FINDING: the container box's lock is cleared on proof that cannot see into it",
+     MACHINE, '        if not getattr(self.sandbox, "stop_ends_its_processes", False):\n',
+     "        if False:\n", OUTLIVES_STOP),
+
+    ("the container box says its stop ends its processes", CONTAINER,
+     "    stop_ends_its_processes = False\n", "    stop_ends_its_processes = True\n", BOXES),
+
+    ("a box that does not say is trusted", MACHINE,
+     '        if not getattr(self.sandbox, "stop_ends_its_processes", False):\n',
+     '        if not getattr(self.sandbox, "stop_ends_its_processes", True):\n', SILENT),
+
+    ("the keep clears a lock a live process holds open", MACHINE,
+     "        if held:\n", "        if False:\n", HELD),
+
+    ("the holder scan never matches the lock", STOPPING,
+     "                if os.readlink(fd) == want:\n", "                if False:\n", HELD),
+
+    ("a failed rm is ignored and the keep commits over the lock", MACHINE,
+     "        if rc != 0:\n            return _lock_kept_said(here, f\"it could not be removed",
+     "        if False:\n            return _lock_kept_said(here, f\"it could not be removed",
+     RM_FAILS),
+
+    ("a lock not shown stale is committed over anyway", MACHINE,
+     "                if said is not None:\n", "                if False:\n", HELD),
+
+    ("the card is not told why the work was not kept", MACHINE,
+     "                    self._say_on_ticket(ticket.id, said)\n                    return\n",
+     "                    return\n", RM_FAILS),
+
     ("the runner never keeps what the timed-out pass wrote", MACHINE,
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
      "            self.sandbox.cleanup(workspace=ws)",

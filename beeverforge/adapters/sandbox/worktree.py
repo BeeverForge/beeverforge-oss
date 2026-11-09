@@ -824,6 +824,11 @@ def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
 
 
 class WorktreeSandbox(SandboxAdapter):
+    #: WHETHER A STOP ENDS EVERY PROCESS THE JOB STARTED (#259): it does here. The job's commands
+    #: run on this host, in groups the stop kills and carrying the mark it sweeps for, and the kill
+    #: reports whether they all ended (`Stop.kill_clean`). See `ContainerSandbox`'s, which does not.
+    stop_ends_its_processes = True
+
     def __init__(self, *, root: Path | str, extra_env: tuple[str, ...] = ()) -> None:
         # where worktrees are created, and where `stage_input` stages a prompt beside them.
         # THE BOX OWNS ITS TYPE (#380). It kept whatever it was handed, and most judging callers

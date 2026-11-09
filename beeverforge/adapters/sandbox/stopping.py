@@ -89,6 +89,36 @@ def _kill_group(pgid: int) -> None:
         pass
 
 
+def _groups_gone(groups: list[int]) -> bool:
+    """Nothing in any group the kill signalled is still running, within the bound (`_all_gone`'s).
+    A ZOMBIE IS NOT RUNNING: a killed command stays in its group until its parent reaps it, and it
+    holds no file and runs nothing (`_running`)."""
+    for _ in range(_GONE_CHECKS):
+        if not any(_group_running(g) for g in groups):
+            return True
+        _pause()
+    return not any(_group_running(g) for g in groups)
+
+
+def _group_running(pgid: int) -> bool:
+    """A process of group `pgid` is still running. Read from `/proc/<pid>/stat` where there is one
+    (the state and the group follow the command's closing parenthesis); elsewhere, the group not
+    being empty."""
+    if not sys.platform.startswith("linux") or not _PROC.is_dir():
+        return not _group_is_empty(pgid)
+    for entry in _PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        fields = stat[stat.rfind(")") + 2:].split()
+        if len(fields) > 2 and fields[2] == str(pgid) and fields[0] not in ("Z", "X"):
+            return True
+    return False
+
+
 def _group_is_empty(pgid: int) -> bool:
     """No process is left in group `pgid` — the only moment its id may be let go of."""
     try:
@@ -122,13 +152,16 @@ def _marked(needle: bytes) -> set[int]:
     return found
 
 
-def _kill_marked(needle: bytes) -> None:
-    """SIGKILL every process carrying `needle`, sweeping again while a sweep finds a new one."""
+def _kill_marked(needle: bytes) -> bool:
+    """SIGKILL every process carrying `needle`, sweeping again while a sweep finds a new one.
+    Answers whether the kill FINISHED CLEAN (review of #504): a sweep found nothing new, and every
+    process it killed is gone (`_all_gone`). False when the sweeps ran out still finding processes,
+    or one it killed is still running past the bound."""
     killed: set[int] = set()
     for _ in range(_SWEEPS):
         fresh = _marked(needle) - killed
         if not fresh:
-            return
+            return _all_gone(killed)
         for pid in fresh:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -137,6 +170,65 @@ def _kill_marked(needle: bytes) -> None:
         killed |= fresh
     log.warning("BEEVERFORGE_JOB_STOP_SWEEPS a stop swept /proc %s times and was still finding "
                 "processes of the job; what started after the last sweep was not killed", _SWEEPS)
+    return False
+
+
+#: How many times, and how far apart, a kill looks for what it killed to be gone: SIGKILL is sent,
+#: not waited for, and a process in uninterruptible sleep outlives it for a while. Bounded at about
+#: five seconds; module values, so a test replaces the pause.
+_GONE_CHECKS = 100
+_GONE_PAUSE = 0.05
+
+
+def _pause() -> None:
+    threading.Event().wait(_GONE_PAUSE)
+
+
+def _running(pid: int) -> bool:
+    """`pid` is still a running process: its `/proc` entry is there and it is not a zombie (which
+    holds no file and runs nothing)."""
+    try:
+        status = (_PROC / str(pid) / "status").read_text()
+    except OSError:
+        return False
+    state = next((line.split()[1] for line in status.splitlines() if line.startswith("State:")),
+                 "")
+    return state not in ("Z", "X")
+
+
+def _all_gone(pids: set[int]) -> bool:
+    """Every one of `pids` has stopped running, within the bound."""
+    for _ in range(_GONE_CHECKS):
+        if not any(_running(pid) for pid in pids):
+            return True
+        _pause()
+    return not any(_running(pid) for pid in pids)
+
+
+def holders(path: Path) -> set[int]:
+    """The pids of the processes this user can read that hold `path` open (`/proc/<pid>/fd`). A
+    git writing the index holds its `index.lock` open until it renames it; a git that was killed
+    holds nothing. A process of another user is not readable and not counted — the job's own
+    processes run as this user on the worktree box."""
+    if not sys.platform.startswith("linux") or not _PROC.is_dir():
+        return set()
+    want = str(path)
+    found = set()
+    for entry in _PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(fd) == want:
+                    found.add(int(entry.name))
+                    break
+            except OSError:
+                continue
+    return found
 
 
 class Stop:
@@ -160,6 +252,15 @@ class Stop:
         #: request that keeps nothing (a person's stop) clears it.
         self.keep = False
         self._keeping = False
+        #: Held by `request` from before the flag is set until its last kill is done, and taken by
+        #: `keeping` before the window opens (#259, found on main's CI after #503): the kill sweeps
+        #: `/proc` for this job's mark up to `_SWEEPS` times, and the keep's own commands carry the
+        #: mark, so a window opened during the sweep had its `git commit` killed and the work was
+        #: lost with the worktree.
+        self._killing = threading.Lock()
+        #: Whether the last kill finished clean (`_kill_marked`, `_groups_gone`): nothing the job
+        #: started is still running. The keep reads it before it clears a lock a killed git left.
+        self.kill_clean = False
 
     @property
     def requested(self) -> bool:
@@ -188,17 +289,19 @@ class Stop:
         `keep` (#259): the attempt ended and the job did not — keep what the agent wrote
         (`keeping`). Only the first request can ask for it; a request that keeps nothing clears
         it, so a person's stop arriving after a timeout publishes nothing."""
-        with self._lock:
-            if not self._event.is_set():
-                self.why = why
-                self.keep = keep
-                self._event.set()
-            elif not keep:
-                self.keep = self._keeping = False  # a person's stop closes an open window too
-            groups = list(self._groups)
-        for pgid in groups:
-            _kill_group(pgid)
-        _kill_marked(f"{MARK_VAR}={self.mark}".encode())
+        with self._killing:
+            with self._lock:
+                if not self._event.is_set():
+                    self.why = why
+                    self.keep = keep
+                    self._event.set()
+                elif not keep:
+                    self.keep = self._keeping = False  # a person's stop closes an open window too
+                groups = list(self._groups)
+            for pgid in groups:
+                _kill_group(pgid)
+            marked = _kill_marked(f"{MARK_VAR}={self.mark}".encode())
+            self.kill_clean = marked and _groups_gone(groups)
 
     def adopt(self, proc: subprocess.Popen) -> None:
         """A command the box just started in its own group (`process_group=0`, so its pid is its
@@ -235,8 +338,11 @@ class Stop:
         """The window in which a timed-out attempt's runner keeps its work (#259): the commands
         it starts run instead of being killed on adoption, and its publishing checks let the push
         through. Yields whether there is anything to keep — False for a stop that keeps nothing,
-        and then the window does not open."""
-        with self._lock:
+        and then the window does not open.
+
+        NOT BEFORE THE KILL IS OVER (`_killing`): the keep's commands carry the job's mark, and a
+        sweep still running would kill them."""
+        with self._killing, self._lock:
             self._keeping = self.keep
         try:
             yield self._keeping

@@ -16,6 +16,7 @@ import asyncio
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,10 +41,12 @@ class _CommittingAgent(stopped._BlockingAgent):
     """A pass that commits part of its work, leaves the rest written but uncommitted, and then
     blocks until it is ended — the shape of a four-hour pass the ceiling cuts."""
 
-    def __init__(self, fifo: Path, files: tuple[str, str] = ("committed.py", "uncommitted.py")):
+    def __init__(self, fifo: Path, files: tuple[str, str] = ("committed.py", "uncommitted.py"),
+                 *, leaves_a_lock: bool | str = False):
         super().__init__(fifo)
         self.files = files
         self.found: set[str] = set()
+        self.leaves_a_lock = leaves_a_lock
 
     def execute(self, *, sandbox, workspace, context):
         where = Path(workspace.path)
@@ -55,12 +58,27 @@ class _CommittingAgent(stopped._BlockingAgent):
                       "commit", "-qm", "the part the agent committed"]):
             subprocess.run(["git", "-C", str(where), *args], check=True, capture_output=True)
         (where / uncommitted).write_text("HALF = 1\n")
+        if self.leaves_a_lock:  # a git the kill ends mid-write leaves its lock behind
+            lock = subprocess.run(["git", "-C", str(where), "rev-parse", "--path-format=absolute",
+                                   "--git-path", "index.lock"], check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            Path(lock).write_text("")
+            self.lock = Path(lock)
+            if self.leaves_a_lock == "held":
+                # A PROCESS THE KILL CANNOT SEE holds it open — no mark, a group of its own — the
+                # way a git a job started with a cleared environment would
+                self.holder = subprocess.Popen(
+                    [sys.executable, "-c", "import sys; f = open(sys.argv[1], 'a'); "
+                     "print('ready', flush=True); sys.stdin.read()", lock],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                    env={"PATH": os.environ.get("PATH", "")}, process_group=0)
+                assert self.holder.stdout.readline().strip() == "ready"
         return super().execute(sandbox=sandbox, workspace=workspace, context=context)
 
 
 async def _a_pass_cut_by(details, client, origin_and_repo, tmp_path, *, then=None,
                          files=("committed.py", "uncommitted.py"), resume_handle=None,
-                         box_class=None, tag="1"):
+                         box_class=None, tag="1", leaves_a_lock=False):
     """Run a job whose agent blocks, cancel its activity with `details` (the engine answering
     `describe` through `client`, and answering `then` from the cancel on), and answer what the job
     left behind. `resume_handle` is the handle the run is resumed with; `box_class` a box of the
@@ -78,13 +96,14 @@ async def _a_pass_cut_by(details, client, origin_and_repo, tmp_path, *, then=Non
     stop = Stop()
     hooks = stopped._Hooks(stop, at="")
     forge, tracker, reviewer = stopped._fakes(hooks)
-    agent = _CommittingAgent(fifo, files)
+    agent = _CommittingAgent(fifo, files, leaves_a_lock=leaves_a_lock)
     box = (box_class or stopped._Box)(root=tmp_path / f"wt-{tag}", hooks=hooks)
     runner = JobRunner(
         tracker=tracker, forge=forge, agent=agent, sandbox=box,
         manifest=Manifest(merge_policy="auto", validate={"test": "true", "security": "true"}),
         repo_path=repo_path, reviewer=reviewer, events=InMemoryEventSink())
     runner.hears(stop)
+    box.tracker = tracker  # what the card was told, for the cases that read it
 
     env = ActivityEnvironment(client=client)
     job = asyncio.create_task(env.run(
@@ -350,6 +369,194 @@ async def test_a_timed_out_attempt_is_told_from_a_stop(details, answer, timed_ou
         is timed_out
 
 
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_lock_a_killed_git_left_does_not_cost_the_keep(origin_and_repo, tmp_path):
+    """Found on main's CI after #503: a git the kill ended mid-write left `index.lock`, the keep's
+    commit refused ("File exists"), and the work went with the worktree. Planted here, so the case
+    does not depend on where the kill lands."""
+    origin, _ = origin_and_repo
+
+    await _a_pass_cut_by(ActivityCancellationDetails(not_found=True, timed_out=True), None,
+                         origin_and_repo, tmp_path, leaves_a_lock=True)
+
+    pushed = _remote(origin, "ls-tree", "-r", "--name-only", f"refs/heads/{BRANCH}").split()
+    assert {"committed.py", "uncommitted.py"} <= set(pushed), (
+        f"a stale index lock cost the timed-out pass its work: {pushed}")
+
+
+def _card_says(box, *words: str) -> bool:
+    said = [c for c in box.tracker.comments if "was not kept" in c]
+    return len(said) == 1 and all(w in said[0] for w in words)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_lock_a_live_process_holds_is_not_removed_and_the_card_says_so(
+        origin_and_repo, tmp_path):
+    """Review of #504: a lock is stale only when no process holds it. Here one the kill cannot see
+    holds it open, so nothing is committed or pushed, the lock stays, and the card names it."""
+    origin, _ = origin_and_repo
+    agent = None
+    try:
+        agent, _, box, _ = await _a_pass_cut_by(
+            ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+            tmp_path, leaves_a_lock="held")
+        assert box.pushes == 0 and stopped._never_pushed(origin), "it committed over a held lock"
+        assert _card_says(box, str(agent.lock), f"process {agent.holder.pid}", "Resume"), (
+            box.tracker.comments)
+    finally:
+        holder = getattr(agent, "holder", None)
+        if holder is not None:
+            holder.kill()
+            holder.wait()
+
+
+class _RmFailsBox(stopped._Box):
+    def run(self, *, workspace, command, timeout=None, **kw):
+        if command.startswith("rm -f -- "):
+            return 1, "rm: cannot remove: Operation not permitted"
+        return super().run(workspace=workspace, command=command, timeout=timeout, **kw)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_lock_that_cannot_be_removed_stops_the_keep_and_the_card_says_so(
+        origin_and_repo, tmp_path):
+    origin, _ = origin_and_repo
+
+    agent, _, box, _ = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True, box_class=_RmFailsBox)
+
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert _card_says(box, str(agent.lock), "could not be removed", "Operation not permitted"), (
+        box.tracker.comments)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_kill_that_did_not_finish_clean_leaves_the_lock_and_the_card_says_so(
+        origin_and_repo, tmp_path, monkeypatch):
+    from beeverforge.adapters.sandbox import stopping
+
+    origin, _ = origin_and_repo
+    real = stopping._kill_marked
+    monkeypatch.setattr(stopping, "_kill_marked", lambda needle: real(needle) and False)
+
+    agent, _, box, stop = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True)
+
+    assert not stop.kill_clean
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert _card_says(box, str(agent.lock), "could not confirm"), box.tracker.comments
+
+
+class _ItsProcessesOutliveTheStop(stopped._Box):
+    """A box whose stop does not reach the processes it runs — the container box's shape: the stop
+    kills the `docker exec` client, and the process in the container lives on until cleanup."""
+
+    stop_ends_its_processes = False
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_box_whose_stop_does_not_reach_its_processes_leaves_the_lock_and_says_so(
+        origin_and_repo, tmp_path):
+    """Review of #504: on such a box a clean kill and an empty holder scan prove nothing — the
+    kill saw only the client, and the worker cannot read the container's processes."""
+    origin, _ = origin_and_repo
+
+    agent, _, box, stop = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True, box_class=_ItsProcessesOutliveTheStop)
+
+    assert stop.kill_clean, "the case proves nothing: the kill was unclean anyway"
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert agent.lock.exists() or not agent.workspace.exists()
+    assert _card_says(box, str(agent.lock), "does not end the processes inside it"), (
+        box.tracker.comments)
+
+
+class _SaysNothing(stopped._Box):
+    """A box that does not say whether its stop ends its processes, as a box outside this tree."""
+
+    @property
+    def stop_ends_its_processes(self):
+        raise AttributeError("stop_ends_its_processes")
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_box_that_does_not_say_is_not_trusted_with_the_lock(origin_and_repo, tmp_path):
+    origin, _ = origin_and_repo
+
+    agent, _, box, _ = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True, box_class=_SaysNothing)
+
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert _card_says(box, str(agent.lock), "does not end the processes inside it")
+
+
+def test_each_box_says_whether_its_stop_ends_its_processes():
+    """The two local boxes say it, and say it truthfully: the container box's stop ends the
+    `docker exec` client only (its `run` docstring), the worktree box's ends what it ran."""
+    from beeverforge.adapters.sandbox.container import ContainerSandbox
+    from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
+
+    assert WorktreeSandbox.stop_ends_its_processes is True
+    assert ContainerSandbox.stop_ends_its_processes is False
+
+
+# ── whether the kill finished clean ─────────────────────────────────────────────────────────────
+
+def test_a_kill_whose_groups_and_marked_processes_end_is_clean():
+    stop = Stop()
+    procs = [subprocess.Popen(["sleep", "60"], process_group=0) for _ in range(2)]
+    try:
+        for proc in procs:
+            stop.adopt(proc)
+        stop.request("ran past its limit", keep=True)
+        assert stop.kill_clean, "a kill whose processes all ended was not called clean"
+    finally:
+        for proc in procs:
+            stopped._kill_quietly(proc.pid)
+            proc.wait()
+
+
+def test_a_kill_whose_sweeps_ran_out_is_not_clean(monkeypatch):
+    from beeverforge.adapters.sandbox import stopping
+
+    fresh = iter(range(2 ** 22, 2 ** 22 + 100))  # pids that are never there: os.kill passes
+    monkeypatch.setattr(stopping, "_marked", lambda needle: {next(fresh)})
+
+    assert stopping._kill_marked(b"X=1") is False
+
+
+def test_a_kill_whose_process_outlives_the_bound_is_not_clean(monkeypatch):
+    from beeverforge.adapters.sandbox import stopping
+
+    found = iter([{2 ** 22}, set()])
+    monkeypatch.setattr(stopping, "_marked", lambda needle: next(found))
+    monkeypatch.setattr(stopping, "_running", lambda pid: True)  # it will not die
+    monkeypatch.setattr(stopping, "_GONE_CHECKS", 3)
+    paused: list[int] = []
+    monkeypatch.setattr(stopping, "_pause", lambda: paused.append(1))  # no clock: counted
+
+    assert stopping._kill_marked(b"X=1") is False
+    assert len(paused) == 3, "the kill did not look again for what it killed, within its bound"
+
+
+def test_a_zombie_is_not_running_and_a_live_process_is():
+    from beeverforge.adapters.sandbox import stopping
+
+    proc = subprocess.Popen(["sleep", "60"], process_group=0)
+    try:
+        assert stopping._running(proc.pid) and stopping._group_running(proc.pid)
+        os.kill(proc.pid, signal.SIGKILL)
+        assert stopping._all_gone({proc.pid}), "a killed, unreaped child was read as running"
+        assert not stopping._group_running(proc.pid)
+    finally:
+        stopped._kill_quietly(proc.pid)
+        proc.wait()
+
+
 # ── the stop's keeping window ───────────────────────────────────────────────────────────────────
 
 def _a_group_sleeping() -> subprocess.Popen:
@@ -373,6 +580,56 @@ def test_a_keeping_stop_runs_the_commands_of_its_window_and_kills_the_rest():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+def test_the_keeping_window_opens_only_once_the_kill_is_over(monkeypatch):
+    """Found on main's CI after #503: the kill sweeps `/proc` for the job's mark, the keep's own
+    `git commit` carries the mark, and a window opened mid-sweep had its commit killed — the work
+    was lost with the worktree. Here the sweep holds until the runner is waiting to open the window
+    (or has opened it), and the order they happened in is the answer. No clock: events and a lock
+    that says when it is waited on."""
+    import threading
+
+    from beeverforge.adapters.sandbox import stopping
+
+    order: list[str] = []
+    waiting = threading.Event()  # the runner asked for the window, or already has it
+
+    def sweep(_needle: bytes) -> None:
+        assert waiting.wait(30), "the runner never asked for the window"
+        order.append("the sweep ended")
+
+    monkeypatch.setattr(stopping, "_kill_marked", sweep)
+    stop = Stop()
+    real = stop._killing
+
+    class _Told:
+        def __enter__(self):
+            if threading.current_thread().name == "runner":
+                waiting.set()
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    stop._killing = _Told()
+
+    def runner() -> None:
+        with stop.keeping() as keep:
+            order.append(f"the window opened ({keep})")
+            waiting.set()
+
+    killing = threading.Thread(target=stop.request, args=("ran past its limit",),
+                               kwargs={"keep": True})
+    killing.start()
+    # the flag is set inside the kill, before the sweep: from here the runner has heard the stop
+    assert stop._event.wait(30), "the stop was never requested"
+    keeper = threading.Thread(target=runner, name="runner")
+    keeper.start()
+    killing.join(30)
+    keeper.join(30)
+
+    assert order == ["the sweep ended", "the window opened (True)"], order
 
 
 def test_a_persons_stop_ends_the_keeping_and_a_plain_stop_never_opens_it():
