@@ -7,6 +7,12 @@ Every pull request carries the line its release's notes will read for it, as a f
 into the version's section here, and its GitHub release page carries the same notes
 ([docs/RELEASING.md](docs/RELEASING.md), "The release notes").
 
+## 0.1.1 (2026-11-09)
+
+### Fixes
+
+- **A fresh install runs a `claude` current Claude models accept.** Every image pinned `claude` 2.1.219, which current models refuse ("version 2.1.280 or newer is required"), so every harness call failed until the CLI was upgraded by hand in the worker and in the toolbox, while the installer, `doctor` and `box prove` stayed green. The box, the toolbox and the worker now pin 2.1.309. An existing deployment's toolbox keeps its old copy after the rebuild until #246 is fixed (#436).
+
 ## 0.1.0 (2026-10-28)
 
 ### Highlights
