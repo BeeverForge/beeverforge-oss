@@ -61,6 +61,7 @@ from beeverforge.contracts.run import (
     AGENT_ACCOUNT_MAX,
     AGENT_PASS_WORDS_MAX,
     AGENT_PASSES_SHOWN,
+    FROM_THE_FORGE,
     HandedBack,
     PassAccount,
 )
@@ -314,10 +315,8 @@ def _failing_gates_said(validations: list[ValidationResult],
     return "\n\n".join(blocks)
 
 
-#: The handle a hold carries when Resume must start from the forge's copy of the branch and not
-#: continue the agent's session (#11): the work on the branch is not the work that session did.
-#: Truthy, so `prepare` restores the branch; it decodes to nothing in any adapter (cold session).
-_FROM_THE_FORGE = "worktree-only"
+#: `contracts.run.FROM_THE_FORGE`, which says what it is (#11).
+_FROM_THE_FORGE = FROM_THE_FORGE
 
 
 def _kept_said(branch: str, kept: str) -> str:
@@ -1693,7 +1692,9 @@ class JobRunner:
         throttled minute late, so each of these steps also asks the engine whether the job's
         workflow is still running (`Stop.ask`, set by the activity's heartbeat loop)."""
         stop = getattr(self, "stop", None)
-        if stop is not None and stop.confirm():
+        # WHILE A TIMED-OUT ATTEMPT KEEPS ITS WORK (#259, `Stop.keeping`) its own push goes
+        # through: that push is what the keeping is for, and a person's stop closes the window
+        if stop is not None and not stop.keeping_now and stop.confirm():
             log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
                         step, stop.why or "a person stopped the job")
             # WHAT ALREADY LANDED IS SAID, ONCE, and then the job stops (review of #453): an open
@@ -2712,6 +2713,12 @@ class JobRunner:
                 self._offer_preview(ticket, pr, branch, ws)
             return self._charged(result)
         finally:
+            # BEFORE THE WORKTREE GOES (#259): an attempt that ran past its time limit while its
+            # job goes on keeps what the agent wrote on the job's branch, HOWEVER THE WALK ENDED —
+            # the kill reaches whatever step the runner is in, so it leaves through a `JobStopped`,
+            # through a failed commit's `RuntimeError`, or through a hold. A person's stop keeps
+            # nothing (`Stop.keep`), and a walk nobody stopped is not touched.
+            self._keep_what_the_attempt_wrote(ticket, ws)
             self.sandbox.cleanup(workspace=ws)
             vars(self).pop("_landed_here", None)  # this walk's fact, never the next one's
             # the fetched knowledge bundle is a temp checkout — one leaked per job
@@ -3718,6 +3725,43 @@ class JobRunner:
         return self._charged(RunResult(ticket_id=ticket.id, state=state, branch=branch, note=note,
                                        retry_at=retry_at, resume_handle=handle,
                                        spent_turns=getattr(self, "_turns", 0)))
+
+    def _keep_what_the_attempt_wrote(self, ticket: Ticket, ws: Workspace) -> None:
+        """Commit and push what the agent wrote when its attempt ran past its time limit and the
+        job did not end (#259) — the work a timed-out pass did is otherwise lost with the worktree.
+
+        A TIMEOUT USED TO READ AS A STOP. The engine cancels a timed-out activity saying the task
+        is gone (`not_found`), which is also what it says once a person's stop ended the workflow,
+        so the agent was killed, the worktree removed and nothing pushed. The workflow then parked
+        the job, and its Resume started from the base: on a deployment, three of four long passes
+        lost their commits in one day. Now the heartbeat loop tells the two apart and asks for a
+        keeping stop (`Stop.request(keep=True)`); this is where the runner keeps.
+
+        THROUGH THE HOLD'S OWN PRESERVE (`_preserve_for_hold`): the commit, the read of what was
+        written, and `_publish`, which keeps somebody else's commits on the branch before pushing
+        over them (#11). The park the workflow makes resumes from that branch. A person's stop that
+        arrives meanwhile ends the keeping as well (`Stop.request` clears it), and nothing more is
+        pushed. NEVER RAISES: it runs in `run()`'s `finally`, where the walk's own outcome — a
+        result, a `JobStopped`, an error — is what leaves."""
+        stop = getattr(self, "stop", None)
+        if stop is None:
+            return
+        with stop.keeping() as keep:
+            if not keep:
+                return
+            try:
+                self._preserve_for_hold(ticket, ws, None)
+            except JobStopped:
+                log.warning("BEEVERFORGE_ATTEMPT_KEEP_STOPPED %s — a person stopped the job while "
+                            "its timed-out attempt was keeping its work; nothing more is pushed",
+                            ws.branch)
+                return
+            except Exception as exc:  # noqa: BLE001 — `_preserve_for_hold` catches its own
+                log.warning("BEEVERFORGE_ATTEMPT_KEEP_FAILED %s — %s", ws.branch,
+                            _withheld(str(exc), self._in_the_gates_reach())[:200])
+                return
+            log.warning("BEEVERFORGE_ATTEMPT_KEPT %s — the attempt ran past its time limit; what "
+                        "its agent wrote: %s", ws.branch, self._preserve_outcome)
 
     def _preserve_for_hold(
         self, ticket: Ticket, ws: Workspace, resume_handle: str | None

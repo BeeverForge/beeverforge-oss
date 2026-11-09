@@ -107,10 +107,11 @@ MUTATIONS = [
      "    if stop is not None:\n        pass\n", TEST),
 
     # ── the cleanup ──
+    # RE-PINNED 2026-11-09 (#259): a timed-out attempt keeps its work first, in the same places
     ("a stopped job leaves its worktree behind", MACHINE,
-     "            return self._charged(result)\n        finally:\n"
+     "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
      "            self.sandbox.cleanup(workspace=ws)\n",
-     "            return self._charged(result)\n        finally:\n"
+     "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
      "            pass\n", MID_AGENT),
 
     # ── a stop is not a timeout, and the sentence claims no more than is known ──
@@ -140,9 +141,10 @@ MUTATIONS = [
      "        pass\n", EMPTIED),
 
     # ── a stop the heartbeat has not heard yet (review of #453) ──
+    # RE-PINNED 2026-11-09 (#259): a timed-out attempt keeps its work first, in the same places
     ("the runner asks only the heartbeat's flag, never the engine", MACHINE,
-     "        if stop is not None and stop.confirm():\n",
-     "        if stop is not None and stop.requested:\n", UNHEARD),
+     "        if stop is not None and not stop.keeping_now and stop.confirm():\n",
+     "        if stop is not None and not stop.keeping_now and stop.requested:\n", UNHEARD),
 
     ("the heartbeat loop gives the runner nothing to ask the engine with", ACTIVITIES,
      "        stop.ask = _the_engine_asked(asyncio.get_running_loop())\n",

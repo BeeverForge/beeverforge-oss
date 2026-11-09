@@ -234,13 +234,27 @@ def _judge_for(project_name: str):
 # a stoppable box starts its commands in a process group of their own (`stopping.own_group`), so a
 # signal sent to the worker's whole group no longer reaches the harness; the shutdown's cancel is
 # what reaches it instead. A heartbeat TIMEOUT, a PAUSE and a RESET are not a person ending the
-# work, and they are left exactly as they were (#259 decides what a timed-out attempt keeps).
+# work, and they are left exactly as they were.
+#
+# A TIMED-OUT ATTEMPT IS NOT A STOP, AND THE ENGINE SPELLS IT LIKE ONE (#259, measured in sdk-core,
+# `worker/activities.rs`). The worker's own timer for the activity's StartToClose (or heartbeat)
+# timeout cancels it with `is_not_found` AND `is_timed_out`; a timeout the server noticed first
+# reaches the worker as a plain NotFound on the next heartbeat, exactly as a stop's does. Read as a
+# stop, a four-hour pass that ran past the ceiling was killed and its worktree removed with nothing
+# pushed. So `_the_attempt_timed_out` is asked first: `timed_out`, or `not_found` while the job's
+# workflow still runs (a stop ends the workflow; a timed-out attempt's workflow goes on to park).
+# Such an attempt is ended as a stop is, and keeps what its agent wrote (`_keep_the_work`).
 _THE_WORK_ENDS = ("not_found", "cancel_requested", "worker_shutdown")
 
 #: How long the activity waits, after telling the runner, for its thread to end — the agent's
 #: groups are already killed, so what is left is a `git worktree remove`; bounded because nothing
 #: heartbeats for it any more.
 _A_STOPPED_JOB_ENDS_WITHIN = 60.0
+
+#: The same wait for an attempt that timed out (#259): its runner also commits and pushes what the
+#: agent wrote, and a push whose lease is refused copies the forge's tip first (#11) — a fetch and
+#: two pushes. Bounded for the same reason; a thread still keeping past it finishes on its own.
+_A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN = 300.0
 
 _WHY_THE_WORK_ENDS = {
     "not_found": "its workflow was ended in the engine (a stop)",
@@ -252,6 +266,57 @@ _WHY_THE_WORK_ENDS = {
 def _the_work_must_end(details) -> bool:
     """Whether a cancellation with these `ActivityCancellationDetails` ends the job's work."""
     return details is not None and any(getattr(details, k, False) for k in _THE_WORK_ENDS)
+
+
+async def _the_attempt_timed_out(details) -> bool:
+    """Whether a cancellation with these details ended this ATTEMPT while its job goes on (#259):
+    the worker's own timer said it timed out, or the engine said the task is gone (`not_found`)
+    while the job's workflow is still running. A stop ends the workflow; a timed-out attempt's
+    workflow goes on, to park the job. An engine that cannot answer is read as a stop: what a stop
+    forbids is any push, and the attempt is ended either way."""
+    if details is None:
+        return False
+    if getattr(details, "timed_out", False):
+        return True
+    if not getattr(details, "not_found", False):
+        return False
+    return await _the_workflow_runs_on()
+
+
+async def _the_workflow_runs_on() -> bool:
+    """This activity's workflow run is still RUNNING in the engine — asked once, bounded."""
+    from temporalio.client import WorkflowExecutionStatus
+
+    try:
+        client = engine_client()
+        info = activity.info()
+        handle = client.get_workflow_handle(info.workflow_id, run_id=info.workflow_run_id)
+        described = await asyncio.wait_for(handle.describe(), timeout=_THE_ENGINE_ANSWERS_WITHIN)
+    except Exception as exc:  # noqa: BLE001 — no answer is read as a stop (the caller says why)
+        activity.logger.warning("BEEVERFORGE_JOB_STOP_UNASKED could not ask the engine whether "
+                                "the job's workflow still runs after its activity was gone (%s) — "
+                                "read as a stop: nothing is pushed", str(exc)[:160] or
+                                type(exc).__name__)
+        return False
+    return described.status == WorkflowExecutionStatus.RUNNING
+
+
+async def _keep_the_work(work: asyncio.Task, stop, detail: str) -> None:
+    """End a timed-out attempt as a stop does, and let its runner keep what the agent wrote on the
+    job's branch before the worktree goes (#259, `JobRunner._keep_what_the_attempt_wrote`)."""
+    activity.logger.warning("BEEVERFORGE_ATTEMPT_TIMED_OUT %s — the attempt ran past its time "
+                            "limit and its job goes on: the agent's processes are killed, and "
+                            "what it wrote is committed and pushed to the job's branch before its "
+                            "worktree is removed", detail)
+    stop.request("this attempt ran past its time limit", keep=True)
+    await asyncio.wait({work}, timeout=_A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN)
+    if not work.done():
+        activity.logger.warning("BEEVERFORGE_ATTEMPT_KEPT_LATE %s — the runner thread had not "
+                                "ended %ss after it was told; it keeps the work on its own",
+                                detail, _A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN)
+        return
+    if not work.cancelled():
+        work.exception()
 
 
 async def _end_the_work(work: asyncio.Task, stop, detail: str, details) -> None:
@@ -366,7 +431,9 @@ async def _heartbeat_while(fn, detail: str, *, tick=None, stop=None) -> RunResul
     except asyncio.CancelledError:
         # `stop` IS WHAT THE THREAD HEARS (#44): cancelling `work` below ends only the wrapper
         details = activity.cancellation_details() if stop is not None else None
-        if _the_work_must_end(details):
+        if await _the_attempt_timed_out(details):
+            await _keep_the_work(work, stop, detail)
+        elif _the_work_must_end(details):
             await _end_the_work(work, stop, detail, details)
         raise
     finally:

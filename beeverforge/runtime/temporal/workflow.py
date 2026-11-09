@@ -20,7 +20,8 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ActivityError, TimeoutType, WorkflowAlreadyStartedError
+from temporalio.exceptions import TimeoutError as TimedOut
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -37,7 +38,9 @@ with workflow.unsafe.imports_passed_through():
         nothing_ran_note,
     )
     from beeverforge.contracts.project import ADJUST_PASSES
+    from beeverforge.contracts.run import FROM_THE_FORGE
     from beeverforge.lifecycle.handed_back import recorded_park
+    from beeverforge.namespace import job_branch
 
     # #1004 — an asked refresh's bounds, beside the pass they bound: plain `timedelta`s
     from beeverforge.product.refresh import PASS_CEILING as KNOWLEDGE_PASS_CEILING
@@ -179,6 +182,33 @@ with workflow.unsafe.imports_passed_through():
 # until the sandbox is externalized (Fargate) and the job is split into finer,
 # individually-idempotent activities. Fail loud instead.
 _ONCE = RetryPolicy(maximum_attempts=1)
+
+
+def _an_attempt_past_its_limit(exc: BaseException, params: JobParams) -> RunResult | None:
+    """The park of a `run_job` that ran past its StartToClose ceiling (#259), or None for any
+    other failure.
+
+    ITS WORK IS ON THE BRANCH, SO RESUME STARTS FROM THE BRANCH. The attempt's own runner, told by
+    its heartbeat loop that the attempt timed out while this workflow goes on, committed and pushed
+    what the agent wrote before its worktree went (`activities._keep_the_work`). This park carries
+    the handle that makes Resume restore that branch (`FROM_THE_FORGE`) instead of starting from
+    the base, which is where three of four long passes on one deployment lost their commits. A
+    branch that was never pushed is no harm: `prepare` falls back to the base when it is absent.
+
+    A PERSON DECIDES, rather than the self-heal: the pass that timed out ran for the whole ceiling,
+    and running it again unattended can spend the same again. One sentence names the cause, where
+    the work is, and the remedy — never the engine's "activity StartToClose timeout"."""
+    cause = exc.cause if isinstance(exc, ActivityError) else None
+    if not isinstance(cause, TimedOut) or cause.type != TimeoutType.START_TO_CLOSE:
+        return None
+    branch = job_branch(params.issue, change=params.change)
+    return RunResult(
+        ticket_id=params.issue, state=JobState.ON_HOLD, branch=branch,
+        note=(f"the agent pass ran past its {ACTIVITY_CEILING / 3600:g} h limit and was ended; "
+              f"what it had written was pushed to `{branch}` (the journal says if that push "
+              "failed) — Resume continues from that branch"),
+        resume_handle=FROM_THE_FORGE,
+    )
 # Promotion steps are read-mostly and their one write (create_tag) is idempotent
 # (find-or-create), so transient GitHub/network failures during a release can be
 # retried safely — exactly where resilience matters most.
@@ -3097,7 +3127,7 @@ class JobWorkflow:
                 # diagnostics (`SetupFailed`'s command + output tail, and the box-image resolver's
                 # own refusal — see activities.py's `_resolved_image`) were already doing the work
                 # to deserve, and were losing the moment they crossed this exact boundary.
-                result = RunResult(
+                result = _an_attempt_past_its_limit(exc, params) or RunResult(
                     ticket_id=params.issue, state=JobState.ON_HOLD,
                     note=f"job errored after retries: {describe(exc, limit=150)}",
                 )
