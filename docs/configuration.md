@@ -517,6 +517,12 @@ task queue is `beeverforge-jobs` and its schedules are named `beeverforge-*`; 0.
   of 0.7's.
 - **A poller paused in 0.7 is not carried over.** `beeverforge-poller` is created running; pause it
   again if the queue was being held.
+- **A workflow 0.7 started is polled, not proven to replay.** Its history is replayed on this
+  release's workflow code; one whose history this code no longer matches fails its workflow task
+  in the worker's log, by name, and is retried, without stopping the worker. Let 0.7's in-flight
+  jobs finish before upgrading when you can, or cancel such a workflow in the Temporal UI.
+- **Up to twice the concurrent activities while 0.7's work drains**: each queue's worker runs up
+  to 8. One job at a time is still held by `max_concurrent_jobs`.
 
 ---
 
