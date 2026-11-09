@@ -449,6 +449,61 @@ async def test_a_kill_that_did_not_finish_clean_leaves_the_lock_and_the_card_say
     assert _card_says(box, str(agent.lock), "could not confirm"), box.tracker.comments
 
 
+class _ItsProcessesOutliveTheStop(stopped._Box):
+    """A box whose stop does not reach the processes it runs — the container box's shape: the stop
+    kills the `docker exec` client, and the process in the container lives on until cleanup."""
+
+    stop_ends_its_processes = False
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_box_whose_stop_does_not_reach_its_processes_leaves_the_lock_and_says_so(
+        origin_and_repo, tmp_path):
+    """Review of #504: on such a box a clean kill and an empty holder scan prove nothing — the
+    kill saw only the client, and the worker cannot read the container's processes."""
+    origin, _ = origin_and_repo
+
+    agent, _, box, stop = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True, box_class=_ItsProcessesOutliveTheStop)
+
+    assert stop.kill_clean, "the case proves nothing: the kill was unclean anyway"
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert agent.lock.exists() or not agent.workspace.exists()
+    assert _card_says(box, str(agent.lock), "does not end the processes inside it"), (
+        box.tracker.comments)
+
+
+class _SaysNothing(stopped._Box):
+    """A box that does not say whether its stop ends its processes, as a box outside this tree."""
+
+    @property
+    def stop_ends_its_processes(self):
+        raise AttributeError("stop_ends_its_processes")
+
+
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_box_that_does_not_say_is_not_trusted_with_the_lock(origin_and_repo, tmp_path):
+    origin, _ = origin_and_repo
+
+    agent, _, box, _ = await _a_pass_cut_by(
+        ActivityCancellationDetails(not_found=True, timed_out=True), None, origin_and_repo,
+        tmp_path, leaves_a_lock=True, box_class=_SaysNothing)
+
+    assert box.pushes == 0 and stopped._never_pushed(origin)
+    assert _card_says(box, str(agent.lock), "does not end the processes inside it")
+
+
+def test_each_box_says_whether_its_stop_ends_its_processes():
+    """The two local boxes say it, and say it truthfully: the container box's stop ends the
+    `docker exec` client only (its `run` docstring), the worktree box's ends what it ran."""
+    from beeverforge.adapters.sandbox.container import ContainerSandbox
+    from beeverforge.adapters.sandbox.worktree import WorktreeSandbox
+
+    assert WorktreeSandbox.stop_ends_its_processes is True
+    assert ContainerSandbox.stop_ends_its_processes is False
+
+
 # ── whether the kill finished clean ─────────────────────────────────────────────────────────────
 
 def test_a_kill_whose_groups_and_marked_processes_end_is_clean():

@@ -3789,10 +3789,12 @@ class JobRunner:
         agent died — leaves the lock, and the keep's `git add` then refuses with "File exists".
 
         ONLY WHEN ITS OWNER IS PROVEN GONE (review of #504), since removing a lock a live git holds
-        is the corruption the lock exists to prevent: the kill finished clean (`Stop.kill_clean`:
-        its sweeps found nothing new and everything it killed stopped running, within a bound), and
-        no process this worker can read holds the lock open (`stopping.holders`; a git writing the
-        index holds its lock open, a killed one holds nothing). What neither sees — a process of
+        is the corruption the lock exists to prevent: the box's stop ends every process the job
+        started (`stop_ends_its_processes` — the container box's does not), the kill finished
+        clean (`Stop.kill_clean`: its sweeps found nothing new and everything it killed stopped
+        running, within a bound), and no process this worker can read holds the lock open
+        (`stopping.holders`; a git writing the index holds its lock open, a killed one holds
+        nothing). What neither sees — a process of
         another user — is the limit #44's kill has too."""
         rc, out = self.sandbox.run(workspace=ws, command="git rev-parse --git-path index.lock",
                                    timeout=60)
@@ -3807,6 +3809,11 @@ class JobRunner:
             here = inside  # the worktree box: the box's paths are the host's
         if not here.exists():
             return None
+        if not getattr(self.sandbox, "stop_ends_its_processes", False):
+            # THE CONTAINER BOX (review of #504): its stop ends the `docker exec` client, not the
+            # process in the container, and the worker cannot see into it — nothing here is proof
+            return _lock_kept_said(here, "this box's stop does not end the processes inside it, "
+                                         "so a git there may still hold it")
         stop = getattr(self, "stop", None)
         if stop is None or not stop.kill_clean:
             return _lock_kept_said(here, "a process of the job may still be running: the stop "

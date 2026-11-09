@@ -353,6 +353,14 @@ _NO_INIT_BINARY = (" — the box is started with `--init` (#532), and this daemo
 
 
 class ContainerSandbox(SandboxAdapter):
+    #: WHETHER A STOP ENDS EVERY PROCESS THE JOB STARTED (#259, review of #504): it does not here.
+    #: The stop kills the `docker exec` client on the host; the process inside the container is the
+    #: daemon's, and ends only at `cleanup()`'s `docker rm -f`, after a timed-out attempt's keep.
+    #: So nothing the worker can read proves a git in the container has ended, and the keep leaves
+    #: an `index.lock` it finds there and says so (`JobRunner._clear_the_lock_a_killed_git_left`).
+    #: Read through `getattr`, as `kept_after_cleanup` is: a box that does not say is not trusted.
+    stop_ends_its_processes = False
+
     def __init__(
         self,
         *,

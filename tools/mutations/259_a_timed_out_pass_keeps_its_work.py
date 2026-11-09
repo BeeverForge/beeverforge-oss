@@ -17,6 +17,7 @@ MACHINE = "beeverforge/orchestrator/machine.py"
 STOPPING = "beeverforge/adapters/sandbox/stopping.py"
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
 WORKFLOW = "beeverforge/runtime/temporal/workflow.py"
+CONTAINER = "beeverforge/adapters/sandbox/container.py"
 
 TEST = "tests/test_a_timed_out_pass_keeps_its_work.py"
 KEPT = TEST + "::test_a_timed_out_pass_is_ended_and_what_it_wrote_reaches_its_branch"
@@ -33,6 +34,10 @@ SEAM = TEST + "::test_the_failed_run_jobs_park_is_the_timed_out_attempts_or_the_
 REMOTE = TEST + "::test_a_remote_box_past_its_ceiling_parks_as_any_failure"
 TOLD = TEST + "::test_a_timed_out_attempt_is_told_from_a_stop"
 LOCK = TEST + "::test_a_lock_a_killed_git_left_does_not_cost_the_keep"
+OUTLIVES_STOP = (TEST + "::test_a_box_whose_stop_does_not_reach_its_processes_leaves_the_lock_and"
+                 "_says_so")
+SILENT = TEST + "::test_a_box_that_does_not_say_is_not_trusted_with_the_lock"
+BOXES = TEST + "::test_each_box_says_whether_its_stop_ends_its_processes"
 HELD = TEST + "::test_a_lock_a_live_process_holds_is_not_removed_and_the_card_says_so"
 RM_FAILS = TEST + "::test_a_lock_that_cannot_be_removed_stops_the_keep_and_the_card_says_so"
 UNCLEAN = TEST + "::test_a_kill_that_did_not_finish_clean_leaves_the_lock_and_the_card_says_so"
@@ -127,6 +132,17 @@ MUTATIONS = [
     ("THE REVIEW'S FINDING: the keep clears the lock after a kill that did not finish clean",
      MACHINE, "        if stop is None or not stop.kill_clean:\n",
      "        if stop is None:\n", UNCLEAN),
+
+    ("THE REVIEW'S FINDING: the container box's lock is cleared on proof that cannot see into it",
+     MACHINE, '        if not getattr(self.sandbox, "stop_ends_its_processes", False):\n',
+     "        if False:\n", OUTLIVES_STOP),
+
+    ("the container box says its stop ends its processes", CONTAINER,
+     "    stop_ends_its_processes = False\n", "    stop_ends_its_processes = True\n", BOXES),
+
+    ("a box that does not say is trusted", MACHINE,
+     '        if not getattr(self.sandbox, "stop_ends_its_processes", False):\n',
+     '        if not getattr(self.sandbox, "stop_ends_its_processes", True):\n', SILENT),
 
     ("the keep clears a lock a live process holds open", MACHINE,
      "        if held:\n", "        if False:\n", HELD),
