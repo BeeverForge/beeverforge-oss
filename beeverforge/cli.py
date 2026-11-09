@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 # lived here, the panel's door asked no host at all and wrote one axis, while this one refused a
 # GitLab URL by name and wrote every axis — two doors into one registry, disagreeing about what
 # the same address means.
-from beeverforge import doors, namespace
+from beeverforge import doors, former_names, namespace
 from beeverforge.cli_refusals import speaks_plainly
 from beeverforge.contracts import JobState
 from beeverforge.factory import build_runner, resolve_box_image
@@ -74,6 +74,9 @@ def _load_environment() -> None:
     """
     load_dotenv()
     load_dotenv(Path(_HOST_ENV).expanduser())
+    # AN OPENFACTORY 0.7 ENVIRONMENT IS READ UNDER ITS NEW NAMES (#264), both files included, so
+    # after the loads: every command — `serve`, `worker` and `up` among them — reads one spelling.
+    former_names.warn(former_names.carry_over())
 
 
 @app.callback()

@@ -37,6 +37,7 @@ from temporalio.client import (
     ScheduleUpdate,
 )
 
+from beeverforge import former_names
 from beeverforge.runtime.temporal import TASK_QUEUE
 from beeverforge.runtime.temporal.connection import (
     EngineNotDeclared,
@@ -294,6 +295,7 @@ async def main() -> None:
     args = ap.parse_args()
 
     load_dotenv()
+    former_names.warn(former_names.carry_over())  # an OpenFactory 0.7 `.env` too (#264)
     # Dialled as the worker is born (#73): the bare `connect()` ended an unreachable engine in a
     # traceback; this waits a bounded time for it to listen, then says so in one sentence. An
     # engine nobody declared is refused at once, and its message is the sentence too.

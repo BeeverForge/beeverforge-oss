@@ -61,6 +61,11 @@ interesting surface is well-defined:
   as that user, so code that knows where to look can read them. The container box mounts none of
   them; a `box.env` name held in a file crosses into it exactly as a variable would, by name.
 
+  An OpenFactory 0.7 variable (`OPENFACTORY_*`) is read under its `BEEVERFORGE_*` name until 1.1,
+  and each process of the deployment removes it from its own environment as it starts, before it
+  builds any workload's: so a credential set under its old name is withheld exactly when its new
+  name is, and no deny list carries the old spelling.
+
   The **worker image run as one container** (`beeverforge worker --with-panel`) starts the panel
   from the worker's own environment, so the panel's HTTP process holds the worker's credentials —
   the GitHub App key, the model credential — by design: the two run as one user in one container,
