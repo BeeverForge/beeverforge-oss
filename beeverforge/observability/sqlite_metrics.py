@@ -280,13 +280,35 @@ class SqliteMetricsSink:
 
     def purge_expired(self, *, now: int | None = None) -> int:
         """Delete rows past their TTL, returning how many went. Filtering on read keeps the answer
-        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone."""
+        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone.
+
+        AND GONE FROM THE FILE, NOT ONLY FROM THE TABLE (#201). A plain `DELETE` moves a row's
+        page to SQLite's free list with its text still in it, and in WAL mode the row's last
+        version also sits in the `-wal` file until a checkpoint copies it back. So the delete runs
+        with `secure_delete` on, which overwrites what it frees with zeros, and the log is then
+        checkpointed and truncated: what the period promised to delete is in neither file.
+
+        THE CHECKPOINT CAN BE REFUSED, AND SAYS SO ONLY IN ITS RESULT (#466's review). With another
+        connection inside a read transaction (the panel, mid-request) it waits the busy timeout,
+        copies nothing back and returns `busy=1`: the zeroed pages are only in the log, and the
+        original text is still in the main file. That is logged, naming the cause, and the
+        checkpoint runs on EVERY purge, not only one that deleted something, so the next run that
+        finds no reader finishes it."""
         try:
             with self._connect(write=True) as conn:
+                conn.execute("PRAGMA secure_delete=ON")
                 cur = conn.execute("DELETE FROM metrics WHERE expires_at IS NOT NULL"
                                    " AND expires_at <= ?", (now if now is not None else
                                                             int(time.time()),))
-                return cur.rowcount or 0
+                purged = cur.rowcount or 0
+                conn.commit()
+                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint and checkpoint[0]:
+                    log.warning("BEEVERFORGE_METRICS_PURGE_PENDING path=%s — the write-ahead log "
+                                "could not be checkpointed because another connection was "
+                                "reading, so what was purged may still be in the file's bytes; "
+                                "the next purge checkpoints again", self.path)
+                return purged
         except Exception as exc:  # noqa: BLE001
             log.warning("metrics purge failed: %s", exc)
             return 0
