@@ -183,6 +183,11 @@ def test_a_repository_on_the_former_folder_gets_one_pull_request_that_moves_it(p
     assert ".openfactory/" in body and ".beeverforge/" in body and "git mv" in body
     assert "- `.beeverforge/project.yaml`" in body
     assert "preview.compose.yml`" not in body
+    # the README OUTSIDE the folder still spells the former path: not edited, but named, in the
+    # body and in the line, for the person who merges (#470's review)
+    assert "OUTSIDE the folder still mention `.openfactory/`" in body and "- `README.md`" in body
+    assert "outside the folder, README.md still mention `.openfactory/`" in out.output
+    assert "OpenFactory" not in body
     assert "✓ acme/api: the rename is proposed at https://forge.example/acme/api/pull/1" in (
         out.output)
     assert ".beeverforge/project.yaml" in out.output
@@ -204,6 +209,19 @@ def test_only_a_path_segment_named_after_the_former_folder_is_rewritten(tmp_path
     assert (folder / "a.yaml").read_text() == (
         "x: .beeverforge/a\ny: ./.beeverforge/b\nz: my.openfactory/c\nw: .openfactoryx/d\n")
     assert (folder / "b.bin").read_bytes() == b"\xff\xfe.openfactory/"
+
+
+def test_a_rewritten_file_keeps_its_line_endings(tmp_path):
+    """#470's review: `read_text`/`write_text` turned every `\\r\\n` into `\\n`, so the pull
+    request changed every line of a file with Windows line endings, not only its path."""
+    from beeverforge.onboarding import migrate_folder
+
+    folder = tmp_path / ".beeverforge"
+    folder.mkdir()
+    (folder / "a.yaml").write_bytes(b"a: .openfactory/x\r\nb: 1\r\n")
+
+    assert migrate_folder.rewrite_paths(folder) == [".beeverforge/a.yaml"]
+    assert (folder / "a.yaml").read_bytes() == b"a: .beeverforge/x\r\nb: 1\r\n"
 
 
 # ── only `.beeverforge/`, or neither: nothing ───────────────────────────────────────────────────
@@ -254,22 +272,26 @@ def test_a_second_run_names_the_open_pull_request_and_opens_none(product):
     assert _git(forge.remotes["acme/api"], "rev-parse", BRANCH) == head
 
 
-def test_a_branch_an_earlier_run_pushed_gets_its_pull_request_and_no_second_push(product):
+def test_a_branch_left_with_no_open_pull_request_is_named_and_never_reopened(product):
+    """#470's review: a branch with no open pull request is an earlier run that never opened one,
+    or a proposal a person closed, and the two cannot be told apart. Reopening it would bring a
+    declined proposal back on every run, so it is named, for a person to delete, even when the
+    forge would open one now."""
     forge = product({"acme/api": FORMER})
     forge.refuses_to_open.add("acme/api")
     first = _migrate()
     assert forge.opened == [] and BRANCH in _branches(forge.remotes["acme/api"]), first.output
-    assert "did not open" in first.output and "run `beeverforge migrate acme-api` again" in (
-        first.output)
+    assert ("open it from `beeverforge/migrate-folder` on the forge; a second run names the "
+            "branch and does not open one on it") in " ".join(first.output.split()), first.output
     head = _git(forge.remotes["acme/api"], "rev-parse", BRANCH)
     forge.refuses_to_open.clear()
 
     again = _migrate()
 
-    assert again.exit_code == 0, again.output
-    opened, = forge.opened
-    assert opened["head"] == BRANCH and "earlier run" in opened["body"]
-    assert "its pull request is open now at https://forge.example/acme/api/pull/1" in again.output
+    assert again.exit_code == 1, again.output
+    assert forge.opened == [], "a branch left with no pull request was proposed again"
+    assert ("already has a branch `beeverforge/migrate-folder` with no open pull request" in
+            again.output and "delete that branch" in again.output), again.output
     assert _git(forge.remotes["acme/api"], "rev-parse", BRANCH) == head
 
 

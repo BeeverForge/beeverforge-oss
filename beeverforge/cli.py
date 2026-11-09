@@ -2023,7 +2023,7 @@ def migrate_cmd(
     yes: bool = typer.Option(False, "--yes",
                              help="Required: this opens pull requests on YOUR repositories"),
 ) -> None:
-    """Propose renaming OpenFactory's `.openfactory/` folder to `.beeverforge/`, one pull request
+    """Propose renaming the former `.openfactory/` folder to `.beeverforge/`, one pull request
     per repository, for a person to merge.
 
     Per repository of the product — its code repository, the ones named with --source, and its
@@ -2031,8 +2031,10 @@ def migrate_cmd(
     only `.openfactory/` gets one pull request on `beeverforge/migrate-folder` that moves the
     folder and rewrites the `.openfactory/` paths written in its files; one already on
     `.beeverforge/` is left alone; one that carries both is named, for a person to reconcile.
-    Safe to run again: a pull request already open is named, never opened twice. Nothing is
-    written into any checkout of yours."""
+    Files outside the folder that still mention `.openfactory/` are not edited: they are named
+    in the pull request and in the line printed, for you to update. Safe to run again: a pull
+    request already open is named, never opened twice, and a branch left with no open pull request
+    is named for you to delete. Nothing is written into any checkout of yours."""
     from beeverforge.onboarding.migrate_folder import is_this_machine, migrate, repositories
 
     project = _get_project(name)
@@ -2062,6 +2064,10 @@ def migrate_cmd(
             moved = (f" — paths rewritten in {', '.join(said.rewritten)}"
                      if said.rewritten else "")
             typer.echo(f"✓ {said.repo}: the rename is proposed at {said.url}{moved}")
+            if said.outside:
+                typer.echo(f"  ! outside the folder, {', '.join(said.outside)} still mention "
+                           f"`.openfactory/` and are not changed — update them once the rename is "
+                           f"merged")
     if failed:
         raise typer.Exit(1)
 

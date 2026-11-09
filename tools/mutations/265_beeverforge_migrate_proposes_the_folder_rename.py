@@ -66,8 +66,11 @@ MUTATIONS = [
      '                      f"branches to `{repo}`, then run `beeverforge migrate {name}` again.")\n',
      "            pass\n"),
 
-    ("a pushed branch whose pull request did not open stops saying a second run opens it", MF,
-     '            detail = f"{detail}, or run `beeverforge migrate {name}` again to open it."\n',
+    # RE-PINNED 2026-11-09 (#470's review): a second run no longer opens it, so the sentence says
+    # to open it from the branch, and that a second run will not
+    ("a pushed branch whose pull request did not open stops saying how to open it", MF,
+     '            detail = (f"{detail} — open it from `{BRANCH}` on the forge; a second run names "\n'
+     '                      f"the branch and does not open one on it.")\n',
      "            pass\n"),
 
     ("a refused clone stops naming the credential and the second run", MF,
@@ -99,4 +102,17 @@ MUTATIONS = [
     ("a project whose forge is this machine is cloned and pushed to — somebody's checkout", CLI,
      "    if is_this_machine(project):\n",
      "    if False:\n"),
+
+    # #470's review
+    ("a rewritten file loses its Windows line endings: read as text, `\\r\\n` becomes `\\n`", MF,
+     '            text = raw.decode("utf-8")\n',
+     '            text = path.read_text(encoding="utf-8")\n'),
+
+    ("the files outside the folder that still spell the former path are not named", MF,
+     "        outside = outside_references(checkout)\n",
+     "        outside = []\n"),
+
+    ("a branch left with no open pull request is proposed again", MF,
+     "        if branch_there:\n",
+     "        if False:\n"),
 ]
