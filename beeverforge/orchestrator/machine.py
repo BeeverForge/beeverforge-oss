@@ -2493,7 +2493,8 @@ class JobRunner:
                 self.forge.review_pr(
                     pr=pr,
                     event=review_event(result.review, self.manifest.review_mode),
-                    body=_without_credentials(format_review(result.review)),
+                    # withheld inside, on the raw words, before they are quieted (#323)
+                    body=format_review(result.review),
                 )
                 self._landed_also("reviewed")
 

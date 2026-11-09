@@ -233,3 +233,21 @@ def test_where_the_code_is_in_doubt_an_ampersand_is_escaped() -> None:
                         ("<div>\n\nsee <ftp://ex.com/&#x40;x> y", "see <ftp\\://ex.com/\\&#x40;x> y")]:
         rows = _review_rows(ReviewResult(decision="approved", score=90, summary=words))
         assert kept in rows, f"{kept!r} not in {rows!r}"
+
+
+def test_a_credential_holding_a_character_the_helper_rewrites_is_withheld_from_the_posted_review(
+        monkeypatch):
+    """Withheld on the reviewer's raw words, THEN quieted (review of #323 with #196): quieted
+    first, a secret this process holds that carries a `#`, an `@` or a `&` is rewritten into text
+    the literal match no longer finds, and is posted in its rewritten spelling."""
+    from beeverforge.orchestrator.machine import WITHHELD_CREDENTIAL
+
+    secret = "Zq9vK2pL&mX7@someone#12"
+    monkeypatch.setenv("SOMEONE_API_TOKEN", secret)
+    review = ReviewResult(decision="rejected", score=40, summary=f"the log quotes {secret}.",
+                          findings=[Finding(severity="high", description=f"leaks {secret}")])
+
+    posted = format_review(review)
+
+    assert "Zq9vK2pL" not in posted, posted
+    assert posted.count(WITHHELD_CREDENTIAL) == 2, posted

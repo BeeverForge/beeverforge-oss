@@ -30,9 +30,11 @@ MUTATIONS = [
      "    verdict = _review_withheld(verdict)\n",
      ""),
 
-    ("the review posted on the pull request withholds nothing", MACHINE,
-     "                    body=_without_credentials(format_review(result.review)),",
-     "                    body=format_review(result.review),"),
+    # RE-PINNED 2026-11-09 (#323): withheld inside `format_review`, on the raw words, before
+    # `quiet` rewrites them; the call site's own pass is gone
+    ("the review posted on the pull request withholds nothing",
+     "beeverforge/orchestrator/merge_policy.py",
+     "    review = _review_withheld(review)\n", ""),
 
     # ── each group of fields ──
     ("the summary is not withheld from", MACHINE,
@@ -85,20 +87,22 @@ MUTATIONS = [
      "        return review"),
 
     # ── the order: on the raw words, before `_as_text` (#885) ──
+    # RE-PINNED 2026-11-09 (#323): the reviewer's words are quieted inside `_as_text` now (#315)
     ("the summary is withheld from after `_as_text` escaped it", MACHINE,
-     "        out = [first, _as_text(r.summary)]",
-     "        out = [first, _without_credentials(_as_text(review.summary))]"),
+     "        out = [first, _as_text(_without_reviewer_mentions(r.summary))]",
+     "        out = [first, _without_credentials(_as_text(_without_reviewer_mentions("
+     "review.summary)))]"),
 
+    # RE-PINNED 2026-11-09 (#323): as above
     ("a finding is withheld from after `_as_text` escaped it", MACHINE,
      '        for f in r.findings:\n'
      '            loc = f" ({f.file}:{f.line})" if f.file else ""\n'
-     '            out.append(f"- **{f.severity}**{loc}: {_as_text(f.description)}")',
+     '            words = _as_text(_without_reviewer_mentions(f.description))\n',
      '        for f, raw in zip(r.findings, review.findings):\n'
      '            loc = f" ({f.file}:{f.line})" if f.file else ""\n'
-     '            out.append(f"- **{f.severity}**{loc}: "\n'
-     '                       f"{_without_credentials(_as_text(raw.description))}")'),
+     '            words = _without_credentials(_as_text(_without_reviewer_mentions('
+     'raw.description)))\n'),
 
-    # ── and before `headline` cuts them ──
     ("the body's pointer is withheld from after `headline` cut it at 120", MACHINE,
      '            out += [f"> - {p}" for p in head["points"] if p.startswith("wire `")]',
      '            out += [f"> - {_without_credentials(p)}"\n'

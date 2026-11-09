@@ -218,4 +218,9 @@ MUTATIONS = [
     ("the summary loses its `## ` escaping while its mentions are broken", MACHINE,
      "        out = [first, _as_text(_without_reviewer_mentions(r.summary))]",
      "        out = [first, _without_reviewer_mentions(r.summary)]"),
+
+    # review of #323 with #196: withheld on the raw words before `quiet` rewrites them
+    ("the posted review is quieted before its credentials are withheld", POLICY,
+     "    review = _review_withheld(review)\n",
+     ""),
 ]
