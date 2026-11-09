@@ -207,6 +207,26 @@ def test_the_push_argv_carries_no_verify_and_the_override(tmp_path, cache, recor
     assert no_verify, "the push runs without --no-verify"
 
 
+def test_the_push_that_keeps_the_remote_tip_carries_no_verify_and_the_override(tmp_path, cache,
+                                                                                recorder):
+    """Keeping the remote's tip pushes too (#11), to a branch of its own, from the same host
+    repository: the same two answers, so neither stands alone there either."""
+    box = WorktreeSandbox(root=tmp_path / "jobs")
+    ws = box.prepare(repo_path=cache, base_branch="main", branch="job-1")
+    _commit_in(ws.path, "job.py")
+    box.publish_branch(workspace=ws)
+    recorder.argvs.clear()
+    kept = box.keep_remote_tip(workspace=ws)
+    pushes = [argv for argv in recorder.gits() if gitpin.subcommand(argv) == "push"]
+    assert len(pushes) == 1, f"expected one push, saw {len(pushes)}"
+    push = pushes[0]
+    assert f"refs/heads/{kept}" in push[-1], "this is not the push that keeps the tip"
+    hookless = _hookless(push)
+    no_verify = "--no-verify" in push[push.index("push"):]
+    assert hookless, "the keep's push runs without core.hooksPath=/dev/null"
+    assert no_verify, "the keep's push runs without --no-verify"
+
+
 def test_the_runner_puts_the_override_first(recorder):
     worktree._run(["git", "-C", "/nonexistent-182", "status"])
     worktree._run(["true"])

@@ -18,6 +18,13 @@ is no longer a directory (a job can repoint either at another repository). The p
 the host's own repository, with the forge's URL as an argument, never written into any config. The
 directory goes when the push is done, pass or fail.
 
+THE LEASE, AND KEEPING WHAT IT REFUSED, GO THE SAME WAY (#11). The push replaces only the tip the
+workspace last saw (`--force-with-lease`), and answers the commit it pushed, read as data, so the
+next lease needs no git command in the job's repository. When the lease is refused, the remote's
+tip is copied to a branch of its own (`keep_the_remote_tip`) by a fetch and a push run in a host
+repository made the same way and under the same door's configuration; the fetch's negotiation is
+told not to run `for-each-ref` in the borrowed repository (`core.alternateRefsCommand`).
+
 NO GIT VERSION IS RELIED ON FOR THIS (review of #403). The design before this one fetched the
 branch into the host's repository, and the fetch ran git's serving side (`upload-pack`) in the
 job's repository, which reads its config; whether that config could make it run a program was a
@@ -85,10 +92,12 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 from beeverforge import gitpin
+from beeverforge.adapters.sandbox.base import LEASE_REFUSED, PushRefused
 
 #: The box's own door to the host: `(argv, timeout=…, env=…) -> (exit code, output)`.
 Runner = Callable[..., tuple[int, str]]
@@ -107,16 +116,101 @@ _MOST = 64 * 1024 * 1024
 
 def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: str, run: Runner,
                                        redact: Callable[[str], str],
-                                       ambient_env: Mapping[str, str] | None = None) -> None:
+                                       ambient_env: Mapping[str, str] | None = None,
+                                       lease: str | None = None) -> str:
     """Push `branch` of the job's repository whose git directory is `git_dir` (the common one, for
-    a linked worktree) to `target`, from a bare repository the host makes for it.
+    a linked worktree) to `target`, from a bare repository the host makes for it. Answers the
+    commit it pushed, read as data from the job's ref before anything ran, so the caller's next
+    lease is that commit with no git command run in the job's repository to learn it.
 
     `ambient_env` is None for the forge door (`target` is the forge's URL): the push reads no
     configuration but its own repository's. Given, it is the ambient door: the push keeps the
     user-level and system configuration and runs in `ambient_env` (see the module docstring).
 
+    `lease` is what the push may replace (`Workspace.lease`, #11): None is a plain `--force`;
+    otherwise `--force-with-lease=<ref>:<lease>`, where `""` says the branch must not be on the
+    remote at all. A refused lease raises `PushRefused`, so the machine can keep the remote's
+    commits (`keep_the_remote_tip`) before it pushes again.
+
     Raises RuntimeError starting `push failed:` naming the step that failed, with a remedy; the
     temporary directory is removed either way."""
+    with _the_hosts_own_repository(git_dir=git_dir, branch=branch, run=run, redact=redact,
+                                   ambient_env=ambient_env) as (own, env, ref, commit):
+        # --no-verify beside the hooks override, as main's push had it (#182): a pre-push hook is
+        # handed the authenticated URL
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", *_force(ref, lease),
+                                   "--no-verify", "--", target, f"{ref}:{ref}"]), env=env)
+        if rc != 0:
+            if LEASE_REFUSED in out:
+                raise PushRefused(f"push refused: {redact(out)}", branch=branch)
+            raise RuntimeError(f"push failed: {redact(out)}")
+        return commit
+
+
+def keep_the_remote_tip(*, git_dir: Path, branch: str, target: str, run: Runner,
+                        redact: Callable[[str], str],
+                        ambient_env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Copy the remote's tip of `branch` to a branch of its own on the remote (#11). Answers
+    `(the kept branch's name, the tip)`; the caller leases its next push on that tip, so a commit
+    landing between this copy and the push is refused again.
+
+    WHAT A REFUSED LEASE DOES NEXT. The branch holds commits the workspace did not start from — a
+    person's fix, the work a park preserved, a re-run's leftover — and the run must still land its
+    own work there unattended (a self-heal resume, a card moved back). So the commits are copied
+    first, to `<branch>-kept-<12 hex>`, and only then replaced. NEVER FORCED: a ref already at that
+    name holding the same commit is "up to date"; one holding anything else refuses, and the caller
+    holds the job rather than replace it.
+
+    FROM THE HOST'S OWN REPOSITORY, as the push is (#386): the fetch and the push run in the bare
+    repository `_the_hosts_own_repository` makes, under the same door's configuration, so the
+    job's `insteadOf` or `core.sshCommand` never meets the forge's credential here either. It
+    borrows the job's objects and names the job's branch, so the fetch tells the remote it has
+    them and receives only the commits the job does not hold. `core.alternateRefsCommand` is
+    `true` on the fetch: by default git runs `for-each-ref` in a borrowed repository to learn what
+    it holds, which is a git command run in the job's repository; the branch named here is all the
+    negotiation needs."""
+    with _the_hosts_own_repository(git_dir=git_dir, branch=branch, run=run, redact=redact,
+                                   ambient_env=ambient_env) as (own, env, ref, _):
+        theirs = "refs/beeverforge/remote-tip"
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-c", "core.alternateRefsCommand=true", "-C",
+                                   str(own), "fetch", "-q", "--no-tags", "--", target,
+                                   f"+{ref}:{theirs}"]), timeout=180, env=env)
+        if rc != 0:
+            raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
+                               f"{redact(out).strip()[:300]}")
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "rev-parse", "--verify", "--quiet",
+                                   f"{theirs}^{{commit}}"]), env=env)
+        tip = out.strip()
+        if rc != 0 or not _OBJECT_NAME.fullmatch(tip):
+            raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
+                               f"{redact(out).strip()[:300]}")
+        kept = f"{branch}-kept-{tip[:12]}"
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--no-verify", "--",
+                                   target, f"{tip}:refs/heads/{kept}"]), env=env)
+        if rc != 0:
+            raise RuntimeError(f"could not keep {branch!r} on {kept!r}: "
+                               f"{redact(out).strip()[:300]}")
+        return kept, tip
+
+
+def _force(ref: str, lease: str | None) -> list[str]:
+    """How the push may replace the remote's branch: over the lease, or plainly when there is none
+    (`Workspace.lease`). One spelling for both boxes, which the semaphore guard reads as a job
+    branch's push."""
+    if lease is None:
+        return ["--force"]
+    return [f"--force-with-lease={ref}:{lease}"]
+
+
+@contextmanager
+def _the_hosts_own_repository(*, git_dir: Path, branch: str, run: Runner,
+                              redact: Callable[[str], str],
+                              ambient_env: Mapping[str, str] | None
+                              ) -> Iterator[tuple[Path, dict[str, str], str, str]]:
+    """A bare repository of the host's own, outside every mount, borrowing the job's objects and
+    naming the job's branch: `(its path, the door's environment, the ref, the branch's commit)`.
+    The ref is read as data and the objects walked first (module docstring); the directory goes
+    when the caller is done, pass or fail."""
     ref = f"refs/heads/{branch}"
     commit = _the_branchs_commit(git_dir, branch)
     _borrows_nothing(git_dir)
@@ -142,12 +236,7 @@ def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: st
                 f"{git_dir}: its branch names {commit}, which its objects do not hold (git "
                 f"update-ref exited {rc}): {redact(out).strip()[:300]} — check that the job's "
                 "repository is whole (`git fsck`), then publish again")
-        # --no-verify beside the hooks override, as main's push had it (#182): a pre-push hook is
-        # handed the authenticated URL
-        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--force", "--no-verify",
-                                   "--", target, f"{ref}:{ref}"]), env=env)
-        if rc != 0:
-            raise RuntimeError(f"push failed: {redact(out)}")
+        yield own, env, ref, commit
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

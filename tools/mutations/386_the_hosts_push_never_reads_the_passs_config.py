@@ -35,30 +35,34 @@ PUSH = "beeverforge/adapters/sandbox/host_push.py"
 
 MUTATIONS = [
     # ── 1. the push runs from the host's own repository ────────────────────────────────────────
+    # RE-PINNED 2026-11-09 (#450): the push carries the lease and answers what it pushed
     ("the worktree box pushes from the job's worktree again, reading the pass's config", BOX,
-     "        push_from_the_hosts_own_repository(\n"
-     "            git_dir=self._git_dir, branch=workspace.branch, target=target, run=_run,\n"
-     "            redact=_redact, ambient_env=None if remote_url else "
-     "_scrubbed_env(self.extra_env))\n",
+     "        pushed = push_from_the_hosts_own_repository(\n"
+     "            git_dir=git_dir, branch=workspace.branch, target=target, run=_run,\n"
+     "            redact=_redact, ambient_env=ambient_env, lease=workspace.lease)\n",
      "        rc, out = _run(gitpin.argv([\"-C\", str(workspace.path), \"push\", \"--force\", "
      "\"--\", target,\n"
      "                                    workspace.branch]))\n"
      "        if rc != 0:\n"
-     "            raise RuntimeError(f\"push failed: {_redact(out)}\")\n"),
+     "            raise RuntimeError(f\"push failed: {_redact(out)}\")\n"
+     "        pushed = workspace.lease\n"),
 
+    # RE-PINNED 2026-11-09 (#450): the push carries the lease and answers what it pushed
     ("the container box pushes from the bind-mounted host clone again, reading the job's config",
      CONTAINER,
-     "            push_from_the_hosts_own_repository(\n"
+     "            pushed = push_from_the_hosts_own_repository(\n"
      "                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,\n"
-     "                redact=_redact, ambient_env=None if remote_url else dict(os.environ))\n",
+     "                redact=_redact, ambient_env=ambient_env, lease=workspace.lease)\n",
      "            rc, out = _host(gitpin.argv([\"-C\", str(self._host_clone), \"push\", "
      "\"--force\",\n"
      "                                         \"--\", target, workspace.branch]))\n"
      "            if rc != 0:\n"
-     "                raise RuntimeError(f\"push failed: {_redact(out)}\")\n"),
+     "                raise RuntimeError(f\"push failed: {_redact(out)}\")\n"
+     "            pushed = workspace.lease\n"),
 
+    # RE-PINNED 2026-11-09 (#450): the push carries the lease and answers what it pushed
     ("the helper pushes with the pass's git directory as its own", PUSH,
-     '[*_HOOKLESS, "-C", str(own), "push",', '[*_HOOKLESS, "-C", str(git_dir), "push",'),
+     '[*_HOOKLESS, "-C", str(own), "push", *_force(ref, lease),', '[*_HOOKLESS, "-C", str(git_dir), "push", *_force(ref, lease),'),
 
     # ── 2. no git command in the pass's repository ─────────────────────────────────────────────
     ("the host's repository fetches the branch out of the pass's again, running its serving side "
@@ -124,10 +128,11 @@ MUTATIONS = [
      "repository \"\n"
      "                f\"{git_dir}: its branch names"),
 
+    # RE-PINNED 2026-11-09 (#450): the push carries the lease and answers what it pushed
     ("the worktree box asks the worktree for its git directory at push time, after the pass "
      "could repoint it", BOX,
-     "git_dir=self._git_dir, branch=workspace.branch,",
-     "git_dir=_common_dir(workspace.path), branch=workspace.branch,"),
+     "        return target, self._git_dir, None if",
+     "        return target, _common_dir(workspace.path), None if"),
 
     ("a worktree box whose git directory could not be read at prepare pushes with none", BOX,
      "        if self._git_dir is None:\n", "        if False:\n"),
@@ -175,12 +180,15 @@ MUTATIONS = [
      '"GIT_SSH_COMMAND": "ssh -F /dev/null"', '"GIT_SSH_COMMAND": "ssh"'),
 
     # ── 4. the ambient door ────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-11-09 (#450): the door is settled once, for the push and the keep
     ("the worktree box's ambient door runs in the worker's whole environment", BOX,
-     "else _scrubbed_env(self.extra_env))", "else dict(os.environ))"),
+     "None if remote_url else _scrubbed_env(self.extra_env)\n",
+     "None if remote_url else dict(os.environ)\n"),
 
+    # RE-PINNED 2026-11-09 (#450): the door is settled once, for the push and the keep
     ("the ambient door drops the person's own configuration, where their credential lives", BOX,
-     "ambient_env=None if remote_url else _scrubbed_env(self.extra_env))",
-     "ambient_env=None)"),
+     "        return target, self._git_dir, None if remote_url else _scrubbed_env(self.extra_env)\n",
+     "        return target, self._git_dir, None\n"),
 
     ("hooks are on in the host's repository, so a hooks path the user config names runs", PUSH,
      '_HOOKLESS = ("-c", "core.hooksPath=/dev/null")', "_HOOKLESS = ()"),

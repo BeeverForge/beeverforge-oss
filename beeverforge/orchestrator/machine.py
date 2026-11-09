@@ -10,6 +10,7 @@ and repair were layered on in this file.) The orchestrator itself stays determin
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 import time
@@ -30,7 +31,12 @@ from beeverforge.adapters.forge.base import display_name as forge_display_name
 from beeverforge.adapters.notify.base import Level, NullNotifier
 from beeverforge.adapters.notify.base import Notifier as NotifierT
 from beeverforge.adapters.reviewer.base import ReviewerAdapter, ReviewInput
-from beeverforge.adapters.sandbox.base import BranchHeldElsewhere, SandboxAdapter, Workspace
+from beeverforge.adapters.sandbox.base import (
+    BranchHeldElsewhere,
+    PushRefused,
+    SandboxAdapter,
+    Workspace,
+)
 from beeverforge.adapters.sandbox.stopping import JobStopped, Stop
 from beeverforge.adapters.tracker.base import TrackerAdapter
 from beeverforge.contracts import (
@@ -86,7 +92,7 @@ from beeverforge.policy.census import vanished as census_vanished
 from beeverforge.policy.protected import violations as protected_violations
 from beeverforge.product.model import WITHHELD_CREDENTIAL, scrub_credentials
 from beeverforge.techlead import voice as tl_voice
-from beeverforge.techlead.classify import ENVIRONMENT, TREE, UNKNOWN
+from beeverforge.techlead.classify import CODE, ENVIRONMENT, TREE, UNKNOWN
 
 _SETUP_TIMEOUT = 1800
 #: The census ENUMERATES; it does not build. `_SETUP_TIMEOUT` is sized for `dotnet restore`
@@ -247,6 +253,140 @@ def _never_ran_reason(validations: list[ValidationResult]) -> str:
     return (f"a gate could not run, so nothing was proven about this diff: {named}{more}. "
             f"No repair was attempted — the command is missing where the gates run, which is not "
             f"something the code can fix.")
+
+
+#: How much of a failing gate a park note shows (#11): the card holds the short form, the journal
+#: the whole tail. Gates past `_GATES_NAMED` are counted, not shown.
+_GATES_NAMED = 3
+_GATE_TAIL_LINES = 5
+_GATE_LINE_CHARS = 160
+_GATE_TAIL_CHARS = 400
+
+
+def _failing_gates(validations: list[ValidationResult]) -> list[ValidationResult]:
+    """The BLOCKING gates that ran and failed: the cause of a gate park. An advisory gate reports
+    and never decides, and a gate that never ran is `_never_ran_reason`'s."""
+    return [v for v in validations if v.passed is False and not v.advisory and not v.unrunnable]
+
+
+def _withheld(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """`text` with every credential in it withheld: first each value in `secrets` — what reached
+    the gate's environment under a name nothing reads as a credential's (`_in_the_gates_reach`,
+    #11) — then every credential `_without_credentials` finds. Values first, on the raw text: a
+    value that holds a token-shaped run would otherwise lose only that run, and the rest of it
+    would be printed."""
+    for secret in secrets:
+        text = text.replace(secret, WITHHELD_CREDENTIAL)
+    return _without_credentials(text)
+
+
+def _gate_tail(v: ValidationResult, secrets: tuple[str, ...] = ()) -> list[str]:
+    """The last lines a gate printed, credentials withheld on the RAW text before any cut — a
+    token split by the cut would no longer match its prefix."""
+    lines = [ln[:_GATE_LINE_CHARS] for ln in _withheld(v.output_tail, secrets).splitlines()
+             if ln.strip()][-_GATE_TAIL_LINES:]
+    while len(lines) > 1 and sum(len(ln) + 1 for ln in lines) > _GATE_TAIL_CHARS:
+        lines.pop(0)
+    return lines
+
+
+def _failing_gates_said(validations: list[ValidationResult],
+                        secrets: tuple[str, ...] = ()) -> str:
+    """Each failing blocking gate for a park note (#11): its role, its exit code, its command and
+    the last lines it printed, as an indented code block — so an `@name` or a `#12` in the output
+    notifies nobody on a forge that renders markdown, and a backtick in it cannot end a span.
+
+    AND EVERY `#12` IS WRITTEN `card 12` (`without_mentions`): the card may be a Jira or an Azure
+    Boards item, whose comment does not read an indent as code, and on Azure `#12` links a work
+    item. An `@name` is left for the indent alone: neither of those notifies on a bare `@`."""
+    failing = _failing_gates(validations)
+    blocks = []
+    for v in failing[:_GATES_NAMED]:
+        command = [f"$ {ln}"[:_GATE_LINE_CHARS] for ln in
+                   (_withheld(v.command, secrets).splitlines() or [""])]
+        printed = _gate_tail(v, secrets) or ["(it printed nothing)"]
+        lines = [without_mentions(ln) for ln in [*command, *printed]]
+        body = "\n".join(f"    {ln}" for ln in lines)
+        blocks.append(f"`{v.name}` exited {v.exit_code}:\n\n{body}")
+    if len(failing) > _GATES_NAMED:
+        blocks.append(f"…and {len(failing) - _GATES_NAMED} more failing gate(s); the journal "
+                      f"holds every one.")
+    return "\n\n".join(blocks)
+
+
+#: The handle a hold carries when Resume must start from the forge's copy of the branch and not
+#: continue the agent's session (#11): the work on the branch is not the work that session did.
+#: Truthy, so `prepare` restores the branch; it decodes to nothing in any adapter (cold session).
+_FROM_THE_FORGE = "worktree-only"
+
+
+def _kept_said(branch: str, kept: str) -> str:
+    """What a push that kept the forge's commits first says on the card and in the journal (#11):
+    the branch they are on now, so a person can get them back."""
+    return (f"`{branch}` on the forge had commits this run did not start from — a person's fix, "
+            f"or the work an earlier attempt left there — so they were kept on the branch "
+            f"`{kept}` before this run's work replaced them on `{branch}`.")
+
+
+def _lease_refused_said(branch: str, *, kept: str = "", keeping_failed: bool = False) -> str:
+    """Why a push was refused rather than made (#11, `Workspace.lease`), and the two ways on:
+    the forge's commits could not be kept first, or the branch moved again after they were."""
+    if kept:
+        why = (f"this run kept them on `{kept}`, and the branch moved again before its push "
+               f"landed, so the push was refused rather than replace what arrived")
+    elif keeping_failed:
+        why = ("keeping a copy of them first failed (the journal has git's words), so this "
+               "run's push was refused rather than replace them")
+    else:
+        why = "so this run's push was refused rather than replace them"
+    return (f"`{branch}` on the forge has commits this run did not start from — a person's fix, "
+            f"or the work an earlier park left there — {why}.{_resume_from_the_forge(branch)}")
+
+
+def _resume_from_the_forge(branch: str) -> str:
+    """What a Resume of a hold refused by the lease does (#11) — not what a pause's does, whose
+    resume carries no handle and starts from the base (`_preserve_partial`)."""
+    return (f" Resume continues from the forge's `{branch}`, dropping this run's own commits; if "
+            f"nothing on it is wanted, delete `{branch}` on the forge first, and Resume starts "
+            f"fresh from the base.")
+
+
+def _pause_refused_said(branch: str, refused: str) -> str:
+    """What a rate-limit pause whose push `_publish` refused says (#11): why, and that its resume
+    starts from the base — it carries no handle, so not what a refused hold's Resume does."""
+    return (f"Nothing was pushed: {refused.removesuffix(_resume_from_the_forge(branch))} The "
+            f"partial work is not on the forge, so the resume starts fresh from the base.")
+
+
+def _where_the_work_is(branch: str, outcome: str, kept: Path | None = None,
+                       refusal: str = "") -> str:
+    """The park note's last sentence: where the agent's work is, and what Resume then does.
+
+    `kept` is the repository that still holds the branch once the workspace is gone, as the box
+    says (`kept_after_cleanup`) — None when nothing survives the job."""
+    if outcome == "pushed":
+        return (f"The work is on branch `{branch}`: Resume continues it, or fix the gate there by "
+                f"hand.")
+    if outcome == "nothing-written":
+        return ("Nothing was pushed: the agent left no change on the branch, so a Resume starts "
+                "fresh.")
+    if outcome == "not-committed":
+        return ("Nothing was pushed: the agent's changes could not be committed (the journal has "
+                "why), so they went with the workspace when the job ended, and a Resume starts "
+                "fresh from the base. The box did not run `git commit`: check that it runs "
+                "commands (`beeverforge box prove`) before resuming.")
+    if outcome == "lease-refused":
+        return "Nothing was pushed: " + (refusal or _lease_refused_said(branch))
+    if kept is not None:
+        return (f"Nothing was pushed: the push of `{branch}` to the forge failed (the journal has "
+                f"git's words). The work is committed on the local branch `{branch}` in the "
+                f"repository at `{kept}` on this worker: push it to the forge by hand before "
+                f"resuming, because Resume starts from the forge's `{branch}`, and with none "
+                f"there it deletes that local branch and starts fresh from the base.")
+    return (f"Nothing was pushed: the push of `{branch}` to the forge failed (the journal has "
+            f"git's words), and the box's copy of the work was discarded when the job ended, so "
+            f"the work is lost and a Resume starts fresh from the base. Check the forge's push "
+            f"credential before resuming, or the next push fails the same way.")
 
 
 @dataclass(frozen=True)
@@ -2231,6 +2371,26 @@ class JobRunner:
                 # is wrong.
                 reason = (_never_ran_reason(validations)
                           or f"validations failed after {attempts} repair attempt(s)")
+                if not _never_ran(validations):
+                    # THE FIRST LINE STAYS THE SENTENCE, ALONE (#11): `classify` reads it as the
+                    # change and `memory.signature` signs only it, so a tail that differs on every
+                    # run still lands on one recognised failure. The gates follow it, and the park
+                    # declares its own cause, so what the project printed cannot steer the verdict.
+                    secrets = self._in_the_gates_reach()
+                    self._emit(ticket, "note", f"{reason} — the failing gates", gates=[
+                        {"name": v.name, "command": _withheld(v.command, secrets),
+                         "exit_code": v.exit_code,
+                         "output_tail": _withheld(v.output_tail, secrets)}
+                        for v in _failing_gates(validations)])
+                    reason += "\n\n" + _failing_gates_said(validations, secrets)
+                    result.hold_cause = CODE
+                # ADR-0013 D1, ON THIS PARK TOO (#11): the agent's commits are pushed, or they
+                # live only in a worktree `cleanup` removes. The latest pass's handle continues it.
+                result.resume_handle = self._preserve_for_hold(
+                    ticket, ws, rep.resume_handle if attempts else agent_result.resume_handle)
+                reason += "\n\n" + _where_the_work_is(branch, self._preserve_outcome,
+                                                       self._kept_after_cleanup(ws),
+                                                       self._preserve_refusal)
                 result.state, result.note = JobState.ON_HOLD, reason
                 mention = f"@{owner} " if owner else ""
                 self._say_on_ticket(ticket.id, f"{mention}On hold — {reason}")
@@ -2460,7 +2620,12 @@ class JobRunner:
             self._knowledge_gate(ticket, ws, base, result)
             # push the branch to the forge (as the bot, host credentials) before the PR
             self._unless_stopped("publish_branch")
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            # SOMEBODY ELSE'S COMMITS MAY BE ON THE BRANCH (#11): a person's fix after a park, the
+            # work a park preserved, a re-run's leftover. `_publish` keeps them on a branch of
+            # their own before replacing them, and holds only when it cannot.
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return self._hold(ticket, owner, refused, JobState.ON_HOLD,
+                                  branch=branch, resume_handle=_FROM_THE_FORGE)
             card = card_reference_for(self, ticket)
             # CHARGED BEFORE THE BODY IS WRITTEN (#310). Every pass of this walk has run by now —
             # the review and any re-review included — and `_charged` used to run only at the
@@ -2793,7 +2958,11 @@ class JobRunner:
                     # way a pass reaches the forge. Its `Cost:` line still catches up.
                     self._republish_review(pr_url)
                     return held.model_copy(update={"code_changed": False})
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            # THE BRANCH MAY HAVE MOVED UNDER THIS PASS (#11): it started from the tip it
+            # fetched. What somebody pushed since is kept, or the pass holds, naming the branch.
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return as_left(self._hold(ticket, owner, refused,
+                                          JobState.ON_HOLD, branch=branch, pr_url=pr_url))
             # Gate-suppression guard (engineering.md #12) on the CI-repair path too: if the fix
             # SILENCED a gate (a noqa / pragma-no-cover / type-ignore / nosec suppression), a
             # green CI no longer proves what it claims — it must NOT auto-merge. The main run()
@@ -3557,26 +3726,125 @@ class JobRunner:
         commit + push whatever the agent wrote, and return the handle ONLY when there was real
         work to preserve. A hold that carries a handle is a RESUMABLE hold (the operator's
         Resume continues the attempt); no work → None → today's fresh-restart semantics (a
-        spec-style hold must not turn into a bogus 'continue')."""
+        spec-style hold must not turn into a bogus 'continue').
+
+        What happened is left in `_preserve_outcome`, for a park that tells its reader where the
+        work is (#11) — named by the step that failed, because each has its own cause and remedy:
+        "not-committed" (`_commit` raised), "push-failed", "lease-refused" (somebody else's
+        commits are on the branch, `PushRefused`), "nothing-written" and "pushed".
+
+        A PUSH THAT FAILED WHERE THE BRANCH SURVIVES THE JOB STILL CARRIES THE HANDLE. On the
+        worktree box the commits stay on the local branch (`kept_after_cleanup`) and the note asks
+        the reader to push it by hand before resuming; a handle is what makes that Resume start
+        from the forge's copy, where without one it would start from the base and the branch they
+        pushed would refuse the next push (`Workspace.lease`). Where nothing survives (the
+        container box) there is nothing to continue, and no handle."""
+        self._preserve_outcome, self._preserve_refusal = "not-committed", ""
         try:
             self._commit(ws, ticket)  # no-ops on an empty tree
-            written = self.sandbox.diff_paths(workspace=ws)
+            try:
+                written = self.sandbox.diff_paths(workspace=ws)
+            except Exception as exc:  # noqa: BLE001 — unread, as `None` is: the push still runs
+                log.warning("could not read what %s changed (%s) — pushing it anyway",
+                            ws.branch, str(exc)[:160])
+                written = None
             # `None` IS NOT `[]` (#251): a diff that could not be read is not a workspace with
             # nothing in it, and discarding on it throws away the agent's partial work and turns
             # a resumable hold into a fresh restart. Preserving costs a push; the other way costs
             # the work. `onboarding/firstrun.py` used to take a second `git status` read here for
             # exactly this reason, alone in the tree.
             if written is not None and not written:
+                self._preserve_outcome = "nothing-written"
                 return None  # nothing was written → plain hold, fresh restart on resume
             self._unless_stopped("publish_branch for a hold")  # a BaseException: not caught below
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            self._preserve_outcome = "push-failed"
+            # a sentence or None, read by truth: `is not None` above is the diff's alone (#251)
+            refused = self._publish(ticket, ws, ws.branch)
+            if refused:
+                self._preserve_outcome, self._preserve_refusal = "lease-refused", refused
+                return _FROM_THE_FORGE
+            self._preserve_outcome = "pushed"
             self._emit(ticket, "note", "partial work pushed — Resume will continue it")
             # No session known → a non-empty sentinel: it still signals "restore the branch"
             # (bool-truthy) while decoding to nothing in any adapter (cold session, warm code).
-            return resume_handle or "worktree-only"
+            return resume_handle or _FROM_THE_FORGE
         except Exception as exc:  # noqa: BLE001 — preserving is opportunistic; never fail the hold
-            self._emit(ticket, "warning", f"couldn't preserve partial work ({str(exc)[:120]})")
+            # git's words can carry the push URL's userinfo: withheld before the cut (#11)
+            self._emit(ticket, "warning", f"couldn't preserve partial work "
+                       f"({_withheld(str(exc), self._in_the_gates_reach())[:120]})")
+            if self._preserve_outcome == "push-failed" and self._kept_after_cleanup(ws):
+                return resume_handle or _FROM_THE_FORGE
             return None
+
+    def _publish(self, ticket: Ticket, ws: Workspace, branch: str) -> str | None:
+        """Push the job's branch, keeping whatever the push would replace that this run did not
+        start from (#11). None when it landed; otherwise the sentence the caller holds on.
+
+        THE ONE DOOR EVERY PUSH OF THE JOB'S BRANCH GOES THROUGH — the pull request's, a CI
+        repair's, the auto-merge's after a rebase, and a park's preserve — so they cannot come to
+        treat a refused lease differently. A refused lease (`PushRefused`) is somebody else's
+        commits on the branch. Parking on it stopped every unattended way back into a card with a
+        leftover branch: a self-heal resume, a card moved back to the queue. So the forge's tip is
+        first copied to a branch of its own (`keep_remote_tip`), the journal and the card say where,
+        and the push is made again with its lease on that tip — a commit landing in between is
+        still refused. Only when the copy fails, or that second push is refused too, does the job
+        hold, naming the branch. Any other failure of the push is raised, as it always was."""
+        remote = self.forge.push_remote()
+        try:
+            self.sandbox.publish_branch(workspace=ws, remote_url=remote)
+            return None
+        except PushRefused:
+            pass
+        keep = getattr(self.sandbox, "keep_remote_tip", None)
+        if not callable(keep):
+            return _lease_refused_said(branch)
+        try:
+            kept = keep(workspace=ws, remote_url=remote)
+        except Exception as exc:  # noqa: BLE001 — nothing kept is nothing replaced: the job holds
+            self._emit(ticket, "warning", f"could not keep what is on `{branch}` before pushing "
+                       f"over it ({_withheld(str(exc), self._in_the_gates_reach())[:200]})")
+            return _lease_refused_said(branch, keeping_failed=True)
+        said = _kept_said(branch, kept)
+        self._emit(ticket, "note", said, kept=kept)
+        self._say_on_ticket(ticket.id, said)
+        try:
+            self.sandbox.publish_branch(workspace=ws, remote_url=remote)
+        except PushRefused:
+            return _lease_refused_said(branch, kept=kept)
+        return None
+
+    def _kept_after_cleanup(self, ws: Workspace) -> Path | None:
+        """The repository that still holds the job's branch once its workspace is gone, as the box
+        says (#11) — None for a box that keeps nothing, or that does not say."""
+        ask = getattr(self.sandbox, "kept_after_cleanup", None)
+        try:
+            return ask(workspace=ws) if callable(ask) else None
+        except Exception as exc:  # noqa: BLE001 — a box that cannot say keeps nothing to name
+            log.warning("the box could not say where %s survives it (%s) — the park says the "
+                        "work is lost", ws.branch, str(exc)[:160])
+            return None
+
+    def _in_the_gates_reach(self) -> tuple[str, ...]:
+        """The values a gate could print that no credential-shaped NAME gives away (#11): every
+        variable the box hands a command it runs that may hold a credential, as the box says
+        (`credentials_in_reach`) — asked with the project's `token_env` names, which can be called
+        anything — longest first. Eight characters at least, as `scrub_credentials` reads them: a
+        shorter value is a flag, and withholding it would eat ordinary words."""
+        from beeverforge.adapters.sandbox.container import _AUTH_ENV_VARS
+        from beeverforge.registry import token_envs
+
+        named = tuple(sorted(n for n in token_envs(self.project)
+                             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)))
+        ask = getattr(self.sandbox, "credentials_in_reach", None)
+        try:
+            found = (ask(named=named) if callable(ask)
+                     else {n: os.environ.get(n, "") for n in (*_AUTH_ENV_VARS, *named)})
+        except Exception:  # noqa: BLE001 — the scrub by shape still runs; this adds to it
+            log.warning("the box could not say which credentials its commands read — a gate's "
+                        "output is withheld by the shape of a credential only", exc_info=True)
+            found = {}
+        return tuple(sorted({v for v in found.values() if v and len(v) >= 8},
+                            key=len, reverse=True))
 
     def _preserve_partial(
         self, ticket: Ticket, ws: Workspace | None, branch: str, resume_handle: str | None
@@ -3585,13 +3853,23 @@ class JobRunner:
         (a fresh, ephemeral container) can restore it via checkout_existing. Returns the opaque
         resume_handle to round-trip — but only if the partial was actually preserved, so a
         resume never checks out a branch that was never pushed. Best-effort: any failure just
-        degrades to a fresh restart (today's behaviour), never crashes the pause."""
+        degrades to a fresh restart (today's behaviour), never crashes the pause.
+
+        THE PUSH GOES THROUGH `_publish` (#11), like every other push of the job's branch. On a
+        fresh start the lease is the empty tip, so a branch an earlier park left on the forge
+        refused this push; the pause handed back no handle and the resume prepared from the base,
+        dropping the agent's partial work. Now the forge's tip is kept on a branch of its own and
+        the push lands; only when that fails too is nothing pushed — said, and no handle."""
         if ws is None:
             return resume_handle  # local/test path with no real git remote — nothing to push
         try:
             self._commit(ws, ticket)  # commit the partial tree (no-op if the agent wrote nothing)
             self._unless_stopped("publish_branch for a pause")  # a BaseException: not caught below
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            if refused := self._publish(ticket, ws, ws.branch):
+                said = _pause_refused_said(ws.branch, refused)
+                self._emit(ticket, "warning", f"couldn't preserve partial work — {said}")
+                self._say_on_ticket(ticket.id, said)
+                return None  # no branch pushed → the resume must NOT try to check it out
             self._emit(ticket, "note", "partial work pushed — resume will continue it")
             return resume_handle
         except Exception as exc:  # noqa: BLE001 — preserving is opportunistic; never fail the pause
@@ -3710,7 +3988,11 @@ class JobRunner:
                     JobState.ON_HOLD, branch=branch,
                 )
             self._unless_stopped("publish_branch after a rebase")
-            self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+            # the lease is the tip this run pushed for the pull request: only somebody else's
+            # push since then refuses it, and `_publish` keeps that before replacing it (#11)
+            if (refused := self._publish(ticket, ws, branch)) is not None:
+                return self._hold(ticket, owner, refused, JobState.ON_HOLD,
+                                  branch=branch, pr_url=pr)
         self._unless_stopped("merge_pr")
         try:
             self.forge.merge_pr(pr=pr)

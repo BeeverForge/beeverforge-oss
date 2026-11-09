@@ -262,6 +262,9 @@ BIRTHS = {
         "created, before any role runs",
     ("beeverforge/onboarding/onboard.py", "onboard_product_context"):
         "onboarding's first commit to a born-empty context repository (no base to propose to)",
+    ("beeverforge/adapters/sandbox/host_push.py", "keep_the_remote_tip"):
+        "a job branch's tip copied to `<branch>-kept-<sha>`, a branch it creates and never forces "
+        "(#11): a ref already there with other content refuses the push",
 }
 
 
@@ -326,6 +329,11 @@ class _Code:
                 parts = node.args if isinstance(node, ast.Call) else node.elts
                 words = [p.value for p in parts if isinstance(p, ast.Constant)]
                 if "push" not in words or "--force" in words:
+                    continue
+                # A JOB BRANCH'S PUSH (#11): forced over the tip its workspace saw, spelled by
+                # `sandbox.host_push._force` for both boxes — a branch of its own, as `--force` is.
+                if any(isinstance(p, ast.Starred) and isinstance(p.value, ast.Call)
+                       and self.callee(p.value) == "_force" for p in parts):
                     continue
                 if isinstance(node, ast.Call) and any(
                         isinstance(p, (ast.List, ast.Tuple)) for p in parts):

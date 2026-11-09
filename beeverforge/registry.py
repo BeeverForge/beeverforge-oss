@@ -820,7 +820,7 @@ class ProjectRegistry:
             self._save_raw(raw)
 
 
-def _token_envs(project) -> set[str]:
+def token_envs(project) -> set[str]:
     """Every variable NAME a project's registry entry says holds one of its credentials."""
     names: set[str] = set()
     for axis in ("tracker", "forge", "board", "ci", "factory_board"):
@@ -845,7 +845,7 @@ def _without_foreign_tokens(project, projects):
     policy = getattr(project, "preview", None)
     if policy is None:
         return project
-    tokens = set().union(*(_token_envs(p) for p in projects))
+    tokens = set().union(*(token_envs(p) for p in projects))
     if not tokens:
         return project
     changed = False

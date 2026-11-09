@@ -69,8 +69,12 @@ def signature(note: str) -> str:
 
     "GraphQL: API rate limit exceeded for installation ID 146152259" on #478 and the same message on
     #503 must land on ONE signature, or a recurring problem is remembered as unrelated one-offs and
-    nothing is ever learned."""
-    text = (note or "").strip().lower()
+    nothing is ever learned.
+
+    ONLY THE FIRST LINE IS SIGNED (#11). A park whose note goes on to quote what a gate printed
+    keeps its identity on that line, and the quote — timings, counts, paths that differ on every
+    run — must not make the same failure two."""
+    text = (note or "").strip().split("\n", 1)[0].lower()
     for pattern, replacement in _NOISE:
         text = pattern.sub(replacement, text)
     return text.strip()[:_SIGNATURE_CHARS]

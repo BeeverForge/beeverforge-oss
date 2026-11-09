@@ -62,9 +62,13 @@ MUTATIONS = [
 
     # 1. the push
     # RE-PINNED 2026-11-09 (#403): the push runs from the host's own repository (`host_push`)
+    # RE-PINNED 2026-11-09 (#450): the push carries the lease and answers what it pushed
     ("the push runs a pre-push hook again: `--no-verify` is gone", HOST_PUSH,
-     '"push", "--force", "--no-verify",\n',
-     '"push", "--force",\n'),
+     '"--no-verify", "--", target, f"{ref}:{ref}"',
+     '"--", target, f"{ref}:{ref}"'),
+    ("the push that keeps the remote's tip runs a pre-push hook: `--no-verify` is gone", HOST_PUSH,
+     '"push", "--no-verify", "--",\n                                   target, f"{tip}',
+     '"push", "--",\n                                   target, f"{tip}'),
     ("the push, and only the push, runs with the shared cache's hooks", WORKTREE,
      '    if cmd[:1] == ["git"]:\n',
      '    if cmd[:1] == ["git"] and "push" not in cmd:\n'),

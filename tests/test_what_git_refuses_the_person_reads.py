@@ -235,7 +235,10 @@ def test_the_auto_hold_carries_the_WHOLE_sentence_and_the_address():
 
     src = inspect.getsource(machine.JobRunner._auto_merge)
     assert "str(exc)[:150]" not in src, "the sentence is truncated before the file name"
-    assert "pr_url=pr" in src, "the hold names no pull request"
+    # THIS hold's call, not the function's: a lease refused after the rebase holds with the
+    # address too (#11), and would answer for this one
+    said = src.index("could not be merged — needs a human")
+    assert "pr_url=pr" in src[said:src.index(")", said)], "the hold names no pull request"
 
 
 # ── one refusal, asked by every door ────────────────────────────────────────────────────────────

@@ -43,7 +43,8 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from beeverforge import gitpin
@@ -53,7 +54,10 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
-from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
+from beeverforge.adapters.sandbox.host_push import (
+    keep_the_remote_tip,
+    push_from_the_hosts_own_repository,
+)
 from beeverforge.adapters.sandbox.pull import PullCredential
 from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 from beeverforge.observability import logs
@@ -283,6 +287,17 @@ def _materialize_workspace(*, repo_path: Path, host_clone: Path, base_branch: st
     # is measured from never depends on which refs its clone happens to carry.
     rc, out = _host(["git", "-C", str(host_clone), "rev-parse", "HEAD"])
     return out.strip() if rc == 0 else None
+
+
+def _lease_of(host_clone: Path, branch: str, checkout_existing: bool) -> str:
+    """What this box's first push may replace (`Workspace.lease`, #11): the branch's tip as
+    `_materialize_workspace` fetched it on a resume or a repair, and nothing — the branch must not
+    be on the remote — on a fresh start. The clone is never the remote, so there is always one."""
+    if not checkout_existing:
+        return ""
+    from beeverforge.adapters.sandbox.worktree import _tip
+
+    return _tip(host_clone, f"refs/remotes/origin/{branch}")
 
 
 def _the_base(host_clone: Path, base_branch: str, remote_url: str | None, repo_path: Path) -> str:
@@ -657,7 +672,8 @@ class ContainerSandbox(SandboxAdapter):
         # `path` is the IN-CONTAINER mount point; `host_path` is the same checkout as the
         # orchestrator sees it (the bind-mounted clone) — what host-side readers must use.
         return Workspace(path=Path(_WORKDIR), host_path=host_clone,
-                         branch=branch, base_branch=base_branch, base_commit=base_commit)
+                         branch=branch, base_branch=base_branch, base_commit=base_commit,
+                         lease=_lease_of(host_clone, branch, checkout_existing))
 
     #: What git says when the global config it was asked to write cannot be written - the only
     #: answers that make HOME the cause. Anything else (no git in the image, a box that stopped)
@@ -909,14 +925,10 @@ class ContainerSandbox(SandboxAdapter):
         # commits live in the host-side ephemeral clone; push from the HOST (never the
         # container). Prefer the authenticated bot remote; else the repo's origin URL.
         assert self._host_clone and self._repo_path, "prepare() must be called first"
-        target = remote_url
-        if not target:
-            rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
-            if rc != 0:
-                raise RuntimeError(f"could not resolve origin remote: {url}")
-            target = url.strip()
-        # --force: the bot's dedicated beeverforge/<id> branch, unique per job, serial execution
-        # — a retry after a partial failure must overwrite, not dead-lock on non-ff.
+        target, ambient_env = self._push_door(remote_url)
+        # FORCED, BUT ONLY OVER WHAT THIS WORKSPACE SAW (#11) — the worktree box's
+        # `publish_branch` says why. This clone is a fresh one per job, so its lease is the only
+        # memory of the remote's tip it has.
         #
         # NEVER FROM THE HOST CLONE'S OWN GIT DIRECTORY (#386): the box sees that clone as
         # /workspace, `.git/config` included, and a push run there reads what the job wrote —
@@ -933,9 +945,44 @@ class ContainerSandbox(SandboxAdapter):
         # `docker pause` until the push's git calls are done, nothing in the box runs. The host
         # reads the clone through its own filesystem, which a paused container does not hold, and
         # nothing here needs the box running (no `docker exec`). No freeze, no push.
+        with self._frozen(workspace.branch) as git_dir:
+            pushed = push_from_the_hosts_own_repository(
+                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
+                redact=_redact, ambient_env=ambient_env, lease=workspace.lease)
+        if workspace.lease is not None:
+            workspace.lease = pushed
+
+    def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
+        """The remote's tip of the branch, kept on a branch of its own before a push replaces it
+        (`host_push.keep_the_remote_tip`, #11) — from the host's own repository, borrowing the
+        clone's objects with the box frozen, as the push does."""
+        assert self._host_clone and self._repo_path, "prepare() must be called first"
+        target, ambient_env = self._push_door(remote_url)
+        with self._frozen(workspace.branch) as git_dir:
+            kept, workspace.lease = keep_the_remote_tip(
+                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
+                redact=_redact, ambient_env=ambient_env)
+        return kept
+
+    def _push_door(self, remote_url: str | None) -> tuple[str, dict[str, str] | None]:
+        """Where this box pushes and the door's environment: the forge's authenticated URL with
+        none of its own, else the repository's origin in the worker's own environment (no mount
+        puts the worker's HOME in this box's reach). One answer for the push and the keep (#11)."""
+        if remote_url:
+            return remote_url, None
+        rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
+        if rc != 0:
+            raise RuntimeError(f"could not resolve origin remote: {url}")
+        return url.strip(), dict(os.environ)
+
+    @contextmanager
+    def _frozen(self, branch: str) -> Iterator[Path]:
+        """The clone's git directory, with the box paused (`docker pause`) until the caller's git
+        calls are done, and refused when it is no longer the directory the materialiser made. The
+        publish comment says why; `keep_remote_tip` reads the same objects, so it is frozen too."""
         if not self._container:
             raise RuntimeError(
-                f"push failed: the box for {workspace.branch!r} has no container to freeze while "
+                f"push failed: the box for {branch!r} has no container to freeze while "
                 "the host reads the job's commits — prepare the box again (run the job again)")
         try:
             rc, out = _host(["docker", "pause", self._container])
@@ -955,9 +1002,7 @@ class ContainerSandbox(SandboxAdapter):
                     f"push failed: {git_dir} is no longer the git directory the box was given "
                     "(the job replaced it with a link or a file) — the job's commits cannot be "
                     "read from it; run the job again")
-            push_from_the_hosts_own_repository(
-                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
-                redact=_redact, ambient_env=None if remote_url else dict(os.environ))
+            yield git_dir
         finally:
             self._thaw()
 
@@ -975,6 +1020,18 @@ class ContainerSandbox(SandboxAdapter):
                         " %s — it stays frozen until cleanup removes it; until then a command run "
                         "in it fails, and `docker unpause %s` frees it", self._container, rc,
                         (out or "").strip()[:200], self._container)
+
+    def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
+        """Nothing (#11): the commits live in the host clone `prepare` made for this job, and
+        `cleanup` deletes it with the container, so a branch that was never pushed is gone."""
+        return None
+
+    def credentials_in_reach(self, *, named: tuple[str, ...] = ()) -> dict[str, str]:
+        """`{name: value}` of every variable a command this box runs can read that may hold a
+        credential (#11): exactly what crosses into it (`_passthrough`) — the harness's own model
+        credential and the project's `box.env`. Nothing else of the worker's environment reaches
+        the box, so `named` (the project's `token_env` names) adds nothing here."""
+        return self._passthrough()
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
