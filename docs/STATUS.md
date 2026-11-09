@@ -88,7 +88,8 @@ moved, pull requests opened in Azure Repos, pipelines observed. The Azure DevOps
 ## Known gaps
 
 **Principles the documents state and the code does not yet meet.** These are aims, written here so
-nobody reads them as facts.
+nobody reads them as facts. None has a tracking issue yet, except that #351 covers the mutation
+rows no gate re-runs.
 
 - **"Born with two"** ([ADR-0022](adr/0022-provider-seams.md)). `channel`, `notifier`,
   `session_store` and `token_pool` have one built-in row each, `box_runner` has none, and no test
@@ -108,7 +109,10 @@ nobody reads them as facts.
   `contracts/` and `policy/` only, and the metrics sink is inferred as `dynamodb` when
   `BEEVERFORGE_METRICS_TABLE` is set (`observability/registry.py::metrics_sink_kind`).
 - **Contributor rules CI does not run.** `mypy` and `bandit` are configured in `pyproject.toml`
-  and run by neither `make ci` nor `.github/workflows/ci.yml`.
+  and run by neither the Makefile's targets nor `.github/workflows/ci.yml`. CONTRIBUTING asks for
+  the suite in fixed order as well as random, and CI runs it in random order only. Mutation plans
+  (`tools/mutations/`) are checked to still apply (`tests/test_every_mutation_plan_can_run.py`:
+  every anchor matches exactly once, every target exists), but no CI job runs one.
 
 **The box proof gates pickup on the `container` box, and on `worktree` only where the worker is
 declared to be somebody's own machine** (`BEEVERFORGE_OWN_WORK`). `beeverforge box prove` resolves

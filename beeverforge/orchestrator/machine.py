@@ -1,9 +1,10 @@
 """The job runner — the deterministic maestro (ADR-0001 state machine).
 
-Slice 1 (the walking skeleton) drives: get_ticket → SPEC_VALIDATION → prepare →
-setup → execute → commit → validate → open PR. It stops before REVIEWING/REPAIRING
-and the D-12 lifecycle (those layer on next). The orchestrator itself stays
-deterministic (D-11); each step is a seam onto an adapter.
+It drives: get_ticket → SPEC_VALIDATION → prepare → setup → execute → commit →
+validate → open PR → REVIEWING → REPAIRING (a bounded review-repair, ADR-0006) and the
+job's parks and hand-backs. (Slice 1, the walking skeleton, stopped at the open PR; review
+and repair were layered on in this file.) The orchestrator itself stays deterministic
+(D-11); each step is a seam onto an adapter.
 """
 
 from __future__ import annotations

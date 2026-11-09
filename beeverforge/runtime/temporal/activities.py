@@ -5,9 +5,11 @@ agent, tests, open a PR, tag, observe an environment). Temporal records each
 one's result in history, so a crash resumes from the last completed activity
 instead of restarting the job.
 
-Every job runs in a Fargate task (run_job, promote_staging, release_prod), so the
-side-effecting work happens where gh + credentials + the cloned repo live, and the
-launcher's job-tag idempotency (re-attach / reconcile) makes retries safe. The forge
+Every job runs in the deployment's box (run_job, promote_staging, release_prod): the
+`worktree` or `container` box the core ships, or a remote runner an add-on declares on the
+`box_runner` axis (`fargate` comes with `beeverforge-aws`). The side-effecting work happens
+where gh + credentials + the cloned repo live, and the launcher's job-tag idempotency
+(re-attach / reconcile) makes retries safe. The forge
 operations themselves are find-or-create idempotent. Each activity offloads its
 blocking launcher call to a thread so the event loop stays free to heartbeat.
 """

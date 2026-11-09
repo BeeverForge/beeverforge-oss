@@ -1,6 +1,7 @@
 # ADR 0001 — Foundational conceptual model of the platform
 
 - **Status:** Accepted (conceptual model); scope and build sequencing are follow-ups.
+- **Note (2026-11-06, #1):** this record says `sdlc …` for the command and `sdlc/`, `.sdlc/` for the package and the repository folder, as they were named when it was written. The command is `beeverforge` (`beeverforge box prove`, `beeverforge approver add`, `beeverforge act`, `beeverforge actions`), the package `beeverforge/`, the folder `.beeverforge/`.
 - **Date:** 2026-07-12
 - **Supersedes:** —
 - **Note:** This ADR is deliberately broad. It freezes the *vocabulary and the
