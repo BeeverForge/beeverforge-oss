@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 from pathlib import Path
 
 log = logging.getLogger("beeverforge.factory")
@@ -217,6 +219,18 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
     # this measurement worktree is cut from a local repository and needs no mark.)
     dest = default_root() / "worktrees" / key
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # NOT OURS, NOT TOUCHED (#317, the defect #124 fixed for the box's `prepare`). The path is
+    # fixed and reused, so whatever stands there is looked at before git is asked to change a
+    # worktree: `exists()` follows a link, `worktree remove --force <link>` removes the tree the
+    # link names, and `worktree add` checks out through it. A link (dangling too, so `is_symlink`
+    # first) or a file is refused, and the person moves it.
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        there = "a symbolic link" if dest.is_symlink() else "a file"
+        raise RuntimeError(
+            f"{dest} is {there}, not a checkout this made, so {ref!r} was not checked out there — "
+            f"move it aside (`mv {shlex.quote(str(dest))} <a path of yours>`) and run again. "
+            f"Nothing was changed"
+        )
     if dest.exists():
         # Left by the previous measurement of this key. `worktree remove` unregisters it with git,
         # which a plain rmtree does not — and a stale registration makes the next `add` fail on a
@@ -224,11 +238,70 @@ def _worktree_at(repo: Path, ref: str, key: str) -> Path:
         _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
-    _git(["-C", str(repo), "worktree", "prune"])
+        if dest.exists() or dest.is_symlink():
+            # `ignore_errors=True` says nothing when it fails, or when a link stands there now.
+            raise RuntimeError(
+                f"{dest} could not be removed to make way for {ref!r} and is still "
+                f"{_what_stands_at(dest)} — remove or move it yourself "
+                f"(`mv {shlex.quote(str(dest))} <a path of yours>`) and run again"
+            )
+        # A leftover git still lists but `remove` would not take (its `.git` gone: "validation
+        # failed") was only rmtree'd, so its registration stands and `add` would refuse the path.
+        # Now the directory is gone, this path's own `remove` drops it (the `else` branch's clear).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
+    else:
+        # The directory is gone but git may still list it (a cache wiped by hand), and `add`
+        # refuses a path it still believes in. THIS path's registration is dropped, never a
+        # blanket `worktree prune`: that drops every other registration whose directory is
+        # momentarily missing, other people's included (see adapters/sandbox/worktree.py).
+        _git(["-C", str(repo), "worktree", "remove", "--force", str(dest)])
+    # THIS FUNCTION MAKES THE PATH ITSELF, RIGHT BEFORE THE ADD (the shape #124 / PR #312 settled).
+    # The guard above reads the path once and git creates it only at the add; in between run a
+    # `worktree remove` and an `rmtree`, so a link planted in that window was still checked out
+    # through. `os.mkdir` never follows a final link and fails on anything at the path, and git
+    # accepts the empty directory it makes. Not `makedirs(exist_ok=True)`: that follows a link to
+    # a directory and calls it fine.
+    try:
+        os.mkdir(dest)
+    except FileExistsError:
+        raise RuntimeError(_appeared_at(dest, ref)) from None
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not make {dest} to check {ref!r} out into ({exc.strerror or exc}) — fix that "
+            f"(permissions, free space, the directory above it) and run again"
+        ) from exc
     rc, out = _git(["-C", str(repo), "worktree", "add", "--detach", str(dest), ref])
     if rc != 0:
+        # Only the empty directory made above, so a rerun is not blocked: `rmdir`, never
+        # recursive, so whatever is in it now, or a link now at the path, stays.
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
         raise RuntimeError(f"could not check {ref!r} out of {repo}: {out.strip()[:300]}")
     return dest
+
+
+def _appeared_at(dest: Path, ref: str) -> str:
+    """The sentence for what `os.mkdir(dest)` met after the guard had read `dest` as free."""
+    return (
+        f"{dest} became {_what_stands_at(dest)} after it was read as free, so {ref!r} was not "
+        f"checked out there — move it aside (`mv {shlex.quote(str(dest))} <a path of yours>`) "
+        f"and run again"
+    )
+
+
+def _what_stands_at(path: Path) -> str:
+    """What is at `path`, read with `lstat` so a link is named and never followed."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError as exc:
+        return f"unreadable ({exc.strerror or exc})"
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    return "a file"
 
 
 def _authenticated(project, url: str, token: str | None) -> str:
@@ -396,6 +469,55 @@ def bot_token_provider_for(project, axis: str):
     return _bot_token_provider()
 
 
+def box_knobs(project) -> dict:
+    """The knobs a box is built with for `project`: the registry's `box:` block, the image's pull
+    credential, and the deployment's toolbox and operator guidelines.
+
+    ONE FUNCTION FOR THE JOB'S BOX AND THE PROOF'S (#191). `build_runner` and
+    `box_prove.box_probes` each built these by hand, and the proof's copy had fallen one knob
+    behind: it never passed the image's pull credential (#742), so a proof of an image in a private
+    registry pulled with no login while the job's box pulled with one. A proof taken in a box the
+    job would not get proves the box nobody runs."""
+    # And the registry's `box:` knobs are FORWARDED, not merely declarable. `BoxConfig` shipped with
+    # network / cache_volume / cpus / memory and this call passed none of them — the same defect
+    # D4 had just fixed for `image`, one field over, in the change that fixed it. Only the keys the
+    # operator actually set are passed, so an absent block leaves every default exactly where it
+    # was and no project that exists today moves.
+    declared = getattr(project, "box", None)
+    knobs = {
+        key: value
+        for key in ("network", "cache_volume", "cpus", "memory")
+        if (value := getattr(declared, key, None)) is not None
+    }
+    # `box.env` — the NAMES of variables this project's box may receive (harness via Bedrock or
+    # a gateway, a client's scanner credentials). Forwarded like every other knob so a box that
+    # cannot honour it says so instead of silently not passing what the operator declared.
+    if declared_env := tuple(getattr(declared, "env", None) or ()):
+        knobs["extra_env"] = declared_env
+    # THE IMAGE'S PULL CREDENTIAL (#742): a reference, forwarded as one and resolved by the box at
+    # the pull. A box that runs no image of its own says it is ignored, like every image knob.
+    from beeverforge.adapters.sandbox.pull import pull_credential_of
+
+    if (pull := pull_credential_of(declared)) is not None:
+        knobs["pull_credential"] = pull
+    # The harness toolbox (ADR-0037 D2) is a DEPLOYMENT fact, not a project one: it is the same
+    # volume for every project on this worker, and a client has no business naming it. Absent →
+    # the box mounts nothing and the harness has to be in the image, which is the pre-D2 world and
+    # still what a local `beeverforge run` against a worktree does.
+    if toolbox_volume := (os.environ.get("BEEVERFORGE_TOOLBOX_VOLUME") or "").strip():
+        knobs["toolbox"] = toolbox_volume
+    # THE OPERATOR'S GUIDELINES ARE A DEPLOYMENT FACT TOO, and they reach the box the same way the
+    # toolbox does: read here, from the environment, never from a project (#318). A box that
+    # isolates cannot see the host's filesystem, so without this the `reference/` tier would be
+    # INDEXED and unopenable — an entry telling the agent to read a document that is not there,
+    # which is worse than no entry (review of #328). The worktree box needs nothing: it is the
+    # host, and it says so through the same capability.
+    from beeverforge.orchestrator import operator_guidelines
+
+    knobs.update(operator_guidelines.box_knobs())
+    return knobs
+
+
 def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool, events=None,
                  repo_key: str | None = None, change: int = 0):
     """Assemble a JobRunner for one ticket: tracker + forge + agent + sandbox +
@@ -438,43 +560,7 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
     # alone (`beeverforge/<issue>`), and issue numbers are per-repository — one deployment hosts N
     # projects, so two clients' ticket #12 were literally the same container name.
     #
-    # And the registry's `box:` knobs are FORWARDED, not merely declarable. `BoxConfig` shipped with
-    # network / cache_volume / cpus / memory and this call passed none of them — the same defect
-    # D4 had just fixed for `image`, one field over, in the change that fixed it. Only the keys the
-    # operator actually set are passed, so an absent block leaves every default exactly where it
-    # was and no project that exists today moves.
-    declared = getattr(project, "box", None)
-    knobs = {
-        key: value
-        for key in ("network", "cache_volume", "cpus", "memory")
-        if (value := getattr(declared, key, None)) is not None
-    }
-    # `box.env` — the NAMES of variables this project's box may receive (harness via Bedrock or
-    # a gateway, a client's scanner credentials). Forwarded like every other knob so a box that
-    # cannot honour it says so instead of silently not passing what the operator declared.
-    if declared_env := tuple(getattr(declared, "env", None) or ()):
-        knobs["extra_env"] = declared_env
-    # THE IMAGE'S PULL CREDENTIAL (#742): a reference, forwarded as one and resolved by the box at
-    # the pull. A box that runs no image of its own says it is ignored, like every image knob.
-    from beeverforge.adapters.sandbox.pull import pull_credential_of
-
-    if (pull := pull_credential_of(declared)) is not None:
-        knobs["pull_credential"] = pull
-    # The harness toolbox (ADR-0037 D2) is a DEPLOYMENT fact, not a project one: it is the same
-    # volume for every project on this worker, and a client has no business naming it. Absent →
-    # the box mounts nothing and the harness has to be in the image, which is the pre-D2 world and
-    # still what a local `beeverforge run` against a worktree does.
-    if toolbox_volume := (os.environ.get("BEEVERFORGE_TOOLBOX_VOLUME") or "").strip():
-        knobs["toolbox"] = toolbox_volume
-    # THE OPERATOR'S GUIDELINES ARE A DEPLOYMENT FACT TOO, and they reach the box the same way the
-    # toolbox does: read here, from the environment, never from a project (#318). A box that
-    # isolates cannot see the host's filesystem, so without this the `reference/` tier would be
-    # INDEXED and unopenable — an entry telling the agent to read a document that is not there,
-    # which is worse than no entry (review of #328). The worktree box needs nothing: it is the
-    # host, and it says so through the same capability.
-    from beeverforge.orchestrator import operator_guidelines
-
-    knobs.update(operator_guidelines.box_knobs())
+    knobs = box_knobs(project)
     if knobs:
         _warn_unhonoured_knobs(project, sandbox, knobs)
     _warn_if_a_pause_will_cost_a_second_pass(project, sandbox)

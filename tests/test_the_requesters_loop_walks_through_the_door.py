@@ -203,7 +203,7 @@ def _approved() -> ReviewResult:
     return ReviewResult(decision="approved", score=90)
 
 
-def _the_box_opens_a_pull_request(inp, run_id=None, watch=None) -> RunResult:
+def _the_box_opens_a_pull_request(inp, run_id=None, watch=None, stop=None) -> RunResult:
     """The job's box: a pull request a person decides — the look is all that holds its merge
     (`merge_policy: auto`, `preview.required`) — on the change this run builds (`change`)."""
     _BOX.append(("run", inp.change))

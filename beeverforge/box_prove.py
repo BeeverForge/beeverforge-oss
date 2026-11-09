@@ -12,8 +12,9 @@ an environment that cannot work.
 WHAT A PROOF IS. Resolve the image's tag to a digest; check the image contract item by item; check
 that the toolbox can even execute in that image; run the client's own `setup:` and then `validate:`
 against untouched `main`; check the harness endpoint is reachable through whatever network the box
-has. Green means *your tests passed inside the factory* — and it costs **zero harness tokens**,
-because nothing here asks an agent to do anything.
+has. Green means *your tests passed inside the factory* — and it costs **no agent work**: nothing
+here asks an agent to do anything. The one model call it can make is a one-word smoke (`_ONE_WORD`)
+on a box that runs no image of its own, to show the harness answers there.
 
 ORDER MATTERS AND STOPPING MATTERS. An unpullable image would make the next six checks fail for the
 same reason and report it six different ways; a `setup:` that fails makes `validate:` a second,
@@ -751,7 +752,13 @@ def prove(project: str, image: str, p: Probes, *,
             ))
         else:
             harnesses = ", ".join(stamp.get("harnesses") or []) or "nothing"
-            proof.findings.append(Finding("toolbox", True, f"{variant} — {harnesses}"))
+            # THE VERSIONS THE BOXES RUN (#246): what the toolbox copied, so a reader can tell a
+            # bumped harness from the old one without running anything in the box.
+            from beeverforge.runtime.toolbox import versions
+
+            recorded = versions(stamp) or "versions not recorded"
+            proof.findings.append(Finding("toolbox", True,
+                                          f"{variant} — {harnesses} ({recorded})"))
 
         # ── the image contract ───────────────────────────────────────────────────────────────────
         broken = p.contract(image)
@@ -1367,33 +1374,20 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         repo = repo_path if repo_path is not None else resolve_repo_path(project, cache_key=key)
         manifest = manifest if manifest is not None else load_manifest(project, repo_root=repo)
         start_error = ""
-        # THE REGISTRY'S `box:` KNOBS ARE FORWARDED, mirroring `build_runner` (factory.py) — this
-        # call passed none of them, so the proof box had the default network, no cache volume, no
-        # `box.env`, while the docstring above promised "the mounts, the network, the limits … are
-        # the ones the job will have". The harness-auth station probed a box that lacked exactly
-        # the `box.env` names the job's box receives (measured by the onboard fact-finding pass,
-        # 2026-08-13). Only keys the operator set are passed; an absent block changes nothing.
-        declared = getattr(project, "box", None)
-        knobs = {
-            k: v for k in ("network", "cache_volume", "cpus", "memory")
-            if (v := getattr(declared, k, None)) is not None
-        }
-        if declared_env := tuple(getattr(declared, "env", None) or ()):
-            knobs["extra_env"] = declared_env
-        # …and the operator directory the job's box mounts (`factory.py`), read from the same
-        # place: a proof box without it opens no operator document, and the budget's fit it
-        # reports pinned that tier where the job leaves it out (review of #364)
-        from beeverforge.orchestrator import operator_guidelines
+        # THE REGISTRY'S `box:` KNOBS ARE FORWARDED, from the one function `build_runner` uses
+        # (`factory.box_knobs`, #191). This call once passed none of them, so the proof box had the
+        # default network, no cache volume, no `box.env` (measured by the onboard fact-finding pass,
+        # 2026-08-13); then its own copy of the list fell one knob behind, the image's pull
+        # credential (#742). Asking the same function is what keeps the two boxes the same box.
+        from beeverforge.factory import box_knobs
 
-        knobs.update(operator_guidelines.box_knobs())
+        knobs = box_knobs(project)
         # THE BOX THIS DEPLOYMENT RUNS, not always the container one (ADR-0049 D9). A proof taken
         # in a box the job will not use proves the box nobody runs — the same reasoning that made
         # this reuse `ContainerSandbox` rather than approximate it, one axis further out.
         kind = (sandbox or default_sandbox()).strip().lower()
         traits = installed_box_traits(kind)
-        box = build_sandbox(kind, image=image, project=f"{key or project.name}-prove",
-                            toolbox=(os.environ.get("BEEVERFORGE_TOOLBOX_VOLUME") or "").strip()
-                                    or None, **knobs)
+        box = build_sandbox(kind, image=image, project=f"{key or project.name}-prove", **knobs)
         workspace = None
     except BaseException:
         _let_go(held)

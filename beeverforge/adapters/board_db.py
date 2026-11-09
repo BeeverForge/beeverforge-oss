@@ -39,12 +39,18 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from beeverforge.util.private_file import create_private
+
 log = logging.getLogger(__name__)
 
 #: Where the file is, when the deployment names it. Compose points the worker AND the panel at the
 #: state volume they already share, exactly as it does for the registry; a host installation names
 #: nothing and gets the operator's own directory.
 PATH_ENV = "BEEVERFORGE_BOARD_DB"
+
+#: What a symbolic link at the board's path is told to do (#308): the board is created `0600` and
+#: an existing one narrowed to it, since it holds cards, comments and registered accounts.
+_LINK_REMEDY = f"remove the link, or point {PATH_ENV} at a regular file"
 
 #: SQLite's busy timeout for this file, and the unit of the module's two bounds. Five seconds is
 #: the registry's own flock timeout. It bounds two different waits, and they are NOT the same on
@@ -300,6 +306,7 @@ def connect(path: str | os.PathLike[str] | None = None,
     remedy nobody can act on from the error sqlite3 gives."""
     target = Path(db_path(path))
     target.parent.mkdir(parents=True, exist_ok=True)
+    create_private(target, what="board", remedy=_LINK_REMEDY, tighten=True)
     conn = sqlite3.connect(target, timeout=0, isolation_level=None)
     try:
         conn.row_factory = sqlite3.Row
@@ -479,6 +486,8 @@ def backup(to: str | os.PathLike[str], path: str | os.PathLike[str] | None = Non
         return None
     target = Path(to)
     target.parent.mkdir(parents=True, exist_ok=True)
+    create_private(target, what="board backup",
+                   remedy="remove the link, or back up to another path", tighten=True)
     conn = sqlite3.connect(source, timeout=BUSY_TIMEOUT_MS / 1000)
     try:
         copy = sqlite3.connect(target)

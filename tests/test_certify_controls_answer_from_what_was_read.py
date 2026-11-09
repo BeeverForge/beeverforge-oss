@@ -62,7 +62,7 @@ def _reading(**over) -> c.Reading:
     base = dict(version="0.6.0", build=("", ""), env={"BEEVERFORGE_PANEL_TOKEN": "t"},
                 env_file=c.EnvFileReading(".env.compose", True, 0o600, False),
                 sandbox="container", identity="local", providers={}, projects=[_project()],
-                floor_protected=(".beeverforge/**",), approvers=["ana"],
+                floor_protected=(".beeverforge/**", ".openfactory/**"), approvers=["ana"],
                 releases=["v0.6.0", "v0.5.1"])
     base.update(over)
     return c.Reading(**base)
@@ -188,6 +188,19 @@ def test_risk():
 def test_the_protected_paths():
     assert _answer("C-PROTECT", _reading(floor_protected=None)).result == "fail"
     assert _answer("C-PROTECT", _reading(floor_protected=("compose.yaml",))).result == "fail"
+
+
+@pytest.mark.parametrize("kept", [".beeverforge/**", ".openfactory/**"])
+def test_a_floor_that_protects_only_one_of_the_folders_names_fails(kept):
+    """#265: the manifest is read from `.openfactory/` in a repository that keeps that name, so
+    a floor protecting one name leaves the other's manifest editable by the agent. Each name
+    alone fails, and the line names the one that is missing."""
+    missing = ({".beeverforge/**", ".openfactory/**"} - {kept}).pop()
+
+    said = _answer("C-PROTECT", _reading(floor_protected=(kept, "compose.yaml")))
+
+    assert said.result == "fail", said
+    assert missing in said.detail, said
 
 
 @pytest.mark.parametrize("value,result", [("", "pass"), ("1", "pass"), ("3", "info"),

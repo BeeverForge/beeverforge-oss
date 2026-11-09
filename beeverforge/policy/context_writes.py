@@ -28,9 +28,16 @@ import posixpath
 import re
 from collections.abc import Iterable
 
+from beeverforge import namespace
+
 #: The platform's own directory in any repository — the shape of a preview lives under it, and no
 #: writer that lands without a person may touch it, whatever else it is allowed.
-PLATFORM_DIR = ".beeverforge/"
+PLATFORM_DIR = f"{namespace.DIR}/"
+
+#: …UNDER EITHER OF ITS NAMES (#265). A repository that keeps OpenFactory's `.openfactory/` has
+#: its preview's shape read from there, so a guard that knew only the current name would let a
+#: bot land a compose file under the former one, straight past it. One tuple, from `namespace`.
+PLATFORM_DIRS = namespace.PREFIXES
 
 #: What `record_fact` exists to write: a learned fact, one file under `domain/`.
 FACTS = ("domain/",)
@@ -55,11 +62,15 @@ IMPORTS = f"{PLATFORM_DIR}imports/"
 _IMPORT_ID = re.compile(r"^\d{4}-\d{2}-\d{2}-[0-9a-f]{10}$")
 
 
-def import_record(import_id: str) -> str:
+def import_record(import_id: str, folder: str = namespace.DIR) -> str:
     """`.beeverforge/imports/<id>/`, the record directory of one import — or "" when `import_id`
-    is not an import's id, which then admits nothing."""
+    is not an import's id, which then admits nothing. `folder` is the one the context repository
+    uses (`namespace.dir_in`): `.openfactory` for a repository that keeps the former name (#265);
+    anything that is not one of the folder's two names admits nothing either."""
     ident = str(import_id or "").strip()
-    return f"{IMPORTS}{ident}/" if _IMPORT_ID.match(ident) else ""
+    if folder not in namespace.DIRS or not _IMPORT_ID.match(ident):
+        return ""
+    return f"{folder}/imports/{ident}/"
 
 
 def _clean(path: str) -> str:
@@ -77,13 +88,13 @@ def _clean(path: str) -> str:
 def outside(paths: Iterable[str], allowed: Iterable[str]) -> list[str]:
     """Every path of `paths` a writer allowed `allowed` may NOT land: one that is not a plain
     path inside the repository, one that is neither an allowed file nor under an allowed
-    directory, and — whatever `allowed` says — one under `.beeverforge/`."""
+    directory, and — whatever `allowed` says — one under `.beeverforge/` or `.openfactory/`."""
     exact = {_clean(a.rstrip("/")) for a in allowed if a} - {""}
     prefixes = tuple(a + "/" for a in exact)
     out = []
     for path in paths:
         norm = _clean(path)
-        if (not norm or norm.startswith(PLATFORM_DIR) or norm + "/" == PLATFORM_DIR
+        if (not norm or namespace.is_ours(norm)
                 or not (norm in exact or norm.startswith(prefixes))):
             out.append(str(path))
     return out
@@ -94,9 +105,12 @@ def outside_an_import(paths: Iterable[str], allowed: Iterable[str], *,
     """`outside`, for the import's writer (#993): every path it may NOT land. One exception to the
     platform's directory and one only — a file under THIS import's own record directory
     (`import_record`). Never another import's record, never `.beeverforge/` itself or anything
-    else under it, and never a spelling that climbs out of the record (`..` is resolved first)."""
-    record = import_record(import_id)
-    rest = [p for p in paths if not (record and _clean(p).startswith(record))]
+    else under it, and never a spelling that climbs out of the record (`..` is resolved first).
+
+    The record is admitted under whichever of the folder's two names the repository uses (#265):
+    the import writes it where it found the folder, and that is still this import's own record."""
+    records = tuple(r for r in (import_record(import_id, d) for d in namespace.DIRS) if r)
+    rest = [p for p in paths if not (records and _clean(p).startswith(records))]
     return outside(rest, allowed)
 
 

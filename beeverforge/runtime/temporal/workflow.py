@@ -87,6 +87,7 @@ with workflow.unsafe.imports_passed_through():
         product_role_say,
         product_sweep,
         promote_staging,
+        purge_expired_records,
         read_ci_checks,
         reap_previews,
         record_job_metrics,
@@ -833,6 +834,21 @@ class ProductKnowledgeRefreshWorkflow:
             refresh_product_knowledge, inp,
             start_to_close_timeout=KNOWLEDGE_PASS_CEILING,
             heartbeat_timeout=KNOWLEDGE_PASS_HEARTBEAT,
+            retry_policy=_ONCE,
+        )
+
+
+@workflow.defn
+class MetricsPurgeWorkflow:
+    """What the metrics store holds past its period, deleted from the file (#201). Its own small
+    workflow on its own schedule, like the previews' reaper: the store is the deployment's, not a
+    project's, and a purge does not need to be the same minute a row expires."""
+
+    @workflow.run
+    async def run(self) -> str:
+        return await workflow.execute_activity(
+            purge_expired_records,
+            start_to_close_timeout=timedelta(minutes=10),
             retry_policy=_ONCE,
         )
 

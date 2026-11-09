@@ -1,6 +1,7 @@
 # ADR 0057 — Who may act is one decision the core's policy makes, and a production approval is a person, not a password
 
 - **Status:** Proposed (design only — no code changes with this ADR; a maintainer accepts it in review)
+- **Note (2026-11-06, #1):** D1 has since been implemented as `policy/authz.py::may`; the rest is not built yet.
 - **Date:** 2026-10-13
 - **Implements:** #690. Finishes C-26 (#55), which moved *who is asking* into the core and left
   *may they* half-moved.

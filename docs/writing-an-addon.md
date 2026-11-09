@@ -118,10 +118,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 ```
 
-**Do not put `beeverforge` in `dependencies`.** The core is published to no index (see
-`plugins.py::install_hint`), so `pip` would try to resolve a name that is not there and fail.
-The core is installed *beside* your package, never pulled by it — `docker/install-addons.sh`
-does exactly that, core first.
+**Do not put `beeverforge` in `dependencies`.** The release workflow publishes the core's wheel to
+PyPI only once a maintainer has enabled the trusted publisher (`release.yml`'s `pypi` job,
+`docs/RELEASING.md`), so a deployment cannot count on resolving the name from an index. The core
+is installed *beside* your package, never pulled by it — `docker/install-addons.sh` does exactly
+that, core first.
 
 `beeverforge_acme/__init__.py`:
 

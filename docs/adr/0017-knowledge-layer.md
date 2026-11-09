@@ -3,6 +3,7 @@
 - **Status:** **Accepted; Phase 1 + 2a shipped, OFF by default and UNPROVEN.** The design is **Revisada pela ADR-0023 (2026-07-29):** o mapa deixou de ser um cache publicado e passa a ser gerado na caixa, a partir do checkout que o agente lê — o detector de defasagem sai do caminho crítico e a publicação vira artefato de inspeção.
   accepted; the *value* is not yet established. `knowledge_map` is false for every project until
   an A/B on the cost dashboard shows cost/ticket dropping.
+- **Note (2026-11-06, #1):** superseded on the default by [ADR-0035](./0035-knowledge-layer-on-by-default.md): `knowledge_map` is **true** by default (`contracts/manifest.py`). The status above is kept as it was decided.
 - **Date:** 2026-07-26
 - **Relates to:** ADR-0001 (D-2/D-9/D-10 — the knowledge cascade the agent reads), ADR-0005
   (post-merge watch — the same trigger point), ADR-0007 (the floor frees at merge — which the

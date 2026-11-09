@@ -1005,6 +1005,25 @@ def test_an_unparsed_review_is_not_a_rejection():
     assert "nothing readable" in stage.message
 
 
+@pytest.mark.parametrize("unread", [
+    ReviewResult(decision="rejected", score=0, did_not_complete=True,
+                 summary="the review did not complete: the reviewer's run ended in error (rc=1)"),
+    ReviewResult(decision="rejected", score=0, pause_reason="rate_limit",
+                 summary="THE REVIEW NEVER RAN (claude_code): rate_limit."),
+], ids=["did-not-complete", "paused"])
+def test_a_review_that_did_not_complete_is_not_a_rejection(unread):
+    """#131 words a failed review run as "did not complete", and a paused one carries its pause
+    reason: neither sentence holds "could not be parsed" or a lower-case "never ran", so the
+    stage read by phrase alone reported them as the reviewer's rejection of the client's diff."""
+    p, _ = _probes(reviewer=FakeReviewer(unread))
+
+    run = fr.rehearse(p, consent=APPROVED)
+
+    stage = next(s for s in run.stages if s.name == "review")
+    assert "nothing readable" in stage.message, stage.message
+    assert "not a judgement about the diff" in stage.remedy
+
+
 def test_the_reviewer_sees_the_diff_and_the_gate_results():
     p, built = _probes(reviewer=FakeReviewer())
     fr.rehearse(p, consent=APPROVED)

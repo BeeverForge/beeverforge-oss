@@ -64,7 +64,8 @@ CONTROLS: tuple[Spec, ...] = (
     Spec("C-MERGE", "merge_policy and review_mode are recorded for every repository", "manifests"),
     Spec("C-RISK", "where components are declared, at least one declares risk: high",
          "manifests"),
-    Spec("C-PROTECT", "the floor's protected paths include .beeverforge/**", "policy"),
+    Spec("C-PROTECT", "the floor's protected paths include .beeverforge/** and .openfactory/**",
+         "policy"),
     Spec("C-BRANCH", "the default branch is protected", "forge"),
     Spec("C-CONCURRENCY", "BEEVERFORGE_MAX_CONCURRENT_JOBS is recorded: 1 passes, more is "
                           "information", "environment"),
@@ -447,13 +448,17 @@ def _risk(r: Reading, n: Pseudonyms) -> Answer:
 def _protect(r: Reading, _n: Pseudonyms) -> Answer:
     from beeverforge import namespace
 
-    wanted = f"{namespace.DIR}/**"
+    # BOTH OF THE FOLDER'S NAMES (#265): the manifest is read from `.openfactory/` in a repository
+    # that keeps it, so a floor protecting only the current name leaves that one unprotected.
+    wanted = [f"{d}/**" for d in namespace.DIRS]
     if r.floor_protected is None:
         return FAIL, ("the deployment's floor (org_defaults/floor.yaml) cannot be read, so no "
                       "path is protected"), ["policy:protected_paths"]
-    if wanted in r.floor_protected:
-        return PASS, f"the floor protects {wanted}", ["policy:protected_paths"]
-    return FAIL, f"the floor's protected paths do not include {wanted}", ["policy:protected_paths"]
+    missing = [w for w in wanted if w not in r.floor_protected]
+    if not missing:
+        return PASS, f"the floor protects {' and '.join(wanted)}", ["policy:protected_paths"]
+    return FAIL, (f"the floor's protected paths do not include {' or '.join(missing)}"), \
+        ["policy:protected_paths"]
 
 
 def _concurrency(r: Reading, _n: Pseudonyms) -> Answer:

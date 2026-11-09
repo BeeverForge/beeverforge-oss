@@ -803,7 +803,8 @@ def _own_shape(layout: Layout, project, unit: Unit, tree: str, base_cfg):
     # checkout — a link out of it would hand the reader any file on the worker — and a failure is
     # said WITHOUT the reader's words, which can quote the file they could not parse
     root = os.path.realpath(layout.root(tree, "change"))
-    where = os.path.realpath(os.path.join(root, project.manifest_path))
+    where = os.path.realpath(os.path.join(
+        root, namespace.in_repo(Path(root), project.manifest_path)))
     if not where.startswith(root + os.sep) or not os.path.isfile(where):
         return ("the change's manifest is not a file inside its checkout, so the preview runs the "
                 "base branch's version.", "", "base", base_cfg)

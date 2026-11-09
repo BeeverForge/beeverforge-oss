@@ -152,9 +152,10 @@ MUTATIONS = [
      "dest))",
      "        if True:\n            out.documents.append(Placed(NEW, name, dest))"),
 
+    # RE-PINNED 2026-11-07 (#265): the record is admitted under either name, as `records`.
     ("the import's exception admits anything under the platform's directory, the preview's "
      "shape included", POLICY,
-     "    rest = [p for p in paths if not (record and _clean(p).startswith(record))]",
+     "    rest = [p for p in paths if not (records and _clean(p).startswith(records))]",
      "    rest = [p for p in paths if not _clean(p).startswith(IMPORTS)]"),
 
     # ── 5. where a folder may come from ────────────────────────────────────────────────────────

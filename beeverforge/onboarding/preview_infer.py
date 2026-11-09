@@ -80,8 +80,8 @@ from beeverforge.util import yaml_io
 COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 #: Where every file the factory drafts lives: under `.beeverforge/`, so it never collides with a
 #: file of the client's, and on the deployment floor, so it is never auto-merged.
-DRAFT_COMPOSE = ".beeverforge/preview.compose.yml"
-DRAFT_DIR = ".beeverforge/preview"
+DRAFT_COMPOSE = f"{namespace.DIR}/preview.compose.yml"
+DRAFT_DIR = f"{namespace.DIR}/preview"
 #: Example environment files a team commits beside the real one it ignores.
 ENV_EXAMPLES = (".env.example", ".env.sample")
 
@@ -1300,7 +1300,7 @@ def _base_image(root: Path, tree: _Tree, stack: str) -> tuple[str, Evidence] | N
 
 def _manifest_setup(root: Path) -> tuple[list[str], list[Evidence]] | None:
     """The `setup:` the manifest already declares — the client's own install step, cited."""
-    rel = namespace.MANIFEST
+    rel = namespace.in_repo(root, namespace.MANIFEST)
     text = _read_in(root, rel)
     if text is None:
         return None
@@ -1437,7 +1437,7 @@ def _from_nothing(root: Path, tree: _Tree, out: PreviewProposal,
 
 
 def _declared(root: Path) -> tuple[dict | None, int | None]:
-    text = _read_in(root, namespace.MANIFEST)
+    text = _read_in(root, namespace.in_repo(root, namespace.MANIFEST))
     if text is None:
         return None, None
     try:
@@ -1484,13 +1484,14 @@ def infer_preview(repo: str | Path, *, tree: _Tree | None = None, setup: Proposa
         out.case = "declared"
         out.declared = block
         out.compose = Proposal(field="preview", value=block, confidence=OBSERVED,
-                               evidence=[Evidence(path=namespace.MANIFEST, line=line,
+                               evidence=[Evidence(path=namespace.in_repo(root, namespace.MANIFEST),
+                                                  line=line,
                                                   excerpt="preview:")],
                                note="the manifest already declares how this repository is "
                                     "previewed — edit it in the repository")
         return out
     dockerfiles = {rel: df for rel in tree.files
-                   if _is_dockerfile(Path(rel).name) and not rel.startswith(".beeverforge/")
+                   if _is_dockerfile(Path(rel).name) and not namespace.is_ours(rel)
                    and (df := _read_dockerfile(root, rel)) is not None}
     found = [n for n in COMPOSE_NAMES if n in tree.files]
     if found:
