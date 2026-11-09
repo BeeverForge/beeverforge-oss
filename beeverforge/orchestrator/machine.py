@@ -47,6 +47,7 @@ from beeverforge.contracts import (
 from beeverforge.contracts.bot import BotIdentity
 from beeverforge.contracts.item_space import closing_keyword, forge_owns_the_card
 from beeverforge.contracts.refs import canonical_ref
+from beeverforge.contracts.review import not_a_verdict, unread_words
 from beeverforge.contracts.run import (
     AGENT_ACCOUNT_HEADING,
     AGENT_ACCOUNT_MAX,
@@ -420,6 +421,26 @@ def _sections_from(rows: list[str]) -> int:
     return next((i + 1 for i in range(len(rows) - 1, -1, -1) if rows[i] == "## Validations"), 0)
 
 
+def _review_said(r: ReviewResult) -> str:
+    """The journal's `review` line for `r`: `<decision> (score N)`, or — for a review that judged
+    nothing (#131) — what happened instead, with no score. `rejected (score 0)` on one that did
+    not complete is a judgement nobody made, read by the panel and by `observability/query` as a
+    rejection of the code. ONE SPELLING for the four places a review is journalled."""
+    return unread_words(r) if not_a_verdict(r) else f"{r.decision} (score {r.score})"
+
+
+def _unfinished_review_note(r: ReviewResult) -> str:
+    """The hold's one sentence for a review that did not complete (#131): that it did not, and
+    why, from the review's own summary — its first sentence, without the "the review did not
+    complete:" the reviewer already opens it with."""
+    first = ((r.summary or "").strip().splitlines() or [""])[0].split(". ")[0].strip().rstrip(".")
+    lead = "the review did not complete:"
+    if first.lower().startswith(lead):
+        first = first[len(lead):].strip()
+    why = first[:300] or "the reviewer gave no reason"
+    return f"the review did not complete, so no pull request was opened — {why}."
+
+
 def _review_lines(r: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
@@ -441,8 +462,9 @@ def _review_lines(r: ReviewResult) -> list[str]:
         A score of 0 is likewise reported only when one was given. Printing `(score 0)` for a
         review that produced no score is the same lie in smaller type.
         """
-        unread = r.score == 0 and not r.findings and (
-            "could not be parsed" in (r.summary or "") or "never ran" in (r.summary or ""))
+        # read from the review's own fields first, its sentence second (#131): one reading,
+        # shared with the first round's review stage
+        unread = not_a_verdict(r)
         from beeverforge.review import verdict as _verdict
 
         # NOT VERIFIED OUTRANKS THE DECISION WORD (#447): "## Review — approved_with_findings"
@@ -1977,18 +1999,30 @@ class JobRunner:
                     ),
                 )
                 self._count_review(result.review)
+                # A REVIEW THE LIMIT OR THE CREDENTIAL STOPPED IS A PAUSE, NOT A VERDICT (#131):
+                # counted first (#262), then out the way an executor pause goes, before the
+                # journal records a "rejected (score 0)" nobody made.
+                if result.review.pause_reason:
+                    return self._paused(ticket, result.review.pause_reason,
+                                        result.review.retry_at, branch=branch, ws=ws)
                 advisory = self.manifest.review_mode != "blocking"
                 # ITS PRICE ON ITS LINE, like every other pass's (#310). `_count_review` put the
                 # review in the result, and this line — the one `/api/jobs` and the panel sum —
                 # carried no `cost_usd`, so the dashboard said $0.01 for a ticket that cost $0.26.
                 self._emit(
                     ticket, "review",
-                    f"{result.review.decision} (score {result.review.score})"
-                    + (" · advisory" if advisory else ""),
+                    _review_said(result.review) + (" · advisory" if advisory else ""),
                     findings=len(result.review.findings),
                     detail=_review_event_detail(result.review),
                     cost_usd=result.review.cost_usd,
                 )
+                # A REVIEW THAT JUDGED NOTHING NEVER PROCEEDS AS REVIEWED (#131). With no pause to
+                # take, it went on as an ordinary rejection — and in advisory mode a rejection is
+                # information, so `should_auto_merge` merged it, a surviving pragma counted as
+                # vetted. It holds as an executor run that stopped unfinished holds: the work kept,
+                # a person told. Journalled first, so its price is on its line.
+                if not_a_verdict(result.review):
+                    return self._unfinished_review_hold(ticket, owner, ws, branch, result)
                 # ADR-0014: in ADVISORY mode the findings are posted to the PR (below) as a comment
                 # for a human — they never trigger the repair loop or block the merge. The
                 # deterministic gates + the executor's own TDD are the quality floor.
@@ -2053,14 +2087,18 @@ class JobRunner:
                     # branch that exists precisely because something went wrong, and therefore the
                     # expensive one — the cheapest-looking part of the ticket.
                     self._count_review(result.review)
+                    if result.review.pause_reason:  # the re-review's limit too (#131)
+                        return self._paused(ticket, result.review.pause_reason,
+                                            result.review.retry_at, branch=branch, ws=ws)
                     self._emit(
                         ticket, "review",
-                        f"{result.review.decision} (score {result.review.score})"
-                        f" [after repair {rev_attempts}]",
+                        _review_said(result.review) + f" [after repair {rev_attempts}]",
                         findings=len(result.review.findings),
                         detail=_review_event_detail(result.review),
                         cost_usd=result.review.cost_usd,
                     )
+                    if not_a_verdict(result.review):  # the re-review judged nothing too (#131)
+                        return self._unfinished_review_hold(ticket, owner, ws, branch, result)
 
             # THE KNOWLEDGE GATE, ON THE CHANGE AS IT WILL BE PROPOSED (ADR-0046): after the
             # review-repair loop, because the diff it judges must be the one the pull request
@@ -2500,7 +2538,7 @@ class JobRunner:
                 self._count_review(review)
                 self._emit(
                     ticket, "review",
-                    f"{review.decision} (score {review.score}) [after repair]",
+                    _review_said(review) + " [after repair]",
                     findings=len(review.findings), detail=_review_event_detail(review),
                     cost_usd=review.cost_usd,
                 )
@@ -2659,7 +2697,7 @@ class JobRunner:
             )
             self._count_review(review)
             self._emit(
-                ticket, "review", f"{review.decision} (score {review.score}) [re-reviewed]",
+                ticket, "review", _review_said(review) + " [re-reviewed]",
                 findings=len(review.findings), detail=_review_event_detail(review),
                 cost_usd=review.cost_usd,
             )
@@ -3088,6 +3126,21 @@ class JobRunner:
                       "comment; "
                       "what it described still happened, and the ticket does not say so: %s",
                       ticket_id, str(exc)[:160], body[:160])
+
+    def _unfinished_review_hold(self, ticket: Ticket, owner: str | None, ws: Workspace,
+                                branch: str, result: RunResult) -> RunResult:
+        """A review that judged nothing, with no pause to take (#131): the hold an executor run
+        that stopped unfinished takes (`_preserve_for_hold`, then `_hold`) — the work committed
+        and pushed so Resume continues it, the ticket back with its owner, one sentence saying
+        the review did not complete and why. No pull request: nothing reviewed what it would
+        carry."""
+        handle = self._preserve_for_hold(ticket, ws, None)
+        return self._hold(
+            ticket, owner, _unfinished_review_note(result.review), JobState.ON_HOLD,
+            branch=branch, resume_handle=handle, spent_turns=self._turns,
+            validations=result.validations, review=result.review,
+            added_suppressions=result.added_suppressions,
+            suppression_details=result.suppression_details)
 
     def _paused(
         self, ticket: Ticket, reason: str | None, retry_at: str | None, branch: str = "",
