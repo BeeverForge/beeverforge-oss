@@ -76,7 +76,7 @@ MUTATIONS = [
      "            missing += []"),
 
     ("the module forgets the sources that were not mounted", MODULE,
-     "        out += [Mount(repo=repo, why=why, own=repo == own)\n"
+     "        out += [Mount(repo=repo, why=why, own=repo.casefold() == own.casefold())\n"
      '                for repo, why in (getattr(self, "_missing_sources", {}) or {}).items()]',
      "        out += []"),
 
