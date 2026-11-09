@@ -436,3 +436,20 @@ def test_the_mark_runs_with_hooks_off(tmp_path, cache, recorder):
     _git("worktree", "add", "-q", "--detach", str(wt), cwd=cache)
     gitworktrees.mark_as_job(wt)
     assert _offenders(recorder.gits()) == [], "the job mark's rev-parse runs with hooks on"
+
+
+def test_every_git_call_the_worktree_box_runs_has_hooks_off_a_push_included(monkeypatch):
+    """`_run` is the one door every git call of the worktree box goes through; a push is no
+    exception, whatever repository it runs in (the push itself now runs from the host's own
+    repository, which turns hooks off on its own too)."""
+    seen = []
+
+    def fake(cmd, **_kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(worktree.subprocess, "run", fake)
+    for argv in (["git", "push", "--force", "--", "origin", "b"], ["git", "status"]):
+        worktree._run(argv)
+
+    assert all(cmd[1:3] == list(gitpin.HOOKLESS) for cmd in seen), seen

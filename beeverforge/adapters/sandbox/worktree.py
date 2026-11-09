@@ -43,6 +43,7 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 
 log = logging.getLogger("beeverforge.sandbox.worktree")
@@ -720,6 +721,21 @@ def _redact(text: str) -> str:
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
 
 
+def _origin_of(repo_path) -> str | None:
+    """`origin`'s URL as `repo_path`'s config spells it, or None when it has none (#386).
+
+    THE RAW VALUE (`config --get`, not `remote get-url`, which applies `insteadOf`): the push that
+    uses it rewrites against the host's own configuration alone. A relative path is the
+    repository's, so it is resolved against `repo_path` — the push runs somewhere else."""
+    rc, out = _run(["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"])
+    url = out.strip()
+    if rc != 0 or not url:
+        return None
+    if "://" in url or re.match(r"^[^/]+:", url) or os.path.isabs(url):
+        return url
+    return os.path.normpath(os.path.join(str(repo_path), url))
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
          env: Mapping[str, str] | None = None) -> tuple[int, str]:
     # `env=None` inherits the process environment, as every caller but the box's own add does.
@@ -749,6 +765,13 @@ class WorktreeSandbox(SandboxAdapter):
                 f"box.env entries must be environment variable NAMES, got {bad!r}")
         self.extra_env = tuple(extra_env)
         self._repo_root: Path | None = None
+        #: `origin`'s URL as `prepare` read it, BEFORE the pass ran (#386): the push's target when
+        #: no forge URL is given. Read at push time it would be whatever the pass wrote there.
+        self._origin: str | None = None
+        #: The repository's common git directory as `prepare` read it, BEFORE the pass ran (#386):
+        #: where the push reads the branch's commit and borrows its objects from, as data. Asked
+        #: at push time, git would read the worktree's `.git` pointer and config the pass can write.
+        self._git_dir: Path | None = None
         #: What `stage_input` wrote for THIS box, so `cleanup` can remove it. Per instance rather
         #: than per directory: a deployment may raise `BEEVERFORGE_MAX_CONCURRENT_JOBS`, and
         #: sweeping the whole directory would delete another job's prompt mid-pass.
@@ -780,6 +803,8 @@ class WorktreeSandbox(SandboxAdapter):
         remote_url: str | None = None,
     ) -> Workspace:
         self._repo_root = repo_path
+        self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         wt = self.root / branch.replace("/", "-")
         # Re-running the same ticket must start clean, so the box's OWN worktree of this branch
@@ -983,6 +1008,8 @@ class WorktreeSandbox(SandboxAdapter):
         OPTIONAL BY DESIGN, as `guidelines_path`: callers ask through `getattr`, and a box without
         it goes through `prepare`, which holds."""
         self._repo_root = repo_path
+        self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         tip = self.root / branch.replace("/", "-")
         trees = self._clear_our_own(repo_path, tip)
@@ -1342,15 +1369,31 @@ class WorktreeSandbox(SandboxAdapter):
         # died) overwrites the bot's OWN dedicated beeverforge/<id> branch instead of dead-locking
         # on a non-fast-forward forever. Safe: this branch is unique per job and only ever
         # the bot's; execution is serial (idempotency, engineering.md #3).
-        # --no-verify beside `_run`'s hooks override: a pre-push hook in the shared cache would
-        # be handed the authenticated URL (#182).
-        target = remote_url or "origin"
-        rc, out = _run(
-            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--no-verify", "--", target,
-                         workspace.branch])
-        )
-        if rc != 0:
-            raise RuntimeError(f"push failed: {_redact(out)}")
+        #
+        # NEVER FROM THE WORKSPACE'S OWN GIT DIRECTORY (#386): the pass can write its config, and a
+        # push run there reads it — `insteadOf` sends the push elsewhere, `core.sshCommand` runs.
+        # The push goes from a repository the host makes for it (`host_push`), and `origin` is the
+        # one this box read before the pass ran (`prepare`), never the one the pass may have set.
+        #
+        # THE FORGE DOOR READS NO CONFIGURATION BUT THE HOST REPOSITORY'S (review of #403): the job
+        # runs as this user, with this HOME, so the user's git and ssh configuration are its to
+        # write too. The ambient door is the person's own push and keeps them, in the workload's
+        # own environment, so whatever they name runs with nothing the job does not already hold.
+        target = remote_url or self._origin
+        if not target:
+            raise RuntimeError(
+                f"push failed: {self._repo_root} has no origin to push {workspace.branch!r} to "
+                "and no forge URL was given — register the project with a forge, or add an "
+                "origin to the repository")
+        if self._git_dir is None:
+            raise RuntimeError(
+                f"push failed: the git directory of {self._repo_root} could not be read when the "
+                f"box was prepared, so there is nothing to push {workspace.branch!r} from — check "
+                "that the repository is a git repository the worker can read, then run the job "
+                "again")
+        push_from_the_hosts_own_repository(
+            git_dir=self._git_dir, branch=workspace.branch, target=target, run=_run,
+            redact=_redact, ambient_env=None if remote_url else _scrubbed_env(self.extra_env))
 
     def rebase_onto_base(
         self, *, workspace: Workspace, base: str, remote_url: str | None = None
