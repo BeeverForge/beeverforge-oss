@@ -335,8 +335,14 @@ async def close_runs(where, *, coordinator: str = "", client=None) -> Closed:
                 if str(wf.id).startswith(prefix)]
         await close_idle(client, mine, closed=closed, at_work=at_work)
         if coordinator:
+            # and OpenFactory 0.7's, until 1.0: an upgraded deployment may still run it
+            # (`FORMER_WORKFLOW_ID_PREFIX`)
+            from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+            former = FORMER_WORKFLOW_ID_PREFIX + coordinator.removeprefix("beeverforge-")
             async for wf in client.list_workflows(
-                    f'WorkflowId = "{coordinator}" AND ExecutionStatus = "Running"'):
+                    f'(WorkflowId = "{coordinator}" OR WorkflowId = "{former}") '
+                    f'AND ExecutionStatus = "Running"'):
                 await client.get_workflow_handle(str(wf.id)).terminate(reason=CLOSED_BECAUSE)
                 closed.append(str(wf.id))
     except Exception as exc:  # noqa: BLE001 — said; what closed before stays closed

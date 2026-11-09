@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 
 from beeverforge.actions import catalog
 from beeverforge.product.authoring import REFUSALS, WriteResult
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 from tests.test_a_card_nobody_started_can_be_closed_and_removed import (  # noqa: F401 — fixtures
     _opened_by_product,
     board,
@@ -150,7 +151,7 @@ class _PastTheGates:
                                corpus=SimpleNamespace(by_number=lambda n: promise))
 
 
-class _Worker:
+class _Worker(HoldsNoFormerWorkflow):
     """The durable engine's client, handing back the activity's dict as the worker would."""
 
     def __init__(self, answer: dict):

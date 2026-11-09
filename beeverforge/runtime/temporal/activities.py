@@ -4909,6 +4909,35 @@ async def record_job_metrics(inp: JobMetricsInput) -> None:
         activity.logger.warning("record_job_metrics failed for %s#%s", inp.project, inp.issue)
 
 
+async def _former_coordinator(client, project: str) -> str | None:
+    """The id of OpenFactory 0.7's coordinator for `project` when it is RUNNING, else None.
+
+    UNTIL 1.0 (`FORMER_WORKFLOW_ID_PREFIX`). 0.7 ran its tech-lead as
+    `openfactory-coordinator-<project>`, and a deployment upgraded in place keeps it running on
+    0.7's queue, which the worker still polls. A signal-with-start on BeeverForge's id would start
+    a second coordinator beside it, and both would brief the same decision; so while 0.7's runs,
+    it is signalled and no new one is started. NOT_FOUND is the usual answer and says nothing;
+    any other failure to ask is said, and BeeverForge's coordinator is used."""
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    former = f"{FORMER_WORKFLOW_ID_PREFIX}coordinator-{project}"
+    try:
+        described = await client.get_workflow_handle(former).describe()
+    except RPCError as exc:
+        if exc.status != RPCStatusCode.NOT_FOUND:
+            activity.logger.warning("could not ask whether 0.7's coordinator %s runs (%s) — "
+                                    "BeeverForge's is used", former, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — an unknown answer falls back to our own, said
+        activity.logger.warning("could not ask whether 0.7's coordinator %s runs (%s) — "
+                                "BeeverForge's is used", former, exc)
+        return None
+    return former if described.status == WorkflowExecutionStatus.RUNNING else None
+
+
 @activity.defn
 async def notify_coordinator(item: CoordinatorItem) -> None:
     """SignalWithStart the project's ALWAYS-ALIVE coordinator with a parked decision — starts it
@@ -4922,6 +4951,9 @@ async def notify_coordinator(item: CoordinatorItem) -> None:
     # reduced to "notify_coordinator failed" in a log nobody reads.
     client = engine_client()
     try:
+        if former := await _former_coordinator(client, item.project):
+            await client.get_workflow_handle(former).signal("on_decision", item)
+            return
         await client.start_workflow(
             "CoordinatorWorkflow", CoordinatorInput(project=item.project),
             id=f"beeverforge-coordinator-{item.project}", task_queue=TASK_QUEUE,
@@ -4952,11 +4984,14 @@ async def notify_coordinator_say(inp: CoordinatorSayInput) -> None:
 
     client = engine_client()  # outside the `try`, for `notify_coordinator`'s reason
     try:
-        await client.start_workflow(
-            "CoordinatorWorkflow", CoordinatorInput(project=inp.project),
-            id=f"beeverforge-coordinator-{inp.project}", task_queue=TASK_QUEUE,
-            start_signal="say", start_signal_args=[inp.text, inp.kind],
-        )
+        if former := await _former_coordinator(client, inp.project):
+            await client.get_workflow_handle(former).signal("say", args=[inp.text, inp.kind])
+        else:
+            await client.start_workflow(
+                "CoordinatorWorkflow", CoordinatorInput(project=inp.project),
+                id=f"beeverforge-coordinator-{inp.project}", task_queue=TASK_QUEUE,
+                start_signal="say", start_signal_args=[inp.text, inp.kind],
+            )
     except Exception:  # noqa: BLE001
         activity.logger.warning("coordinator say failed for %s", inp.project)
     if inp.kind in ("pickup", "merge", "needs_action"):  # the tech-lead's voice in Slack
@@ -6690,6 +6725,7 @@ async def techlead_watch(project_name: str) -> str:
         waiting,
     )
     from beeverforge.runtime.temporal import view as tv_view
+    from beeverforge.runtime.temporal.view import job_handle as tv_job_handle
     from beeverforge.runtime.temporal.view import parse_job_id as tv_parse_job_id
     from beeverforge.techlead.classify import classify, remedy_for
     from beeverforge.techlead.memory import learn_from, remedy_verdicts, temper
@@ -6980,7 +7016,8 @@ async def techlead_watch(project_name: str) -> str:
         if any(str(x.subject) == finding.ticket and x.about == sig for x in open_remedies):
             continue
         try:
-            handle = client.get_workflow_handle(f"beeverforge-{project_name}-{finding.ticket}")
+            # 0.7's job too, until 1.0 (`job_handle`): the rounds found it by `parse_job_id`
+            handle = tv_job_handle(client, project_name, finding.ticket)
             # `args=[...]`, NOT two positionals. `WorkflowHandle.signal` is
             # `(signal, arg=UNSET, *, args=[])` — `args` is keyword-only, so a second value
             # passed positionally is a TypeError before anything reaches the server. This was
@@ -7069,7 +7106,10 @@ async def _terminal_outcome(client, project_name: str, ticket: str) -> str:
     from beeverforge.techlead.memory import DID_NOT_WORK, WORKED
 
     try:
-        desc = await client.get_workflow_handle(f"beeverforge-{project_name}-{ticket}").describe()
+        from beeverforge.runtime.temporal.view import job_handle
+
+        # 0.7's job too, until 1.0 (`job_handle`)
+        desc = await job_handle(client, project_name, ticket).describe()
     except Exception as exc:  # noqa: BLE001 — cannot see → no verdict; PENDING is the honest state
         activity.logger.info("techlead memory: could not learn how #%s ended (%s) — its remedy "
                              "stays pending", ticket, exc)

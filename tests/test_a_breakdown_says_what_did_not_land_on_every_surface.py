@@ -18,6 +18,7 @@ import pytest
 
 from beeverforge.actions import catalog
 from beeverforge.product import confirm, voice
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 from tests.test_accepting_what_the_code_already_does_files_nothing import (  # noqa: F401
     ADMIN,
     AUTHORED,
@@ -42,7 +43,7 @@ def worker(monkeypatch):
     """The breakdown as the worker returns it: one front landed, one refused — set per test."""
     rows: list[dict] = []
 
-    class _Engine:
+    class _Engine(HoldsNoFormerWorkflow):
         async def execute_workflow(self, name, inp, **_kw):
             return list(rows)
 

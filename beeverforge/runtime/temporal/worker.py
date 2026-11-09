@@ -30,7 +30,8 @@ except ModuleNotFoundError as _exc:
 
     raise SystemExit(f"✗ the worker cannot start: {CLIENT_MISSING}") from None
 
-from beeverforge.runtime.temporal import TASK_QUEUE
+from beeverforge import former_names
+from beeverforge.runtime.temporal import FORMER_TASK_QUEUE, TASK_QUEUE
 from beeverforge.runtime.temporal.activities import (
     adjust_pr,
     announce_rate_pause,
@@ -305,8 +306,32 @@ def start_channel_listeners(projects) -> list:
     return held
 
 
+async def run_together(workers) -> None:
+    """Run every worker until ONE of them ends, then end the rest — and raise what it raised.
+
+    One worker's `run` ending, by returning or by raising, always ended this process; with a
+    second worker on 0.7's queue (until 1.0) that must stay true. `asyncio.gather` did not do it:
+    a worker that raised left the other polling until the loop was torn down, and one that
+    returned left the process up on half its queues. So: wait for the first to end, cancel the
+    others (a Temporal worker's `run` shuts it down when cancelled), wait for them to finish, and
+    hand back the first one's outcome. Cancelled from outside, every worker is cancelled too."""
+    tasks = [asyncio.ensure_future(worker.run()) for worker in workers]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        # what the others raise on their way down is not the cause; the first one's is
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
 async def main() -> None:
     load_dotenv()  # bot credentials + Claude token for the activities
+    # …and an OpenFactory 0.7 `.env`'s names, read under the new ones (#264). `born` carried
+    # the container's own environment before the log was set up; this carries the file's.
+    former_names.warn(former_names.carry_over())
     # NO KEY IS WRITTEN TO DISK AT BOOT (#742). An App key handed over as content used to be copied
     # into a temp file here; the minter takes the content (`credentials.app_private_key` reads it
     # first, through the credential store), so the copy was read by nothing.
@@ -388,9 +413,16 @@ async def main() -> None:
     # `ensure_techlead_watch`, and has since f1d9fb2 — the duplicate was added on a mistaken
     # reading that nothing called it, and reconciled half of what the line above reconciles.)
 
-    worker = Worker(
+    # TWO WORKERS, ONE PER QUEUE, UNTIL 1.0 (#264): this deployment's own queue, and OpenFactory
+    # 0.7's, where a deployment upgraded in place against the same engine still has the workflows
+    # 0.7 started and the activities they scheduled. A Temporal worker polls exactly one task
+    # queue, so the former one gets a worker of its own, built from the same lists — a workflow
+    # 0.7 started replays here and schedules its activities and children on the queue it runs on,
+    # so the former queue needs every type the new one knows. Nothing starts work on it
+    # (`FORMER_TASK_QUEUE` says why), so on a fresh deployment its worker simply never gets a task.
+    workers = [Worker(
         client,
-        task_queue=TASK_QUEUE,
+        task_queue=queue,
         workflows=[JobWorkflow, PollWorkflow, DeployWatchWorkflow, CoordinatorWorkflow,
                    ProductSweepWorkflow, TechLeadWatchWorkflow, AskWorkflow,
                    CardQuestionSweepWorkflow,
@@ -418,12 +450,13 @@ async def main() -> None:
         # activities barely overlap by construction. 8 lets the read-only checks (check_*,
         # notify_*, scan_*) interleave with a running job — the panel and Slack stay real-time.
         max_concurrent_activities=8,
-    )
+    ) for queue in (TASK_QUEUE, FORMER_TASK_QUEUE)]
     # Printed for a person, as it always was — or, with JSON log lines, logged, so stdout carries
     # JSON too: a container's log is stdout and stderr together (review of #818).
     logs.announce(log, f"beeverforge worker up · {address()} · ns={namespace()} · "
-                       f"queue={TASK_QUEUE}")
-    await worker.run()
+                       f"queue={TASK_QUEUE} (and OpenFactory 0.7's {FORMER_TASK_QUEUE}, "
+                       f"until 1.0)")
+    await run_together(workers)
 
 
 async def born() -> None:
@@ -441,7 +474,12 @@ async def born() -> None:
     `configure` hands the exception nobody catches to the log (fourth review of #818)."""
     from beeverforge.observability import logs
 
+    # AN OPENFACTORY 0.7 ENVIRONMENT IS READ UNDER ITS NEW NAMES (#264) — carried BEFORE the log
+    # is set up, because `OPENFACTORY_LOG_FORMAT` is how a 0.7 deployment asked for JSON lines,
+    # and said after it, so the warning is a line of that log.
+    carried = former_names.carry_over()
     logs.configure()
+    former_names.warn(carried)
     try:
         await main()
     # AN ENGINE NOBODY DECLARED is the other refusal at birth (#163), said the same way (#73):

@@ -19,6 +19,7 @@ The claims, each a row:
 TEST = "tests/test_a_hook_in_the_shared_cache_never_runs_on_the_host.py"
 PIN = "beeverforge/gitpin.py"
 WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
+HOST_PUSH = "beeverforge/adapters/sandbox/host_push.py"
 MARKS = "beeverforge/adapters/gitworktrees.py"
 CACHE = "beeverforge/runtime/repo_cache.py"
 
@@ -60,9 +61,10 @@ MUTATIONS = [
      '    head = subprocess.run(["git", "-C", str(repo_path), "rev-parse",', CACHE_GUARD),
 
     # 1. the push
-    ("the push runs a pre-push hook again: `--no-verify` is gone", WORKTREE,
-     '"push", "--force", "--no-verify", "--", target,',
-     '"push", "--force", "--", target,'),
+    # RE-PINNED 2026-11-09 (#403): the push runs from the host's own repository (`host_push`)
+    ("the push runs a pre-push hook again: `--no-verify` is gone", HOST_PUSH,
+     '"push", "--force", "--no-verify",\n',
+     '"push", "--force",\n'),
     ("the push, and only the push, runs with the shared cache's hooks", WORKTREE,
      '    if cmd[:1] == ["git"]:\n',
      '    if cmd[:1] == ["git"] and "push" not in cmd:\n'),

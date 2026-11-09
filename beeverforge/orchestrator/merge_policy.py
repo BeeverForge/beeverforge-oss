@@ -249,13 +249,23 @@ def _not_verified(review: ReviewResult) -> bool:
 
 
 def format_review(review: ReviewResult) -> str:
+    """The review posted on the pull request; the reviewer's words link nothing (#315) and carry
+    no credential (#196)."""
+    from beeverforge.orchestrator.machine import _review_withheld
+    from beeverforge.orchestrator.machine import _without_reviewer_mentions as quiet
+
+    # WITHHELD ON THE RAW WORDS, THEN QUIETED (review of #323): `quiet` rewrites `#N`, `@name` and
+    # `&`, and a credential carrying one of them is no longer found once it has — the order the
+    # pull request body already keeps (`_review_withheld` at the top of `_review_lines`)
+    review = _review_withheld(review)
+
     # THE HEADING OF A REVIEW THAT JUDGED NOTHING SAYS SO (#131), with no score: `**rejected** —
     # score 0` is a judgement of the code nobody made, on the pull request's first line.
     heading = (f"**{unread_words(review).capitalize()}** — this diff has not been reviewed, and "
                "nothing here is a judgement about the code" if not_a_verdict(review)
                else f"**{review.decision}** — score {review.score}")
-    lines = [heading, "", review.summary]
+    lines = [heading, "", quiet(review.summary)]
     for f in review.findings:
         loc = f" (`{f.file}:{f.line}`)" if f.file else ""
-        lines.append(f"- **{f.severity}**{loc}: {f.description}")
+        lines.append(f"- **{f.severity}**{loc}: {quiet(f.description)}")
     return "\n".join(lines)

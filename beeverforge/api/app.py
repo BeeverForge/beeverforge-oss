@@ -42,7 +42,7 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from starlette.routing import compile_path
 
-from beeverforge import __version__, actions, doors
+from beeverforge import __version__, actions, doors, former_names
 from beeverforge.api import read_models
 from beeverforge.api.project_route import AboutItsProject
 from beeverforge.contracts.project import Project
@@ -71,8 +71,12 @@ def _load_environment() -> None:
     repository — write-capable, on some seeds and not others.
 
     A library module must not have side effects on import. `serve()` is the entry point.
+
+    The `.env` read here again may still carry an OpenFactory 0.7 deployment's names, so they are
+    carried over to their new names after it, as the command line's entry does (#264).
     """
     load_dotenv()
+    former_names.warn(former_names.carry_over())
 
 # NO KEY IS WRITTEN TO DISK AT IMPORT (#742). This block copied an App key delivered as content
 # into a temp file and pointed `BEEVERFORGE_GH_APP_KEY` at it, for readers that wanted a path.
@@ -4450,7 +4454,7 @@ def factory(project: str) -> dict:
     except Exception as exc:  # noqa: BLE001 — the panel renders without the engine links
         log.warning("panel: no Temporal coordinates, engine links hidden (%s)", str(exc)[:120])
     if namespace and temporal_base:
-        q = quote(f'WorkflowId STARTS_WITH "beeverforge-{project}-"')
+        q = engine_jobs_query(project)
         temporal = f"{temporal_base}/namespaces/{namespace}/workflows?query={q}"
     else:
         temporal = temporal_base
@@ -4624,3 +4628,14 @@ def _board_url(project) -> str:
         return ""
 
 
+
+
+def engine_jobs_query(project: str) -> str:
+    """The engine UI's list filter for `project`'s jobs, quoted for a URL — BeeverForge's ids and,
+    until 1.0, OpenFactory 0.7's (`FORMER_WORKFLOW_ID_PREFIX`): a job picked up from 0.7's queue
+    keeps the id 0.7 gave it, and a link that filtered it out would show a running job as none."""
+    # the package's own constant: `runtime/temporal/__init__.py` imports nothing of the engine's
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    return quote(f'WorkflowId STARTS_WITH "beeverforge-{project}-" OR '
+                 f'WorkflowId STARTS_WITH "{FORMER_WORKFLOW_ID_PREFIX}{project}-"')

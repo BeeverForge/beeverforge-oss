@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from beeverforge import gitpin
+from beeverforge import former_names, gitpin
 
 RESULT_PREFIX = "BEEVERFORGE_RESULT_JSON:"
 _DONE = {"pr_open", "merged", "done", "awaiting_prod_approval"}
@@ -409,6 +409,11 @@ def main() -> int:
         forge_token_for,
     )
 
+    # A BOX'S ENVIRONMENT IS SET BY WHOEVER STARTS IT (#264): the worker composes it under the new
+    # names, but a task definition a 0.7 deployment wrote for its own cloud box carries the old
+    # ones. Read under the new names before anything reads the environment, and gone from it
+    # before the agent's process inherits it.
+    former_names.warn(former_names.carry_over())
     issue = os.environ.get("BEEVERFORGE_ISSUE", "")
     try:
         cfg = config_from_env(dict(os.environ))

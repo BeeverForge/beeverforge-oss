@@ -13,7 +13,8 @@ code:
     (`BEEVERFORGE_STATE_DIR`), and the pass's wall (`BEEVERFORGE_AGENT_TIMEOUT`, which the old
     "throttles" row named beside the floor);
   · each "unset" cell is what the code falls back to, read from the code with the variable unset;
-  · each row says no `OPENFACTORY_*` spelling is read only while the code reads none.
+  · each row names its `OPENFACTORY_*` spelling, and the release that stops reading it, only
+    while the code reads it (#264); `not read` only while it does not.
 """
 
 from __future__ import annotations
@@ -128,13 +129,27 @@ def test_the_unset_cell_is_the_codes_default(name, monkeypatch):
     assert said.group(1) == _default_of(name, monkeypatch), name
 
 
+def _read_as(old: str) -> str | None:
+    """The name an entry point reads `old` as (#264), MEASURED on `former_names.carry_over` with
+    `old` alone in an environment of its own — or None when it reads it as nothing."""
+    from beeverforge import former_names
+
+    env = {old: "fake-value"}
+    former_names.carry_over(env)
+    return next((k for k, v in env.items() if k != old and v == "fake-value"), None)
+
+
 @pytest.mark.parametrize("name", sorted(_rows()))
-def test_an_openfactory_spelling_is_said_not_read_only_while_the_code_reads_none(name):
+def test_an_openfactory_spelling_is_said_read_only_while_the_code_reads_it(name):
+    from beeverforge import former_names
+
     old = "OPENFACTORY_" + name.removeprefix("BEEVERFORGE_")
-    read = old in _literals()
+    read = old in _literals() or _read_as(old) == name
     cell = _rows()[name][4]
 
     if read:
-        assert cell != "not read", f"the code reads {old}, and the table says it does not"
+        assert cell == f"`{old}`, until {former_names.LAST_READ_BEFORE}", (
+            f"the code reads {old} as {name} until {former_names.LAST_READ_BEFORE}, and the "
+            f"table says {cell!r}")
     else:
         assert cell == "not read", f"the code does not read {old}; the table says {cell!r}"

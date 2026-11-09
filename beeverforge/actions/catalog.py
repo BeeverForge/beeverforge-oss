@@ -1069,7 +1069,7 @@ async def _answer_gate(*, project: str, issue: str, by: Actor, answer: str,
         waiting = None
         try:
             waiting = await _what_it_is_waiting_on(
-                client.get_workflow_handle(tv.job_id(found.name, issue)))
+                tv.job_handle(client, found.name, issue))
         except Exception as ask:  # noqa: BLE001 — the refusal stands; only its reason is lost
             log.info("could not ask #%s what it waits on instead (%s)", issue, ask)
         if waiting:
@@ -1302,7 +1302,7 @@ async def _stop(*, project: str, issue: str, by: Actor, reason: str = "") -> Out
     if unreachable:
         return unreachable
 
-    handle = client.get_workflow_handle(tv.job_id(found.name, issue))
+    handle = tv.job_handle(client, found.name, issue)
     try:
         described = await handle.describe()
     except Exception as exc:  # noqa: BLE001 — a job nobody can find is not a job to terminate
@@ -4043,7 +4043,18 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
     # conversation, so the one the requirement was asked in hears what it filed, when its record
     # names one; otherwise this door's own answer is all that is said, as before
     conversation, room = await asyncio.to_thread(_where_it_was_written, project, number)
+    from beeverforge.product.breaking import former_running
+
+    class _FormerRunning(Exception):
+        """OpenFactory 0.7's breakdown of this requirement is running (review of #500)."""
+
     try:
+        # OPENFACTORY 0.7'S BREAKDOWN, UNTIL 1.0: it keeps 0.7's id, so the engine would accept
+        # this start beside it; read as the refusal below, waiting on 0.7's execution
+        former = await former_running(client, project, number)
+        if former:
+            breaking = former
+            raise _FormerRunning
         return await client.execute_workflow(
             "ProductBreakdownWorkflow",
             ProductBreakdownInput(project=project, number=number, actor=by.id,
@@ -4051,7 +4062,7 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
             id=breaking,
             task_queue=TASK_QUEUE,
         ) or []
-    except WorkflowAlreadyStartedError:
+    except (WorkflowAlreadyStartedError, _FormerRunning):
         # THE REFUSAL THIS ID WAS SHARED FOR, SAID AS WHAT IT IS (#563, ADR-0051 D18). The engine
         # does not hand a second start the running execution's result: it refuses the start, and
         # both callers' catch-alls turned that into "nothing was filed" / "I could not turn it
@@ -5464,7 +5475,7 @@ async def _job_on_the_card(project: str, issue: str) -> _JobOnTheCard:
             f"there is no way to tell whether a job is still on {issue} — {unreachable.message} "
             f"Closing a card from under a running job is what this gate exists for, so nothing "
             f"was changed; say it on the card meanwhile."))
-    handle = client.get_workflow_handle(tv.job_id(project, issue))
+    handle = tv.job_handle(client, project, issue)
     try:
         described = await handle.describe()
     except Exception as exc:  # noqa: BLE001 — an engine that cannot answer is a state, not a crash

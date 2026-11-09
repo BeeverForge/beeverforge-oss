@@ -206,9 +206,17 @@ def reserved(name: str, *, root: Path | None = None) -> str | None:
     nothing: a scan that finds no reads is a broken install, not a platform that reads nothing
     (this module alone reads three names), and an add-on refused for that reason is the safe
     direction — every shipped role still resolves from its tables."""
+    # OPENFACTORY_* IS RESERVED TOO, for the opposite reason (#264): it IS served, as the
+    # BEEVERFORGE_* name it carries over to, and each process removes it from its environment as
+    # it starts — so an add-on's variable under it would be read under the platform's name and
+    # gone before the add-on looked.
+    from beeverforge.former_names import FORMER_PREFIX
+
     for prefix, whose in ((ENV_PREFIX, "this platform's own configuration namespace"),
                           (RETIRED_ENV_PREFIX, "the old spelling of this platform's namespace, "
-                                               "which nothing serves and no add-on may take up")):
+                                               "which nothing serves and no add-on may take up"),
+                          (FORMER_PREFIX, "OpenFactory's spelling of this platform's namespace, "
+                                          f"read as {ENV_PREFIX}* until 1.1")):
         if name.startswith(prefix):
             return f"under {prefix}*, {whose}"
     read = names_read(root)

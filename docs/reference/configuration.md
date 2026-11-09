@@ -522,6 +522,12 @@ ask for a variable that is already set.
 
 Secrets and deployment coordinates. The ones you will actually set:
 
+**An OpenFactory 0.7 deployment's `OPENFACTORY_*` variables are read until BeeverForge 1.1.** Each
+process reads an `OPENFACTORY_<NAME>` as `BEEVERFORGE_<NAME>` when that name is unset, after loading
+`.env` and `~/.beeverforge/env`, and removes the old name from its environment, so no box receives
+it. When both are set, the `BEEVERFORGE_*` value wins. One warning line names the old variables it
+read or ignored, never their values; rename them to `BEEVERFORGE_*` before 1.1, which reads none.
+
 | | |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | the harness. Irreducible |
@@ -590,20 +596,19 @@ whole set: `tests/test_the_floor_the_limits_and_the_state_directory_are_document
 name here is not read by the code, when the code reads one of these that is not here, or when a
 default here is not the code's.
 
-**No `OPENFACTORY_*` spelling is read.** BeeverForge 0.1.x reads none of OpenFactory's names
-(`CHANGELOG.md`, 0.1.0). Reading the old names, for an OpenFactory 0.7 deployment upgraded in place,
-is planned for 0.2.0 (#266); this table will say then which old spelling is read and in which
-release it stops.
+**Each old spelling is read until 1.1.** The last column names the `OPENFACTORY_*` variable an
+OpenFactory 0.7 deployment set; it is read as the `BEEVERFORGE_*` name when that is unset ([the
+environment](#the-environment)).
 
 | variable | what it sets | unset | a value it cannot read | `OPENFACTORY_*` spelling |
 |---|---|---|---|---|
-| `BEEVERFORGE_MAX_CONCURRENT_JOBS` | the floor: how many jobs may be in flight at once. The poller and a manual scan start at most this many minus those running. `0` pauses pickup | `1` | not a whole number → `1`; below `0` → `0` | not read |
-| `BEEVERFORGE_MAX_TURNS` | how many turns one pass of the `claude_code` harness may take (`--max-turns`) | `200` | must be a whole number: anything else raises when the harness is built | not read |
-| `BEEVERFORGE_AGENT_TIMEOUT` | how many seconds one pass may run, on every harness, before it is stopped | `14400` (four hours) | must be a whole number of seconds: read once, when the sandbox code loads, and anything else raises there | not read |
-| `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once | `4` | not a positive whole number → `4`, said once in the log | not read |
-| `BEEVERFORGE_PRODUCT_TURNS_PER_PRODUCT` | how many turns of one product's role run at once, across its conversations | `2` | not a positive whole number → `2`, logged as an error | not read |
-| `BEEVERFORGE_PRODUCT_TURNS_PER_DEPLOYMENT` | how many product turns run at once on a worker, across every product | `4` | not a positive whole number → `4`, logged as an error | not read |
-| `BEEVERFORGE_STATE_DIR` | the directory the halves of a deployment share: each half writes the build it runs there, and `beeverforge doctor` on the worker reads the others' to say when they differ. The worker and the panel must agree | `/var/lib/beeverforge` | empty → `/var/lib/beeverforge`. A directory a half cannot write is logged, and that half's build goes unrecorded | not read |
+| `BEEVERFORGE_MAX_CONCURRENT_JOBS` | the floor: how many jobs may be in flight at once. The poller and a manual scan start at most this many minus those running. `0` pauses pickup | `1` | not a whole number → `1`; below `0` → `0` | `OPENFACTORY_MAX_CONCURRENT_JOBS`, until 1.1 |
+| `BEEVERFORGE_MAX_TURNS` | how many turns one pass of the `claude_code` harness may take (`--max-turns`) | `200` | must be a whole number: anything else raises when the harness is built | `OPENFACTORY_MAX_TURNS`, until 1.1 |
+| `BEEVERFORGE_AGENT_TIMEOUT` | how many seconds one pass may run, on every harness, before it is stopped | `14400` (four hours) | must be a whole number of seconds: read once, when the sandbox code loads, and anything else raises there | `OPENFACTORY_AGENT_TIMEOUT`, until 1.1 |
+| `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once | `4` | not a positive whole number → `4`, said once in the log | `OPENFACTORY_PREVIEW_MAX`, until 1.1 |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_PRODUCT` | how many turns of one product's role run at once, across its conversations | `2` | not a positive whole number → `2`, logged as an error | `OPENFACTORY_PRODUCT_TURNS_PER_PRODUCT`, until 1.1 |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_DEPLOYMENT` | how many product turns run at once on a worker, across every product | `4` | not a positive whole number → `4`, logged as an error | `OPENFACTORY_PRODUCT_TURNS_PER_DEPLOYMENT`, until 1.1 |
+| `BEEVERFORGE_STATE_DIR` | the directory the halves of a deployment share: each half writes the build it runs there, and `beeverforge doctor` on the worker reads the others' to say when they differ. The worker and the panel must agree | `/var/lib/beeverforge` | empty → `/var/lib/beeverforge`. A directory a half cannot write is logged, and that half's build goes unrecorded | `OPENFACTORY_STATE_DIR`, until 1.1 |
 
 The product turn ceilings are explained with the rest of the conversation's settings in
 [`docs/configuration.md`](../configuration.md#conversations-the-door-the-turn-and-the-ceiling).

@@ -186,6 +186,11 @@ _CACHES = {
     ("beeverforge/runtime/temporal/view.py", "_LIST_CONCURRENCY_SAID"):
         "one per unreadable value of `BEEVERFORGE_LIST_CONCURRENCY` — bounded by the environment, "
         "never by traffic",
+    # #264, review of #499 — the OpenFactory 0.7 names this process has warned about, so a process
+    # that loads `.env` twice warns once.
+    ("beeverforge/former_names.py", "_REPORTED"):
+        "one per distinct `OPENFACTORY_*` name a load has found — bounded by the environment, "
+        "never by traffic",
     # #373 — one refresh machinery per machine identity the registry declares.
     ("beeverforge/adapters/azure_devops.py", "_WORKLOAD"):
         "one per identity client id a registry axis declares (the machine's own under '') — "
