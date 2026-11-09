@@ -76,7 +76,8 @@ _SHORTEST_SECRET = 6
 #: schema ids, the pack's own file names. None of them names a customer.
 PLATFORM_WORDS = frozenset({
     ".env.compose", ".env.compose.example", "~/.beeverforge/env", ".beeverforge/**",
-    ".beeverforge/project.yaml", "project.yaml", "docker-compose.yml", "registry.yaml",
+    ".beeverforge/project.yaml", ".openfactory/**", ".openfactory/project.yaml", "project.yaml",
+    "docker-compose.yml", "registry.yaml",
     "org_defaults/floor.yaml", "floor.yaml", "box.env", "platform.version", "pack.json",
     "pack.sig", "summary.md", "redactions.json", "n/a", "SECURITY.md",
 })
