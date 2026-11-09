@@ -227,10 +227,12 @@ MUTATIONS = [
      "    return None\n",
      PRIORITY),
 
+    # RE-PINNED 2026-11-07 (#191): the proof builds its box from `factory.box_knobs`, the job's
+    # own function, so the cut drops the operator directory from what the proof takes from it
     ("box prove builds its proof box without the operator directory the job's box mounts",
      BOX_PROVE,
-     "    knobs.update(operator_guidelines.box_knobs())\n",
-     "",
+     "        knobs = box_knobs(project)\n",
+     '        knobs = {k: v for k, v in box_knobs(project).items() if k != "guidelines"}\n',
      PRIORITY),
 
     ("the job's own box is built without the operator directory",

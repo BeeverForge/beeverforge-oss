@@ -140,8 +140,10 @@ def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: st
                 f"{git_dir}: its branch names {commit}, which its objects do not hold (git "
                 f"update-ref exited {rc}): {redact(out).strip()[:300]} — check that the job's "
                 "repository is whole (`git fsck`), then publish again")
-        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--force", "--", target,
-                                   f"{ref}:{ref}"]), env=env)
+        # --no-verify beside the hooks override, as main's push had it (#182): a pre-push hook is
+        # handed the authenticated URL
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--force", "--no-verify",
+                                   "--", target, f"{ref}:{ref}"]), env=env)
         if rc != 0:
             raise RuntimeError(f"push failed: {redact(out)}")
     finally:

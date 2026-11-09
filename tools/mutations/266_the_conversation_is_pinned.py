@@ -919,14 +919,16 @@ MUTATIONS = [
     # RE-PINNED 2026-09-24 (#266 slice 3): the history is read from the project's PRODUCT, handed
     # the project itself
     # RE-PINNED 2026-09-25 (#335): the history is read into `before`, which the clock reads
+    # RE-PINNED 2026-11-06 (#437): the same call, now inside `_not_the_platform(...)`
     ("a thread's history forgets the room's rolling exchange", ENGINE,
-     "    before = [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)",
-     '    before = [t for t in transcript.recent(project, thread=ex.thread, channel="")'),
+     "        [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)",
+     '        [t for t in transcript.recent(project, thread=ex.thread, channel="")'),
 
     # RE-PINNED 2026-09-24: moved to engine.py
     # RE-PINNED 2026-09-25 (#335): the same filter, on `before`
+    # RE-PINNED 2026-11-06 (#437): the same filter, inside `_not_the_platform(...)`
     ("the current message is handed to the model as its own history", ENGINE,
-     "              if not (arrival_ts and t.ts == arrival_ts)]", "              if True]"),
+     "         if not (arrival_ts and t.ts == arrival_ts)])", "         if True])"),
 
     # RE-PINNED 2026-09-24 (#266 slice 4): the scan moved into `_staged_here`, which finds a
     # proposal by its room OR by its conversation (another person's key in the same one); the cut
@@ -944,9 +946,11 @@ MUTATIONS = [
      '        log.warning("[%s] product module unavailable: %s", project.name, ctx.reason)\n'),
 
     # RE-PINNED 2026-09-24: moved to engine.py
+    # RE-PINNED 2026-11-06 (#437): a failed answer is said as the role's failure, not as an
+    # unreadable product; the cut still lets it through as an answer
     ("an answer the model could not give is passed on as one", ENGINE,
-     "    if not answer.ok:\n        return unavailable(language=lang)",
-     "    if False:\n        return unavailable(language=lang)"),
+     "    if not answer.ok:\n        return _could_not(",
+     "    if False:\n        return _could_not("),
 
     # RE-PINNED 2026-09-24: moved to engine.py
     # RE-PINNED 2026-09-24 (#266 slice 3): the read-only path says the same sentence twice, so the

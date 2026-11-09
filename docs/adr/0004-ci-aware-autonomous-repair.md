@@ -161,8 +161,8 @@ amendment, not a reversal: the agent still repairs every red build the step does
 - **Once, not on every attempt** (PO, 2026-10-19). The rule guesses, and it guesses wrong in the
   commonest real-regression shape: changed `src/billing/invoice_totals.ts`, failing
   `tests/checkout.spec.ts` (#258's review). So it is asked only when `attempt == 1`. Every later
-  attempt launches the agent whatever the log says, and a wrong "unrelated" costs one CI re-run, not
-  the repair budget.
+  attempt launches the agent whatever the log says, and a wrong "unrelated" spends one of the two
+  repair attempts (`_CI_REPAIR_MAX`) on a CI re-run.
 - **"Could not see" is "related".** A diff the forge could not read, or one `truncated` cut (it
   carries `DIFF_CUT_MARKER`), or a log `truncated_tail` cut (it carries `LOG_CUT_MARKER`, #161),
   launches the agent as before.

@@ -101,7 +101,8 @@ embed = [
 # NO `sandbox` AND NO `slack` EXTRA ANY MORE (2026-08-26). Both were the vendor SDKs of code
 # that is not the core's: boto3 for the S3 session snapshot inside the cloud box, slack_sdk for
 # the chat listener. A vendor's SDK is a dependency of the package that ships the vendor's rows —
-# `addons/beeverforge-aws` declares boto3, `addons/beeverforge-slack` declares slack_sdk — and an
+# `beeverforge-aws` declares boto3, `beeverforge-slack` declares slack_sdk; both are packages of
+# their own, outside this repository (this tree has no `addons/` directory) — and an
 # extra here would have made the core's metadata claim a face the core does not have. The images
 # install the packages (`docker/worker.Dockerfile`, `docker/sandbox.Dockerfile`).
 dev = [
@@ -154,8 +155,9 @@ dev = [
 #
 # THE PLATFORM'S OWN CONNECTORS REGISTER THROUGH THE SAME DOOR — FROM THEIR OWN PACKAGES. The
 # core declares NO row in the group: the `fargate` runner, the DynamoDB metrics sink, the S3
-# session store and the SSM token-pool source are declared by `addons/beeverforge-aws/pyproject.toml`,
-# and the chat channel, its notifier and the Telegram fallback by `addons/beeverforge-slack/`.
+# session store and the SSM token-pool source are declared by the `beeverforge-aws` package's own
+# pyproject, and the chat channel, its notifier and the Telegram fallback by `beeverforge-slack`'s.
+# Both packages live outside this repository; this tree has no `addons/` directory.
 # The four cloud rows lived in this file from 2026-08-24 to 2026-08-26, which made the cloud a
 # directory delete for the CODE and not for the METADATA: the public tree would have shipped four
 # entry points naming modules it does not contain, and every `beeverforge --help` would have

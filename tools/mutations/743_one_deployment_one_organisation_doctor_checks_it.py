@@ -122,10 +122,11 @@ MUTATIONS = [
 
     # ── the read (adapters/github_app.installation_account) ─────────────────────────────────────
     ("the read mints an installation token to ask instead of signing the App's JWT", ADAPTER,
-     "        app_jwt = _app_jwt(app_id, private_key)\n    except Exception as exc:",
+     "        app_jwt = _app_jwt(app_id, private_key)\n"
+     "    except Exception as exc:  # noqa: BLE001 — a key",
      "        app_jwt = mint_installation_token(app_id=app_id, private_key=private_key,\n"
      "                                          installation_id=installation_id)[0]\n"
-     "    except Exception as exc:",
+     "    except Exception as exc:  # noqa: BLE001 — a key",
      f"{READ}::test_no_installation_token_is_minted_to_ask"),
 
     # The plan's cut was `timeout=None`, but that also breaks the reason's `{timeout:g}`, so the

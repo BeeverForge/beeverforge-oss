@@ -145,7 +145,7 @@ class _Recording:
     from its `refuse_from`-th asking on (1: every one) and runs everything else. With
     `wall_fingerprint`, it runs the fingerprint for real and answers what the box's own wall
     answers (`timeout_result`: its exit code, its marker, then the output so far), as if the wall
-    hit after git had printed both hashes."""
+    hit after git had printed all four fingerprint lines."""
 
     def __init__(self, inner, *, refuse_fingerprint: bool = False, refuse_from: int = 1,
                  wall_fingerprint: bool = False) -> None:
@@ -385,10 +385,10 @@ def test_a_workspace_that_cannot_be_asked_after_the_pass_holds_the_job(repo, tmp
     assert "wrote" not in note, f"an unreadable workspace is not a planner that wrote: {note}"
 
 
-def test_a_fingerprint_the_box_walled_is_not_read_even_with_both_hashes_printed(repo, tmp_path):
+def test_a_fingerprint_the_box_walled_is_not_read_even_with_all_four_lines_printed(repo, tmp_path):
     """1d, the exit code decides. The box's wall answers `TIMEOUT_EXIT` and the output so far
-    (`timeout_result`), and a wall that hits after git printed both hashes leaves two hashes as the
-    last two lines. Only an exit 0 is a fingerprint: the job holds before the pass, naming the
+    (`timeout_result`), and a wall that hits after git printed the fingerprint leaves its four lines
+    (tree, HEAD, the ref HEAD is on, the branch's commit) as the last four. Only an exit 0 is a fingerprint: the job holds before the pass, naming the
     exit. Green since the check landed; red under the cut that reads the hashes whatever the exit
     (task 17), where the walled answer read as a mark and the job went on to PR_OPEN."""
     sandbox = _Recording(WorktreeSandbox(root=tmp_path / "wt"), wall_fingerprint=True)

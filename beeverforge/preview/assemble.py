@@ -41,7 +41,7 @@ import re
 from collections.abc import Iterable
 from typing import Literal
 
-from beeverforge import preview
+from beeverforge import namespace, preview
 from beeverforge.contracts.manifest import PreviewConfig
 from beeverforge.contracts.project import PreviewPolicy
 from beeverforge.preview.admit import admit, as_map
@@ -49,8 +49,11 @@ from beeverforge.preview.plan import Layout, PreviewPlan, Refused, TreePath, Uni
 
 #: The factory's own shape files, whatever the manifest names: a change to any of them changes
 #: what a preview WOULD run, and the preview runs the base's.
-SHAPE_FILES = (".beeverforge/preview.compose.yml", ".beeverforge/product.yaml")
-SHAPE_DIR = ".beeverforge/preview/"
+#: Under EITHER of the folder's names (#265): a repository that keeps `.openfactory/` has its
+#: shape read from there, and an edit to it is an edit to the shape all the same.
+SHAPE_FILES = tuple(f"{d}/{name}" for d in namespace.DIRS
+                    for name in ("preview.compose.yml", "product.yaml"))
+SHAPE_DIRS = tuple(f"{d}/preview/" for d in namespace.DIRS)
 
 #: Hosts an environment value may name without leaving the preview.
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"})
@@ -161,17 +164,17 @@ def _reroot(service: dict, layout: Layout) -> dict:
 
 
 def shape_edits(diff_paths: Iterable[str], cfg: PreviewConfig | None,
-                manifest_path: str = ".beeverforge/project.yaml") -> list[str]:
+                manifest_path: str = namespace.MANIFEST) -> list[str]:
     """The paths of a diff that change what a preview WOULD run: a `preview.compose` file, the
     factory's own shape files, or the manifest the block lives in."""
     compose = {posixpath.normpath(p) for p in (cfg.compose if cfg else [])}
-    fixed = {posixpath.normpath(manifest_path), *SHAPE_FILES}
+    fixed = {*(posixpath.normpath(m) for m in namespace.spellings(manifest_path)), *SHAPE_FILES}
     return [p for p in diff_paths
-            if posixpath.normpath(p) in compose | fixed or p.startswith(SHAPE_DIR)]
+            if posixpath.normpath(p) in compose | fixed or p.startswith(SHAPE_DIRS)]
 
 
 def topology_changed(diff_paths: Iterable[str], cfg: PreviewConfig | None,
-                     manifest_path: str = ".beeverforge/project.yaml") -> bool:
+                     manifest_path: str = namespace.MANIFEST) -> bool:
     """Whether the change edits the preview's shape. It is then previewed with the base's shape —
     the change's compose file is never opened — and the card says so (S10)."""
     return bool(shape_edits(diff_paths, cfg, manifest_path))
@@ -241,7 +244,7 @@ def _carried(service: dict) -> list[str]:
 
 def assemble(doc: dict, *, cfg: PreviewConfig, unit: Unit, layout: Layout,
              policy: PreviewPolicy | None = None, shape_tree: str = "",
-             manifest_path: str = ".beeverforge/project.yaml", domain: str = "",
+             manifest_path: str = namespace.MANIFEST, domain: str = "",
              scheme: str = "https", public_port: int | None = None,
              reach: Literal["network", "loopback"] = "network",
              loopback_range: tuple[int, int] | None = None, expires_at: int = 0,

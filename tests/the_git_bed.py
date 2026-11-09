@@ -334,6 +334,23 @@ def a_hosted_door(bed: Bed, dest: Path) -> Path:
     return bed.copy("hosted-door", dest, _hosted_door)
 
 
+def _with_a_submodule(where: Path, _env: pytest.MonkeyPatch) -> None:
+    where.mkdir()
+    _card_repository(where / "lib", WORK)
+    repo = _card_repository(where / "repo", WORK)
+    # RELATIVE (`../lib`), so the committed `.gitmodules` holds no path of the template: the copy
+    # rewrites the template's root in every text file, and a tracked one would read as modified.
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", "../lib", "sub")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgSign=false",
+         "commit", "-q", "-m", "the submodule")
+
+
+def a_repository_with_a_submodule(bed: Bed, dest: Path) -> Path:
+    """`dest / "repo"`: a card repository on `main` whose submodule `sub` is a clean checkout of
+    `dest / "lib"`, another one, committed. A test dirties `sub` itself."""
+    return bed.copy("with-a-submodule", dest, _with_a_submodule) / "repo"
+
+
 # ── the count ───────────────────────────────────────────────────────────────────────────────────
 
 _GIT_INIT = re.compile(r"\bgit\s+init\b")

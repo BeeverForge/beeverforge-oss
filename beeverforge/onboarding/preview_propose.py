@@ -949,6 +949,30 @@ class _Written(BaseModel):
     merged: Merged | None = None
     paths: list[str] = Field(default_factory=list)
     base: str = "main"
+    #: the folder the drafted files were written under — the one the repository uses (#265)
+    folder: str = namespace.DIR
+
+
+#: Our folder's name where a drafted path or a sentence spells it — not `~/.beeverforge/`, the
+#: operator's own directory, and not a longer name that merely ends in it.
+_OUR_FOLDER = re.compile(r"(?<![\w~/.-])" + re.escape(namespace.DIR) + r"/")
+
+
+def in_folder(text: str, folder: str) -> str:
+    """`text` with every drafted path under `.beeverforge/` moved under `folder` — the folder
+    the repository being written into uses (`namespace.dir_in`). The draft is composed under the
+    current name; a repository that keeps `.openfactory/` is written there, its `compose:` value
+    names it there, and the pull request says so (#265)."""
+    if folder == namespace.DIR:
+        return text
+    return _OUR_FOLDER.sub(lambda _m: f"{folder}/", text)
+
+
+def relocated(out: Draft, folder: str) -> Draft:
+    """The same draft, every path and every sentence in it under `folder` (`in_folder`)."""
+    if folder == namespace.DIR:
+        return out
+    return Draft.model_validate_json(in_folder(out.model_dump_json(), folder))
 
 
 def _draft_into(checkout: Path, project, *, repo: str, accept: bool,
@@ -969,7 +993,8 @@ def _draft_into(checkout: Path, project, *, repo: str, accept: bool,
             f"the preview once that is merged. Nothing was written."))
     text = manifest.read_text(encoding="utf-8")
     proposal = infer_preview(checkout, name=_short(repo) or project.name)
-    out = draft(proposal, accept=accept, answers=answers)
+    folder = namespace.dir_in(checkout)
+    out = relocated(draft(proposal, accept=accept, answers=answers), folder)
     if out.refusal:
         return Outcome(repo=repo, detail=out.refusal + " Nothing was written.",
                        questions=proposal.questions)
@@ -1007,7 +1032,7 @@ def _draft_into(checkout: Path, project, *, repo: str, accept: bool,
         manifest.write_text(merged.text, encoding="utf-8")
         paths.insert(0, str(manifest.relative_to(checkout)))
     return _Written(proposal=proposal, out=out, merged=merged, paths=paths,
-                    base=_base_branch(text))
+                    base=_base_branch(text), folder=folder)
 
 
 def _base_branch(manifest_text: str) -> str:
@@ -1054,8 +1079,10 @@ def _propose_local(project, *, repo: str, accept: bool, answers: dict[str, Any] 
         return written
     proof = prove(project, written.out.files, written.out.block or {}) if prove and \
         written.out.block else ""
-    body = pr_body(written.proposal, written.out, project=project.name, repo=repo, proof=proof,
-                   comments_kept=written.merged is None or written.merged.comments_kept)
+    body = in_folder(pr_body(written.proposal, written.out, project=project.name, repo=repo,
+                             proof=proof, comments_kept=(written.merged is None
+                                                         or written.merged.comments_kept)),
+                     written.folder)
     return Outcome(ok=True, repo=repo, wrote=written.paths, base=written.base, body=body,
                    questions=written.proposal.questions,
                    detail=(f"wrote {', '.join(f'`{p}`' for p in written.paths)} into {checkout} "
@@ -1116,9 +1143,10 @@ def _propose_hosted(project, *, repo: str, accept: bool, answers: dict[str, Any]
             return written
         proof = prove(project, written.out.files, written.out.block or {}) if prove and \
             written.out.block else ""
-        body = pr_body(written.proposal, written.out, project=project.name, repo=repo,
-                       proof=proof,
-                       comments_kept=written.merged is None or written.merged.comments_kept)
+        body = in_folder(pr_body(written.proposal, written.out, project=project.name, repo=repo,
+                                 proof=proof, comments_kept=(written.merged is None
+                                                             or written.merged.comments_kept)),
+                         written.folder)
         first, rest = written.paths[0], written.paths[1:]
         result = propose(
             checkout=checkout, manifest_path=first, repo=repo, clone_url=url, base=base,

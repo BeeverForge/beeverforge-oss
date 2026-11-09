@@ -55,6 +55,7 @@ from beeverforge.adapters.sandbox.base import (
 )
 from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 from beeverforge.adapters.sandbox.pull import PullCredential
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 from beeverforge.observability import logs
 
 log = logging.getLogger("beeverforge.sandbox.container")
@@ -411,6 +412,8 @@ class ContainerSandbox(SandboxAdapter):
         #: What the command currently running has written — the buffer `tail()` reads (C-39). One
         #: per box for the same reason as the handle above: one job at a time.
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
 
     def guidelines_path(self, host_dir: Path) -> str | None:
@@ -634,8 +637,17 @@ class ContainerSandbox(SandboxAdapter):
             raise RuntimeError(
                 f"could not start the box {cname!r} (docker run exited {rc}): {out.strip()[:300]}"
                 + _NO_INIT_BINARY * any(w in out for w in ("init binary", "catatonit")))
-        _host(["docker", "exec", cname, "git", "config", "--global",
-               "--add", "safe.directory", _WORKDIR])
+        # THE WRITE IS CHECKED (#172). A client image whose HOME cannot hold a global config (a
+        # `HOME=/nonexistent` user, measured 2026-10-20) fails this write, and every later git call
+        # in the box is then refused with "detected dubious ownership", exit 128 — which used to
+        # read as "nothing to commit" further down. Refuse here, by name, with no box left behind.
+        rc, out = _host(["docker", "exec", cname, "git", "config", "--global",
+                         "--add", "safe.directory", _WORKDIR])
+        if rc != 0:
+            refusal = self._safe_directory_refusal(cname, rc, out)
+            _host(["docker", "rm", "-f", cname])
+            shutil.rmtree(host_clone, ignore_errors=True)
+            raise RuntimeError(refusal)
 
         self._container, self._host_clone = cname, host_clone
         # A NEW container is a new HOME: the image may differ from the last job's (ADR-0037 D4
@@ -646,6 +658,36 @@ class ContainerSandbox(SandboxAdapter):
         # orchestrator sees it (the bind-mounted clone) — what host-side readers must use.
         return Workspace(path=Path(_WORKDIR), host_path=host_clone,
                          branch=branch, base_branch=base_branch, base_commit=base_commit)
+
+    #: What git says when the global config it was asked to write cannot be written - the only
+    #: answers that make HOME the cause. Anything else (no git in the image, a box that stopped)
+    #: is named for what it is: a confident wrong remedy is worse than none (ADR-0020).
+    _HOME_WRITE_FAILURES = ("could not lock config file", "$HOME not set")
+
+    def _safe_directory_refusal(self, cname: str, rc: int, out: str) -> str:
+        """The one sentence a failed `safe.directory` write refuses with, naming its real cause."""
+        words = " ".join((out or "").split())[:200] or "no output"
+        what = (f"the box image {self.image!r} could not mark {_WORKDIR} as a safe git directory "
+                f"(`git config --global` exited {rc}: {words})")
+        if "is not running" in (out or ""):
+            return (f"{what} because the box stopped right after it started, so no command can "
+                    "run in it; run the image by hand with `docker run --entrypoint sleep "
+                    f"{self.image} infinity` to see why it exits.")
+        if rc in (126, 127):
+            return (f"{what} because the box could not run git, so every git call in the box "
+                    "would fail; make sure the image has git on PATH.")
+        if not any(w in (out or "") for w in self._HOME_WRITE_FAILURES):
+            return (f"{what}, so every git call in the box would be refused; make "
+                    f"`git config --global --add safe.directory {_WORKDIR}` succeed in the image.")
+        home_rc, home_out = _host(
+            ["docker", "exec", cname, "sh", "-c", 'printf "OFHOME:%s\\n" "$HOME"'])
+        home = next((ln[len("OFHOME:"):].strip() for ln in (home_out or "").splitlines()
+                     if ln.startswith("OFHOME:")), "") if home_rc == 0 else ""
+        return (f"{what} because "
+                + (f"its HOME {home!r}" if home else "an unreadable HOME")
+                + " cannot hold a global git config, so every git call in the box would be "
+                "refused; give the image a writable HOME (set `HOME` to a writable directory in "
+                "its Dockerfile, or run it as a user whose home directory exists).")
 
     def harness_path(self, name: str) -> str:
         """An absolute path into the mounted toolbox — never a bare name.
@@ -807,8 +849,14 @@ class ContainerSandbox(SandboxAdapter):
         passing = self._passthrough()
         for var in passing:
             env_flags += ["-e", var]
-        return run_and_stream(
-            subprocess.Popen(
+        # A JOB'S `docker exec` CLIENT IN A GROUP OF ITS OWN (#44), as on the worktree box: a
+        # person's stop kills the client at once, and `cleanup`'s `docker rm -f` — which `run()`'s
+        # `finally` reaches as soon as the pass returns — takes the process inside the container.
+        # So this box needs neither the worktree box's mark nor its `TMPDIR` (review of #453):
+        # `docker rm -f` ends every process in the container, a `setsid`'d one included, and the
+        # container's `/tmp` goes with it.
+        stop = self.stop
+        proc = subprocess.Popen(
                 # `sh -c`, NEVER `sh -lc`. A login shell sources the CLIENT IMAGE's /etc/profile
                 # and /etc/profile.d/* before the command — arbitrary third-party code running
                 # ahead of everything the platform issues, with the harness token already in the
@@ -826,9 +874,12 @@ class ContainerSandbox(SandboxAdapter):
                  "sh", "-c", command],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1, env=self._client_env(passing),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: `docker exec` is a local subprocess and the daemon relays the container

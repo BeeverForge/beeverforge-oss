@@ -2305,9 +2305,15 @@ def test_a_base_that_cannot_be_read_is_said_plainly_with_no_receipt_and_no_model
     assert table.turns(ROOM) == [("person", question, CLIENT), ("agent", reply, "")]
 
 
-def test_an_answer_the_model_could_not_give_is_the_same_sentence(table, ledger):
-    """The model was asked and did not answer: the same unavailable sentence — the receipt had
-    already gone out, before the model was asked."""
+def test_an_answer_the_model_could_not_give_says_so_not_that_the_product_is_unreadable(table,
+                                                                                      ledger):
+    """The model was asked and did not answer — the receipt had already gone out, before the model
+    was asked.
+
+    FLIPPED BY #437, ON PURPOSE. This was pinned as "the same unavailable sentence": "I can't see
+    the product's requirements… I've flagged it to the team", said after the requirements were
+    read, with nothing flagged. The role now says it could not put an answer together, and promises
+    an alert only when one was filed — here nothing could be, so it promises none."""
     project = _project()
     question = "o extrato conciliado pode ser editado?"
     module = _Module(project, replies={"conciliado": ProductAnswer(ok=False, error="timeout")})
@@ -2315,7 +2321,7 @@ def test_an_answer_the_model_could_not_give_is_the_same_sentence(table, ledger):
 
     reply = talk.say(question, user=CLIENT)
 
-    assert reply == voice.unavailable(language=LANG)
+    assert reply == voice.cannot_answer(alerted=False, language=LANG)
     assert talk.receipts == [_receipt(question)]
 
 

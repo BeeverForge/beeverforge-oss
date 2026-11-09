@@ -76,7 +76,8 @@ def _git(
         })
     try:
         p = subprocess.run(
-            ["git", *args], cwd=str(cwd) if cwd else None, capture_output=True, text=True,
+            ["git", *gitpin.HOOKLESS, *args], cwd=str(cwd) if cwd else None, capture_output=True,
+            text=True,
             timeout=_GIT_TIMEOUT, env=env, check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -156,7 +157,9 @@ def _head_commit(repo_path: Path) -> str:
     import subprocess
 
     try:
-        p = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        # hooks off (#182, #384's review): `repo_path` is a job's tree, and a worktree box's
+        # tree is a linked worktree of the shared repo cache, whose hooks and config it shares
+        p = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=15, check=False)
         return p.stdout.strip() if p.returncode == 0 else ""
     except Exception as exc:  # noqa: BLE001 — a stamp, never a gate

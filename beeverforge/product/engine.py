@@ -951,6 +951,62 @@ def _looking_at(ex: Exchange, module) -> dict:
     return {"context": state} if takes else {}
 
 
+def _could_not(project, error: str, *, step: str, language: str | None) -> str:
+    """The role's own model call failed (#437): the harness crashed, refused the model, or is not
+    logged in. By this point the requirements were READ, so `voice.unavailable` ("I can't see the
+    requirements… I've flagged it to the team") would be false twice over, and it was: the cause
+    was dropped, nothing was logged, and no impediment was filed.
+
+    So the cause is logged, an impediment is opened for it (once per cause: `impediment.report`
+    files one, under a lock, and asks the board again on every later occurrence), and the person is
+    told a sentence that names no requirement and promises an alert only when one is open on the
+    board. Any failure of the role reaches here, whatever the harness printed.
+
+    ONE FAILED TURN IS ENOUGH TO FILE, and the next answered turn closes it: the corpus and mount
+    seams (`module._tell_the_factory`) behave the same way, so a harness that fails once and then
+    answers leaves one ticket opened and closed, with the cause and the evidence on it. Waiting for
+    a second failure would leave the first person told nothing reached the team."""
+    from beeverforge.ops import impediment
+    from beeverforge.product import voice
+    from beeverforge.product.model import scrub_credentials
+
+    cause = impediment.PRODUCT_CANNOT_ANSWER
+    # SCRUBBED, THEN CUT (#437's review): the harness's own text can echo the prompt, a path or a
+    # credential, and this goes to the log AND to a ticket on the factory board, which may be a
+    # tracker other people read. Truncation is not redaction (`util/causes.scrubbed`).
+    detail = scrub_credentials((error or "").strip())[:400] or "no cause declared"
+    log.warning("BEEVERFORGE_PRODUCT_CANNOT_ANSWER project=%s step=%s — the product role's model "
+                "call failed: %s", getattr(project, "name", "?"), step, detail)
+    # RECHECKED: the person is about to be told the team knows, so the board is asked again rather
+    # than this process's memory, which a person closing the ticket would have made a lie
+    ref = impediment.report(project, cause, f"{step}: {detail}", recheck=True)
+    alerted = bool(ref)
+    said = voice.cannot_draft if step == "draft" else voice.cannot_answer
+    return said(alerted=alerted, language=language)
+
+
+def _answered_again(project) -> None:
+    """The role answered, so an impediment opened for its model call closes (#437), the way the
+    corpus seam closes its own: by observation. Free on the ordinary path (`impediment.resolved`
+    skips a cause it already saw working)."""
+    from beeverforge.ops import impediment
+
+    impediment.resolved(project, impediment.PRODUCT_CANNOT_ANSWER,
+                        evidence="the product role answered a turn")
+
+
+def _not_the_platform(turns: list) -> list:
+    """The conversation without the platform's own sentences (#437): a crash reply, an
+    unavailable, a could-not-answer. They are the platform's, not the role's, and a model that
+    reads them as its own earlier answers explains them, falsely ("I said I couldn't see anything,
+    but I hadn't actually tried to look"). The person's lines stay, so an unanswered question
+    still reads as asked."""
+    from beeverforge.product import voice
+
+    return [t for t in turns
+            if not (getattr(t, "role", "") == "agent" and voice.own_voice_kind(t.text))]
+
+
 def _this_conversation(ex: Exchange, *, arrival_ts: str = "") -> tuple[str, list]:
     """This conversation as the role reads it — the rendered block and the turns it came from.
 
@@ -963,8 +1019,9 @@ def _this_conversation(ex: Exchange, *, arrival_ts: str = "") -> tuple[str, list
     agent_name = getattr(getattr(project, "product", None), "agent_name", "")
     # the CURRENT message is excluded by the ts it was recorded under: it is already the
     # "## Question" of this prompt, and history is strictly what came before it
-    before = [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)
-              if not (arrival_ts and t.ts == arrival_ts)]
+    before = _not_the_platform(
+        [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)
+         if not (arrival_ts and t.ts == arrival_ts)])
     # WHEN EACH LINE WAS SAID, AND WHEN THIS TURN IS (`product/clock.py`): without them five days
     # of silence read as one sitting, and the role said "ontem" about last week
     zone, _zone_name = clock.zone_of(project)
@@ -1055,7 +1112,8 @@ def converse(ex: Exchange, waiting: dict | None, *, arrival_ts: str = ""):
                            **_looking_at(ex, module),
                            **({"intake": intake} if intake and _accepts_intake(module) else {}))
     if not answer.ok:
-        return unavailable(language=lang)
+        return _could_not(project, getattr(answer, "error", ""), step="answer", language=lang)
+    _answered_again(project)
     try:
         _case.note_turn(project, thread, user, text, answer, message_id=ex.message.id)
     except Exception:  # noqa: BLE001 — the case is bookkeeping; the reply is the act
@@ -1713,6 +1771,13 @@ def offer_draft(project, *, request: str, user: str, thread: str, module,
     _progress.stage("drafting")    # a model call of its own, after the answer's (#395)
     answer = module.draft(request, asked_by=asked_by or user, **_drafted_from(
         module.draft, conversation=conversation, reply=reply, replacing=replacing))
+    if not answer.ok and getattr(answer, "harness_failed", False):
+        # THE DRAFT'S MODEL CALL FAILED (#437), which is not "there was nothing to draft": the
+        # answer before it may have promised one. Said after that answer, and reported. A draft
+        # that came back and was refused (no testable outcome, an unreadable shape) is not this:
+        # the model ran, and the conversation goes on as it always did.
+        return preamble + _could_not(project, getattr(answer, "error", ""), step="draft",
+                                     language=lang)
     if not answer.ok or answer.draft is None:
         return None  # nothing to confirm; the conversation continues
 

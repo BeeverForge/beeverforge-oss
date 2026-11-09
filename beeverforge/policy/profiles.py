@@ -31,6 +31,7 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
+from beeverforge import namespace
 from beeverforge.contracts.profile import MAX_EXTENDS_DEPTH, Profile, RiskPolicy
 from beeverforge.contracts.state import RiskLevel
 from beeverforge.util import yaml_io
@@ -45,7 +46,13 @@ FRAMEWORK_PROFILES_DIR = Path(__file__).resolve().parent.parent / "org_defaults"
 #: comment, `project.yaml.example` and the ADR) true only if every caller remembered to pass
 #: `repo/.beeverforge`. Nothing established that, so a client following the documentation got a
 #: `ProfileError`. The one contract a client has to get right is now the one thing the code states.
-PROJECT_PROFILES_SUBDIR = Path(".beeverforge") / "profiles"
+PROJECT_PROFILES_SUBDIR = Path(namespace.DIR) / "profiles"
+
+
+def _project_profiles(project_dir: Path) -> Path:
+    """`<checkout>/.beeverforge/profiles` — under `.openfactory/` for a checkout that keeps the
+    folder's former name (#265): a client's profiles are read where their repository has them."""
+    return project_dir / namespace.in_repo(project_dir, PROJECT_PROFILES_SUBDIR.as_posix())
 
 
 class ProfileError(Exception):
@@ -207,7 +214,7 @@ def _read(path: Path) -> dict:
 
 def _locate(name: str, project_dir: Path | None) -> Path | None:
     if project_dir is not None:
-        candidate = project_dir / PROJECT_PROFILES_SUBDIR / f"{name}.yaml"
+        candidate = _project_profiles(project_dir) / f"{name}.yaml"
         if candidate.is_file():
             return candidate
     shipped = FRAMEWORK_PROFILES_DIR / f"{name}.yaml"
@@ -220,7 +227,7 @@ def load_profile(name: str, *, project_dir: Path | None = None) -> Profile:
     if path is None:
         looked = [str(FRAMEWORK_PROFILES_DIR / f"{name}.yaml")]
         if project_dir is not None:
-            looked.insert(0, str(project_dir / PROJECT_PROFILES_SUBDIR / f"{name}.yaml"))
+            looked.insert(0, str(_project_profiles(project_dir) / f"{name}.yaml"))
         raise ProfileError(
             f"the manifest declares `profile: {name}` and no such profile exists. Looked in: "
             + ", ".join(looked)
@@ -248,7 +255,7 @@ def available_profiles(project_dir: Path | None = None) -> list[str]:
     names = {p.stem for p in FRAMEWORK_PROFILES_DIR.glob("*.yaml")} if (
         FRAMEWORK_PROFILES_DIR.is_dir()) else set()
     if project_dir is not None:
-        d = project_dir / PROJECT_PROFILES_SUBDIR
+        d = _project_profiles(project_dir)
         if d.is_dir():
             names |= {p.stem for p in d.glob("*.yaml")}
     return sorted(names)

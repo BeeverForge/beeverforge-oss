@@ -7,7 +7,9 @@ two processes compute differently. A test no job selected would leave the gate g
 
 THE RULES THIS FILE HOLDS:
   1. the slices of one selection (`--shard I/N`) hold every test exactly once, whatever process
-     computes them, and an xdist run writes each test it started once (`--record-ids`);
+     computes them, and an xdist run writes each test it started once (`--record-ids`). A slice
+     is whole test files, balanced by the committed duration table and by CRC32 of the path for a
+     file the table does not list, and a shard never imports a file another shard owns (#356);
   2. the proof (`scripts/every_test_ran_once.py`) fails on a test missing, doubled or unknown, and
      names it;
   3. CI wires it: the `test` job needs every other job and runs the proof; the unit job's slices
@@ -26,11 +28,14 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import tomllib
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -44,7 +49,25 @@ ROOT = Path(__file__).resolve().parent.parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 SLICES = 3
 
-PROBE = textwrap.dedent("""\
+
+def _test_roots() -> list[Path]:
+    """The directories pytest collects when it is named nothing: `testpaths`, kept to what the
+    tree holds (`addons/*/tests` leaves with the public cut)."""
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return sorted({p for pattern in config["tool"]["pytest"]["ini_options"]["testpaths"]
+                   for p in ROOT.glob(pattern) if p.is_dir()})
+
+#: Every probe module says when it is imported, into the file `PROBE_IMPORTS` names: the guard that
+#: a shard imports only the files it owns reads it.
+IMPORTED = textwrap.dedent("""\
+    import os
+
+    if os.environ.get("PROBE_IMPORTS"):
+        with open(os.environ["PROBE_IMPORTS"], "a", encoding="utf-8") as log:
+            log.write(__file__ + "\\n")
+""")
+
+PROBE = IMPORTED + textwrap.dedent("""\
     import pytest
 
 
@@ -64,6 +87,42 @@ PROBE = textwrap.dedent("""\
         assert who
 """)
 
+SMALL = IMPORTED + textwrap.dedent("""\
+
+
+    def test_first():
+        pass
+
+
+    def test_second():
+        pass
+""")
+
+#: Run through a fixture of its own conftest and a helper beside it: a shard that skipped either
+#: would error these, or never collect them.
+IN_SUB = IMPORTED + textwrap.dedent("""\
+    import helper
+
+
+    def test_the_fixture_resolves(from_the_sub_conftest):
+        assert from_the_sub_conftest == "sub"
+
+
+    def test_the_helper_imports():
+        assert helper.WHO == "helper"
+""")
+
+#: The table the probe's conftest reads: two files of equal seconds (the path breaks the tie), and
+#: one that is gone (a stale entry takes a share of nothing). Every other probe file is unlisted.
+#: THE NAMES ARE CHOSEN, not arbitrary: under 3 slices `test_new_1.py` and `test_new_7.py` are the
+#: files whose CRC32 lands on index 4 when the fallback is cut `% (count + 1)`, and the directory
+#: `sub` hashes to slice 3 while `sub/test_in_sub.py` hashes to slice 1, so a rule that skipped a
+#: directory by its own key would lose the sub tests.
+TABLE = {"test_heavy.py": 5.0, "test_gone.py": 4.0, "test_probe.py": 3.0, "test_tie_b.py": 2.0,
+         "test_tie_a.py": 2.0, "test_light.py": 1.0}
+LISTED = ["test_heavy.py", "test_tie_a.py", "test_tie_b.py", "test_light.py"]
+UNLISTED = [f"test_new_{n}.py" for n in range(1, 8)]
+
 
 def _the_proof():
     spec = importlib.util.spec_from_file_location("every_test_ran_once",
@@ -77,37 +136,72 @@ def _ids(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
-@pytest.fixture(scope="module")
-def probe(tmp_path_factory):
-    where = tmp_path_factory.mktemp("ci-slices")
-    assert ROOT not in where.resolve().parents, "the probe is inside the tree under test"
+def _write_probe(where: Path) -> None:
     (where / "test_probe.py").write_text(PROBE, encoding="utf-8")
+    for name in [*LISTED, *UNLISTED]:
+        (where / name).write_text(SMALL, encoding="utf-8")
+    (where / "sub").mkdir()
+    (where / "sub" / "conftest.py").write_text(textwrap.dedent("""\
+        import pytest
+
+
+        @pytest.fixture
+        def from_the_sub_conftest():
+            return "sub"
+    """), encoding="utf-8")
+    (where / "sub" / "helper.py").write_text('WHO = "helper"\n', encoding="utf-8")
+    (where / "sub" / "test_in_sub.py").write_text(IN_SUB, encoding="utf-8")
     (where / "conftest.py").write_text(
         (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8"), encoding="utf-8")
+    (where / "shard_durations.json").write_text(json.dumps(TABLE), encoding="utf-8")
 
-    def run(*args: str) -> subprocess.CompletedProcess:
+
+@pytest.fixture(scope="module")
+def probe(tmp_path_factory):
+    """The probe DIRECTORY, collected as pytest walks it, so every file but the directory itself
+    is asked about (pytest never ignores a path it was named). Keyed from its own root, as the
+    tree's files are keyed from the repository's; `own_root=False` keeps the tree's root."""
+    where = tmp_path_factory.mktemp("ci-slices")
+    assert ROOT not in where.resolve().parents, "the probe is inside the tree under test"
+    _write_probe(where)
+
+    def run(*args: str, own_root: bool = True, imports: Path | None = None,
+            seed: int = 0) -> subprocess.CompletedProcess:
+        env = {**os.environ, "PYTHONHASHSEED": str(seed)}
+        env.pop("PROBE_IMPORTS", None)
+        if imports is not None:
+            env["PROBE_IMPORTS"] = str(imports)
         return subprocess.run(
-            [sys.executable, "-m", "pytest", str(where / "test_probe.py"),
+            [sys.executable, "-m", "pytest", str(where),
              "-c", str(ROOT / "pyproject.toml"), "-q", "-p", "no:cacheprovider", "--no-header",
-             *args],
-            capture_output=True, text=True, cwd=str(ROOT), timeout=300)
+             *([f"--rootdir={where}"] if own_root else []), *args],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=300, env=env)
 
     run.dir = where
+    run.out = tmp_path_factory.mktemp("ci-slices-out")
     return run
 
 
 @pytest.fixture(scope="module")
 def sliced(probe):
-    collected = probe.dir / "collected.txt"
-    done = probe("--collect-only", f"--record-ids={collected}")
+    """The whole collection, then each slice in a process of its own, with a hash seed of its own:
+    a rule salted per process puts a file in two slices, or in none."""
+    collected = probe.out / "collected.txt"
+    done = probe("--collect-only", f"--record-ids={collected}",
+                 imports=probe.out / "imported-all.txt")
     assert done.returncode == 0, done.stdout[-1500:]
     ran = []
     for index in range(1, SLICES + 1):
-        path = probe.dir / f"ran-{index}.txt"
-        done = probe(f"--shard={index}/{SLICES}", f"--record-ids={path}")
+        path = probe.out / f"ran-{index}.txt"
+        done = probe(f"--shard={index}/{SLICES}", f"--record-ids={path}",
+                     imports=probe.out / f"imported-{index}.txt", seed=index)
         assert done.returncode == 0, done.stdout[-1500:]
         ran.append(path)
     return collected, ran
+
+
+def _files_of(ids: list[str], where: Path) -> set[str]:
+    return {str(where / nodeid.partition("::")[0]) for nodeid in ids}
 
 
 # ── 1. the slices ───────────────────────────────────────────────────────────────────────────────
@@ -116,9 +210,81 @@ def test_the_slices_hold_every_collected_test_exactly_once(sliced):
     collected, ran = sliced
     every = [nodeid for path in ran for nodeid in _ids(path)]
 
-    assert len(_ids(collected)) == 33, _ids(collected)
+    assert len(_ids(collected)) == 57, _ids(collected)
     assert Counter(every) == Counter(_ids(collected)), "a test fell between the slices, or in two"
     assert all(_ids(path) for path in ran), "a slice is empty: the rule does not spread the tests"
+
+
+def test_a_shard_imports_only_the_files_it_owns(sliced, probe):
+    """THE POINT OF SPLITTING BY FILE (#356): a shard that imports every file and deselects three
+    quarters of the tests pays the whole suite's collection in every worker of every job."""
+    collected, ran = sliced
+    imported = [_ids(probe.out / f"imported-{index}.txt") for index in range(1, SLICES + 1)]
+
+    for index, (path, names) in enumerate(zip(ran, imported, strict=True), start=1):
+        assert sorted(names) == sorted(_files_of(_ids(path), probe.dir)), (
+            f"slice {index} imported {sorted(names)}: a file it does not run, or one twice")
+    assert Counter(name for names in imported for name in names) == Counter(
+        _files_of(_ids(collected), probe.dir)), "a probe file was imported by two slices, or none"
+    assert sorted(_ids(probe.out / "imported-all.txt")) == sorted(
+        _files_of(_ids(collected), probe.dir)), "a run without --shard skipped a file"
+
+
+def test_a_shard_never_skips_a_conftest_or_a_helper(sliced):
+    """`sub/test_in_sub.py` runs on its own directory's conftest fixture and a helper beside it,
+    in the one slice that owns it, and passes there (`sliced` requires every slice green). A rule
+    that skipped the directory or the conftest by its own key would lose those tests, or error
+    them."""
+    _, ran = sliced
+    owners = [path for path in ran if any(n.startswith("sub/test_in_sub.py::") for n in _ids(path))]
+
+    assert len(owners) == 1, f"sub/test_in_sub.py ran in {len(owners)} slices"
+    assert sorted(n for n in _ids(owners[0]) if n.startswith("sub/")) == [
+        "sub/test_in_sub.py::test_the_fixture_resolves", "sub/test_in_sub.py::test_the_helper_imports"]
+
+
+def test_the_longest_file_goes_to_the_least_loaded_shard_ties_by_path():
+    """In process, on a table whose order is not its paths' order: `b.py` and `a.py` weigh the
+    same, so the path decides, and `c.py` meets two shards of equal load and takes the lower."""
+    from tests.conftest import _shard_owners
+
+    table = {"c.py": 1.0, "b.py": 2.0, "a.py": 2.0, "big.py": 5.0}
+
+    assert _shard_owners(table, 3) == {"big.py": 1, "a.py": 2, "b.py": 3, "c.py": 2}
+    assert _shard_owners(dict(reversed(table.items())), 3) == _shard_owners(table, 3)
+
+
+def test_every_file_of_the_tree_lands_in_one_shard_for_any_n():
+    """Every test file of every test root, a file added tomorrow that the table does not list,
+    and a listed file that is gone: each in exactly one shard of 1..N, with the committed table."""
+    from tests.conftest import SHARD_TABLE, _shard_of, _shard_owners, _shard_table
+
+    table = _shard_table(SHARD_TABLE)
+    assert table, f"{SHARD_TABLE} is empty: every file goes by CRC32, balanced only by luck"
+    patterns = ["test_*.py", "*_test.py"]
+    files = sorted({p.relative_to(ROOT).as_posix() for root in _test_roots()
+                    for pattern in patterns for p in root.rglob(pattern)})
+    keys = [*files, "tests/test_added_tomorrow_and_never_measured.py", "tests/test_gone_since.py"]
+
+    for count in range(1, 7):
+        owners = _shard_owners({**table, "tests/test_gone_since.py": 9.9}, count)
+        for key in keys:
+            assert _shard_of(key, owners, count) in range(1, count + 1), (key, count)
+    assert sum(key not in table for key in files) < len(files) / 10, (
+        f"{SHARD_TABLE} lists too few of the tree's test files to balance them; rebuild it with "
+        f"`python -m tests.shard_durations <junit.xml>`")
+
+
+@pytest.mark.skipif(importlib.util.find_spec("xdist") is None, reason="pytest-xdist not installed")
+def test_under_xdist_a_slice_runs_what_one_process_runs(probe, sliced):
+    """Every worker of a `--shard` run computes the shard for itself: workers that disagreed
+    would collect different suites, and xdist refuses that, or runs the wrong one."""
+    _, ran = sliced
+    path = probe.out / "ran-xdist-slice.txt"
+    done = probe("-n", "2", f"--shard=2/{SLICES}", f"--record-ids={path}", seed=7)
+    assert done.returncode == 0, done.stdout[-1500:]
+
+    assert sorted(_ids(path)) == sorted(_ids(ran[1])), "xdist ran another slice than one process"
 
 
 def test_a_skipped_test_counts_as_started(sliced):
@@ -133,10 +299,10 @@ def test_under_xdist_each_started_test_is_written_once(probe):
     and a slice rule salted per process would make the workers collect different suites. And
     under `--dist loadgroup`, as CI's integration job runs, xdist suffixes a grouped test's id
     with `@<group>`, which the collection does not carry."""
-    path = probe.dir / "ran-xdist.txt"
+    path = probe.out / "ran-xdist.txt"
     done = probe("-n", "2", "--dist", "loadgroup", f"--record-ids={path}")
     assert done.returncode == 0, done.stdout[-1500:]
-    alone = probe.dir / "ran-alone.txt"
+    alone = probe.out / "ran-alone.txt"
     assert probe(f"--record-ids={alone}").returncode == 0
 
     assert sorted(_ids(path)) == sorted(_ids(alone)), "xdist and one process ran different tests"
@@ -152,7 +318,7 @@ def test_ids_written_inside_the_tree_are_refused(probe):
     and a guard that leaves a file in the tree while failing hands the scan its next red."""
     inside = ROOT / f"test-ids-probe-{uuid.uuid4().hex[:8]}" / "ran.txt"
     try:
-        done = probe(f"--record-ids={inside}")
+        done = probe(f"--record-ids={inside}", own_root=False)
         wrote = inside.parent.exists()
     finally:
         shutil.rmtree(inside.parent, ignore_errors=True)
@@ -167,6 +333,55 @@ def test_a_slice_that_does_not_exist_is_refused(probe):
 
     assert done.returncode != 0
     assert "expected I/N" in done.stdout + done.stderr
+
+
+def test_a_malformed_table_is_refused_naming_the_file_and_the_command(tmp_path):
+    """A table that is not path to seconds cannot be split by; the refusal says which file and
+    how to rebuild it. A missing table is not refused: a copied conftest has none."""
+    (tmp_path / "conftest.py").write_text(
+        (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "test_one.py").write_text("def test_one():\n    pass\n", encoding="utf-8")
+
+    def run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", str(tmp_path), "-c", str(ROOT / "pyproject.toml"),
+             f"--rootdir={tmp_path}", "-q", "-p", "no:cacheprovider", "--shard=1/1"],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=300)
+
+    assert run().returncode == 0, "a conftest with no table beside it refused to shard"
+    (tmp_path / "shard_durations.json").write_text('{"test_one.py": "slow"}', encoding="utf-8")
+    done = run()
+
+    said = done.stdout + done.stderr
+    assert done.returncode != 0
+    assert str(tmp_path / "shard_durations.json") in said, said
+    assert "python -m tests.shard_durations <junit.xml>" in said, said
+
+
+def test_the_table_is_rebuilt_from_a_junit_report(tmp_path):
+    """Seconds summed per file, a class's tests credited to the file that holds the class, rounded
+    to 0.1 s with a floor of 0.1 s, and a classname that names no file left out."""
+    from tests.shard_durations import main
+
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    for name in ("test_a.py", "test_b.py", "test_c.py"):
+        (root / "tests" / name).write_text("", encoding="utf-8")
+    report = tmp_path / "run.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest">'
+        '<testcase classname="tests.test_a" name="test_one" time="0.84"/>'
+        '<testcase classname="tests.test_a" name="test_two[x]" time="0.42"/>'
+        '<testcase classname="tests.test_b.TestThing" name="test_in_a_class" time="2.06"/>'
+        '<testcase classname="tests.test_c" name="test_instant" time="0.001"/>'
+        '<testcase classname="tests.test_gone" name="test_moved_away" time="9.0"/>'
+        '</testsuite></testsuites>', encoding="utf-8")
+    out = tmp_path / "table.json"
+
+    assert main([str(report), "--out", str(out), "--root", str(root)]) == 0
+    assert out.read_text(encoding="utf-8") == json.dumps(
+        {"tests/test_a.py": 1.3, "tests/test_b.py": 2.1, "tests/test_c.py": 0.1},
+        indent=1, sort_keys=True) + "\n"
 
 
 # ── 2. the proof ────────────────────────────────────────────────────────────────────────────────
@@ -195,6 +410,88 @@ def test_an_empty_collection_is_a_failure_not_a_pass(tmp_path):
     empty.write_text("", encoding="utf-8")
 
     assert _the_proof().main([str(empty), str(empty)]) == 1
+
+
+# ── 2b. a re-run reads its newest attempt (#417) ──────────────────────────────────────────────
+
+def _artifact(root: Path, name: str, files: dict[str, str]) -> None:
+    """One downloaded artifact, as `download-artifact` lays it out without `merge-multiple`."""
+    (root / name).mkdir(parents=True)
+    for file, text in files.items():
+        (root / name / file).write_text(text, encoding="utf-8")
+
+
+def test_a_re_run_job_is_read_from_its_newest_attempt_alone(tmp_path):
+    """The run that showed it (main, 6632539): attempt 2's `integration` stopped before
+    `make test-alone`, attempt 3's ran it, and the proof still read attempt 2's files and called
+    the 153 `alone` tests missing. A job that was not re-run keeps its first attempt's files."""
+    got, into = tmp_path / "artifacts", tmp_path / "ids"
+    _artifact(got, "test-ids-collected-attempt-1", {"collected.txt": "a\nb\nc\n"})
+    _artifact(got, "test-ids-unit-1-attempt-1", {"ran-unit-1.txt": "a\n"})
+    _artifact(got, "test-ids-integration-attempt-2", {"ran-integration.txt": "b\n"})
+    _artifact(got, "test-ids-integration-attempt-3", {"ran-integration.txt": "b\n",
+                                                       "ran-alone.txt": "c\n"})
+    _artifact(got, "test-ids-integration-attempt-10", {"ran-integration.txt": "b\n",
+                                                        "ran-alone.txt": "c\n"})
+    proof = _the_proof()
+
+    assert proof.main(["--newest-attempts", str(got), str(into)]) == 0
+    assert sorted(p.name for p in into.iterdir()) == [
+        "collected.txt", "ran-alone.txt", "ran-integration.txt", "ran-unit-1.txt"]
+    assert proof.main([str(into / "collected.txt"),
+                       *(str(p) for p in sorted(into.glob("ran-*.txt")))]) == 0
+
+
+def test_an_older_attempt_is_never_read_even_when_it_holds_more(tmp_path):
+    """Attempt 10 sorts before attempt 2 as text; the newest is the larger number."""
+    got, into = tmp_path / "artifacts", tmp_path / "ids"
+    _artifact(got, "test-ids-integration-attempt-2", {"ran-integration.txt": "old\n",
+                                                       "ran-stale.txt": "x\n"})
+    _artifact(got, "test-ids-integration-attempt-10", {"ran-integration.txt": "new\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(into)]) == 0
+    assert sorted(p.name for p in into.iterdir()) == ["ran-integration.txt"]
+    assert (into / "ran-integration.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.parametrize("name", ["test-ids-integration", "test-ids-integration-attempt-x"])
+def test_an_artifact_without_its_attempt_is_refused_by_name(tmp_path, capsys, name):
+    """An upload renamed without its attempt would otherwise be read, or dropped, unseen."""
+    got = tmp_path / "artifacts"
+    _artifact(got, name, {"ran-integration.txt": "a\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(tmp_path / "ids")]) == 1
+    said = capsys.readouterr().err
+    assert name in said and "-attempt-<n>" in said, said
+
+
+def test_two_jobs_writing_one_file_name_is_refused_not_overwritten(tmp_path, capsys):
+    got = tmp_path / "artifacts"
+    _artifact(got, "test-ids-unit-1-attempt-1", {"ran-unit.txt": "a\n"})
+    _artifact(got, "test-ids-unit-2-attempt-1", {"ran-unit.txt": "b\n"})
+
+    assert _the_proof().main(["--newest-attempts", str(got), str(tmp_path / "ids")]) == 1
+    said = capsys.readouterr().err
+    assert "ran-unit.txt" in said and "test-ids-unit-1" in said and "test-ids-unit-2" in said, said
+
+
+def test_every_upload_names_its_attempt_and_the_proof_reads_the_newest():
+    """CI's side of #417: each job's artifact carries `github.run_attempt`, and the `test` job
+    downloads them apart and keeps each job's newest before the proof runs."""
+    jobs = _jobs()
+    uploads = [step for job in jobs.values() for step in job.get("steps", [])
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    assert len(uploads) == 3, uploads
+    for step in uploads:
+        assert step["with"]["name"].endswith("-attempt-${{ github.run_attempt }}"), step["with"]
+    steps = jobs["test"]["steps"]
+    download = next(s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+    assert download["with"].get("merge-multiple") in (None, False), download["with"]
+    runs = _runs(jobs["test"])
+    pick = next(i for i, r in enumerate(runs) if "--newest-attempts" in r)
+    assert download["with"]["path"].split("/")[-1] in runs[pick], (download["with"], runs[pick])
+    assert "${{ runner.temp }}/beeverforge-test-ids" in runs[pick], runs[pick]
+    assert pick < runs.index("make test-ran-once"), "the proof runs before the newest are picked"
 
 
 # ── 3. CI wires it ──────────────────────────────────────────────────────────────────────────────

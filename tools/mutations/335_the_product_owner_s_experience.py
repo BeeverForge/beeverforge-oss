@@ -17,6 +17,11 @@ the role, and the role's prompt without its `## When`.
 ROWS 16-20 ARE THE PAGE: a session id reaching a click handler in any shape, a forged id in the
 list painted, a link of any scheme, markdown built on unescaped text, and the subscribe frame
 without its session (every "new conversation" is the first one again).
+
+THE LAST ROW IS THE DOCUMENTS LIST: an internal document filed as readable by a client reader.
+For one round no test saw it (#433) — every production caller of `overview` passes
+`internal=True` and the renderer filters again — so `DOCUMENTS_TEST` now holds the guard, a reader
+who may not see internal documents is never listed one, asserted on what `overview(key)` returns.
 """
 
 TEST = "tests/test_a_person_has_more_than_one_conversation.py"

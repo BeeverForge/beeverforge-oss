@@ -179,7 +179,8 @@ registry acted on it.
 
 The tech-lead thread on the panel — what a person asked, what the factory answered, and what it
 proposed doing about it — is kept in the **same store as everything else the factory says**
-(`beeverforge/memory/messages.py`, a sqlite sink under `BEEVERFORGE_STATE_DIR`). No database to
+(`beeverforge/memory/messages.py`, through the metrics sink: on a deployment that runs `sqlite`,
+the file `BEEVERFORGE_METRICS_DB` names). No database to
 provision, no account, no cloud: a deployment that buys nothing keeps its conversation.
 
 Before this, the thread lived in a JavaScript array in whichever browser tab produced it. A
@@ -227,9 +228,32 @@ mount (`beeverforge_state`), and both run as **one user**: root, since neither s
 `user:` and the worker image they share has no `USER`. A deployment that runs them as two users
 locks the panel out of a `0600` store; give the two the same user.
 
+### When an expired row leaves the file
+
+A row written with a period (a message kept under ADR-0024, an invitation, a staged suggestion)
+carries `expires_at`, and every read hides it once that has passed. **Hiding is not deleting**, so
+a deployment-wide schedule, `beeverforge-metrics-purge`, deletes those rows from the `sqlite` store
+**every six hours** (#201): a row outlives its period on disk by at most that long. The delete
+zeroes what it frees and the write-ahead log is checkpointed after it, so the row's text is in
+neither `BEEVERFORGE_METRICS_DB` nor its `-wal` file afterwards, whether or not SQLite was built to
+zero deleted bytes by itself. **One exception:** when another connection is reading at that moment
+(the panel, mid-request), SQLite refuses the checkpoint. The rows are gone from every read, but
+their text stays in the file until a later checkpoint. The purge then logs
+`BEEVERFORGE_METRICS_PURGE_PENDING`, and every purge checkpoints again, even one that deletes
+nothing new, so the next run that finds no reader finishes it. Each run writes one line to the
+worker's log:
+`BEEVERFORGE_METRICS_PURGED kind=sqlite rows=<n>`. A store with no purge of its own (`null` keeps
+nothing; a table with its own TTL deletes by itself) is said as `BEEVERFORGE_METRICS_PURGE kind=…`.
+
+The worker creates the schedule at boot, with the others (`schedule.ensure_all`), and the
+durable engine's UI lists it beside the poller.
+
 ### Where it lives
 
 - `beeverforge/memory/messages.py` — `READ_LAST`, `SUGGESTION_TTL_HOURS`, and the `staged` fold.
+- `beeverforge/observability/sqlite_metrics.py` — `purge_expired`;
+  `beeverforge/runtime/temporal/schedule.py` — `METRICS_PURGE_SCHEDULE_ID`,
+  `METRICS_PURGE_EVERY_HOURS`.
 - `beeverforge/api/app.py` — `GET /api/messages/{project}` serves the thread and whether the
   suggestion may still be pressed; `POST /api/messages/{project}/suggestion` performs it through
   the action layer, with the credential that pressed the button, and records the decision.

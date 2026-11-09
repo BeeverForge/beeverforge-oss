@@ -2012,6 +2012,66 @@ def onboard_cmd(
         raise typer.Exit(1)
 
 
+@app.command("migrate")
+@speaks_plainly("propose the folder's rename")
+def migrate_cmd(
+    name: str = typer.Argument(..., help="the registered project"),
+    source: list[str] = typer.Option(None, "--source",  # noqa: B008 — typer's own idiom
+                                     help="Another repository of this product, owner/name "
+                                          "(repeatable). The registry's own repository and the "
+                                          "context repository are always included"),
+    yes: bool = typer.Option(False, "--yes",
+                             help="Required: this opens pull requests on YOUR repositories"),
+) -> None:
+    """Propose renaming the former `.openfactory/` folder to `.beeverforge/`, one pull request
+    per repository, for a person to merge.
+
+    Per repository of the product — its code repository, the ones named with --source, and its
+    context repository — from a throwaway clone of the base branch: a repository that carries
+    only `.openfactory/` gets one pull request on `beeverforge/migrate-folder` that moves the
+    folder and rewrites the `.openfactory/` paths written in its files; one already on
+    `.beeverforge/` is left alone; one that carries both is named, for a person to reconcile.
+    Files outside the folder that still mention `.openfactory/` are not edited: they are named
+    in the pull request and in the line printed, for you to update. Safe to run again: a pull
+    request already open is named, never opened twice, and a branch left with no open pull request
+    is named for you to delete. Nothing is written into any checkout of yours."""
+    from beeverforge.onboarding.migrate_folder import is_this_machine, migrate, repositories
+
+    project = _get_project(name)
+    if is_this_machine(project):
+        typer.echo(f"✗ {name}'s repository is a checkout on this machine, and `migrate` proposes "
+                   f"through a forge — run `git mv .openfactory .beeverforge` there and commit "
+                   f"it yourself; nothing was proposed.")
+        raise typer.Exit(2)
+    repos = repositories(project, list(source or []))
+    if not repos:
+        typer.echo(f"✗ {name} names no repository in its registry entry and no --source was "
+                   f"given — there is nothing to migrate.")
+        raise typer.Exit(2)
+    if not yes:
+        typer.echo(f"This may open a pull request on: {', '.join(repos)} — re-run with --yes.")
+        raise typer.Exit(2)
+    failed = False
+    for said in migrate(project, sources=list(source or [])):
+        if not said.ok:
+            failed = True
+            typer.echo(f"✗ {said.repo}: {said.detail}")
+        elif said.both:
+            typer.echo(f"! {said.repo}: {said.detail}")
+        elif said.nothing or said.existed or not said.url:
+            typer.echo(f"· {said.repo}: {said.detail}")
+        else:
+            moved = (f" — paths rewritten in {', '.join(said.rewritten)}"
+                     if said.rewritten else "")
+            typer.echo(f"✓ {said.repo}: the rename is proposed at {said.url}{moved}")
+            if said.outside:
+                typer.echo(f"  ! outside the folder, {', '.join(said.outside)} still mention "
+                           f"`.openfactory/` and are not changed — update them once the rename is "
+                           f"merged")
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("floor")
 def floor_cmd(
     project: str = typer.Argument("", help="one project, or nothing for the whole deployment"),
@@ -3368,7 +3428,12 @@ def bot_token(
         export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)
     """
     from beeverforge.credentials import app_id as env_app_id
-    from beeverforge.credentials import app_installation_id, app_private_key, app_private_key_at
+    from beeverforge.credentials import (
+        app_installation_id,
+        app_private_key,
+        app_private_key_at,
+        app_private_key_source,
+    )
 
     # THE FLAGS FALL BACK TO THE COMPOSITION ROOT rather than reading the environment themselves
     # (#64). These carried `envvar=`, which made typer the FOURTH independent reader of
@@ -3414,8 +3479,10 @@ def bot_token(
                        ".pem GitHub gave you, or leave --key-path out to use the deployment's key",
                        err=True)
             raise typer.Exit(1)
+        source = f"--key-path {key_path}"
     else:
         key = app_private_key()
+        source = app_private_key_source() or "the deployment's App key"
     if not (app_id and key and installation_id):
         typer.echo(
             "need the App id (--app-id or BEEVERFORGE_GH_APP_ID), the installation id "
@@ -3425,11 +3492,40 @@ def bot_token(
             err=True,
         )
         raise typer.Exit(1)
-    from beeverforge.adapters.github_app import mint_installation_token
+    import httpx
 
-    token, _expires = mint_installation_token(
-        app_id=app_id, private_key=key, installation_id=installation_id
-    )
+    from beeverforge.adapters.github_app import AppKeyDoesNotSign, mint_installation_token
+
+    # A FAILED MINT IS A SENTENCE (#217): a key that cannot sign, GitHub's refusal and an
+    # unreachable API each ended in a traceback. Branched on TYPE only, never on an exception's
+    # text: `AppKeyDoesNotSign` is raised around the signing step alone, the rest are httpx's own.
+    ids = "check that --app-id and --installation-id name one App and one of its installations"
+    try:
+        token, _expires = mint_installation_token(
+            app_id=app_id, private_key=key, installation_id=installation_id
+        )
+    except AppKeyDoesNotSign as exc:
+        typer.echo(f"✗ the App key from {source} does not sign a JWT ({exc}) — nothing was sent "
+                   "to GitHub; it is not an RSA private key (a PEM beginning "
+                   "-----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----), and the "
+                   "App's private key is downloaded from the App's settings page on GitHub",
+                   err=True)
+        raise typer.Exit(1) from None
+    except httpx.HTTPStatusError as exc:
+        try:
+            body = exc.response.json()
+        except ValueError:
+            body = None
+        message = body.get("message") if isinstance(body, dict) else None
+        typer.echo(f"✗ GitHub refused to mint a token for installation {installation_id} of App "
+                   f"{app_id} ({exc.response.status_code} "
+                   f"{message or exc.response.reason_phrase}) — {ids}", err=True)
+        raise typer.Exit(1) from None
+    except httpx.TransportError as exc:
+        typer.echo(f"✗ GitHub could not be reached to mint a token for installation "
+                   f"{installation_id} of App {app_id} ({type(exc).__name__}) — {ids}, and that "
+                   "api.github.com is reachable from here", err=True)
+        raise typer.Exit(1) from None
     # THE TOKEN ON STDOUT, THE MEANING ON STDERR — so `$(beeverforge bot-token)` still captures
     # exactly the token while a human at a terminal is told what they are looking at. Without
     # this the printed value reads as a fourth credential to paste somewhere.

@@ -1,6 +1,7 @@
 # ADR 0016 — Acting from Slack: read for all, write behind an allowlist
 
 - **Status:** **Accepted; v3 shipped** (resume/skip from Slack, gated).
+- **Note (2026-11-06, #1):** the title names Slack because it was the chat transport then. Chat transports are add-ons since [ADR-0038](./0038-the-platform-is-complete-channels-are-add-ons.md): the core ships the panel, and Slack comes with the `beeverforge-slack` package.
 - **Date:** 2026-07-22
 - **Relates to / amends:** ADR-0015 (the tech-lead: diagnosis + Slack, one brain / two triggers). This is the v3 "act" trigger + its authorization model.
 - **Amended by:** [ADR-0057](./0057-who-may-act-is-one-decision-and-a-production-approval-is-a-person.md) (Proposed): the `project.admins` allowlist becomes the `operator` role on the project (D3, D6), and the production boundary's "identity + password" becomes an approval by the signed-in person holding `approver`, with a step-up (D4).

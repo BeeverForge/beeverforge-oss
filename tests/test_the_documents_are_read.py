@@ -18,6 +18,7 @@ internal never loses the label.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -1265,3 +1266,28 @@ def test_every_credential_is_listed_every_document(two_credentials):
     assert product["documents_internal"] == floor["documents_internal"]
     assert set(product["documents"][0]) == {"path", "title", "type", "audience"}
     assert product["listed_all"] is True
+
+
+def test_a_reader_who_may_not_see_internal_documents_is_never_listed_one(lark, tree):
+    """#433: a reader who may not see internal documents (`overview(key)`, `internal=False`) is
+    listed the client's readable documents only — an internal one's name is content, so it is
+    nowhere in what that reader is handed, not in `documents` nor anywhere else."""
+    (tree / "client").mkdir(exist_ok=True)
+    (tree / "client" / "terms.md").write_text("# Terms\n")
+    (tree / "internal").mkdir(exist_ok=True)
+    (tree / "internal" / "plano.md").write_text("# O plano\n")
+    # and one this reader may not see that could not be read: `overview` files the unreadable
+    # ones by audience too (`listed[may_read(label, CLIENT)]`), and hands this reader a count
+    (tree / "internal" / "old.odt").write_bytes(b"PK\x03\x04 a word processor's zip")
+    ingest(lark, root=tree, reader=bed.StubReader())
+    seen = overview(bed.KEY)
+    assert "client/terms.md" in [d["path"] for d in seen["documents"]]
+    assert {d["audience"] for d in seen["documents"]} == {"client"}
+    assert "documents_internal" not in seen
+    assert seen["internal_withheld"] == 1
+    said = json.dumps(seen, ensure_ascii=False)
+    assert "internal/plano.md" not in said
+    assert "internal/old.odt" not in said
+    assert "O plano" not in said
+    floor = overview(bed.KEY, internal=True)  # it was read: a floor reader is listed it
+    assert "internal/plano.md" in [d["path"] for d in floor["documents_internal"]]

@@ -12,8 +12,9 @@ an environment that cannot work.
 WHAT A PROOF IS. Resolve the image's tag to a digest; check the image contract item by item; check
 that the toolbox can even execute in that image; run the client's own `setup:` and then `validate:`
 against untouched `main`; check the harness endpoint is reachable through whatever network the box
-has. Green means *your tests passed inside the factory* — and it costs **zero harness tokens**,
-because nothing here asks an agent to do anything.
+has. Green means *your tests passed inside the factory* — and it costs **no agent work**: nothing
+here asks an agent to do anything. The one model call it can make is a one-word smoke (`_ONE_WORD`)
+on a box that runs no image of its own, to show the harness answers there.
 
 ORDER MATTERS AND STOPPING MATTERS. An unpullable image would make the next six checks fail for the
 same reason and report it six different ways; a `setup:` that fails makes `validate:` a second,
@@ -47,8 +48,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from beeverforge import namespace
+from beeverforge.adapters.sandbox.timeouts import TIMEOUT_MARKER, timed_out
 from beeverforge.observability.job_record import record_one_pass
-from beeverforge.orchestrator.validation import advisory_gates, gate_commands
+from beeverforge.orchestrator.validation import advisory_gates, gate_commands, gate_timeout
 from beeverforge.util.filelock import FileLock, Waited
 
 if TYPE_CHECKING:
@@ -388,6 +390,16 @@ class Probes:
     #: checkout/manifest this call could not read; the station is skipped rather than invented.
     inlined_documents: (Callable[[], tuple[dict[str, int], str, DocumentFit | None] | None]
                         | None) = None
+    #: The repo-wide gates AS DECLARED, `{name: gate}` — from the same source as
+    #: `validate_commands` (`manifest.validation`), so the proof can read each gate's
+    #: `timeout_minutes` the way a job does (#70). Defaults to nothing: an older `Probes` gives
+    #: every gate the box's own limit, exactly as before.
+    validation_gates: Callable[[], dict] = dict
+    #: Run ONE GATE inside the box with an explicit limit: `(command, timeout_s, on_line)`, where
+    #: `on_line` is None when nobody is watching. None = an older probe set, which keeps running
+    #: gates through `run_in_box`/`run_streaming` with the box's default. A separate entry rather
+    #: than a widened `run_in_box`, so every single-argument test double stays valid.
+    run_gate: Callable[[str, int, Callable[[str], None] | None], tuple[int, str]] | None = None
 
 
 def component_gates(manifest) -> dict[str, str]:
@@ -650,14 +662,21 @@ def prove(project: str, image: str, p: Probes, *,
         proof.findings.append(Finding(
             "documents", True, message + (f"\n{note}" if note else "")))
 
-    def _run(command: str, *, label: str) -> tuple[int, str]:
+    def _run(command: str, *, label: str, timeout: int | None = None) -> tuple[int, str]:
         """One command inside the box, streamed when there is somebody watching.
 
         The fallback is EXPLICIT rather than a `TypeError` handler around a wider call: a probe
         set that cannot stream is an ordinary, correct thing (every test double is one), and
         catching the exception a wrong signature would raise is how a real defect gets to look
-        like a supported configuration."""
+        like a supported configuration.
+
+        `timeout` is given to GATES only, and only reaches a probe set that can take one
+        (`run_gate`); everything else keeps the box's own limit (#70)."""
         _say("start", label)
+        watched = on_stage is not None and p.run_streaming is not None
+        if timeout is not None and p.run_gate is not None:
+            relay = (lambda line: _say("line", line)) if watched else None
+            return p.run_gate(command, timeout, relay)
         if on_stage is not None and p.run_streaming is not None:
             return p.run_streaming(command, lambda line: _say("line", line))
         return p.run_in_box(command)
@@ -733,7 +752,13 @@ def prove(project: str, image: str, p: Probes, *,
             ))
         else:
             harnesses = ", ".join(stamp.get("harnesses") or []) or "nothing"
-            proof.findings.append(Finding("toolbox", True, f"{variant} — {harnesses}"))
+            # THE VERSIONS THE BOXES RUN (#246): what the toolbox copied, so a reader can tell a
+            # bumped harness from the old one without running anything in the box.
+            from beeverforge.runtime.toolbox import versions
+
+            recorded = versions(stamp) or "versions not recorded"
+            proof.findings.append(Finding("toolbox", True,
+                                          f"{variant} — {harnesses} ({recorded})"))
 
         # ── the image contract ───────────────────────────────────────────────────────────────────
         broken = p.contract(image)
@@ -799,11 +824,29 @@ def prove(project: str, image: str, p: Probes, *,
     #: (command, output) — the OUTPUT rides along because the remedy reads the binary's name out
     #: of it; carrying the command alone is what forced `_missing_tool_remedy` to guess.
     cannot_run: list[tuple[str, str]] = []
+    #: BLOCKING gates the box stopped at their limit: they did not fail, they ran out of time
+    stopped: list[str] = []
+    # EACH GATE GETS THE LIMIT A JOB GIVES IT (#70): its `timeout_minutes`, else the job's own
+    # default — one formula, `gate_timeout`, shared with `machine`. A name the probe set did not
+    # declare a gate for keeps the box's limit, as an older probe set always did.
+    from beeverforge.orchestrator.machine import _VALIDATION_TIMEOUT
+
+    gates = p.validation_gates()
     for name, cmd in sorted(validate.items()):
-        rc, out = _run(cmd, label=f"{name}: {cmd}")
+        limit = gate_timeout(gates[name], _VALIDATION_TIMEOUT) if name in gates else None
+        rc, out = _run(cmd, label=f"{name}: {cmd}", timeout=limit)
         if rc == 0:
             continue
         line = f"{name}: `{cmd}` exited {rc}\n{_tail(out)}"
+        if timed_out(rc, out):
+            # THE LIMIT IS NAMED IN THE LINE, because the box writes it at the HEAD of the output
+            # and `_tail` keeps the end: a long suite stopped at its limit read as a plain
+            # `exited 124` (review of #434). A gate no declaration covers has no setting to raise.
+            stopped_at = limit if limit is not None else _killed_after(out)
+            raise_it = (f"raise validate.{name}.timeout_minutes" if limit is not None else
+                        "no gate is declared for it, so it ran with the box's own limit")
+            line = (f"{name}: `{cmd}` was stopped at its limit of {stopped_at}s "
+                    f"(exit {rc}); {raise_it}\n{_tail(out)}")
         # A COMMAND THE BOX CANNOT EXECUTE IS NOT ADVISORY, whatever the project declared. The
         # flag says "a finding here should not stop the work"; it cannot say "this image has the
         # tool" when the shell just said it does not. That is the same asymmetry the per-component
@@ -813,6 +856,10 @@ def prove(project: str, image: str, p: Probes, *,
             advisory_gates_failed.append(line)
             continue
         failed_gates.append(line)
+        if timed_out(rc, out):
+            # counted only HERE, among the blocking failures: an advisory gate that ran out of
+            # time is the advisory finding's, not a reason to re-word the blocking one's remedy
+            stopped.append(name)
         if _cannot_run(rc, out):
             cannot_run.append((cmd, out))
     if advisory_gates_failed:
@@ -829,6 +876,16 @@ def prove(project: str, image: str, p: Probes, *,
         remedy = ("these are YOUR gates, on untouched `main`, inside the box. Failing here "
                   "means the box cannot reproduce your build — fix that before a ticket does "
                   "it for you")
+        # A GATE THAT RAN OUT OF TIME IS NOT A BUILD THE BOX CANNOT REPRODUCE, and the generic
+        # remedy sent the reader looking for a broken build that was never there.
+        timeout_remedy = ("a gate stopped at its limit did not fail, it ran out of time; if it "
+                          "passes in your CI given longer, give that gate a longer "
+                          "`timeout_minutes` under `validate:` — a job gives the gate the same "
+                          "limit")
+        if stopped and len(stopped) == len(failed_gates):
+            remedy = timeout_remedy
+        elif stopped:
+            remedy = f"{remedy}. And {timeout_remedy}"
         if cannot_run:
             remedy = _missing_tool_remedy(cannot_run[0][0], image, cannot_run[0][1],
                                           honours_image=p.honours_image)
@@ -1103,6 +1160,12 @@ def _tail(out: str, lines: int = 20) -> str:
     return "\n".join((out or "").splitlines()[-lines:])
 
 
+def _killed_after(out: str) -> str:
+    """The seconds the box's own timeout line says it stopped a command at, else `?`."""
+    found = re.search(rf"{re.escape(TIMEOUT_MARKER)} killed after (\d+)s", out or "")
+    return found.group(1) if found else "?"
+
+
 def is_valid(proof: Proof, *, digest: str, toolbox: str, commands_hash: str) -> bool:
     """Whether a recorded proof still describes the world (ADR-0037 D5).
 
@@ -1311,33 +1374,20 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         repo = repo_path if repo_path is not None else resolve_repo_path(project, cache_key=key)
         manifest = manifest if manifest is not None else load_manifest(project, repo_root=repo)
         start_error = ""
-        # THE REGISTRY'S `box:` KNOBS ARE FORWARDED, mirroring `build_runner` (factory.py) — this
-        # call passed none of them, so the proof box had the default network, no cache volume, no
-        # `box.env`, while the docstring above promised "the mounts, the network, the limits … are
-        # the ones the job will have". The harness-auth station probed a box that lacked exactly
-        # the `box.env` names the job's box receives (measured by the onboard fact-finding pass,
-        # 2026-08-13). Only keys the operator set are passed; an absent block changes nothing.
-        declared = getattr(project, "box", None)
-        knobs = {
-            k: v for k in ("network", "cache_volume", "cpus", "memory")
-            if (v := getattr(declared, k, None)) is not None
-        }
-        if declared_env := tuple(getattr(declared, "env", None) or ()):
-            knobs["extra_env"] = declared_env
-        # …and the operator directory the job's box mounts (`factory.py`), read from the same
-        # place: a proof box without it opens no operator document, and the budget's fit it
-        # reports pinned that tier where the job leaves it out (review of #364)
-        from beeverforge.orchestrator import operator_guidelines
+        # THE REGISTRY'S `box:` KNOBS ARE FORWARDED, from the one function `build_runner` uses
+        # (`factory.box_knobs`, #191). This call once passed none of them, so the proof box had the
+        # default network, no cache volume, no `box.env` (measured by the onboard fact-finding pass,
+        # 2026-08-13); then its own copy of the list fell one knob behind, the image's pull
+        # credential (#742). Asking the same function is what keeps the two boxes the same box.
+        from beeverforge.factory import box_knobs
 
-        knobs.update(operator_guidelines.box_knobs())
+        knobs = box_knobs(project)
         # THE BOX THIS DEPLOYMENT RUNS, not always the container one (ADR-0049 D9). A proof taken
         # in a box the job will not use proves the box nobody runs — the same reasoning that made
         # this reuse `ContainerSandbox` rather than approximate it, one axis further out.
         kind = (sandbox or default_sandbox()).strip().lower()
         traits = installed_box_traits(kind)
-        box = build_sandbox(kind, image=image, project=f"{key or project.name}-prove",
-                            toolbox=(os.environ.get("BEEVERFORGE_TOOLBOX_VOLUME") or "").strip()
-                                    or None, **knobs)
+        box = build_sandbox(kind, image=image, project=f"{key or project.name}-prove", **knobs)
         workspace = None
     except BaseException:
         _let_go(held)
@@ -1551,6 +1601,8 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             setup_commands=lambda: list(manifest.setup),
             validate_commands=lambda: gate_commands(manifest.validation),
             advisory_gates=lambda: advisory_gates(manifest.validation),
+            validation_gates=lambda: dict(manifest.validation),
+            run_gate=lambda cmd, timeout, on_line: _in_box(cmd, on_line, timeout=timeout),
             component_gate_commands=lambda: component_gates(manifest),
             # THROUGH THE BOX'S OWN SEAM, exactly as the executor does. `harness_path` (ADR-0037
             # D2a) exists because `PATH` cannot be relied on inside a CLIENT's image, and this
