@@ -174,11 +174,16 @@ dev = [
 # stale install.
 
 [project.scripts]
-# ONE NAME, AND IT IS THE PRODUCT'S. `beeverforge` is what the project is called and what a
-# stranger will type; the wheel guard (`tests/test_the_wheel_ships_what_the_platform_needs.py`)
-# asserts this is the only console script a `pip install` delivers, so an alias cannot come back
-# as a courtesy nobody measured.
+# THE PRODUCT'S NAME, AND THE FORMER ONE UNTIL 1.1. `beeverforge` is what the project is called and
+# what a stranger will type. `openfactory` is OpenFactory 0.7's name for the same app: removed
+# outright in 0.1.0, it answered every 0.7 script and cron line with "command not found" on an
+# upgrade in place, so it is back as an ALIAS that prints one warning on stderr naming
+# `beeverforge` and leaves stdout and the exit code to the app (`beeverforge/former_command.py`).
+# It is REMOVED IN 1.1. The wheel guard (`tests/test_the_wheel_ships_what_the_platform_needs.py`)
+# asserts these two are the console scripts a `pip install` delivers and where each points, so no
+# other alias can come back as a courtesy nobody measured, and this one cannot stay silently.
 beeverforge = "beeverforge.cli:app"
+openfactory = "beeverforge.former_command:main"
 
 [build-system]
 # 77, NOT 68, AND THE NUMBER IS MEASURED. `license = "Apache-2.0"` above is a PEP 639 licence
@@ -197,7 +202,10 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["beeverforge*"]
+# `openfactory` is OpenFactory 0.7's import name, one module beside the package that aliases it to
+# `beeverforge` for 0.7 add-ons until 1.1 (`openfactory/__init__.py`). Named exactly, not
+# `openfactory*`: it has no submodules of its own, and a glob would ship any stray directory.
+include = ["beeverforge*", "openfactory"]
 
 [tool.setuptools.package-data]
 # `**` SO THE INTENT IS EXPLICIT, NOT BECAUSE A ONE-LEVEL GLOB WAS LOSING FILES. An audit reported
