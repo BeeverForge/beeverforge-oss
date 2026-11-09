@@ -435,7 +435,10 @@ def _unfinished_review_note(r: ReviewResult) -> str:
     """The hold's one sentence for a review that did not complete (#131): that it did not, and
     why, from the review's own summary — its first sentence, without the "the review did not
     complete:" the reviewer already opens it with."""
-    first = ((r.summary or "").strip().splitlines() or [""])[0].split(". ")[0].strip().rstrip(".")
+    # the reviewer's own words reach the ticket here: withheld first, like every other place
+    # they are quoted (#196), and before the cut, so no part of a token straddles it
+    summary = _review_withheld(r).summary
+    first = ((summary or "").strip().splitlines() or [""])[0].split(". ")[0].strip().rstrip(".")
     lead = "the review did not complete:"
     if first.lower().startswith(lead):
         first = first[len(lead):].strip()
@@ -443,7 +446,7 @@ def _unfinished_review_note(r: ReviewResult) -> str:
     return f"the review did not complete, so no pull request was opened — {why}."
 
 
-def _review_lines(r: ReviewResult) -> list[str]:
+def _review_lines(review: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
         Extracted from `_pr_body` because it is now written twice: once when the pull request is
@@ -464,6 +467,9 @@ def _review_lines(r: ReviewResult) -> list[str]:
         A score of 0 is likewise reported only when one was given. Printing `(score 0)` for a
         review that produced no score is the same lie in smaller type.
         """
+        # A CREDENTIAL THE REVIEWER QUOTES IS WITHHELD, from every word of its own, before anything
+        # below cuts (`headline`) or escapes (`_as_text`) them (#196) — see `_review_withheld`.
+        r = _review_withheld(review)
         # read from the review's own fields first, its sentence second (#131): one reading,
         # shared with the first round's review stage
         unread = not_a_verdict(r)
@@ -675,6 +681,47 @@ def _without_credentials(text: str) -> str:
     prefix, an `Authorization` value, a secret this process holds, and a URL's userinfo — replaced
     by the marker, not dropped, so the reader is told (#885)."""
     return scrub_credentials(text, userinfo=WITHHELD_CREDENTIAL + "@")
+
+
+#: THE WORDS THE REVIEWER WRITES, field by field (#196): every free-text field of
+#: `contracts/review.py` a model fills. Left out, as no text of the reviewer's: `decision`,
+#: `severity` and `status` (literals), `score`, `line` and the cost fields (numbers), `model` and
+#: `harness` (the adapter's). `executed_by` is the platform's on a settled verdict (#447) and is
+#: only ever read for whether it is set; it is in, because an unsettled verdict carries whatever
+#: the model wrote there, and the marker keeps it set.
+_REVIEW_WORDS = ("summary",)
+_FINDING_WORDS = ("description", "file", "criterion")
+_CHECK_WORDS = ("criterion", "evidence", "would_verify", "executed_by")
+
+
+def _words_withheld(row: dict, fields: tuple[str, ...]) -> dict:
+    return {**row, **{k: _without_credentials(row[k]) for k in fields
+                      if isinstance(row.get(k), str)}}
+
+
+def _review_withheld(review):
+    """`review` — a `ReviewResult` or the dict `model_dump` makes of one — with a credential in
+    any of the reviewer's words (`_REVIEW_WORDS`, `_FINDING_WORDS`, `_CHECK_WORDS`) shown as
+    `WITHHELD_CREDENTIAL`; anything else is returned as it came.
+
+    ONE PLACE, ON THE RAW WORDS (#196). Withheld sentence by sentence at each renderer, the
+    summary and a finding's description were covered and a finding's `file`, a criterion and a
+    `would_verify` pointer reached the pull request body and the ticket as written; and withheld
+    after `headline` cut them, a token straddling the cut (`would_verify` at 120, a criterion at
+    160) loses the characters its shape is matched by and is shown in part. After `_as_text`, a
+    key of this process spanning a `## ` row is escaped and never found whole: the order of the
+    agent's account, for the reasons above `_CLAIM` (#885). A key the dict lacks stays absent:
+    `headline` reads an empty verdict as "no review"."""
+    if isinstance(review, ReviewResult):
+        return ReviewResult.model_validate(_review_withheld(review.model_dump()))
+    if not isinstance(review, dict):
+        return review
+    out = _words_withheld(review, _REVIEW_WORDS)
+    for key, fields in (("findings", _FINDING_WORDS), ("acceptance", _CHECK_WORDS)):
+        if isinstance(review.get(key), list):
+            out[key] = [_words_withheld(row, fields) if isinstance(row, dict) else row
+                        for row in review[key]]
+    return out
 
 
 def _decision_withheld(dr: DecisionRequest) -> DecisionRequest:
@@ -1239,6 +1286,8 @@ def _review_sentence(result) -> str:
 
     review = getattr(result, "review", None)
     verdict = review.model_dump() if hasattr(review, "model_dump") else (review or {})
+    # a credential the reviewer quotes is withheld before `headline` cuts its words (#196)
+    verdict = _review_withheld(verdict)
     head = headline(verdict if isinstance(verdict, dict) else {})
     out = f"\n{head['word']} — {head['clause']}"
     for point in (head.get("points") or [])[:3]:
@@ -2262,7 +2311,7 @@ class JobRunner:
                 self.forge.review_pr(
                     pr=pr,
                     event=review_event(result.review, self.manifest.review_mode),
-                    body=format_review(result.review),
+                    body=_without_credentials(format_review(result.review)),
                 )
                 self._landed_also("reviewed")
 
