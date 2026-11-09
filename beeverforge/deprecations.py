@@ -27,6 +27,13 @@ class Removal:
 
 
 REMOVALS: tuple[Removal, ...] = (
+    Removal("openfactory-command", "1.1",
+            "OpenFactory 0.7's `openfactory` console script, an alias of `beeverforge` "
+            "(`beeverforge/former_command.py`, its `[project.scripts]` row in pyproject.toml)"),
+    Removal("openfactory-import", "1.1",
+            "OpenFactory 0.7's `openfactory` import name, an alias of the `beeverforge` package "
+            "(`openfactory/__init__.py`, its `packages.find` entry in pyproject.toml and its "
+            "COPY in the three Dockerfiles)"),
     Removal("openfactory-environment", "1.1",
             "OpenFactory 0.7's `OPENFACTORY_*` environment names, read as `BEEVERFORGE_*` "
             "(`beeverforge/former_names.py`)"),

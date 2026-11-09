@@ -37,9 +37,12 @@ import sys
 import warnings
 
 import beeverforge
+from beeverforge.deprecations import removed_in
 
-#: The release that removes the `openfactory` import name.
-REMOVED_IN = "1.1"
+#: The release that removes the `openfactory` import name — the register's, not restated here.
+#: `beeverforge.deprecations` imports only `re` and `dataclasses`, so the shim stays cheap and
+#: reaches nothing that could import the shim back.
+REMOVED_IN = removed_in("openfactory-import")
 
 _OLD, _NEW = "openfactory", "beeverforge"
 

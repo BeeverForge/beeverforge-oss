@@ -25,12 +25,13 @@ from __future__ import annotations
 import logging
 import sys
 
+from beeverforge.deprecations import removed_in
 from beeverforge.observability import logs
 
 log = logging.getLogger("beeverforge.former_command")
 
-#: The release that removes the `openfactory` command.
-REMOVED_IN = "1.1"
+#: The release that removes the `openfactory` command — the register's, not restated here.
+REMOVED_IN = removed_in("openfactory-command")
 
 WARNING = (f"warning: `openfactory` is now `beeverforge`; run `beeverforge` instead — the "
            f"`openfactory` command is removed in BeeverForge {REMOVED_IN}.")

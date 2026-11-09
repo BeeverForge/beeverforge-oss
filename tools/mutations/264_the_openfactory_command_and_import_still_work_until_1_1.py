@@ -59,6 +59,21 @@ MUTATIONS = [
     ("importing `beeverforge` registers the old name too", "beeverforge/__init__.py",
      "",
      "\nimport openfactory  # noqa: E402,F401\n"),
+    # ── the register (#501's review) ──
+    ("the command restates its release instead of reading the register", COMMAND,
+     'REMOVED_IN = removed_in("openfactory-command")',
+     'REMOVED_IN = "1.1"'),
+    ("the import shim restates its release instead of reading the register", SHIM,
+     'REMOVED_IN = removed_in("openfactory-import")',
+     'REMOVED_IN = "1.1"'),
+    ("the command alias is not in the register", "beeverforge/deprecations.py",
+     '    Removal("openfactory-command", "1.1",',
+     '    Removal("openfactory-command-x", "1.1",'),
+    # ── the carry-over, said once though the alias loads the environment twice ──
+    ("the carry-over forgets what it said, so the alias's second load says it again",
+     "beeverforge/former_names.py",
+     "    _REPORTED.update(new.carried + new.ignored)\n",
+     ""),
     # ── the shipping ──
     ("the wheel does not ship the shim", PYPROJECT,
      'include = ["beeverforge*", "openfactory"]',

@@ -206,3 +206,56 @@ def test_the_old_import_warns_a_person_once_under_the_default_filters(tmp_path):
     assert "FutureWarning" in said[0], said[0]
     assert "someone_addon.py" in said[0], (
         f"the warning names {said[0]!r}, not the add-on line that imported the old name")
+
+
+# ── the register, and the alias beside #499's carry-over ────────────────────────────────────────
+
+def test_both_aliases_leave_in_the_release_the_register_names(tmp_path):
+    """The removal is written ONCE, in `beeverforge/deprecations.py`, where the guard that stops a
+    release carrying a due entry reads it — so each alias's warning must name the register's
+    release. Proven by moving the register and reading what each warning then says."""
+    from beeverforge import deprecations
+
+    assert deprecations.removed_in("openfactory-command") == "1.1"
+    assert deprecations.removed_in("openfactory-import") == "1.1"
+    done = _run("""
+        import dataclasses, sys, warnings
+        from beeverforge import deprecations
+        deprecations.REMOVALS = tuple(
+            dataclasses.replace(e, removed_in="9.9") if e.key.startswith("openfactory-") else e
+            for e in deprecations.REMOVALS)
+        from beeverforge import former_command
+        assert "9.9" in former_command.WARNING, former_command.WARNING
+        with warnings.catch_warnings(record=True) as said:
+            warnings.simplefilter("always")
+            import openfactory
+        assert len(said) == 1 and "9.9" in str(said[0].message), [str(w.message) for w in said]
+    """, tmp_path)
+    assert done.returncode == 0
+
+
+def test_the_command_alias_says_the_carry_over_once_and_its_own_warning_once(tmp_path,
+                                                                              monkeypatch):
+    """`openfactory` loads the environment to read the log format, then the app's callback loads
+    it again. A 0.7 `.env` holding an `OPENFACTORY_*` whose `BEEVERFORGE_*` name is set to another
+    value is read by BOTH loads (the first removes the old name from the process, the second
+    `.env` load puts it back): the carry-over must still be said once, beside one alias warning.
+    A fresh interpreter per run is a fresh `former_names._REPORTED`."""
+    (tmp_path / ".env").write_text("OPENFACTORY_SOMEONE_SETTING=old\n")
+    monkeypatch.setenv("BEEVERFORGE_SOMEONE_SETTING", "new")
+    monkeypatch.delenv("OPENFACTORY_SOMEONE_SETTING", raising=False)
+    plain = _command("openfactory", ["actions"], tmp_path)
+    assert plain.returncode == 0, plain.stderr[-800:]
+    carried = [line for line in plain.stderr.splitlines()
+               if "OPENFACTORY_SOMEONE_SETTING" in line]
+    assert len(carried) == 1, f"the carry-over said {len(carried)} times:\n{plain.stderr}"
+    assert len(_lines_naming_the_rename(plain.stderr)) == 1, plain.stderr
+
+    monkeypatch.setenv("BEEVERFORGE_LOG_FORMAT", "json")
+    structured = _command("openfactory", ["actions"], tmp_path)
+    assert structured.returncode == 0, structured.stderr[-800:]
+    records = [json.loads(line) for line in structured.stderr.splitlines()]
+    carried = [r for r in records if r["logger"] == "beeverforge.environment"
+               and "OPENFACTORY_SOMEONE_SETTING" in r["message"]]
+    assert len(carried) == 1, records
+    assert len([r for r in records if _lines_naming_the_rename(r["message"])]) == 1, records
