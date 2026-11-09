@@ -10,6 +10,14 @@ durability around the existing JobRunner/PromotionRunner without changing them.
 
 TASK_QUEUE = "beeverforge-jobs"
 
+#: OpenFactory 0.7's task queue, POLLED BY THE WORKER UNTIL 1.0 and never a destination (#264).
+#: A 0.7 deployment upgraded in place against the same Temporal server has workflows 0.7 started,
+#: and activities they scheduled, waiting on this queue; a worker polling only `TASK_QUEUE` would
+#: strand every one of them — a job in flight, a merge gate a person answers hours later, a deploy
+#: watch. The worker runs a second `Worker` on it with the same workflows and activities; nothing
+#: starts a workflow or aims a schedule at it, so it drains and stays empty. Removed in 1.0.
+FORMER_TASK_QUEUE = "openfactory-jobs"
+
 
 def max_concurrent_jobs() -> int:
     """The floor size — how many jobs may be IN FLIGHT at once. v1 is **1**: a single agent

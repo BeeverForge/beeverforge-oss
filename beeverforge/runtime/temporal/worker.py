@@ -30,7 +30,7 @@ except ModuleNotFoundError as _exc:
 
     raise SystemExit(f"✗ the worker cannot start: {CLIENT_MISSING}") from None
 
-from beeverforge.runtime.temporal import TASK_QUEUE
+from beeverforge.runtime.temporal import FORMER_TASK_QUEUE, TASK_QUEUE
 from beeverforge.runtime.temporal.activities import (
     adjust_pr,
     announce_rate_pause,
@@ -388,9 +388,16 @@ async def main() -> None:
     # `ensure_techlead_watch`, and has since f1d9fb2 — the duplicate was added on a mistaken
     # reading that nothing called it, and reconciled half of what the line above reconciles.)
 
-    worker = Worker(
+    # TWO WORKERS, ONE PER QUEUE, UNTIL 1.0 (#264): this deployment's own queue, and OpenFactory
+    # 0.7's, where a deployment upgraded in place against the same engine still has the workflows
+    # 0.7 started and the activities they scheduled. A Temporal worker polls exactly one task
+    # queue, so the former one gets a worker of its own, built from the same lists — a workflow
+    # 0.7 started replays here and schedules its activities and children on the queue it runs on,
+    # so the former queue needs every type the new one knows. Nothing starts work on it
+    # (`FORMER_TASK_QUEUE` says why), so on a fresh deployment its worker simply never gets a task.
+    workers = [Worker(
         client,
-        task_queue=TASK_QUEUE,
+        task_queue=queue,
         workflows=[JobWorkflow, PollWorkflow, DeployWatchWorkflow, CoordinatorWorkflow,
                    ProductSweepWorkflow, TechLeadWatchWorkflow, AskWorkflow,
                    CardQuestionSweepWorkflow,
@@ -418,12 +425,14 @@ async def main() -> None:
         # activities barely overlap by construction. 8 lets the read-only checks (check_*,
         # notify_*, scan_*) interleave with a running job — the panel and Slack stay real-time.
         max_concurrent_activities=8,
-    )
+    ) for queue in (TASK_QUEUE, FORMER_TASK_QUEUE)]
     # Printed for a person, as it always was — or, with JSON log lines, logged, so stdout carries
     # JSON too: a container's log is stdout and stderr together (review of #818).
     logs.announce(log, f"beeverforge worker up · {address()} · ns={namespace()} · "
-                       f"queue={TASK_QUEUE}")
-    await worker.run()
+                       f"queue={TASK_QUEUE} (and OpenFactory 0.7's {FORMER_TASK_QUEUE}, "
+                       f"until 1.0)")
+    # Together: either one ending ends the worker, as the one worker's `run` ending always did.
+    await asyncio.gather(*(worker.run() for worker in workers))
 
 
 async def born() -> None:

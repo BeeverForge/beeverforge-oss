@@ -497,6 +497,27 @@ policy SKIP + a 2-min per-poll timeout, so a stuck poll never blocks the next. P
 the Temporal Cloud UI (Schedules → `beeverforge-poller`) to halt pickup without stopping in-flight
 jobs.
 
+**An OpenFactory 0.7 deployment upgraded in place, on the same Temporal server.** BeeverForge's
+task queue is `beeverforge-jobs` and its schedules are named `beeverforge-*`; 0.7's were
+`openfactory-jobs` and `openfactory-*`. Until 1.0:
+
+- **The worker also polls `openfactory-jobs`**, with the same workflows and activities, so a job,
+  a merge gate or a deploy watch that 0.7 started before the upgrade carries on where it was.
+  Nothing new is ever started on that queue; its worker idles once 0.7's work has drained. The
+  worker's first line names both queues.
+- **At boot, once BeeverForge's own schedules are created, the worker deletes 0.7's**:
+  `openfactory-poller`, `openfactory-preview-reaper`, and every `openfactory-product-sweep-<project>`,
+  `openfactory-techlead-watch-<project>`, `openfactory-card-questions-<project>` and
+  `openfactory-okf-refresh-<project>`. Left in place they would keep firing beside the new ones, so
+  every board would be scanned twice a tick and every sweep reported twice. No other schedule is
+  touched. The log says which it deleted in one line (`schedule retired OpenFactory 0.7's …`). A
+  schedule it could not delete, or an engine whose schedules it could not list, is logged as an
+  error naming it and the cause; the worker starts anyway, and the next boot tries again — or
+  delete it in the Temporal UI. A worker that could not create BeeverForge's schedules deletes none
+  of 0.7's.
+- **A poller paused in 0.7 is not carried over.** `beeverforge-poller` is created running; pause it
+  again if the queue was being held.
+
 ---
 
 ## 7. Temporal Cloud connection
