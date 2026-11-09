@@ -43,19 +43,23 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from beeverforge import gitpin
 from beeverforge.adapters.sandbox.base import (
-    LEASE_REFUSED,
     OutputBuffer,
-    PushRefused,
     SandboxAdapter,
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.host_push import (
+    keep_the_remote_tip,
+    push_from_the_hosts_own_repository,
+)
 from beeverforge.adapters.sandbox.pull import PullCredential
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 from beeverforge.observability import logs
 
 log = logging.getLogger("beeverforge.sandbox.container")
@@ -423,6 +427,8 @@ class ContainerSandbox(SandboxAdapter):
         #: What the command currently running has written — the buffer `tail()` reads (C-39). One
         #: per box for the same reason as the handle above: one job at a time.
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
 
     def guidelines_path(self, host_dir: Path) -> str | None:
@@ -646,8 +652,17 @@ class ContainerSandbox(SandboxAdapter):
             raise RuntimeError(
                 f"could not start the box {cname!r} (docker run exited {rc}): {out.strip()[:300]}"
                 + _NO_INIT_BINARY * any(w in out for w in ("init binary", "catatonit")))
-        _host(["docker", "exec", cname, "git", "config", "--global",
-               "--add", "safe.directory", _WORKDIR])
+        # THE WRITE IS CHECKED (#172). A client image whose HOME cannot hold a global config (a
+        # `HOME=/nonexistent` user, measured 2026-10-20) fails this write, and every later git call
+        # in the box is then refused with "detected dubious ownership", exit 128 — which used to
+        # read as "nothing to commit" further down. Refuse here, by name, with no box left behind.
+        rc, out = _host(["docker", "exec", cname, "git", "config", "--global",
+                         "--add", "safe.directory", _WORKDIR])
+        if rc != 0:
+            refusal = self._safe_directory_refusal(cname, rc, out)
+            _host(["docker", "rm", "-f", cname])
+            shutil.rmtree(host_clone, ignore_errors=True)
+            raise RuntimeError(refusal)
 
         self._container, self._host_clone = cname, host_clone
         # A NEW container is a new HOME: the image may differ from the last job's (ADR-0037 D4
@@ -659,6 +674,36 @@ class ContainerSandbox(SandboxAdapter):
         return Workspace(path=Path(_WORKDIR), host_path=host_clone,
                          branch=branch, base_branch=base_branch, base_commit=base_commit,
                          lease=_lease_of(host_clone, branch, checkout_existing))
+
+    #: What git says when the global config it was asked to write cannot be written - the only
+    #: answers that make HOME the cause. Anything else (no git in the image, a box that stopped)
+    #: is named for what it is: a confident wrong remedy is worse than none (ADR-0020).
+    _HOME_WRITE_FAILURES = ("could not lock config file", "$HOME not set")
+
+    def _safe_directory_refusal(self, cname: str, rc: int, out: str) -> str:
+        """The one sentence a failed `safe.directory` write refuses with, naming its real cause."""
+        words = " ".join((out or "").split())[:200] or "no output"
+        what = (f"the box image {self.image!r} could not mark {_WORKDIR} as a safe git directory "
+                f"(`git config --global` exited {rc}: {words})")
+        if "is not running" in (out or ""):
+            return (f"{what} because the box stopped right after it started, so no command can "
+                    "run in it; run the image by hand with `docker run --entrypoint sleep "
+                    f"{self.image} infinity` to see why it exits.")
+        if rc in (126, 127):
+            return (f"{what} because the box could not run git, so every git call in the box "
+                    "would fail; make sure the image has git on PATH.")
+        if not any(w in (out or "") for w in self._HOME_WRITE_FAILURES):
+            return (f"{what}, so every git call in the box would be refused; make "
+                    f"`git config --global --add safe.directory {_WORKDIR}` succeed in the image.")
+        home_rc, home_out = _host(
+            ["docker", "exec", cname, "sh", "-c", 'printf "OFHOME:%s\\n" "$HOME"'])
+        home = next((ln[len("OFHOME:"):].strip() for ln in (home_out or "").splitlines()
+                     if ln.startswith("OFHOME:")), "") if home_rc == 0 else ""
+        return (f"{what} because "
+                + (f"its HOME {home!r}" if home else "an unreadable HOME")
+                + " cannot hold a global git config, so every git call in the box would be "
+                "refused; give the image a writable HOME (set `HOME` to a writable directory in "
+                "its Dockerfile, or run it as a user whose home directory exists).")
 
     def harness_path(self, name: str) -> str:
         """An absolute path into the mounted toolbox — never a bare name.
@@ -820,8 +865,14 @@ class ContainerSandbox(SandboxAdapter):
         passing = self._passthrough()
         for var in passing:
             env_flags += ["-e", var]
-        return run_and_stream(
-            subprocess.Popen(
+        # A JOB'S `docker exec` CLIENT IN A GROUP OF ITS OWN (#44), as on the worktree box: a
+        # person's stop kills the client at once, and `cleanup`'s `docker rm -f` — which `run()`'s
+        # `finally` reaches as soon as the pass returns — takes the process inside the container.
+        # So this box needs neither the worktree box's mark nor its `TMPDIR` (review of #453):
+        # `docker rm -f` ends every process in the container, a `setsid`'d one included, and the
+        # container's `/tmp` goes with it.
+        stop = self.stop
+        proc = subprocess.Popen(
                 # `sh -c`, NEVER `sh -lc`. A login shell sources the CLIENT IMAGE's /etc/profile
                 # and /etc/profile.d/* before the command — arbitrary third-party code running
                 # ahead of everything the platform issues, with the harness token already in the
@@ -839,9 +890,12 @@ class ContainerSandbox(SandboxAdapter):
                  "sh", "-c", command],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1, env=self._client_env(passing),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: `docker exec` is a local subprocess and the daemon relays the container
@@ -871,44 +925,101 @@ class ContainerSandbox(SandboxAdapter):
         # commits live in the host-side ephemeral clone; push from the HOST (never the
         # container). Prefer the authenticated bot remote; else the repo's origin URL.
         assert self._host_clone and self._repo_path, "prepare() must be called first"
-        target = remote_url
-        if not target:
-            rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
-            if rc != 0:
-                raise RuntimeError(f"could not resolve origin remote: {url}")
-            target = url.strip()
+        target, ambient_env = self._push_door(remote_url)
         # FORCED, BUT ONLY OVER WHAT THIS WORKSPACE SAW (#11) — the worktree box's
         # `publish_branch` says why. This clone is a fresh one per job, so its lease is the only
         # memory of the remote's tip it has.
-        from beeverforge.adapters.sandbox.worktree import _force, _tip
-
-        rc, out = _host(
-            gitpin.argv(["-C", str(self._host_clone), "push", *_force(workspace), "--", target,
-                         workspace.branch])
-        )
-        if rc != 0:
-            if LEASE_REFUSED in out:
-                raise PushRefused(f"push refused: {_redact(out)}", branch=workspace.branch)
-            raise RuntimeError(f"push failed: {_redact(out)}")
+        #
+        # NEVER FROM THE HOST CLONE'S OWN GIT DIRECTORY (#386): the box sees that clone as
+        # /workspace, `.git/config` included, and a push run there reads what the job wrote —
+        # `insteadOf` sends the push elsewhere, `core.sshCommand` runs on the host. The push goes
+        # from a repository the host makes for it, outside the mount (`host_push`).
+        #
+        # THE CLONE'S `.git` MUST BE THE DIRECTORY THE MATERIALISER MADE: the box can replace it
+        # with a symlink or a `gitdir:` file naming another repository on the host. The ambient
+        # door keeps the worker's own git configuration, which no mount puts in the box's reach.
+        #
+        # AND THE BOX IS FROZEN WHILE THE HOST READS IT (review of #403): the container, and
+        # anything the job left running in it, lives until `cleanup()`, which comes after this,
+        # so a process the job started could plant a link under `objects` after the walk. From
+        # `docker pause` until the push's git calls are done, nothing in the box runs. The host
+        # reads the clone through its own filesystem, which a paused container does not hold, and
+        # nothing here needs the box running (no `docker exec`). No freeze, no push.
+        with self._frozen(workspace.branch) as git_dir:
+            pushed = push_from_the_hosts_own_repository(
+                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
+                redact=_redact, ambient_env=ambient_env, lease=workspace.lease)
         if workspace.lease is not None:
-            workspace.lease = _tip(self._host_clone, f"refs/heads/{workspace.branch}")
+            workspace.lease = pushed
 
     def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
         """The remote's tip of the branch, kept on a branch of its own before a push replaces it
-        (`worktree.keep_the_remote_tip`, #11) — from the host clone, as the push is."""
+        (`host_push.keep_the_remote_tip`, #11) — from the host's own repository, borrowing the
+        clone's objects with the box frozen, as the push does."""
         assert self._host_clone and self._repo_path, "prepare() must be called first"
-        from beeverforge.adapters.sandbox.worktree import keep_the_remote_tip
+        target, ambient_env = self._push_door(remote_url)
+        with self._frozen(workspace.branch) as git_dir:
+            kept, workspace.lease = keep_the_remote_tip(
+                git_dir=git_dir, branch=workspace.branch, target=target, run=_host,
+                redact=_redact, ambient_env=ambient_env)
+        return kept
 
-        return keep_the_remote_tip(self._host_clone, workspace, self._push_target(remote_url))
-
-    def _push_target(self, remote_url: str | None) -> str:
-        """Where this box pushes: the forge's authenticated URL, else the repository's origin."""
+    def _push_door(self, remote_url: str | None) -> tuple[str, dict[str, str] | None]:
+        """Where this box pushes and the door's environment: the forge's authenticated URL with
+        none of its own, else the repository's origin in the worker's own environment (no mount
+        puts the worker's HOME in this box's reach). One answer for the push and the keep (#11)."""
         if remote_url:
-            return remote_url
+            return remote_url, None
         rc, url = _host(["git", "-C", str(self._repo_path), "remote", "get-url", "origin"])
         if rc != 0:
             raise RuntimeError(f"could not resolve origin remote: {url}")
-        return url.strip()
+        return url.strip(), dict(os.environ)
+
+    @contextmanager
+    def _frozen(self, branch: str) -> Iterator[Path]:
+        """The clone's git directory, with the box paused (`docker pause`) until the caller's git
+        calls are done, and refused when it is no longer the directory the materialiser made. The
+        publish comment says why; `keep_remote_tip` reads the same objects, so it is frozen too."""
+        if not self._container:
+            raise RuntimeError(
+                f"push failed: the box for {branch!r} has no container to freeze while "
+                "the host reads the job's commits — prepare the box again (run the job again)")
+        try:
+            rc, out = _host(["docker", "pause", self._container])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc, out = -1, str(exc)
+        if rc != 0:
+            raise RuntimeError(
+                f"push failed: could not freeze the box {self._container} before reading the "
+                f"job's commits (docker pause exited {rc}): {out.strip()[:300]} — a process the "
+                "job left running could change the repository while the host reads it, so "
+                "nothing was pushed; check that the container is still running (`docker ps`), "
+                "then run the job again")
+        try:
+            git_dir = self._host_clone / ".git"
+            if git_dir.is_symlink() or not git_dir.is_dir():
+                raise RuntimeError(
+                    f"push failed: {git_dir} is no longer the git directory the box was given "
+                    "(the job replaced it with a link or a file) — the job's commits cannot be "
+                    "read from it; run the job again")
+            yield git_dir
+        finally:
+            self._thaw()
+
+    def _thaw(self) -> None:
+        """`docker unpause`, after the push. A failure is said and not raised: the branch is
+        pushed, or the push's own failure is already on its way out. `cleanup()`'s `docker rm -f`
+        removes the container paused or not; a box left paused is frozen until then, and a later
+        `docker exec` in it fails saying it is paused (`docker unpause <name>` frees it)."""
+        try:
+            rc, out = _host(["docker", "unpause", self._container])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc, out = -1, str(exc)
+        if rc != 0:
+            log.warning("could not unfreeze the box %s after the push (docker unpause exited %s):"
+                        " %s — it stays frozen until cleanup removes it; until then a command run "
+                        "in it fails, and `docker unpause %s` frees it", self._container, rc,
+                        (out or "").strip()[:200], self._container)
 
     def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
         """Nothing (#11): the commits live in the host clone `prepare` made for this job, and

@@ -5,9 +5,11 @@ agent, tests, open a PR, tag, observe an environment). Temporal records each
 one's result in history, so a crash resumes from the last completed activity
 instead of restarting the job.
 
-Every job runs in a Fargate task (run_job, promote_staging, release_prod), so the
-side-effecting work happens where gh + credentials + the cloned repo live, and the
-launcher's job-tag idempotency (re-attach / reconcile) makes retries safe. The forge
+Every job runs in the deployment's box (run_job, promote_staging, release_prod): the
+`worktree` or `container` box the core ships, or a remote runner an add-on declares on the
+`box_runner` axis (`fargate` comes with `beeverforge-aws`). The side-effecting work happens
+where gh + credentials + the cloned repo live, and the launcher's job-tag idempotency
+(re-attach / reconcile) makes retries safe. The forge
 operations themselves are find-or-create idempotent. Each activity offloads its
 blocking launcher call to a thread so the event loop stays free to heartbeat.
 """
@@ -27,9 +29,11 @@ from typing import TYPE_CHECKING
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from beeverforge import gitpin
 from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
 from beeverforge.adapters.channel.registry import channel_destination
 from beeverforge.adapters.sandbox.registry import installed_box_traits, remote_box
+from beeverforge.adapters.sandbox.stopping import Stop
 from beeverforge.contracts import JobState, RunResult
 from beeverforge.contracts.checks import NOTHING_RAN, CiDecision, decide, declares_no_checks
 from beeverforge.contracts.checks import read as read_checks
@@ -213,7 +217,121 @@ def _judge_for(project_name: str):
         return build_techlead(None)
 
 
-async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
+# ── a stop reaches the work, not only its workflow (#44) ─────────────────────────────────────────
+#
+# MEASURED IN THE INSTALLED SDK (temporalio 1.35), and it decided the shape. `stop` terminates the
+# job's workflow (`catalog._stop`). Nothing tells a running activity that directly: its next
+# heartbeat is answered NotFound by the server, core turns that into a Cancel with
+# `is_not_found`, and `worker/_activity.py::_handle_cancel_activity_task` sets
+# `activity.cancellation_details()` and cancels the async activity's task — so `_heartbeat_while`
+# gets a CancelledError at its next beat (every ~30 s). `stop` keeps TERMINATING rather than asking
+# for a cancel first: a cancel request is acted on only by the workflow, and a wedged workflow —
+# the case `stop` exists for — never acts on it, so a cancel-first stop would end nothing there.
+#
+# WHAT ENDS THE WORK, AND WHAT DOES NOT. An ended workflow (`not_found`), a cancel the workflow
+# asked for (`cancel_requested`) and a worker shutting down (`worker_shutdown`) end it: the agent's
+# process groups are killed and nothing more is published. `worker_shutdown` is among them because
+# a stoppable box starts its commands in a process group of their own (`stopping.own_group`), so a
+# signal sent to the worker's whole group no longer reaches the harness; the shutdown's cancel is
+# what reaches it instead. A heartbeat TIMEOUT, a PAUSE and a RESET are not a person ending the
+# work, and they are left exactly as they were (#259 decides what a timed-out attempt keeps).
+_THE_WORK_ENDS = ("not_found", "cancel_requested", "worker_shutdown")
+
+#: How long the activity waits, after telling the runner, for its thread to end — the agent's
+#: groups are already killed, so what is left is a `git worktree remove`; bounded because nothing
+#: heartbeats for it any more.
+_A_STOPPED_JOB_ENDS_WITHIN = 60.0
+
+_WHY_THE_WORK_ENDS = {
+    "not_found": "its workflow was ended in the engine (a stop)",
+    "cancel_requested": "its workflow cancelled it",
+    "worker_shutdown": "its worker is shutting down",
+}
+
+
+def _the_work_must_end(details) -> bool:
+    """Whether a cancellation with these `ActivityCancellationDetails` ends the job's work."""
+    return details is not None and any(getattr(details, k, False) for k in _THE_WORK_ENDS)
+
+
+async def _end_the_work(work: asyncio.Task, stop, detail: str, details) -> None:
+    """Tell the runner thread, kill what it started, and wait (bounded) for it to clean up."""
+    why = next((_WHY_THE_WORK_ENDS[k] for k in _THE_WORK_ENDS if getattr(details, k, False)), "")
+    activity.logger.warning("BEEVERFORGE_JOB_STOPPED %s — %s: the agent's processes are killed, "
+                            "its worktree is removed and nothing more is published", detail, why)
+    stop.request(why)
+    await asyncio.wait({work}, timeout=_A_STOPPED_JOB_ENDS_WITHIN)
+    if not work.done():
+        activity.logger.warning("BEEVERFORGE_JOB_STOPPED_LATE %s — the runner thread had not ended "
+                                "%ss after it was told; it publishes nothing when it does",
+                                detail, _A_STOPPED_JOB_ENDS_WITHIN)
+        return
+    # RETRIEVED, so nothing logs "exception never retrieved": a `JobStopped`, or whatever the
+    # pass raised on its way out; the activity's own answer is the cancellation either way
+    if not work.cancelled():
+        work.exception()
+
+
+#: The runner's thread logs here: `activity.logger` belongs to the activity's own context.
+_log = logging.getLogger("beeverforge.runtime.activities")
+
+#: How long the runner's thread waits for the engine's answer before a publishing step. An answer
+#: that does not come in time is no answer: the step goes on, as it did before the engine was asked.
+_THE_ENGINE_ANSWERS_WITHIN = 15.0
+
+
+def _the_engine_asked(loop):
+    """What the runner's thread calls before each publishing step (`Stop.ask`): a reason when this
+    activity's workflow run is no longer running, None while it is or when the engine cannot say.
+
+    WHY ASK AT ALL. `stop` terminates the workflow and the heartbeat loop hears it only when a
+    heartbeat reaches the server. temporalio throttles those to `min(0.8 × heartbeat_timeout,
+    max_heartbeat_throttle_interval)` — 60 s here (the job's 120 s timeout, the SDK's 60 s default,
+    temporalio 1.35 `worker/_worker.py`) — so for up to a minute after `stop` answered, a runner
+    whose agent finished would push, open and merge. The engine is the one record both the person's
+    stop and this worker can read, wherever each of them runs.
+
+    ON THE ACTIVITY'S OWN LOOP, which is awake (it is awaiting the thread), through the activity's
+    own client. NOT FOUND is an answer — the run is gone; any other failure is not, and is logged:
+    an engine this worker cannot reach is one a stop could not have reached either."""
+    try:
+        client = engine_client()  # the one seam (#217): the client this worker already holds
+        info = activity.info()
+    except NoEngineClientHere:  # a test environment built with no client: nothing to ask
+        return None
+
+    def ask() -> str | None:
+        from temporalio.client import WorkflowExecutionStatus
+        from temporalio.service import RPCError, RPCStatusCode
+
+        asked = None
+        try:
+            handle = client.get_workflow_handle(info.workflow_id, run_id=info.workflow_run_id)
+            asked = asyncio.run_coroutine_threadsafe(handle.describe(), loop)
+            described = asked.result(timeout=_THE_ENGINE_ANSWERS_WITHIN)
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                return "its workflow is no longer in the engine (a stop)"
+            return _unasked(info.workflow_id, exc)
+        except Exception as exc:  # noqa: BLE001 — a timeout or a closed loop: no answer
+            if asked is not None:
+                asked.cancel()
+            return _unasked(info.workflow_id, exc)
+        if described.status == WorkflowExecutionStatus.RUNNING:
+            return None
+        status = getattr(described.status, "name", str(described.status)).lower()
+        return f"its workflow was {status} in the engine (a stop)"
+
+    return ask
+
+
+def _unasked(workflow_id: str, exc: BaseException) -> None:
+    _log.warning("BEEVERFORGE_JOB_STOP_UNASKED could not ask the engine whether %s is still "
+                 "running (%s) — the step goes on", workflow_id,
+                 str(exc)[:160] or type(exc).__name__)
+
+
+async def _heartbeat_while(fn, detail: str, *, tick=None, stop=None) -> RunResult:
     """Run blocking work in a thread while heartbeating every ~30s, so Temporal sees the
     activity is alive (a dead worker trips heartbeat_timeout instead of the full ceiling).
     On cancellation/timeout the pending thread-task is cancelled, never leaked (H7).
@@ -228,6 +346,10 @@ async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
     IT MUST NEVER BE ABLE TO END THE WORK. A watcher raising here would cancel a pass that was
     perfectly healthy, so it is called defensively — the heartbeat is what keeps the activity
     alive, and it is issued whether or not the tick succeeded."""
+    if stop is not None:
+        # THE RUNNER ASKS THE ENGINE BEFORE IT PUBLISHES (review of #453): a heartbeat reaches the
+        # server at most once a throttled minute, and a terminate is heard only then
+        stop.ask = _the_engine_asked(asyncio.get_running_loop())
     work = asyncio.create_task(asyncio.to_thread(fn))
     try:
         while not work.done():
@@ -241,6 +363,12 @@ async def _heartbeat_while(fn, detail: str, *, tick=None) -> RunResult:
             activity.heartbeat(f"{detail} — {note}" if note else detail)
             await asyncio.wait({work}, timeout=30)
         return work.result()
+    except asyncio.CancelledError:
+        # `stop` IS WHAT THE THREAD HEARS (#44): cancelling `work` below ends only the wrapper
+        details = activity.cancellation_details() if stop is not None else None
+        if _the_work_must_end(details):
+            await _end_the_work(work, stop, detail, details)
+        raise
     finally:
         # the underlying Fargate task is stopped by the workflow's cleanup compensation
         if not work.done():
@@ -464,11 +592,15 @@ async def run_job(inp: RunJobInput) -> RunResult:
     # `_watch_for` says so in the log rather than attaching a watcher that would see nothing.
     watch = _watch_for(inp)
     applied = _this_activitys_event("handed-back")
+    # WHAT THE RUNNER THREAD HEARS WHEN THE JOB IS STOPPED (#44): the loop below requests it on a
+    # cancel that ends the work, and `_do_run_job` hands it to the runner and its box
+    stop = Stop()
     result = await _heartbeat_while(
         lambda: _the_worker_applies(inp.project, inp.issue, applied,
-                                    _do_run_job(inp, run_id, watch=watch)),
+                                    _do_run_job(inp, run_id, watch=watch, stop=stop)),
         f"{inp.project}#{inp.issue} via {inp.sandbox}",
         tick=watch.tick if watch else None,
+        stop=stop,
     )
     try:
         # BOUNDED, BECAUSE NOTHING BEATS FOR IT: the loop above stopped beating when the job
@@ -657,7 +789,7 @@ def _running_previews(kind: str):
 
 
 def _do_run_job(inp: RunJobInput, run_id: str | None = None,
-                watch: HarnessWatch | None = None) -> RunResult:
+                watch: HarnessWatch | None = None, stop: Stop | None = None) -> RunResult:
     # BY TRAIT, NOT BY NAME. `if inp.sandbox == "fargate"` stood here, and it meant a third box
     # declaring `remote=True` was built as a LOCAL adapter by this line while `stop_job` ignored
     # it — the two halves of one lifecycle disagreeing about where the job is (measured with an
@@ -680,6 +812,10 @@ def _do_run_job(inp: RunJobInput, run_id: str | None = None,
     # (which lives one frame up, in the loop that stays awake) is given them.
     if watch is not None:
         watch.attach(runner)
+    # …and the stop, beside it: the runner checks it before each step that reaches the forge or the
+    # board, and its box starts each command in a group the stop can kill (#44)
+    if stop is not None:
+        runner.hears(stop)
     result = runner.run(inp.issue, resume_handle=inp.resume_handle,
                         spent_turns=inp.spent_turns, decision=inp.decision,  # C2 + D4 + a choice
                         another_pass=inp.another_pass)  # #448 slice 4: the card's next change
@@ -1596,7 +1732,8 @@ def _worker_checkout(project, repo: str):
 
 
 def _head_of(repo_path: Path) -> str:
-    head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+    # hooks off: `repo_path` is the shared repo cache, whose hooks a pass can write (#182)
+    head = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],
                           capture_output=True, text=True, timeout=30, check=False)
     return head.stdout.strip() if head.returncode == 0 else ""
 
@@ -2144,6 +2281,29 @@ async def check_pr_status(inp: MergeCheckInput) -> str:
 
     forge = _forge_for(ProjectRegistry().get(inp.project))
     return await asyncio.to_thread(lambda: forge.pr_status(pr=inp.pr_url))
+
+
+@activity.defn
+async def purge_expired_records() -> str:
+    """Delete what the metrics store holds past its period, from the file and not only from the
+    reads (#201): conversation messages kept under ADR-0024, invitations, staged suggestions.
+
+    The store's read path already hides an expired row; nothing deleted it, so on a `sqlite`
+    deployment every row stayed in the file for ever. A sink that deletes by itself (a table with
+    its own TTL) or keeps nothing has no `purge_expired`, and that is said rather than skipped in
+    silence. One line in the log either way, so an operator can see the sweep ran and what it did.
+    """
+    from beeverforge.observability.registry import deployment_metrics_sink, metrics_sink_kind
+
+    kind = metrics_sink_kind()
+    purge = getattr(deployment_metrics_sink(), "purge_expired", None)
+    if not callable(purge):
+        activity.logger.info("BEEVERFORGE_METRICS_PURGE kind=%s — this store deletes nothing "
+                             "itself (it keeps nothing, or its own TTL deletes expired rows)", kind)
+        return f"nothing to purge: the {kind} store does not keep expired rows itself"
+    purged = await asyncio.to_thread(purge)
+    activity.logger.info("BEEVERFORGE_METRICS_PURGED kind=%s rows=%d", kind, purged)
+    return f"purged {purged} expired row(s) from the {kind} store"
 
 
 @activity.defn
@@ -2777,10 +2937,11 @@ def _rerun_what_the_change_does_not_touch(project, inp: CiRepairInput, repo: str
 
     IN THIS ORDER, each step cheaper than the next. The capability first, so Azure Repos, the
     local forge, every add-on and every test double without `rerun_failed` never pay a diff read
-    for a move they cannot make, and say nothing. Then the bound: the first attempt only (PO
-    answer to Q1, once per head). A wrong "unrelated" (changed `invoice_totals.ts`, failing
-    `checkout.spec.ts`, #258's review) then costs one re-run, not the whole repair budget. Then the
-    diff: one that could not be read or was cut is "could not see", and launches the agent.
+    for a move they cannot make, and say nothing. Then the bound: the first repair attempt of the
+    watch only (PO answer to Q1). A wrong "unrelated" (changed `invoice_totals.ts`, failing
+    `checkout.spec.ts`, #258's review) then spends one of the two repair attempts
+    (`_CI_REPAIR_MAX`) on a re-run, and the next attempt reaches an agent. Then the diff: one
+    that could not be read or was cut is "could not see", and launches the agent.
 
     A REFUSED RE-RUN FALLS THROUGH TO THE AGENT, handed the same `evidence`, and is said both in
     the worker log and on the pull request (PO answer to Q3). `[]` (asked, and nothing was
@@ -4195,10 +4356,12 @@ async def _tell_the_breakdown(project, inp: ProductBreakdownInput, results) -> N
 async def product_role_answer(inp: ProductAnswerInput) -> dict:
     """Resolve a staged proposal by token — on the worker, where the agent runs.
 
-    THE OUTCOME TRAVELS BESIDE THE SENTENCE, never inferred from it. `answer_staged` names six
-    (`done`, `rejected`, `unauthorized`, `gone`, `replaced`, `expired`) and the caller maps them
-    onto a refusal code; telling them apart by comparing Portuguese prose is how a refusal gets
-    recorded as a decision — the reason the gate started returning a pair at all (C-33)."""
+    THE OUTCOME TRAVELS BESIDE THE SENTENCE, never inferred from it. `answer_staged` names eight
+    (`done`, `rejected`, `unauthorized`, `gone`, `replaced`, `expired`, `refused`, `failed`) and
+    the caller maps them onto a refusal code; telling them apart by comparing Portuguese prose is
+    how a refusal gets recorded as a decision — the reason the gate started returning a pair at
+    all (C-33). A `refused` write carries the module's word in `refusal` (#187), so the row answers
+    that word's code rather than a guess."""
     project = ProjectRegistry().get(inp.project)
 
     def _run():
@@ -4217,7 +4380,8 @@ async def product_role_answer(inp: ProductAnswerInput) -> dict:
                              message_id=inp.message_id)
 
     code, sentence = await asyncio.to_thread(_run)
-    return {"outcome": str(code or ""), "message": str(sentence or "")}
+    return {"outcome": str(code or ""), "message": str(sentence or ""),
+            "refusal": str(getattr(sentence, "refusal", "") or "")}
 
 
 @activity.defn
@@ -4745,6 +4909,35 @@ async def record_job_metrics(inp: JobMetricsInput) -> None:
         activity.logger.warning("record_job_metrics failed for %s#%s", inp.project, inp.issue)
 
 
+async def _former_coordinator(client, project: str) -> str | None:
+    """The id of OpenFactory 0.7's coordinator for `project` when it is RUNNING, else None.
+
+    UNTIL 1.0 (`FORMER_WORKFLOW_ID_PREFIX`). 0.7 ran its tech-lead as
+    `openfactory-coordinator-<project>`, and a deployment upgraded in place keeps it running on
+    0.7's queue, which the worker still polls. A signal-with-start on BeeverForge's id would start
+    a second coordinator beside it, and both would brief the same decision; so while 0.7's runs,
+    it is signalled and no new one is started. NOT_FOUND is the usual answer and says nothing;
+    any other failure to ask is said, and BeeverForge's coordinator is used."""
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    former = f"{FORMER_WORKFLOW_ID_PREFIX}coordinator-{project}"
+    try:
+        described = await client.get_workflow_handle(former).describe()
+    except RPCError as exc:
+        if exc.status != RPCStatusCode.NOT_FOUND:
+            activity.logger.warning("could not ask whether 0.7's coordinator %s runs (%s) — "
+                                    "BeeverForge's is used", former, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — an unknown answer falls back to our own, said
+        activity.logger.warning("could not ask whether 0.7's coordinator %s runs (%s) — "
+                                "BeeverForge's is used", former, exc)
+        return None
+    return former if described.status == WorkflowExecutionStatus.RUNNING else None
+
+
 @activity.defn
 async def notify_coordinator(item: CoordinatorItem) -> None:
     """SignalWithStart the project's ALWAYS-ALIVE coordinator with a parked decision — starts it
@@ -4758,6 +4951,9 @@ async def notify_coordinator(item: CoordinatorItem) -> None:
     # reduced to "notify_coordinator failed" in a log nobody reads.
     client = engine_client()
     try:
+        if former := await _former_coordinator(client, item.project):
+            await client.get_workflow_handle(former).signal("on_decision", item)
+            return
         await client.start_workflow(
             "CoordinatorWorkflow", CoordinatorInput(project=item.project),
             id=f"beeverforge-coordinator-{item.project}", task_queue=TASK_QUEUE,
@@ -4788,11 +4984,14 @@ async def notify_coordinator_say(inp: CoordinatorSayInput) -> None:
 
     client = engine_client()  # outside the `try`, for `notify_coordinator`'s reason
     try:
-        await client.start_workflow(
-            "CoordinatorWorkflow", CoordinatorInput(project=inp.project),
-            id=f"beeverforge-coordinator-{inp.project}", task_queue=TASK_QUEUE,
-            start_signal="say", start_signal_args=[inp.text, inp.kind],
-        )
+        if former := await _former_coordinator(client, inp.project):
+            await client.get_workflow_handle(former).signal("say", args=[inp.text, inp.kind])
+        else:
+            await client.start_workflow(
+                "CoordinatorWorkflow", CoordinatorInput(project=inp.project),
+                id=f"beeverforge-coordinator-{inp.project}", task_queue=TASK_QUEUE,
+                start_signal="say", start_signal_args=[inp.text, inp.kind],
+            )
     except Exception:  # noqa: BLE001
         activity.logger.warning("coordinator say failed for %s", inp.project)
     if inp.kind in ("pickup", "merge", "needs_action"):  # the tech-lead's voice in Slack
@@ -4974,7 +5173,7 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
                 if (published / name).is_file():
                     shutil.copy2(published / name, dest / name)
 
-        head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        head = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=30, check=False)
         commit = head.stdout.strip() if head.returncode == 0 else ""
         now = datetime.now(UTC).isoformat()
@@ -5040,8 +5239,10 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
         # ticket's PR. Restore-then-clean rather than a blind delete, because a project may
         # legitimately keep `knowledge/` COMMITTED in its own repo (Phase 1's shape) — there the
         # directory is tracked content that must survive us having written into it.
+        # Hooks off (#182, #384's review): this is the shared repo cache, and a `post-checkout`
+        # hook planted there fired on exactly this `checkout -- <dir>`.
         for args in (["checkout", "--", BUNDLE_DIRNAME], ["clean", "-fdq", BUNDLE_DIRNAME]):
-            subprocess.run(["git", "-C", str(repo_path), *args],
+            subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), *args],
                            capture_output=True, timeout=60, check=False)
 
 
@@ -6524,6 +6725,7 @@ async def techlead_watch(project_name: str) -> str:
         waiting,
     )
     from beeverforge.runtime.temporal import view as tv_view
+    from beeverforge.runtime.temporal.view import job_handle as tv_job_handle
     from beeverforge.runtime.temporal.view import parse_job_id as tv_parse_job_id
     from beeverforge.techlead.classify import classify, remedy_for
     from beeverforge.techlead.memory import learn_from, remedy_verdicts, temper
@@ -6814,7 +7016,8 @@ async def techlead_watch(project_name: str) -> str:
         if any(str(x.subject) == finding.ticket and x.about == sig for x in open_remedies):
             continue
         try:
-            handle = client.get_workflow_handle(f"beeverforge-{project_name}-{finding.ticket}")
+            # 0.7's job too, until 1.0 (`job_handle`): the rounds found it by `parse_job_id`
+            handle = tv_job_handle(client, project_name, finding.ticket)
             # `args=[...]`, NOT two positionals. `WorkflowHandle.signal` is
             # `(signal, arg=UNSET, *, args=[])` — `args` is keyword-only, so a second value
             # passed positionally is a TypeError before anything reaches the server. This was
@@ -6903,7 +7106,10 @@ async def _terminal_outcome(client, project_name: str, ticket: str) -> str:
     from beeverforge.techlead.memory import DID_NOT_WORK, WORKED
 
     try:
-        desc = await client.get_workflow_handle(f"beeverforge-{project_name}-{ticket}").describe()
+        from beeverforge.runtime.temporal.view import job_handle
+
+        # 0.7's job too, until 1.0 (`job_handle`)
+        desc = await job_handle(client, project_name, ticket).describe()
     except Exception as exc:  # noqa: BLE001 — cannot see → no verdict; PENDING is the honest state
         activity.logger.info("techlead memory: could not learn how #%s ended (%s) — its remedy "
                              "stays pending", ticket, exc)

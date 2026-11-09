@@ -96,7 +96,8 @@ WRITERS = {
     ("beeverforge/product/module.py", "_file_one"): "file_issues",
     ("beeverforge/actions/catalog.py", "_card_create"): "_card_create",
     ("beeverforge/runtime/temporal/activities.py", "_do_split"): "_do_split",
-    ("beeverforge/ops/impediment.py", "report"): "report",
+    # #437's review: the check-and-create moved under `report`'s lock, into `_report`
+    ("beeverforge/ops/impediment.py", "_report"): "_report",
     ("beeverforge/onboarding/preview_propose.py", "_as_card"): "_as_card",
 }
 #: Where a `create_ticket` is not a writer but the port: a row implementing it, and the in-memory

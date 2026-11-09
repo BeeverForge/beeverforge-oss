@@ -99,7 +99,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from beeverforge import gitpin
+from beeverforge import gitpin, namespace
 from beeverforge.product.authoring import NOT_REFUSED, NOT_VALID, NOT_WAITING, WriteResult
 from beeverforge.product.corpus import (
     _FIRST_SECTION_RE,
@@ -704,7 +704,8 @@ def plan(brought: Brought, *, root: Path, requirements_dir: str, first: int, ide
             # promise only a person's yes makes
             kept = agreed[r.number]
             out.requirements.append(Row(BESIDE, r.number, r.slug, r.title, kept.number,
-                                        kept.status, path=_proposal(ident, kept.number, r.slug)))
+                                        kept.status, path=_proposal(ident, kept.number, r.slug,
+                                                                     root)))
         else:
             # WHAT IT RETIRES NOW: the product's live texts nobody agreed — its slug's twin, and
             # every one its history reaches. None is accepted (`agreed` would hold it), and one
@@ -834,10 +835,10 @@ def _path(folder: str, number: int, slug: str) -> str:
     return f"{folder}/{number:04d}-{slug}.md"
 
 
-def _proposal(ident: str, number: int, slug: str) -> str:
+def _proposal(ident: str, number: int, slug: str, root: Path) -> str:
     from beeverforge.policy.context_writes import import_record
 
-    return f"{import_record(ident)}{PROPOSALS}/{number:04d}-{slug}.md"
+    return f"{import_record(ident, namespace.dir_in(root))}{PROPOSALS}/{number:04d}-{slug}.md"
 
 
 def _free(root: Path, path: str, planned: set[str]) -> str:
@@ -1007,7 +1008,7 @@ def land(the_plan: Plan, brought: Brought, *, root: Path, requirements_dir: str,
             return done
         done.record = {"version": 1, **the_plan.as_dict(), "brought": brought.name, "by": by,
                        "landed_at": at, "token": the_plan.token, "landed": list(done.paths)}
-        record = f"{import_record(the_plan.id)}{RECORD_FILE}"
+        record = f"{import_record(the_plan.id, namespace.dir_in(root))}{RECORD_FILE}"
         _write(root, record,
                (json.dumps(done.record, indent=2, ensure_ascii=False) + "\n").encode())
         done.paths.append(record)
@@ -1097,7 +1098,7 @@ def record_of(root: Path, ident: str) -> dict | None:
     """The record of the import `ident` in the checkout at `root`, or None when there is none."""
     from beeverforge.policy.context_writes import import_record
 
-    where = import_record(ident)
+    where = import_record(ident, namespace.dir_in(root))
     path = root / f"{where}{RECORD_FILE}" if where else None
     if path is None or not path.is_file():
         return None
@@ -1113,9 +1114,9 @@ def newest(root: Path) -> dict | None:
     """The record of the newest import in the checkout at `root` — by when it landed — or None
     when nothing was ever imported there (#994). A record that cannot be read is skipped and said;
     it is never the newest by default."""
-    from beeverforge.policy.context_writes import IMPORTS, import_record
+    from beeverforge.policy.context_writes import import_record
 
-    folder = Path(root) / IMPORTS
+    folder = Path(root) / namespace.dir_in(Path(root)) / "imports"
     if not folder.is_dir():
         return None
     found = []
@@ -1393,7 +1394,7 @@ def land_import(*, docs_repo: str, clone_url: str, brought: Brought, forge,
         if rc != 0:
             return Imported(ok=False, refusal=NOT_REFUSED,
                             detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
-        record = f"{import_record(ident)}{RECORD_FILE}"
+        record = f"{import_record(ident, namespace.dir_in(tmp))}{RECORD_FILE}"
         found = record_of(tmp, ident)
         if found is not None:
             return Imported(ok=True, existed=True, ref=record, record=found,

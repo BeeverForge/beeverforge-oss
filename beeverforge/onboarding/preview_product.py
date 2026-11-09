@@ -41,7 +41,9 @@ from beeverforge.onboarding.preview_propose import (
     Outcome,
     _first_error,
     draft,
+    in_folder,
     pr_body,
+    relocated,
 )
 
 log = logging.getLogger("beeverforge.onboarding.preview_product")
@@ -304,6 +306,11 @@ def propose_product(project, *, accept: bool = False,
             readings.append((repo, infer_preview(there, name=_short(repo))))
         reading, out = draft_product(readings, product=project.name, context=context,
                                      accept=accept, answers=answers, checkouts=clones)
+        # WRITTEN UNDER THE FOLDER THE CONTEXT REPOSITORY USES (#265) — `.openfactory/` when that
+        # is the one it has: the drafted files, the `compose:` value naming them, the body.
+        folder = namespace.dir_in(checkout)
+        out = relocated(out, folder)
+        product_yaml = namespace.in_repo(checkout, PRODUCT_YAML)
         if out.refusal:
             return Outcome(repo=context, detail=out.refusal + " Nothing was written.",
                            questions=reading.questions)
@@ -321,12 +328,12 @@ def propose_product(project, *, accept: bool = False,
         paths: list[str] = []
         comments_kept = True
         if out.block is not None:
-            before = (checkout / PRODUCT_YAML).read_text(encoding="utf-8")
+            before = (checkout / product_yaml).read_text(encoding="utf-8")
             onboarded = plan(project, checkout, preview=out.block)
             if onboarded.refusal:
                 return Outcome(repo=context, detail=onboarded.refusal)
-            (checkout / PRODUCT_YAML).write_text(onboarded.product_yaml, encoding="utf-8")
-            paths.append(PRODUCT_YAML)
+            (checkout / product_yaml).write_text(onboarded.product_yaml, encoding="utf-8")
+            paths.append(product_yaml)
             header = {ln for ln in onboarded.product_yaml.splitlines() if ln.startswith("#")}
             comments_kept = not [ln for ln in before.splitlines()
                                  if ln.lstrip().startswith("#") and ln not in header]
@@ -335,8 +342,8 @@ def propose_product(project, *, accept: bool = False,
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(body, encoding="utf-8")
             paths.append(rel)
-        body = pr_body(reading, out, project=project.name, repo=context,
-                       comments_kept=comments_kept)
+        body = in_folder(pr_body(reading, out, project=project.name, repo=context,
+                                 comments_kept=comments_kept), folder)
         base = default_branch(checkout)
         result = propose(
             checkout=checkout, manifest_path=paths[0], repo=context, clone_url=url, base=base,

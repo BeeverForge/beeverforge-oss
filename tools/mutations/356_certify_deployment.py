@@ -185,8 +185,9 @@ MUTATIONS = [
      "        if high:\n            return PASS",
      "        if True:\n            return PASS", CTRL),
 
+    # RE-PINNED 2026-11-07 (#265): the control wants both of the folder's names, as `missing`.
     ("a floor without .beeverforge/** passes", CONTROLS,
-     "    if wanted in r.floor_protected:",
+     "    if not missing:",
      "    if r.floor_protected:", CTRL),
 
     ("more than one job at a time passes instead of being information", CONTROLS,

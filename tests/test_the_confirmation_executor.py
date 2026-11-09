@@ -253,7 +253,8 @@ def test_a_crash_in_a_branch_still_answers_the_person(monkeypatch, caplog):
         code, sentence = executor.answer_staged(_project(), token=token, approved=True,
                                                 user=ADMIN, module=_Broken())
 
-    assert code == "done" and sentence, "a crashing branch answered with silence"
+    # the person is still answered — and the caller is told the write did not happen (#187)
+    assert code == "failed" and sentence, "a crashing branch answered with silence"
     assert any("BEEVERFORGE_PRODUCT_MUTE" in r.getMessage() for r in caplog.records), (
         "the mute is invisible in the logs, so nobody would ever find it")
 
@@ -377,6 +378,22 @@ async def test_product_answer_maps_each_named_outcome(_resolvable, monkeypatch, 
 
     assert not result.ok and result.code == code, (result.code, result.message)
     assert result.message == "não deu", "the client's sentence was replaced by a generic one"
+
+
+@pytest.mark.asyncio
+async def test_product_answer_keeps_a_rejection_ok(_resolvable, monkeypatch):
+    """A `rejected` proposal is the person's own answer, performed: it stays `ok` (#187 changed
+    only the outcomes of an approval whose write did not happen)."""
+    from beeverforge.actions import catalog
+
+    engine = _Engine({"outcome": "rejected", "message": "descartei"})
+    monkeypatch.setattr(catalog, "_connected", _returns(engine))
+
+    result = await catalog._product_answer(project="books", token=f"{KEY}|abc", answer="reject",
+                                           by=_actor(), yes=True)
+
+    assert result.ok and result.data["outcome"] == "rejected", (result.code, result.message)
+    assert result.message == "descartei"
 
 
 def _returns(engine):

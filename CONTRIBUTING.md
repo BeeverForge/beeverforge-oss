@@ -101,6 +101,7 @@ dropped.py`) precisely so that this search works.
 - **Run the suite in both orders**: `python -m pytest -q -n auto` and
   `python -m pytest -q -n auto -p no:randomly` (`make test` is the first, without `-n auto`).
   A failure that depends on ordering is a state leak, not flake — find it, don't reroll.
+  CI runs the random order only, so the fixed-order run is yours to make before you push.
   `-n auto` is pytest-xdist, which `make install` installed: the suite is large (the count lives
   in [`docs/STATUS.md`](docs/STATUS.md)) and drops from
   minutes to seconds. If a test passes alone and fails under `-n auto`, that is the same state

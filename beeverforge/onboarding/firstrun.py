@@ -1354,9 +1354,12 @@ class _Runner:
         # a first round is where that mistake costs most: the one thing a client is watching is
         # whether the independent review works, and "rejected" about our own parser reads as the
         # factory judging their code.
+        # A paused or did-not-complete review is read from its fields, not its sentence (#131):
+        # "did not complete" holds neither phrase this stage once matched on its own.
+        from beeverforge.contracts.review import not_a_verdict
+
         summary = (getattr(result, "summary", "") or "")
-        unread = (result.score == 0 and not result.findings
-                  and ("could not be parsed" in summary or "never ran" in summary))
+        unread = not_a_verdict(result)
         if unread:
             self.finish(_fail(
                 "review", f"the reviewer produced nothing readable: {summary[:160]}",
@@ -1568,7 +1571,12 @@ def probes_for(project, *, image: str | None = None, turn_cap: int = DEFAULT_TUR
         list is where a client names their forge token, their package-feed credential, their
         scanner key — every one of them readable by agent-written code inside the box, as
         `contracts/project.py` says in its own comment. A round whose safety rests on a removed git
-        remote while handing the agent a push token has one layer, not two."""
+        remote while handing the agent a push token has one layer, not two.
+
+        SO IT IS NOT `factory.box_knobs` (#191), which the job's box and the proof's are built
+        from: that adds `box.env`, which this box holds back for the reason above, and the image's
+        pull credential, which this list does not pass either. Whether the rehearsal also gets
+        what the job's box gets is #191's slice 2, still open."""
         knobs = {
             key: value
             for key in ("network", "cache_volume", "cpus", "memory")

@@ -45,6 +45,7 @@ MACHINE = "beeverforge/orchestrator/machine.py"
 MEMORY = "beeverforge/techlead/memory.py"
 WORKTREE = "beeverforge/adapters/sandbox/worktree.py"
 CONTAINER = "beeverforge/adapters/sandbox/container.py"
+HOST_PUSH = "beeverforge/adapters/sandbox/host_push.py"
 
 MUTATIONS = [
     # ── claim 1: what the note names ──────────────────────────────────────────────────────────
@@ -192,10 +193,12 @@ MUTATIONS = [
      '        self._preserve_outcome, self._preserve_refusal = "push-failed", ""\n'),
 
     # ── claim 8: the lease ────────────────────────────────────────────────────────────────────
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("THE FINDING: the push is a plain `--force` again, on both boxes",
-     WORKTREE,
-     '    return [f"--force-with-lease=refs/heads/{workspace.branch}:{workspace.lease}"]',
-     '    return ["--force"]'),
+     HOST_PUSH,
+     '    return [f"--force-with-lease={ref}:{lease}"]',
+     '    return ["--force"]',
+     PUSH),
 
     ("the worktree box starts a fresh workspace with no lease, so it pushes over anything",
      WORKTREE,
@@ -208,16 +211,18 @@ MUTATIONS = [
      "",
      PUSH),
 
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("the worktree box does not move its lease after a push, so a repair's second push is refused",
      WORKTREE,
-     '            workspace.lease = _tip(workspace.path, f"refs/heads/{workspace.branch}")',
-     "            pass",
+     "        if workspace.lease is not None:\n            workspace.lease = pushed",
+     "        if workspace.lease is not None:\n            pass",
      PUSH),
 
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("the container box does not move its lease after a push",
      CONTAINER,
-     '            workspace.lease = _tip(self._host_clone, f"refs/heads/{workspace.branch}")',
-     "            pass",
+     "        if workspace.lease is not None:\n            workspace.lease = pushed",
+     "        if workspace.lease is not None:\n            pass",
      PUSH),
 
     ("the container box starts a fresh workspace with no lease",
@@ -232,17 +237,13 @@ MUTATIONS = [
      '    return ""',
      PUSH),
 
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("a refused push is not told from any other failed push, on either box",
-     WORKTREE,
+     HOST_PUSH,
      "            if LEASE_REFUSED in out:\n"
-     "                raise PushRefused(f\"push refused: {_redact(out)}\", "
-     "branch=workspace.branch)\n"
-     "            raise RuntimeError(f\"push failed: {_redact(out)}\")\n"
-     "        if workspace.lease is not None:\n"
-     "            workspace.lease = _tip(workspace.path",
-     "            raise RuntimeError(f\"push failed: {_redact(out)}\")\n"
-     "        if workspace.lease is not None:\n"
-     "            workspace.lease = _tip(workspace.path"),
+     "                raise PushRefused(f\"push refused: {redact(out)}\", branch=branch)\n",
+     "",
+     PUSH),
 
     ("the refused pull-request push holds with no handle, so its Resume starts from the base again",
      MACHINE,
@@ -260,10 +261,11 @@ MUTATIONS = [
      "            kept = keep(workspace=ws, remote_url=remote)\n",
      "            kept = \"\"\n"),
 
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("the kept branch is pushed with force, so a branch already at its name is replaced",
-     WORKTREE,
-     '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--", target,\n',
-     '    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--force", "--", target,\n'),
+     HOST_PUSH,
+     '"push", "--no-verify", "--",\n                                   target, f"{tip}:refs/heads/{kept}"]',
+     '"push", "--force", "--no-verify", "--",\n                                   target, f"{tip}:refs/heads/{kept}"]'),
 
     # re-pinned with the line above it: the pause's refusal says itself on the card too
     ("the card is not told where the forge's commits went",
@@ -276,10 +278,32 @@ MUTATIONS = [
      "        self._emit(ticket, \"note\", said, kept=kept)\n",
      ""),
 
+    # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("the lease does not move to the kept tip, so the push after the keep is refused",
      WORKTREE,
-     "    workspace.lease = tip\n    return kept\n",
-     "    return kept\n"),
+     "        kept, workspace.lease = keep_the_remote_tip(",
+     "        kept, _ = keep_the_remote_tip(",
+     PUSH),
+
+    ("the container box's lease does not move to the kept tip",
+     CONTAINER,
+     "            kept, workspace.lease = keep_the_remote_tip(",
+     "            kept, _ = keep_the_remote_tip(",
+     PUSH),
+
+    ("the container box keeps the remote's tip with the box running, so a process the job left "
+     "could plant a link under the objects the keep borrows",
+     CONTAINER,
+     "        with self._frozen(workspace.branch) as git_dir:\n            kept,",
+     "        with __import__(\"contextlib\").nullcontext(self._host_clone / \".git\") as git_dir:\n"
+     "            kept,",
+     PUSH),
+
+    ("the keep's fetch runs `for-each-ref` in the job's repository to learn what it borrows",
+     HOST_PUSH,
+     '[*_HOOKLESS, "-c", "core.alternateRefsCommand=true", "-C",',
+     '[*_HOOKLESS, "-C",',
+     PUSH),
 
     ("a keep that failed lets the run go on as if it had pushed",
      MACHINE,

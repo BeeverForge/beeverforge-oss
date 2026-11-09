@@ -23,11 +23,12 @@ MUTATIONS = [
 
     ("the tip's add checks the branch out instead of its tip, which git refuses while it is held",
      BOX,
-     '        rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", '
+     # RE-PINNED (#91): the tip's add now runs under the cache key's lock, one indent deeper
+     '            rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", '
      'str(tip),\n'
-     "                         start], env=_in_gits_own_words())\n",
-     '        rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", str(tip),\n'
-     "                         branch], env=_in_gits_own_words())\n"),
+     "                             start], env=_in_gits_own_words())\n",
+     '            rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", str(tip),\n'
+     "                             branch], env=_in_gits_own_words())\n"),
 
     ("the tip asks who holds the branch and refuses, as the doors that commit do", BOX,
      "        trees = self._clear_our_own(repo_path, tip)\n",
@@ -48,15 +49,16 @@ MUTATIONS = [
      "                remote_url=remote_url, from_base=False, drop_branch=True)\n"),
 
     ("on a hosted forge the review reads the base instead of the pull request's tip", BOX,
-     # Re-pinned for the transport wrapper added after PR #283 met the new review door.
-     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
-     'timeout=180)\n'
-     "            if rc == 0:\n"
-     '                start = f"origin/{branch}"\n',
-     '                                         f"+{branch}:refs/remotes/origin/{branch}"]), '
-     'timeout=180)\n'
-     "            if rc == 0:\n"
-     "                start = base_branch\n"),
+     # Re-pinned for the transport wrapper added after PR #283 met the new review door, and again
+     # for #91: the fetch now runs under the cache key's lock, one indent deeper.
+     '                                             f"+{branch}:refs/remotes/origin/{branch}"]),\n'
+     '                                timeout=180)\n'
+     "                if rc == 0:\n"
+     '                    start = f"origin/{branch}"\n',
+     '                                             f"+{branch}:refs/remotes/origin/{branch}"]),\n'
+     '                                timeout=180)\n'
+     "                if rc == 0:\n"
+     "                    start = base_branch\n"),
 
     ("on the local forge the review reads the base instead of the branch", BOX,
      '                start = f"refs/heads/{branch}"\n',

@@ -167,7 +167,7 @@ def _scrub_remote(path: Path, clone_url: str) -> None:
 
 def _git(args: list[str], cwd: Path | None = None,
          env: dict[str, str] | None = None) -> tuple[int, str]:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+    p = subprocess.run(["git", *gitpin.HOOKLESS, *args], cwd=cwd, capture_output=True, text=True,
                        timeout=_GIT_TIMEOUT, env={**os.environ, **env} if env else None)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -383,7 +383,7 @@ class RepoCache:
         return not self.held
 
     @staticmethod
-    def _held_by_a_job(served: Path, why: str) -> bool:
+    def _held_by_a_job(served: Path, why: str, *, again: bool = False) -> bool:
         """Whether a running job's worktree stands on `served`, said when it does.
 
         A JOB ON THE WORKTREE BOX LIVES IN THIS TREE'S `.git` (#747). For a project registered by
@@ -403,6 +403,10 @@ class RepoCache:
                         "job may stand on it. Check the permissions of %s.",
                         served, why, served / ".git" / "worktrees")
             return True
+        if again:
+            # ASKED A SECOND TIME BY ONE SYNC (#91, `_publish`): the first ask already said each
+            # expired hold, and a sync says it once
+            marks = gitworktrees.JobMarks(live=marks.live, stale=[])
         for stale in marks.stale:
             log.warning("BEEVERFORGE_CACHE_HOLD_EXPIRED the job worktree %s was marked %d h ago, "
                         "past the %d h a job may hold %s, so it no longer holds it — a job that "
@@ -442,6 +446,16 @@ class RepoCache:
             self._say_linkless(exc)
             shutil.copytree(master, stage, symlinks=True)
         if os.path.lexists(served):
+            # ASKED AGAIN, RIGHT BEFORE THE SWAP (#91). `_needs_publish` read the marks before the
+            # copy above, and a job's add and mark that landed during it (a box on this thread,
+            # which the re-entrant key lock lets through, or one that took no lock) wrote its
+            # admin directory into the tree the rename below takes away. Asked here, only the two
+            # renames are left as the window; the box's lock on the key closes it.
+            if RepoCache._held_by_a_job(served, "a newer snapshot was staged to replace it",
+                                     again=True):
+                shutil.rmtree(stage, ignore_errors=True)
+                self.held = True
+                return
             trash_root = self.root / _TRASH_DIRNAME
             trash_root.mkdir(parents=True, exist_ok=True)
             slot = trash_root / f"{project}{_SLOT_SEP}{uuid.uuid4().hex[:8]}"
@@ -648,7 +662,8 @@ def _git_out(args: list[str], cwd: Path | None, env: dict[str, str],
              stdin: str | None = None) -> subprocess.CompletedProcess:
     """One git command with its streams apart — a listing read from stdout must not carry a warning
     git wrote to stderr."""
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, input=stdin,
+    return subprocess.run(["git", *gitpin.HOOKLESS, *args], cwd=cwd, capture_output=True,
+                          text=True, input=stdin,
                           timeout=_GIT_TIMEOUT, env={**os.environ, **env}, check=False)
 
 

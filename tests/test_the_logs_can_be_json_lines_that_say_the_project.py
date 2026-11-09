@@ -180,6 +180,9 @@ OUTSIDE_THE_LOG = {
         "*": "the CLI, which answers a person at a terminal — save the commands that become the "
              "deployment's own processes (`BECOME_A_PROCESS`)"},
     "beeverforge/cli_refusals.py": {"*": "the CLI's refusals, which only the CLI imports"},
+    "beeverforge/former_command.py": {
+        "main": "the `openfactory` alias's warning, printed only where the process's lines are "
+                "not JSON — logged as a record where they are"},
     "beeverforge/observability/logs.py": {
         "announce": "the one door for a line for a person: it prints only where the process's "
                     "lines are not JSON",
@@ -1411,9 +1414,9 @@ def _a_probe_that_answers(monkeypatch) -> list[tuple[str, int]]:
     recorded in the list returned. For the cases that read the CONNECT — the client held, the
     runtime it is made on, the attempt that fails or is cancelled — and not the probe.
 
-    WHY NOT A REAL LISTENER (#396): the probe waits 1.0 s of its own for the handshake, a number in
-    `beeverforge/` that no `within` and no `BEEVERFORGE_ENGINE_DEADLINE` reaches, so a case that
-    asks it is bounded by elapsed time on the runner. A loaded `make test-unit` gave the
+    WHY NOT A REAL LISTENER (#396): a case that asks the real probe is bounded by elapsed time on
+    the runner (until #398 the probe waited a fixed 1.0 s of its own; since then, the attempt's
+    bound). A loaded `make test-unit` gave the
     one-client case `EngineNotListening` at a `listening` address; measured on 4 cores at load
     averages of 17 to 52, the probe answered in 0.2 ms at the median and 0.12 s at worst, so the
     failure is rare, and no bound a case passes would reach it. The probe keeps its guards on
@@ -1423,7 +1426,9 @@ def _a_probe_that_answers(monkeypatch) -> list[tuple[str, int]]:
 
     asked: list[tuple[str, int]] = []
 
-    async def _listening(host: str, port: int) -> bool:
+    async def _listening(host: str, port: int, within: float | None = None) -> bool:
+        # `within`, as the real probe takes it since #398: what bound it was handed is not what
+        # these cases read.
         asked.append((host, port))
         return True
 

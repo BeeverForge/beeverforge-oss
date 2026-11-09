@@ -33,6 +33,7 @@ from __future__ import annotations
 import posixpath
 import re
 from collections.abc import Iterable
+from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict
@@ -75,9 +76,11 @@ def read_docs(root: str) -> tuple[ProductDocs | None, str]:
     never disagree about what the file says."""
     from beeverforge.product.loader import parse_docs_manifest
 
-    text = _read_inside(root, posixpath.join(root, PRODUCT_YAML))
+    # UNDER THE FOLDER THE CONTEXT REPOSITORY USES — `.openfactory/` when that is its one (#265).
+    rel = namespace.in_repo(Path(root), PRODUCT_YAML)
+    text = _read_inside(root, posixpath.join(root, rel))
     if text is None:
-        return None, (f"`{PRODUCT_YAML}` is not a file of the context repository's base branch")
+        return None, (f"`{rel}` is not a file of the context repository's base branch")
     return parse_docs_manifest(text)
 
 
@@ -193,7 +196,7 @@ def strangers(layout: Layout, shape: ProductShape) -> list[str]:
 
 
 def _declares_preview(root: str, rel: str) -> bool:
-    text = _read_inside(root, posixpath.join(root, rel))
+    text = _read_inside(root, posixpath.join(root, namespace.in_repo(Path(root), rel)))
     if text is None:
         return False
     try:

@@ -62,6 +62,10 @@ async def start(project, number: int, *, actor: str, asked_for: bool, conversati
 
     name = getattr(project, "name", "") or str(project)
     client = client or await _engine()
+    if await former_running(client, name, number):
+        log.info("BEEVERFORGE_PRODUCT_BREAKDOWN_RUNNING project=%s req=%s — OpenFactory 0.7's "
+                 "breakdown of it is running; nothing was started", name, number)
+        return RUNNING
     try:
         await client.start_workflow(
             "ProductBreakdownWorkflow",
@@ -74,6 +78,35 @@ async def start(project, number: int, *, actor: str, asked_for: bool, conversati
                  "asked while one runs; nothing was started", name, number)
         return RUNNING
     return STARTED
+
+
+async def former_running(client, project: str, number: int) -> str:
+    """The id of OpenFactory 0.7's breakdown of this requirement when it is running now, else
+    "" — until 1.0 (`FORMER_WORKFLOW_ID_PREFIX`). A breakdown 0.7 started keeps 0.7's id, so the
+    engine's one-execution-per-id refusal never sees it: `start`, `running` and the catalog's door
+    ask this first, or a second breakdown files every card again beside it (review of #500).
+    NOT_FOUND is "not running"; any other refusal RAISES, as the engine's other answers do."""
+    try:
+        from temporalio.client import WorkflowExecutionStatus
+        from temporalio.service import RPCError, RPCStatusCode
+
+        from beeverforge.runtime.temporal.io import breakdown_workflow_id
+    except ImportError as exc:
+        # AN INSTALL WITHOUT THE RUNTIME EXTRA (#178), said as `start` and `running` say it
+        from beeverforge.runtime.host import why_the_engine_cannot_be_read
+
+        raise RuntimeError(why_the_engine_cannot_be_read(exc)) from exc
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    former = FORMER_WORKFLOW_ID_PREFIX + breakdown_workflow_id(project, number).removeprefix(
+        "beeverforge-")
+    try:
+        described = await client.get_workflow_handle(former).describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            return ""
+        raise
+    return former if described.status == WorkflowExecutionStatus.RUNNING else ""
 
 
 def start_now(project, number: int, **kwargs) -> str:
@@ -101,6 +134,8 @@ async def running(project, number: int, *, client=None) -> bool:
 
     name = getattr(project, "name", "") or str(project)
     client = client or await _engine()
+    if await former_running(client, name, number):
+        return True
     try:
         described = await client.get_workflow_handle(breakdown_workflow_id(name, number)).describe()
     except RPCError as exc:
@@ -136,12 +171,18 @@ async def running_numbers(project, *, client=None) -> set[int]:
 
         raise RuntimeError(why_the_engine_cannot_be_read(exc)) from exc
 
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
     name = getattr(project, "name", "") or str(project)
     prefix = breakdown_workflow_id(name, 0)[:-1]
+    # …and OpenFactory 0.7's, until 1.0: a breakdown it started keeps 0.7's id, and one read as
+    # not running would be started again beside it (`FORMER_WORKFLOW_ID_PREFIX`)
+    prefixes = (prefix, FORMER_WORKFLOW_ID_PREFIX + prefix.removeprefix("beeverforge-"))
     client = client or await _engine()
     out: set[int] = set()
     async for wf in client.list_workflows(_RUNNING):
-        tail = str(wf.id)[len(prefix):] if str(wf.id).startswith(prefix) else ""
+        wid = str(wf.id)
+        tail = next((wid[len(p):] for p in prefixes if wid.startswith(p)), "")
         if tail.isdigit():
             out.add(int(tail))
     return out

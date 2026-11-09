@@ -147,12 +147,14 @@ def test_a_directory_with_binaries_but_no_stamp_is_not_populated(baked, tmp_path
     assert toolbox.is_populated(live) is True
 
 
-def test_the_stamp_is_invalidated_before_the_copy_starts(baked, tmp_path, monkeypatch):
-    """A stale stamp sitting over freshly-written bytes is the one arrangement that LIES. So the
-    stamp goes first and is rewritten last — if the copy dies in between, the next boot sees no
-    stamp and redoes it."""
+def test_a_copy_that_fails_leaves_the_old_toolbox_and_its_stamp(baked, tmp_path, monkeypatch):
+    """The copy is built in a staging directory beside the live toolbox (#246's review), so a copy
+    that dies has written nothing into it: the old bytes and the old stamp still agree, the boxes
+    keep a harness that runs, and nothing half-copied is left on the volume."""
     live = tmp_path / "live"
     toolbox.populate(source=baked, live=live)
+    before = (live / toolbox.STAMP).read_text()
+    (live / "codex").write_text("#!/bin/sh\nexec true OLD\n")
 
     import shutil as _shutil
 
@@ -163,8 +165,100 @@ def test_the_stamp_is_invalidated_before_the_copy_starts(baked, tmp_path, monkey
     with pytest.raises(OSError):
         toolbox.populate(source=baked, live=live, force=True)
 
-    assert not (live / toolbox.STAMP).exists(), "a stamp survived a failed copy"
+    assert (live / toolbox.STAMP).read_text() == before, "the stamp changed over the old bytes"
+    assert "OLD" in (live / "codex").read_text(), "the old toolbox was touched by a failed copy"
+    assert not list(live.glob(".toolbox-staging-*")), "a failed copy left its staging behind"
+
+
+def _renames_failing_at(monkeypatch, *calls: int) -> None:
+    """`os.rename` in the toolbox raises on the given calls (counted from 1) and works otherwise."""
+    real, seen = toolbox.os.rename, []
+
+    def _rename(a, b):
+        seen.append(a)
+        if len(seen) in calls:
+            raise OSError(f"rename {len(seen)} failed")
+        return real(a, b)
+
+    monkeypatch.setattr(toolbox.os, "rename", _rename)
+
+
+#: The fixture's live toolbox has four top-level entries (`claude`, `codex`, `pkg`, `runtime`), so
+#: a swap renames four aside (calls 1-4) and then four into place, in that order (calls 5-8). Call 8
+#: fails with three new entries in place, among them the `pkg` DIRECTORY: putting the old `pkg`
+#: back over it fails unless the new one is moved out first (a rename replaces a file or a link,
+#: never a directory that has entries).
+AFTER_NEW_ENTRIES_ARE_IN = 8
+
+
+def test_a_swap_that_fails_puts_the_old_toolbox_back(baked, tmp_path, monkeypatch):
+    """The worker's boot swallows a populate error, so a swap left half done would leave the boxes
+    a partial toolbox until the next boot (#461's review). A rename that raises after a new entry
+    is already in place moves those entries back out, puts the old entries and the old stamp back,
+    and leaves no staging behind."""
+    live = tmp_path / "live"
+    toolbox.populate(source=baked, live=live)
+    before = (live / toolbox.STAMP).read_text()
+    (live / "codex").write_text("#!/bin/sh\nexec true OLD\n")
+    (live / "pkg" / "OLD").write_text("old")
+    entries = sorted(e.name for e in live.iterdir())
+
+    _renames_failing_at(monkeypatch, AFTER_NEW_ENTRIES_ARE_IN)
+    with pytest.raises(OSError):
+        toolbox.populate(source=baked, live=live, force=True)
+    monkeypatch.undo()
+
+    assert (live / toolbox.STAMP).read_text() == before, "the old stamp was not put back"
+    assert "OLD" in (live / "codex").read_text(), "the old toolbox was not put back"
+    assert (live / "pkg" / "OLD").exists(), "a new entry already moved in stayed in place"
+    assert sorted(e.name for e in live.iterdir()) == entries
+    assert not list(live.glob(".toolbox-staging-*")), "a failed swap left its staging behind"
+
+
+def test_an_undo_that_fails_keeps_the_old_toolbox_on_the_volume(baked, tmp_path, monkeypatch):
+    """When the undo's own rename raises, staging still holds the old entries it had not put back
+    (in `.old`). Removing it there would leave the volume with neither toolbox, so it stays, and
+    with no stamp the next boot clears it and copies again."""
+    live = tmp_path / "live"
+    toolbox.populate(source=baked, live=live)
+    (live / "codex").write_text("#!/bin/sh\nexec true OLD\n")
+
+    # call 8 fails the swap; the undo then moves the three new entries back out (9-11) and fails on
+    # the first old entry it puts back (12)
+    _renames_failing_at(monkeypatch, AFTER_NEW_ENTRIES_ARE_IN, 12)
+    with pytest.raises(OSError):
+        toolbox.populate(source=baked, live=live, force=True)
+    monkeypatch.undo()
+
+    held = [*live.glob("codex"), *live.glob(".toolbox-staging-*/.old/codex")]
+    assert held and "OLD" in held[0].read_text(), "the undo's failure removed the old toolbox"
+    assert not (live / toolbox.STAMP).exists()
+
+    toolbox.populate(source=baked, live=live)
+    assert toolbox.is_populated(live, source=baked) is True
+    assert not list(live.glob(".toolbox-staging-*"))
+
+
+def test_a_swap_killed_midway_leaves_no_stamp(baked, tmp_path, monkeypatch):
+    """A worker KILLED during the swap runs nothing after the rename it died on, so nothing is put
+    back: what it leaves is a mix of old and new entries. The stamp went before the first rename,
+    so nothing says that mix is complete, and the next boot clears the debris and copies again.
+    The kill is the swap raising with the undo switched off."""
+    live = tmp_path / "live"
+    toolbox.populate(source=baked, live=live)
+
+    _renames_failing_at(monkeypatch, AFTER_NEW_ENTRIES_ARE_IN)
+    monkeypatch.setattr(toolbox, "_put_back", lambda *a, **k: None)
+    with pytest.raises(OSError):
+        toolbox.populate(source=baked, live=live, force=True)
+    monkeypatch.undo()
+
+    assert not (live / toolbox.STAMP).exists(), "a stamp survived a swap that was killed"
     assert toolbox.is_populated(live) is False
+
+    toolbox.populate(source=baked, live=live)
+    assert toolbox.is_populated(live, source=baked) is True
+    assert not list(live.glob(".toolbox-staging-*")), "the next boot left the dead swap's debris"
 
 
 def test_a_toolbox_built_for_another_variant_is_not_populated(baked, tmp_path, monkeypatch):

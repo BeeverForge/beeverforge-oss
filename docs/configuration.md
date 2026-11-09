@@ -497,6 +497,50 @@ policy SKIP + a 2-min per-poll timeout, so a stuck poll never blocks the next. P
 the Temporal Cloud UI (Schedules → `beeverforge-poller`) to halt pickup without stopping in-flight
 jobs.
 
+**An OpenFactory 0.7 deployment upgraded in place, on the same Temporal server.** BeeverForge's
+task queue is `beeverforge-jobs` and its schedules are named `beeverforge-*`; 0.7's were
+`openfactory-jobs` and `openfactory-*`. Until 1.0:
+
+- **The worker also polls `openfactory-jobs`**, with the same workflows and activities, so a job,
+  a merge gate or a deploy watch that 0.7 started before the upgrade carries on where it was.
+  Nothing new is ever started on that queue; its worker idles once 0.7's work has drained. The
+  worker's first line names both queues, and when either queue's worker stops, the other is
+  stopped too and the worker exits with the first one's error.
+- **A workflow 0.7 started keeps 0.7's id** (`openfactory-<project>-<issue>` for a job,
+  `openfactory-coordinator-<project>` for the tech-lead, `openfactory-deploy-…` for a deploy watch,
+  `openfactory-product-breakdown-…` for a breakdown), and is read under it beside BeeverForge's:
+  the panel lists the job and its **Engine ↗** link finds it, its gates are answered (the answer is
+  sealed for that id), the tech-lead's rounds see it parked, and a deploy watch shows on its card.
+  A breakdown 0.7 is still running is read as running wherever the product role, the panel or a
+  conversation asks, and is never started a second time beside it: breaking a requirement down
+  again while it runs is answered the way a second start of BeeverForge's own breakdown is,
+  waiting on the one that runs. While 0.7's coordinator runs, a decision or an update
+  is sent to it rather than starting a second one beside it, and forgetting a project closes it
+  too.
+- **No job runs twice for one card** because a running 0.7 job holds the floor like any other:
+  the poller and a manual scan count every running job, whatever its id, against
+  `BEEVERFORGE_MAX_CONCURRENT_JOBS`, so with the default of one nothing new starts while it runs.
+  With a higher floor, a card a 0.7 job is still working on could be started again only if it were
+  back in the pickup column.
+- **At boot, once BeeverForge's own schedules are created, the worker deletes 0.7's**:
+  `openfactory-poller`, `openfactory-preview-reaper`, and every `openfactory-product-sweep-<project>`,
+  `openfactory-techlead-watch-<project>`, `openfactory-card-questions-<project>` and
+  `openfactory-okf-refresh-<project>`. Left in place they would keep firing beside the new ones, so
+  every board would be scanned twice a tick and every sweep reported twice. No other schedule is
+  touched. The log says which it deleted in one line (`schedule retired OpenFactory 0.7's …`). A
+  schedule it could not delete, or an engine whose schedules it could not list, is logged as an
+  error naming it and the cause; the worker starts anyway, and the next boot tries again — or
+  delete it in the Temporal UI. A worker that could not create BeeverForge's schedules deletes none
+  of 0.7's.
+- **A poller paused in 0.7 is not carried over.** `beeverforge-poller` is created running; pause it
+  again if the queue was being held.
+- **A workflow 0.7 started is polled, not proven to replay.** Its history is replayed on this
+  release's workflow code; one whose history this code no longer matches fails its workflow task
+  in the worker's log, by name, and is retried, without stopping the worker. Let 0.7's in-flight
+  jobs finish before upgrading when you can, or cancel such a workflow in the Temporal UI.
+- **Up to twice the concurrent activities while 0.7's work drains**: each queue's worker runs up
+  to 8. One job at a time is still held by `max_concurrent_jobs`.
+
 ---
 
 ## 7. Temporal Cloud connection
@@ -699,9 +743,9 @@ harness would otherwise cost a rebuild and a roll). Don't configure a deployment
 - **Kimi is wired but unproven** — no observed stream output yet. Its read-only roles are also
   weaker: instruction only, with no mode and no policy. A planner pass that writes to the job's
   workspace holds the job, naming the files (§10); the questions run on the host, in a directory
-  nothing commits from, except `env context --ask`, which asks in the checkout it is pointed at
-  and leaves a write in that working tree, and the independent review, which runs in the job's
-  box on the job's workspace before the push, where its write can reach the pull request (review
+  nothing commits from (`env context --ask` asks in a copy of the checkout it is pointed at,
+  removed after it answers, #167), except the independent review, which runs in the job's box on
+  the job's workspace before the push, where its write can reach the pull request (review
   is on by default). Don't put a client on it until a real run.
 - **Cost from a harness that reports no price reads UNKNOWN, never `$0.00`.** A zero would make it
   look free and win every comparison.

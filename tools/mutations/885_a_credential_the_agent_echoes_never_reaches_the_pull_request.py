@@ -20,6 +20,19 @@ Claims:
   - a `Digest` or SigV4 header withholds its `response=` / `Signature=` only, and keeps the rest
     of its parameter list as written (never the marker on the first parameter's name), and a
     SHA-256 response (64 hex) whole, not its first 32;
+  - an `Authorization` value with NO scheme is withheld only when it is 16 token68 characters
+    with a digit, and never `AWS4-HMAC-SHA256`, the SigV4 scheme word (#198);
+  - the value under a secret-named name (`_SECRET_NAME`'s words plus a header's `API-KEY`) is
+    withheld after `=` or `:`, read to its natural end (its closing quote, its `\\` escapes
+    read as part of it, or its closing backtick when a backtick opened it and a value starts right
+    after that backtick; else whitespace, `,`, `;`, a quote, a backtick or an `&` before another
+    `name=`, a `%` included), the floor of the header form's
+    credential's mark on the whole value, and withheld whole — never through the header value's
+    alphabet (review of PR #445) — never a value that starts with `$` or a URL scheme, the name and
+    separator kept; SigV4's `Credential` and `X-Amz-Credential` are quoted as written (#198);
+  - a presigned URL's `X-Amz-Signature=<64 hex>` is withheld (#198);
+  - a `Digest` / SigV4 parameter list is read as comma-separated `name=value` pairs, so a header
+    longer than 1,000 characters is withheld and a `response=` after a prose word is not (#198);
   - the userinfo pattern needs its `@`, so a URL with no userinfo keeps its host, and a userinfo of
     exactly `git` (an SSH remote's user) is no credential;
   - the platform's `_redact` regex (https userinfo only) is no substitute;
@@ -77,10 +90,13 @@ MUTATIONS = [
      '    r"|(\\bBearer[ \\t]+)[\\w.~+/-]+=*", re.IGNORECASE)\n', PROSE),
     # re-pinned 2026-10-21: the header value moved to its own line with the credential's mark;
     # re-pinned again: `+` and `/` left the mark set (review on cfe48e02); and again: `=` counts
-    # only as trailing padding (review on 34209477)
+    # only as trailing padding (review on 34209477). #198: the same line is now `_MARKED_VALUE`;
+    # re-pinned on the review of PR #445: its case pair is `_CASE_PAIR`, shared with the secret-
+    # named shape, which reads its own value (`_WHOLE_VALUE`) — so this cut and the two below cut
+    # the header form only
     ("a variable reference is read as a value", MODEL,
-     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/-]{8,}=*"\n',
-     '    r"(?=[\\w.~+/$-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/$-]{8,}=*"\n', PROSE),
+     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|" + _CASE_PAIR + r"))[\\w.~+/-]{8,}=*"\n',
+     '    r"(?=[\\w.~+/$-]*(?:\\d|=+(?!\\.?[\\w~+/-])|" + _CASE_PAIR + r"))[\\w.~+/$-]{8,}=*"\n', PROSE),
     ("a slash is a credential's mark", MODEL, '(?:\\d|=+(?!\\.?[\\w~+/-])|',
      '(?:\\d|[+/]|=+(?!\\.?[\\w~+/-])|', PROSE),
     # review on 34209477: `=` is a mark only as the padding that ends a value
@@ -92,10 +108,10 @@ MUTATIONS = [
     # review on c0bb69c0: one lowercase letter followed by one capital is the mark, not by two
     ("a case pair needs a second capital", MODEL, '(?-i:[a-z][A-Z])', '(?-i:[a-z][A-Z]{2})'),
     ("a word after an Authorization scheme is withheld", MODEL,
-     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/-]{8,}=*"\n',
-     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/-]+=*"\n', PROSE),
+     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|" + _CASE_PAIR + r"))[\\w.~+/-]{8,}=*"\n',
+     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|" + _CASE_PAIR + r"))[\\w.~+/-]+=*"\n', PROSE),
     ("a header value needs no credential's mark", MODEL,
-     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|(?-i:[a-z][A-Z])))[\\w.~+/-]{8,}=*"\n',
+     '    r"(?=[\\w.~+/-]*(?:\\d|=+(?!\\.?[\\w~+/-])|" + _CASE_PAIR + r"))[\\w.~+/-]{8,}=*"\n',
      '    r"[\\w.~+/-]{8,}=*"\n', PROSE),
     ("any word is read as an Authorization scheme", MODEL,
      '(?:Bearer|Basic|token|Bot|Negotiate|NTLM)',  # re-pinned 2026-10-21: Digest and AWS4 left for _SIGNED_PARAMETER
@@ -141,6 +157,86 @@ MUTATIONS = [
     ("AWS4-HMAC-SHA256 is read as a one-token scheme, its first parameter's name withheld", MODEL,
      '(?:Bearer|Basic|token|Bot|Negotiate|NTLM)',
      '(?:Bearer|Basic|token|Bot|Negotiate|NTLM|AWS4-HMAC-SHA256)'),
+    # ── #198: the shapes another machine's credential takes ──────────────────────────────────────
+    ("a scheme-less Authorization value is quoted", MODEL,
+     "    text = _SCHEMELESS_AUTHORIZATION.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)\n",
+     ""),
+    ("a scheme-less Authorization value needs no digit", MODEL,
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{16,}=*", re.IGNORECASE)\n',
+     '    r"[\\w.~+/-]{16,}=*", re.IGNORECASE)\n', PROSE),
+    ("a scheme-less Authorization value needs 8 characters, not 16", MODEL,
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{16,}=*", re.IGNORECASE)\n',
+     '    r"(?=[\\w.~+/-]*\\d)[\\w.~+/-]{8,}=*", re.IGNORECASE)\n', PROSE),
+    ("the SigV4 scheme word is read as a scheme-less value", MODEL,
+     "(?!AWS4-HMAC-SHA256\\b)", ""),
+    ("a hyphenated Api-Key header is not secret-named", MODEL, "|API-KEY)", ")"),
+    ("a secret-named value is quoted", MODEL,
+     "    text = _SECRET_NAMED_VALUE.sub(_secret_named_value_withheld, text)\n", ""),
+    # re-pinned on the review of PR #445: the value is `_WHOLE_VALUE`, read to its natural end;
+    # re-pinned again: the separator accepts a backtick as an opening quote
+    ("a secret-named value needs no credential's mark", MODEL,
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)(?![$])(?![a-z][a-z0-9+.-]{0,31}://)" + _VALUE_CHAR\n'
+     '    + r"{8,}", re.IGNORECASE)\n', PROSE),
+    # review of PR #445: a password is written with punctuation, and is read to its natural end
+    ("a secret-named value is read through the header value's alphabet", MODEL,
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _WHOLE_VALUE, re.IGNORECASE)\n',
+     '    r"([\\"\']?[ \\t]*[:=][ \\t]*[\\"\'`]?)" + _MARKED_VALUE, re.IGNORECASE)\n'),
+    # re-pinned on the review of PR #445: each quoted branch reads its escapes
+    ("a double-quoted value is read to its first space, not its closing quote", MODEL,
+     '    r"(?<=\\")(?=" + _DOUBLE_QUOTED_CHAR + r"{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\\"))"\n'
+     '    + _DOUBLE_QUOTED_CHAR + r"{8,}(?=\\")"\n',
+     '    r"(?<=\\")(?!)"\n'),
+    ("a single-quoted value is read to its first space, not its closing quote", MODEL,
+     '    r"|(?<=\')(?=" + _SINGLE_QUOTED_CHAR + r"{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}\'))"\n'
+     '    + _SINGLE_QUOTED_CHAR + r"{8,}(?=\')"\n',
+     '    r"|(?<=\')(?!)"\n'),
+    # review of PR #445: a quoted value reads its escapes, and a backtick opens a value
+    ("a double-quoted value does not read its escapes", MODEL,
+     '_DOUBLE_QUOTED_CHAR = r"(?:[^\\"\\\\\\n]|\\\\.)"\n',
+     '_DOUBLE_QUOTED_CHAR = r"[^\\"\\n]"\n'),
+    ("a single-quoted value does not read its escapes", MODEL,
+     '_SINGLE_QUOTED_CHAR = r"(?:[^\'\\\\\\n]|\\\\.)"\n',
+     '_SINGLE_QUOTED_CHAR = r"[^\'\\n]"\n'),
+    ("the mark is looked for without a double-quoted value's escapes", MODEL,
+     'r"(?<=\\")(?=" + _DOUBLE_QUOTED_CHAR + r"{0,64}?',
+     'r"(?<=\\")(?=[^\\"\\n]{0,64}?'),
+    ("a backtick opens no value", MODEL,
+     '    r"|(?<=`)(?=[^`\\s])(?=[^`\\n]{0,64}?(?:\\d|" + _CASE_PAIR + r"|={1,2}`))[^`\\n]{8,}(?=`)"\n', ""),
+    ("a backtick is no opening quote after the separator", MODEL,
+     '[ \\t]*[:=][ \\t]*[\\"\'`]?)', '[ \\t]*[:=][ \\t]*[\\"\']?)'),
+    ("a code span's closing backtick opens a value", MODEL, 'r"|(?<=`)(?=[^`\\s])(?=',
+     'r"|(?<=`)(?=', PROSE),
+    ("a percent sign ends an unquoted value", MODEL,
+     '_VALUE_CHAR = r"(?:[^\\s,;\\"\'`&]|&(?![\\w-]{1,64}=))"\n',
+     '_VALUE_CHAR = r"(?:[^\\s,;\\"\'`&%]|&(?![\\w-]{1,64}=))"\n'),
+    ("a value that starts with $ is read", MODEL, 'r"(?![$])(?![a-z]', 'r"(?![a-z]', PROSE),
+    ("a value that starts with a URL scheme is read", MODEL,
+     '(?![a-z][a-z0-9+.-]{0,31}://)(?:"', '(?:"', PROSE),
+    ("an & always continues an unquoted value", MODEL,
+     '|&(?![\\w-]{1,64}=))"', '|&)"'),
+    ("a secret-named name is read with no bound on its length", MODEL,
+     '    r"(?<![\\w-])([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n',
+     '    r"([\\w-]*?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]*)"\n'),
+    ("a secret-named name is read from any character, not where a name starts", MODEL,
+     '    r"(?<![\\w-])([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n',
+     '    r"([\\w-]{0,64}?(?:" + _SECRET_NAME.pattern + r"|API-KEY)[\\w-]{0,64})"\n'),
+    ("SigV4's Credential header parameter is withheld", MODEL,
+     'if name == "credential" or name.endswith("amz-credential"):',
+     'if name.endswith("amz-credential"):'),
+    ("a presigned URL's X-Amz-Credential is withheld", MODEL,
+     'if name == "credential" or name.endswith("amz-credential"):',
+     'if name == "credential":', PROSE),
+    ("a presigned URL's signature is quoted", MODEL,
+     "    text = _PRESIGNED_SIGNATURE.sub(lambda m: m.group(1) + WITHHELD_CREDENTIAL, text)\n", ""),
+    ("a parameter list is scanned to 1,000 characters, not read as pairs", MODEL,
+     '    r"(?:[\\w-]+[ \\t]*=[ \\t]*(?:\\"[^\\"\\n]*\\"|[^\\s,\\"]*)[ \\t]*,[ \\t]*)*?"\n',
+     '    r"[^\\n]{0,1000}?"\n'),
+    ("a parameter list is scanned freely, not read as pairs", MODEL,
+     '    r"(?:[\\w-]+[ \\t]*=[ \\t]*(?:\\"[^\\"\\n]*\\"|[^\\s,\\"]*)[ \\t]*,[ \\t]*)*?"\n',
+     '    r"[^\\n]*?"\n'),
+    ("a quoted parameter value ends at a comma inside its quotes", MODEL,
+     '(?:\\"[^\\"\\n]*\\"|', '(?:\\"[^\\",\\n]*\\"|'),
     ("a URL with no userinfo loses its host", MODEL,
      '_USERINFO = re.compile(r"(\\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\\s/@]+@")\n',
      '_USERINFO = re.compile(r"(\\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^\\s/@]+")\n', PROSE),

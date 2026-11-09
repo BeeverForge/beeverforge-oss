@@ -101,7 +101,8 @@ embed = [
 # NO `sandbox` AND NO `slack` EXTRA ANY MORE (2026-08-26). Both were the vendor SDKs of code
 # that is not the core's: boto3 for the S3 session snapshot inside the cloud box, slack_sdk for
 # the chat listener. A vendor's SDK is a dependency of the package that ships the vendor's rows —
-# `addons/beeverforge-aws` declares boto3, `addons/beeverforge-slack` declares slack_sdk — and an
+# `beeverforge-aws` declares boto3, `beeverforge-slack` declares slack_sdk; both are packages of
+# their own, outside this repository (this tree has no `addons/` directory) — and an
 # extra here would have made the core's metadata claim a face the core does not have. The images
 # install the packages (`docker/worker.Dockerfile`, `docker/sandbox.Dockerfile`).
 dev = [
@@ -154,8 +155,9 @@ dev = [
 #
 # THE PLATFORM'S OWN CONNECTORS REGISTER THROUGH THE SAME DOOR — FROM THEIR OWN PACKAGES. The
 # core declares NO row in the group: the `fargate` runner, the DynamoDB metrics sink, the S3
-# session store and the SSM token-pool source are declared by `addons/beeverforge-aws/pyproject.toml`,
-# and the chat channel, its notifier and the Telegram fallback by `addons/beeverforge-slack/`.
+# session store and the SSM token-pool source are declared by the `beeverforge-aws` package's own
+# pyproject, and the chat channel, its notifier and the Telegram fallback by `beeverforge-slack`'s.
+# Both packages live outside this repository; this tree has no `addons/` directory.
 # The four cloud rows lived in this file from 2026-08-24 to 2026-08-26, which made the cloud a
 # directory delete for the CODE and not for the METADATA: the public tree would have shipped four
 # entry points naming modules it does not contain, and every `beeverforge --help` would have
@@ -172,11 +174,16 @@ dev = [
 # stale install.
 
 [project.scripts]
-# ONE NAME, AND IT IS THE PRODUCT'S. `beeverforge` is what the project is called and what a
-# stranger will type; the wheel guard (`tests/test_the_wheel_ships_what_the_platform_needs.py`)
-# asserts this is the only console script a `pip install` delivers, so an alias cannot come back
-# as a courtesy nobody measured.
+# THE PRODUCT'S NAME, AND THE FORMER ONE UNTIL 1.1. `beeverforge` is what the project is called and
+# what a stranger will type. `openfactory` is OpenFactory 0.7's name for the same app: removed
+# outright in 0.1.0, it answered every 0.7 script and cron line with "command not found" on an
+# upgrade in place, so it is back as an ALIAS that prints one warning on stderr naming
+# `beeverforge` and leaves stdout and the exit code to the app (`beeverforge/former_command.py`).
+# It is REMOVED IN 1.1. The wheel guard (`tests/test_the_wheel_ships_what_the_platform_needs.py`)
+# asserts these two are the console scripts a `pip install` delivers and where each points, so no
+# other alias can come back as a courtesy nobody measured, and this one cannot stay silently.
 beeverforge = "beeverforge.cli:app"
+openfactory = "beeverforge.former_command:main"
 
 [build-system]
 # 77, NOT 68, AND THE NUMBER IS MEASURED. `license = "Apache-2.0"` above is a PEP 639 licence
@@ -195,7 +202,10 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["beeverforge*"]
+# `openfactory` is OpenFactory 0.7's import name, one module beside the package that aliases it to
+# `beeverforge` for 0.7 add-ons until 1.1 (`openfactory/__init__.py`). Named exactly, not
+# `openfactory*`: it has no submodules of its own, and a glob would ship any stray directory.
+include = ["beeverforge*", "openfactory"]
 
 [tool.setuptools.package-data]
 # `**` SO THE INTENT IS EXPLICIT, NOT BECAUSE A ONE-LEVEL GLOB WAS LOSING FILES. An audit reported

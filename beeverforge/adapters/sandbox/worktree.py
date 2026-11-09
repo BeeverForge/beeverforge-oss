@@ -23,6 +23,7 @@ and git removes it with the worktree.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -37,14 +38,18 @@ from pathlib import Path
 from beeverforge import gitpin
 from beeverforge.adapters import gitworktrees
 from beeverforge.adapters.sandbox.base import (
-    LEASE_REFUSED,
     BranchHeldElsewhere,
     OutputBuffer,
-    PushRefused,
     SandboxAdapter,
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.host_push import (
+    keep_the_remote_tip,
+    push_from_the_hosts_own_repository,
+)
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
+from beeverforge.util.filelock import Waited
 
 log = logging.getLogger("beeverforge.sandbox.worktree")
 
@@ -56,6 +61,10 @@ _INPUT_DIRNAME = ".inputs"
 #: legitimately degrades a resume to a fresh start. Every other failure (no credential, no
 #: network, no such host) means we could not ask, and "could not ask" is never "it is not there".
 _NO_SUCH_REF = ("couldn't find remote ref", "could not find remote ref")
+
+#: How long a worktree add on a served cache checkout waits for a sync of the same key, as the
+#: cache's own `_LOCK_WAIT_SECONDS`: a sync holds the key for a fetch, a copy and two renames.
+_CACHE_LOCK_WAIT_SECONDS = 30 * 60
 
 
 def _remote_has_no_such_branch(fetch_output: str) -> bool:
@@ -462,6 +471,64 @@ def _write_mark(repo_path, wt: Path) -> Path | None:
     return mark
 
 
+@contextlib.contextmanager
+def _cache_key_held(repo_path: Path):
+    """Hold the repository cache's lock on the key `repo_path` is served under, while the box adds
+    and marks a worktree in it (#91); a repository that is not a cache checkout takes no lock.
+
+    THE ADD AND THE SWAP ARE ONE KEY'S BUSINESS. `RepoCache._publish` copies the master and then
+    renames the served tree into the trash, under `_key_lock(root, key)`. An add plus mark that
+    landed in between wrote the job's admin directory into the tree about to go, and every git
+    command in the job then exited 128, its push included. Under the same lock, the publish either
+    ended before the add (the worktree lands in the new tree) or begins after the mark (it sees the
+    mark and holds the tree).
+
+    HOW THE BOX KNOWS A SERVED CHECKOUT, WITHOUT THE CACHE'S INTERNALS: the cache serves key `k`
+    at `<root>/k` and its lock file is `<root>/.locks/k.lock`, which every sync creates before it
+    creates the served tree, so the lock file existing beside `repo_path` is the proof. Only
+    `_key_lock` is borrowed, so the box asks for the very file the cache locks. A project
+    registered by path has no such file next to it and takes nothing, as before; nothing is
+    created beside it either. A key with a slash in it (none is used) would not be recognised.
+
+    RE-ENTRANT ON ONE THREAD (`util/filelock.py`): a box on a thread already holding the key goes
+    through, and the cache's re-check before the rename is what keeps that tree. A holder on
+    another thread or process makes this wait, and past the wait the add is refused by name,
+    never run unlocked."""
+    # imported here, as `compose.py` and `registry.py` import the runtime: the box is an adapter
+    from beeverforge.runtime.repo_cache import _key_lock
+
+    lock = _key_lock(repo_path.parent, repo_path.name)
+    # ABSENT IS NOT UNREADABLE (docs/engineering-lessons.md §2). `isfile` answered False for both,
+    # so a `.locks` this process could not search (the panel and the worker sharing a volume, as
+    # `_key_lock`'s docstring says) let the add run unlocked, silently. Only "no such file" means
+    # this is not a cache checkout; anything else refuses the add by name.
+    try:
+        os.stat(lock.path)
+    except (FileNotFoundError, NotADirectoryError):
+        yield
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"the worktree was not added to {repo_path}: whether it is a repository cache "
+            f"checkout could not be read, because its lock {lock.path} could not be checked "
+            f"({exc.strerror or exc}). Give this process permission to search "
+            f"{Path(lock.path).parent} and read {lock.path}, then retry.") from exc
+    try:
+        lock.acquire(timeout=_CACHE_LOCK_WAIT_SECONDS)
+    except Waited as exc:
+        refusal = RuntimeError(
+            f"the worktree was not added to the repository cache checkout {repo_path}: a cache "
+            f"sync of that key held its lock {lock.path} for the whole {exc.waited:.0f} s this "
+            f"job waited, and a worktree added while that sync swaps the checkout loses its .git. "
+            f"Retry once that sync has ended; if it never ends, look for a hung sync (a git "
+            f"fetch or clone that does not return) holding {lock.path}.")
+        raise refusal from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _unlink_mark(mark: Path | None) -> None:
     if mark is None:
         return
@@ -712,46 +779,17 @@ def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:
 
 def _tip(repo, ref: str) -> str:
     """The commit `ref` names in `repo`, or `""` when it names none — which, as a lease, refuses
-    a push over any branch, rather than letting one through unread."""
+    a push over any branch, rather than letting one through unread. Read in `prepare`, before the
+    job runs; nothing reads the job's repository with git once it has (#386)."""
     rc, out = _run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
                     f"{ref}^{{commit}}"])
     return out.strip() if rc == 0 else ""
 
 
-def _force(workspace: Workspace) -> list[str]:
-    """How `publish_branch` may replace the remote's branch: over the lease, or plainly when
-    there is none (`Workspace.lease`). One spelling for both boxes."""
-    if workspace.lease is None:
-        return ["--force"]
-    return [f"--force-with-lease=refs/heads/{workspace.branch}:{workspace.lease}"]
-
-
-def keep_the_remote_tip(where: Path, workspace: Workspace, target: str) -> str:
-    """Copy the remote's tip of `workspace.branch` to a branch of its own on the remote, and lease
-    the next push on that tip (#11). Answers the kept branch's name.
-
-    WHAT A REFUSED LEASE DOES NEXT. The branch holds commits this workspace did not start from — a
-    person's fix, the work a park preserved, a re-run's leftover — and the run must still land its
-    own work there unattended (a self-heal resume, a card moved back). So the commits are copied
-    first, to `<branch>-kept-<12 hex>`, and only then replaced. NEVER FORCED: a ref already at that
-    name holding the same commit is "up to date"; one holding anything else refuses, and the caller
-    holds the job rather than replace it. The lease moves to the kept tip, so a commit landing
-    between this copy and the push is refused again. `where` is the checkout git runs in: the
-    worktree itself, or the container box's host clone."""
-    branch = workspace.branch
-    rc, out = _run(gitpin.argv(["-C", str(where), "fetch", "--", target, f"refs/heads/{branch}"]),
-                   timeout=180)
-    tip = _tip(where, "FETCH_HEAD") if rc == 0 else ""
-    if not tip:
-        raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
-                           f"{_redact(out).strip()[:300]}")
-    kept = f"{branch}-kept-{tip[:12]}"
-    rc, out = _run(gitpin.argv(["-C", str(where), "push", "--", target,
-                                f"{tip}:refs/heads/{kept}"]))
-    if rc != 0:
-        raise RuntimeError(f"could not keep {branch!r} on {kept!r}: {_redact(out).strip()[:300]}")
-    workspace.lease = tip
-    return kept
+def job_tmpdir(workspace: Workspace) -> Path:
+    """A job's `TMPDIR`: beside its worktree, under the box's root, named so that no worktree can
+    be — a git branch component never starts with a dot, and a worktree is named by its branch."""
+    return workspace.path.parent / f".{workspace.path.name}.tmp"
 
 
 def _redact(text: str) -> str:
@@ -759,9 +797,28 @@ def _redact(text: str) -> str:
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
 
 
+def _origin_of(repo_path) -> str | None:
+    """`origin`'s URL as `repo_path`'s config spells it, or None when it has none (#386).
+
+    THE RAW VALUE (`config --get`, not `remote get-url`, which applies `insteadOf`): the push that
+    uses it rewrites against the host's own configuration alone. A relative path is the
+    repository's, so it is resolved against `repo_path` — the push runs somewhere else."""
+    rc, out = _run(["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"])
+    url = out.strip()
+    if rc != 0 or not url:
+        return None
+    if "://" in url or re.match(r"^[^/]+:", url) or os.path.isabs(url):
+        return url
+    return os.path.normpath(os.path.join(str(repo_path), url))
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
          env: Mapping[str, str] | None = None) -> tuple[int, str]:
-    # `env=None` inherits the process environment, as every caller but the box's own add does
+    # `env=None` inherits the process environment, as every caller but the box's own add does.
+    # Every git call runs in the shared repo cache with its hooks off (#182): a hook a pass
+    # planted there would run here, on the host, with the host's credentials.
+    if cmd[:1] == ["git"]:
+        cmd = ["git", *gitpin.HOOKLESS, *cmd[1:]]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -784,12 +841,21 @@ class WorktreeSandbox(SandboxAdapter):
                 f"box.env entries must be environment variable NAMES, got {bad!r}")
         self.extra_env = tuple(extra_env)
         self._repo_root: Path | None = None
+        #: `origin`'s URL as `prepare` read it, BEFORE the pass ran (#386): the push's target when
+        #: no forge URL is given. Read at push time it would be whatever the pass wrote there.
+        self._origin: str | None = None
+        #: The repository's common git directory as `prepare` read it, BEFORE the pass ran (#386):
+        #: where the push reads the branch's commit and borrows its objects from, as data. Asked
+        #: at push time, git would read the worktree's `.git` pointer and config the pass can write.
+        self._git_dir: Path | None = None
         #: What `stage_input` wrote for THIS box, so `cleanup` can remove it. Per instance rather
         #: than per directory: a deployment may raise `BEEVERFORGE_MAX_CONCURRENT_JOBS`, and
         #: sweeping the whole directory would delete another job's prompt mid-pass.
         self._staged: list[Path] = []
         #: What the command currently running has written — the buffer `tail()` reads (C-39).
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
     def guidelines_path(self, host_dir: Path) -> str | None:
         """Where the operator's guidelines directory is readable FROM INSIDE THIS BOX (#318).
@@ -813,6 +879,8 @@ class WorktreeSandbox(SandboxAdapter):
         remote_url: str | None = None,
     ) -> Workspace:
         self._repo_root = repo_path
+        self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         wt = self.root / branch.replace("/", "-")
         # Re-running the same ticket must start clean, so the box's OWN worktree of this branch
@@ -963,35 +1031,38 @@ class WorktreeSandbox(SandboxAdapter):
                                               what=what, owner=owner, locked=locked)) from None
         except OSError as exc:
             raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc
-        mark = _write_mark(repo_path, wt)
-        rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())
-        _unlink_mark(mark)
-        if rc != 0:
-            # Somebody may have checked the branch out between the read above and this add, or
-            # the read may have failed; the porcelain is asked once more before git's sentence is
-            # passed on.
-            if made:
-                _remove_if_empty(wt)
-            held = _holder(repo_path, branch)
-            if held is not None:
-                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, rebuilt=rebuilt,
-                                             ours=wt)
-            raise RuntimeError(f"worktree add failed: {out}")
-        # THIS WORKTREE IS A JOB'S, AND THE REPOSITORY CACHE MUST KNOW IT (#747). For a project
-        # registered by clone URL `repo_path` is the cache's served checkout, so the job's admin
-        # directory, branch and objects live in the served `.git`. A sync that found the base
-        # moved swapped that tree into `.trash/<key>~<hex>`, and every git command in the job then
-        # exited 128, `fatal: not a git repository: <root>/<key>/.git/worktrees/<name>` — the
-        # push included (82500f9, git 2.43.0). The marker goes into THIS worktree's own admin
-        # directory and nowhere else, right after the add, so the forge read below is covered and
-        # its `worktree remove --force` on failure takes the marker with it.
-        try:
-            gitworktrees.mark_as_job(wt)
-        except OSError as exc:
-            # the job still starts: refusing it would cost the work the marker protects
-            log.warning("could not mark %s as a running job's worktree (%s) — a repository "
-                        "cache sync may swap the checkout it stands on while it runs",
-                        wt, exc)
+        # UNDER THE CACHE KEY'S LOCK, the add and the mark (#91, `_cache_key_held`).
+        with _cache_key_held(repo_path):
+            mark = _write_mark(repo_path, wt)
+            rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())
+            _unlink_mark(mark)
+            if rc != 0:
+                # Somebody may have checked the branch out between the read above and this add,
+                # or the read may have failed; the porcelain is asked once more before git's
+                # sentence is passed on.
+                if made:
+                    _remove_if_empty(wt)
+                held = _holder(repo_path, branch)
+                if held is not None:
+                    raise _branch_held_elsewhere(branch, held, repo_path=repo_path, rebuilt=rebuilt,
+                                                 ours=wt)
+                raise RuntimeError(f"worktree add failed: {out}")
+            # THIS WORKTREE IS A JOB'S, AND THE REPOSITORY CACHE MUST KNOW IT (#747). For a
+            # project registered by clone URL `repo_path` is the cache's served checkout, so the
+            # job's admin directory, branch and objects live in the served `.git`. A sync that
+            # found the base moved swapped that tree into `.trash/<key>~<hex>`, and every git
+            # command in the job then exited 128, `fatal: not a git repository:
+            # <root>/<key>/.git/worktrees/<name>` — the push included (82500f9, git 2.43.0). The
+            # marker goes into THIS worktree's own admin directory and nowhere else, right after
+            # the add, so the forge read below is covered and its `worktree remove --force` on
+            # failure takes the marker with it.
+            try:
+                gitworktrees.mark_as_job(wt)
+            except OSError as exc:
+                # the job still starts: refusing it would cost the work the marker protects
+                log.warning("could not mark %s as a running job's worktree (%s) — a repository "
+                            "cache sync may swap the checkout it stands on while it runs",
+                            wt, exc)
         base_commit = None
         if not keep and remote_url and not _is_this_repo(remote_url, repo_path):
             base_commit = self._read_the_forges_base(
@@ -1021,6 +1092,8 @@ class WorktreeSandbox(SandboxAdapter):
         OPTIONAL BY DESIGN, as `guidelines_path`: callers ask through `getattr`, and a box without
         it goes through `prepare`, which holds."""
         self._repo_root = repo_path
+        self._origin = _origin_of(repo_path)
+        self._git_dir = _common_dir(repo_path)
         self.root.mkdir(parents=True, exist_ok=True)
         tip = self.root / branch.replace("/", "-")
         trees = self._clear_our_own(repo_path, tip)
@@ -1030,39 +1103,44 @@ class WorktreeSandbox(SandboxAdapter):
             raise RuntimeError(path_taken(branch, str(_where(tip)), repo=str(repo_path),
                                           what=what, owner=owner, locked=locked))
         here = _is_this_repo(remote_url, repo_path)
-        start = base_branch
-        if here:
-            if _branch_exists(repo_path, branch):
-                start = f"refs/heads/{branch}"
+        # UNDER THE CACHE KEY'S LOCK, the fetch, the add and the mark (#91, `_cache_key_held`):
+        # the add starts from the `origin/<branch>` the fetch wrote, so both go into one tree.
+        with _cache_key_held(repo_path):
+            start = base_branch
+            if here:
+                if _branch_exists(repo_path, branch):
+                    start = f"refs/heads/{branch}"
+                else:
+                    log.warning("BEEVERFORGE_BRANCH_GONE %s is not in %s — this review reads %s "
+                                "instead of the pull request's branch", branch, repo_path,
+                                base_branch)
             else:
-                log.warning("BEEVERFORGE_BRANCH_GONE %s is not in %s — this review reads %s "
-                            "instead of the pull request's branch", branch, repo_path,
-                            base_branch)
-        else:
-            rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",
-                                         remote_url or "origin",
-                                         f"+{branch}:refs/remotes/origin/{branch}"]), timeout=180)
-            if rc == 0:
-                start = f"origin/{branch}"
-            elif _remote_has_no_such_branch(said):
-                log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this review reads "
-                            "%s instead of the pull request's branch", branch, base_branch)
-            else:
-                raise RuntimeError(
-                    f"could not ask the remote for {branch!r}, so this workspace cannot start "
-                    f"from the open PR's branch: {_redact(said).strip()[:300]}")
-        own_mark = _write_mark(repo_path, tip)
-        rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", str(tip),
-                         start], env=_in_gits_own_words())
-        _unlink_mark(own_mark)
-        if rc != 0:
-            raise RuntimeError(f"worktree add failed: {said}")
-        try:
-            gitworktrees.mark_as_job(tip)
-        except OSError as exc:
-            log.warning("could not mark %s as a running review's worktree (%s) — a repository "
-                        "cache sync may swap the checkout it stands on while it runs",
-                        tip, exc)
+                rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",
+                                             remote_url or "origin",
+                                             f"+{branch}:refs/remotes/origin/{branch}"]),
+                                timeout=180)
+                if rc == 0:
+                    start = f"origin/{branch}"
+                elif _remote_has_no_such_branch(said):
+                    log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this review "
+                                "reads %s instead of the pull request's branch", branch,
+                                base_branch)
+                else:
+                    raise RuntimeError(
+                        f"could not ask the remote for {branch!r}, so this workspace cannot start "
+                        f"from the open PR's branch: {_redact(said).strip()[:300]}")
+            own_mark = _write_mark(repo_path, tip)
+            rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", str(tip),
+                             start], env=_in_gits_own_words())
+            _unlink_mark(own_mark)
+            if rc != 0:
+                raise RuntimeError(f"worktree add failed: {said}")
+            try:
+                gitworktrees.mark_as_job(tip)
+            except OSError as exc:
+                log.warning("could not mark %s as a running review's worktree (%s) — a repository "
+                            "cache sync may swap the checkout it stands on while it runs",
+                            tip, exc)
         base_commit = None
         if remote_url and not here:
             base_commit = self._read_the_forges_base(
@@ -1268,16 +1346,42 @@ class WorktreeSandbox(SandboxAdapter):
 
         `errors="replace"` is new and deliberate: `text=True` alone decodes strictly, so a single
         stray byte anywhere in four hours of agent output raised `UnicodeDecodeError` out of the
-        sandbox — losing the entire pass to a mojibake character in a filename."""
-        return run_and_stream(
-            subprocess.Popen(
+        sandbox — losing the entire pass to a mojibake character in a filename.
+
+        A JOB'S BOX STARTS EACH COMMAND IN A PROCESS GROUP OF ITS OWN (#44), and only a job's: the
+        one exception to the same-group rule `base.run_and_stream` states at its wall. A person's
+        `stop` has to end the agent pass and everything the harness spawned, and only a group of
+        its own can be killed whole without killing the worker; `self.stop` kills it
+        (`stopping.Stop.request`). What the shared group gave — a signal sent to the worker's whole
+        group (a terminal's Ctrl-C) reaching the harness — is given back on a graceful shutdown by
+        the worker's own cancel, which the activity treats as a stop
+        (`activities._the_work_must_end`); a worker killed with SIGKILL orphans the harness, as a
+        box in the shared group always could. A box with no stop (every judging role) is unchanged.
+
+        …AND MARKED, AND GIVEN A TEMPORARY DIRECTORY OF ITS OWN (review of #453). A job's command
+        carries its stop's mark (`stopping.MARK_VAR`), which a descendant in a session of its own
+        still inherits and the stop kills by; and `TMPDIR` names `job_tmpdir(workspace)`, beside
+        the worktree, which `cleanup` removes with it — so a test run SIGKILLed by a stop, whose
+        own `finally` never runs, leaves nothing in `/tmp`. Made here, before the command, so it
+        exists for the first one. A tool that ignores `TMPDIR`, or a harness that sets its own for
+        the commands it runs (Claude Code does, measured), writes where it always did.
+        """
+        stop = self.stop
+        env = _scrubbed_env(self.extra_env)
+        if stop is not None:
+            tmp = job_tmpdir(workspace)
+            tmp.mkdir(parents=True, exist_ok=True)
+            env.update(stop.env(), TMPDIR=str(tmp))
+        proc = subprocess.Popen(
                 command, shell=True, cwd=workspace.path,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1,
-                env=_scrubbed_env(self.extra_env),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                env=env, **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: a local subprocess's pipe is the shortest read there is, and this box says
@@ -1358,22 +1462,52 @@ class WorktreeSandbox(SandboxAdapter):
         # it (`keep_remote_tip`) and pushes again (`JobRunner._publish`). A plain `--force` was
         # written for "this branch is only ever the bot's", and a park that pushes and names the
         # branch for a person to fix by hand made that false.
-        target = remote_url or "origin"
-        rc, out = _run(
-            gitpin.argv(["-C", str(workspace.path), "push", *_force(workspace), "--", target,
-                         workspace.branch])
-        )
-        if rc != 0:
-            if LEASE_REFUSED in out:
-                raise PushRefused(f"push refused: {_redact(out)}", branch=workspace.branch)
-            raise RuntimeError(f"push failed: {_redact(out)}")
+        #
+        # NEVER FROM THE WORKSPACE'S OWN GIT DIRECTORY (#386): the pass can write its config, and a
+        # push run there reads it — `insteadOf` sends the push elsewhere, `core.sshCommand` runs.
+        # The push goes from a repository the host makes for it (`host_push`), and `origin` is the
+        # one this box read before the pass ran (`prepare`), never the one the pass may have set.
+        #
+        # THE FORGE DOOR READS NO CONFIGURATION BUT THE HOST REPOSITORY'S (review of #403): the job
+        # runs as this user, with this HOME, so the user's git and ssh configuration are its to
+        # write too. The ambient door is the person's own push and keeps them, in the workload's
+        # own environment, so whatever they name runs with nothing the job does not already hold.
+        target, git_dir, ambient_env = self._push_from(workspace, remote_url)
+        pushed = push_from_the_hosts_own_repository(
+            git_dir=git_dir, branch=workspace.branch, target=target, run=_run,
+            redact=_redact, ambient_env=ambient_env, lease=workspace.lease)
         if workspace.lease is not None:
-            workspace.lease = _tip(workspace.path, f"refs/heads/{workspace.branch}")
+            workspace.lease = pushed
+
+    def _push_from(self, workspace: Workspace,
+                   remote_url: str | None) -> tuple[str, Path, dict[str, str] | None]:
+        """Where this box pushes, the git directory it pushes from — both settled in `prepare`,
+        before the pass ran, never anything the pass may have set (#386) — and the door's
+        environment: None for the forge's URL, the workload's own scrubbed one for the person's
+        `origin`. One answer for the push and for keeping the remote's tip (#11)."""
+        target = remote_url or self._origin
+        if not target:
+            raise RuntimeError(
+                f"push failed: {self._repo_root} has no origin to push {workspace.branch!r} to "
+                "and no forge URL was given — register the project with a forge, or add an "
+                "origin to the repository")
+        if self._git_dir is None:
+            raise RuntimeError(
+                f"push failed: the git directory of {self._repo_root} could not be read when the "
+                f"box was prepared, so there is nothing to push {workspace.branch!r} from — check "
+                "that the repository is a git repository the worker can read, then run the job "
+                "again")
+        return target, self._git_dir, None if remote_url else _scrubbed_env(self.extra_env)
 
     def keep_remote_tip(self, *, workspace: Workspace, remote_url: str | None = None) -> str:
         """The remote's tip of the branch, kept on a branch of its own before a push replaces it
-        (`keep_the_remote_tip`, #11). OPTIONAL BY DESIGN: a box without it holds on a refusal."""
-        return keep_the_remote_tip(workspace.path, workspace, remote_url or "origin")
+        (`host_push.keep_the_remote_tip`, #11), from the host's own repository and through the
+        same door as the push. OPTIONAL BY DESIGN: a box without it holds on a refusal."""
+        target, git_dir, ambient_env = self._push_from(workspace, remote_url)
+        kept, workspace.lease = keep_the_remote_tip(
+            git_dir=git_dir, branch=workspace.branch, target=target, run=_run, redact=_redact,
+            ambient_env=ambient_env)
+        return kept
 
     def kept_after_cleanup(self, *, workspace: Workspace) -> Path | None:
         """The repository that still holds `workspace`'s branch once `cleanup` has run (#11): the
@@ -1452,3 +1586,6 @@ class WorktreeSandbox(SandboxAdapter):
             log.warning("the box's own tree %s is locked — left as it is", workspace.path)
         elif workspace.path.exists():
             shutil.rmtree(workspace.path, ignore_errors=True)
+        # THE JOB'S `TMPDIR` GOES WITH ITS TREE (review of #453), locked or not: it is never a
+        # person's, and it holds what a killed test run never got to remove
+        shutil.rmtree(job_tmpdir(workspace), ignore_errors=True)

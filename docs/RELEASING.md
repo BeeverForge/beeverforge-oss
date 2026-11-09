@@ -262,6 +262,12 @@ Wednesday  the final, when nothing found in a candidate is open
   The audit lists those that carry neither, and each gets its fragment in a small pull request, or
   the label.
 
+- **What this release removes is in `beeverforge/deprecations.py`.** Each old name the platform
+  still reads is one entry there with the release that removes it, and
+  `tests/test_what_a_release_removes_is_registered.py` fails once the version on `main` reaches
+  that release: remove the old path and its entry before the cut. A pull request that keeps an old
+  name readable "until X" adds its one-line entry there.
+
 **Exit:** no open `release-blocker`, and `main`'s CI is green on the commit to be cut.
 
 ### 2. The cut

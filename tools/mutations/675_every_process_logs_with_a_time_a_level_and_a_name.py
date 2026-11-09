@@ -21,7 +21,11 @@ CLI = "beeverforge/cli.py"
 MUTATIONS = [
     # 1. both entry points
     ("the worker's door does not set the log up", WORKER,
-     "    logs.configure()\n    try:\n        await main()", "    try:\n        await main()"),
+     # RE-PINNED 2026-11-09 (#264): the door now says what it carried of an OpenFactory 0.7
+     # environment between setting the log up and starting, so the line after
+     # `logs.configure()` is that warning. Same cut.
+     "    logs.configure()\n    former_names.warn(carried)\n",
+     "    former_names.warn(carried)\n"),
     ("serve does not set the log up", CLI,
      # RE-PINNED 2026-10-18 (#681): the panel's first line is announced once the log is set up,
      # so the line after `logs.configure()` is that announcement's comment. Same cut.

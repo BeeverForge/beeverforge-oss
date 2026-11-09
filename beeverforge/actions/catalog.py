@@ -1069,7 +1069,7 @@ async def _answer_gate(*, project: str, issue: str, by: Actor, answer: str,
         waiting = None
         try:
             waiting = await _what_it_is_waiting_on(
-                client.get_workflow_handle(tv.job_id(found.name, issue)))
+                tv.job_handle(client, found.name, issue))
         except Exception as ask:  # noqa: BLE001 — the refusal stands; only its reason is lost
             log.info("could not ask #%s what it waits on instead (%s)", issue, ask)
         if waiting:
@@ -1302,7 +1302,7 @@ async def _stop(*, project: str, issue: str, by: Actor, reason: str = "") -> Out
     if unreachable:
         return unreachable
 
-    handle = client.get_workflow_handle(tv.job_id(found.name, issue))
+    handle = tv.job_handle(client, found.name, issue)
     try:
         described = await handle.describe()
     except Exception as exc:  # noqa: BLE001 — a job nobody can find is not a job to terminate
@@ -1353,11 +1353,64 @@ async def _stop(*, project: str, issue: str, by: Actor, reason: str = "") -> Out
         return bad
     settled = not moved.outcome("column").startswith("failed")
     await asyncio.to_thread(_journal_the_stop, found, issue, by=by, why=why)
+    # WHAT ENDED IS THE WORKFLOW (#44). The job's work runs on a worker, which hears of it at its
+    # next heartbeat, or not at all while it is gone — so the sentence says what the worker was
+    # last heard doing, read from the description taken before the terminate, and claims no more.
+    worker, told = _what_the_worker_hears(described, now=_now())
     return _after_the_door(moved, done(
-        f"#{issue}: stopped by {by} — the floor is free. This does not resume: the ticket goes "
-        f"back to the board and a fresh job starts from the beginning, so whatever that run had "
-        f"in flight is gone.",
-        project=found.name, issue=issue, by=str(by), reason=why, freed=True, settled=settled))
+        f"#{issue}: the engine ended its workflow on {by}'s stop — the floor is free. {told}. "
+        f"This does not resume: the ticket goes back to the board and a fresh job starts from "
+        f"the beginning, so whatever that run had in flight is gone.",
+        project=found.name, issue=issue, by=str(by), reason=why, freed=True, settled=settled,
+        worker=worker))
+
+
+def _now():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
+
+
+#: The job activity's heartbeat window (`workflow.py`, `_run_job_once`: `heartbeat_timeout`): a
+#: worker heard within it is still beating, and is told of the stop at its next beat.
+_HEARD_WITHIN_SECONDS = 120
+
+
+def _what_the_worker_hears(described, *, now) -> tuple[str, str]:
+    """`(heard | silent | none, the sentence)` — what the worker running the job's `run_job` is
+    known to hear of a stop, from `describe()`'s pending activities. Read with `getattr` all the
+    way down: a description that cannot say is read as no step reported running, never as heard."""
+    raw = getattr(described, "raw_description", None)
+    pending = [p for p in (getattr(raw, "pending_activities", None) or ())
+               if getattr(getattr(p, "activity_type", None), "name", "") == "run_job"]
+    if not pending:
+        return "none", "No step of it was reported running on a worker"
+    beat = _when(getattr(pending[0], "last_heartbeat_time", None))
+    if beat is not None and (now - beat).total_seconds() <= _HEARD_WITHIN_SECONDS:
+        # ITS RUNNER ASKS THE ENGINE BEFORE EACH PUBLISHING STEP (review of #453), so "publish
+        # nothing" holds from the terminate on; only the agent's END waits for the heartbeat
+        return "heard", (f"Its worker was heard at {_said(beat)} and is told at its next heartbeat "
+                         f"to end the agent and remove the worktree; it asks the engine before "
+                         f"each step that would publish, so it will publish nothing")
+    since = _said(beat) if beat is not None else "it started"
+    return "silent", (f"Its worker has not been heard from since {since}, so whether its agent is "
+                      f"still running there is not known; a worker that comes back is told at its "
+                      f"first heartbeat and publishes nothing, and its log says "
+                      f"BEEVERFORGE_JOB_STOPPED when it has been")
+
+
+def _when(stamp):
+    """A protobuf `Timestamp` as an aware datetime, or None when it is unset or unreadable."""
+    from datetime import UTC, datetime
+
+    seconds = getattr(stamp, "seconds", 0) or 0
+    if not isinstance(seconds, int) or seconds <= 0:
+        return None
+    return datetime.fromtimestamp(seconds, UTC)
+
+
+def _said(at) -> str:
+    return at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _journal_the_stop(project, issue: str, *, by: Actor, why: str) -> None:
@@ -2673,6 +2726,15 @@ async def _product_answer(*, project: str, token: str, answer: str, by: Actor,
         return _failed("I could not tell what happened to that proposal, so treat it as "
                        "unanswered and look again.", did="answer the staged proposal",
                        project=proj.name)
+    if outcome == "refused":
+        # THE MODULE DECLINED THE WRITE (#187): the role's sentence, with its word's code — never
+        # `done` for a write that did not happen
+        return _not_done(text, str(raw.get("refusal") or ""), did="answer the staged proposal",
+                         project=proj.name)
+    if outcome == "failed":
+        # THE WRITE RAISED ON THE WORKER (#187): the person heard "something broke", and the
+        # caller gets a failure with a reference its own line names
+        return _failed(text, did="answer the staged proposal", project=proj.name)
     return done(text, project=proj.name, token=tok, answer=said, outcome=outcome)
 
 
@@ -3981,7 +4043,18 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
     # conversation, so the one the requirement was asked in hears what it filed, when its record
     # names one; otherwise this door's own answer is all that is said, as before
     conversation, room = await asyncio.to_thread(_where_it_was_written, project, number)
+    from beeverforge.product.breaking import former_running
+
+    class _FormerRunning(Exception):
+        """OpenFactory 0.7's breakdown of this requirement is running (review of #500)."""
+
     try:
+        # OPENFACTORY 0.7'S BREAKDOWN, UNTIL 1.0: it keeps 0.7's id, so the engine would accept
+        # this start beside it; read as the refusal below, waiting on 0.7's execution
+        former = await former_running(client, project, number)
+        if former:
+            breaking = former
+            raise _FormerRunning
         return await client.execute_workflow(
             "ProductBreakdownWorkflow",
             ProductBreakdownInput(project=project, number=number, actor=by.id,
@@ -3989,7 +4062,7 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
             id=breaking,
             task_queue=TASK_QUEUE,
         ) or []
-    except WorkflowAlreadyStartedError:
+    except (WorkflowAlreadyStartedError, _FormerRunning):
         # THE REFUSAL THIS ID WAS SHARED FOR, SAID AS WHAT IT IS (#563, ADR-0051 D18). The engine
         # does not hand a second start the running execution's result: it refuses the start, and
         # both callers' catch-alls turned that into "nothing was filed" / "I could not turn it
@@ -5402,7 +5475,7 @@ async def _job_on_the_card(project: str, issue: str) -> _JobOnTheCard:
             f"there is no way to tell whether a job is still on {issue} — {unreachable.message} "
             f"Closing a card from under a running job is what this gate exists for, so nothing "
             f"was changed; say it on the card meanwhile."))
-    handle = client.get_workflow_handle(tv.job_id(project, issue))
+    handle = tv.job_handle(client, project, issue)
     try:
         described = await handle.describe()
     except Exception as exc:  # noqa: BLE001 — an engine that cannot answer is a state, not a crash
@@ -6234,10 +6307,121 @@ def _semantic_pass(project, checkout: Path, ctx):
             f"`beeverforge env context <target> --ask` where the harness is installed. The "
             f"deterministic survey needs none of this and costs nothing — run it again "
             f"without `ask`.")
-    return ctx.agent_ask(
-        build_asker(project),
-        sandbox=judging_worktree(project, root=checkout),
-        workspace=Workspace(path=str(checkout), branch="main", base_branch="main"))
+    asker = build_asker(project)
+    # A HARNESS THAT CANNOT JUDGE IS SAID NOW, before the survey, as it always was: binding it
+    # raises `TypeError` and asks nothing
+    ctx.agent_ask(asker, sandbox=None, workspace=None)
+    # WHAT THE COPY WILL HOLD IS DECIDED NOW TOO (#467's review), so a checkout too large to copy,
+    # or one git cannot list, is refused with a sentence before the survey rather than as a
+    # traceback inside it. `ValueError` reaches the person as it is.
+    names = _what_to_copy(checkout)
+
+    def ask(prompt: str) -> str:
+        """ASKED IN A COPY OF THE CHECKOUT, NEVER IN THE CHECKOUT ITSELF (#167). The checkout is
+        the path the person typed or the project's registered `repo_path`, which on a local
+        deployment is the repository they commit from. A harness that is read-only by
+        instruction only (Kimi, `roles.py`) and disobeys it wrote there, and the file was left in
+        their working tree for them to commit. The copy holds what they see (the files git tracks
+        and the untracked ones it does not ignore, as they are now, uncommitted edits included),
+        holds no `.git` (a harness asked here cannot read the history), and is removed when the
+        question is answered or fails, whatever the harness wrote into it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="beeverforge-ask-") as tmp:
+            room = _copy_into(checkout, names, Path(tmp) / (checkout.name or "checkout"))
+            return ctx.agent_ask(
+                asker,
+                sandbox=judging_worktree(project, root=room),
+                workspace=Workspace(path=str(room), branch="main", base_branch="main"))(prompt)
+
+    return ask
+
+
+#: The most an `env context --ask` copy may hold, in bytes (#467's review). The copy is made in the
+#: system's temporary directory, which on many machines is memory, once per question. A checkout
+#: past this is refused before anything is copied, with the remedy.
+_ASK_COPY_LIMIT = 256 * 1024 * 1024
+
+
+def _what_to_copy(checkout: Path) -> list[str]:
+    """The paths under `checkout`, relative to it, that a copy for a question holds: in a git
+    working tree, what `git ls-files --cached --others --exclude-standard` lists (so `node_modules`,
+    build output and `.git` stay behind); anywhere else, or where git is not installed, every file
+    and link but those under a `.git` directory. A tracked file deleted from the working tree is not
+    there, so it is not listed.
+
+    Raises `ValueError`, in one sentence naming the cause and the remedy, when git does not answer
+    in time or the files listed come to more than `_ASK_COPY_LIMIT`."""
+    import os
+    import subprocess
+
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(checkout), "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"], capture_output=True, check=False, timeout=60)
+    except FileNotFoundError:
+        listed = None                    # no git on this machine: the whole tree, as for a folder
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"git did not list the files of {checkout} within {int(exc.timeout)} seconds, so it "
+            f"could not be copied for the question. Run `beeverforge env context` without `ask`, "
+            f"which reads the checkout itself and needs no copy.") from exc
+    if listed is not None and listed.returncode == 0:
+        names = sorted({n for n in listed.stdout.decode("utf-8", "surrogateescape").split("\0")
+                        if n})
+    else:
+        names = []
+        for top, dirs, files in os.walk(checkout):
+            dirs[:] = sorted(d for d in dirs if d != ".git")
+            links = [d for d in dirs if (Path(top) / d).is_symlink()]
+            names += [os.path.relpath(Path(top) / f, checkout) for f in sorted(files + links)]
+    size = 0
+    for name in names:
+        try:
+            info = (checkout / name).lstat()
+        except OSError:
+            continue
+        size += info.st_size
+    if size > _ASK_COPY_LIMIT:
+        raise ValueError(
+            f"the files a question would be asked over in {checkout} come to "
+            f"{size // (1024 * 1024)} MB, over the {_ASK_COPY_LIMIT // (1024 * 1024)} MB a copy "
+            f"for `--ask` may hold. Add what it should not read to `.gitignore`, or run "
+            f"`beeverforge env context` without `ask`.")
+    return names
+
+
+def _copy_into(checkout: Path, names: list[str], room: Path) -> Path:
+    """`names` (from `_what_to_copy`), copied from `checkout` to `room`, as they are now.
+
+    A LINK IS COPIED ONLY WHEN IT STAYS INSIDE THE CHECKOUT (#467's review). A link with an
+    absolute target, or one that climbs out of the checkout, would reach the person's real files
+    from inside the copy, and a write through it would land there: the very write the copy exists
+    to keep out. Such a link is left out of the copy. Raises `RuntimeError`, in one sentence naming
+    the file and the remedy, when a file cannot be read."""
+    import os
+    import shutil
+
+    root = checkout.resolve()
+    room.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        source, target = checkout / name, room / name
+        if source.is_symlink():
+            pointed = os.readlink(source)
+            lands = (source.parent / pointed).resolve()
+            if os.path.isabs(pointed) or not lands.is_relative_to(root):
+                continue
+        elif not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"{name} in {checkout} could not be copied for the question "
+                f"({exc.strerror or exc}). Make it readable, add it to `.gitignore`, or run "
+                f"`beeverforge env context` without `ask`.") from exc
+    return room
 
 
 async def _env_read(*, target: str, by: Actor) -> Outcome:
@@ -6400,10 +6584,12 @@ async def _preview_proposal(*, target: str, by: Actor, accept: object = None) ->
 
     def _read():
         from beeverforge.onboarding.preview_infer import infer_preview
-        from beeverforge.onboarding.preview_propose import draft
+        from beeverforge.onboarding.preview_propose import draft, relocated
 
         found = infer_preview(checkout, name=(repo.rsplit("/", 1)[-1] if repo else ""))
-        return found, draft(found, accept=_said_yes(accept))
+        # SHOWN WHERE IT WOULD BE WRITTEN: the folder this repository uses (#265).
+        return found, relocated(draft(found, accept=_said_yes(accept)),
+                                namespace.dir_in(checkout))
 
     try:
         found, drafted = await asyncio.to_thread(_read)
@@ -7156,7 +7342,10 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
     when = datetime.now(UTC).date().isoformat()
     body = _yaml_header(written, skipped, when=when, who=str(by)) + yaml_io.dump(
         document, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    destination = (Path(str(out)).expanduser() if out else checkout / found.manifest_path)
+    # INTO THE DIRECTORY THE REPOSITORY USES (#265): a repository that keeps `.openfactory/` gets
+    # its manifest written there, never a second one under `.beeverforge/` that would shadow it.
+    in_repo = namespace.in_repo(checkout, str(found.manifest_path))
+    destination = (Path(str(out)).expanduser() if out else checkout / in_repo)
 
     if not consented:
         return refused(
@@ -7207,7 +7396,7 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
         from beeverforge.onboarding.propose_manifest import propose
 
         outcome = propose(
-            checkout=clone_to_discard, manifest_path=str(found.manifest_path),
+            checkout=clone_to_discard, manifest_path=in_repo,
             repo=repo_of(found), clone_url=url, base=base, forge=forge,
             project_name=found.name,
             summary=f"{len(written)} field(s) proposed from the repository: {kept}")
@@ -7220,7 +7409,7 @@ async def _env_apply_impl(*, project: str, by: Actor, yes: object = False,
             + (f". {len(skipped)} field(s) were left out on purpose."
                if skipped else ". Nothing was left out.")
             + f" Merge it, then: `beeverforge env check {found.name}`.",
-            verb="apply", measured_on=where, wrote=str(found.manifest_path),
+            verb="apply", measured_on=where, wrote=in_repo,
             project=found.name, pull_request=outcome.url, ref=outcome.ref,
             existed=outcome.existed, written=written, skipped=skipped, content=body)
 
@@ -7763,9 +7952,9 @@ def _the_steps_came_to(project: str, steps: list[dict], **data: object) -> Outco
 
 def _differs(held, asked) -> list[str]:
     """The fields `asked` was given that `held` does not hold the same — `[]` when the registry
-    already says what was asked. An axis agrees when its kind and its repository are the same and
-    every option asked for is held with the same value, so a board attached since, or a credential
-    variable named since, is not a disagreement."""
+    already says what was asked. An axis agrees when its kind and its repository are the same (in
+    any case, #385) and every option asked for is held with the same value, so a board attached
+    since, or a credential variable named since, is not a disagreement."""
     from beeverforge.contracts.project import ProviderRef
 
     out = []
@@ -7773,7 +7962,7 @@ def _differs(held, asked) -> list[str]:
         want, have = getattr(asked, key), getattr(held, key, None)
         if isinstance(want, ProviderRef):
             same = (isinstance(have, ProviderRef) and want.kind == have.kind
-                    and want.repo == have.repo
+                    and (want.repo or "").casefold() == (have.repo or "").casefold()
                     and all(have.options.get(k) == v for k, v in want.options.items()))
         else:
             same = want == have
@@ -8309,13 +8498,15 @@ def _the_declaration_step(project, docs_repo: str, root: Path, *, sources: list[
                           capture_output=True, text=True, timeout=60, check=False)
     named = (head.stdout or "").strip()
     base_branch = named if (head.returncode == 0 and named and named != "HEAD") else "main"
-    target = root / PRODUCT_YAML
+    # WHERE THE CONTEXT REPOSITORY KEEPS IT (#265): `.openfactory/` when that is its folder.
+    product_yaml = namespace.in_repo(root, PRODUCT_YAML)
+    target = root / product_yaml
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(result.product_yaml, encoding="utf-8")
     branch = proposal_branch(name)
     bot = bot_identity()
     ident = ["-c", f"user.name={bot.name}", "-c", f"user.email={bot.email}"]
-    for args in (["checkout", "-b", branch], ["add", "--", PRODUCT_YAML],
+    for args in (["checkout", "-b", branch], ["add", "--", product_yaml],
                  ["commit", "-m", f"{name}: declare this product for BeeverForge"],
                  # --force: the bot's OWN onboarding branch, so a run after a partial failure
                  # (pushed, then the review request did not open) overwrites rather than

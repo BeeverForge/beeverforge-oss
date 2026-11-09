@@ -40,7 +40,7 @@
 # runtime that ships beside them — at ~50 MB it is noise next to the harnesses.
 FROM node:20-slim AS toolbox
 
-ARG HARNESS_CLAUDE=@anthropic-ai/claude-code@2.1.219
+ARG HARNESS_CLAUDE=@anthropic-ai/claude-code@2.1.309
 ARG HARNESS_CODEX=@openai/codex@0.146.0
 ARG HARNESS_KIMI=@moonshot-ai/kimi-code@0.31.1
 ARG HARNESS_OPENCODE=1.18.13
@@ -402,7 +402,7 @@ COPY --from=compose-plugin /docker-compose /usr/local/lib/docker/cli-plugins/doc
 # cached checkout — so the worker now carries the agent CLI. SAME pinned version as the
 # sandbox base image (docker/base-python.Dockerfile) — drift between the two would create
 # "works in preflight, breaks in execute" bugs.
-RUN npm install -g @anthropic-ai/claude-code@2.1.219
+RUN npm install -g @anthropic-ai/claude-code@2.1.309
 
 # THE PRODUCT'S SEARCH BY MEANING, OUT OF THE BOX (#337). The local embedding row loads a model from
 # a folder and never downloads one (`adapters/embed/local.py`), so the published image carries it:
@@ -440,6 +440,8 @@ COPY pyproject.toml README.md LICENSE NOTICE ./
 # the backend warns and installs an empty description today; a newer one may refuse the build.
 COPY docs/pypi.md ./docs/pypi.md
 COPY beeverforge ./beeverforge
+# OpenFactory 0.7's import name, which 0.7 add-ons import until 1.1 — a package pyproject.toml declares
+COPY openfactory ./openfactory
 # THE ADD-ON PACKAGES, BUILT HERE FROM THE SAME TREE — WHERE THE TREE HAS THEM. The cloud rows (the
 # remote box, the metrics table, the session store, the token pool) and the chat rows (the channel,
 # its notifier, the Telegram fallback) are `addons/beeverforge-aws` and `addons/beeverforge-slack`

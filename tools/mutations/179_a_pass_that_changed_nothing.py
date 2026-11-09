@@ -23,12 +23,15 @@ MUTATIONS = [
      "        return out if rc == 0 else None",
      "        return out"),
 
+    # RE-PINNED 2026-11-04 (#197): the hold now withholds a credential in the agent's words.
     ("the pass that gave up is assumed to have changed nothing instead of being measured",
      "beeverforge/orchestrator/machine.py",
      '                return as_left(self._hold(\n'
-     '                    ticket, owner, f"ci-repair agent stopped: {rep.summary}",',
+     '                    ticket, owner, f"ci-repair agent stopped: '
+     '{_without_credentials(rep.summary)}",',
      '                return (self._hold(\n'
-     '                    ticket, owner, f"ci-repair agent stopped: {rep.summary}",'),
+     '                    ticket, owner, f"ci-repair agent stopped: '
+     '{_without_credentials(rep.summary)}",'),
 
     ("the successful pass reports nothing about what it pushed",
      "beeverforge/orchestrator/machine.py",
