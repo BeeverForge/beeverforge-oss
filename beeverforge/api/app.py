@@ -42,7 +42,7 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from starlette.routing import compile_path
 
-from beeverforge import __version__, actions, doors
+from beeverforge import __version__, actions, doors, former_names
 from beeverforge.api import read_models
 from beeverforge.api.project_route import AboutItsProject
 from beeverforge.contracts.project import Project
@@ -71,8 +71,12 @@ def _load_environment() -> None:
     repository — write-capable, on some seeds and not others.
 
     A library module must not have side effects on import. `serve()` is the entry point.
+
+    The `.env` read here again may still carry an OpenFactory 0.7 deployment's names, so they are
+    carried over to their new names after it, as the command line's entry does (#264).
     """
     load_dotenv()
+    former_names.warn(former_names.carry_over())
 
 # NO KEY IS WRITTEN TO DISK AT IMPORT (#742). This block copied an App key delivered as content
 # into a temp file and pointed `BEEVERFORGE_GH_APP_KEY` at it, for readers that wanted a path.

@@ -142,8 +142,11 @@ class _HandDown:
 #: configuration is `BEEVERFORGE_*` (`environ.ENV_PREFIX`), and the durable engine adds `TEMPORAL_*`
 #: — both are the operator's when they arrive in the shell, and both are stripped so no test reads
 #: them. The suite SETS its own under `BEEVERFORGE_*` (a registry, a log dir, a cache); those are
-#: written back AFTER this strip, by the fixtures and hooks that own them.
-OPERATOR_PREFIXES = ("BEEVERFORGE_", "TEMPORAL_")
+#: written back AFTER this strip, by the fixtures and hooks that own them. `OPENFACTORY_*` is the
+#: third (#264): an OpenFactory 0.7 deployment's names, which every entry point now reads as their
+#: `BEEVERFORGE_*` twins — so a contributor who also runs 0.7 would otherwise hand a test that
+#: calls an entry point that deployment's live credentials under the new names.
+OPERATOR_PREFIXES = ("BEEVERFORGE_", "TEMPORAL_", "OPENFACTORY_")
 
 
 def _isolate_the_operator(suite_home: Path, workerinput: dict | None = None) -> None:

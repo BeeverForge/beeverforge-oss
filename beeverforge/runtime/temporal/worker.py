@@ -30,6 +30,7 @@ except ModuleNotFoundError as _exc:
 
     raise SystemExit(f"✗ the worker cannot start: {CLIENT_MISSING}") from None
 
+from beeverforge import former_names
 from beeverforge.runtime.temporal import FORMER_TASK_QUEUE, TASK_QUEUE
 from beeverforge.runtime.temporal.activities import (
     adjust_pr,
@@ -328,6 +329,9 @@ async def run_together(workers) -> None:
 
 async def main() -> None:
     load_dotenv()  # bot credentials + Claude token for the activities
+    # …and an OpenFactory 0.7 `.env`'s names, read under the new ones (#264). `born` carried
+    # the container's own environment before the log was set up; this carries the file's.
+    former_names.warn(former_names.carry_over())
     # NO KEY IS WRITTEN TO DISK AT BOOT (#742). An App key handed over as content used to be copied
     # into a temp file here; the minter takes the content (`credentials.app_private_key` reads it
     # first, through the credential store), so the copy was read by nothing.
@@ -470,7 +474,12 @@ async def born() -> None:
     `configure` hands the exception nobody catches to the log (fourth review of #818)."""
     from beeverforge.observability import logs
 
+    # AN OPENFACTORY 0.7 ENVIRONMENT IS READ UNDER ITS NEW NAMES (#264) — carried BEFORE the log
+    # is set up, because `OPENFACTORY_LOG_FORMAT` is how a 0.7 deployment asked for JSON lines,
+    # and said after it, so the warning is a line of that log.
+    carried = former_names.carry_over()
     logs.configure()
+    former_names.warn(carried)
     try:
         await main()
     # AN ENGINE NOBODY DECLARED is the other refusal at birth (#163), said the same way (#73):

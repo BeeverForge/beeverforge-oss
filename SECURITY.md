@@ -61,6 +61,11 @@ interesting surface is well-defined:
   as that user, so code that knows where to look can read them. The container box mounts none of
   them; a `box.env` name held in a file crosses into it exactly as a variable would, by name.
 
+  An OpenFactory 0.7 variable (`OPENFACTORY_*`) is read under its `BEEVERFORGE_*` name until 1.1,
+  and each process of the deployment removes it from its own environment as it starts, before it
+  builds any workload's: so a credential set under its old name is withheld exactly when its new
+  name is, and no deny list carries the old spelling.
+
   The **host's push** is a third reach, and it differs by door (`host_push.py`, #386). With a
   forge URL, which carries the push credential, the push reads no git or ssh configuration a job
   could write — not the job's repository's, not the user-level or system git config, not the ssh
