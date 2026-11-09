@@ -6296,10 +6296,121 @@ def _semantic_pass(project, checkout: Path, ctx):
             f"`beeverforge env context <target> --ask` where the harness is installed. The "
             f"deterministic survey needs none of this and costs nothing — run it again "
             f"without `ask`.")
-    return ctx.agent_ask(
-        build_asker(project),
-        sandbox=judging_worktree(project, root=checkout),
-        workspace=Workspace(path=str(checkout), branch="main", base_branch="main"))
+    asker = build_asker(project)
+    # A HARNESS THAT CANNOT JUDGE IS SAID NOW, before the survey, as it always was: binding it
+    # raises `TypeError` and asks nothing
+    ctx.agent_ask(asker, sandbox=None, workspace=None)
+    # WHAT THE COPY WILL HOLD IS DECIDED NOW TOO (#467's review), so a checkout too large to copy,
+    # or one git cannot list, is refused with a sentence before the survey rather than as a
+    # traceback inside it. `ValueError` reaches the person as it is.
+    names = _what_to_copy(checkout)
+
+    def ask(prompt: str) -> str:
+        """ASKED IN A COPY OF THE CHECKOUT, NEVER IN THE CHECKOUT ITSELF (#167). The checkout is
+        the path the person typed or the project's registered `repo_path`, which on a local
+        deployment is the repository they commit from. A harness that is read-only by
+        instruction only (Kimi, `roles.py`) and disobeys it wrote there, and the file was left in
+        their working tree for them to commit. The copy holds what they see (the files git tracks
+        and the untracked ones it does not ignore, as they are now, uncommitted edits included),
+        holds no `.git` (a harness asked here cannot read the history), and is removed when the
+        question is answered or fails, whatever the harness wrote into it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="beeverforge-ask-") as tmp:
+            room = _copy_into(checkout, names, Path(tmp) / (checkout.name or "checkout"))
+            return ctx.agent_ask(
+                asker,
+                sandbox=judging_worktree(project, root=room),
+                workspace=Workspace(path=str(room), branch="main", base_branch="main"))(prompt)
+
+    return ask
+
+
+#: The most an `env context --ask` copy may hold, in bytes (#467's review). The copy is made in the
+#: system's temporary directory, which on many machines is memory, once per question. A checkout
+#: past this is refused before anything is copied, with the remedy.
+_ASK_COPY_LIMIT = 256 * 1024 * 1024
+
+
+def _what_to_copy(checkout: Path) -> list[str]:
+    """The paths under `checkout`, relative to it, that a copy for a question holds: in a git
+    working tree, what `git ls-files --cached --others --exclude-standard` lists (so `node_modules`,
+    build output and `.git` stay behind); anywhere else, or where git is not installed, every file
+    and link but those under a `.git` directory. A tracked file deleted from the working tree is not
+    there, so it is not listed.
+
+    Raises `ValueError`, in one sentence naming the cause and the remedy, when git does not answer
+    in time or the files listed come to more than `_ASK_COPY_LIMIT`."""
+    import os
+    import subprocess
+
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(checkout), "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"], capture_output=True, check=False, timeout=60)
+    except FileNotFoundError:
+        listed = None                    # no git on this machine: the whole tree, as for a folder
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"git did not list the files of {checkout} within {int(exc.timeout)} seconds, so it "
+            f"could not be copied for the question. Run `beeverforge env context` without `ask`, "
+            f"which reads the checkout itself and needs no copy.") from exc
+    if listed is not None and listed.returncode == 0:
+        names = sorted({n for n in listed.stdout.decode("utf-8", "surrogateescape").split("\0")
+                        if n})
+    else:
+        names = []
+        for top, dirs, files in os.walk(checkout):
+            dirs[:] = sorted(d for d in dirs if d != ".git")
+            links = [d for d in dirs if (Path(top) / d).is_symlink()]
+            names += [os.path.relpath(Path(top) / f, checkout) for f in sorted(files + links)]
+    size = 0
+    for name in names:
+        try:
+            info = (checkout / name).lstat()
+        except OSError:
+            continue
+        size += info.st_size
+    if size > _ASK_COPY_LIMIT:
+        raise ValueError(
+            f"the files a question would be asked over in {checkout} come to "
+            f"{size // (1024 * 1024)} MB, over the {_ASK_COPY_LIMIT // (1024 * 1024)} MB a copy "
+            f"for `--ask` may hold. Add what it should not read to `.gitignore`, or run "
+            f"`beeverforge env context` without `ask`.")
+    return names
+
+
+def _copy_into(checkout: Path, names: list[str], room: Path) -> Path:
+    """`names` (from `_what_to_copy`), copied from `checkout` to `room`, as they are now.
+
+    A LINK IS COPIED ONLY WHEN IT STAYS INSIDE THE CHECKOUT (#467's review). A link with an
+    absolute target, or one that climbs out of the checkout, would reach the person's real files
+    from inside the copy, and a write through it would land there: the very write the copy exists
+    to keep out. Such a link is left out of the copy. Raises `RuntimeError`, in one sentence naming
+    the file and the remedy, when a file cannot be read."""
+    import os
+    import shutil
+
+    root = checkout.resolve()
+    room.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        source, target = checkout / name, room / name
+        if source.is_symlink():
+            pointed = os.readlink(source)
+            lands = (source.parent / pointed).resolve()
+            if os.path.isabs(pointed) or not lands.is_relative_to(root):
+                continue
+        elif not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(
+                f"{name} in {checkout} could not be copied for the question "
+                f"({exc.strerror or exc}). Make it readable, add it to `.gitignore`, or run "
+                f"`beeverforge env context` without `ask`.") from exc
+    return room
 
 
 async def _env_read(*, target: str, by: Actor) -> Outcome:

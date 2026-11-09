@@ -129,6 +129,13 @@ Everything above that primitive — the sizer, the diagnosis, the coordinator's 
 answer, the independent review — is **one shared implementation**. Parity by construction rather
 than by four more copies per harness.
 
+**Amended 2026-11-07 (#167): `env context --ask` asks in a copy of the checkout it is pointed at.**
+`actions/catalog.py::_semantic_pass` no longer asks in the person's checkout. Each question copies
+the files git tracks and the untracked ones it does not ignore, as they are in the working tree, to
+a temporary directory, asks there, and removes it when the question is answered. A write a
+read-only-by-instruction harness makes is left in that copy and removed with it, and no longer in
+the person's working tree. The paragraph above stands as what was measured before it.
+
 ### 3. Native-first: a proven implementation is never displaced by the generic one
 
 Where a harness already implements a role itself, that implementation wins; the generic path serves
