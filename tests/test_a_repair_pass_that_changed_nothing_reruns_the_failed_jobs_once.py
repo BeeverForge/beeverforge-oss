@@ -22,8 +22,8 @@ are red: `_run_ci_repair` returns the pass's result as it came. The rows that ex
 green there BY DESIGN, and each names the cut in
 `tools/mutations/756_an_unrelated_red_check_is_rerun_not_repaired.py` that turns it red.
 
-Every input passes `attempt=2`, so the pre-launch re-run (criterion A, once per head) never stands
-in for the pass: the agent runs and the post-pass move is the only one in play.
+Every input passes `attempt=2`, so the pre-launch re-run (criterion A, first attempt of the watch
+only) never stands in for the pass: the agent runs and the post-pass move is the only one in play.
 """
 
 from __future__ import annotations
