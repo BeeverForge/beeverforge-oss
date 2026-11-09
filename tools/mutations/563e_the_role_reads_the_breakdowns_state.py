@@ -66,9 +66,10 @@ MUTATIONS = [
      "        return Breakdowns(running=None)", "        return Breakdowns(running=frozenset())"),
 
     # 3. one listing, this project
+    # RE-PINNED 2026-11-09 (#500): matched against BeeverForge's prefix and 0.7's
     ("another project's breakdowns are read as this one's", BREAKING,
-     "        tail = str(wf.id)[len(prefix):] if str(wf.id).startswith(prefix) else \"\"",
-     "        tail = str(wf.id).rsplit(\"-\", 1)[-1]"),
+     "        tail = next((wid[len(p):] for p in prefixes if wid.startswith(p)), \"\")",
+     "        tail = wid.rsplit(\"-\", 1)[-1]"),
 
     # 4. told where it was written
     ("TODAY'S RUN: the panel's breakdown is told to nobody", CATALOG,

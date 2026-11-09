@@ -53,12 +53,11 @@ def version_for(issue: str) -> str:
     return f"{_VERSION_PREFIX}-{str(issue).lstrip('#')}"
 
 
-def _job_id(project_name: str, issue: str) -> str:
-    return f"beeverforge-{project_name}-{str(issue).lstrip('#')}"
-
-
 async def _awaiting(client, project_name: str, issue: str) -> bool:
-    handle = client.get_workflow_handle(_job_id(project_name, issue))
+    from beeverforge.runtime.temporal.view import job_handle
+
+    # 0.7's job too, until 1.0 (`job_handle`)
+    handle = job_handle(client, project_name, str(issue).lstrip("#"))
     return bool(await handle.query("awaiting_approval"))
 
 

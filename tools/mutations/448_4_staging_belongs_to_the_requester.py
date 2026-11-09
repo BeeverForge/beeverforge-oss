@@ -344,9 +344,10 @@ MUTATIONS = [
      '        raise AdjustsSpent(int(gate.get("adjust_passes") or 0))\n'
      "    seal = gate_seal.seal(gate_seal.NOT_YET",
      "    seal = gate_seal.seal(gate_seal.NOT_YET", SEAM),
+    # RE-PINNED 2026-11-09 (#500): sealed over the id that answered (`handle.id`)
     ("a not-yet is sealed as a release approval", VIEW,
-     "    seal = gate_seal.seal(gate_seal.NOT_YET, wf_id, instruction, by)\n",
-     "    seal = gate_seal.seal(gate_seal.APPROVE_PROD, wf_id, instruction, by)\n", SEALED),
+     "    seal = gate_seal.seal(gate_seal.NOT_YET, handle.id, instruction, by)\n",
+     "    seal = gate_seal.seal(gate_seal.APPROVE_PROD, handle.id, instruction, by)\n", SEALED),
     ("a finished job is read as parked at its last gate", VIEW,
      "    if described.status != WorkflowExecutionStatus.RUNNING:\n        return None\n"
      "    if not await handle.query(JobWorkflow.awaiting_approval):\n        return None\n",

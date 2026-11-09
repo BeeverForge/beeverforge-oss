@@ -35,6 +35,7 @@ from beeverforge.memory.ledger import DELIVERY, open_loop
 from beeverforge.product import breaking
 from beeverforge.product.corpus import Corpus, Requirement
 from beeverforge.product.role import Breakdowns, ProductRole, requirement_index
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -215,7 +216,7 @@ def door(monkeypatch):
 
     started = []
 
-    class _Engine:
+    class _Engine(HoldsNoFormerWorkflow):
         async def execute_workflow(self, name, inp, **kw):
             started.append(inp)
             return []

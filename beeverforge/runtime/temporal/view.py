@@ -286,6 +286,73 @@ def job_id(project: str, issue: str) -> str:
     return f"{_WF_ID_PREFIX}{project}-{issue}"
 
 
+def former_workflow_id(wf_id: str) -> str:
+    """The id OpenFactory 0.7 gave the workflow BeeverForge calls `wf_id`: the same id with
+    `FORMER_WORKFLOW_ID_PREFIX` in place of `beeverforge-` (until 1.0)."""
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    return FORMER_WORKFLOW_ID_PREFIX + wf_id.removeprefix(_WF_ID_PREFIX)
+
+
+#: A handle's calls that ASK THE ENGINE ABOUT ONE WORKFLOW, and so are asked again under 0.7's id
+#: when the engine does not know BeeverForge's (`job_handle`).
+_ASKED_AGAIN = frozenset({"describe", "query", "signal", "result", "cancel", "terminate",
+                          "fetch_history"})
+
+
+class _EitherId:
+    """A workflow handle on BeeverForge's id that, until 1.0, falls back to 0.7's.
+
+    Each call is made on BeeverForge's id first. Only when the engine answers NOT_FOUND is the same
+    call made on 0.7's id (`former_workflow_id`), because that is the one answer that says the
+    workflow may be under its other name; any other failure is the engine's, raised as it came.
+    Neither id held → the NOT_FOUND about BeeverForge's id, which is the one a person knows.
+
+    `id` IS THE ID THAT ANSWERED, and a call that found 0.7's keeps to it from then on. A gate's
+    seal is bound to the workflow's own id (`gate_seal`, checked against the running workflow's),
+    so an answer sealed over BeeverForge's id would be refused by a 0.7 job: seal over `id`, after
+    the query that found the job."""
+
+    def __init__(self, client, wf_id: str):
+        self._client = client
+        self._handle = client.get_workflow_handle(wf_id)
+        self._former_id = former_workflow_id(wf_id)
+        self.id = wf_id
+
+    def __getattr__(self, name):
+        asked = getattr(self._handle, name)
+        if name not in _ASKED_AGAIN:
+            return asked
+
+        async def either(*args, **kwargs):
+            from temporalio.service import RPCError, RPCStatusCode
+
+            try:
+                return await asked(*args, **kwargs)
+            except RPCError as exc:
+                if exc.status != RPCStatusCode.NOT_FOUND:
+                    raise
+                missing = exc
+            former = self._client.get_workflow_handle(self._former_id)
+            try:
+                answer = await getattr(former, name)(*args, **kwargs)
+            except RPCError as exc:
+                if exc.status == RPCStatusCode.NOT_FOUND:
+                    raise missing from None
+                raise
+            self._handle, self.id = former, self._former_id
+            return answer
+
+        return either
+
+
+def job_handle(client, project: str, issue: str):
+    """The handle of the job on `project`'s `issue` — under BeeverForge's id, or under the id
+    OpenFactory 0.7 started it with when only that one is held (until 1.0, `_EitherId`). Every
+    read or answer about an EXISTING job goes through here; a start uses `job_id`."""
+    return _EitherId(client, job_id(project, issue))
+
+
 def _registered_projects() -> list[str]:
     from beeverforge.registry import ProjectRegistry
 
@@ -294,7 +361,8 @@ def _registered_projects() -> list[str]:
 
 def parse_job_id(wf_id: str, *, known_projects: list[str] | None = None
                  ) -> tuple[str | None, str | None]:
-    """`beeverforge-acme-189` → `('acme', '189')`. `(None, None)` for ids of another shape.
+    """`beeverforge-acme-189` → `('acme', '189')`, and 0.7's `openfactory-acme-189` the same
+    until 1.0 (`FORMER_WORKFLOW_ID_PREFIX`). `(None, None)` for ids of another shape.
 
     A ref is the PROVIDER's string, and a Jira one contains a hyphen — so the old
     `rpartition("-")` turned `beeverforge-demo-CONT-412` into project `demo-CONT`, ref `412`.
@@ -312,9 +380,14 @@ def parse_job_id(wf_id: str, *, known_projects: list[str] | None = None
     not read — falls back to the old split. A job that vanished from the panel because its project
     was deleted would be a worse answer than an imperfectly parsed one.
     """
-    if not wf_id.startswith(_WF_ID_PREFIX):
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    # 0.7'S ID TOO, until 1.0: a job picked up from 0.7's queue keeps the id 0.7 gave it.
+    prefix = next((p for p in (_WF_ID_PREFIX, FORMER_WORKFLOW_ID_PREFIX)
+                   if wf_id.startswith(p)), None)
+    if prefix is None:
         return None, None
-    rest = wf_id[len(_WF_ID_PREFIX):]
+    rest = wf_id[len(prefix):]
     if known_projects is None:
         try:
             known_projects = _registered_projects()
@@ -581,7 +654,9 @@ async def _deploy_state(client: Client, project: str, issue: str) -> str | None:
     if wf_id in _deploy_cache:
         return _deploy_cache[wf_id]
     try:
-        desc = await client.get_workflow_handle(wf_id).describe()
+        # a 0.7 job's watch is under 0.7's id (until 1.0, `_EitherId`)
+        watch = _EitherId(client, wf_id)
+        desc = await watch.describe()
     except Exception as exc:  # noqa: BLE001 — usually genuinely absent (not opted in)
         log.debug("no deploy-watch for %s (%s)", wf_id, exc)
         return None
@@ -590,7 +665,7 @@ async def _deploy_state(client: Client, project: str, issue: str) -> str | None:
     label = "deploy_failed"  # a failed/terminated/timed-out child reads as a deploy failure
     if desc.status == WorkflowExecutionStatus.COMPLETED:
         try:
-            result = await client.get_workflow_handle(wf_id).result()
+            result = await watch.result()
             label = _DEPLOY_LABEL.get(str(result), "deploy_failed")
         except Exception as exc:  # noqa: BLE001 — same degrade as above
             log.info("could not read deploy %s (%s) — showing it as failed", wf_id, exc)
@@ -649,7 +724,7 @@ async def job_detail(client: Client, project: str, issue: str, namespace: str) -
     + findings, the added suppressions (with location), and the gate results. Reads the
     JobWorkflow's result once; running/older jobs return what's available."""
     wf_id = job_id(project, issue)
-    handle = client.get_workflow_handle(wf_id)
+    handle = job_handle(client, project, issue)
     out: dict = {"project": project, "issue": issue, "workflow_id": wf_id}
     try:
         desc = await handle.describe()
@@ -1350,9 +1425,13 @@ async def coordinator_messages(client: Client) -> list[dict]:
         log.warning("could not list the coordinators (%s) — no narration will reach the panel "
                     "or a chat add-on this round", exc)
         return out
-    pfx = "beeverforge-coordinator-"
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    # 0.7's coordinator too, until 1.0: it keeps running under the id 0.7 gave it
+    prefixes = (f"{_WF_ID_PREFIX}coordinator-", f"{FORMER_WORKFLOW_ID_PREFIX}coordinator-")
     async for wf in wfs:
-        project = wf.id[len(pfx):] if wf.id.startswith(pfx) else wf.id
+        pfx = next((p for p in prefixes if wf.id.startswith(p)), "")
+        project = wf.id[len(pfx):] if pfx else wf.id
         try:
             msgs = await client.get_workflow_handle(wf.id, run_id=wf.run_id).query("recent")
         except Exception as exc:  # noqa: BLE001 — one coordinator missing is not all of them
@@ -1495,14 +1574,13 @@ async def approve_job(
     the workflow is actually at the gate first, so an approval is never silently lost."""
     from beeverforge import gate_seal
 
-    wf_id = job_id(project, issue)
-    handle = client.get_workflow_handle(wf_id)
+    handle = job_handle(client, project, issue)
     if not await handle.query(JobWorkflow.awaiting_approval):
         raise RuntimeError("job is not awaiting prod approval")
     # SEALED, because the workflow acts on nothing else: the signal alone could have come from
     # anybody who reaches the engine (`gate_seal`). Every caller of this function has checked the
     # person already; the seal is how the worker knows that it was one of them.
-    seal = gate_seal.seal(gate_seal.APPROVE_PROD, wf_id, version, approver, comment)
+    seal = gate_seal.seal(gate_seal.APPROVE_PROD, handle.id, version, approver, comment)
     await handle.signal(JobWorkflow.approve_prod, args=[version, approver, comment, seal])
 
 
@@ -1523,8 +1601,7 @@ async def answer_merge_gate(client: Client, project: str, issue: str, *, answer:
         raise ValueError("answer must be 'merge', 'adjust', 'address', 'discard' or 'review'")
     from beeverforge import gate_seal
 
-    wf_id = job_id(project, issue)
-    handle = client.get_workflow_handle(wf_id)
+    handle = job_handle(client, project, issue)
     gate = await handle.query(JobWorkflow.awaiting_merge)
     if not gate:
         raise RuntimeError("this job is not waiting on a merge")
@@ -1539,7 +1616,7 @@ async def answer_merge_gate(client: Client, project: str, issue: str, *, answer:
         # binary predates the number: delivered, as before, and its own branch decides.
         raise AdjustsSpent(int(gate.get("adjust_passes") or 0))
     # Sealed for `approve_job`'s reason above.
-    seal = gate_seal.seal(gate_seal.MERGE_GATE, wf_id, answer, instruction, by)
+    seal = gate_seal.seal(gate_seal.MERGE_GATE, handle.id, answer, instruction, by)
     await handle.signal(JobWorkflow.human_merge_gate, args=[answer, instruction, by, seal])
     return dict(gate)
 
@@ -1552,7 +1629,7 @@ async def merge_gate(client: Client, project: str, issue: str) -> dict | None:
     completed still holds the last `_merge_wait` it set, and reading that as a gate would offer a
     person another pass on a change already in the product. A workflow that never ran raises, as
     the engine says it; the caller decides what that means to the person it answers."""
-    handle = client.get_workflow_handle(job_id(project, issue))
+    handle = job_handle(client, project, issue)
     described = await handle.describe()
     if described.status != WorkflowExecutionStatus.RUNNING:
         return None
@@ -1568,7 +1645,7 @@ async def release_gate(client: Client, project: str, issue: str) -> dict | None:
     THE CHANGE IS ALREADY MERGED THERE, which is what makes it a gate of its own: "not yet" at the
     merge gate rewrites the open pull request; here it is answered with a NEW change of the card
     (`another_change`). A job whose binary predates the query raises, as the engine says it."""
-    handle = client.get_workflow_handle(job_id(project, issue))
+    handle = job_handle(client, project, issue)
     described = await handle.describe()
     if described.status != WorkflowExecutionStatus.RUNNING:
         return None
@@ -1591,8 +1668,7 @@ async def another_change(client: Client, project: str, issue: str, *, instructio
     the two fields the job acts on."""
     from beeverforge import gate_seal
 
-    wf_id = job_id(project, issue)
-    handle = client.get_workflow_handle(wf_id)
+    handle = job_handle(client, project, issue)
     if not await handle.query(JobWorkflow.awaiting_approval):
         raise RuntimeError("this job is not waiting at its last gate")
     gate = dict(await handle.query(JobWorkflow.release_wait) or {"hears": False})
@@ -1601,7 +1677,7 @@ async def another_change(client: Client, project: str, issue: str, *, instructio
                        "can be released as it is, or a person starts the card again")
     if gate.get("adjusts_left") == 0:
         raise AdjustsSpent(int(gate.get("adjust_passes") or 0))
-    seal = gate_seal.seal(gate_seal.NOT_YET, wf_id, instruction, by)
+    seal = gate_seal.seal(gate_seal.NOT_YET, handle.id, instruction, by)
     await handle.signal(JobWorkflow.not_yet, args=[instruction, by, seal])
     return gate
 
@@ -1609,7 +1685,7 @@ async def another_change(client: Client, project: str, issue: str, *, instructio
 async def merge_gate_of(client: Client, project: str, issue: str) -> dict | None:
     """The merge-wait a job is holding, or None when it is not at the merge gate — asked, never
     answered. For a row that must read the pull request before it decides to answer (#330)."""
-    gate = await client.get_workflow_handle(job_id(project, issue)).query(
+    gate = await job_handle(client, project, issue).query(
         JobWorkflow.awaiting_merge)
     return dict(gate) if gate else None
 
@@ -1683,7 +1759,7 @@ async def act_job(client: Client, project: str, issue: str, *, action: str,
     lost."""
     if action not in ("resume", "skip"):
         raise ValueError("action must be 'resume' or 'skip'")
-    handle = client.get_workflow_handle(job_id(project, issue))
+    handle = job_handle(client, project, issue)
     parked = await handle.query(JobWorkflow.awaiting_action)
     if not parked:
         raise RuntimeError("job is not parked (no impediment/pause awaiting an action)")

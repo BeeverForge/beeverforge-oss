@@ -27,8 +27,13 @@ MUTATIONS = [
     ("TODAY'S RUN: the conversation's breakdown is a second execution beside the panel's",
      BREAKING, "            id=breakdown_workflow_id(name, number), task_queue=TASK_QUEUE)",
      '            id=breakdown_workflow_id(name, number) + "-asked", task_queue=TASK_QUEUE)'),
+    # RE-PINNED 2026-11-09 (#500): a second `return RUNNING` now answers a running 0.7 breakdown;
+    # this row means the engine's refusal of a second BeeverForge start
     ("a breakdown already running is told as one this door started", BREAKING,
-     "        return RUNNING\n", "        return STARTED\n"),
+     "                 \"asked while one runs; nothing was started\", name, number)\n"
+     "        return RUNNING\n",
+     "                 \"asked while one runs; nothing was started\", name, number)\n"
+     "        return STARTED\n"),
 
     # 2. the telling
     ("the conversation that started it is never told", ACTIVITIES,
