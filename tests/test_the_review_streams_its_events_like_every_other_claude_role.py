@@ -8,8 +8,8 @@ of `claude` — rotating accounts, benching one a quota exhausted, auditing call
 review's `rate_limit_event`, and could not bench an account a review used up (reported by a
 downstream deployment, v0.6.0-rc.2).
 
-THE STAND-IN IS 2.1.219, AS MEASURED, AND NOTHING MORE (2026-10-19, the pinned CLI, no credential;
-`tests/fixtures/claude_cli/2.1.219/README.md`): asked `json` it prints one envelope; asked
+THE STAND-IN IS THE PINNED CLI, AS MEASURED, AND NOTHING MORE (2.1.219 on 2026-10-19 and 2.1.309 on
+2026-11-06, no credential; `tests/fixtures/claude_cli/<version>/README.md`): asked `json` it prints one envelope; asked
 `stream-json` without `--verbose` it refuses on stderr and exits 1 — the pin's own sentence, so a
 change that drops `--verbose` turns every review unreadable here as it would on a box; asked
 `stream-json --verbose` it prints init, a `rate_limit_event` (the shape the binary declares; no

@@ -30,6 +30,7 @@ silently and a fix that never happened must not look alike.
 from __future__ import annotations
 
 import logging
+import threading
 
 from beeverforge.util.bounded import BoundedDict
 
@@ -56,6 +57,25 @@ log = logging.getLogger("beeverforge.ops")
 #: refusing therefore costs one attempt per message until it lands, which is the price of the only
 #: alternative on offer: an impediment nobody ever hears about.
 _LAST: BoundedDict[str, bool] = BoundedDict(256)
+#: The ref each `(project, cause)` was last filed or found under, so an occurrence that waited on
+#: the lock while another filed it can say what was filed (#437's review).
+_FILED: BoundedDict[str, str] = BoundedDict(256)
+#: ONE CHECK-AND-CREATE AT A TIME PER `(project, cause)` (#437's review). `report` reads the board
+#: and then creates; two occurrences at once (two people, or a thread and its retry) both passed
+#: the check and both created a ticket with the same title. The lock makes the second wait for the
+#: first's create.
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+#: HOW LONG AN OCCURRENCE WAITS FOR THE ONE AHEAD OF IT (#463's review). The lock is held across
+#: the board's calls, so a forge that hangs would queue every later failing turn behind it, and
+#: `report` never blocks the reply. One that waits this long gives up and files nothing, and its
+#: caller then says nothing was alerted, which is true of that turn.
+_WAIT_FOR_LOCK_S = 30.0
+
+
+def _lock_for(key: str) -> threading.Lock:
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(key, threading.Lock())
 
 #: Known causes. A CLOSED SET on purpose: the title is derived from the cause, dedup is by title,
 #: and a free-form string would file a new ticket for every wording of the same trouble — the
@@ -65,6 +85,9 @@ PRODUCT_MOUNT_EMPTY = "product-mount-empty"
 PRODUCT_CORPUS_UNREADABLE = "product-corpus-unreadable"
 PRODUCT_BOARD_UNREADABLE = "product-board-unreadable"
 PRODUCT_CANNOT_WRITE = "product-cannot-write"
+#: The product role's own model call failed: the harness crashed, refused the model, or is not
+#: logged in (#437). The requirements were read; the role could not answer from them.
+PRODUCT_CANNOT_ANSWER = "product-cannot-answer"
 #: A gate the project declares cannot RUN where the factory runs it — the command is not in the
 #: box, or is not executable. NOT a gate that ran and failed: that is the client's code, it is the
 #: repair loop's business, and it belongs on the client's own ticket. This one is the platform
@@ -109,6 +132,9 @@ _TITLES_SAID = {
                                "pt-BR": "o quadro de trabalho não pode ser lido"},
     PRODUCT_CANNOT_WRITE: {"en": "a write by the product agent failed",
                            "pt-BR": "uma escrita da agente de produto falhou"},
+    PRODUCT_CANNOT_ANSWER: {"en": "the product agent cannot answer: its model call fails",
+                            "pt-BR": "a agente de produto não consegue responder: a chamada ao "
+                                     "modelo falha"},
     GATE_CANNOT_RUN: {"en": "a gate this project declares cannot run in the box",
                       "pt-BR": "uma verificação que este projeto declara não consegue rodar no "
                                "box"},
@@ -232,7 +258,7 @@ def _tracker_for(project, tracker):
                                                                                 "tracker"))
 
 
-def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
+def report(project, cause: str, detail: str = "", *, tracker=None, recheck: bool = False) -> str:
     """Open (or leave open) the impediment for `cause`. Returns its ref, or "".
 
     NEVER RAISES AND NEVER BLOCKS THE REPLY. This runs on the path of a client's message: an
@@ -240,11 +266,54 @@ def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
 
     Idempotent by title, so a capability broken for an hour produces ONE ticket and not one per
     message — the difference between a history and a flood. A second occurrence adds nothing: the
-    ticket is already open and already says the same thing.
+    ticket is already open and already says the same thing. Two occurrences AT ONCE file one too:
+    the check and the create run under one lock per `(project, cause)`.
+
+    `recheck` is for a caller that tells a person "the team has been alerted" (#437's review): an
+    occurrence after the first asks the board again rather than trusting this process's memory,
+    so a ticket a person closed or deleted is filed again, and the ref returned is one that is
+    open. It costs one board lookup per occurrence, on the failure path only.
     """
     name = getattr(project, "name", "?")
-    if _LAST.get(f"{name}|{cause}") is False:
+    key = f"{name}|{cause}"
+    seen = _LAST.get(key)
+    if seen is False and not recheck:
         return ""          # already known broken; the ticket is open and already says this
+    lock = _lock_for(key)
+    if not lock.acquire(timeout=_WAIT_FOR_LOCK_S):
+        log.warning("BEEVERFORGE_OPS_REPORT_WAITED project=%s cause=%s — another occurrence held "
+                    "the board for %ss, so this one filed nothing: %s", name, cause,
+                    _WAIT_FOR_LOCK_S, detail[:200])
+        return ""
+    try:
+        if seen is not False and _LAST.get(key) is False:
+            # filed by an occurrence that held the lock first while this one waited: trusted
+            # without asking the board, whose search may not show a ticket created a moment ago
+            return _FILED.get(key, "")
+        # ON A RECHECK, THE TICKET THIS PROCESS FILED IS READ BY ITS REF (#463's review), not
+        # searched for by title: a search that lags behind the create would find nothing and file
+        # a second one. Only a ticket read as closed, or one that cannot be read, is filed again.
+        known = _FILED.get(key, "") if seen is False else ""
+        return _report(project, name, key, cause, detail, tracker, known=known)
+    finally:
+        lock.release()
+
+
+def _still_open(trk, ref: str) -> bool:
+    """Whether the ticket `ref` reads as open — False when it reads as closed or cannot be read
+    (deleted, or the forge refused), so the caller files again rather than promise a ticket that
+    may not be there."""
+    try:
+        ticket = trk.get_ticket(ref)
+    except Exception as exc:  # noqa: BLE001 — unreadable is not open
+        log.info("BEEVERFORGE_OPS_UNREADABLE ref=%s (%s) — read as closed, so it is filed again",
+                 ref, str(exc)[:160])
+        return False
+    return (getattr(ticket, "state", None) or "open") != "closed"
+
+
+def _report(project, name: str, key: str, cause: str, detail: str, tracker, *,
+            known: str = "") -> str:
     try:
         trk = _tracker_for(project, tracker)
         if trk is None:
@@ -255,9 +324,13 @@ def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
                         "factory board, so the impediment has nowhere to go and only this line "
                         "records it: %s", name, cause, detail[:200])
             return ""
+        if known and _still_open(trk, known):
+            log.info("BEEVERFORGE_OPS_STILL_OPEN project=%s cause=%s ref=%s", name, cause, known)
+            return known
         existing = _open(trk, name, cause)
         if existing:
-            _LAST[f"{name}|{cause}"] = False      # the board HAS it; a repeat adds nothing
+            _LAST[key] = False                    # the board HAS it; a repeat adds nothing
+            _FILED[key] = str(existing)
             log.info("BEEVERFORGE_OPS_STILL_OPEN project=%s cause=%s ref=%s", name, cause, existing)
             return str(existing)
         held = _born_in_the_queue(project, trk)
@@ -270,7 +343,8 @@ def report(project, cause: str, detail: str = "", *, tracker=None) -> str:
         ref = trk.create_ticket(
             title=title_on(project, cause),
             body=_body(name, cause, detail, board, getattr(project, "language", None)))
-        _LAST[f"{name}|{cause}"] = False          # after the create, so a refused one is retried
+        _LAST[key] = False                        # after the create, so a refused one is retried
+        _FILED[key] = str(ref)
         _label_and_assign(trk, ref, board, project)
         log.error("BEEVERFORGE_OPS_IMPEDIMENT_FILED project=%s cause=%s ref=%s — %s",
                   name, cause, ref, detail[:200])

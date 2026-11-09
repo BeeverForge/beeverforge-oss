@@ -232,8 +232,12 @@ def test_no_thread_is_the_project_wide_conversation_and_what_she_could_not_answe
     answered with the client's sentence for that, recorded as what she said — the conversation's
     rule, pinned in `test_the_conversation_is_pinned.py`. The panel's old ask turn recorded nothing
     and handed the row a refusal instead; that path is gone on purpose (#266 slice 2): one turn,
-    one answer to the same message on every surface."""
-    from beeverforge.product.voice import unavailable
+    one answer to the same message on every surface.
+
+    THE SENTENCE CHANGED WITH #437: a turn whose model call failed is said as the role's failure
+    ("I couldn't put an answer together"), never as "I can't see the requirements", and with no
+    factory board here it promises no alert."""
+    from beeverforge.product.voice import cannot_answer
 
     _turn("olá", "cli", "")
     assert list(worker.turns) == ["acme"], "keyed by the project, as the say turn keys it"
@@ -241,7 +245,7 @@ def test_no_thread_is_the_project_wide_conversation_and_what_she_could_not_answe
     Role.reply = SimpleNamespace(ok=False, text="", error="no corpus", is_request=False)
     replies = _turn("olá de novo", "cli", "person:ana")
     assert [t.role for t in worker.turns["person:ana"]] == ["person", "agent"]
-    assert replies[-1].text == unavailable(language=None), replies
+    assert replies[-1].text == cannot_answer(alerted=False, language=None), replies
 
 
 def test_the_client_s_document_says_so():

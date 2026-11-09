@@ -117,10 +117,11 @@ MUTATIONS = [
      "    if not getattr(result, \"handed_back\", None):\n        return result\n    try:\n",
      "    if True:\n        return result\n    try:\n"),
 
+    # RE-PINNED (#44): the call now hands the runner the job's stop as well
     ("run_job no longer applies its box's outcomes", ACTIVITIES,
      "        lambda: _the_worker_applies(inp.project, inp.issue, applied,\n"
-     "                                    _do_run_job(inp, run_id, watch=watch)),\n",
-     "        lambda: _do_run_job(inp, run_id, watch=watch),\n"),
+     "                                    _do_run_job(inp, run_id, watch=watch, stop=stop)),\n",
+     "        lambda: _do_run_job(inp, run_id, watch=watch, stop=stop),\n"),
 
     ("repair_ci no longer applies its box's outcomes", ACTIVITIES,
      "        lambda: _the_worker_applies(inp.project, inp.issue, applied, "

@@ -52,8 +52,8 @@ MUTATIONS = [
     ("the planner is counted after its pause again, where it used to be", MACHINE,
      "                self._count(plan_result, \"planner\")\n",
      "                if plan_result.pause_reason:\n"
-     "                    self._emit(ticket, \"note\", f\"planner paused: "
-     "{plan_result.summary[:200]}\",\n"
+     "                    self._emit(ticket, \"note\", \"planner paused: \"\n"
+     "                               f\"{_without_credentials(plan_result.summary)[:200]}\",\n"
      "                               cost_usd=plan_result.cost_usd, role=\"planner\")\n"
      "                    return self._paused(\n"
      "                        ticket, plan_result.pause_reason, plan_result.retry_at, "
@@ -96,10 +96,12 @@ MUTATIONS = [
      "            self._count(rep, \"ci_repair\")\n"),
 
     # ── claim 2: the pause reaches the journal ────────────────────────────────────────────────
+    # RE-PINNED 2026-11-04 (#197), here and in the planner row above: the note withholds a
+    # credential in the planner's words before its cut, and is split over two lines.
     ("the paused planner is counted and never journalled — the dashboard does not hear of it",
      MACHINE,
-     "                    self._emit(ticket, \"note\", f\"planner paused: "
-     "{plan_result.summary[:200]}\",\n"
+     "                    self._emit(ticket, \"note\", \"planner paused: \"\n"
+     "                               f\"{_without_credentials(plan_result.summary)[:200]}\",\n"
      "                               cost_usd=plan_result.cost_usd, role=\"planner\")\n",
      ""),
 

@@ -340,3 +340,18 @@ def test_every_word_the_reviewer_writes_is_withheld_and_nothing_else_changes():
     # a key the dict lacks stays absent: `headline` reads `{}` as "no review"
     assert _review_withheld({}) == {}
     assert _review_withheld({"decision": "approved"}) == {"decision": "approved"}
+
+
+def test_a_credential_in_an_unfinished_reviews_summary_is_withheld_from_the_hold_sentence():
+    """A review that did not complete puts the reviewer's own first sentence on the ticket, in
+    the hold's one sentence: the reviewer's words, so withheld like the rest of them."""
+    from beeverforge.orchestrator.machine import _unfinished_review_note
+
+    review = ReviewResult(decision="rejected", score=0, findings=[],
+                          summary=f"the review did not complete: it quoted {SUMMARY_TOKEN} and "
+                                  f"stopped. More follows.")
+
+    note = _unfinished_review_note(review)
+
+    assert SUMMARY_TOKEN[:12] not in note, note
+    assert WITHHELD_CREDENTIAL in note and note.startswith("the review did not complete"), note

@@ -1,6 +1,7 @@
 # ADR 0038 — The platform is complete on its own; channels are add-ons
 
 - **Status:** **Accepted**
+- **Note (2026-11-06, #1):** this record says `sdlc …` for the command and `sdlc/`, `.sdlc/` for the package and the repository folder, as they were named when it was written. The command is `beeverforge` (`beeverforge box prove`, `beeverforge approver add`, `beeverforge act`, `beeverforge actions`), the package `beeverforge/`, the folder `.beeverforge/`.
 - **Date:** 2026-08-02
 - **Relates to:** ADR-0015 (the notifier), ADR-0016 (production is never released from chat),
   ADR-0022 (provider seams), ADR-0026 (two surfaces, same floor), C-23 (#51, the action layer),

@@ -167,7 +167,7 @@ def _scrub_remote(path: Path, clone_url: str) -> None:
 
 def _git(args: list[str], cwd: Path | None = None,
          env: dict[str, str] | None = None) -> tuple[int, str]:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+    p = subprocess.run(["git", *gitpin.HOOKLESS, *args], cwd=cwd, capture_output=True, text=True,
                        timeout=_GIT_TIMEOUT, env={**os.environ, **env} if env else None)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -648,7 +648,8 @@ def _git_out(args: list[str], cwd: Path | None, env: dict[str, str],
              stdin: str | None = None) -> subprocess.CompletedProcess:
     """One git command with its streams apart — a listing read from stdout must not carry a warning
     git wrote to stderr."""
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, input=stdin,
+    return subprocess.run(["git", *gitpin.HOOKLESS, *args], cwd=cwd, capture_output=True,
+                          text=True, input=stdin,
                           timeout=_GIT_TIMEOUT, env={**os.environ, **env}, check=False)
 
 

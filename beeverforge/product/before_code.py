@@ -452,7 +452,8 @@ def _list_in_context(project, would_be, entry: str) -> bool:
             head = git("symbolic-ref", "--short", "HEAD", cwd=root)
             onto = (head.stdout or "").strip() if head.returncode == 0 else ""
             onto = branch or onto or "main"
-            for args in (["add", "--", PRODUCT_YAML],
+            # STAGED WHERE IT WAS WRITTEN: the folder the context repository uses (#265).
+            for args in (["add", "--", namespace.in_repo(root, PRODUCT_YAML)],
                          ["commit", "-qm", f"{project.name}: its first source, {entry}"],
                          gitpin.pinned(["push", "-q", "--", "origin", f"HEAD:{onto}"])):
                 done = git(*args, cwd=root)

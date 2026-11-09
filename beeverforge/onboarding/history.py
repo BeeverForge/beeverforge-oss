@@ -69,6 +69,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from beeverforge import gitpin
+
 log = logging.getLogger(__name__)
 
 #: How far back to look. A year covers one full cycle of a team's seasons — a release, an audit,
@@ -185,7 +187,9 @@ def _git(repo: Path | str, args: list[str], *,
     a credential-shaped failure and an absent `git` must both reach the same named refusal."""
     try:
         done = subprocess.run(  # noqa: S603 — argv list, no shell, `git` only
-            ["git", "-c", "core.quotePath=false", "-C", str(repo), *args],
+            # hooks off (#182, #384's review): the knowledge refresh reads the shared repo cache's
+            # history through here, and a pass can write that cache's hooks
+            ["git", *gitpin.HOOKLESS, "-c", "core.quotePath=false", "-C", str(repo), *args],
             capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         return 124, "", f"`git {args[0]}` did not finish in {timeout}s"

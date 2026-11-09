@@ -446,7 +446,8 @@ class Manifest(BaseModel):
     # both sides declare it independently, a disagreement becomes DETECTABLE instead of silent.
     docs_repo: str | None = None
 
-    # Optional project-level tightening of permissions (never loosening — D-2).
+    # Optional project-level tightening of permissions (never loosening — D-2). NOT IMPLEMENTED:
+    # accepted and read by nothing (`loader.py::_INERT` lists it; docs/STATUS.md, "Known gaps").
     permissions: dict[str, object] = Field(default_factory=dict)
 
     # Scope-explosion threshold (ADR-0001 D-6): abort to refinement past this. Enforced in

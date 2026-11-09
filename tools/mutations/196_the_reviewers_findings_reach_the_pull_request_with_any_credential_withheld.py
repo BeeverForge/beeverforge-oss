@@ -115,4 +115,9 @@ MUTATIONS = [
      "    out = _without_credentials(f\"\\n{head['word']} — {head['clause']}\")\n"
      "    for point in (head.get(\"points\") or [])[:3]:\n"
      "        out += _without_credentials(f\"\\n· {point}\")\n"),
+
+    # the hold sentence of a review that did not complete quotes the reviewer's summary
+    ("an unfinished review's summary reaches the hold sentence with its credential", MACHINE,
+     "    summary = _review_withheld(r).summary\n",
+     "    summary = r.summary\n"),
 ]

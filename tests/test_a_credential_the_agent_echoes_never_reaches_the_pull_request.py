@@ -81,9 +81,36 @@ AWS_SIGNATURE = "5d672d79" + "c15b1316" + "2d9279b0" + "855cfba6" * 2 + "789a8ed
 DB_PASSWORD = "q7" + "hunter" * 3
 OPAQUE = "q7" + "OPAQUE" * 5
 LINK_PASSWORD = "q7" + "linkpw" * 3
+#: Passwords written with punctuation, as a password usually is (review of PR #445): at d32308a the
+#: value was read only through a header value's alphabet, `[\w.~+/-]`, so the run before the first
+#: `!` or `&` was withheld and the rest published — or, under 8 characters, nothing was withheld.
+PUNCTUATED_PASSWORD = "Pa55word" + "!Secret#xyz"
+AMPERSAND_PASSWORD = "Tr0ub4dor" + "&3horse"
+QUOTED_PASSWORD = "hunter2" + "!Abcdef9"
+#: A quoted value with an escaped quote inside it, as JSON writes one (review of PR #445): at
+#: 04790d2 the quoted value ended at the `\"`, so the tail after it was shown — or, with fewer than
+#: 8 characters before it, nothing was withheld.
+ESCAPED_TAIL = "Abc123xyz" + '\\"' + "rest-of-it"
+ESCAPED_HEAD = "abc" + '\\"' + "Def123xyz"
+ESCAPED_SINGLE = "Abc123xyz" + "\\'" + "rest-of-it"
+#: A password in a Markdown code span (review of PR #445): at 04790d2 a backtick was no opening
+#: quote, so the value came back unchanged.
+SPANNED_PASSWORD = "Pa55word" + "!Spanned"
+#: A percent-encoded value, withheld whole: `%` is part of an unquoted value.
+PERCENT_ENCODED = "Abc123def" + "%2Fghi"
+#: A passphrase, read to its closing quote, spaces included.
+PASSPHRASE = "correct horse " + "battery 9staple"
 #: A key of this process, PEM-shaped: three lines, its body a line no shape would catch alone.
 KEY_BODY = "MIIEv" + "q7KEYBODY" * 6
 PEM = "-----BEGIN " + "PRIVATE KEY-----\n" + KEY_BODY + "\n-----END " + "PRIVATE KEY-----"
+#: A model vendor's key written without its `sk-` prefix, as another machine holds it (#198).
+UNPREFIXED_KEY = "q7" + "OPENAIKEY" * 3
+#: A SigV4 header's `SignedHeaders=` list longer than the 1,000 characters the scan once read
+#: (#198): one name of no whitespace or comma, as SigV4 writes it.
+LONG_SIGNED_HEADERS = "host;" + ";".join(f"x-amz-meta-q{i}" for i in range(90))
+#: A Digest `uri=` longer than 1,000 characters with a comma inside its quotes (#198): a pair
+#: scan that read the comma as a separator would lose its place.
+LONG_URI = "/x?" + "q" * 750 + "," + "q" * 750
 
 
 @pytest.fixture(autouse=True)
@@ -155,9 +182,12 @@ def test_a_github_token_in_the_agents_message_is_withheld_and_the_body_says_so(
     # review on c0bb69c0: a value whose only mark is ONE lowercase letter followed by ONE capital
     # (`eV`); every other case's pair is followed by a second capital, so `[a-z][A-Z]{2}` survived
     (f"{SENTINEL}: sent Authorization: Basic {CASE_PAIR} once", CASE_PAIR),
+    # #198: a value another machine holds, written with no scheme at all
+    (f"{SENTINEL}: I called it with Authorization: {JWT} and it answered 200", JWT),
+    (f'{SENTINEL}: the client sends {{"Authorization": "{JWT}"}}', JWT),
 ], ids=["bearer-jwt", "curl-token-hex", "bare-bearer", "lowercase-header", "json-key", "equals",
         "bot", "negotiate", "ntlm", "padding-only-mark", "padding-before-a-full-stop",
-        "one-case-pair-mark"])
+        "one-case-pair-mark", "schemeless-jwt", "schemeless-json-key"])
 def test_the_value_of_an_authorization_header_in_the_agents_message_is_withheld_and_the_body_says_so(
         repo: Path, tmp_path: Path, said: str, secret: str):
     """At 620bb577 none of these values carries a vendor prefix, and `scrub_credentials` returned
@@ -185,8 +215,20 @@ def test_the_value_of_an_authorization_header_in_the_agents_message_is_withheld_
     # bound would leave after the marker (`response="[credential withheld]<the last 32 hex>"`).
     (f'{SENTINEL}: it sent Authorization: Digest username="ann", algorithm=SHA-256, '
      f'response="{DIGEST_SHA256}"', DIGEST_SHA256[32:], "algorithm=SHA-256"),
+    # #198: a presigned URL carries the signature in its query string, with no space after a scheme
+    (f"{SENTINEL}: fetched https://bucket.s3.example.test/k?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+     f"&X-Amz-Credential=AKIDEXAMPLE%2F20261021%2Fus-east-1%2Fs3%2Faws4_request"
+     f"&X-Amz-Date=20261021T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature={AWS_SIGNATURE}",
+     AWS_SIGNATURE, "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE"),
+    # #198: parameters before the secret one that run past 1,000 characters
+    (f'{SENTINEL}: it sent Authorization: Digest username="ann", realm="api", uri="{LONG_URI}", '
+     f'response="{DIGEST_RESPONSE}", qop=auth', DIGEST_RESPONSE, 'Digest username="ann"'),
+    (f"{SENTINEL}: it sent Authorization: AWS4-HMAC-SHA256 "
+     f"Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request, "
+     f"SignedHeaders={LONG_SIGNED_HEADERS}, Signature={AWS_SIGNATURE}", AWS_SIGNATURE,
+     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request"),
 ], ids=["digest", "aws4-hmac-sha256", "digest-lowercase", "aws4-signedheaders-first",
-        "digest-sha256"])
+        "digest-sha256", "presigned-url", "digest-past-1000", "aws4-past-1000"])
 def test_a_signed_header_withholds_its_secret_parameter_and_keeps_the_rest(
         repo: Path, tmp_path: Path, said: str, secret: str, kept: str):
     """Review on 5fe330d2, decision 3: a `Digest` or SigV4 header is a parameter list. At d892b0a3
@@ -196,6 +238,111 @@ def test_a_signed_header_withholds_its_secret_parameter_and_keeps_the_rest(
     quoted as written."""
     quote = _assert_withheld_and_said(_opened(repo, tmp_path, _Says(said)), secret)
     assert kept in _shown(quote), f"the header's other parameters were not quoted as written: {quote}"
+
+
+def test_a_signed_headers_parameter_list_is_read_pair_by_pair_not_scanned():
+    """#198: the scan from `Digest` to its `response=` reads `name=value` pairs separated by
+    commas, not any run of characters. Unbounded, a free scan read to the end of the line from
+    every `Digest` (11.29 s on a 400 KB line, review on cfe48e02); bounded at 1,000 characters it
+    left a longer header's response raw. A `response=` after a prose word is no header's, so the
+    400 KB line comes back unchanged — a free scan would withhold every one of them; and a header
+    of a thousand-odd characters of pairs is matched from its scheme to its secret's end. No
+    clock: the span is what is compared."""
+    line = (f'the Digest scheme is how it signs, and its response="{DIGEST_RESPONSE}" is echoed. '
+            * 5000)
+    assert len(line) >= 400_000, "the line is shorter than the one measured — wrong case"
+    assert model.scrub_credentials(line) == line
+
+    header = 'Digest username="ann", ' + 'realm="api", ' * 100 + f'response="{DIGEST_RESPONSE}"'
+    assert len(header) > 1000, "the header is within the old bound — wrong case"
+    found = model._SIGNED_PARAMETER.search(header)
+    assert found is not None and found.span() == (0, len(header) - len('"')), found
+
+
+# ── criterion 1: a value under a secret-named name (#198) ───────────────────────────────────────
+
+@pytest.mark.parametrize("said, secret, kept", [
+    (f'{SENTINEL}: ran curl -H "X-Api-Key: {HEX_TOKEN}" https://api.example.test/x', HEX_TOKEN,
+     "X-Api-Key:"),
+    (f"{SENTINEL}: the gateway wants Api-Key: {OPAQUE} on each call", OPAQUE, "Api-Key:"),
+    (f"{SENTINEL}: ran export OPENAI_API_KEY={UNPREFIXED_KEY} first", UNPREFIXED_KEY,
+     "OPENAI_API_KEY="),
+    (f"{SENTINEL}: the bed connects with password={DB_PASSWORD} today", DB_PASSWORD, "password="),
+    (f"{SENTINEL}: the config reads passwd: {DB_PASSWORD} now", DB_PASSWORD, "passwd:"),
+    (f'{SENTINEL}: the client sends {{"api_key": "{OPAQUE}"}}', OPAQUE, '"api_key":'),
+    (f"{SENTINEL}: the bed connects with password={PUNCTUATED_PASSWORD} today",
+     PUNCTUATED_PASSWORD, "password="),
+    (f"{SENTINEL}: the config reads passwd: {AMPERSAND_PASSWORD} now", AMPERSAND_PASSWORD,
+     "passwd:"),
+    (f'{SENTINEL}: the env file sets DB_PASSWORD="{QUOTED_PASSWORD}" for the bed', QUOTED_PASSWORD,
+     'DB_PASSWORD="'),
+    (f'{SENTINEL}: the env file sets DB_PASSWORD="{PASSPHRASE}" for the bed', PASSPHRASE,
+     'DB_PASSWORD="'),
+    (f"{SENTINEL}: the client sends {{'password': '{PASSPHRASE}'}}", PASSPHRASE, "'password':"),
+    # a query string's next `name=` ends the value before it, so SigV4's credential (quoted as
+    # written) does not carry the session token after it into the quote
+    (f"{SENTINEL}: fetched https://bucket.s3.example.test/k?X-Amz-Credential=AKIDEXAMPLE"
+     f"&X-Amz-Security-Token={OPAQUE}&X-Amz-Date=20261021T000000Z", OPAQUE,
+     "X-Amz-Credential=AKIDEXAMPLE&X-Amz-Security-Token="),
+], ids=["x-api-key", "api-key", "export-openai", "password-equals", "passwd-colon",
+        "json-api-key", "punctuated-password", "ampersand-passwd", "quoted-short-run-password",
+        "double-quoted-passphrase", "single-quoted-passphrase", "presigned-security-token"])
+def test_a_secret_named_value_in_the_agents_message_is_withheld_and_the_body_says_so(
+        repo: Path, tmp_path: Path, said: str, secret: str, kept: str):
+    """#198, measured at an older commit: none of these values carries a vendor prefix or follows
+    a named `Authorization` scheme, and each came back unchanged. The value is withheld; its name
+    and its `=` or `:` are quoted as written. The WHOLE value is withheld: no run of it between
+    its punctuation is shown either (review of PR #445)."""
+    quote = _assert_withheld_and_said(_opened(repo, tmp_path, _Says(said)), secret)
+    assert kept in _shown(quote), f"the name the value was under was not quoted: {quote}"
+    for part in re.split(r"[^A-Za-z0-9]+", secret):
+        assert not part or part not in _shown(quote), f"part of the value was shown, {part!r}: {quote}"
+
+
+@pytest.mark.parametrize("said, kept, pieces", [
+    (f'{SENTINEL}: the client sends {{"password": "{ESCAPED_TAIL}"}}', '"password":',
+     ["Abc123xyz", "rest-of-it"]),
+    (f'{SENTINEL}: the client sends {{"client_secret": "{ESCAPED_HEAD}"}}', '"client_secret":',
+     ["abc", "Def123xyz"]),
+    (f"{SENTINEL}: the client sends {{'password': '{ESCAPED_SINGLE}'}}", "'password':",
+     ["Abc123xyz", "rest-of-it"]),
+    (f"{SENTINEL}: ran export DB_PASSWORD=`{SPANNED_PASSWORD}` first", "DB_PASSWORD=",
+     ["Pa55word", "Spanned"]),
+    (f"{SENTINEL}: ran export DB_PASSWORD=`{PASSPHRASE}` first", "DB_PASSWORD=",
+     ["correct horse", "9staple"]),
+    (f"{SENTINEL}: fetched it with token={PERCENT_ENCODED} today", "token=",
+     ["Abc123def", "2Fghi"]),
+], ids=["escaped-quote-tail", "escaped-quote-head", "escaped-single-quote", "code-span-password",
+        "code-span-passphrase", "percent-encoded"])
+def test_a_secret_named_value_is_withheld_whole_through_its_escapes_and_code_spans(
+        repo: Path, tmp_path: Path, said: str, kept: str, pieces: list[str]):
+    """Review of PR #445, measured at 04790d2: `"password": "Abc123xyz\\"rest-of-it"` was quoted as
+    `"password": "[credential withheld]"rest-of-it"`, the tail shown; `"abc\\"Def123xyz"` under a
+    secret name, and a password in a Markdown code span, came back unchanged. A quoted value reads
+    `\\` and the character after it as part of it, and a backtick opens a value read to the closing
+    backtick on its line. No piece of the value is shown, as written or as rendered."""
+    body = _opened(repo, tmp_path, _Says(said))
+    quote = _shown(_rendered("\n".join(_quoted_block(body))))
+    assert WITHHELD_CREDENTIAL in quote and SENTINEL in quote, quote
+    assert kept in quote, f"the name the value was under was not quoted: {quote}"
+    whole = html_lib.unescape(_rendered(body))
+    for piece in pieces:
+        assert piece not in quote and piece not in whole, (
+            f"part of the value was shown, {piece!r}: {quote}")
+
+
+def test_a_secret_named_name_is_read_from_where_a_name_starts_and_within_its_bound():
+    """#198: the name around the secret word is read from where a name can start, at most 64
+    characters on each side, so a long hyphenated line is read once, not from every character
+    of it. Compared by span, never by clock: a name within the bound is matched from its first
+    character; one past it is not matched at all — not from its start, and not from a later
+    character of it either."""
+    within = "q-" * 30 + "TOKEN"
+    found = model._SECRET_NAMED_VALUE.search(f"{within}={OPAQUE}")
+    assert found is not None and found.span(1) == (0, len(within)), found
+
+    beyond = "q-" * 40 + "TOKEN"
+    assert model._SECRET_NAMED_VALUE.search(f"{beyond}={OPAQUE}") is None
 
 
 # ── criterion 1: the password of a URL ──────────────────────────────────────────────────────────
@@ -318,6 +465,34 @@ NEAR_MISSES = [
     "Authorization: Basic username/password pairs are refused now",  # review on cfe48e02
     "Authorization: requires OAuth2.0 scopes on every route",  # a word, not a scheme, before a mark
     "Authorization: Basic username=admin is refused",  # an `=` inside prose is no padding (review on 34209477)
+    # #198: no scheme — a word with a digit under 16 characters, and a long word with no digit
+    "Authorization: OAuth2.0 is required",
+    "Authorization: authenticationMiddleware decides it",
+    # #198: a secret-named name with no value after it, a variable where the value would stand, a
+    # value with no credential's mark, and SigV4's Credential (a key id and a scope, no secret)
+    "password= is required",
+    "password: required for login",
+    "export OPENAI_API_KEY=$OPENAI_API_KEY",
+    "X-Api-Key: required on every call",
+    "token_env: ADO_FOR_THIS_CLIENT",
+    "X-Amz-Credential=AKIDEXAMPLE/20261021/us-east-1/s3/aws4_request",
+    # review of PR #445: a secret-named value is read to its natural end, `$`, `(`, `:` and `)`
+    # included — so a variable or a command whose name has a mark, a link, and a closing `)` or a
+    # full stop after a value with no mark stay prose
+    "export OPENAI_API_KEY=$OPENAI_API_KEY_2",
+    "TOKEN=$(cat ~/.token2)",
+    "the token: https://docs.example.test/auth2 explains it",
+    "the login form (password: required).",
+    'password: "required for login"',
+    # review of PR #445: a backtick opens a value only when a value starts after it, so a code span
+    # naming a variable, or a span's closing backtick after a name, stays prose
+    "set `API_KEY` in your env",
+    "the `password:` field takes 12 characters",
+    "set `TOKEN=` in step 2 of `setup`",
+    # #198: the presigned URL's parameter named, and a value too short to be a signature
+    "the SDK appends X-Amz-Signature= to the query string",
+    "X-Amz-Signature=deadbeef is too short to be one",
+    "Digest authentication sends a response= field",
     "ghp_ is the prefix of a personal token",
     "sk-learn",
     "https://octocat.github.io/x",
