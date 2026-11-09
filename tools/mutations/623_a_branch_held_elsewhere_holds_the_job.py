@@ -68,16 +68,17 @@ MUTATIONS = [
      "        trees = self._clear_our_own(repo_path, wt)\n"
      '        _run(["git", "-C", str(repo_path), "worktree", "prune"])\n'),
 
+    # RE-PINNED (#91): the add now runs under the cache key's lock, one indent deeper
     # Re-pinned by #124: the box's own `rmdir` of the path it made now stands above the re-ask.
     ("the porcelain is not asked again after git refuses the add, so a branch taken in the "
      "window between the read and the add fails the job with git's sentence", BOX,
-     "                _remove_if_empty(wt)\n"
-     "            held = _holder(repo_path, branch)\n"
-     "            if held is not None:\n"
-     "                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
+     "                    _remove_if_empty(wt)\n"
+     "                held = _holder(repo_path, branch)\n"
+     "                if held is not None:\n"
+     "                    raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
      "rebuilt=rebuilt,\n"
-     "                                             ours=wt)\n",
-     "                _remove_if_empty(wt)\n"),
+     "                                                 ours=wt)\n",
+     "                    _remove_if_empty(wt)\n"),
 
     ("a bare `locked` line (a lock with no reason) is not read, so the person is told to remove a "
      "tree git refuses to remove",
@@ -144,13 +145,14 @@ MUTATIONS = [
      "        elif workspace.path.exists():\n",
      "        if workspace.path.exists():\n"),
 
+    # RE-PINNED (#91): the add now runs under the cache key's lock, one indent deeper
     ("the second porcelain read is worded for the other door", BOX,
-     "                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
+     "                    raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
      "rebuilt=rebuilt,\n"
-     "                                             ours=wt)\n",
-     "                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
+     "                                                 ours=wt)\n",
+     "                    raise _branch_held_elsewhere(branch, held, repo_path=repo_path, "
      "rebuilt=not rebuilt,\n"
-     "                                             ours=wt)\n"),
+     "                                                 ours=wt)\n"),
 
     ("a hold the agent itself reached is followed by \"no agent saw these comments\"",
      "beeverforge/runtime/temporal/activities.py",

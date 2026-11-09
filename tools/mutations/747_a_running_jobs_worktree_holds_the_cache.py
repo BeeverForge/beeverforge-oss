@@ -47,9 +47,13 @@ MUTATIONS = [
     ("M2 _needs_publish ignores the marks and publishes on the old three reasons", CACHE,
      "        self.held = RepoCache._held_by_a_job(served, why)\n",
      "        self.held = False\n"),
+    # RE-TARGETED (#91): `_publish` asks for the marks again before its rename, so with this cut
+    # the release test's first sync still keeps the tree; what the cut breaks now is that the
+    # decision comes before anything is staged
     ("M2, seen from the release: the first sync already swaps the tree the job stands on", CACHE,
      "        self.held = RepoCache._held_by_a_job(served, why)\n",
-     "        self.held = False\n", RELEASE_TEST),
+     "        self.held = False\n",
+     TEST + "::test_a_held_sync_decides_before_it_stages_a_snapshot"),
 
     # M3 — the "still on disk" test
     ("M3 a marked worktree whose directory is gone still holds the tree", MARKS,

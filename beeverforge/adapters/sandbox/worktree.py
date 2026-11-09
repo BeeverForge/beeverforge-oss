@@ -23,6 +23,7 @@ and git removes it with the worktree.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -45,6 +46,7 @@ from beeverforge.adapters.sandbox.base import (
 )
 from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
+from beeverforge.util.filelock import Waited
 
 log = logging.getLogger("beeverforge.sandbox.worktree")
 
@@ -56,6 +58,10 @@ _INPUT_DIRNAME = ".inputs"
 #: legitimately degrades a resume to a fresh start. Every other failure (no credential, no
 #: network, no such host) means we could not ask, and "could not ask" is never "it is not there".
 _NO_SUCH_REF = ("couldn't find remote ref", "could not find remote ref")
+
+#: How long a worktree add on a served cache checkout waits for a sync of the same key, as the
+#: cache's own `_LOCK_WAIT_SECONDS`: a sync holds the key for a fetch, a copy and two renames.
+_CACHE_LOCK_WAIT_SECONDS = 30 * 60
 
 
 def _remote_has_no_such_branch(fetch_output: str) -> bool:
@@ -460,6 +466,64 @@ def _write_mark(repo_path, wt: Path) -> Path | None:
             log.debug("could not remove %s", tmp)
         return None
     return mark
+
+
+@contextlib.contextmanager
+def _cache_key_held(repo_path: Path):
+    """Hold the repository cache's lock on the key `repo_path` is served under, while the box adds
+    and marks a worktree in it (#91); a repository that is not a cache checkout takes no lock.
+
+    THE ADD AND THE SWAP ARE ONE KEY'S BUSINESS. `RepoCache._publish` copies the master and then
+    renames the served tree into the trash, under `_key_lock(root, key)`. An add plus mark that
+    landed in between wrote the job's admin directory into the tree about to go, and every git
+    command in the job then exited 128, its push included. Under the same lock, the publish either
+    ended before the add (the worktree lands in the new tree) or begins after the mark (it sees the
+    mark and holds the tree).
+
+    HOW THE BOX KNOWS A SERVED CHECKOUT, WITHOUT THE CACHE'S INTERNALS: the cache serves key `k`
+    at `<root>/k` and its lock file is `<root>/.locks/k.lock`, which every sync creates before it
+    creates the served tree, so the lock file existing beside `repo_path` is the proof. Only
+    `_key_lock` is borrowed, so the box asks for the very file the cache locks. A project
+    registered by path has no such file next to it and takes nothing, as before; nothing is
+    created beside it either. A key with a slash in it (none is used) would not be recognised.
+
+    RE-ENTRANT ON ONE THREAD (`util/filelock.py`): a box on a thread already holding the key goes
+    through, and the cache's re-check before the rename is what keeps that tree. A holder on
+    another thread or process makes this wait, and past the wait the add is refused by name,
+    never run unlocked."""
+    # imported here, as `compose.py` and `registry.py` import the runtime: the box is an adapter
+    from beeverforge.runtime.repo_cache import _key_lock
+
+    lock = _key_lock(repo_path.parent, repo_path.name)
+    # ABSENT IS NOT UNREADABLE (docs/engineering-lessons.md §2). `isfile` answered False for both,
+    # so a `.locks` this process could not search (the panel and the worker sharing a volume, as
+    # `_key_lock`'s docstring says) let the add run unlocked, silently. Only "no such file" means
+    # this is not a cache checkout; anything else refuses the add by name.
+    try:
+        os.stat(lock.path)
+    except (FileNotFoundError, NotADirectoryError):
+        yield
+        return
+    except OSError as exc:
+        raise RuntimeError(
+            f"the worktree was not added to {repo_path}: whether it is a repository cache "
+            f"checkout could not be read, because its lock {lock.path} could not be checked "
+            f"({exc.strerror or exc}). Give this process permission to search "
+            f"{Path(lock.path).parent} and read {lock.path}, then retry.") from exc
+    try:
+        lock.acquire(timeout=_CACHE_LOCK_WAIT_SECONDS)
+    except Waited as exc:
+        refusal = RuntimeError(
+            f"the worktree was not added to the repository cache checkout {repo_path}: a cache "
+            f"sync of that key held its lock {lock.path} for the whole {exc.waited:.0f} s this "
+            f"job waited, and a worktree added while that sync swaps the checkout loses its .git. "
+            f"Retry once that sync has ended; if it never ends, look for a hung sync (a git "
+            f"fetch or clone that does not return) holding {lock.path}.")
+        raise refusal from exc
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _unlink_mark(mark: Path | None) -> None:
@@ -950,35 +1014,38 @@ class WorktreeSandbox(SandboxAdapter):
                                               what=what, owner=owner, locked=locked)) from None
         except OSError as exc:
             raise RuntimeError(path_not_made(branch, str(_where(wt)), error=exc)) from exc
-        mark = _write_mark(repo_path, wt)
-        rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())
-        _unlink_mark(mark)
-        if rc != 0:
-            # Somebody may have checked the branch out between the read above and this add, or
-            # the read may have failed; the porcelain is asked once more before git's sentence is
-            # passed on.
-            if made:
-                _remove_if_empty(wt)
-            held = _holder(repo_path, branch)
-            if held is not None:
-                raise _branch_held_elsewhere(branch, held, repo_path=repo_path, rebuilt=rebuilt,
-                                             ours=wt)
-            raise RuntimeError(f"worktree add failed: {out}")
-        # THIS WORKTREE IS A JOB'S, AND THE REPOSITORY CACHE MUST KNOW IT (#747). For a project
-        # registered by clone URL `repo_path` is the cache's served checkout, so the job's admin
-        # directory, branch and objects live in the served `.git`. A sync that found the base
-        # moved swapped that tree into `.trash/<key>~<hex>`, and every git command in the job then
-        # exited 128, `fatal: not a git repository: <root>/<key>/.git/worktrees/<name>` — the
-        # push included (82500f9, git 2.43.0). The marker goes into THIS worktree's own admin
-        # directory and nowhere else, right after the add, so the forge read below is covered and
-        # its `worktree remove --force` on failure takes the marker with it.
-        try:
-            gitworktrees.mark_as_job(wt)
-        except OSError as exc:
-            # the job still starts: refusing it would cost the work the marker protects
-            log.warning("could not mark %s as a running job's worktree (%s) — a repository "
-                        "cache sync may swap the checkout it stands on while it runs",
-                        wt, exc)
+        # UNDER THE CACHE KEY'S LOCK, the add and the mark (#91, `_cache_key_held`).
+        with _cache_key_held(repo_path):
+            mark = _write_mark(repo_path, wt)
+            rc, out = _run(["git", "-C", str(repo_path), *add], env=_in_gits_own_words())
+            _unlink_mark(mark)
+            if rc != 0:
+                # Somebody may have checked the branch out between the read above and this add,
+                # or the read may have failed; the porcelain is asked once more before git's
+                # sentence is passed on.
+                if made:
+                    _remove_if_empty(wt)
+                held = _holder(repo_path, branch)
+                if held is not None:
+                    raise _branch_held_elsewhere(branch, held, repo_path=repo_path, rebuilt=rebuilt,
+                                                 ours=wt)
+                raise RuntimeError(f"worktree add failed: {out}")
+            # THIS WORKTREE IS A JOB'S, AND THE REPOSITORY CACHE MUST KNOW IT (#747). For a
+            # project registered by clone URL `repo_path` is the cache's served checkout, so the
+            # job's admin directory, branch and objects live in the served `.git`. A sync that
+            # found the base moved swapped that tree into `.trash/<key>~<hex>`, and every git
+            # command in the job then exited 128, `fatal: not a git repository:
+            # <root>/<key>/.git/worktrees/<name>` — the push included (82500f9, git 2.43.0). The
+            # marker goes into THIS worktree's own admin directory and nowhere else, right after
+            # the add, so the forge read below is covered and its `worktree remove --force` on
+            # failure takes the marker with it.
+            try:
+                gitworktrees.mark_as_job(wt)
+            except OSError as exc:
+                # the job still starts: refusing it would cost the work the marker protects
+                log.warning("could not mark %s as a running job's worktree (%s) — a repository "
+                            "cache sync may swap the checkout it stands on while it runs",
+                            wt, exc)
         base_commit = None
         if not keep and remote_url and not _is_this_repo(remote_url, repo_path):
             base_commit = self._read_the_forges_base(
@@ -1019,39 +1086,44 @@ class WorktreeSandbox(SandboxAdapter):
             raise RuntimeError(path_taken(branch, str(_where(tip)), repo=str(repo_path),
                                           what=what, owner=owner, locked=locked))
         here = _is_this_repo(remote_url, repo_path)
-        start = base_branch
-        if here:
-            if _branch_exists(repo_path, branch):
-                start = f"refs/heads/{branch}"
+        # UNDER THE CACHE KEY'S LOCK, the fetch, the add and the mark (#91, `_cache_key_held`):
+        # the add starts from the `origin/<branch>` the fetch wrote, so both go into one tree.
+        with _cache_key_held(repo_path):
+            start = base_branch
+            if here:
+                if _branch_exists(repo_path, branch):
+                    start = f"refs/heads/{branch}"
+                else:
+                    log.warning("BEEVERFORGE_BRANCH_GONE %s is not in %s — this review reads %s "
+                                "instead of the pull request's branch", branch, repo_path,
+                                base_branch)
             else:
-                log.warning("BEEVERFORGE_BRANCH_GONE %s is not in %s — this review reads %s "
-                            "instead of the pull request's branch", branch, repo_path,
-                            base_branch)
-        else:
-            rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",
-                                         remote_url or "origin",
-                                         f"+{branch}:refs/remotes/origin/{branch}"]), timeout=180)
-            if rc == 0:
-                start = f"origin/{branch}"
-            elif _remote_has_no_such_branch(said):
-                log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this review reads "
-                            "%s instead of the pull request's branch", branch, base_branch)
-            else:
-                raise RuntimeError(
-                    f"could not ask the remote for {branch!r}, so this workspace cannot start "
-                    f"from the open PR's branch: {_redact(said).strip()[:300]}")
-        own_mark = _write_mark(repo_path, tip)
-        rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", str(tip),
-                         start], env=_in_gits_own_words())
-        _unlink_mark(own_mark)
-        if rc != 0:
-            raise RuntimeError(f"worktree add failed: {said}")
-        try:
-            gitworktrees.mark_as_job(tip)
-        except OSError as exc:
-            log.warning("could not mark %s as a running review's worktree (%s) — a repository "
-                        "cache sync may swap the checkout it stands on while it runs",
-                        tip, exc)
+                rc, said = _run(gitpin.argv(["-C", str(repo_path), "fetch", "--",
+                                             remote_url or "origin",
+                                             f"+{branch}:refs/remotes/origin/{branch}"]),
+                                timeout=180)
+                if rc == 0:
+                    start = f"origin/{branch}"
+                elif _remote_has_no_such_branch(said):
+                    log.warning("BEEVERFORGE_BRANCH_GONE %s is not on the remote — this review "
+                                "reads %s instead of the pull request's branch", branch,
+                                base_branch)
+                else:
+                    raise RuntimeError(
+                        f"could not ask the remote for {branch!r}, so this workspace cannot start "
+                        f"from the open PR's branch: {_redact(said).strip()[:300]}")
+            own_mark = _write_mark(repo_path, tip)
+            rc, said = _run(["git", "-C", str(repo_path), "worktree", "add", "--detach", str(tip),
+                             start], env=_in_gits_own_words())
+            _unlink_mark(own_mark)
+            if rc != 0:
+                raise RuntimeError(f"worktree add failed: {said}")
+            try:
+                gitworktrees.mark_as_job(tip)
+            except OSError as exc:
+                log.warning("could not mark %s as a running review's worktree (%s) — a repository "
+                            "cache sync may swap the checkout it stands on while it runs",
+                            tip, exc)
         base_commit = None
         if remote_url and not here:
             base_commit = self._read_the_forges_base(
