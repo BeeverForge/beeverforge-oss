@@ -31,7 +31,8 @@ MUTATIONS = [
     # ── the warning ──
     ("nothing is said",
      _FORMER,
-     "    (logger or log).warning(done.sentence())\n",
+     # RE-PINNED 2026-11-09 (review of #499): the line says only what is new to the process.
+     "    (logger or log).warning(new.sentence())\n",
      "    pass\n"),
 
     ("the warning prints the value beside the name",
@@ -53,6 +54,57 @@ MUTATIONS = [
      _FORMER,
      "    if logs.structured():\n        logs.configure()\n",
      "    pass\n"),
+
+    # ── once per process (review of #499) ──
+    ("the process forgets what it said, so every load warns again",
+     _FORMER,
+     "    _REPORTED.update(new.carried + new.ignored)\n",
+     ""),
+
+    ("a carried name already said is said again",
+     _FORMER,
+     "    new = CarriedOver(carried=tuple(n for n in done.carried if n not in _REPORTED),\n",
+     "    new = CarriedOver(carried=done.carried,\n"),
+
+    ("an ignored name already said is said again (serve's second load)",
+     _FORMER,
+     "                      ignored=tuple(n for n in done.ignored if n not in _REPORTED))\n",
+     "                      ignored=done.ignored)\n"),
+
+    ("after the first warning, a new old name is never said",
+     _FORMER,
+     "    if not new:\n        return\n",
+     "    if not new or _REPORTED:\n        return\n"),
+
+    ("a name already said is no longer carried on the next load",
+     _FORMER,
+     "    for old in former:\n",
+     "    for old in [k for k in former if k not in _REPORTED]:\n"),
+
+    # ── the register (review of #499) ──
+    ("the register never finds an entry due",
+     "beeverforge/deprecations.py",
+     "    return [e for e in REMOVALS if _release(version) >= _release(e.removed_in)]\n",
+     "    return []\n",
+     "tests/test_what_a_release_removes_is_registered.py"),
+
+    ("the removing release itself is not due, only the ones after it",
+     "beeverforge/deprecations.py",
+     "_release(version) >= _release(e.removed_in)",
+     "_release(version) > _release(e.removed_in)",
+     "tests/test_what_a_release_removes_is_registered.py"),
+
+    ("the register says the old names go in the release this tree already is",
+     "beeverforge/deprecations.py",
+     '    Removal("openfactory-environment", "1.1",\n',
+     '    Removal("openfactory-environment", "0.2",\n',
+     "tests/test_what_a_release_removes_is_registered.py"),
+
+    ("`1.1.0` reads as a release after `1.1`",
+     "beeverforge/deprecations.py",
+     "    while len(parts) > 1 and parts[-1] == 0:\n        parts.pop()\n",
+     "",
+     "tests/test_what_a_release_removes_is_registered.py"),
 
     # ── every entry ──
     ("the command line does not carry the old names",

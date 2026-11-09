@@ -51,6 +51,12 @@ def _absent(monkeypatch, *names: str) -> None:
         monkeypatch.delenv(name)
 
 
+@pytest.fixture(autouse=True)
+def _a_process_that_has_said_nothing(monkeypatch):
+    """`warn` remembers, per process, what it has said; each test is a process of its own."""
+    monkeypatch.setattr(former_names, "_REPORTED", set(), raising=False)
+
+
 # ── the rule ────────────────────────────────────────────────────────────────────────────────────
 
 def test_an_old_name_alone_is_read_under_the_new_one_and_leaves():
@@ -150,6 +156,60 @@ def test_nothing_carried_is_nothing_said(caplog):
         former_names.warn(former_names.carry_over({"BEEVERFORGE_SANDBOX": "container"}))
 
     assert not [r for r in caplog.records if r.name == "beeverforge.environment"]
+
+
+def _environment_records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "beeverforge.environment"]
+
+
+def test_serve_loading_env_twice_warns_once(monkeypatch, tmp_path, caplog):
+    """The real `serve` sequence: the command line's callback, then the panel's own `.env` load.
+    The second load puts `.env`'s `OPENFACTORY_SANDBOX` back, the new name is set to another value,
+    so both loads find it ignored — and the process says so once."""
+    import dotenv.main
+
+    from beeverforge import cli
+    from beeverforge.api import app
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENFACTORY_SANDBOX=worktree\n")
+    monkeypatch.setattr(dotenv.main, "find_dotenv", lambda *_a, **_k: str(env_file))
+    _absent(monkeypatch, "OPENFACTORY_SANDBOX")
+    monkeypatch.setenv("BEEVERFORGE_SANDBOX", "container")
+
+    with caplog.at_level(logging.WARNING, logger="beeverforge.environment"):
+        cli._main()
+        app._load_environment()
+
+    said = _environment_records(caplog)
+    assert len(said) == 1, [r.getMessage() for r in said]
+    assert "OPENFACTORY_SANDBOX" in said[0].getMessage()
+    assert os.environ["BEEVERFORGE_SANDBOX"] == "container"
+    assert "OPENFACTORY_SANDBOX" not in os.environ, "the second load's old name was not removed"
+
+
+def test_a_name_said_once_is_not_said_again_and_a_new_one_is(caplog):
+    with caplog.at_level(logging.WARNING, logger="beeverforge.environment"):
+        former_names.warn(former_names.carry_over({"OPENFACTORY_SANDBOX": "worktree"}))
+        former_names.warn(former_names.carry_over({"OPENFACTORY_SANDBOX": "worktree"}))
+        assert len(_environment_records(caplog)) == 1
+
+        former_names.warn(former_names.carry_over({"OPENFACTORY_SANDBOX": "worktree",
+                                                   "OPENFACTORY_REPOS_DIR": "/srv/someone"}))
+
+    said = [r.getMessage() for r in _environment_records(caplog)]
+    assert len(said) == 2, said
+    assert "OPENFACTORY_REPOS_DIR" in said[1] and "OPENFACTORY_SANDBOX" not in said[1], said
+
+
+def test_carrying_stays_idempotent_after_the_warning(caplog):
+    """Remembering what was SAID changes nothing about what is READ: every load still carries."""
+    former_names.warn(former_names.carry_over({"OPENFACTORY_SANDBOX": "worktree"}))
+    env = {"OPENFACTORY_SANDBOX": "worktree"}
+
+    former_names.carry_over(env)
+
+    assert env == {"BEEVERFORGE_SANDBOX": "worktree"}
 
 
 # ── the box ─────────────────────────────────────────────────────────────────────────────────────

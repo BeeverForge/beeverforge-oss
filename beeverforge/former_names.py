@@ -22,7 +22,13 @@ ONE LINE SAYS IT, NAMES ONLY. Many of these variables hold credentials, so the w
 variables and never prints a value. A name set under both spellings with the SAME value says
 nothing: that is a deployment that already renamed, or this process carrying a `.env` read again.
 
-The old names are read until 1.1, and removed then.
+ONCE PER PROCESS, HOWEVER MANY LOADS (review of #499). A process loads `.env` more than once —
+`serve` through the command line's callback and then the panel's own load, the worker in `born`
+and again in `main` — and each load puts an `OPENFACTORY_*` from the file back, so `carry_over`
+runs, and finds it, each time. It stays idempotent; `warn` remembers which names this process has
+already said and says only the new ones.
+
+The old names are read until the release `deprecations.py` registers for them, and removed then.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import os
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 
+from beeverforge.deprecations import removed_in
 from beeverforge.environ import ENV_PREFIX
 
 log = logging.getLogger("beeverforge.environment")
@@ -42,8 +49,12 @@ FORMER_PREFIX = "OPENFACTORY_"
 #: The prefix they are read under.
 PREFIX = ENV_PREFIX
 
-#: The release that stops reading the former names.
-LAST_READ_BEFORE = "1.1"
+#: The release that stops reading the former names — the register's, not restated here.
+LAST_READ_BEFORE = removed_in("openfactory-environment")
+
+#: The former names this process has already warned about, carried or ignored. Bounded by the
+#: environment, never by traffic: one entry per distinct `OPENFACTORY_*` name a load has found.
+_REPORTED: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -91,14 +102,17 @@ def carry_over(environ: MutableMapping[str, str] | None = None) -> CarriedOver:
 
 
 def warn(done: CarriedOver, logger: logging.Logger | None = None) -> None:
-    """Log what `carry_over` did as ONE warning, when it did anything.
+    """Log what `carry_over` did as ONE warning, naming only what this process has not said yet.
 
     A deployment that asked for JSON lines has its log set up first, so the line is one JSON
     object like the rest of its log and not a bare line among them."""
-    if not done:
+    new = CarriedOver(carried=tuple(n for n in done.carried if n not in _REPORTED),
+                      ignored=tuple(n for n in done.ignored if n not in _REPORTED))
+    if not new:
         return
+    _REPORTED.update(new.carried + new.ignored)
     from beeverforge.observability import logs
 
     if logs.structured():
         logs.configure()
-    (logger or log).warning(done.sentence())
+    (logger or log).warning(new.sentence())
