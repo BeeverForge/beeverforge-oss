@@ -62,15 +62,29 @@ class _Worker:
     """`temporalio.worker.Worker`, recorded: what each was built with, and whether it ran."""
 
     built: list[_Worker] = []
+    #: the queue whose worker's `run` raises; every other one then waits until it is cancelled,
+    #: or until `release` is set — so a worker that is never stopped fails the test, not hangs it
+    failing: str | None = None
+    release: asyncio.Event
 
     def __init__(self, client, **kwargs):
         self.client = client
         self.kwargs = kwargs
         self.ran = False
+        self.cancelled = False
         _Worker.built.append(self)
 
     async def run(self):
         self.ran = True
+        if _Worker.failing is None:
+            return
+        if self.kwargs.get("task_queue") == _Worker.failing:
+            raise RuntimeError(f"polling {_Worker.failing} was refused")
+        try:
+            await _Worker.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 @pytest.fixture
@@ -80,6 +94,7 @@ def booted(monkeypatch):
     from beeverforge.runtime.temporal import worker
 
     _Worker.built = []
+    _Worker.failing = None
 
     async def _client():
         return "the client"
@@ -101,8 +116,45 @@ def booted(monkeypatch):
     monkeypatch.setattr("beeverforge.observability.health.listen", _no_health)
     monkeypatch.setattr("beeverforge.namespace.announce_build", lambda *_a, **_k: None)
     monkeypatch.setattr("beeverforge.runtime.temporal.schedule.ensure_all", _no_schedules)
+    if getattr(booted_with, "failing", None):
+        _Worker.failing = booted_with.failing
+
+        async def _boot():
+            _Worker.release = asyncio.Event()
+            boot = asyncio.ensure_future(worker.main())
+            await asyncio.wait([boot], timeout=10)
+            # read BEFORE the release, and before the loop's teardown cancels what is left
+            stopped = [w.cancelled for w in _Worker.built
+                       if w.kwargs.get("task_queue") != _Worker.failing]
+            _Worker.release.set()
+            # what the boot raised, read here and asserted by the test, so a boot that did not
+            # raise fails the test rather than erroring its fixture
+            try:
+                await asyncio.wait_for(boot, timeout=10)
+            except RuntimeError as exc:
+                return exc, stopped
+            return None, stopped
+
+        return asyncio.run(_boot())
     asyncio.run(asyncio.wait_for(worker.main(), timeout=10))
     return _Worker.built
+
+
+#: set by a test that wants one queue's worker to fail at boot (`booted`)
+booted_with = type("BootedWith", (), {"failing": None})
+
+
+@pytest.fixture
+def one_fails(monkeypatch):
+    monkeypatch.setattr(booted_with, "failing", FORMER_QUEUE)
+
+
+def test_the_worker_ends_when_either_queues_worker_fails(one_fails, booted):
+    """The worker exits with the failed queue's error, and the other queue's worker is stopped
+    before it does — not left polling half the work."""
+    error, others_cancelled = booted
+    assert isinstance(error, RuntimeError) and FORMER_QUEUE in str(error), error
+    assert others_cancelled == [True]
 
 
 def test_the_former_queue_is_the_one_openfactory_0_7_polled():
@@ -364,3 +416,398 @@ def test_an_engine_without_any_of_0_7s_schedules_says_nothing_about_them(engine)
 
     assert engine.deleted == set()
     assert not [line for line in lines if "0.7" in line], lines
+
+
+# ── a 0.7 workflow keeps its 0.7 id (review of #500) ─────────────────────────────────────────────
+#
+# Picked up from `openfactory-jobs`, a workflow 0.7 started still answers to the id 0.7 gave it:
+# `openfactory-<project>-<issue>` for a job, `openfactory-coordinator-<project>` for the
+# tech-lead, `openfactory-deploy-<project>-<issue>` for a deploy watch,
+# `openfactory-product-breakdown-<project>-<n>` for a breakdown (read at v0.7.0). Everything that
+# finds or addresses one by `beeverforge-` alone would not see it.
+
+FORMER_JOB = f"openfactory-{PROJECT}-7"
+
+
+def test_the_former_workflow_id_prefix_is_0_7s():
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    assert FORMER_WORKFLOW_ID_PREFIX == "openfactory-"
+
+
+def test_a_0_7_job_id_is_parsed_as_its_project_and_issue():
+    from beeverforge.runtime.temporal import view
+
+    assert view.parse_job_id(FORMER_JOB, known_projects=[PROJECT]) == (PROJECT, "7")
+    assert view.parse_job_id(f"openfactory-{PROJECT}-web-CONT-412",
+                             known_projects=[PROJECT, f"{PROJECT}-web"]) == \
+        (f"{PROJECT}-web", "CONT-412")
+    assert view.parse_job_id(f"beeverforge-{PROJECT}-8", known_projects=[PROJECT]) == \
+        (PROJECT, "8")
+    assert view.parse_job_id("someone-else-9", known_projects=[PROJECT]) == (None, None)
+
+
+class _Wf:
+    def __init__(self, wf_id, status=None):
+        from datetime import UTC, datetime
+
+        from temporalio.client import WorkflowExecutionStatus
+
+        self.id = wf_id
+        self.run_id = "run-1"
+        self.status = status or WorkflowExecutionStatus.RUNNING
+        self.start_time = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
+        self.close_time = None
+
+    async def memo(self):
+        return {}
+
+
+class _Workflows:
+    """A client holding some workflows by id. `list_workflows` honours one clause of the query, a
+    `WorkflowId STARTS_WITH "<x>"`, which is the clause that would hide a 0.7 id; a handle answers
+    `describe`, `query` (None) and `signal`, and raises the engine's NOT_FOUND for an id it does
+    not hold."""
+
+    def __init__(self, *wfs):
+        self.wfs = {w.id: w for w in wfs}
+        self.queries: list[str] = []
+        self.signals: list[tuple] = []
+        self.started: list[tuple] = []
+        self.terminated: list[str] = []
+        #: what every query answers
+        self.answer = None
+
+    def list_workflows(self, query=""):
+        import re
+
+        self.queries.append(query)
+        prefixes = re.findall(r'WorkflowId STARTS_WITH "([^"]*)"', query)
+        exact = re.findall(r'WorkflowId = "([^"]*)"', query)
+        listed = [w for w in self.wfs.values()
+                  if (not prefixes or any(w.id.startswith(p) for p in prefixes))
+                  and (not exact or w.id in exact)]
+
+        async def _iterate():
+            for w in listed:
+                yield w
+
+        return _iterate()
+
+    def get_workflow_handle(self, wf_id, run_id=None):
+        client = self
+
+        class _Handle:
+            id = wf_id
+
+            def _held(self):
+                if wf_id not in client.wfs:
+                    raise _not_found(wf_id)
+                return client.wfs[wf_id]
+
+            async def describe(self):
+                held = self._held()
+                return type("Described", (), {"status": held.status, "run_id": held.run_id})()
+
+            async def query(self, *_a, **_k):
+                self._held()
+                return client.answer
+
+            async def signal(self, name, *args, **kwargs):
+                self._held()
+                client.signals.append((wf_id, name, args, kwargs))
+
+            async def result(self):
+                self._held()
+                return {}
+
+            async def terminate(self, *_a, **_k):
+                self._held()
+                client.terminated.append(wf_id)
+
+        return _Handle()
+
+    async def start_workflow(self, workflow, arg=None, *, id, **kwargs):
+        self.started.append((workflow, id, kwargs))
+
+
+async def test_a_0_7_job_is_listed_on_the_panel(monkeypatch):
+    from beeverforge.runtime.temporal import view
+
+    monkeypatch.setattr(view, "_registered_projects", lambda: [PROJECT])
+    view.forget_jobs()
+    rows = await view.list_jobs(_Workflows(_Wf(FORMER_JOB)), "default")
+    assert [(r["project"], r["issue"], r["workflow_id"]) for r in rows] == \
+        [(PROJECT, "7", FORMER_JOB)]
+
+
+def test_the_panels_engine_link_finds_a_0_7_job_too():
+    """The project's **Engine ↗** link filters by id; read off the query the panel builds."""
+    from urllib.parse import unquote
+
+    from beeverforge.api import app
+
+    query = unquote(app.engine_jobs_query(PROJECT))
+    held = _Workflows(_Wf(FORMER_JOB), _Wf(f"beeverforge-{PROJECT}-8"),
+                      _Wf("beeverforge-other-1"))
+    import re
+
+    prefixes = re.findall(r'WorkflowId STARTS_WITH "([^"]*)"', query)
+    found = sorted(w for w in held.wfs if any(w.startswith(p) for p in prefixes))
+    assert found == sorted([FORMER_JOB, f"beeverforge-{PROJECT}-8"]), query
+    assert " OR " in query, query
+
+
+async def test_a_gate_on_a_0_7_job_is_answered_on_its_0_7_id():
+    """A person answers the merge gate of a job 0.7 started: the panel addresses the job by
+    project and issue, and the engine holds it under 0.7's id."""
+    from beeverforge.runtime.temporal import view
+
+    held = _Workflows(_Wf(FORMER_JOB))
+    handle = view.job_handle(held, PROJECT, "7")
+    assert (await handle.describe()).status is not None
+    await handle.signal("act_on_impediment", "resume")
+    assert held.signals and held.signals[0][0] == FORMER_JOB
+
+
+async def test_a_0_7_jobs_gate_answer_is_sealed_over_its_0_7_id(monkeypatch):
+    """The worker checks a gate's seal against the running workflow's own id, so an approval
+    sealed over BeeverForge's id would be refused by the 0.7 job it was meant for."""
+    from beeverforge import gate_seal
+    from beeverforge.runtime.temporal import view
+
+    monkeypatch.delenv(gate_seal.VARIABLE, raising=False)
+    held = _Workflows(_Wf(FORMER_JOB))
+    held.answer = True
+    await view.approve_job(held, PROJECT, "7", version="1.2.0", approver="someone", comment="")
+    ((to, _name, _args, kwargs),) = held.signals
+    version, approver, comment, seal = kwargs["args"]
+    assert to == FORMER_JOB
+    assert gate_seal.refusal(seal, gate_seal.APPROVE_PROD, FORMER_JOB,
+                             version, approver, comment) == ""
+
+
+async def test_beeverforges_own_job_is_addressed_first():
+    from beeverforge.runtime.temporal import view
+
+    held = _Workflows(_Wf(FORMER_JOB), _Wf(f"beeverforge-{PROJECT}-7"))
+    await view.job_handle(held, PROJECT, "7").signal("act_on_impediment", "resume")
+    assert [s[0] for s in held.signals] == [f"beeverforge-{PROJECT}-7"]
+
+
+async def test_a_job_under_neither_id_is_said_under_beeverforges():
+    from temporalio.service import RPCError
+
+    from beeverforge.runtime.temporal import view
+
+    with pytest.raises(RPCError) as raised:
+        await view.job_handle(_Workflows(), PROJECT, "7").describe()
+    assert f"beeverforge-{PROJECT}-7" in str(raised.value)
+
+
+async def test_an_engine_failure_other_than_not_found_is_not_retried_on_0_7s_id():
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from beeverforge.runtime.temporal import view
+
+    held = _Workflows(_Wf(FORMER_JOB))
+    asked: list[str] = []
+    real = held.get_workflow_handle
+
+    def _handle(wf_id, run_id=None):
+        asked.append(wf_id)
+        handle = real(wf_id)
+        if wf_id.startswith("beeverforge-"):
+            async def _refused(*_a, **_k):
+                raise RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+            handle.describe = _refused
+        return handle
+
+    held.get_workflow_handle = _handle
+    with pytest.raises(RPCError):
+        await view.job_handle(held, PROJECT, "7").describe()
+    assert FORMER_JOB not in asked
+
+
+def test_no_job_is_addressed_by_beeverforges_id_alone():
+    """Every handle on an existing job goes through `job_handle`: a `get_workflow_handle` given
+    `job_id(...)`, or an f-string spelling `beeverforge-{project}-{issue}`, would miss a 0.7 job."""
+    found = []
+    for path in sorted((ROOT / "beeverforge").rglob("*.py")):
+        for node in ast.walk(parsed(path)):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "attr", "") == "get_workflow_handle" and node.args):
+                continue
+            arg = node.args[0]
+            named = arg.func if isinstance(arg, ast.Call) else None
+            if named is not None and (getattr(named, "attr", "") in ("job_id", "_job_id")
+                                      or getattr(named, "id", "") in ("job_id", "_job_id")):
+                found.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+            if isinstance(arg, ast.JoinedStr) and arg.values and isinstance(
+                    arg.values[0], ast.Constant) and arg.values[0].value == "beeverforge-":
+                found.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    assert not found, f"a job addressed by BeeverForge's id alone: {found}"
+
+
+async def test_a_0_7_deploy_watch_is_read_for_the_panel():
+    from beeverforge.runtime.temporal import view
+
+    held = _Workflows(_Wf(f"openfactory-deploy-{PROJECT}-7"))
+    view._deploy_cache.clear()
+    assert await view._deploy_state(held, PROJECT, "7") == "deploying"
+
+
+async def test_the_floor_counts_a_running_0_7_job(monkeypatch):
+    """No job runs twice for one card because a running 0.7 job holds the floor: with one slot,
+    the poller starts nothing while it runs."""
+    from beeverforge.runtime.temporal import activities
+
+    held = _Workflows(_Wf(FORMER_JOB))
+    monkeypatch.setattr(activities, "engine_client", lambda: held)
+    monkeypatch.setenv("BEEVERFORGE_MAX_CONCURRENT_JOBS", "1")
+    assert await activities.available_slots() == 0
+    monkeypatch.setenv("BEEVERFORGE_MAX_CONCURRENT_JOBS", "2")
+    assert await activities.available_slots() == 1
+
+
+def _coordinating(monkeypatch, *wfs):
+    from beeverforge.runtime.temporal import activities
+
+    held = _Workflows(*wfs)
+    monkeypatch.setattr(activities, "engine_client", lambda: held)
+    return held
+
+
+async def test_a_running_0_7_coordinator_is_signalled_and_no_second_is_started(monkeypatch):
+    from beeverforge.runtime.temporal import activities
+    from beeverforge.runtime.temporal.io import CoordinatorItem, CoordinatorSayInput
+
+    former = f"openfactory-coordinator-{PROJECT}"
+    held = _coordinating(monkeypatch, _Wf(former))
+    item = CoordinatorItem(project=PROJECT, issue="7", job_id=FORMER_JOB)
+    await activities.notify_coordinator(item)
+    await activities.notify_coordinator_say(CoordinatorSayInput(project=PROJECT, text="hi"))
+
+    assert held.started == [], held.started
+    assert [(s[0], s[1]) for s in held.signals] == [(former, "on_decision"), (former, "say")]
+
+
+async def test_without_a_0_7_coordinator_beeverforges_is_started(monkeypatch):
+    from temporalio.client import WorkflowExecutionStatus
+
+    from beeverforge.runtime.temporal import activities
+    from beeverforge.runtime.temporal.io import CoordinatorItem, CoordinatorSayInput
+
+    held = _coordinating(monkeypatch, _Wf(f"openfactory-coordinator-{PROJECT}",
+                                          WorkflowExecutionStatus.COMPLETED))
+    await activities.notify_coordinator(
+        CoordinatorItem(project=PROJECT, issue="7", job_id=f"beeverforge-{PROJECT}-7"))
+    await activities.notify_coordinator_say(CoordinatorSayInput(project=PROJECT, text="hi"))
+
+    assert [s[1] for s in held.started] == [f"beeverforge-coordinator-{PROJECT}"] * 2
+    assert held.signals == []
+
+
+async def test_forgetting_a_project_closes_its_0_7_coordinator_too():
+    from types import SimpleNamespace
+
+    from beeverforge.product import forget
+
+    held = _Workflows(_Wf(f"openfactory-coordinator-{PROJECT}"),
+                      _Wf(f"beeverforge-coordinator-{PROJECT}"))
+    await forget.close_runs(SimpleNamespace(key=PROJECT),
+                            coordinator=forget.coordinator_id(PROJECT), client=held)
+    assert sorted(held.terminated) == sorted([f"openfactory-coordinator-{PROJECT}",
+                                              f"beeverforge-coordinator-{PROJECT}"])
+
+
+async def test_a_0_7_coordinators_messages_are_filed_under_its_project():
+    from beeverforge.runtime.temporal import view
+
+    held = _Workflows(_Wf(f"openfactory-coordinator-{PROJECT}"))
+
+    class _Speaks:
+        async def query(self, *_a, **_k):
+            return [{"id": 1, "text": "picked up #7"}]
+
+    held.get_workflow_handle = lambda *_a, **_k: _Speaks()
+    said = await view.coordinator_messages(held)
+    assert [m["project"] for m in said] == [PROJECT]
+
+
+async def test_a_running_0_7_breakdown_is_read_as_running(monkeypatch):
+    from beeverforge.product import breaking
+
+    held = _Workflows(_Wf(f"openfactory-product-breakdown-{PROJECT}-3"),
+                      _Wf(f"beeverforge-product-breakdown-{PROJECT}-4"))
+    assert await breaking.running_numbers(PROJECT, client=held) == {3, 4}
+
+
+# ── the two workers end together ─────────────────────────────────────────────────────────────────
+
+class _Runs:
+    """A worker whose `run` returns, raises, or waits — until it is cancelled, or until the test
+    RELEASES it. The release is what keeps a broken pairing from hanging the test: a pair that never
+    cancels its other worker is let go after the wait, and the test fails on what it saw instead."""
+
+    def __init__(self, *, raises: BaseException | None = None, returns: bool = False):
+        self.raises, self.returns = raises, returns
+        self.cancelled = False
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self):
+        self.started.set()
+        if self.raises is not None:
+            raise self.raises
+        if self.returns:
+            return
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+async def _settled(pair, runs, *, within=5.0):
+    """Wait `within` for `pair` to end by itself, say whether it did, then release every worker so
+    it ends either way — and hand back what it raised (None when it returned)."""
+    done, _ = await asyncio.wait([pair], timeout=within)
+    for run in runs:
+        run.release.set()
+    try:
+        await asyncio.wait_for(pair, within)
+    except BaseException as exc:  # noqa: BLE001 — what it raised is what the test reads
+        return bool(done), exc
+    return bool(done), None
+
+
+async def test_a_worker_that_fails_ends_the_other_and_its_error_is_raised():
+    from beeverforge.runtime.temporal import worker
+
+    failing, waiting = _Runs(raises=RuntimeError("the poll was refused")), _Runs()
+    pair = asyncio.ensure_future(worker.run_together([waiting, failing]))
+    ended, raised = await _settled(pair, [waiting, failing])
+    assert ended and waiting.cancelled
+    assert isinstance(raised, RuntimeError) and "the poll was refused" in str(raised)
+
+
+async def test_a_worker_that_returns_ends_the_other():
+    from beeverforge.runtime.temporal import worker
+
+    returned, waiting = _Runs(returns=True), _Runs()
+    pair = asyncio.ensure_future(worker.run_together([returned, waiting]))
+    ended, raised = await _settled(pair, [returned, waiting])
+    assert ended and waiting.cancelled and raised is None
+
+
+async def test_cancelling_the_pair_cancels_both():
+    from beeverforge.runtime.temporal import worker
+
+    first, second = _Runs(), _Runs()
+    pair = asyncio.ensure_future(worker.run_together([first, second]))
+    await asyncio.wait_for(asyncio.gather(first.started.wait(), second.started.wait()), 5)
+    pair.cancel()
+    ended, raised = await _settled(pair, [first, second])
+    assert ended and isinstance(raised, asyncio.CancelledError)
+    assert first.cancelled and second.cancelled

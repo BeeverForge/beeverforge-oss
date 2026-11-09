@@ -305,6 +305,27 @@ def start_channel_listeners(projects) -> list:
     return held
 
 
+async def run_together(workers) -> None:
+    """Run every worker until ONE of them ends, then end the rest — and raise what it raised.
+
+    One worker's `run` ending, by returning or by raising, always ended this process; with a
+    second worker on 0.7's queue (until 1.0) that must stay true. `asyncio.gather` did not do it:
+    a worker that raised left the other polling until the loop was torn down, and one that
+    returned left the process up on half its queues. So: wait for the first to end, cancel the
+    others (a Temporal worker's `run` shuts it down when cancelled), wait for them to finish, and
+    hand back the first one's outcome. Cancelled from outside, every worker is cancelled too."""
+    tasks = [asyncio.ensure_future(worker.run()) for worker in workers]
+    try:
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        # what the others raise on their way down is not the cause; the first one's is
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
 async def main() -> None:
     load_dotenv()  # bot credentials + Claude token for the activities
     # NO KEY IS WRITTEN TO DISK AT BOOT (#742). An App key handed over as content used to be copied
@@ -431,8 +452,7 @@ async def main() -> None:
     logs.announce(log, f"beeverforge worker up · {address()} · ns={namespace()} · "
                        f"queue={TASK_QUEUE} (and OpenFactory 0.7's {FORMER_TASK_QUEUE}, "
                        f"until 1.0)")
-    # Together: either one ending ends the worker, as the one worker's `run` ending always did.
-    await asyncio.gather(*(worker.run() for worker in workers))
+    await run_together(workers)
 
 
 async def born() -> None:

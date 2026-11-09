@@ -4450,7 +4450,7 @@ def factory(project: str) -> dict:
     except Exception as exc:  # noqa: BLE001 — the panel renders without the engine links
         log.warning("panel: no Temporal coordinates, engine links hidden (%s)", str(exc)[:120])
     if namespace and temporal_base:
-        q = quote(f'WorkflowId STARTS_WITH "beeverforge-{project}-"')
+        q = engine_jobs_query(project)
         temporal = f"{temporal_base}/namespaces/{namespace}/workflows?query={q}"
     else:
         temporal = temporal_base
@@ -4624,3 +4624,14 @@ def _board_url(project) -> str:
         return ""
 
 
+
+
+def engine_jobs_query(project: str) -> str:
+    """The engine UI's list filter for `project`'s jobs, quoted for a URL — BeeverForge's ids and,
+    until 1.0, OpenFactory 0.7's (`FORMER_WORKFLOW_ID_PREFIX`): a job picked up from 0.7's queue
+    keeps the id 0.7 gave it, and a link that filtered it out would show a running job as none."""
+    # the package's own constant: `runtime/temporal/__init__.py` imports nothing of the engine's
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
+    return quote(f'WorkflowId STARTS_WITH "beeverforge-{project}-" OR '
+                 f'WorkflowId STARTS_WITH "{FORMER_WORKFLOW_ID_PREFIX}{project}-"')

@@ -73,6 +73,11 @@ NAMED: dict[tuple[str, str, str], str] = {
         "the client `release()` keeps across approvals (#201) — reached only from `release()`'s "
         "own never-raises `try`, through the coroutine handed to the standing loop, two calls "
         "deep and so further than this sweep follows",
+    # ADDED 2026-11-09 (#500): a parked job is asked through `view.job_handle`, which reads it
+    # under OpenFactory 0.7's id too.
+    ("beeverforge/product/release.py", "_awaiting", "beeverforge.runtime.temporal.view"):
+        "takes a CONNECTED engine client — `_run` hands it the one `_client()` made — and asks one "
+        "job whether it waits; there is no client to pass on an install without the library",
     ("beeverforge/product/release.py", "parked_for_release", "beeverforge.runtime.temporal.view"):
         "takes a CONNECTED engine client and lists its workflows — there is no client to pass on "
         "an install without the library",

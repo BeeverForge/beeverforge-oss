@@ -504,7 +504,21 @@ task queue is `beeverforge-jobs` and its schedules are named `beeverforge-*`; 0.
 - **The worker also polls `openfactory-jobs`**, with the same workflows and activities, so a job,
   a merge gate or a deploy watch that 0.7 started before the upgrade carries on where it was.
   Nothing new is ever started on that queue; its worker idles once 0.7's work has drained. The
-  worker's first line names both queues.
+  worker's first line names both queues, and when either queue's worker stops, the other is
+  stopped too and the worker exits with the first one's error.
+- **A workflow 0.7 started keeps 0.7's id** (`openfactory-<project>-<issue>` for a job,
+  `openfactory-coordinator-<project>` for the tech-lead, `openfactory-deploy-…` for a deploy watch,
+  `openfactory-product-breakdown-…` for a breakdown), and is read under it beside BeeverForge's:
+  the panel lists the job and its **Engine ↗** link finds it, its gates are answered (the answer is
+  sealed for that id), the tech-lead's rounds see it parked, a deploy watch shows on its card, and
+  a running breakdown is not started again. While 0.7's coordinator runs, a decision or an update
+  is sent to it rather than starting a second one beside it, and forgetting a project closes it
+  too.
+- **No job runs twice for one card** because a running 0.7 job holds the floor like any other:
+  the poller and a manual scan count every running job, whatever its id, against
+  `BEEVERFORGE_MAX_CONCURRENT_JOBS`, so with the default of one nothing new starts while it runs.
+  With a higher floor, a card a 0.7 job is still working on could be started again only if it were
+  back in the pickup column.
 - **At boot, once BeeverForge's own schedules are created, the worker deletes 0.7's**:
   `openfactory-poller`, `openfactory-preview-reaper`, and every `openfactory-product-sweep-<project>`,
   `openfactory-techlead-watch-<project>`, `openfactory-card-questions-<project>` and

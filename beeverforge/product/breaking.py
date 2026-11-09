@@ -136,12 +136,18 @@ async def running_numbers(project, *, client=None) -> set[int]:
 
         raise RuntimeError(why_the_engine_cannot_be_read(exc)) from exc
 
+    from beeverforge.runtime.temporal import FORMER_WORKFLOW_ID_PREFIX
+
     name = getattr(project, "name", "") or str(project)
     prefix = breakdown_workflow_id(name, 0)[:-1]
+    # …and OpenFactory 0.7's, until 1.0: a breakdown it started keeps 0.7's id, and one read as
+    # not running would be started again beside it (`FORMER_WORKFLOW_ID_PREFIX`)
+    prefixes = (prefix, FORMER_WORKFLOW_ID_PREFIX + prefix.removeprefix("beeverforge-"))
     client = client or await _engine()
     out: set[int] = set()
     async for wf in client.list_workflows(_RUNNING):
-        tail = str(wf.id)[len(prefix):] if str(wf.id).startswith(prefix) else ""
+        wid = str(wf.id)
+        tail = next((wid[len(p):] for p in prefixes if wid.startswith(p)), "")
         if tail.isdigit():
             out.add(int(tail))
     return out
