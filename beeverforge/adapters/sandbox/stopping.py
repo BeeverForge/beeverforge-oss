@@ -160,6 +160,12 @@ class Stop:
         #: request that keeps nothing (a person's stop) clears it.
         self.keep = False
         self._keeping = False
+        #: Held by `request` from before the flag is set until its last kill is done, and taken by
+        #: `keeping` before the window opens (#259, found on main's CI after #503): the kill sweeps
+        #: `/proc` for this job's mark up to `_SWEEPS` times, and the keep's own commands carry the
+        #: mark, so a window opened during the sweep had its `git commit` killed and the work was
+        #: lost with the worktree.
+        self._killing = threading.Lock()
 
     @property
     def requested(self) -> bool:
@@ -188,17 +194,18 @@ class Stop:
         `keep` (#259): the attempt ended and the job did not — keep what the agent wrote
         (`keeping`). Only the first request can ask for it; a request that keeps nothing clears
         it, so a person's stop arriving after a timeout publishes nothing."""
-        with self._lock:
-            if not self._event.is_set():
-                self.why = why
-                self.keep = keep
-                self._event.set()
-            elif not keep:
-                self.keep = self._keeping = False  # a person's stop closes an open window too
-            groups = list(self._groups)
-        for pgid in groups:
-            _kill_group(pgid)
-        _kill_marked(f"{MARK_VAR}={self.mark}".encode())
+        with self._killing:
+            with self._lock:
+                if not self._event.is_set():
+                    self.why = why
+                    self.keep = keep
+                    self._event.set()
+                elif not keep:
+                    self.keep = self._keeping = False  # a person's stop closes an open window too
+                groups = list(self._groups)
+            for pgid in groups:
+                _kill_group(pgid)
+            _kill_marked(f"{MARK_VAR}={self.mark}".encode())
 
     def adopt(self, proc: subprocess.Popen) -> None:
         """A command the box just started in its own group (`process_group=0`, so its pid is its
@@ -235,8 +242,11 @@ class Stop:
         """The window in which a timed-out attempt's runner keeps its work (#259): the commands
         it starts run instead of being killed on adoption, and its publishing checks let the push
         through. Yields whether there is anything to keep — False for a stop that keeps nothing,
-        and then the window does not open."""
-        with self._lock:
+        and then the window does not open.
+
+        NOT BEFORE THE KILL IS OVER (`_killing`): the keep's commands carry the job's mark, and a
+        sweep still running would kill them."""
+        with self._killing, self._lock:
             self._keeping = self.keep
         try:
             yield self._keeping

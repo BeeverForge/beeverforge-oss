@@ -40,10 +40,12 @@ class _CommittingAgent(stopped._BlockingAgent):
     """A pass that commits part of its work, leaves the rest written but uncommitted, and then
     blocks until it is ended — the shape of a four-hour pass the ceiling cuts."""
 
-    def __init__(self, fifo: Path, files: tuple[str, str] = ("committed.py", "uncommitted.py")):
+    def __init__(self, fifo: Path, files: tuple[str, str] = ("committed.py", "uncommitted.py"),
+                 *, leaves_a_lock: bool = False):
         super().__init__(fifo)
         self.files = files
         self.found: set[str] = set()
+        self.leaves_a_lock = leaves_a_lock
 
     def execute(self, *, sandbox, workspace, context):
         where = Path(workspace.path)
@@ -55,12 +57,17 @@ class _CommittingAgent(stopped._BlockingAgent):
                       "commit", "-qm", "the part the agent committed"]):
             subprocess.run(["git", "-C", str(where), *args], check=True, capture_output=True)
         (where / uncommitted).write_text("HALF = 1\n")
+        if self.leaves_a_lock:  # a git the kill ends mid-write leaves its lock behind
+            lock = subprocess.run(["git", "-C", str(where), "rev-parse", "--path-format=absolute",
+                                   "--git-path", "index.lock"], check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            Path(lock).write_text("")
         return super().execute(sandbox=sandbox, workspace=workspace, context=context)
 
 
 async def _a_pass_cut_by(details, client, origin_and_repo, tmp_path, *, then=None,
                          files=("committed.py", "uncommitted.py"), resume_handle=None,
-                         box_class=None, tag="1"):
+                         box_class=None, tag="1", leaves_a_lock=False):
     """Run a job whose agent blocks, cancel its activity with `details` (the engine answering
     `describe` through `client`, and answering `then` from the cancel on), and answer what the job
     left behind. `resume_handle` is the handle the run is resumed with; `box_class` a box of the
@@ -78,7 +85,7 @@ async def _a_pass_cut_by(details, client, origin_and_repo, tmp_path, *, then=Non
     stop = Stop()
     hooks = stopped._Hooks(stop, at="")
     forge, tracker, reviewer = stopped._fakes(hooks)
-    agent = _CommittingAgent(fifo, files)
+    agent = _CommittingAgent(fifo, files, leaves_a_lock=leaves_a_lock)
     box = (box_class or stopped._Box)(root=tmp_path / f"wt-{tag}", hooks=hooks)
     runner = JobRunner(
         tracker=tracker, forge=forge, agent=agent, sandbox=box,
@@ -350,6 +357,21 @@ async def test_a_timed_out_attempt_is_told_from_a_stop(details, answer, timed_ou
         is timed_out
 
 
+@pytest.mark.skipif(not _LINUX, reason="the box's stop reads /proc")
+async def test_a_lock_a_killed_git_left_does_not_cost_the_keep(origin_and_repo, tmp_path):
+    """Found on main's CI after #503: a git the kill ended mid-write left `index.lock`, the keep's
+    commit refused ("File exists"), and the work went with the worktree. Planted here, so the case
+    does not depend on where the kill lands."""
+    origin, _ = origin_and_repo
+
+    await _a_pass_cut_by(ActivityCancellationDetails(not_found=True, timed_out=True), None,
+                         origin_and_repo, tmp_path, leaves_a_lock=True)
+
+    pushed = _remote(origin, "ls-tree", "-r", "--name-only", f"refs/heads/{BRANCH}").split()
+    assert {"committed.py", "uncommitted.py"} <= set(pushed), (
+        f"a stale index lock cost the timed-out pass its work: {pushed}")
+
+
 # ── the stop's keeping window ───────────────────────────────────────────────────────────────────
 
 def _a_group_sleeping() -> subprocess.Popen:
@@ -373,6 +395,56 @@ def test_a_keeping_stop_runs_the_commands_of_its_window_and_kills_the_rest():
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+def test_the_keeping_window_opens_only_once_the_kill_is_over(monkeypatch):
+    """Found on main's CI after #503: the kill sweeps `/proc` for the job's mark, the keep's own
+    `git commit` carries the mark, and a window opened mid-sweep had its commit killed — the work
+    was lost with the worktree. Here the sweep holds until the runner is waiting to open the window
+    (or has opened it), and the order they happened in is the answer. No clock: events and a lock
+    that says when it is waited on."""
+    import threading
+
+    from beeverforge.adapters.sandbox import stopping
+
+    order: list[str] = []
+    waiting = threading.Event()  # the runner asked for the window, or already has it
+
+    def sweep(_needle: bytes) -> None:
+        assert waiting.wait(30), "the runner never asked for the window"
+        order.append("the sweep ended")
+
+    monkeypatch.setattr(stopping, "_kill_marked", sweep)
+    stop = Stop()
+    real = stop._killing
+
+    class _Told:
+        def __enter__(self):
+            if threading.current_thread().name == "runner":
+                waiting.set()
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    stop._killing = _Told()
+
+    def runner() -> None:
+        with stop.keeping() as keep:
+            order.append(f"the window opened ({keep})")
+            waiting.set()
+
+    killing = threading.Thread(target=stop.request, args=("ran past its limit",),
+                               kwargs={"keep": True})
+    killing.start()
+    # the flag is set inside the kill, before the sweep: from here the runner has heard the stop
+    assert stop._event.wait(30), "the stop was never requested"
+    keeper = threading.Thread(target=runner, name="runner")
+    keeper.start()
+    killing.join(30)
+    keeper.join(30)
+
+    assert order == ["the sweep ended", "the window opened (True)"], order
 
 
 def test_a_persons_stop_ends_the_keeping_and_a_plain_stop_never_opens_it():

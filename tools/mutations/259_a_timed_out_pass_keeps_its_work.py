@@ -32,6 +32,8 @@ ASKED = TEST + "::test_the_workflow_parks_a_failed_run_job_through_it"
 SEAM = TEST + "::test_the_failed_run_jobs_park_is_the_timed_out_attempts_or_the_failure_named"
 REMOTE = TEST + "::test_a_remote_box_past_its_ceiling_parks_as_any_failure"
 TOLD = TEST + "::test_a_timed_out_attempt_is_told_from_a_stop"
+LOCK = TEST + "::test_a_lock_a_killed_git_left_does_not_cost_the_keep"
+KILL_OVER = TEST + "::test_the_keeping_window_opens_only_once_the_kill_is_over"
 PERSON_LATE = (TEST + "::test_a_person_who_stops_the_job_while_it_keeps_its_work_gets_nothing"
                "_pushed")
 
@@ -67,6 +69,15 @@ MUTATIONS = [
      "            if not self._event.is_set() or self._keeping:\n",
      "            if not self._event.is_set():\n", KEPT),
 
+    ("FOUND ON MAIN'S CI: the window opens while the kill still sweeps, and the keep's own commit "
+     "is killed", STOPPING,
+     "        with self._killing, self._lock:\n            self._keeping = self.keep",
+     "        with self._lock:\n            self._keeping = self.keep", KILL_OVER),
+
+    ("the kill does not hold its lock, so the window does not wait for it", STOPPING,
+     "        with self._killing:\n            with self._lock:\n",
+     "        if True:\n            with self._lock:\n", KILL_OVER),
+
     ("the window opens for a stop that keeps nothing", STOPPING,
      "            self._keeping = self.keep\n", "            self._keeping = True\n", PERSON),
 
@@ -82,6 +93,9 @@ MUTATIONS = [
      "        return self._keeping\n", PERSON_LATE),
 
     # ── the runner keeps before its worktree goes ────────────────────────────────────────────
+    ("FOUND ON MAIN'S CI: a lock a killed git left stops the keep's commit", MACHINE,
+     "                self._clear_the_lock_a_killed_git_left(ws)\n", "", LOCK),
+
     ("the runner never keeps what the timed-out pass wrote", MACHINE,
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
      "            self.sandbox.cleanup(workspace=ws)",

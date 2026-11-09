@@ -3751,6 +3751,7 @@ class JobRunner:
             if not keep:
                 return
             try:
+                self._clear_the_lock_a_killed_git_left(ws)
                 self._preserve_for_hold(ticket, ws, None)
             except JobStopped:
                 log.warning("BEEVERFORGE_ATTEMPT_KEEP_STOPPED %s — a person stopped the job while "
@@ -3763,6 +3764,21 @@ class JobRunner:
                 return
             log.warning("BEEVERFORGE_ATTEMPT_KEPT %s — the attempt ran past its time limit; what "
                         "its agent wrote: %s", ws.branch, self._preserve_outcome)
+
+    def _clear_the_lock_a_killed_git_left(self, ws: Workspace) -> None:
+        """Remove the worktree's `index.lock` before the keep commits (#259, found on main's CI
+        after #503): a git the kill ended mid-write — the agent's own, or the walk's commit after
+        the agent died — leaves it, and the keep's `git add` then refuses with "index.lock: File
+        exists", so nothing was committed and the work went with the worktree.
+
+        STALE BY CONSTRUCTION HERE: the keeping window opens only once the kill is over
+        (`Stop.keeping`), so no process of the job is left to hold the index, and the runner's own
+        commands run one at a time. In the box, so it is the box's own path on either box."""
+        rc, out = self.sandbox.run(
+            workspace=ws, command='rm -f -- "$(git rev-parse --git-path index.lock)"', timeout=60)
+        if rc != 0:
+            log.warning("BEEVERFORGE_ATTEMPT_LOCK_KEPT %s — could not clear the index lock a "
+                        "killed git may have left (exit %s): %s", ws.branch, rc, out.strip()[:200])
 
     def _preserve_for_hold(
         self, ticket: Ticket, ws: Workspace, resume_handle: str | None
