@@ -193,6 +193,14 @@ class PassAccount(BaseModel):
         return kind
 
 
+#: The handle a hold carries when Resume must start from the forge's copy of the branch and not
+#: continue the agent's session (#11): the work on the branch is not the work that session did.
+#: Truthy, so `prepare` restores the branch; it decodes to nothing in any adapter (cold session).
+#: HERE, so the runner's holds and the workflow's own park of a timed-out attempt (#259) carry the
+#: one spelling.
+FROM_THE_FORGE = "worktree-only"
+
+
 class RunResult(BaseModel):
     """The full outcome of one job attempt, assembled by the orchestrator."""
 

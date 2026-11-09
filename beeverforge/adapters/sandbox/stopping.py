@@ -154,6 +154,12 @@ class Stop:
         #: job's workflow is no longer running, None while it is or when the engine cannot say.
         #: Set by the activity's heartbeat loop; None asks nothing.
         self.ask: Callable[[], str | None] | None = None
+        #: The attempt ended without a person ending the job (#259): its activity timed out and
+        #: the job's workflow is still running. Killed like a stop, but what the agent wrote is
+        #: committed and pushed to the job's branch before the worktree goes (`keeping`). A later
+        #: request that keeps nothing (a person's stop) clears it.
+        self.keep = False
+        self._keeping = False
 
     @property
     def requested(self) -> bool:
@@ -174,14 +180,21 @@ class Stop:
         """What a job's box adds to each command's environment."""
         return {MARK_VAR: self.mark}
 
-    def request(self, why: str = "") -> None:
+    def request(self, why: str = "", *, keep: bool = False) -> None:
         """End the work: set the flag, kill every group adopted so far and every process carrying
         this job's mark. Idempotent — the first reason stays, and a second call only kills again
-        what is still there."""
+        what is still there.
+
+        `keep` (#259): the attempt ended and the job did not — keep what the agent wrote
+        (`keeping`). Only the first request can ask for it; a request that keeps nothing clears
+        it, so a person's stop arriving after a timeout publishes nothing."""
         with self._lock:
             if not self._event.is_set():
                 self.why = why
+                self.keep = keep
                 self._event.set()
+            elif not keep:
+                self.keep = self._keeping = False  # a person's stop closes an open window too
             groups = list(self._groups)
         for pgid in groups:
             _kill_group(pgid)
@@ -192,10 +205,44 @@ class Stop:
         group id). Killed at once when the stop is already requested."""
         with self._lock:
             self._prune()
-            if not self._event.is_set():
+            if not self._event.is_set() or self._keeping:
                 self._groups.add(proc.pid)
                 return
         _kill_group(proc.pid)
+
+    @property
+    def keeping_now(self) -> bool:
+        """Inside `keeping`: the runner is committing and pushing what the attempt wrote."""
+        return self._keeping
+
+    def still_keeping(self) -> bool:
+        """Inside `keeping`, whether the push may still go: ASKS THE ENGINE (review of #503).
+        Nothing else can deliver a person's stop here — the heartbeat loop has handled its one
+        cancellation and beats no more — so a workflow that is no longer running (a person stopped
+        the job while its timed-out attempt was keeping) closes the window through `request`,
+        which keeps nothing. An engine that cannot say leaves the window open: the workflow was
+        running when the timeout was read, and the push is the job's own branch."""
+        if not self._keeping:
+            return False
+        ask = self.ask
+        why = ask() if ask is not None else None
+        if why:
+            self.request(why)
+        return self._keeping
+
+    @contextmanager
+    def keeping(self) -> Iterator[bool]:
+        """The window in which a timed-out attempt's runner keeps its work (#259): the commands
+        it starts run instead of being killed on adoption, and its publishing checks let the push
+        through. Yields whether there is anything to keep — False for a stop that keeps nothing,
+        and then the window does not open."""
+        with self._lock:
+            self._keeping = self.keep
+        try:
+            yield self._keeping
+        finally:
+            with self._lock:
+                self._keeping = False
 
     def settle(self, proc: subprocess.Popen) -> None:
         """The command returned. Its group is let go of only once it is EMPTY: a child it left
