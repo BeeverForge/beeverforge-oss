@@ -180,6 +180,9 @@ OUTSIDE_THE_LOG = {
         "*": "the CLI, which answers a person at a terminal — save the commands that become the "
              "deployment's own processes (`BECOME_A_PROCESS`)"},
     "beeverforge/cli_refusals.py": {"*": "the CLI's refusals, which only the CLI imports"},
+    "beeverforge/former_command.py": {
+        "main": "the `openfactory` alias's warning, printed only where the process's lines are "
+                "not JSON — logged as a record where they are"},
     "beeverforge/observability/logs.py": {
         "announce": "the one door for a line for a person: it prints only where the process's "
                     "lines are not JSON",

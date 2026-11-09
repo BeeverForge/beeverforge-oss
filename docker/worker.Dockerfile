@@ -440,6 +440,8 @@ COPY pyproject.toml README.md LICENSE NOTICE ./
 # the backend warns and installs an empty description today; a newer one may refuse the build.
 COPY docs/pypi.md ./docs/pypi.md
 COPY beeverforge ./beeverforge
+# OpenFactory 0.7's import name, which 0.7 add-ons import until 1.1 — a package pyproject.toml declares
+COPY openfactory ./openfactory
 # THE ADD-ON PACKAGES, BUILT HERE FROM THE SAME TREE — WHERE THE TREE HAS THEM. The cloud rows (the
 # remote box, the metrics table, the session store, the token pool) and the chat rows (the channel,
 # its notifier, the Telegram fallback) are `addons/beeverforge-aws` and `addons/beeverforge-slack`

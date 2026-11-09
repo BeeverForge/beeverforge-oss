@@ -14,6 +14,13 @@ In a compose deployment the same commands run inside the worker:
 docker compose --env-file .env.compose exec worker python -m beeverforge.cli <command>
 ```
 
+**The former name, until 1.1.** OpenFactory 0.7 installed this command as `openfactory`, and
+`openfactory` still runs it: the same commands, the same output on stdout and the same exit codes,
+with one warning on stderr that names `beeverforge`. An add-on written for 0.7 can still
+`import openfactory` and `from openfactory.<module> import …`, which give it the `beeverforge`
+package and its modules, with a `FutureWarning` naming the new import. Both old names are removed
+in BeeverForge 1.1: change scripts to call `beeverforge`, and add-ons to import `beeverforge`.
+
 ---
 
 ## Running work

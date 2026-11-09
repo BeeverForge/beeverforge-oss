@@ -83,6 +83,8 @@ COPY pyproject.toml README.md LICENSE NOTICE ./
 # the backend warns and installs an empty description today; a newer one may refuse the build.
 COPY docs/pypi.md ./docs/pypi.md
 COPY beeverforge ./beeverforge
+# OpenFactory 0.7's import name, which 0.7 add-ons import until 1.1 — a package pyproject.toml declares
+COPY openfactory ./openfactory
 COPY docker/install-addons.sh ./docker/install-addons.sh
 COPY addon[s] ./addons
 RUN sh docker/install-addons.sh .

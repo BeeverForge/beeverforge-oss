@@ -105,6 +105,10 @@ MUST_SHIP = [
     # THE THRESHOLDS `certify verify` HOLDS A PACK TO (#356). Absent from a wheel, verify could
     # not judge a pack by the numbers the submissions bot uses.
     "beeverforge/certify/thresholds.yaml",
+    # THE FORMER IMPORT NAME, UNTIL 1.1. A 0.7 add-on writes `from openfactory.<module> import …`;
+    # the package lives beside `beeverforge/`, outside the `beeverforge*` glob, so it ships only
+    # because `[tool.setuptools.packages.find]` names it too.
+    "openfactory/__init__.py",
 ]
 
 
@@ -119,8 +123,9 @@ def _pristine_source(into: str) -> Path:
     `infra/`), which is what makes building from scratch affordable at all."""
     src = Path(into) / "pristine"
     src.mkdir()
-    shutil.copytree(ROOT / "beeverforge", src / "beeverforge",
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for package in _the_declared_packages():
+        shutil.copytree(ROOT / package, src / package,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for f in ("pyproject.toml", "LICENSE", "NOTICE", "README.md", *_the_declared_description()):
         (src / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / f, src / f)
@@ -139,6 +144,17 @@ def _the_declared_description() -> list[str]:
     if isinstance(readme, dict) and readme.get("file"):
         return [readme["file"]]
     return [readme] if isinstance(readme, str) else []
+
+
+def _the_declared_packages() -> list[str]:
+    """The top-level package directories `[tool.setuptools.packages.find]` selects, as paths
+    beside `pyproject.toml` — `beeverforge` from `beeverforge*`, and `openfactory`, the former
+    import name kept until 1.1. Derived, so a package the declaration adds is copied and required
+    by the same rule; a copy holding `beeverforge/` alone would build a wheel without the alias
+    and this guard would never know the declaration names it."""
+    include = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["setuptools"][
+        "packages"]["find"]["include"]
+    return sorted({re.split(r"[.*]", pattern, maxsplit=1)[0] for pattern in include})
 
 
 def _what_the_backend_reads_beside_pyproject() -> list[str]:
@@ -183,7 +199,7 @@ def _what_the_build_context_lacks(text: str) -> list[str] | None:
     if "pyproject.toml" not in landed:
         return None
     beside = posixpath.dirname(landed["pyproject.toml"])
-    return [rel for rel in _what_the_backend_reads_beside_pyproject()
+    return [rel for rel in [*_what_the_backend_reads_beside_pyproject(), *_the_declared_packages()]
             if landed.get(posixpath.normpath(rel)) != posixpath.join(beside, rel)]
 
 
@@ -219,8 +235,9 @@ def test_every_image_that_builds_the_package_carries_what_pyproject_declares():
 def test_the_context_reader_can_SEE_a_missing_or_misplaced_declared_file():
     """Verify the verifier, on the shape the images had and the two ways to get the fix wrong."""
     page = _the_declared_description()[0]
-    head = "FROM python:3.12-slim\nWORKDIR /opt/beeverforge\n"
-    was_here = head + "COPY pyproject.toml README.md LICENSE NOTICE ./\nCOPY beeverforge ./beeverforge\n"
+    packages = "".join(f"COPY {d} ./{d}\n" for d in _the_declared_packages())
+    head = "FROM python:3.12-slim\nWORKDIR /opt/beeverforge\n" + packages
+    was_here = head + "COPY pyproject.toml README.md LICENSE NOTICE ./\n"
     flattened = head + f"COPY pyproject.toml README.md LICENSE NOTICE {page} ./\n"
     elsewhere = head + f"COPY pyproject.toml LICENSE NOTICE ./\nWORKDIR /tmp\nCOPY {page} ./{page}\n"
     fixed = head + f"COPY pyproject.toml README.md LICENSE NOTICE ./\nCOPY {page} ./{page}\n"
@@ -231,6 +248,12 @@ def test_the_context_reader_can_SEE_a_missing_or_misplaced_declared_file():
     for carries in (fixed, exec_form):
         assert _what_the_build_context_lacks(carries) == [], carries
     assert _what_the_build_context_lacks(head + "COPY --from=x /pyproject.toml ./\n") is None
+
+    # THE FORMER IMPORT NAME IS A PACKAGE THE BACKEND READS TOO: an image that copies
+    # `beeverforge/` alone installs a core no 0.7 add-on can import from
+    assert {"beeverforge", "openfactory"} <= set(_the_declared_packages()), _the_declared_packages()
+    core_only = fixed.replace(packages, "COPY beeverforge ./beeverforge\n")
+    assert _what_the_build_context_lacks(core_only) == ["openfactory"], core_only
 
 
 @pytest.mark.slow
@@ -280,15 +303,21 @@ def test_every_runtime_data_file_is_inside_the_built_wheel():
             f"reserved': {sorted(shipped)[:8]}…"
         )
 
-        # ONE CONSOLE SCRIPT, AND IT IS THE PRODUCT'S. Asserted positively — the exact set, not
-        # "no old name" — because an absent alias and an absent entry-points file read the same
-        # to a negative check. The former name shipped as a second script until 2026-08-25.
+        # THE PRODUCT'S CONSOLE SCRIPT, AND THE FORMER NAME AS ITS ALIAS UNTIL 1.1. Asserted
+        # positively — the exact set and where each one points, not "no other name" — because an
+        # absent alias and an absent entry-points file read the same to a negative check. The
+        # former name shipped as a second script until 2026-08-25 and was removed outright, which
+        # broke every 0.7 script that called it; it is back as an alias that says it leaves in 1.1
+        # (`beeverforge/former_command.py`), and the alias is what `openfactory` must point at.
         entry_points = next((n for n in shipped if n.endswith("/entry_points.txt")), None)
         assert entry_points, f"the wheel declares no entry points at all: {sorted(shipped)[:8]}"
         declared = zipfile.ZipFile(wheels[0]).read(entry_points).decode()
-        scripts = re.findall(r"^(\w+)\s*=", declared.split("[console_scripts]", 1)[1], re.M)
-        assert scripts == ["beeverforge"], (
-            f"`pip install` delivers these console scripts: {scripts} — the product has one name")
+        section = declared.split("[console_scripts]", 1)[1].split("\n[", 1)[0]
+        scripts = dict(re.findall(r"^(\w+)\s*=\s*(\S+)", section, re.M))
+        assert scripts == {"beeverforge": "beeverforge.cli:app",
+                           "openfactory": "beeverforge.former_command:main"}, (
+            f"`pip install` delivers these console scripts: {scripts} — the product's name, and "
+            f"the former one as the alias that says it is removed in 1.1")
 
         # THE PAGE THE INDEX SHOWS IS THE ONE IN THE WHEEL'S METADATA (#368), and nowhere else:
         # the upload carries METADATA, not `pyproject.toml`, so a declaration that never reaches
