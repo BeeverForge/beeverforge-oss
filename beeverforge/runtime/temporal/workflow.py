@@ -184,29 +184,49 @@ with workflow.unsafe.imports_passed_through():
 _ONCE = RetryPolicy(maximum_attempts=1)
 
 
+def _the_park_of_a_failed_run_job(exc: BaseException, params: JobParams) -> RunResult:
+    """What a `run_job` that failed past its own retries parks as: a timed-out attempt's park
+    (`_an_attempt_past_its_limit`), else the failure named, as it always was."""
+    return _an_attempt_past_its_limit(exc, params) or RunResult(
+        ticket_id=params.issue, state=JobState.ON_HOLD,
+        note=f"job errored after retries: {describe(exc, limit=150)}",
+    )
+
+
 def _an_attempt_past_its_limit(exc: BaseException, params: JobParams) -> RunResult | None:
-    """The park of a `run_job` that ran past its StartToClose ceiling (#259), or None for any
-    other failure.
+    """The park of a `run_job` that ran past its StartToClose ceiling on a LOCAL box (#259), or
+    None for any other failure.
 
-    ITS WORK IS ON THE BRANCH, SO RESUME STARTS FROM THE BRANCH. The attempt's own runner, told by
-    its heartbeat loop that the attempt timed out while this workflow goes on, committed and pushed
-    what the agent wrote before its worktree went (`activities._keep_the_work`). This park carries
-    the handle that makes Resume restore that branch (`FROM_THE_FORGE`) instead of starting from
-    the base, which is where three of four long passes on one deployment lost their commits. A
-    branch that was never pushed is no harm: `prepare` falls back to the base when it is absent.
+    ITS WORK IS KEPT ON THE BRANCH, SO RESUME STARTS FROM THE BRANCH. The attempt's own runner,
+    told by its heartbeat loop that the attempt timed out while this workflow goes on, commits and
+    pushes what the agent wrote before its worktree goes (`activities._keep_the_work`). This park
+    carries the handle that makes Resume restore that branch (`FROM_THE_FORGE`) instead of
+    starting from the base. A branch nothing reached is no harm: `prepare` falls back to the base.
 
-    A PERSON DECIDES, rather than the self-heal: the pass that timed out ran for the whole ceiling,
-    and running it again unattended can spend the same again. One sentence names the cause, where
-    the work is, and the remedy — never the engine's "activity StartToClose timeout"."""
+    THE SENTENCE SAYS ONLY WHAT THIS WORKFLOW KNOWS (review of #503). The keep's outcome is not
+    in its hands: the activity's result is lost with the timeout, and when the server timed the
+    attempt out first this park is made while the runner may still be pushing (bounded by
+    `_A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN`). So it says the work is kept on the branch WHEN the push
+    lands, and the journal's `BEEVERFORGE_ATTEMPT_KEPT` line says whether it did. A Resume pressed
+    before the push lands starts from what the branch holds then; the late push is then refused
+    by that run's lease and copied to `<branch>-kept-<sha>` before the run pushes (#11), so
+    neither pass's work is replaced unseen.
+
+    A REMOTE BOX keeps nothing this way — its runner is not this worker's — so its timeout parks
+    as any other failure. A PERSON DECIDES, rather than the self-heal: the pass that timed out ran
+    for the whole ceiling, and running it again unattended can spend the same again."""
     cause = exc.cause if isinstance(exc, ActivityError) else None
     if not isinstance(cause, TimedOut) or cause.type != TimeoutType.START_TO_CLOSE:
+        return None
+    if params.traits().remote:
         return None
     branch = job_branch(params.issue, change=params.change)
     return RunResult(
         ticket_id=params.issue, state=JobState.ON_HOLD, branch=branch,
         note=(f"the agent pass ran past its {ACTIVITY_CEILING / 3600:g} h limit and was ended; "
-              f"what it had written was pushed to `{branch}` (the journal says if that push "
-              "failed) — Resume continues from that branch"),
+              f"what it had written is kept on `{branch}` once its push lands (the journal says "
+              "whether it did), and Resume continues from that branch — from the base if nothing "
+              "reached it"),
         resume_handle=FROM_THE_FORGE,
     )
 # Promotion steps are read-mostly and their one write (create_tag) is idempotent
@@ -3127,10 +3147,7 @@ class JobWorkflow:
                 # diagnostics (`SetupFailed`'s command + output tail, and the box-image resolver's
                 # own refusal — see activities.py's `_resolved_image`) were already doing the work
                 # to deserve, and were losing the moment they crossed this exact boundary.
-                result = _an_attempt_past_its_limit(exc, params) or RunResult(
-                    ticket_id=params.issue, state=JobState.ON_HOLD,
-                    note=f"job errored after retries: {describe(exc, limit=150)}",
-                )
+                result = _the_park_of_a_failed_run_job(exc, params)
 
             if result.state == JobState.PAUSED:  # rate-limit / usage cap (token ran out)
                 if rate_resumes >= _MAX_PAUSE_RESUMES:  # persistent → escalate to a human

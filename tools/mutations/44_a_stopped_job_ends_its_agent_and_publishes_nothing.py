@@ -143,8 +143,8 @@ MUTATIONS = [
     # ── a stop the heartbeat has not heard yet (review of #453) ──
     # RE-PINNED 2026-11-09 (#259): a timed-out attempt keeps its work first, in the same places
     ("the runner asks only the heartbeat's flag, never the engine", MACHINE,
-     "        if stop is not None and not stop.keeping_now and stop.confirm():\n",
-     "        if stop is not None and not stop.keeping_now and stop.requested:\n", UNHEARD),
+     "        if stop is not None and not stop.still_keeping() and stop.confirm():\n",
+     "        if stop is not None and not stop.still_keeping() and stop.requested:\n", UNHEARD),
 
     ("the heartbeat loop gives the runner nothing to ask the engine with", ACTIVITIES,
      "        stop.ask = _the_engine_asked(asyncio.get_running_loop())\n",

@@ -29,6 +29,11 @@ CHECK = TEST + "::test_the_runners_publishing_check_lets_the_keeps_push_through"
 PARKED = TEST + "::test_a_run_job_past_its_ceiling_parks_resumable_from_its_branch"
 OTHER = TEST + "::test_any_other_failure_parks_as_it_did"
 ASKED = TEST + "::test_the_workflow_parks_a_failed_run_job_through_it"
+SEAM = TEST + "::test_the_failed_run_jobs_park_is_the_timed_out_attempts_or_the_failure_named"
+REMOTE = TEST + "::test_a_remote_box_past_its_ceiling_parks_as_any_failure"
+TOLD = TEST + "::test_a_timed_out_attempt_is_told_from_a_stop"
+PERSON_LATE = (TEST + "::test_a_person_who_stops_the_job_while_it_keeps_its_work_gets_nothing"
+               "_pushed")
 
 MUTATIONS = [
     # ── the heartbeat loop tells a timed-out attempt from a stop ─────────────────────────────
@@ -46,7 +51,7 @@ MUTATIONS = [
 
     ("a workflow a person terminated is read as one that runs on, and the stop pushes", ACTIVITIES,
      "    return described.status == WorkflowExecutionStatus.RUNNING\n",
-     "    return True\n", STOPPED),
+     "    return True\n", TOLD),
 
     ("the activity asks for a stop that keeps nothing", ACTIVITIES,
      '    stop.request("this attempt ran past its time limit", keep=True)',
@@ -65,9 +70,16 @@ MUTATIONS = [
     ("the window opens for a stop that keeps nothing", STOPPING,
      "            self._keeping = self.keep\n", "            self._keeping = True\n", PERSON),
 
+    # RE-PINNED 2026-11-09 (review of #503)
     ("the runner's publishing check refuses the keep's own push", MACHINE,
-     "        if stop is not None and not stop.keeping_now and stop.confirm():",
+     "        if stop is not None and not stop.still_keeping() and stop.confirm():",
      "        if stop is not None and stop.confirm():", CHECK),
+
+    ("THE REVIEW'S FINDING: the window never asks the engine, so a person's stop during the keep "
+     "is not heard and the push goes through", STOPPING,
+     "        why = ask() if ask is not None else None\n        if why:\n"
+     "            self.request(why)\n        return self._keeping\n",
+     "        return self._keeping\n", PERSON_LATE),
 
     # ── the runner keeps before its worktree goes ────────────────────────────────────────────
     ("the runner never keeps what the timed-out pass wrote", MACHINE,
@@ -82,9 +94,18 @@ MUTATIONS = [
      "            self._keep_what_the_attempt_wrote(ticket, ws)", KEPT),
 
     # ── the workflow parks it resumable from its branch ──────────────────────────────────────
+    # RE-PINNED 2026-11-09 (review of #503)
+    ("the handler around run_job no longer parks through the seam", WORKFLOW,
+     "                result = _the_park_of_a_failed_run_job(exc, params)\n",
+     "                result = RunResult(ticket_id=params.issue, state=JobState.ON_HOLD,\n"
+     "                                   note=f\"job errored after retries: {exc}\")\n", ASKED),
+
     ("a failed run_job no longer asks whether it ran past its limit", WORKFLOW,
-     "                result = _an_attempt_past_its_limit(exc, params) or RunResult(",
-     "                result = RunResult(", ASKED),
+     "    return _an_attempt_past_its_limit(exc, params) or RunResult(",
+     "    return RunResult(", SEAM),
+
+    ("a remote box's timeout is parked as work kept on a branch it never pushed", WORKFLOW,
+     "    if params.traits().remote:\n        return None\n", "", REMOTE),
 
     ("the park carries no handle, so Resume starts from the base again", WORKFLOW,
      "        resume_handle=FROM_THE_FORGE,\n    )\n", "    )\n", PARKED),

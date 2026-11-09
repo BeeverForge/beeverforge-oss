@@ -1693,8 +1693,9 @@ class JobRunner:
         workflow is still running (`Stop.ask`, set by the activity's heartbeat loop)."""
         stop = getattr(self, "stop", None)
         # WHILE A TIMED-OUT ATTEMPT KEEPS ITS WORK (#259, `Stop.keeping`) its own push goes
-        # through: that push is what the keeping is for, and a person's stop closes the window
-        if stop is not None and not stop.keeping_now and stop.confirm():
+        # through: that push is what the keeping is for. The engine is still asked
+        # (`still_keeping`, review of #503): a person's stop arriving meanwhile closes the window
+        if stop is not None and not stop.still_keeping() and stop.confirm():
             log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
                         step, stop.why or "a person stopped the job")
             # WHAT ALREADY LANDED IS SAID, ONCE, and then the job stops (review of #453): an open

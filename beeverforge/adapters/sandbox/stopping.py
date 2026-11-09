@@ -215,6 +215,21 @@ class Stop:
         """Inside `keeping`: the runner is committing and pushing what the attempt wrote."""
         return self._keeping
 
+    def still_keeping(self) -> bool:
+        """Inside `keeping`, whether the push may still go: ASKS THE ENGINE (review of #503).
+        Nothing else can deliver a person's stop here — the heartbeat loop has handled its one
+        cancellation and beats no more — so a workflow that is no longer running (a person stopped
+        the job while its timed-out attempt was keeping) closes the window through `request`,
+        which keeps nothing. An engine that cannot say leaves the window open: the workflow was
+        running when the timeout was read, and the push is the job's own branch."""
+        if not self._keeping:
+            return False
+        ask = self.ask
+        why = ask() if ask is not None else None
+        if why:
+            self.request(why)
+        return self._keeping
+
     @contextmanager
     def keeping(self) -> Iterator[bool]:
         """The window in which a timed-out attempt's runner keeps its work (#259): the commands
