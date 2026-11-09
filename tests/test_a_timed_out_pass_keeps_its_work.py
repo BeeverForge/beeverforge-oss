@@ -298,7 +298,9 @@ async def test_a_keep_that_outlives_the_activitys_wait_finishes_whole(
     from beeverforge.runtime.temporal import activities
 
     origin, _ = origin_and_repo
-    monkeypatch.setattr(activities, "_A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN", 0.05)
+    # 0, NOT A SHORT WAIT (review of #503): `asyncio.wait(..., timeout=0)` returns at once with
+    # the thread still pending, which is the case, and nothing here waits on a clock
+    monkeypatch.setattr(activities, "_A_TIMED_OUT_ATTEMPT_KEEPS_WITHIN", 0)
     boxes: list[_SlowPushBox] = []
 
     class _Recorded(_SlowPushBox):
