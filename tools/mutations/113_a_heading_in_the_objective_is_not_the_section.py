@@ -48,6 +48,7 @@ MUTATIONS = [
      '''            "", "## Objective", _as_text(card.text(ticket.objective)), "", "## Validations",''',
      '''            "", "## Objective", card.text(ticket.objective), "", "## Validations",'''),
 
+    # The reviewer's words are withheld from (#196) before these lines, in `_review_withheld`.
     ("the reviewer's summary is written raw, so a stale verdict outlives a fresh one", MACHINE,
      "        out = [first, _as_text(_without_reviewer_mentions(r.summary))]",
      "        out = [first, _without_reviewer_mentions(r.summary)]"),

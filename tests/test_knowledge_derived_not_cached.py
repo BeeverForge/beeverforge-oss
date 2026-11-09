@@ -17,6 +17,7 @@ worth its machinery when computing is expensive.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -78,8 +79,80 @@ def test_the_temp_directory_is_reclaimed():
 
 # ── cheap enough that the cache was never justified ─────────────────────────────────────────────
 
+PACKAGES = 20
+FILES_PER_PACKAGE = 20
+FILES = PACKAGES * FILES_PER_PACKAGE
+FUNCTIONS_PER_FILE = 11  # ~1,340 AST nodes a file; this repository averaged 1,365 (2026-11-03)
+PER_FILE_ALLOWANCE = 0.008  # seconds of CPU a file may cost; see the guard's docstring
+
+
+def _a_source_file(package: int, module: int) -> str:
+    """One deterministic, valid Python file the size of this repository's average one: a module
+    docstring, two absolute imports of sibling packages and one relative import (so the import
+    resolver does real work), top-level functions with branches, and a class with methods."""
+    first, second = (package + 1) % PACKAGES, (package + 7) % PACKAGES
+    lines = [
+        f'"""Package {package}, module {module}: a fixed-size stand-in for one source file."""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "import os",
+        "from pathlib import Path",
+        "",
+        f"from pkg{first:02d}.mod{module:02d} import f0 as _a",
+        f"from pkg{second:02d}.mod{(module + 3) % (FILES_PER_PACKAGE - 1):02d} import f1 as _b",
+        f"from .mod{(module + 1) % (FILES_PER_PACKAGE - 1):02d} import f2 as _c",
+        "",
+        f"LIMIT = {package * FILES_PER_PACKAGE + module}",
+        "",
+    ]
+    for i in range(FUNCTIONS_PER_FILE):
+        lines += [
+            f"def f{i}(x: int, y: int = {i}) -> int:",
+            f'    """Step {i}."""',
+            "    total = 0",
+            "    for k in range(x):",
+            "        if k % 2 and y > LIMIT:",
+            "            total += k * y - (k // 3)",
+            "        elif k in (1, 2, 3):",
+            "            total -= len(str(k)) + len(os.sep)",
+            "        else:",
+            "            total = max(total, k, y)",
+            '    return total if Path(".").name != "x" else -total',
+            "",
+        ]
+    lines += [
+        f"class Thing{module}:",
+        '    """A class with methods."""',
+        "",
+        "    def __init__(self, n: int) -> None:",
+        "        self.n = n",
+        "",
+        "    def twice(self) -> int:",
+        "        return _a(self.n, 1) + _b(self.n, 2) + _c(self.n, 3)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _a_repository_of_fixed_size(root: Path) -> None:
+    """`PACKAGES` packages of `FILES_PER_PACKAGE` files each. Nothing here reads REPO.
+
+    A plain directory, not a repository: the generator's two git reads (`ignored_by_git`, the HEAD
+    stamp) still run, and answer "not a repository". A bare `git init` here would be one over the
+    line `test_a_test_gets_its_repository_from_the_bed.py` holds, and the bed's fixture would
+    change this guard's signature, which `ci_runs_every_test_exactly_once.py` anchors on."""
+    for package in range(PACKAGES):
+        pkg = root / f"pkg{package:02d}"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(f'"""Package {package}."""\n', encoding="utf-8")
+        for module in range(FILES_PER_PACKAGE - 1):
+            (pkg / f"mod{module:02d}.py").write_text(
+                _a_source_file(package, module), encoding="utf-8")
+
+
 @pytest.mark.alone
-def test_generating_is_fast_enough_to_do_every_time():
+def test_generating_is_fast_enough_to_do_every_time(capsys):
     """0.24s for 215 files, measured 2026-07-29. The assertion is generous — it guards the
     ARCHITECTURE (deriving beats caching) rather than a benchmark: if this ever failed, the answer
     would not be to raise the number, it would be to revisit ADR-0023.
@@ -93,19 +166,55 @@ def test_generating_is_fast_enough_to_do_every_time():
     AND NOT BESIDE OTHER WORKERS (2026-10-12). CPU time is not immune to neighbours either: with
     CI's suite split across xdist workers on a four-core runner, this read 13.1 s, against 7.6–8.0 s
     for the same generation alone on a loaded laptop. So it is marked `alone`, and runs in a process
-    of its own. The 0.24 s above was 215 files; REPO is this repository, now about 2,000, so the
-    budget it guards is much closer than it was."""
+    of its own.
+
+    A FIXED INPUT, NOT THIS REPOSITORY (2026-11-03, #415). Until then the guard generated the map
+    of REPO, this repository, under a flat 10.0 s. Every PR added files, so every PR moved the
+    guard closer to red without generation getting any dearer: CI's `integration` job read
+    10.03 s on main and 11.2 s on a PR that touched nothing in the generator. Now it generates
+    the map of a repository the test builds — `FILES` Python files, each about the size of this
+    repository's average one — and its budget is `FILES × PER_FILE_ALLOWANCE`. What it guards is
+    the PER-FILE cost, which is what ADR-0023 rests on (a map of N files costs N small, linear
+    pieces of work), and adding files to this repository cannot fail it. MEASURED 2026-11-03 on
+    this input, alone: 0.83 s (2.08 ms a file, median of 5) on a laptop, and 0.760 to 1.320 s
+    (1.90 to 3.30 ms a file, two runs the same day) in CI's `integration` job. So the 8 ms
+    allowance leaves about 3.9 times of margin on the laptop and 2.4 to 4.2 times on CI, against
+    the 11 to 14 times dearer per file that `tools/mutations/415_*` makes it, and about 1.0 times
+    the old guard had left by then. (The 2.5 times CI was slower on the whole repository does not carry over: git and the
+    size of the tree differ between machines, and this input has neither.) A heavily loaded
+    machine can still eat the margin, as it could the old one. If generation gets several times
+    dearer per file, this goes red — and the answer is still not to raise the allowance."""
     def cpu() -> float:
         t = os.times()
         return t.user + t.system + t.children_user + t.children_system
 
-    started = cpu()
-    d = generate_bundle_for(REPO)
-    elapsed = cpu() - started
-    discard_fetched_bundle(d)
-    assert elapsed < 10.0, (
-        f"generation cost {elapsed:.1f}s of CPU — if this is real, the cache ADR-0023 removed "
-        f"may have been justified after all"
+    budget = FILES * PER_FILE_ALLOWANCE
+    with tempfile.TemporaryDirectory(prefix="beeverforge-fixed-input-") as tmp:
+        root = Path(tmp)
+        _a_repository_of_fixed_size(root)
+
+        started = cpu()
+        d = generate_bundle_for(root)
+        elapsed = cpu() - started
+
+        assert d is not None, "the fixed input produced no map — nothing was measured"
+        try:
+            bundle = read_bundle_dir(d)
+        finally:
+            discard_fetched_bundle(d)
+    assert bundle is not None, "the bundle could not be read back — nothing was measured"
+    assert len(bundle.module_map.modules) >= PACKAGES, (
+        f"{len(bundle.module_map.modules)} modules from {PACKAGES} packages — the generation "
+        f"did not read the input it was timed on"
+    )
+    per_file_ms = elapsed / FILES * 1000
+    with capsys.disabled():  # in CI's log even when it passes: the margin is read there (#415)
+        print(f"\nknowledge generation: {elapsed:.3f}s of CPU for {FILES} files "
+              f"({per_file_ms:.2f} ms a file), budget {budget:.1f}s")
+    assert elapsed < budget, (
+        f"generation cost {elapsed:.2f}s of CPU for {FILES} files ({per_file_ms:.2f} ms a file, "
+        f"budget {budget:.1f}s) — if this is real, the cache ADR-0023 removed may have been "
+        f"justified after all"
     )
 
 
