@@ -153,6 +153,9 @@ def onboard_source_repo(project, repo: str, *, sandbox: str = "container",
     try:
         base = default_branch(checkout)
 
+        # WHERE THIS REPOSITORY KEEPS ITS FOLDER (#265): a repository on `.openfactory/` is
+        # written — and proposed — there, never handed a second manifest under `.beeverforge/`.
+        manifest_rel = namespace.in_repo(checkout, manifest_rel)
         manifest_file = checkout / manifest_rel
         manifest = None
         try:
@@ -485,7 +488,7 @@ def onboard_product_context(project, *, sources: list[str],
             return out
 
         if not result.already_correct:
-            target = docs_clone / PRODUCT_YAML
+            target = docs_clone / namespace.in_repo(docs_clone, PRODUCT_YAML)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(result.product_yaml, encoding="utf-8")
 

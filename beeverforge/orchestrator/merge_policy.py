@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from beeverforge.adapters.forge.base import ReviewEvent
 from beeverforge.contracts import Manifest, ReviewResult, RunResult
+from beeverforge.contracts.review import not_a_verdict, unread_words
 from beeverforge.policy.profiles import ResolvedProfile
 
 _EVENT: dict[str, ReviewEvent] = {
@@ -20,7 +21,11 @@ def review_event(review: ReviewResult | None, mode: str = "blocking") -> ReviewE
     # request-changes that would block the merge (or an approve that reads as a gate passing).
     if mode != "blocking":
         return "comment"
-    return _EVENT.get(review.decision, "comment") if review else "comment"
+    # A REVIEW THAT JUDGED NOTHING ASKS FOR NOTHING (#131): its `rejected` is the safe default,
+    # not a finding, and a request-changes would ask for changes on a diff nobody read.
+    if review is None or not_a_verdict(review):
+        return "comment"
+    return _EVENT.get(review.decision, "comment")
 
 
 # Coverage pragmas are the codebase's convention for genuinely-untestable wiring (a 100%-cov
@@ -138,6 +143,13 @@ def should_auto_merge(manifest: Manifest, result: RunResult, *,
     # A change nobody verified goes to a person, who is told so (`review/verdict.headline`).
     if result.review is not None and _not_verified(result.review):
         return False
+    # A REVIEW THAT JUDGED NOTHING (#131) is no review, and a review was asked for: the job holds
+    # on one before it gets here (`JobRunner.run`), and this is the same answer in the policy,
+    # whatever the review mode — advisory mode reads a rejection as information, and this one
+    # carries none.
+    reviewed = None if result.review is None or not_a_verdict(result.review) else result.review
+    if result.review is not None and reviewed is None:
+        return False
     # Suppressions that SURVIVED the suppression-repair loop (ADR-0011). A HARD suppression
     # (noqa / type: ignore / nosec) always goes to a human. A coverage pragma may auto-merge —
     # but ONLY when an INDEPENDENT review has vetted it (the reviewer caught #207 and passed
@@ -145,7 +157,7 @@ def should_auto_merge(manifest: Manifest, result: RunResult, *,
     if result.added_suppressions:
         if _hard_suppressions(result.added_suppressions):
             return False
-        if result.review is None:
+        if reviewed is None:  # an unread review vetted nothing (#131)
             return False
     # RISK IS ASKED IN ONE PLACE NOW, and that place answers a wider question than this loop did.
     # The loop walked the components the diff MATCHED and looked for `high` — so a change matching
@@ -240,7 +252,12 @@ def format_review(review: ReviewResult) -> str:
     """The review posted on the pull request; the reviewer's words link nothing (#315)."""
     from beeverforge.orchestrator.machine import _without_reviewer_mentions as quiet
 
-    lines = [f"**{review.decision}** — score {review.score}", "", quiet(review.summary)]
+    # THE HEADING OF A REVIEW THAT JUDGED NOTHING SAYS SO (#131), with no score: `**rejected** —
+    # score 0` is a judgement of the code nobody made, on the pull request's first line.
+    heading = (f"**{unread_words(review).capitalize()}** — this diff has not been reviewed, and "
+               "nothing here is a judgement about the code" if not_a_verdict(review)
+               else f"**{review.decision}** — score {review.score}")
+    lines = [heading, "", quiet(review.summary)]
     for f in review.findings:
         loc = f" (`{f.file}:{f.line}`)" if f.file else ""
         lines.append(f"- **{f.severity}**{loc}: {quiet(f.description)}")

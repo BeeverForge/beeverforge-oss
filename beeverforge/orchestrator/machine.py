@@ -1,9 +1,10 @@
 """The job runner — the deterministic maestro (ADR-0001 state machine).
 
-Slice 1 (the walking skeleton) drives: get_ticket → SPEC_VALIDATION → prepare →
-setup → execute → commit → validate → open PR. It stops before REVIEWING/REPAIRING
-and the D-12 lifecycle (those layer on next). The orchestrator itself stays
-deterministic (D-11); each step is a seam onto an adapter.
+It drives: get_ticket → SPEC_VALIDATION → prepare → setup → execute → commit →
+validate → open PR → REVIEWING → REPAIRING (a bounded review-repair, ADR-0006) and the
+job's parks and hand-backs. (Slice 1, the walking skeleton, stopped at the open PR; review
+and repair were layered on in this file.) The orchestrator itself stays deterministic
+(D-11); each step is a seam onto an adapter.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from beeverforge.adapters.notify.base import Level, NullNotifier
 from beeverforge.adapters.notify.base import Notifier as NotifierT
 from beeverforge.adapters.reviewer.base import ReviewerAdapter, ReviewInput
 from beeverforge.adapters.sandbox.base import BranchHeldElsewhere, SandboxAdapter, Workspace
+from beeverforge.adapters.sandbox.stopping import JobStopped, Stop
 from beeverforge.adapters.tracker.base import TrackerAdapter
 from beeverforge.contracts import (
     AgentRunMetric,
@@ -47,6 +49,7 @@ from beeverforge.contracts import (
 from beeverforge.contracts.bot import BotIdentity
 from beeverforge.contracts.item_space import closing_keyword, forge_owns_the_card
 from beeverforge.contracts.refs import canonical_ref
+from beeverforge.contracts.review import not_a_verdict, unread_words
 from beeverforge.contracts.run import (
     AGENT_ACCOUNT_HEADING,
     AGENT_ACCOUNT_MAX,
@@ -73,6 +76,7 @@ from beeverforge.orchestrator.validation import (
     applicable_validations,
     as_gate,
     could_not_run,
+    gate_timeout,
     scope_explosion,
 )
 from beeverforge.policy import census as census_policy
@@ -600,6 +604,26 @@ def _sections_from(rows: list[str]) -> int:
     return next((i + 1 for i in range(len(rows) - 1, -1, -1) if rows[i] == "## Validations"), 0)
 
 
+def _review_said(r: ReviewResult) -> str:
+    """The journal's `review` line for `r`: `<decision> (score N)`, or — for a review that judged
+    nothing (#131) — what happened instead, with no score. `rejected (score 0)` on one that did
+    not complete is a judgement nobody made, read by the panel and by `observability/query` as a
+    rejection of the code. ONE SPELLING for the four places a review is journalled."""
+    return unread_words(r) if not_a_verdict(r) else f"{r.decision} (score {r.score})"
+
+
+def _unfinished_review_note(r: ReviewResult) -> str:
+    """The hold's one sentence for a review that did not complete (#131): that it did not, and
+    why, from the review's own summary — its first sentence, without the "the review did not
+    complete:" the reviewer already opens it with."""
+    first = ((r.summary or "").strip().splitlines() or [""])[0].split(". ")[0].strip().rstrip(".")
+    lead = "the review did not complete:"
+    if first.lower().startswith(lead):
+        first = first[len(lead):].strip()
+    why = first[:300] or "the reviewer gave no reason"
+    return f"the review did not complete, so no pull request was opened — {why}."
+
+
 def _review_lines(r: ReviewResult) -> list[str]:
         """The pull request's review section — the ONE place it is composed (#187).
 
@@ -621,8 +645,9 @@ def _review_lines(r: ReviewResult) -> list[str]:
         A score of 0 is likewise reported only when one was given. Printing `(score 0)` for a
         review that produced no score is the same lie in smaller type.
         """
-        unread = r.score == 0 and not r.findings and (
-            "could not be parsed" in (r.summary or "") or "never ran" in (r.summary or ""))
+        # read from the review's own fields first, its sentence second (#131): one reading,
+        # shared with the first round's review stage
+        unread = not_a_verdict(r)
         from beeverforge.review import verdict as _verdict
 
         # NOT VERIFIED OUTRANKS THE DECISION WORD (#447): "## Review — approved_with_findings"
@@ -672,6 +697,15 @@ def _review_lines(r: ReviewResult) -> list[str]:
 # lines are split and neutralised, in `_pass_words` before the fold and the cut — neutralising
 # escapes `_` (no prefix matches `ghp\_`), keeps a link's destination raw, and the fold and the
 # cut break a secret that spans lines or straddles character 200. The claim says so.
+#
+# AND EVERYWHERE ELSE THE AGENT'S WORDS ARE QUOTED FOR A PERSON (#197): every journal note, every
+# `agent_action`, a review event's finding detail, and every hold and assumption note `_hold`
+# posts on the ticket pass the text through `_without_credentials` whole, BEFORE their `[:N]`:
+# `ghp_` and ten characters match no shape, so a scrub after the cut shows the head of a token
+# that straddles it. The agent's DecisionRequest is withheld field by field as soon as it is
+# parsed (`_decision_withheld`), so the decision comment, the hold's reason and
+# `RunResult.decision` all carry it withheld. The activity payload (`agent_account`,
+# `agent_passes`) stays raw, because the body above is composed from it (ADR-0001, D-5).
 
 #: Withholding credentials made "as it wrote it." false on its own (#885): it says what was changed.
 _CLAIM = ("This is the implementing agent's own account, as it wrote it, with any credential in it "
@@ -823,6 +857,21 @@ def _without_credentials(text: str) -> str:
     prefix, an `Authorization` value, a secret this process holds, and a URL's userinfo — replaced
     by the marker, not dropped, so the reader is told (#885)."""
     return scrub_credentials(text, userinfo=WITHHELD_CREDENTIAL + "@")
+
+
+def _decision_withheld(dr: DecisionRequest) -> DecisionRequest:
+    """The agent's DecisionRequest with every free-text field withheld, whole (#197): the question,
+    its context, and each option's label and consequence. It becomes `RunResult.decision`, which
+    the impediment payload, the panel's needs-you API and the coordinator's channel item quote, and
+    `_record_decision` posts it on the ticket. Each option's `key` and the `default` stay as
+    written: an answer is matched on them. `stage` is the machine's; `advice` is attached later."""
+    return dr.model_copy(update={
+        "question": _without_credentials(dr.question),
+        "context": _without_credentials(dr.context),
+        "options": [o.model_copy(update={"label": _without_credentials(o.label),
+                                         "consequence": _without_credentials(o.consequence)})
+                    for o in dr.options],
+    })
 
 
 def _quoted(text: str) -> list[str]:
@@ -1098,6 +1147,28 @@ def _fit_to_forge(before: list[str], account: _Account, after: list[str],
     return rows
 
 
+#: Worded after the rehearsal's (`onboarding/firstrun.py`, #331), and kept here rather than
+#: imported: the orchestrator does not reach into onboarding.
+_GIT_REFUSED_REMEDY = "make git usable on this workspace in the box"
+
+
+class DiffPathsUnread(Exception):
+    """`git diff --name-only` exited non-zero in the box: nobody knows which paths changed (#368).
+
+    It used to read as `[]` — "nothing reached the verifier" — and git's own words (exit 128,
+    dubious ownership, a lock) reached nobody. `str()` is one clause: what failed, git's exit code,
+    its last lines joined on one line, and the remedy."""
+
+    def __init__(self, rc: int, out: str) -> None:
+        self.rc = rc
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        self.words = " / ".join(lines[-3:])[:300]
+        super().__init__(
+            f"`git diff --name-only` exited {rc} in the box"
+            + (f": {self.words}" if self.words else "")
+            + f" — {_GIT_REFUSED_REMEDY}")
+
+
 def _measured_from(ws: Workspace, base: str) -> str:
     """What `<this>..HEAD` names so that the diff is this job's own change (#168).
 
@@ -1365,8 +1436,8 @@ def _review_event_detail(review: ReviewResult) -> list[dict]:
     for f in review.findings[:8]:
         out.append({
             "severity": f.severity,
-            "description": (f.description or "")[:200],
-            "file": f.file or "",
+            "description": _without_credentials(f.description or "")[:200],
+            "file": _without_credentials(f.file or ""),
             "line": f.line or 0,
         })
     return out
@@ -1406,6 +1477,91 @@ class JobRunner:
     #: and every runner of the same job (the run, a repair, an adjust, a re-review) is built with
     #: the same number, so they all find the branch the open pull request tracks.
     change: int = 0
+    #: A PERSON'S STOP, AS THE THREAD RUNNING THIS HEARS IT (#44). The activity's heartbeat loop
+    #: requests it when the job's workflow is ended; `_unless_stopped` asks it before each step
+    #: that reaches the forge or the board. None — every runner but a job's — asks nothing.
+    stop: Stop | None = field(default=None, repr=False)
+
+    def hears(self, stop: Stop) -> None:
+        """This runner, and its box, are told of `stop`. The box is given it only when it has a
+        `stop` of its own to set (a local box): it then starts each command in a process group the
+        stop kills. Not on the `SandboxAdapter` port, which is `runtime_checkable`: a data member
+        there would make every test double non-conforming."""
+        self.stop = stop
+        if hasattr(self.sandbox, "stop"):
+            self.sandbox.stop = stop
+
+    def _unless_stopped(self, step: str) -> None:
+        """Raise `JobStopped` when a person stopped this job: `step` is not taken.
+
+        ASKED BEFORE EACH STEP THAT REACHES THE FORGE OR THE BOARD — a push, a pull request, its
+        review, reviewers, a merge, a card's move, a comment on the ticket — because those are what
+        a stopped job did on a deployment, 46 minutes after `stop` said it was over. Raised, not
+        returned: a `BaseException` that the best-effort handlers do not swallow, out through
+        `run()`'s `finally`, which removes the worktree as a job that ends normally does.
+
+        `confirm`, NOT `requested` (review of #453): the heartbeat hears a terminate up to a
+        throttled minute late, so each of these steps also asks the engine whether the job's
+        workflow is still running (`Stop.ask`, set by the activity's heartbeat loop)."""
+        stop = getattr(self, "stop", None)
+        if stop is not None and stop.confirm():
+            log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
+                        step, stop.why or "a person stopped the job")
+            # WHAT ALREADY LANDED IS SAID, ONCE, and then the job stops (review of #453): an open
+            # pull request or a merge the stop arrived too late to prevent is otherwise mentioned
+            # by nothing — the card the stop put in the backlog says the work stopped
+            landed = vars(self).pop("_landed_here", None)
+            if landed is not None:
+                self._say_what_landed(*landed)
+            raise JobStopped(step, stop.why)
+
+    #: What may have landed on the forge before a stop reached the job: an opened pull request,
+    #: an armed auto-merge, a merge. The keys are the only sentences `_say_what_landed` says.
+    _WHAT_LANDED = {"opened": "job.stopped.landed.opened", "armed": "job.stopped.landed.armed",
+                    "merged": "job.stopped.landed.merged"}
+
+    def _landed(self, ticket: Ticket, kind: str, *, pr: str, base: str) -> None:
+        """An irreversible forge call returned (#44, review of #453): from here on a stop says what
+        it left behind (`_unless_stopped`), because nothing the stop does can take it back."""
+        assert kind in self._WHAT_LANDED, kind
+        done = vars(self).get("_landed_here", (None, None, None, None, frozenset()))[4]
+        vars(self)["_landed_here"] = (ticket, kind, pr, base, done)
+
+    #: What else reached the opened pull request, and so what the "opened" sentence says of it
+    #: (review of #453): a stop during `review_pr` lands the review, one during
+    #: `request_reviewers` asks them, and a sentence saying neither happened would be false.
+    _DONE_ON_IT = ("reviewed", "asked")
+
+    def _landed_also(self, what: str) -> None:
+        """Another forge call on the opened pull request returned: the sentence says it."""
+        assert what in self._DONE_ON_IT, what
+        landed = vars(self).get("_landed_here")
+        if landed is not None:
+            vars(self)["_landed_here"] = (*landed[:4], landed[4] | {what})
+
+    def _say_what_landed(self, ticket: Ticket, kind: str, pr: str, base: str,
+                         done: frozenset = frozenset()) -> None:
+        """THE ONE COMMENT A STOPPED JOB STILL WRITES, and the journal line beside it.
+
+        NOT `_say_on_ticket`, which refuses after a stop and must go on refusing: this takes no
+        text, only which of `_WHAT_LANDED`'s facts landed, so it cannot become a way to say
+        anything else after a stop. Best-effort, like every comment: a tracker that refuses loses
+        the comment, never the stop."""
+        # BUILT FROM WHAT WAS RECORDED, so it never says a review or a reviewer request that did
+        # happen did not
+        review = self._say("job.stopped.landed.reviewed" if "reviewed" in done
+                           else "job.stopped.landed.not-reviewed")
+        reviewers = self._say("job.stopped.landed.asked" if "asked" in done
+                              else "job.stopped.landed.not-asked")
+        body = self._say(self._WHAT_LANDED[kind], pr=pr, base=base, review=review,
+                         reviewers=reviewers)
+        self._emit(ticket, "note", f"stopped after the forge took it: {body}", url=pr, landed=kind)
+        try:
+            self.tracker.comment(ticket.id, body)
+        except Exception as exc:  # noqa: BLE001 — the stop stands; only the telling failed
+            log.error("BEEVERFORGE_TICKET_COMMENT_LOST ticket=%s (%s) — the tracker refused the "
+                      "comment saying what landed before the stop: %s", ticket.id,
+                      str(exc)[:160], body[:160])
 
     def _review(self, *, sandbox, workspace, review_input: ReviewInput) -> ReviewResult:
         """The reviewer's verdict with its evidence checked against the gates that ran (#447).
@@ -1756,7 +1912,7 @@ class JobRunner:
                                       hold_cause=ENVIRONMENT)
                 plan_result = self.agent.plan(sandbox=self.sandbox, workspace=ws, context=ctx)
                 for action in plan_result.actions:
-                    self._emit(ticket, "agent_action", action, role="planner")
+                    self._emit(ticket, "agent_action", _without_credentials(action), role="planner")
                 self._emit_credential(ticket, plan_result)
                 # COUNTED BEFORE IT IS ASKED WHETHER IT PAUSED (#262), at this pass and at every
                 # one below: a pause is a way out, and the count used to sit after it, so a pass
@@ -1824,7 +1980,8 @@ class JobRunner:
                         f"`.beeverforge/project.yaml`. Resuming runs the plan again.",
                         JobState.ON_HOLD, branch=branch, hold_cause=UNKNOWN)
                 if plan_result.pause_reason:
-                    self._emit(ticket, "note", f"planner paused: {plan_result.summary[:200]}",
+                    self._emit(ticket, "note", "planner paused: "
+                               f"{_without_credentials(plan_result.summary)[:200]}",
                                cost_usd=plan_result.cost_usd, role="planner")
                     return self._paused(
                         ticket, plan_result.pause_reason, plan_result.retry_at, branch=branch,
@@ -1832,7 +1989,7 @@ class JobRunner:
                     )
                 ctx.plan = (plan_result.summary or plan_result.raw_output or "").strip()
                 plan_cost = plan_result.cost_usd or 0.0
-                self._emit(ticket, "note", f"plan ready: {ctx.plan[:200]}",
+                self._emit(ticket, "note", f"plan ready: {_without_credentials(ctx.plan)[:200]}",
                            cost_usd=plan_result.cost_usd, role="planner")
                 # Task-sizing gate (ADR-0002): if the plan is too large (or the planner
                 # returned a SPLIT verdict), refine BEFORE the expensive executor runs —
@@ -1856,10 +2013,11 @@ class JobRunner:
             self._set_state(ticket, JobState.IMPLEMENTING)
             agent_result = self.agent.execute(sandbox=self.sandbox, workspace=ws, context=ctx)
             for action in agent_result.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
             self._emit_credential(ticket, agent_result)
             self._emit(
-                ticket, "note", f"agent finished: {agent_result.summary[:200]}",
+                ticket, "note",
+                f"agent finished: {_without_credentials(agent_result.summary)[:200]}",
                 cost_usd=agent_result.cost_usd, role="executor",
             )
             # WHAT THE AGENT SAYS IT DID, WHOLE (#627): the note above keeps its 200-character cut
@@ -1889,13 +2047,15 @@ class JobRunner:
             if not agent_result.ok and agent_result.pause_reason is None:
                 dr = parse_decision(agent_result.raw_output or agent_result.summary)
                 if dr is not None:
+                    dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
                     dr.stage = dr.stage or "execute"
                     self._record_decision(ticket, dr)
                     # ADR-0013 D1: the executor was told to leave the workspace continuable, and
                     # the resume carries the picked option INTO the same session via the handle.
                     handle = self._preserve_for_hold(ticket, ws, agent_result.resume_handle)
                     return self._hold(
-                        ticket, owner, f"decision needed — {dr.question[:200]}",
+                        ticket, owner,
+                        f"decision needed — {dr.question[:200]}",
                         JobState.BLOCKED, branch=branch, decision=dr, resume_handle=handle,
                         spent_turns=self._turns,
                     )
@@ -1913,7 +2073,8 @@ class JobRunner:
                 self._set_state(ticket, JobState.REPAIRING)
                 self._emit(ticket, "note",
                            f"⛑ recovery {rec}/{self.manifest.recovery_max_attempts}: executor "
-                           f"stopped unfinished ({agent_result.summary[:120]})")
+                           "stopped unfinished "
+                           f"({_without_credentials(agent_result.summary)[:120]})")
                 if rec == 1 and agent_result.resume_handle and \
                         hasattr(self.agent, "continue_execute"):
                     agent_result = self._hand("continue_execute", ws, ctx, _CONTINUE_BRIEF,
@@ -1924,10 +2085,11 @@ class JobRunner:
                 else:  # an adapter without recovery methods reuses repair (same shape)
                     agent_result = self._repair(ws, ctx, _recovery_brief(agent_result))
                 for action in agent_result.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit_credential(ticket, agent_result)
                 self._emit(ticket, "note", f"recovery {rec} finished: "
-                                           f"{agent_result.summary[:150]}",
+                                           f"{_without_credentials(agent_result.summary)[:150]}",
                            cost_usd=agent_result.cost_usd, role="executor")
                 self._count(agent_result, "recovery")
                 # a recovery commits nothing of its own: its position is its identity
@@ -1945,7 +2107,7 @@ class JobRunner:
                 # message is decision-shaped: the human decides, never debugs.
                 handle = self._preserve_for_hold(ticket, ws, agent_result.resume_handle)
                 why = (self._effort_reason() if self._over_effort()
-                       else f"agent stopped: {agent_result.summary}")
+                       else f"agent stopped: {_without_credentials(agent_result.summary)}")
                 return self._hold(
                     ticket, owner, why,
                     JobState.ON_HOLD, branch=branch, resume_handle=handle,
@@ -1981,9 +2143,11 @@ class JobRunner:
                 rep = self._repair(ws, self._build_context(ticket, ws),
                                    _gates_brief(validations))
                 for action in rep.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit(
-                    ticket, "note", f"repair {attempts}: {rep.summary[:150]}", cost_usd=rep.cost_usd
+                    ticket, "note", f"repair {attempts}: {_without_credentials(rep.summary)[:150]}",
+                    cost_usd=rep.cost_usd,
                 )
                 total_cost += rep.cost_usd or 0.0
                 self._count(rep, "repair")
@@ -2087,9 +2251,11 @@ class JobRunner:
                 rep = self._repair(ws, self._build_context(ticket, ws),
                                    _suppression_repair_brief(result.suppression_details))
                 for action in rep.actions:
-                    self._emit(ticket, "agent_action", action, role="executor")
+                    self._emit(ticket, "agent_action", _without_credentials(action),
+                               role="executor")
                 self._emit(ticket, "note",
-                           f"suppression-repair {supp_attempts}: {rep.summary[:150]}",
+                           f"suppression-repair {supp_attempts}: "
+                           f"{_without_credentials(rep.summary)[:150]}",
                            cost_usd=rep.cost_usd, role="executor")
                 # NEVER COUNTED, ON ANY WAY OUT (#262). The journal above carried its price, so
                 # `/api/jobs` summed it; the result, the per-model telemetry and the pull request's
@@ -2136,18 +2302,30 @@ class JobRunner:
                     ),
                 )
                 self._count_review(result.review)
+                # A REVIEW THE LIMIT OR THE CREDENTIAL STOPPED IS A PAUSE, NOT A VERDICT (#131):
+                # counted first (#262), then out the way an executor pause goes, before the
+                # journal records a "rejected (score 0)" nobody made.
+                if result.review.pause_reason:
+                    return self._paused(ticket, result.review.pause_reason,
+                                        result.review.retry_at, branch=branch, ws=ws)
                 advisory = self.manifest.review_mode != "blocking"
                 # ITS PRICE ON ITS LINE, like every other pass's (#310). `_count_review` put the
                 # review in the result, and this line — the one `/api/jobs` and the panel sum —
                 # carried no `cost_usd`, so the dashboard said $0.01 for a ticket that cost $0.26.
                 self._emit(
                     ticket, "review",
-                    f"{result.review.decision} (score {result.review.score})"
-                    + (" · advisory" if advisory else ""),
+                    _review_said(result.review) + (" · advisory" if advisory else ""),
                     findings=len(result.review.findings),
                     detail=_review_event_detail(result.review),
                     cost_usd=result.review.cost_usd,
                 )
+                # A REVIEW THAT JUDGED NOTHING NEVER PROCEEDS AS REVIEWED (#131). With no pause to
+                # take, it went on as an ordinary rejection — and in advisory mode a rejection is
+                # information, so `should_auto_merge` merged it, a surviving pragma counted as
+                # vetted. It holds as an executor run that stopped unfinished holds: the work kept,
+                # a person told. Journalled first, so its price is on its line.
+                if not_a_verdict(result.review):
+                    return self._unfinished_review_hold(ticket, owner, ws, branch, result)
                 # ADR-0014: in ADVISORY mode the findings are posted to the PR (below) as a comment
                 # for a human — they never trigger the repair loop or block the merge. The
                 # deterministic gates + the executor's own TDD are the quality floor.
@@ -2167,9 +2345,11 @@ class JobRunner:
                     rep = self._repair(ws, self._build_context(ticket, ws),
                                        _review_repair_brief(result.review))
                     for action in rep.actions:
-                        self._emit(ticket, "agent_action", action, role="executor")
+                        self._emit(ticket, "agent_action", _without_credentials(action),
+                                   role="executor")
                     self._emit(
-                        ticket, "note", f"review-repair {rev_attempts}: {rep.summary[:150]}",
+                        ticket, "note", f"review-repair {rev_attempts}: "
+                                        f"{_without_credentials(rep.summary)[:150]}",
                         cost_usd=rep.cost_usd, role="executor",
                     )
                     # count it like every other invocation: this one was missing from the
@@ -2212,20 +2392,25 @@ class JobRunner:
                     # branch that exists precisely because something went wrong, and therefore the
                     # expensive one — the cheapest-looking part of the ticket.
                     self._count_review(result.review)
+                    if result.review.pause_reason:  # the re-review's limit too (#131)
+                        return self._paused(ticket, result.review.pause_reason,
+                                            result.review.retry_at, branch=branch, ws=ws)
                     self._emit(
                         ticket, "review",
-                        f"{result.review.decision} (score {result.review.score})"
-                        f" [after repair {rev_attempts}]",
+                        _review_said(result.review) + f" [after repair {rev_attempts}]",
                         findings=len(result.review.findings),
                         detail=_review_event_detail(result.review),
                         cost_usd=result.review.cost_usd,
                     )
+                    if not_a_verdict(result.review):  # the re-review judged nothing too (#131)
+                        return self._unfinished_review_hold(ticket, owner, ws, branch, result)
 
             # THE KNOWLEDGE GATE, ON THE CHANGE AS IT WILL BE PROPOSED (ADR-0046): after the
             # review-repair loop, because the diff it judges must be the one the pull request
             # carries, and before the push, because its stance goes into the body.
             self._knowledge_gate(ticket, ws, base, result)
             # push the branch to the forge (as the bot, host credentials) before the PR
+            self._unless_stopped("publish_branch")
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             card = card_reference_for(self, ticket)
             # CHARGED BEFORE THE BODY IS WRITTEN (#310). Every pass of this walk has run by now —
@@ -2243,21 +2428,25 @@ class JobRunner:
             result.auto_but_for_the_look = auto_but_for_the_look(
                 self.manifest, result, profile=getattr(self, "_profile", None))
             result.preview_shape = self._preview_shape(ws)
+            self._unless_stopped("open_pr")
             pr = self.forge.open_pr(
                 head=branch, base=base, title=card.title,
                 body=self._pr_body(ticket, result, card=card),
             )
             result.pr_url = pr
+            self._landed(ticket, "opened", pr=pr, base=base)
             self._emit(ticket, "pr", f"opened {pr}", url=pr)
 
             # the reviewer's verdict on the PR (D-5). ADR-0014: in advisory mode review_event()
             # returns "comment" — informational, never a blocking request-changes.
             if result.review is not None:
+                self._unless_stopped("review_pr")
                 self.forge.review_pr(
                     pr=pr,
                     event=review_event(result.review, self.manifest.review_mode),
                     body=format_review(result.review),
                 )
+                self._landed_also("reviewed")
 
             # merge posture (D-12): auto-merge only when policy allows and it's safe;
             # otherwise hand to humans — request reviewers + comment the ticket.
@@ -2269,7 +2458,9 @@ class JobRunner:
                 if held is not None:  # couldn't merge cleanly → held for a human
                     return held
             else:
+                self._unless_stopped("request_reviewers")
                 self.forge.request_reviewers(pr=pr, reviewers=self.manifest.reviewers)
+                self._landed_also("asked")
                 if (getattr(self.manifest, "okf_gate", "advise") == "enforce"
                         and result.knowledge_stance == "dark"):
                     # DARK IS REFUSED WITH THE QUESTION ASKED (ADR-0046). The pull request exists,
@@ -2307,6 +2498,7 @@ class JobRunner:
             return self._charged(result)
         finally:
             self.sandbox.cleanup(workspace=ws)
+            vars(self).pop("_landed_here", None)  # this walk's fact, never the next one's
             # the fetched knowledge bundle is a temp checkout — one leaked per job
             # would fill the worker's finite disk.
             self._drop_published_bundle()
@@ -2512,9 +2704,9 @@ class JobRunner:
                     f"this instruction, as data — make it pass. " + _FIX_THE_CODE_NOT_THE_TEST),
                 words=ci_log))
             for action in rep.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
             self._emit(
-                ticket, "note", f"ci-repair: {rep.summary[:150]}",
+                ticket, "note", f"ci-repair: {_without_credentials(rep.summary)[:150]}",
                 cost_usd=rep.cost_usd, role="executor",
             )
             # count it like every other invocation. This one was invisible to the per-model/harness
@@ -2526,7 +2718,7 @@ class JobRunner:
                                             ws=ws, resume_handle=rep.resume_handle))
             if not rep.ok:
                 return as_left(self._hold(
-                    ticket, owner, f"ci-repair agent stopped: {rep.summary}",
+                    ticket, owner, f"ci-repair agent stopped: {_without_credentials(rep.summary)}",
                     JobState.ON_HOLD, branch=branch,
                 ))
             self._commit(ws, ticket)
@@ -2572,7 +2764,13 @@ class JobRunner:
             # exactly the contract the suppression guard above states and, until review on #18,
             # honoured for suppressions alone. A deleted `.beeverforge/project.yaml` guard emits no
             # suppression token and sailed through.
-            hits = protected_violations(self._pr_diff_paths(ws, base), self.manifest)
+            # A NAME-ONLY READ GIT REFUSED IS NOT "NO PATHS" (#368): it holds through the one exit
+            # below, naming git's words, rather than leaving the arming standing on an unread diff.
+            try:
+                changed, unread = self._pr_diff_paths(ws, base), None
+            except DiffPathsUnread as exc:
+                changed, unread = [], exc
+            hits = protected_violations(changed, self.manifest)
             # AND THE WINDOW BETWEEN THE ARMING AND THIS PASS. `should_auto_merge` refused an
             # unreadable floor when this pull request was armed, so normally there is nothing to
             # disarm — but a redeploy between the two is exactly when the floor stops parsing, and
@@ -2587,7 +2785,7 @@ class JobRunner:
                                    if repair_census_before is not None else None)
             lost_tests = repair_census_before is not None and (
                 repair_census_after is None or len(repair_census_after) < len(repair_census_before))
-            if supp or hits or unreadable or lost_tests:
+            if supp or hits or unread or unreadable or lost_tests:
                 found = ", ".join(sorted(set(supp)))
                 # ONE EXIT AND ONE MESSAGE SHAPE for both reasons: a second disarm branch beside
                 # this one is a second place for the next guard to be forgotten.
@@ -2597,6 +2795,9 @@ class JobRunner:
                 if hits:
                     shown = ", ".join(hits[:protected_policy.MAX_SHOWN])
                     why.append(f"a change to the verifier's own inputs [{shown}]")
+                if unread is not None:
+                    why.append("a change whose paths git would not name, so the verifier's own "
+                               f"inputs could not be checked ({unread})")
                 if unreadable and not hits:
                     why.append("a protected-path floor this deployment can no longer read "
                                "(OUR install, not this repository)")
@@ -2650,7 +2851,7 @@ class JobRunner:
                 self._count_review(review)
                 self._emit(
                     ticket, "review",
-                    f"{review.decision} (score {review.score}) [after repair]",
+                    _review_said(review) + " [after repair]",
                     findings=len(review.findings), detail=_review_event_detail(review),
                     cost_usd=review.cost_usd,
                 )
@@ -2715,8 +2916,9 @@ class JobRunner:
             self._set_state(ticket, JobState.REPAIRING)
             fix = self._repair(ws, self._build_context(ticket, ws), _gates_brief(validations))
             for action in fix.actions:
-                self._emit(ticket, "agent_action", action, role="executor")
-            self._emit(ticket, "note", f"adjust repair {attempts}: {fix.summary[:150]}",
+                self._emit(ticket, "agent_action", _without_credentials(action), role="executor")
+            self._emit(ticket, "note",
+                       f"adjust repair {attempts}: {_without_credentials(fix.summary)[:150]}",
                        cost_usd=fix.cost_usd, role="executor")
             spent += fix.cost_usd or 0.0
             self._count(fix, "repair")
@@ -2809,7 +3011,7 @@ class JobRunner:
             )
             self._count_review(review)
             self._emit(
-                ticket, "review", f"{review.decision} (score {review.score}) [re-reviewed]",
+                ticket, "review", _review_said(review) + " [re-reviewed]",
                 findings=len(review.findings), detail=_review_event_detail(review),
                 cost_usd=review.cost_usd,
             )
@@ -2899,6 +3101,8 @@ class JobRunner:
 
     def _set_state(self, ticket: Ticket, state: JobState, reason: str | None = None, *,
                    needs_person: bool | None = None) -> None:
+        # OUTSIDE EVERY `try` BELOW: a stopped job moves no card and hands no outcome back (#44)
+        self._unless_stopped(f"set_state {state.value}")
         # THE FORGE IS A MIRROR OF THE TRANSITION, NOT THE TRANSITION. What actually decides what
         # happens next is this platform's own record — the event, the RunResult, and the alarm the
         # caller raises after. Once every tracker write learned to report a refusal by raising,
@@ -3231,6 +3435,7 @@ class JobRunner:
         is why this is an ERROR with a greppable marker rather than a shrug; losing the park costs a
         job nobody knows is stuck, which is the thing this platform exists to make impossible.
         """
+        self._unless_stopped("say_on_ticket")  # outside the `try`: a stop is not a lost comment
         try:
             self.tracker.comment(ticket_id, body)
         except Exception as exc:  # noqa: BLE001 — the act stands; only the telling failed
@@ -3238,6 +3443,21 @@ class JobRunner:
                       "comment; "
                       "what it described still happened, and the ticket does not say so: %s",
                       ticket_id, str(exc)[:160], body[:160])
+
+    def _unfinished_review_hold(self, ticket: Ticket, owner: str | None, ws: Workspace,
+                                branch: str, result: RunResult) -> RunResult:
+        """A review that judged nothing, with no pause to take (#131): the hold an executor run
+        that stopped unfinished takes (`_preserve_for_hold`, then `_hold`) — the work committed
+        and pushed so Resume continues it, the ticket back with its owner, one sentence saying
+        the review did not complete and why. No pull request: nothing reviewed what it would
+        carry."""
+        handle = self._preserve_for_hold(ticket, ws, None)
+        return self._hold(
+            ticket, owner, _unfinished_review_note(result.review), JobState.ON_HOLD,
+            branch=branch, resume_handle=handle, spent_turns=self._turns,
+            validations=result.validations, review=result.review,
+            added_suppressions=result.added_suppressions,
+            suppression_details=result.suppression_details)
 
     def _paused(
         self, ticket: Ticket, reason: str | None, retry_at: str | None, branch: str = "",
@@ -3298,6 +3518,7 @@ class JobRunner:
             # exactly this reason, alone in the tree.
             if written is not None and not written:
                 return None  # nothing was written → plain hold, fresh restart on resume
+            self._unless_stopped("publish_branch for a hold")  # a BaseException: not caught below
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             self._emit(ticket, "note", "partial work pushed — Resume will continue it")
             # No session known → a non-empty sentinel: it still signals "restore the branch"
@@ -3319,6 +3540,7 @@ class JobRunner:
             return resume_handle  # local/test path with no real git remote — nothing to push
         try:
             self._commit(ws, ticket)  # commit the partial tree (no-op if the agent wrote nothing)
+            self._unless_stopped("publish_branch for a pause")  # a BaseException: not caught below
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             self._emit(ticket, "note", "partial work pushed — resume will continue it")
             return resume_handle
@@ -3343,7 +3565,8 @@ class JobRunner:
         split = re.search(r"SPLIT NEEDED:.*", plan, re.IGNORECASE | re.DOTALL)
         if split:
             return self._hold(
-                ticket, owner, f"ticket too large — {split.group().strip()[:400]}",
+                ticket, owner,
+                f"ticket too large — {_without_credentials(split.group()).strip()[:400]}",
                 JobState.NEEDS_REFINEMENT, branch=branch,
             )
         return None
@@ -3366,6 +3589,7 @@ class JobRunner:
                 return self._hold(
                     ticket, owner, "the planner blocked but proposed no options — refine the "
                     "ticket or split it", JobState.NEEDS_REFINEMENT, branch=branch)
+            dr = _decision_withheld(dr)  # the ticket, the result and the panel (#197)
             dr.stage = dr.stage or "plan"
             self._record_decision(ticket, dr)
             return self._hold(
@@ -3374,6 +3598,7 @@ class JobRunner:
         if status == "assume":
             am = re.search(r'"assumption"\s*:\s*"((?:[^"\\]|\\.){1,400})"', plan)
             note = (am.group(1) if am else "").strip() or "(assumption recorded)"
+            note = _without_credentials(note)  # the ticket, the journal and the PR quote it (#197)
             self._say_on_ticket(ticket.id, self._say("job.assumption", note=note))
             self._emit(ticket, "note", f"assumption: {note}", role="planner")
             self._assumptions.append(note)
@@ -3397,6 +3622,7 @@ class JobRunner:
             + "\n".join(lines)
             + "\n\nAnswer on the panel, or in the project channel with `decision: <key>`."
         )
+        self._unless_stopped("record_decision")  # outside the `try`: a stop is not a lost comment
         try:
             self.tracker.comment(ticket.id, body)
         except Exception as exc:  # noqa: BLE001 — recording is best-effort; the park still holds
@@ -3433,7 +3659,9 @@ class JobRunner:
                     f"PR {pr} rebased onto {base} but validations then failed — needs a human",
                     JobState.ON_HOLD, branch=branch,
                 )
+            self._unless_stopped("publish_branch after a rebase")
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+        self._unless_stopped("merge_pr")
         try:
             self.forge.merge_pr(pr=pr)
         except Exception as exc:  # e.g. a race re-drifted it, or the merge is truly blocked
@@ -3452,7 +3680,9 @@ class JobRunner:
         # (required CI still pending). Only claim MERGED when it truly is; otherwise hand the
         # durable workflow the CI-watch/repair/merge loop (ADR-0004) — a red CI gets fixed,
         # not left armed forever.
-        if self.forge.pr_merged(pr=pr):
+        merged = self.forge.pr_merged(pr=pr)
+        self._landed(ticket, "merged" if merged else "armed", pr=pr, base=base)
+        if merged:
             self._emit(ticket, "pr", "auto-merge complete", url=pr)
             result.state = JobState.MERGED
             self._set_state(ticket, JobState.MERGED)
@@ -3618,10 +3848,10 @@ class JobRunner:
         from beeverforge.knowledge.gate import judge
         from beeverforge.knowledge.pipeline import discard_fetched_bundle
 
-        paths = self._pr_diff_paths(ws, base)
         bundle: Path | None = None
         authored = 0
         try:
+            paths = self._pr_diff_paths(ws, base)
             # THE FORGE'S REPOSITORY, NEVER `ticket.repo` (#403). The ticket's `repo` is where the
             # TRACKER keeps the card — the registry name on the local board, the Azure DevOps
             # project on Azure Boards — and the bundle is published under the repository the
@@ -3638,6 +3868,11 @@ class JobRunner:
                 # the concepts the dark files lack, publishes them, and judges again. Parking
                 # with the question is what is left when that did not cover the change.
                 report, authored = self._author_first(ticket, bundle, report, paths)
+        except DiffPathsUnread as exc:
+            # WHOLE, NOT CUT AT 120 CHARACTERS like the handler below: the remedy is at the end
+            log.warning("BEEVERFORGE_KNOWLEDGE_GATE_SKIPPED ticket=%s (%s)", ticket.id, exc)
+            result.knowledge_note = f"could not run — {exc}; nothing was judged"
+            return
         except Exception as exc:  # noqa: BLE001 — the gate informs or parks; it never crashes a job
             log.warning("BEEVERFORGE_KNOWLEDGE_GATE_SKIPPED ticket=%s (%s)", ticket.id,
                         str(exc)[:160])
@@ -3804,15 +4039,19 @@ class JobRunner:
 
         `sandbox.diff_paths` answers the same question against `workspace.base_branch`; this takes
         the base the caller is already holding, because the CI-repair path works on an open pull
-        request and must not assume the two agree. A failed read returns `[]` — the gate that uses
-        it treats an empty diff as "nothing reached the verifier", which is the honest reading of
-        "git could not say" here only because the suppression scan beside it fails the same way.
+        request and must not assume the two agree.
+
+        A FAILED READ RAISES `DiffPathsUnread` (#368), carrying git's exit code and words. It used
+        to return `[]`, which every caller reads as "nothing reached the verifier"; an empty list
+        now means only what git said with exit 0.
         """
         rc, out = self.sandbox.run(
             workspace=ws, command=f"git diff --name-only {_measured_from(ws, base)}..HEAD",
             timeout=120,
         )
-        return [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        if rc != 0:
+            raise DiffPathsUnread(rc, out)
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
     def _head(self, ws: Workspace) -> str:
         """The commit the workspace's branch points at — "" when git could not say.
@@ -3858,11 +4097,28 @@ class JobRunner:
             "git checkout -- .github/workflows 2>/dev/null; "
             "git clean -fdq .github/workflows 2>/dev/null; "
         )
-        self.sandbox.run(
+        # BY EXIT CODE, NOT `|| true` (#172). git commit exits 1 for "nothing to commit", and that
+        # stays quiet; but a box whose git refuses the workspace ("detected dubious ownership")
+        # exits 128, and `|| true` read that as nothing to commit — the job silently committed
+        # nothing. Exit 1 is believed only when nothing is staged: not "is the tree clean?",
+        # because a dirty submodule stays ` M sub` in `git status` while `git add -A` stages
+        # nothing of it, and a hook that rejects the commit leaves its changes staged.
+        rc, out = self.sandbox.run(
             workspace=ws,
-            command=f"{strip_workflows}git add -A && {author}git commit -m {msg} || true",
+            command=f"{strip_workflows}git add -A && {author}git commit -m {msg}",
             timeout=120,
         )
+        if rc == 0:
+            return
+        if rc == 1:
+            staged_rc, _ = self.sandbox.run(
+                workspace=ws, command="git diff --cached --quiet", timeout=60)
+            if staged_rc == 0:
+                return
+        words = " ".join((out or "").split())[:300] or "no output"
+        raise RuntimeError(
+            f"git refused to commit the job's work in the box (exit {rc}: {words}), so nothing "
+            "was committed; make git usable on this workspace in the box.")
 
     def _note_stripped_workflows(self, ws: Workspace, ticket: Ticket) -> None:
         """Record (and announce) any `.github/workflows/**` change about to be stripped. Purely
@@ -3984,7 +4240,8 @@ class JobRunner:
         return ids
 
     #: The paths whose edit changes what a preview would RUN (ADR-0050 D3): the compose spec's
-    #: names at the root, and everything the factory keeps under `.beeverforge/`.
+    #: names at the root, and everything the factory keeps under `.beeverforge/` (or the former
+    #: `.openfactory/`, #265).
     _SHAPE_NAMES = frozenset({"compose.yaml", "compose.yml", "docker-compose.yaml",
                               "docker-compose.yml"})
 
@@ -4004,10 +4261,12 @@ class JobRunner:
         from beeverforge.util import yaml_io
 
         hits = tuple(getattr(self, "_protected", ()) or ())
-        manifest_rel = namespace.MANIFEST
-        if not any(h in self._SHAPE_NAMES or h.startswith(".beeverforge/") for h in hits):
+        if not any(h in self._SHAPE_NAMES or namespace.is_ours(h) for h in hits):
             return []
         root = Path(getattr(ws, "host_path", None) or ws.path)
+        # THE FOLDER THIS REPOSITORY USES — `.openfactory/` when that is its one (#265).
+        folder = namespace.dir_in(root)
+        manifest_rel = namespace.in_repo(root, namespace.MANIFEST)
         try:
             text = (root / manifest_rel).read_text(encoding="utf-8")
             block = (yaml_io.load(text) or {}).get("preview") or {}
@@ -4015,11 +4274,11 @@ class JobRunner:
             block = {}
         compose = block.get("compose") if isinstance(block, dict) else None
         files = [compose] if isinstance(compose, str) else list(compose or [])
-        extra = root / ".beeverforge" / "preview"
+        extra = root / folder / "preview"
         if extra.is_dir():
             files += sorted(str(p.relative_to(root)) for p in extra.rglob("*") if p.is_file())
-        if (root / ".beeverforge" / "preview.compose.yml").is_file():
-            files.append(".beeverforge/preview.compose.yml")
+        if (root / folder / "preview.compose.yml").is_file():
+            files.append(f"{folder}/preview.compose.yml")
         out: list[str] = []
         for rel in dict.fromkeys(str(f) for f in files if f):
             path = (root / rel)
@@ -4073,7 +4332,7 @@ class JobRunner:
             cmd = gate.command
             # A scan measured in minutes must not borrow the test suite's wall, and a scanner that
             # hangs must not hold the floor for the test timeout.
-            timeout = (gate.timeout_minutes * 60) if gate.timeout_minutes else _VALIDATION_TIMEOUT
+            timeout = gate_timeout(gate, _VALIDATION_TIMEOUT)
             rc, out = self.sandbox.run(workspace=ws, command=cmd, timeout=timeout)
             # THE SHELL'S VERDICT ON THE COMMAND, kept apart from the gate's verdict on the code.
             unrunnable = could_not_run(rc, out)

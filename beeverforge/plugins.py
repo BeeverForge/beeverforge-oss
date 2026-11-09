@@ -108,12 +108,13 @@ def install_hint(axis: str, kind: str) -> str:
     refusal then says only what IS installed, which is all it knows.
 
     IT NO LONGER SAYS `pip install <name>`, AND THAT WAS THE ONLY REMEDY A STUCK OPERATOR HAD
-    (2026-08-26). Nothing in this repository publishes a distribution to an index, so the bare
-    name resolved nowhere: the one command the platform handed a person at the moment it refused
-    to run was a command that fails, while the page repeating it called the packages private
-    twenty lines later. What is TRUE is where the row comes from — a wheel the deployment
-    carries — and what the kind is called on the entry-point group, which is also the whole
-    contract a stranger needs to satisfy it with a package of their own
+    (2026-08-26). Nothing in this repository published a distribution to an index then (the
+    release workflow's `pypi` job now does, once a maintainer enables its trusted publisher, and
+    for the core only), so the bare name resolved nowhere: the one command the platform handed a
+    person at the moment it refused to run was a command that fails, while the page repeating it
+    called the packages private twenty lines later. What is TRUE is where the row comes from — a
+    wheel the deployment carries — and what the kind is called on the entry-point group, which is
+    also the whole contract a stranger needs to satisfy it with a package of their own
     (`docs/core/07-extensibility.md`).
     """
     package = SHIPS_IN.get(f"{axis}.{kind}")

@@ -18,6 +18,23 @@ AN EXPLICIT PATH IS NEVER OVERRIDDEN. `Project.manifest_path` exists so a client
 where their conventions say; the refusal below applies only to OUR default location, because the
 retired name has a twin only there.
 
+THE OPENFACTORY NAME IS READ AGAIN — AMENDED 2026-11-07 (GitHub issue #265). The paragraphs above
+are the history of the `.sdlc` name and still hold for it: that name is refused, never read. The
+platform's previous release, OpenFactory 0.7, called the folder `.openfactory/`, and the people
+who ran it have repositories that carry it. Renaming those on the platform's own initiative would
+rewrite a client's repository nobody asked us to touch, so the core READS both names:
+
+    `.beeverforge/` when the repository has it — it wins when both are there, and `doctor` names
+        the other as stale;
+    `.openfactory/` (`FORMER_DIR`) when only that one is there;
+    `.beeverforge/` for a repository that has neither — what the platform creates is created
+        under the current name.
+
+`dir_in(root)` is that one answer, and every reader and every writer into an EXISTING repository
+takes the directory from it — a writer never moves a client's file to the other name. The guards
+that match paths under the folder (the context-write policy, the preview's shape files, the
+floor's protected glob) match BOTH names, from the one tuple `DIRS`.
+
 …AND THE ONE EXCEPTION IS A PULL REQUEST, which is written here because it is the exception to the
 paragraph above (GitHub issue #259). READING honours a `manifest_path` outside the repository,
 through the very same `root / relative` join — an absolute value wins it, which is exactly what
@@ -77,6 +94,62 @@ PRODUCT_MANIFEST = f"{DIR}/product.yaml"
 RETIRED_DIR = ".sdlc"
 
 
+#: The directory's FORMER name — OpenFactory 0.7's — which is READ, unlike the retired one (#265).
+#: A repository that carries only this directory keeps it: readers find their files there and
+#: writers write there. Never created by the platform in a repository that does not have it.
+FORMER_DIR = ".openfactory"
+
+#: Both names the folder is read under, the current one first. The ONE place a guard takes them
+#: from: a guard that matched one name would let a write into the other straight past it.
+DIRS = (DIR, FORMER_DIR)
+
+#: The same two, as the prefixes of a relative POSIX path under them.
+PREFIXES = tuple(f"{d}/" for d in DIRS)
+
+
+def is_ours(relative: str) -> bool:
+    """Whether a repository-relative POSIX path is the folder itself or lies under it, by
+    EITHER name — the question every guard asks."""
+    rel = str(relative).replace("\\", "/").removeprefix("./")
+    return rel in DIRS or rel.startswith(PREFIXES)
+
+
+def dir_in(root: Path) -> str:
+    """The folder `root` uses: `.beeverforge` when it has it, else `.openfactory` when it has
+    THAT, else `.beeverforge` — a repository with neither is new, and new is the current name."""
+    if (Path(root) / FORMER_DIR).is_dir() and not (Path(root) / DIR).is_dir():
+        return FORMER_DIR
+    return DIR
+
+
+def stale_former_dir(root: Path) -> bool:
+    """Whether `root` carries BOTH folders — the current one is read, and the former one is
+    stale: nothing under it is read while the current one is there."""
+    return (Path(root) / DIR).is_dir() and (Path(root) / FORMER_DIR).is_dir()
+
+
+def in_repo(root: Path, relative: str) -> str:
+    """`relative` as the repository at `root` spells it: a path under OUR default folder is
+    moved under the folder the repository actually uses (`dir_in`); anything else — an explicit
+    path a client chose — is returned exactly as given."""
+    rel = str(relative).replace("\\", "/").removeprefix("./")
+    if rel == DIR or rel.startswith(f"{DIR}/"):
+        return dir_in(root) + rel[len(DIR):]
+    return str(relative)
+
+
+def spellings(relative: str) -> tuple[str, ...]:
+    """Every spelling of `relative` a repository may carry: a path under either of the folder's
+    names under BOTH of them, the current one first; anything else, only itself. What a guard
+    asks when it holds one path and must recognise the other name too."""
+    rel = str(relative).replace("\\", "/").removeprefix("./")
+    for d in DIRS:
+        if rel == d or rel.startswith(f"{d}/"):
+            rest = rel[len(d):]
+            return tuple(f"{other}{rest}" for other in DIRS)
+    return (str(relative),)
+
+
 class RetiredNamespace(FileNotFoundError):
     """A repository still on the retired directory name, and nothing under the current one.
 
@@ -84,6 +157,13 @@ class RetiredNamespace(FileNotFoundError):
     IS a missing manifest — the only difference is that the sentence says what to rename, which is
     the difference between a client fixing it in a minute and hunting a typo in a file the platform
     never opened."""
+
+
+class TwoFolders(FileNotFoundError):
+    """A repository carrying BOTH folders, with the file asked for only under the former one
+    (#469's review). `.beeverforge/` is the one read when both are there, so the file is missing
+    from what is read while it sits next door: said by name, as the retired name is, never as a
+    plain "no manifest" that tells a person to create a file they already have."""
 
 
 def _retired_twin(relative: str) -> str:
@@ -101,13 +181,26 @@ def _retired_twin(relative: str) -> str:
 def resolve(root: Path, relative: str, *, project: str = "") -> Path:
     """The path to read — and a refusal, by name, when only the retired twin is there.
 
+    A path under OUR default folder is read under the folder the repository uses (`in_repo`):
+    `.openfactory/` for a repository that has only that one (#265). A repository with both, whose
+    file is only under `.openfactory/`, is refused by name (`TwoFolders`).
+
     Returns `root / relative` whether or not it exists: "missing" is then reported in the name we
     use, and a client reading the error is told what to create. The one thing this never does is
     answer with the retired path or pretend it did not see it.
     """
-    new = root / relative
+    new = root / in_repo(root, relative)
     if new.exists():
         return new
+    rel = str(relative).replace("\\", "/").removeprefix("./")
+    if stale_former_dir(root) and rel.startswith(f"{DIR}/"):
+        former = FORMER_DIR + rel[len(DIR):]
+        if (root / former).exists():
+            raise TwoFolders(
+                f"project {project or root.name!r} has no `{rel}` — the repository has both "
+                f"`{DIR}/` and `{FORMER_DIR}/`, only `{DIR}/` is read, and the file is at "
+                f"`{former}`. Move it to `{rel}` and remove `{FORMER_DIR}/`, or remove the "
+                f"empty `{DIR}/` so `{FORMER_DIR}/` is read.")
     old_rel = _retired_twin(relative)
     if old_rel and (root / old_rel).exists():
         raise RetiredNamespace(

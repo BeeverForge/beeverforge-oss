@@ -1,6 +1,7 @@
 # ADR 0039 — The action layer: what a human can ask the factory to do, written once
 
 - **Status:** **Accepted**
+- **Note (2026-11-06, #1):** this record says `sdlc …` for the command and `sdlc/`, `.sdlc/` for the package and the repository folder, as they were named when it was written. The command is `beeverforge` (`beeverforge box prove`, `beeverforge approver add`, `beeverforge act`, `beeverforge actions`), the package `beeverforge/`, the folder `.beeverforge/`.
 - **Date:** 2026-08-03
 - **Implements:** C-23 (#51)
 - **Relates to:** ADR-0010 (single-line strict / park on impediment), ADR-0022 (provider seams),

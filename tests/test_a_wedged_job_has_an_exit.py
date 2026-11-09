@@ -23,6 +23,7 @@ the board and a fresh job starts from the beginning.
 from __future__ import annotations
 
 import inspect
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -79,16 +80,23 @@ def test_the_ref_is_REQUIRED_by_the_pattern_and_not_by_a_caller():
 # ── 2. it refuses a job that is merely waiting ──────────────────────────────────────────────────
 
 class _Handle:
-    def __init__(self, status="running", answers=None, terminated=None):
+    def __init__(self, status="running", answers=None, terminated=None, raw_description=None):
         self._status = status
         self._answers = answers or {}
         self.terminated = terminated if terminated is not None else []
         self.id = "beeverforge-p-87"
+        self._raw = raw_description
 
     async def describe(self):
+        status, raw = self._status, self._raw
+
         class D:
-            status = self._status
-        return D()
+            pass
+        d = D()
+        d.status = status
+        if raw is not None:  # the old fake had none: a description that cannot say is read as none
+            d.raw_description = raw
+        return d
 
     async def query(self, name):
         return self._answers.get(name)
@@ -382,3 +390,121 @@ def test_the_snapshot_tells_a_WEDGED_job_apart_from_a_slow_one():
                                   "wedged": True}])
     assert "WEDGED" not in slow
     assert "WEDGED" in stuck and "stop" in stuck
+
+
+# ── 5. the sentence says what the worker was told, and no more (#44) ────────────────────────────
+#
+# A terminate ends the WORKFLOW. The job's work runs on a worker, which hears of it at its next
+# heartbeat — or never, if the worker is gone. The old sentence ("stopped … the floor is free") read
+# as the job having ended, and on a deployment that job opened and merged a pull request 46 minutes
+# later. The sentence is built from the description taken before the terminate.
+
+_NOW = datetime(2026, 11, 4, 12, 0, 0, tzinfo=UTC)
+
+
+def _beat(at: datetime | None):
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    ts = Timestamp()
+    if at is not None:
+        ts.FromDatetime(at)
+    return ts
+
+
+def _described(*pending):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(pending_activities=[
+        SimpleNamespace(activity_type=SimpleNamespace(name=name), last_heartbeat_time=_beat(beat),
+                        last_started_time=_beat(started))
+        for name, beat, started in pending])
+
+
+@pytest.fixture
+def now(monkeypatch):
+    from beeverforge.actions import catalog
+
+    monkeypatch.setattr(catalog, "_now", lambda: _NOW)
+    return _NOW
+
+
+def test_a_HEARD_worker_is_said_to_be_told_at_its_next_heartbeat(engine, now):
+    from beeverforge.runtime.temporal.view import WorkflowExecutionStatus
+
+    engine(_Handle(status=WorkflowExecutionStatus.RUNNING, raw_description=_described(
+        ("run_job", now - timedelta(seconds=20), now - timedelta(minutes=30)))))
+
+    outcome = _stop()
+
+    assert outcome.ok, outcome.message
+    assert "told at its next heartbeat" in outcome.message, outcome.message
+    assert "publish nothing" in outcome.message
+    assert outcome.data["worker"] == "heard"
+
+
+def test_a_SILENT_worker_is_said_to_be_not_known(engine, now):
+    """Heard 10 minutes ago, past the 120 s heartbeat window: whether its agent still runs there
+    is not something this side can know, and the sentence says so."""
+    from beeverforge.runtime.temporal.view import WorkflowExecutionStatus
+
+    engine(_Handle(status=WorkflowExecutionStatus.RUNNING, raw_description=_described(
+        ("run_job", now - timedelta(minutes=10), now - timedelta(minutes=30)))))
+
+    outcome = _stop()
+
+    assert "not been heard from since" in outcome.message, outcome.message
+    assert "not known" in outcome.message
+    assert "BEEVERFORGE_JOB_STOPPED" in outcome.message
+    assert outcome.data["worker"] == "silent"
+
+
+def test_a_worker_that_never_beat_is_silent_since_it_started(engine, now):
+    from beeverforge.runtime.temporal.view import WorkflowExecutionStatus
+
+    engine(_Handle(status=WorkflowExecutionStatus.RUNNING, raw_description=_described(
+        ("run_job", None, now - timedelta(minutes=30)))))
+
+    outcome = _stop()
+
+    assert "not been heard from since it started" in outcome.message, outcome.message
+    assert outcome.data["worker"] == "silent"
+
+
+@pytest.mark.parametrize("raw", [None, _described(), _described(("gather", None, None))],
+                         ids=["no_description", "no_activity", "another_activity"])
+def test_no_step_reported_running_is_said_as_such(engine, now, raw):
+    from beeverforge.runtime.temporal.view import WorkflowExecutionStatus
+
+    engine(_Handle(status=WorkflowExecutionStatus.RUNNING, raw_description=raw))
+
+    outcome = _stop()
+
+    assert outcome.ok, outcome.message
+    assert "no step of it was reported running on a worker" in outcome.message.lower(), (
+        outcome.message)
+    assert outcome.data["worker"] == "none"
+
+
+@pytest.mark.parametrize("raw", [None, _described(("run_job", _NOW, _NOW))],
+                         ids=["none", "heard"])
+def test_no_stop_sentence_says_the_job_ended(engine, now, raw):
+    """What ended is the workflow; the job's work ends when its worker hears it."""
+    from beeverforge.runtime.temporal.view import WorkflowExecutionStatus
+
+    engine(_Handle(status=WorkflowExecutionStatus.RUNNING, raw_description=raw))
+
+    said = _stop().message.lower()
+
+    for claim in ("stopped by", "was stopped", "terminated", "job ended", "stopped running"):
+        assert claim not in said, f"it claims the job ended ({claim!r}): {said}"
+    assert "the engine ended its workflow" in said
+
+
+def test_the_cards_note_does_not_say_the_job_ended_either():
+    from beeverforge.product import voice
+
+    for language in ("en", "pt-BR"):
+        note = voice._CARD_NOTE[language]["stopped"]
+        assert "terminated" not in note and "O job foi encerrado" not in note, (language, note)
+        assert ("publish nothing" in note) if language == "en" else ("não publicar" in note), (
+            language, note)

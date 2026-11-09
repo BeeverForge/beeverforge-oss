@@ -2012,6 +2012,66 @@ def onboard_cmd(
         raise typer.Exit(1)
 
 
+@app.command("migrate")
+@speaks_plainly("propose the folder's rename")
+def migrate_cmd(
+    name: str = typer.Argument(..., help="the registered project"),
+    source: list[str] = typer.Option(None, "--source",  # noqa: B008 — typer's own idiom
+                                     help="Another repository of this product, owner/name "
+                                          "(repeatable). The registry's own repository and the "
+                                          "context repository are always included"),
+    yes: bool = typer.Option(False, "--yes",
+                             help="Required: this opens pull requests on YOUR repositories"),
+) -> None:
+    """Propose renaming the former `.openfactory/` folder to `.beeverforge/`, one pull request
+    per repository, for a person to merge.
+
+    Per repository of the product — its code repository, the ones named with --source, and its
+    context repository — from a throwaway clone of the base branch: a repository that carries
+    only `.openfactory/` gets one pull request on `beeverforge/migrate-folder` that moves the
+    folder and rewrites the `.openfactory/` paths written in its files; one already on
+    `.beeverforge/` is left alone; one that carries both is named, for a person to reconcile.
+    Files outside the folder that still mention `.openfactory/` are not edited: they are named
+    in the pull request and in the line printed, for you to update. Safe to run again: a pull
+    request already open is named, never opened twice, and a branch left with no open pull request
+    is named for you to delete. Nothing is written into any checkout of yours."""
+    from beeverforge.onboarding.migrate_folder import is_this_machine, migrate, repositories
+
+    project = _get_project(name)
+    if is_this_machine(project):
+        typer.echo(f"✗ {name}'s repository is a checkout on this machine, and `migrate` proposes "
+                   f"through a forge — run `git mv .openfactory .beeverforge` there and commit "
+                   f"it yourself; nothing was proposed.")
+        raise typer.Exit(2)
+    repos = repositories(project, list(source or []))
+    if not repos:
+        typer.echo(f"✗ {name} names no repository in its registry entry and no --source was "
+                   f"given — there is nothing to migrate.")
+        raise typer.Exit(2)
+    if not yes:
+        typer.echo(f"This may open a pull request on: {', '.join(repos)} — re-run with --yes.")
+        raise typer.Exit(2)
+    failed = False
+    for said in migrate(project, sources=list(source or [])):
+        if not said.ok:
+            failed = True
+            typer.echo(f"✗ {said.repo}: {said.detail}")
+        elif said.both:
+            typer.echo(f"! {said.repo}: {said.detail}")
+        elif said.nothing or said.existed or not said.url:
+            typer.echo(f"· {said.repo}: {said.detail}")
+        else:
+            moved = (f" — paths rewritten in {', '.join(said.rewritten)}"
+                     if said.rewritten else "")
+            typer.echo(f"✓ {said.repo}: the rename is proposed at {said.url}{moved}")
+            if said.outside:
+                typer.echo(f"  ! outside the folder, {', '.join(said.outside)} still mention "
+                           f"`.openfactory/` and are not changed — update them once the rename is "
+                           f"merged")
+    if failed:
+        raise typer.Exit(1)
+
+
 @app.command("floor")
 def floor_cmd(
     project: str = typer.Argument("", help="one project, or nothing for the whole deployment"),
@@ -3090,13 +3150,49 @@ def people_list() -> None:
                    f"registered)")
 
 
+#: Said when `worker --with-panel` is asked to start with nowhere for the worker to dial (#363).
+NO_ENGINE_DECLARED = (
+    "the worker and the panel cannot start: nobody said where the durable engine is, and this "
+    "command starts none. Set `TEMPORAL_ADDRESS` to the engine's host:port — and "
+    "`TEMPORAL_NAMESPACE` and `TEMPORAL_API_KEY` for a hosted engine — and start it again; on a "
+    "machine that should run its own engine, use `beeverforge up` instead.")
+
+#: Said when `worker --with-panel` would serve an OPEN panel off the loopback (review of #406).
+OPEN_PANEL_OFF_THE_LOOPBACK = (
+    "the worker and the panel cannot start: the panel would listen on {host} with no sign-in — "
+    "neither `BEEVERFORGE_PANEL_TOKEN` nor `BEEVERFORGE_PANEL_TOKENS` is set — so anybody who "
+    "can reach that port could manage this factory, and in this mode the panel's process holds "
+    "the worker's credentials. Pass `BEEVERFORGE_PANEL_TOKEN` (or per-person "
+    "`BEEVERFORGE_PANEL_TOKENS`) into the container and start it again, or hold the panel to the "
+    "container with `--panel-host 127.0.0.1`.")
+
+
 @app.command("worker")
-def worker_cmd() -> None:
+def worker_cmd(
+    with_panel: bool = typer.Option(
+        False, "--with-panel",
+        help="Also serve the panel, supervised with the worker: one container command against a "
+             "remote engine"),
+    panel_host: str | None = typer.Option(
+        None, help="With --with-panel: the interface the panel listens on (default 0.0.0.0, "
+                   "which needs a panel sign-in such as BEEVERFORGE_PANEL_TOKEN; 127.0.0.1 "
+                   "keeps it to the container, for a sidecar)"),
+    panel_port: int | None = typer.Option(
+        None, help=f"With --with-panel: where the panel listens (default: the port "
+                   f"`{_PANEL.reach_vars[0]}` or `{_PANEL.port_var}` names, else "
+                   f"{_PANEL.default_port})"),
+) -> None:
     """Run the durable worker in the foreground — what the compose stack runs in its container.
 
     The module has always been runnable (`python -m beeverforge.runtime.temporal.worker`) and the
     compose file runs exactly that; a person on their own machine had to know the module path,
     which is the kind of thing a platform should not ask anybody to remember.
+
+    With `--with-panel` it also serves the panel and stops both together: the published worker
+    image's command for one long-lived container against an engine run elsewhere. It ends with
+    the status of whichever process ended, and SIGTERM stops both. The panel shares the worker's
+    environment, credentials included, so off the loopback it refuses to start a panel that
+    asks for no sign-in (set `BEEVERFORGE_PANEL_TOKEN` or `BEEVERFORGE_PANEL_TOKENS`).
 
     Without the durable engine's client library (the `runtime` extra) it refuses in one sentence
     that names the install, instead of starting."""
@@ -3105,11 +3201,108 @@ def worker_cmd() -> None:
     # module named 'temporalio'` — the leftover #174 named. The ids stay here and not in the
     # docstring: that is this command's `--help`, and a stranger cannot open a card.
     _refuse_without_the_client("the worker cannot start", code=1)
+    if with_panel:
+        _worker_with_panel(panel_host=panel_host or "0.0.0.0", panel_port=panel_port)
+        return
+    _refuse_panel_flags_without_the_panel(panel_host, panel_port)
     # `born`, not `main`: the same door the module's own `-m` entry uses, so an engine that never
     # started listening is a sentence here too rather than a traceback (#135).
     from beeverforge.runtime.temporal.worker import born as worker_born
 
     asyncio.run(worker_born())
+
+
+def _refuse_panel_flags_without_the_panel(panel_host: str | None, panel_port: int | None) -> None:
+    """A panel flag without `--with-panel` is refused, not dropped (#363).
+
+    A container command that names `--panel-host 127.0.0.1` and forgets `--with-panel` would
+    otherwise run a worker alone and serve no panel, in silence. Like `_refuse_without_the_client`,
+    this answers before the command becomes the worker process, so it speaks to the terminal."""
+    if panel_host is not None or panel_port is not None:
+        typer.echo("worker: --panel-host and --panel-port only say where the panel listens, and "
+                   "without --with-panel no panel is started; add --with-panel to serve it "
+                   "beside the worker, or drop the panel flags.", err=True)
+        raise typer.Exit(code=2)
+
+
+def _worker_with_panel(*, panel_host: str, panel_port: int | None) -> None:
+    """`worker --with-panel`: the worker and the panel under `host.run`, which supervises (#363).
+
+    NOT `up --no-engine`, which plans the panel alone and never a worker — a worker there, beside
+    the `localhost` engine address `init` writes, would exit at once and take the panel down.
+
+    A DEPLOYMENT PROCESS, so its lines are the log's (review of #406): it is the worker image's
+    container command, and what it says sits in the container's log beside the worker's and the
+    panel's lines. Its log is set up first, and every line it and `host.run` say goes through
+    `logs.announce` — printed as it always was, or a JSON line at its level. Only a refusal before
+    anything starts speaks to the terminal, from `_the_set_or_a_refusal`."""
+    from beeverforge.observability import logs
+    from beeverforge.runtime import host
+
+    logs.configure()
+    planned = _the_set_or_a_refusal(panel_host=panel_host, panel_port=panel_port)
+
+    def say(line: str) -> None:
+        # THE LEVEL IS THE LINE'S MARK: `✗` a process of the set that ended it or never started —
+        # the container exits with its status next — and `!` what did not go as declared. Each
+        # mark is its own call site, so the guard that classes every line for a person by its
+        # first words (`LINE_LEVELS`) classes each.
+        if line.startswith("✗ "):
+            logs.announce(log, f"✗ {line.removeprefix('✗ ')}", logging.ERROR)
+        elif line.startswith("! "):
+            logs.announce(log, f"! {line.removeprefix('! ')}", logging.WARNING)
+        else:
+            logs.announce(log, line)
+
+    for line in planned.said:
+        say(f"! {line}")
+    say(f"the panel will be at {planned.reach[_PANEL.name]} (listening on {panel_host})")
+    code = host.run(planned.plan, say=say, env=planned.env)
+    if code:
+        raise typer.Exit(code)
+
+
+def _the_set_or_a_refusal(*, panel_host: str, panel_port: int | None):
+    """The worker and the panel, planned — or a refusal, before anything starts (#363).
+
+    Like `_refuse_without_the_client`, each refusal here answers before the command becomes the
+    supervisor of anything, so it speaks to the terminal, on stderr."""
+    from beeverforge import listeners
+    from beeverforge.runtime import host
+
+    # NOWHERE TO DIAL IS A SENTENCE, NOT A SET THAT STARTS AND DIES: the worker would exit on its
+    # first connection and its exit would end the panel with it.
+    if not listeners.ENGINE.declared():
+        typer.echo(f"✗ {NO_ENGINE_DECLARED}", err=True)
+        raise typer.Exit(code=1)
+    # AN OPEN PANEL OFF THE LOOPBACK IS NOT STARTED (review of #406). The documented command
+    # served one on every interface: `0.0.0.0` and no token. In this mode it would also be the
+    # process that holds the worker's GitHub App key and model credential. On the loopback it may
+    # start open, for a sidecar in the container's own network namespace.
+    if panel_host not in listeners.THIS_MACHINE and _the_panel_would_be_open():
+        typer.echo(f"✗ {OPEN_PANEL_OFF_THE_LOOPBACK.format(host=panel_host)}", err=True)
+        raise typer.Exit(code=1)
+    try:
+        return host.worker_and_panel(panel_host=panel_host, panel_port=panel_port)
+    except listeners.CannotHonour as exc:
+        typer.echo(f"worker: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+
+
+def _the_panel_would_be_open() -> bool:
+    """Whether the panel, started from this environment, would let everybody in — asked as the
+    panel's own gate asks it (`api.app._admission`): the deployment's identity provider, and its
+    `open_to_everyone`. So a per-person token, a product or board credential, single sign-on or a
+    person registered by invitation closes it here exactly as it closes the panel.
+
+    A provider that cannot be built is NOT open: the panel then refuses every request."""
+    from beeverforge.identity import build_identity
+
+    try:
+        provider = build_identity()
+    except (ValueError, TypeError):
+        return False
+    return bool(getattr(provider, "open_to_everyone", lambda: False)())
 
 
 @app.command("up")
@@ -3235,7 +3428,12 @@ def bot_token(
         export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)
     """
     from beeverforge.credentials import app_id as env_app_id
-    from beeverforge.credentials import app_installation_id, app_private_key, app_private_key_at
+    from beeverforge.credentials import (
+        app_installation_id,
+        app_private_key,
+        app_private_key_at,
+        app_private_key_source,
+    )
 
     # THE FLAGS FALL BACK TO THE COMPOSITION ROOT rather than reading the environment themselves
     # (#64). These carried `envvar=`, which made typer the FOURTH independent reader of
@@ -3281,8 +3479,10 @@ def bot_token(
                        ".pem GitHub gave you, or leave --key-path out to use the deployment's key",
                        err=True)
             raise typer.Exit(1)
+        source = f"--key-path {key_path}"
     else:
         key = app_private_key()
+        source = app_private_key_source() or "the deployment's App key"
     if not (app_id and key and installation_id):
         typer.echo(
             "need the App id (--app-id or BEEVERFORGE_GH_APP_ID), the installation id "
@@ -3292,11 +3492,40 @@ def bot_token(
             err=True,
         )
         raise typer.Exit(1)
-    from beeverforge.adapters.github_app import mint_installation_token
+    import httpx
 
-    token, _expires = mint_installation_token(
-        app_id=app_id, private_key=key, installation_id=installation_id
-    )
+    from beeverforge.adapters.github_app import AppKeyDoesNotSign, mint_installation_token
+
+    # A FAILED MINT IS A SENTENCE (#217): a key that cannot sign, GitHub's refusal and an
+    # unreachable API each ended in a traceback. Branched on TYPE only, never on an exception's
+    # text: `AppKeyDoesNotSign` is raised around the signing step alone, the rest are httpx's own.
+    ids = "check that --app-id and --installation-id name one App and one of its installations"
+    try:
+        token, _expires = mint_installation_token(
+            app_id=app_id, private_key=key, installation_id=installation_id
+        )
+    except AppKeyDoesNotSign as exc:
+        typer.echo(f"✗ the App key from {source} does not sign a JWT ({exc}) — nothing was sent "
+                   "to GitHub; it is not an RSA private key (a PEM beginning "
+                   "-----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----), and the "
+                   "App's private key is downloaded from the App's settings page on GitHub",
+                   err=True)
+        raise typer.Exit(1) from None
+    except httpx.HTTPStatusError as exc:
+        try:
+            body = exc.response.json()
+        except ValueError:
+            body = None
+        message = body.get("message") if isinstance(body, dict) else None
+        typer.echo(f"✗ GitHub refused to mint a token for installation {installation_id} of App "
+                   f"{app_id} ({exc.response.status_code} "
+                   f"{message or exc.response.reason_phrase}) — {ids}", err=True)
+        raise typer.Exit(1) from None
+    except httpx.TransportError as exc:
+        typer.echo(f"✗ GitHub could not be reached to mint a token for installation "
+                   f"{installation_id} of App {app_id} ({type(exc).__name__}) — {ids}, and that "
+                   "api.github.com is reachable from here", err=True)
+        raise typer.Exit(1) from None
     # THE TOKEN ON STDOUT, THE MEANING ON STDERR — so `$(beeverforge bot-token)` still captures
     # exactly the token while a human at a terminal is told what they are looking at. Without
     # this the printed value reads as a fourth credential to paste somewhere.

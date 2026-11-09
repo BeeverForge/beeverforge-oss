@@ -119,6 +119,26 @@ changes it only through an action. `--source owner/repo` (repeatable) names the 
 N repositories, N proofs, N pull requests; `--skip-context` leaves the context half out. A
 failing proof does not withhold the pull request — it is quoted in it. Walked in [ONBOARDING §3](../ONBOARDING.md).
 
+**Renaming the former folder** — `beeverforge migrate <name> --yes` proposes renaming
+`.openfactory/`, the platform's folder under its former name, to `.beeverforge/`:
+one pull request per repository, on `beeverforge/migrate-folder`, for a person to merge. It looks
+at the project's code repository, the ones named with `--source owner/repo` (repeatable) and its
+context repository, each from a throwaway clone of the base branch. A repository that carries only
+`.openfactory/` gets the folder moved with `git mv`, and the `.openfactory/` paths written in the
+moved files (a `preview.compose: .openfactory/preview.compose.yml`) rewritten, line endings kept;
+nothing outside the folder is edited, and the pull request names the files a path was rewritten
+in. Files OUTSIDE the folder that still mention `.openfactory/` (a `.gitignore` line, a CI step, a
+document) are named in the pull request and in the line printed, for you to update: they are not
+changed, and once the rename is merged they point at a folder that is gone. One already on
+`.beeverforge/`, or with neither, is left alone; one that carries both gets no pull request, and
+the line says `.beeverforge/` is the one read and `.openfactory/` is yours to reconcile and remove.
+Safe to run again: an open pull request is named, never opened twice, and after the merge the run
+does nothing. A `beeverforge/migrate-folder` branch with no open pull request (an interrupted run,
+or a proposal you closed) is named and never reopened: delete it to propose the rename afresh. One line per repository; a repository that could not be cloned, asked or pushed to is
+one sentence with the cause and the remedy, the others still run, and the command exits 1. Nothing
+is written into a checkout — a project whose forge is this machine is refused (exit 2), with the
+`git mv` to run there yourself.
+
 **The environment session** — `env read <path-or-name>` proposes the manifest and writes
 nothing; `env apply <path-or-name> --yes` writes it into that checkout (`--accept`, `--set`,
 `--force`, `--out`). With **no checkout anywhere**, `env apply <name> --yes --pr` has the worker
@@ -236,6 +256,7 @@ without `--allow-unsigned`.
 |---|---|
 | `beeverforge autonomy <project> [--days N] [--json]` | how many of the project's cards reached their merge with no repair pass and nobody stepping in, read from the card's record — beside it the code-writing passes per card, how many repair passes each card took (0, 1, 2, 3+) and why cards parked, classified from the recorded note. **Measurement starts with cards promoted from 0.5.0 on**: older cards are listed as *before the record* and never enter a rate, so do not quote a yield over them. Writes nothing. `--json` is the `autonomy` block of `GET /api/metrics`, which the cost dashboard shows; a store that cannot be read exits 2 with the cause and what to check |
 | `beeverforge serve` | the panel, `--host`/`--port`. An unset `BEEVERFORGE_PANEL_TOKEN` means **open** — fine on a laptop, wrong for anything reachable |
+| `beeverforge worker [--with-panel [--panel-host H] [--panel-port P]]` | the durable worker in the foreground. `--with-panel` also serves the panel (on `0.0.0.0` unless `--panel-host` says otherwise, e.g. `127.0.0.1` for a sidecar) and supervises both: the worker image's command for one long-lived container against a remote engine. It needs `TEMPORAL_ADDRESS` (plus `TEMPORAL_NAMESPACE`/`TEMPORAL_API_KEY` for a hosted engine) and refuses without it. The panel shares the worker's environment, credentials included, so off the loopback it also refuses to start an open panel: set `BEEVERFORGE_PANEL_TOKEN` or `BEEVERFORGE_PANEL_TOKENS` (anything else that closes the panel, such as single sign-on, counts too). SIGTERM stops both, and when either ends it exits with that one's status ([operations](../operations.md)) |
 | `beeverforge bot-token` | mint a GitHub App installation token (~1h). On the onboarding path this is **the App smoke test** and nothing else: a printed `ghs_…` proves App ID, key and Installation ID agree, and there is nothing to save — the factory mints its own per job ([the guide](../setup/github.md) §5). The `export BEEVERFORGE_BOT_TOKEN=$(beeverforge bot-token)` form is for a shell that needs a token for a one-off `gh` command. Reads the key from `BEEVERFORGE_GH_APP_KEY` (a path) or `BEEVERFORGE_GH_APP_KEY_CONTENT` (the PEM itself); `--key-path <file>`, with `--app-id` and `--installation-id`, wins over both, so a newly downloaded key can be proven before it is deployed. A `--key-path` that is empty or cannot be read is refused by name (exit 1) and the environment's key is not used instead |
 | `beeverforge knowledge build \| check` | build and inspect the Knowledge Layer bundle — a module map the agents are handed. On by default ([ADR-0035](../adr/0035-knowledge-layer-on-by-default.md)). For a project the factory cloned itself, `build --publish` pushes the map to the repository's knowledge branch — without it the map lands in a disposable clone and the command says so. `--repo owner/repo` targets a multi-repo product's other repositories |
 | `beeverforge knowledge system PATH…` | the system layer of a product, derived from local checkouts of its sources (`NAME=PATH` names one): its components, the APIs, events and databases between them, and — first — what could not be derived. No model, no network, and nothing in the checkouts is run. `--out DIR` writes the five files the knowledge refresh publishes at `.okf/system/` in the context repository ([the knowledge layer](../knowledge-layer.md) §9; ADR-0052 D17, #268) |

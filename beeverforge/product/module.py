@@ -81,6 +81,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from beeverforge import namespace
 from beeverforge.adapters.board.base import stage_column
 from beeverforge.contracts.document import INTERNAL
 from beeverforge.contracts.refs import (
@@ -939,6 +940,13 @@ def _the_gate_said(why: str, *, ref: str, detail: str) -> WriteResult:
 #: hand-written copy is where wording drifts, and the one that never had a sentence at all returned
 #: `read_board`'s operator prose — English, naming the repository — into the channel verbatim. It
 #: lived here as a Portuguese literal until #513, so an English conversation read it in Portuguese.
+
+
+def documents_of_an_import(landed: list[str]) -> list[str]:
+    """What an import landed that the documents' pass reads: everything but the import's own
+    record under the platform's folder — by EITHER of its names (#265), since the record is
+    written under the one the context repository keeps."""
+    return [p for p in landed if not namespace.is_ours(p)]
 
 
 class _CorpusNoted:
@@ -3740,7 +3748,7 @@ class ProductModule:
             ctx = self.context()
             if not ctx.docs_path:
                 return
-            documents = [p for p in landed if not p.startswith(".beeverforge/")]
+            documents = documents_of_an_import(landed)
             if documents:
                 ingest(self.project, root=Path(ctx.docs_path), commit=ctx.docs_commit,
                        paths=documents, terms=[f.term for f in ctx.domain.live()],

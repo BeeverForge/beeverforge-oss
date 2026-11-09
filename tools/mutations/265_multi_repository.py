@@ -52,9 +52,12 @@ MUTATIONS = [
     ("the plan trusts whatever tree is on disk under a member's name", PRODUCT,
      "        if not expected or not repo_match(tree.repo, expected):",
      "        if False:"),
+    # RE-PINNED 2026-11-07 (#265): read under the folder the context repository uses (`rel`).
     ("product.yaml is read through a link out of its checkout", PRODUCT,
-     "    text = _read_inside(root, posixpath.join(root, PRODUCT_YAML))",
-     "    text = open(posixpath.join(root, PRODUCT_YAML), encoding=\"utf-8\").read()"),
+     "    text = _read_inside(root, posixpath.join(root, rel))\n    if text is None:\n"
+     "        return None,",
+     "    text = open(posixpath.join(root, rel), encoding=\"utf-8\").read()\n"
+     "    if text is None:\n        return None,"),
 
     # ── the siblings: the platform's own pull request, open, in its own repository ──
     ("a sibling's pull request is looked for on a branch the platform never opened", SIBLINGS,
@@ -137,8 +140,9 @@ MUTATIONS = [
     ("a direct writer commits whatever its checkout staged", AUTHORING,
      "    if not staged:\n        return None",
      "    if True:\n        return None"),
+    # RE-PINNED 2026-11-07 (#265): both of the folder's names, asked of `namespace.is_ours`.
     ("the platform's own directory is a path any writer may land", WRITES,
-     "        if (not norm or norm.startswith(PLATFORM_DIR) or norm + \"/\" == PLATFORM_DIR",
+     "        if (not norm or namespace.is_ours(norm)",
      "        if (not norm"),
     ("the module map is published wherever it is pointed", PIPELINE,
      "    if outside([subpath.as_posix()], KNOWLEDGE):",

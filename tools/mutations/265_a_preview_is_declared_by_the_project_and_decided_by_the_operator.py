@@ -62,8 +62,9 @@ MUTATIONS = [
     ("the shape follows a line out of the repository", MACHINE,
      "                digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12] if inside else \"\"",
      "                digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]"),
+    # RE-PINNED 2026-11-07 (#265): the folder is matched under either name, `namespace.is_ours`.
     ("a change that touches nothing of the shape still prints one", MACHINE,
-     "        if not any(h in self._SHAPE_NAMES or h.startswith(\".beeverforge/\") for h in hits):",
+     "        if not any(h in self._SHAPE_NAMES or namespace.is_ours(h) for h in hits):",
      "        if False:"),
     ("the body drops the files a shape change points at", MACHINE,
      "        if result.preview_shape:\n            lines += [\"\", \"## What merging this lets the factory run\",",

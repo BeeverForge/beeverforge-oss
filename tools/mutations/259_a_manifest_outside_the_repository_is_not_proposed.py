@@ -59,14 +59,17 @@ MUTATIONS = [
      '                f"<path-to-your-checkout> --out {found.manifest_path} --yes`.",\n',
      '                f"{found.name} cannot be proposed as a pull request.",\n'),
 
+    # RE-PINNED 2026-11-07 (#265): the destination joins the path as the repository spells it
+    # (`namespace.in_repo`, which returns an explicit path unchanged) — the same cut, one line on.
     ("the reverse: the refusal leaks into the LOCAL write, which has no pull request to carry "
      "anything and has always honoured an explicit path", CAT,
-     "    destination = (Path(str(out)).expanduser() if out else checkout / found.manifest_path)\n",
+     "    destination = (Path(str(out)).expanduser() if out else checkout / in_repo)\n",
      '    destination = (Path(str(out)).expanduser() if out\n'
-     '                   else checkout / str(found.manifest_path).lstrip("/"))\n'),
+     '                   else checkout / in_repo.lstrip("/"))\n'),
 
+    # RE-PINNED 2026-11-07 (#265): `resolve` reads the path under the folder the repository uses.
     ("the reverse: it leaks into READING, where an absolute manifest_path is the whole point of "
      "the field", "beeverforge/namespace.py",
-     "    new = root / relative\n",
-     '    new = root / str(relative).lstrip("/")\n'),
+     "    new = root / in_repo(root, relative)\n",
+     '    new = root / in_repo(root, str(relative).lstrip("/"))\n'),
 ]

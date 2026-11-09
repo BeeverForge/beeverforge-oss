@@ -24,9 +24,10 @@ MUTATIONS = [
      "            words = _as_text(_without_reviewer_mentions(f.description))",
      "            words = _as_text(f.description)"),
 
+    # RE-PINNED 2026-11-09 (#323): main's #131 gave the posted review its own heading line
     ("the posted review's summary is raw", POLICY,
-     '''    lines = [f"**{review.decision}** — score {review.score}", "", quiet(review.summary)]''',
-     '''    lines = [f"**{review.decision}** — score {review.score}", "", review.summary]'''),
+     '''    lines = [heading, "", quiet(review.summary)]''',
+     '''    lines = [heading, "", review.summary]'''),
 
     ("the posted review's finding is raw", POLICY,
      '''        lines.append(f"- **{f.severity}**{loc}: {quiet(f.description)}")''',

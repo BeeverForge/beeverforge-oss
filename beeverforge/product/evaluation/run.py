@@ -42,6 +42,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
+from beeverforge import namespace
 from beeverforge.product.evaluation.battery import NO_QUESTIONS, Battery, BatteryRefused, Question
 from beeverforge.product.evaluation.score import Judge, Tally, Verdict, score, totals
 from beeverforge.util import yaml_io
@@ -84,7 +85,8 @@ class LiveRunRefused(RuntimeError):
 
 def fixture_name(fixture: str | Path) -> str:
     """The product the fixture is: the `product:` its context repository declares."""
-    manifest = Path(fixture) / "context" / ".beeverforge" / "product.yaml"
+    context = Path(fixture) / "context"
+    manifest = context / namespace.in_repo(context, namespace.PRODUCT_MANIFEST)
     try:
         data = yaml_io.load(manifest.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as exc:

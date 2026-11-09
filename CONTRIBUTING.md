@@ -57,6 +57,17 @@ is `python -m pytest -q tests/<the file>.py`. Each xdist worker holds the parsed
 runs a guard that reads it (`tests/the_tree_read_once.py`: ~260 MB, and ~450 MB more in a worker
 that runs a guard reading `tests/` too), so a box running `-n 12` should budget that per worker.
 
+**The shard table.** CI splits the unit run into four jobs with `--shard=k/4`
+(`make test-unit TEST_SHARD=k TEST_SHARDS=4` runs one locally). A shard is whole test files, and a
+shard never imports a file another shard owns. The files are balanced by
+`tests/shard_durations.json`, the measured seconds of each test file. A file the table does not
+list still runs in exactly one shard, picked by its path, so a stale table only costs balance.
+Refresh it after you add or move heavy test files, or when CI's four unit job times drift apart.
+Write the JUnit report outside the tree, then rebuild the table from it:
+
+    python -m pytest -q -n auto -p no:randomly -m "not (owns_its_engine or slow or alone)" --junitxml=/tmp/unit.xml
+    python -m tests.shard_durations /tmp/unit.xml
+
 **What green looks like.** pytest's last line reads `N passed, M skipped` and some warnings — no
 `failed`, no `error` — and `make test` exits 0. Skips are normal and each says why: in this public
 tree the tests of the add-on packages skip naming `beeverforge-aws`, the checks held to the
@@ -90,6 +101,7 @@ dropped.py`) precisely so that this search works.
 - **Run the suite in both orders**: `python -m pytest -q -n auto` and
   `python -m pytest -q -n auto -p no:randomly` (`make test` is the first, without `-n auto`).
   A failure that depends on ordering is a state leak, not flake — find it, don't reroll.
+  CI runs the random order only, so the fixed-order run is yours to make before you push.
   `-n auto` is pytest-xdist, which `make install` installed: the suite is large (the count lives
   in [`docs/STATUS.md`](docs/STATUS.md)) and drops from
   minutes to seconds. If a test passes alone and fails under `-n auto`, that is the same state

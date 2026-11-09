@@ -42,11 +42,12 @@ MUTATIONS = [
      "    landed = list(dict.fromkeys(canonical_ref(r.ref) for r in results if r.ok and r.ref))\n",
      "    landed = list(dict.fromkeys(canonical_ref(r.ref) for r in results if r.ref))\n"),
 
+    # RE-PINNED 2026-11-04 (#187): the refusal is said through `_refused`, which carries its word
     ("a half-refused queue answers with the refusal alone, the card that went in unnamed", CONFIRM,
      "    if not landed:\n"
-     "        return (_client_detail(failed[0].detail, lang, project=project) if failed\n"
+     "        return (_refused(results, lang, project=project) if failed\n"
      "                else _said(lang)[\"not_queued\"])\n",
      "    if not landed or failed:\n"
-     "        return (_client_detail(failed[0].detail, lang, project=project) if failed\n"
+     "        return (_refused(results, lang, project=project) if failed\n"
      "                else _said(lang)[\"not_queued\"])\n"),
 ]

@@ -90,6 +90,13 @@ OKF_EVERY_HOURS = 6
 PREVIEW_REAP_SCHEDULE_ID = "beeverforge-preview-reaper"
 PREVIEW_REAP_EVERY_MINUTES = 10
 
+#: The metrics store's expired rows, deleted from the file (#201). One deployment-wide schedule:
+#: the store is the deployment's. SIX HOURS is how long a row may outlive its period on disk —
+#: the shortest period kept there is a staged suggestion's twelve hours, and every read already
+#: hides an expired row, so the purge keeps a promise about the file, not about an answer.
+METRICS_PURGE_SCHEDULE_ID = "beeverforge-metrics-purge"
+METRICS_PURGE_EVERY_HOURS = 6
+
 
 def _schedule(every_minutes: int, sandbox: str | None) -> Schedule:
     return Schedule(
@@ -179,6 +186,7 @@ async def ensure_all() -> list[str]:
     out += await ensure_okf_refresh()
     out += await ensure_card_question_sweeps()
     out.append(await ensure_preview_reaper())
+    out.append(await ensure_metrics_purge())
     out += await retire_orphan_schedules()
     return out
 
@@ -449,6 +457,34 @@ def _preview_reap_schedule(every_minutes: int) -> Schedule:
         spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(minutes=every_minutes))]),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
+
+
+def _metrics_purge_schedule(every_hours: int) -> Schedule:
+    return Schedule(
+        action=ScheduleActionStartWorkflow(
+            "MetricsPurgeWorkflow",
+            id=METRICS_PURGE_SCHEDULE_ID,
+            task_queue=TASK_QUEUE,
+            # one 10m activity, no retry — the next tick is the retry
+            execution_timeout=timedelta(minutes=15),
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(hours=every_hours))]),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+    )
+
+
+async def ensure_metrics_purge(every_hours: int = METRICS_PURGE_EVERY_HOURS) -> str:
+    """The metrics store's purge (#201), created or brought to this build's definition.
+    Idempotent."""
+    client = await connect()
+    schedule = _metrics_purge_schedule(every_hours)
+    try:
+        await client.create_schedule(METRICS_PURGE_SCHEDULE_ID, schedule)
+        return f"created {METRICS_PURGE_SCHEDULE_ID}"
+    except ScheduleAlreadyRunningError:
+        handle = client.get_schedule_handle(METRICS_PURGE_SCHEDULE_ID)
+        await handle.update(lambda _: ScheduleUpdate(schedule=schedule))
+        return f"updated {METRICS_PURGE_SCHEDULE_ID}"
 
 
 async def ensure_preview_reaper(every_minutes: int = PREVIEW_REAP_EVERY_MINUTES) -> str:

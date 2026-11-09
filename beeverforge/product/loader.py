@@ -101,12 +101,14 @@ def _read_docs_manifest(path) -> tuple[ProductDocs | None, str]:
         # THE RETIRED NAME IS A REASON, NOT A MISSING FILE. Folding it into "missing" would tell
         # the operator to create a file beside one that already exists under the old name.
         return None, str(exc)
+    # NAMED AS THIS REPOSITORY SPELLS IT: `.openfactory/product.yaml` where that is its folder.
+    shown = namespace.in_repo(path, DOCS_MANIFEST)
     if not manifest.is_file():
-        return None, f"{DOCS_MANIFEST} is missing from the repository root"
+        return None, f"{shown} is missing from the repository root"
     try:
         text = manifest.read_text(encoding="utf-8")
     except OSError as exc:
-        return None, f"{DOCS_MANIFEST} could not be read: {exc}"
+        return None, f"{shown} could not be read: {exc}"
     return parse_docs_manifest(text)
 
 

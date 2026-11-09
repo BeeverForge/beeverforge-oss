@@ -211,6 +211,29 @@ def deployment(*, panel_port: int | None, state: Path, engine: str | None,
                       said=started.said)
 
 
+def worker_and_panel(*, panel_host: str, panel_port: int | None,
+                     env: Mapping[str, str] | None = None) -> Deployment:
+    """The worker and the panel, against an engine somebody else runs (#363).
+
+    THE PUBLISHED WORKER IMAGE AS ONE LONG-LIVED CONTAINER: `beeverforge worker --with-panel`.
+    No engine is started and none is planned — the worker dials what `TEMPORAL_ADDRESS` says, and
+    the panel reads the same. `processes` is left alone on purpose: there the worker is planned
+    only beside an engine this machine starts, which is `up`'s promise and not this one.
+
+    THE PANEL'S BIND IS AN ARGUMENT. In a container that publishes the panel's port it must listen
+    on every interface; in one that publishes nothing and is reached from a sidecar, on the
+    loopback only.
+
+    Raises `listeners.CannotHonour` for a panel port it cannot start on; the front end says it.
+    """
+    started = listeners.started_by_up(env, panel_port=panel_port, durable=False)
+    plan = [("worker", [sys.executable, "-m", "beeverforge.runtime.temporal.worker"]),
+            ("panel", [sys.executable, "-m", "beeverforge.cli", "serve", "--host", panel_host,
+                       "--port", str(started.ports[PANEL.name])])]
+    return Deployment(plan=plan, env=started.child_env(env), reach=dict(started.reach),
+                      said=started.said)
+
+
 #: How long a child is given to stop after it is asked, before it is made to.
 GRACE_S = 10.0
 
@@ -237,6 +260,10 @@ def run(plan: list[tuple[str, list[str]]], *, say, grace: float = GRACE_S,
     """
     started: list[tuple[str, subprocess.Popen]] = []
     reaper: subprocess.Popen | None = None
+    # THE STATUS OF THE CHILD THAT ENDED THE SET, SINCE #363. This returned 0 whatever ended it,
+    # so a container whose worker died exited clean and a restart policy never saw the death. A
+    # stop that was ASKED for — Ctrl-C, SIGTERM, SIGHUP — leaves it 0.
+    ended = 0
     previous = _stop_on_signals()
     try:
         for name, argv in plan:
@@ -262,6 +289,7 @@ def run(plan: list[tuple[str, list[str]]], *, say, grace: float = GRACE_S,
                     # is a factory that looks up and takes no cards — the silent half-state this
                     # platform exists to refuse.
                     say(f"✗ {name} exited ({child.returncode}) — stopping the rest")
+                    ended = exit_status(child.returncode)
                     raise KeyboardInterrupt
             time.sleep(0.4)
     except KeyboardInterrupt:
@@ -275,7 +303,13 @@ def run(plan: list[tuple[str, list[str]]], *, say, grace: float = GRACE_S,
                 reaper.wait(timeout=grace)
         _stop(started, grace=grace)
         _restore(previous)
-    return 0
+    return ended
+
+
+def exit_status(returncode: int) -> int:
+    """A child's `returncode` as a shell and a container runtime report it: a death by signal N,
+    which `Popen` spells -N, is 128+N — an exit code cannot be negative."""
+    return 128 - returncode if returncode < 0 else returncode
 
 
 def _stop_on_signals() -> dict:

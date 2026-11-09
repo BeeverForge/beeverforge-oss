@@ -35,6 +35,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from beeverforge.observability.metrics import MetricRecord
+from beeverforge.util.private_file import LinkedPath as LinkedPath  # re-exported (#228's name)
+from beeverforge.util.private_file import create_private
 
 log = logging.getLogger("beeverforge.metrics")
 
@@ -73,6 +75,17 @@ CREATE INDEX IF NOT EXISTS metrics_expiry  ON metrics (expires_at);
 _SCHEMA_ENSURED: set[str] = set()
 
 
+_STORE_REMEDY = "remove the link, or point BEEVERFORGE_METRICS_DB at a regular file"
+
+
+def _create_private(path: Path, *, what: str = "metrics store",
+                    remedy: str = _STORE_REMEDY) -> None:
+    """Create the store's file, mode `0600`, if it is missing (#228). An existing file is untouched:
+    its mode is the operator's. The body is the shared `util.private_file.create_private` (#308),
+    which the product index and the board use too."""
+    create_private(path, what=what, remedy=remedy)
+
+
 class SqliteMetricsSink:
     """A `MetricsSink` that also reads. Safe to construct anywhere: it touches no disk until used —
     and the first use, read or write, makes sure the table exists (#137).
@@ -105,17 +118,24 @@ class SqliteMetricsSink:
         `CREATE ... IF NOT EXISTS`.
 
         A store that cannot take the schema — a read-only directory, a file that is not a database —
-        is still read, and the read says what it finds: `StoreUnreadable`, never a silent `[]`."""
+        is still read, and the read says what it finds: `StoreUnreadable`, never a silent `[]`.
+
+        THE FILE IS MADE SURE OF ON EVERY OPEN, THE SCHEMA ONCE (#228). The cache remembers a
+        pathname, not that its file is still there: a store deleted under a running process was
+        made again by `sqlite3.connect` under the umask, and a path swapped for a link after the
+        first read was followed. So the private creation and the link refusal run before every
+        open, cached or not — one `open` that fails `EEXIST` when the store is already there."""
         key = str(self.path)
         ensure = write or key not in _SCHEMA_ENSURED
         if write:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        elif ensure:
+            _create_private(self.path)
+        else:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                _create_private(self.path)
             except OSError as exc:   # the connect below fails honestly and names the file
-                log.info("metrics store %s: could not create its directory for a read — %s",
-                         self.path, exc)
+                log.info("metrics store %s: could not create it for a read — %s", self.path, exc)
         conn = sqlite3.connect(self.path, timeout=self.timeout)
         try:
             conn.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer
@@ -240,9 +260,16 @@ class SqliteMetricsSink:
         alone is a backup missing exactly what was written last, and a copy taken mid-checkpoint
         is a file that may not open. `Connection.backup` copies pages under SQLite's own locks and
         restarts when a writer changes one underneath it, so what lands is one moment of the
-        store, whole."""
+        store, whole.
+
+        PRIVATE LIKE THE STORE (#228): the copy is the same clients' messages and audit trail, so
+        it is created by `_create_private` before SQLite opens it, and its `-journal`, `-wal` and
+        `-shm` take its `0600`. Left to `sqlite3.connect`, every copy `forget` takes followed the
+        umask — `0644` under the usual `022`."""
         target = Path(to)
         target.parent.mkdir(parents=True, exist_ok=True)
+        _create_private(target, what="metrics backup",
+                        remedy="remove the link, or back up to another path")
         with self._connect(write=False) as conn:
             copy = sqlite3.connect(target)
             try:
@@ -253,13 +280,35 @@ class SqliteMetricsSink:
 
     def purge_expired(self, *, now: int | None = None) -> int:
         """Delete rows past their TTL, returning how many went. Filtering on read keeps the answer
-        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone."""
+        correct; only this keeps the promise — "we delete it" has to mean the bytes are gone.
+
+        AND GONE FROM THE FILE, NOT ONLY FROM THE TABLE (#201). A plain `DELETE` moves a row's
+        page to SQLite's free list with its text still in it, and in WAL mode the row's last
+        version also sits in the `-wal` file until a checkpoint copies it back. So the delete runs
+        with `secure_delete` on, which overwrites what it frees with zeros, and the log is then
+        checkpointed and truncated: what the period promised to delete is in neither file.
+
+        THE CHECKPOINT CAN BE REFUSED, AND SAYS SO ONLY IN ITS RESULT (#466's review). With another
+        connection inside a read transaction (the panel, mid-request) it waits the busy timeout,
+        copies nothing back and returns `busy=1`: the zeroed pages are only in the log, and the
+        original text is still in the main file. That is logged, naming the cause, and the
+        checkpoint runs on EVERY purge, not only one that deleted something, so the next run that
+        finds no reader finishes it."""
         try:
             with self._connect(write=True) as conn:
+                conn.execute("PRAGMA secure_delete=ON")
                 cur = conn.execute("DELETE FROM metrics WHERE expires_at IS NOT NULL"
                                    " AND expires_at <= ?", (now if now is not None else
                                                             int(time.time()),))
-                return cur.rowcount or 0
+                purged = cur.rowcount or 0
+                conn.commit()
+                checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint and checkpoint[0]:
+                    log.warning("BEEVERFORGE_METRICS_PURGE_PENDING path=%s — the write-ahead log "
+                                "could not be checkpointed because another connection was "
+                                "reading, so what was purged may still be in the file's bytes; "
+                                "the next purge checkpoints again", self.path)
+                return purged
         except Exception as exc:  # noqa: BLE001
             log.warning("metrics purge failed: %s", exc)
             return 0

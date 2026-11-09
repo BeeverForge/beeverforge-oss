@@ -79,6 +79,7 @@ from beeverforge.runtime.temporal.activities import (
     product_role_say,
     product_sweep,
     promote_staging,
+    purge_expired_records,
     read_ci_checks,
     reap_previews,
     record_job_metrics,
@@ -122,6 +123,7 @@ from beeverforge.runtime.temporal.workflow import (
     GateKeyProbeWorkflow,
     JobWorkflow,
     KnowledgeRefreshWorkflow,
+    MetricsPurgeWorkflow,
     PreviewReapWorkflow,
     PreviewWorkflow,
     ProductAnswerWorkflow,
@@ -213,6 +215,9 @@ WORKER_ACTIVITIES = [
     # ADR-0050 — the previews' end. Registered for the rule at the top of this list: the schedule
     # fires it every ten minutes on a worker nobody is watching.
     reap_previews,
+    # #201 — the metrics store's expired rows, deleted from the file on the same rule: a schedule
+    # fires it every six hours.
+    purge_expired_records,
     # …and a preview on demand: a person presses start on a card hours after the job moved on,
     # and an unregistered step fails at exactly that moment.
     preview_materialise, preview_plan, preview_up, preview_watch, preview_logs, preview_down,
@@ -393,7 +398,7 @@ async def main() -> None:
                    ProductQueueWorkflow, ProductCardWorkflow,
                    ProductSayWorkflow, ProductNeedsActionWorkflow,
                    ProductBaselineWorkflow, ProductAnswerWorkflow,
-                   PreviewReapWorkflow, PreviewWorkflow,
+                   PreviewReapWorkflow, PreviewWorkflow, MetricsPurgeWorkflow,
                    KnowledgeRefreshWorkflow,
                    # an asked refresh of a product's knowledge, one flight per product (#1004)
                    ProductKnowledgeRefreshWorkflow,

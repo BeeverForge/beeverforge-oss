@@ -17,6 +17,14 @@ turning *"the agent wrote the wrong code"* into *"the agent picked the machine"*
 
 ## The manifest
 
+**The folder has two names.** BeeverForge's is `.beeverforge/`; OpenFactory 0.7 called it
+`.openfactory/`, and a repository that keeps that folder is read there — the manifest, the
+product's `product.yaml`, the profiles, a preview's compose file — and what BeeverForge writes into
+it (`env apply`, `onboard`, `preview propose`, an import's record) lands there too. Nothing renames
+it for you. A repository that has neither gets `.beeverforge/`. When a repository has both,
+`.beeverforge/` is read, nothing under `.openfactory/` is, and `beeverforge doctor` names the stale
+one. The floor protects both.
+
 38 fields, **all optional** — an empty file loads. The ones that matter:
 
 ```yaml
@@ -238,8 +246,8 @@ each project may edit, close, remove, queue or rank it. Pick a field that takes 
 the issue has only one of, or a single label of a set), and give every project on the Jira project
 its own.
 
-**A scoped project refuses to edit, close, remove, queue or rank a card outside its slice.**
-Editing, closing, removing or queueing a card first asks where it sits, and a card outside the
+**A scoped project refuses to edit, close, remove, reopen, queue or rank a card outside its slice.**
+Editing, closing, removing, reopening or queueing a card first asks where it sits, and a card outside the
 slice is not on this project's board; ranking one in the product role's order writes by key. So
 the factory asks Jira once more, `project = "DAR" AND (<scope>) AND key = "<card>"`, and refuses a
 card that is not in the slice by name: it is another project's card, or one this project filed
@@ -248,11 +256,10 @@ on it — act on it from the project whose slice it is in, or put it in this one
 search cannot be made, the action is refused as for an unreadable board. A project without
 `scope_jql` makes no extra request.
 
-Three acts are **not** held to the slice yet, and reach any card of the Jira project by its key:
+Two acts are **not** held to the slice yet, and reach any card of the Jira project by its key:
 starting a job on a card (the floor's `start` and `beeverforge run <project> <card>`), which an
-operator does by naming the card; reopening a closed card, which the reopen reaches by key
-without asking the slice; and commenting on a card, which is written in the person's own name.
-Name only cards of this project's slice to them.
+operator does by naming the card; and commenting on a card, which is written in the person's own
+name. Name only cards of this project's slice to them.
 
 A condition that would escape its parentheses is refused when the tracker is built, naming the
 scope: a `)` it never opened, which would close the `AND (...)` and widen the read past the
@@ -534,7 +541,7 @@ Secrets and deployment coordinates. The ones you will actually set:
 | `BEEVERFORGE_PROD_APPROVERS` | deployment-wide release allowlist (the manifest's `prod_approvers` is the per-project form) |
 | `BEEVERFORGE_APPROVERS` / `BEEVERFORGE_APPROVERS_FILE` | the hashed release passwords, when `~/.beeverforge/approvers.json` cannot be mounted. `BEEVERFORGE_APPROVERS` (JSON, login → hash) wins: while it is set the file is neither read nor written, and a value that is not a JSON object means nobody can approve — `beeverforge approver list` says which. Mint an entry with `BEEVERFORGE_APPROVERS= beeverforge approver add <login>` and copy it from the file |
 | `BEEVERFORGE_SANDBOX` | which box every job runs in: `worktree` \| `container` \| the kind an installed box add-on registers (`fargate`, from the AWS add-on). Unset → `container`. **Never inferred** — a cloud deployment DECLARES `BEEVERFORGE_SANDBOX=fargate`; setting only the add-on's cluster coordinates leaves every job in a local container |
-| `BEEVERFORGE_CREDENTIAL_STORE` | which store the deployment's own credentials are asked of before the environment: `env` (unset means this — the environment alone) \| `file` \| the kind an installed add-on registers. Never inferred; a kind nobody installed refuses every credential by name rather than falling back ([the credential store](#the-credential-store)) |
+| `BEEVERFORGE_CREDENTIAL_STORE` | which store the deployment's own credentials are asked of before the environment: `env` (unset means this — the environment alone) \| `file` \| the kind an installed add-on registers. Never inferred; a kind nobody installed refuses every credential by name rather than falling back ([the credential store](#the-credential-store)). An installed add-on's kind is a supported value: its package registers `credential_store.<kind>` in the `beeverforge.adapters` entry-point group, the store is asked before the environment, and its refusal is final — nothing falls back to the variable. What a worker asks for at start is the engine's credential: `TEMPORAL_API_KEY`, and `TEMPORAL_TLS_KEY` when no API key answers; the forge's `BEEVERFORGE_FORGE_TOKEN` / `BEEVERFORGE_BOT_TOKEN` and the harness's `BEEVERFORGE_AGENT_TOKENS` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` are asked of the same store when a job or a check needs them |
 | `BEEVERFORGE_CREDENTIAL_DIR` | the file store's directory, where the deployment's secret files are mounted (`/run/secrets`). A reference `file:<name>` names one file in it. Withheld from a worktree workload |
 | `BEEVERFORGE_TOKEN_POOL_SOURCE` | where the panel reads the agent-token pool from (count and ids, never a value): `env` (the default — this process's environment) \| the kind an installed add-on registers (`ssm`, from the AWS add-on). Unset → `env`. Never inferred — the reference cloud deployment declares `ssm` |
 | `BEEVERFORGE_SANDBOX_IMAGE` | deployment-wide box image; a project's `box.image` wins |
@@ -556,13 +563,13 @@ Secrets and deployment coordinates. The ones you will actually set:
 | `BEEVERFORGE_REGISTRY` · `BEEVERFORGE_REGISTRY_SEED` | where the registry is read and what seeds it on first boot |
 | `BEEVERFORGE_TOOLBOX` · `BEEVERFORGE_TOOLBOX_VOLUME` | the harness toolbox: where the worker keeps it, and the docker volume name it mounts into boxes |
 | `TEMPORAL_ADDRESS` · `TEMPORAL_NAMESPACE` | the durable engine. Compose sets these to its own container |
-| `BEEVERFORGE_MAX_CONCURRENT_JOBS` · `BEEVERFORGE_MAX_TURNS` · `BEEVERFORGE_AGENT_TIMEOUT` | the throttles |
+| `BEEVERFORGE_MAX_CONCURRENT_JOBS` · `BEEVERFORGE_MAX_TURNS` · `BEEVERFORGE_AGENT_TIMEOUT` | the floor and the job's limits: [below](#the-floor-the-limits-and-the-state-directory), with their defaults |
 | `BEEVERFORGE_PREVIEW_RUNTIME` | which runtime runs a preview: `compose` \| `none` \| the kind an installed add-on registers. Unset → `none`; the compose stack's file sets `compose`. The deployment's to name, never a repository's ([setup/previews.md](../setup/previews.md)) |
 | `BEEVERFORGE_PREVIEW_REACH` · `BEEVERFORGE_PANEL_CONTAINER` · `BEEVERFORGE_PREVIEW_PORTS` | how the panel reaches a preview: `network` (unset means this) — the worker joins the panel's container, `beeverforge-panel` on the compose stack, to each preview's own network — or `loopback`, one machine: exposed services on 127.0.0.1 at ports within `lo-hi` |
 | `BEEVERFORGE_PREVIEW_DOMAIN` | the domain previews are served under; the worker and the panel must agree. Unset → no preview is served; the compose stack's file sets `preview.localhost`. Sharing a plain-http panel's registrable domain fails `beeverforge doctor` |
 | `BEEVERFORGE_PREVIEW_SECRET` | the key preview links are signed with; `init` generates it. Unset → one per panel process |
 | `BEEVERFORGE_PREVIEW_DOCKER_CONFIG` | the registry logins previews pull with (`beeverforge preview login`). Unset → `~/.docker`; the compose stack's file sets `/var/lib/beeverforge/docker` |
-| `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once. Unset → 4 |
+| `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once: [below](#the-floor-the-limits-and-the-state-directory) |
 | `BEEVERFORGE_SOURCES_PARALLEL` | how many of a product's sources are brought up at once — for a turn of the product role and for the system layer's refresh. Each is one git process talking to its forge. Unset → `8`; a value that is not a positive number is 8, said once in the log |
 | `BEEVERFORGE_LIST_CONCURRENCY` | how many recent jobs the job list asks the engine about at once — the list the panel, the floor and the tech-lead read. Each running job is a describe plus up to three queries a worker answers by replaying its history; readers asking the same question together share one scan. Unset → `8`; a value that is not a positive number is 8, said once in the log |
 | `BEEVERFORGE_SOURCES_FRESH_SECONDS` | how long a source brought up for the product role is served again without asking its forge, so a conversation's back-and-forth costs one question per source per window instead of per message. Unset → `60`; `0` asks on every turn; a value that is not a number of seconds is 60, said once. A commit pushed inside the window reaches the role on the first turn after it. Never applied to the system layer's refresh, which publishes the map right after a merge |
@@ -574,6 +581,32 @@ for itself inside a box, or cloud-only coordinates (`BEEVERFORGE_FARGATE_*`, `BE
 `BEEVERFORGE_*_LOG_GROUP`) that a local deployment never reads — a cloud-only *coordinate*, never a
 cloud-only *capability*: every one of them has a free counterpart above, because a deployment with no
 cloud may cost you a vendor and must never cost you a feature.
+
+### The floor, the limits and the state directory
+
+Every variable the worker reads for its floor, its limits and its state directory, with what it
+falls back to (#365). A tool that writes a worker container's environment can take this table as the
+whole set: `tests/test_the_floor_the_limits_and_the_state_directory_are_documented.py` fails when a
+name here is not read by the code, when the code reads one of these that is not here, or when a
+default here is not the code's.
+
+**No `OPENFACTORY_*` spelling is read.** BeeverForge 0.1.x reads none of OpenFactory's names
+(`CHANGELOG.md`, 0.1.0). Reading the old names, for an OpenFactory 0.7 deployment upgraded in place,
+is planned for 0.2.0 (#266); this table will say then which old spelling is read and in which
+release it stops.
+
+| variable | what it sets | unset | a value it cannot read | `OPENFACTORY_*` spelling |
+|---|---|---|---|---|
+| `BEEVERFORGE_MAX_CONCURRENT_JOBS` | the floor: how many jobs may be in flight at once. The poller and a manual scan start at most this many minus those running. `0` pauses pickup | `1` | not a whole number → `1`; below `0` → `0` | not read |
+| `BEEVERFORGE_MAX_TURNS` | how many turns one pass of the `claude_code` harness may take (`--max-turns`) | `200` | must be a whole number: anything else raises when the harness is built | not read |
+| `BEEVERFORGE_AGENT_TIMEOUT` | how many seconds one pass may run, on every harness, before it is stopped | `14400` (four hours) | must be a whole number of seconds: read once, when the sandbox code loads, and anything else raises there | not read |
+| `BEEVERFORGE_PREVIEW_MAX` | how many previews run at once | `4` | not a positive whole number → `4`, said once in the log | not read |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_PRODUCT` | how many turns of one product's role run at once, across its conversations | `2` | not a positive whole number → `2`, logged as an error | not read |
+| `BEEVERFORGE_PRODUCT_TURNS_PER_DEPLOYMENT` | how many product turns run at once on a worker, across every product | `4` | not a positive whole number → `4`, logged as an error | not read |
+| `BEEVERFORGE_STATE_DIR` | the directory the halves of a deployment share: each half writes the build it runs there, and `beeverforge doctor` on the worker reads the others' to say when they differ. The worker and the panel must agree | `/var/lib/beeverforge` | empty → `/var/lib/beeverforge`. A directory a half cannot write is logged, and that half's build goes unrecorded | not read |
+
+The product turn ceilings are explained with the rest of the conversation's settings in
+[`docs/configuration.md`](../configuration.md#conversations-the-door-the-turn-and-the-ceiling).
 
 **Precedence, where it exists**, is always most-specific-wins: an explicit CLI flag, then the
 project's registry entry, then a deployment-wide environment variable, then the framework's default.
