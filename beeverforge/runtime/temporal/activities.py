@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from beeverforge import gitpin
 from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
 from beeverforge.adapters.channel.registry import channel_destination
 from beeverforge.adapters.sandbox.registry import installed_box_traits, remote_box
@@ -1596,7 +1597,8 @@ def _worker_checkout(project, repo: str):
 
 
 def _head_of(repo_path: Path) -> str:
-    head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+    # hooks off: `repo_path` is the shared repo cache, whose hooks a pass can write (#182)
+    head = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],
                           capture_output=True, text=True, timeout=30, check=False)
     return head.stdout.strip() if head.returncode == 0 else ""
 
@@ -4977,7 +4979,7 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
                 if (published / name).is_file():
                     shutil.copy2(published / name, dest / name)
 
-        head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        head = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=30, check=False)
         commit = head.stdout.strip() if head.returncode == 0 else ""
         now = datetime.now(UTC).isoformat()
@@ -5043,8 +5045,10 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
         # ticket's PR. Restore-then-clean rather than a blind delete, because a project may
         # legitimately keep `knowledge/` COMMITTED in its own repo (Phase 1's shape) — there the
         # directory is tracked content that must survive us having written into it.
+        # Hooks off (#182, #384's review): this is the shared repo cache, and a `post-checkout`
+        # hook planted there fired on exactly this `checkout -- <dir>`.
         for args in (["checkout", "--", BUNDLE_DIRNAME], ["clean", "-fdq", BUNDLE_DIRNAME]):
-            subprocess.run(["git", "-C", str(repo_path), *args],
+            subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(repo_path), *args],
                            capture_output=True, timeout=60, check=False)
 
 

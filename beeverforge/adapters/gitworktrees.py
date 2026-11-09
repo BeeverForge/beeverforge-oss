@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from beeverforge import gitpin
+
 
 @dataclass(frozen=True)
 class WorkingTree:
@@ -132,7 +134,8 @@ def mark_as_job(worktree: Path) -> None:
     written. The age the cache reads is the file's mtime. Raises `OSError` when git cannot answer
     or the file cannot be written; the caller says so."""
     try:
-        done = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"],
+        done = subprocess.run(["git", *gitpin.HOOKLESS, "-C", str(worktree),
+                               "rev-parse", "--absolute-git-dir"],
                               capture_output=True, text=True, timeout=60, check=False)
     except subprocess.SubprocessError as exc:
         # a hung git raises `TimeoutExpired`, not `OSError`: the caller catches only the latter

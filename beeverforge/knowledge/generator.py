@@ -40,6 +40,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NamedTuple
 
+from beeverforge import gitpin
 from beeverforge.knowledge.contracts import (
     Module,
     ModuleMap,
@@ -544,9 +545,12 @@ def ignored_by_git(repo: Path) -> frozenset[str]:
     in a way the caller cannot see — so the walk's callers that record blindness
     (`onboarding/context._collect_files`) record this set, and an empty one on a real
     repository is visible there."""
+    # HOOKS OFF (#182, #384's second review): the knowledge refresh builds this bundle in the
+    # shared repo cache, whose hooks a pass can write, and `status` may write the index and so
+    # fire a planted `post-index-change` on the host.
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain", "--ignored",
+            ["git", *gitpin.HOOKLESS, "-C", str(repo), "status", "--porcelain", "--ignored",
              "--untracked-files=normal", "--no-renames"],
             capture_output=True, text=True, timeout=60, check=False)
     except (OSError, subprocess.SubprocessError):
