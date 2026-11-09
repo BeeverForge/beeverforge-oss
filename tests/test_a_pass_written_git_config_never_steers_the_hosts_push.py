@@ -910,19 +910,24 @@ def _plain_run(cmd, *, cwd=None, timeout=120, env=None):
 
 def test_the_hosts_repository_runs_no_hook_the_user_config_names_whatever_runs_it(scene):
     """The ambient door keeps the person's own git configuration, and a `core.hooksPath` in it
-    would run in the host's repository on the host. `host_push` turns hooks off itself, so it
-    holds under a runner that adds nothing (the worktree box's `_run` turns them off as well,
-    which hid this layer)."""
+    would run in the host's repository on the host. `host_push` turns hooks off itself on every
+    call it makes, so it holds under a runner that adds nothing (the worktree box's `_run` turns
+    them off as well, which hid this layer).
+
+    EACH HOOK RECORDS THE REPOSITORY IT RAN IN (review of #403): the forge here is a local
+    repository whose receiving side reads the same user configuration, and a real forge's hooks
+    are its own, so a run there is allowed and a run anywhere else fails, naming where. Matched by
+    resolved path, never by path text."""
     from beeverforge.adapters.sandbox.host_push import push_from_the_hosts_own_repository
 
     hooks = scene["root"] / "user-hooks"
     hooks.mkdir()
-    for name in ("pre-push", "reference-transaction", "post-update"):
+    ran = scene["root"] / "hooks-ran"
+    for name in ("pre-push", "reference-transaction", "post-update", "post-checkout"):
         hook = hooks / name
-        # the forge here is a local repository whose receiving side reads the same user config;
-        # a real forge's hooks are its own, so only the sending side is recorded
-        hook.write_text(f"#!/bin/sh\ncase \"$PWD\" in *forge-side*) exit 0;; esac\n"
-                        f"touch '{scene['sentinel'] / name}'\nexit 0\n")
+        hook.write_text("#!/bin/sh\n"
+                        f"echo \"{name} $(cd \"$(git rev-parse --git-dir)\" && pwd -P)\" >> '{ran}'\n"
+                        "exit 0\n")
         hook.chmod(0o755)
     user = scene["root"] / "user.gitconfig"
     user.write_text(f"[core]\n\thooksPath = {hooks}\n")
@@ -935,4 +940,7 @@ def test_the_hosts_repository_runs_no_hook_the_user_config_names_whatever_runs_i
         ambient_env={**os.environ, "GIT_CONFIG_GLOBAL": str(user)})
 
     assert _git(scene["forge"], "rev-parse", "refs/heads/sdlc/4").stdout.strip() == head
-    assert sorted(os.listdir(scene["sentinel"])) == []
+    forge = os.path.realpath(scene["forge"])
+    lines = ran.read_text().splitlines() if ran.exists() else []
+    elsewhere = [line for line in lines if line.split(" ", 1)[1] != forge]
+    assert elsewhere == [], f"a hook the user config names ran outside the forge: {elsewhere}"

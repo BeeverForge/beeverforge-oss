@@ -124,7 +124,9 @@ def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: st
     try:
         own = scratch / "repo.git"
         env = dict(ambient_env) if ambient_env is not None else _own_configuration_only(scratch)
-        rc, out = run(gitpin.argv(["init", "--bare", "-q", str(own)]), env=env)
+        # hooks off here too (review of #403): from git 2.46 `init` writes HEAD through a ref
+        # transaction, and a `reference-transaction` hook the person's config names runs on it
+        rc, out = run(gitpin.argv([*_HOOKLESS, "init", "--bare", "-q", str(own)]), env=env)
         if rc != 0:
             raise RuntimeError(
                 f"push failed: could not make the host's own repository to push {branch!r} from "
