@@ -24,6 +24,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 from tests.test_a_card_nobody_started_can_be_closed_and_removed import (  # noqa: F401 — fixtures
     ADMIN,
     ASKER,
@@ -207,7 +208,7 @@ def test_a_breakdown_whose_every_front_was_refused_answers_that_refusal(
     front = {"ok": False, "ref": "", "url": "", "existed": False, "detail": detail,
              "refusal": "not_waiting"}
 
-    class _Engine:
+    class _Engine(HoldsNoFormerWorkflow):
         async def execute_workflow(self, name, inp, **_kw):
             return [dict(front), dict(front)]
 
@@ -275,7 +276,7 @@ def _a_newer_worker(monkeypatch, deployment):  # noqa: F811 — the imported fix
             return SimpleNamespace(available=True, reason="",
                                    corpus=SimpleNamespace(by_number=lambda n: promise))
 
-    class _Engine:
+    class _Engine(HoldsNoFormerWorkflow):
         async def execute_workflow(self, name, inp, **_kw):
             return [dict(row) for row in _FILED_AND_ONE_NEWER]
 

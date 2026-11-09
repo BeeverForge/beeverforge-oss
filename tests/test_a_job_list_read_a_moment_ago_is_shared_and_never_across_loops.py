@@ -249,8 +249,11 @@ def _writes_in_view() -> list[str]:
     tree = parsed(Path(inspect.getsourcefile(tv)))
 
     def a_handle(node) -> bool:
-        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get_workflow_handle")
+        # `job_handle(client, …)` is a handle on the client too (#500): a job's, under
+        # BeeverForge's id or OpenFactory 0.7's
+        return isinstance(node, ast.Call) and (
+            isinstance(node.func, ast.Attribute) and node.func.attr == "get_workflow_handle"
+            or isinstance(node.func, ast.Name) and node.func.id == "job_handle")
 
     found = []
     for fn in tree.body:

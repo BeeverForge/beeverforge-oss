@@ -4,9 +4,9 @@
 
 The same command also creates or refreshes the per-project schedules: for each enabled project
 the tech-lead watch, the knowledge refresh and the card-question sweep, and the product sweep for
-each project with the product module. The history retention, the previews' reaper and the
-retirement of orphaned schedules are not reconciled by this command; the worker reconciles them,
-with everything above, at boot (`ensure_all`).
+each project with the product module. The history retention, the previews' reaper, the
+retirement of orphaned schedules and of OpenFactory 0.7's are not reconciled by this command; the
+worker reconciles them, with everything above, at boot (`ensure_all`).
 
 Idempotent: updates the schedule if it already exists. Overlap policy SKIP — a tick
 that fires while the previous one still runs is dropped (the next one catches up),
@@ -96,6 +96,17 @@ PREVIEW_REAP_EVERY_MINUTES = 10
 #: hides an expired row, so the purge keeps a promise about the file, not about an answer.
 METRICS_PURGE_SCHEDULE_ID = "beeverforge-metrics-purge"
 METRICS_PURGE_EVERY_HOURS = 6
+
+#: OPENFACTORY 0.7'S SCHEDULES, RETIRED AT BOOT UNTIL 1.0 (#264). A 0.7 deployment upgraded in
+#: place against the same engine still has them, each firing onto 0.7's task queue — which the
+#: worker polls until 1.0 (`FORMER_TASK_QUEUE`) — beside the `beeverforge-*` schedules above: every
+#: board scanned twice a tick, every sweep and every round reported twice, two reapers. The names
+#: are 0.7's own, read at its tag v0.7.0: the poller and the reaper by their exact ids, the four
+#: per-project schedules as `<prefix>-<project>`. 0.7 had no metrics purge. Nothing else is
+#: considered (`retire_former_schedules`). Removed in 1.0.
+FORMER_SCHEDULE_IDS = ("openfactory-poller", "openfactory-preview-reaper")
+FORMER_SCHEDULE_PREFIXES = ("openfactory-product-sweep", "openfactory-techlead-watch",
+                            "openfactory-card-questions", "openfactory-okf-refresh")
 
 
 def _schedule(every_minutes: int, sandbox: str | None) -> Schedule:
@@ -187,6 +198,9 @@ async def ensure_all() -> list[str]:
     out += await ensure_card_question_sweeps()
     out.append(await ensure_preview_reaper())
     out.append(await ensure_metrics_purge())
+    # After every `ensure_*` above and never before: a boot that could not create BeeverForge's
+    # schedules raised out of this function, and 0.7's poller is then the only one there is.
+    out += await retire_former_schedules()
     out += await retire_orphan_schedules()
     return out
 
@@ -243,6 +257,66 @@ async def ensure_retention() -> str:
     log.warning("raised %s's history retention from %sh to %sd", client.namespace,
                 int(current.total_seconds() // 3600), want.days)
     return f"retention raised to {want.days}d on {client.namespace}"
+
+
+def _is_former(sid: str) -> bool:
+    """Whether `sid` is one of OpenFactory 0.7's schedules: an exact id, or a per-project prefix
+    followed by `-` and a project. `openfactory-poller-copy` and a bare prefix are not."""
+    return sid in FORMER_SCHEDULE_IDS or any(
+        sid.startswith(f"{prefix}-") for prefix in FORMER_SCHEDULE_PREFIXES)
+
+
+async def retire_former_schedules() -> list[str]:
+    """Delete OpenFactory 0.7's schedules, which fire onto a queue this worker polls until 1.0
+    (`FORMER_SCHEDULE_IDS`). Returns one line naming every schedule it deleted, or none.
+
+    ONLY 0.7'S NAMES (`_is_former`): a schedule this code did not create is not this code's to
+    delete, so `retire_orphan_schedules`' rule holds here too.
+
+    NEVER RAISES, NEVER QUIET. It runs after the new schedules are ensured, and a failure here
+    must not undo that boot; but a 0.7 schedule left in place keeps doubling the work, so each one
+    that could not be deleted is an ERROR naming it, and so is a listing that failed. A schedule
+    already gone when its delete arrives — deleted by a person, or by a second worker booting
+    beside this one — is the state this wants, and says nothing."""
+    from temporalio.service import RPCError, RPCStatusCode
+
+    try:
+        client = await connect()
+        former = sorted({sid async for sid in _schedule_ids(client) if _is_former(sid)})
+    except Exception as exc:  # noqa: BLE001 — a boot that ensured the new ones must go on
+        log.error("could not list the engine's schedules to retire OpenFactory 0.7's (%s) — "
+                  "if it has any, they keep firing beside BeeverForge's own until the next boot "
+                  "retires them, or they are deleted in the Temporal UI", exc)
+        return []
+    retired: list[str] = []
+    for sid in former:
+        try:
+            await client.get_schedule_handle(sid).delete()
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                continue
+            _could_not_retire(sid, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 — one schedule's failure must not keep the rest
+            _could_not_retire(sid, exc)
+            continue
+        retired.append(sid)
+    if not retired:
+        return []
+    return [f"retired OpenFactory 0.7's {', '.join(retired)} — BeeverForge's schedules do "
+            f"their work now"]
+
+
+async def _schedule_ids(client):
+    """Every schedule id on the engine, as `client.list_schedules()` yields them."""
+    async for sched in await client.list_schedules():
+        yield str(getattr(sched, "id", ""))
+
+
+def _could_not_retire(sid: str, exc: BaseException) -> None:
+    log.error("could not retire OpenFactory 0.7's schedule %s (%s) — it keeps firing beside "
+              "BeeverForge's own until the next boot retires it, or it is deleted in the "
+              "Temporal UI", sid, exc)
 
 
 async def retire_orphan_schedules() -> list[str]:

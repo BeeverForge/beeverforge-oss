@@ -35,9 +35,10 @@ MUTATIONS = [
     ("another product's conversations are closed with this one's", FORGET,
      "                if str(wf.id).startswith(prefix)]\n",
      "                ]\n"),
+    # RE-PINNED 2026-11-09 (#500): the coordinator's block now also names 0.7's id first
     ("the project's tech-lead run is left open", FORGET,
-     "        if coordinator:\n            async for wf in client.list_workflows(",
-     "        if False:\n            async for wf in client.list_workflows("),
+     "        if coordinator:\n            # and OpenFactory 0.7's",
+     "        if False:\n            # and OpenFactory 0.7's"),
 
     ("a turn at work is ended mid-turn", FORGET,
      '        if any(presence.get(k) for k in ("running", "working", "fast", "waiting")):\n'
