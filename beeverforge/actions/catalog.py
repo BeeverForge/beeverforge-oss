@@ -1353,11 +1353,64 @@ async def _stop(*, project: str, issue: str, by: Actor, reason: str = "") -> Out
         return bad
     settled = not moved.outcome("column").startswith("failed")
     await asyncio.to_thread(_journal_the_stop, found, issue, by=by, why=why)
+    # WHAT ENDED IS THE WORKFLOW (#44). The job's work runs on a worker, which hears of it at its
+    # next heartbeat, or not at all while it is gone — so the sentence says what the worker was
+    # last heard doing, read from the description taken before the terminate, and claims no more.
+    worker, told = _what_the_worker_hears(described, now=_now())
     return _after_the_door(moved, done(
-        f"#{issue}: stopped by {by} — the floor is free. This does not resume: the ticket goes "
-        f"back to the board and a fresh job starts from the beginning, so whatever that run had "
-        f"in flight is gone.",
-        project=found.name, issue=issue, by=str(by), reason=why, freed=True, settled=settled))
+        f"#{issue}: the engine ended its workflow on {by}'s stop — the floor is free. {told}. "
+        f"This does not resume: the ticket goes back to the board and a fresh job starts from "
+        f"the beginning, so whatever that run had in flight is gone.",
+        project=found.name, issue=issue, by=str(by), reason=why, freed=True, settled=settled,
+        worker=worker))
+
+
+def _now():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
+
+
+#: The job activity's heartbeat window (`workflow.py`, `_run_job_once`: `heartbeat_timeout`): a
+#: worker heard within it is still beating, and is told of the stop at its next beat.
+_HEARD_WITHIN_SECONDS = 120
+
+
+def _what_the_worker_hears(described, *, now) -> tuple[str, str]:
+    """`(heard | silent | none, the sentence)` — what the worker running the job's `run_job` is
+    known to hear of a stop, from `describe()`'s pending activities. Read with `getattr` all the
+    way down: a description that cannot say is read as no step reported running, never as heard."""
+    raw = getattr(described, "raw_description", None)
+    pending = [p for p in (getattr(raw, "pending_activities", None) or ())
+               if getattr(getattr(p, "activity_type", None), "name", "") == "run_job"]
+    if not pending:
+        return "none", "No step of it was reported running on a worker"
+    beat = _when(getattr(pending[0], "last_heartbeat_time", None))
+    if beat is not None and (now - beat).total_seconds() <= _HEARD_WITHIN_SECONDS:
+        # ITS RUNNER ASKS THE ENGINE BEFORE EACH PUBLISHING STEP (review of #453), so "publish
+        # nothing" holds from the terminate on; only the agent's END waits for the heartbeat
+        return "heard", (f"Its worker was heard at {_said(beat)} and is told at its next heartbeat "
+                         f"to end the agent and remove the worktree; it asks the engine before "
+                         f"each step that would publish, so it will publish nothing")
+    since = _said(beat) if beat is not None else "it started"
+    return "silent", (f"Its worker has not been heard from since {since}, so whether its agent is "
+                      f"still running there is not known; a worker that comes back is told at its "
+                      f"first heartbeat and publishes nothing, and its log says "
+                      f"BEEVERFORGE_JOB_STOPPED when it has been")
+
+
+def _when(stamp):
+    """A protobuf `Timestamp` as an aware datetime, or None when it is unset or unreadable."""
+    from datetime import UTC, datetime
+
+    seconds = getattr(stamp, "seconds", 0) or 0
+    if not isinstance(seconds, int) or seconds <= 0:
+        return None
+    return datetime.fromtimestamp(seconds, UTC)
+
+
+def _said(at) -> str:
+    return at.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _journal_the_stop(project, issue: str, *, by: Actor, why: str) -> None:

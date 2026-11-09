@@ -30,6 +30,7 @@ from beeverforge.adapters.notify.base import Level, NullNotifier
 from beeverforge.adapters.notify.base import Notifier as NotifierT
 from beeverforge.adapters.reviewer.base import ReviewerAdapter, ReviewInput
 from beeverforge.adapters.sandbox.base import BranchHeldElsewhere, SandboxAdapter, Workspace
+from beeverforge.adapters.sandbox.stopping import JobStopped, Stop
 from beeverforge.adapters.tracker.base import TrackerAdapter
 from beeverforge.contracts import (
     AgentRunMetric,
@@ -1293,6 +1294,91 @@ class JobRunner:
     #: and every runner of the same job (the run, a repair, an adjust, a re-review) is built with
     #: the same number, so they all find the branch the open pull request tracks.
     change: int = 0
+    #: A PERSON'S STOP, AS THE THREAD RUNNING THIS HEARS IT (#44). The activity's heartbeat loop
+    #: requests it when the job's workflow is ended; `_unless_stopped` asks it before each step
+    #: that reaches the forge or the board. None — every runner but a job's — asks nothing.
+    stop: Stop | None = field(default=None, repr=False)
+
+    def hears(self, stop: Stop) -> None:
+        """This runner, and its box, are told of `stop`. The box is given it only when it has a
+        `stop` of its own to set (a local box): it then starts each command in a process group the
+        stop kills. Not on the `SandboxAdapter` port, which is `runtime_checkable`: a data member
+        there would make every test double non-conforming."""
+        self.stop = stop
+        if hasattr(self.sandbox, "stop"):
+            self.sandbox.stop = stop
+
+    def _unless_stopped(self, step: str) -> None:
+        """Raise `JobStopped` when a person stopped this job: `step` is not taken.
+
+        ASKED BEFORE EACH STEP THAT REACHES THE FORGE OR THE BOARD — a push, a pull request, its
+        review, reviewers, a merge, a card's move, a comment on the ticket — because those are what
+        a stopped job did on a deployment, 46 minutes after `stop` said it was over. Raised, not
+        returned: a `BaseException` that the best-effort handlers do not swallow, out through
+        `run()`'s `finally`, which removes the worktree as a job that ends normally does.
+
+        `confirm`, NOT `requested` (review of #453): the heartbeat hears a terminate up to a
+        throttled minute late, so each of these steps also asks the engine whether the job's
+        workflow is still running (`Stop.ask`, set by the activity's heartbeat loop)."""
+        stop = getattr(self, "stop", None)
+        if stop is not None and stop.confirm():
+            log.warning("BEEVERFORGE_JOB_STOPPED before %s — %s; nothing more is published",
+                        step, stop.why or "a person stopped the job")
+            # WHAT ALREADY LANDED IS SAID, ONCE, and then the job stops (review of #453): an open
+            # pull request or a merge the stop arrived too late to prevent is otherwise mentioned
+            # by nothing — the card the stop put in the backlog says the work stopped
+            landed = vars(self).pop("_landed_here", None)
+            if landed is not None:
+                self._say_what_landed(*landed)
+            raise JobStopped(step, stop.why)
+
+    #: What may have landed on the forge before a stop reached the job: an opened pull request,
+    #: an armed auto-merge, a merge. The keys are the only sentences `_say_what_landed` says.
+    _WHAT_LANDED = {"opened": "job.stopped.landed.opened", "armed": "job.stopped.landed.armed",
+                    "merged": "job.stopped.landed.merged"}
+
+    def _landed(self, ticket: Ticket, kind: str, *, pr: str, base: str) -> None:
+        """An irreversible forge call returned (#44, review of #453): from here on a stop says what
+        it left behind (`_unless_stopped`), because nothing the stop does can take it back."""
+        assert kind in self._WHAT_LANDED, kind
+        done = vars(self).get("_landed_here", (None, None, None, None, frozenset()))[4]
+        vars(self)["_landed_here"] = (ticket, kind, pr, base, done)
+
+    #: What else reached the opened pull request, and so what the "opened" sentence says of it
+    #: (review of #453): a stop during `review_pr` lands the review, one during
+    #: `request_reviewers` asks them, and a sentence saying neither happened would be false.
+    _DONE_ON_IT = ("reviewed", "asked")
+
+    def _landed_also(self, what: str) -> None:
+        """Another forge call on the opened pull request returned: the sentence says it."""
+        assert what in self._DONE_ON_IT, what
+        landed = vars(self).get("_landed_here")
+        if landed is not None:
+            vars(self)["_landed_here"] = (*landed[:4], landed[4] | {what})
+
+    def _say_what_landed(self, ticket: Ticket, kind: str, pr: str, base: str,
+                         done: frozenset = frozenset()) -> None:
+        """THE ONE COMMENT A STOPPED JOB STILL WRITES, and the journal line beside it.
+
+        NOT `_say_on_ticket`, which refuses after a stop and must go on refusing: this takes no
+        text, only which of `_WHAT_LANDED`'s facts landed, so it cannot become a way to say
+        anything else after a stop. Best-effort, like every comment: a tracker that refuses loses
+        the comment, never the stop."""
+        # BUILT FROM WHAT WAS RECORDED, so it never says a review or a reviewer request that did
+        # happen did not
+        review = self._say("job.stopped.landed.reviewed" if "reviewed" in done
+                           else "job.stopped.landed.not-reviewed")
+        reviewers = self._say("job.stopped.landed.asked" if "asked" in done
+                              else "job.stopped.landed.not-asked")
+        body = self._say(self._WHAT_LANDED[kind], pr=pr, base=base, review=review,
+                         reviewers=reviewers)
+        self._emit(ticket, "note", f"stopped after the forge took it: {body}", url=pr, landed=kind)
+        try:
+            self.tracker.comment(ticket.id, body)
+        except Exception as exc:  # noqa: BLE001 — the stop stands; only the telling failed
+            log.error("BEEVERFORGE_TICKET_COMMENT_LOST ticket=%s (%s) — the tracker refused the "
+                      "comment saying what landed before the stop: %s", ticket.id,
+                      str(exc)[:160], body[:160])
 
     def _review(self, *, sandbox, workspace, review_input: ReviewInput) -> ReviewResult:
         """The reviewer's verdict with its evidence checked against the gates that ran (#447).
@@ -2141,6 +2227,7 @@ class JobRunner:
             # carries, and before the push, because its stance goes into the body.
             self._knowledge_gate(ticket, ws, base, result)
             # push the branch to the forge (as the bot, host credentials) before the PR
+            self._unless_stopped("publish_branch")
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             card = card_reference_for(self, ticket)
             # CHARGED BEFORE THE BODY IS WRITTEN (#310). Every pass of this walk has run by now —
@@ -2158,21 +2245,25 @@ class JobRunner:
             result.auto_but_for_the_look = auto_but_for_the_look(
                 self.manifest, result, profile=getattr(self, "_profile", None))
             result.preview_shape = self._preview_shape(ws)
+            self._unless_stopped("open_pr")
             pr = self.forge.open_pr(
                 head=branch, base=base, title=card.title,
                 body=self._pr_body(ticket, result, card=card),
             )
             result.pr_url = pr
+            self._landed(ticket, "opened", pr=pr, base=base)
             self._emit(ticket, "pr", f"opened {pr}", url=pr)
 
             # the reviewer's verdict on the PR (D-5). ADR-0014: in advisory mode review_event()
             # returns "comment" — informational, never a blocking request-changes.
             if result.review is not None:
+                self._unless_stopped("review_pr")
                 self.forge.review_pr(
                     pr=pr,
                     event=review_event(result.review, self.manifest.review_mode),
                     body=format_review(result.review),
                 )
+                self._landed_also("reviewed")
 
             # merge posture (D-12): auto-merge only when policy allows and it's safe;
             # otherwise hand to humans — request reviewers + comment the ticket.
@@ -2184,7 +2275,9 @@ class JobRunner:
                 if held is not None:  # couldn't merge cleanly → held for a human
                     return held
             else:
+                self._unless_stopped("request_reviewers")
                 self.forge.request_reviewers(pr=pr, reviewers=self.manifest.reviewers)
+                self._landed_also("asked")
                 if (getattr(self.manifest, "okf_gate", "advise") == "enforce"
                         and result.knowledge_stance == "dark"):
                     # DARK IS REFUSED WITH THE QUESTION ASKED (ADR-0046). The pull request exists,
@@ -2222,6 +2315,7 @@ class JobRunner:
             return self._charged(result)
         finally:
             self.sandbox.cleanup(workspace=ws)
+            vars(self).pop("_landed_here", None)  # this walk's fact, never the next one's
             # the fetched knowledge bundle is a temp checkout — one leaked per job
             # would fill the worker's finite disk.
             self._drop_published_bundle()
@@ -2824,6 +2918,8 @@ class JobRunner:
 
     def _set_state(self, ticket: Ticket, state: JobState, reason: str | None = None, *,
                    needs_person: bool | None = None) -> None:
+        # OUTSIDE EVERY `try` BELOW: a stopped job moves no card and hands no outcome back (#44)
+        self._unless_stopped(f"set_state {state.value}")
         # THE FORGE IS A MIRROR OF THE TRANSITION, NOT THE TRANSITION. What actually decides what
         # happens next is this platform's own record — the event, the RunResult, and the alarm the
         # caller raises after. Once every tracker write learned to report a refusal by raising,
@@ -3156,6 +3252,7 @@ class JobRunner:
         is why this is an ERROR with a greppable marker rather than a shrug; losing the park costs a
         job nobody knows is stuck, which is the thing this platform exists to make impossible.
         """
+        self._unless_stopped("say_on_ticket")  # outside the `try`: a stop is not a lost comment
         try:
             self.tracker.comment(ticket_id, body)
         except Exception as exc:  # noqa: BLE001 — the act stands; only the telling failed
@@ -3238,6 +3335,7 @@ class JobRunner:
             # exactly this reason, alone in the tree.
             if written is not None and not written:
                 return None  # nothing was written → plain hold, fresh restart on resume
+            self._unless_stopped("publish_branch for a hold")  # a BaseException: not caught below
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             self._emit(ticket, "note", "partial work pushed — Resume will continue it")
             # No session known → a non-empty sentinel: it still signals "restore the branch"
@@ -3259,6 +3357,7 @@ class JobRunner:
             return resume_handle  # local/test path with no real git remote — nothing to push
         try:
             self._commit(ws, ticket)  # commit the partial tree (no-op if the agent wrote nothing)
+            self._unless_stopped("publish_branch for a pause")  # a BaseException: not caught below
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
             self._emit(ticket, "note", "partial work pushed — resume will continue it")
             return resume_handle
@@ -3340,6 +3439,7 @@ class JobRunner:
             + "\n".join(lines)
             + "\n\nAnswer on the panel, or in the project channel with `decision: <key>`."
         )
+        self._unless_stopped("record_decision")  # outside the `try`: a stop is not a lost comment
         try:
             self.tracker.comment(ticket.id, body)
         except Exception as exc:  # noqa: BLE001 — recording is best-effort; the park still holds
@@ -3376,7 +3476,9 @@ class JobRunner:
                     f"PR {pr} rebased onto {base} but validations then failed — needs a human",
                     JobState.ON_HOLD, branch=branch,
                 )
+            self._unless_stopped("publish_branch after a rebase")
             self.sandbox.publish_branch(workspace=ws, remote_url=self.forge.push_remote())
+        self._unless_stopped("merge_pr")
         try:
             self.forge.merge_pr(pr=pr)
         except Exception as exc:  # e.g. a race re-drifted it, or the merge is truly blocked
@@ -3395,7 +3497,9 @@ class JobRunner:
         # (required CI still pending). Only claim MERGED when it truly is; otherwise hand the
         # durable workflow the CI-watch/repair/merge loop (ADR-0004) — a red CI gets fixed,
         # not left armed forever.
-        if self.forge.pr_merged(pr=pr):
+        merged = self.forge.pr_merged(pr=pr)
+        self._landed(ticket, "merged" if merged else "armed", pr=pr, base=base)
+        if merged:
             self._emit(ticket, "pr", "auto-merge complete", url=pr)
             result.state = JobState.MERGED
             self._set_state(ticket, JobState.MERGED)
