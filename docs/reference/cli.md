@@ -119,6 +119,26 @@ changes it only through an action. `--source owner/repo` (repeatable) names the 
 N repositories, N proofs, N pull requests; `--skip-context` leaves the context half out. A
 failing proof does not withhold the pull request — it is quoted in it. Walked in [ONBOARDING §3](../ONBOARDING.md).
 
+**Renaming the former folder** — `beeverforge migrate <name> --yes` proposes renaming
+`.openfactory/`, the platform's folder under its former name, to `.beeverforge/`:
+one pull request per repository, on `beeverforge/migrate-folder`, for a person to merge. It looks
+at the project's code repository, the ones named with `--source owner/repo` (repeatable) and its
+context repository, each from a throwaway clone of the base branch. A repository that carries only
+`.openfactory/` gets the folder moved with `git mv`, and the `.openfactory/` paths written in the
+moved files (a `preview.compose: .openfactory/preview.compose.yml`) rewritten, line endings kept;
+nothing outside the folder is edited, and the pull request names the files a path was rewritten
+in. Files OUTSIDE the folder that still mention `.openfactory/` (a `.gitignore` line, a CI step, a
+document) are named in the pull request and in the line printed, for you to update: they are not
+changed, and once the rename is merged they point at a folder that is gone. One already on
+`.beeverforge/`, or with neither, is left alone; one that carries both gets no pull request, and
+the line says `.beeverforge/` is the one read and `.openfactory/` is yours to reconcile and remove.
+Safe to run again: an open pull request is named, never opened twice, and after the merge the run
+does nothing. A `beeverforge/migrate-folder` branch with no open pull request (an interrupted run,
+or a proposal you closed) is named and never reopened: delete it to propose the rename afresh. One line per repository; a repository that could not be cloned, asked or pushed to is
+one sentence with the cause and the remedy, the others still run, and the command exits 1. Nothing
+is written into a checkout — a project whose forge is this machine is refused (exit 2), with the
+`git mv` to run there yourself.
+
 **The environment session** — `env read <path-or-name>` proposes the manifest and writes
 nothing; `env apply <path-or-name> --yes` writes it into that checkout (`--accept`, `--set`,
 `--force`, `--out`). With **no checkout anywhere**, `env apply <name> --yes --pr` has the worker
