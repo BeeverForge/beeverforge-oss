@@ -6,8 +6,11 @@ WORKER = "beeverforge/runtime/temporal/worker.py"
 CLI = "beeverforge/cli.py"
 
 MUTATIONS = [
+    # RE-PINNED 2026-11-03 (#398): the birth probe is handed `_birth_bound` (what is left of the
+    # birth's wait, at least the read deadline) instead of a fixed 1.0 s of its own. Same cut.
     ("the worker dials at once again, and dies on the first refusal", CONN,
-     "    while not await _listening(host, port):", "    while False:"),
+     "    while not await _listening(host, port, within=_birth_bound(deadline)):",
+     "    while False:"),
 
     ("the wait has no bound: an engine that never starts holds the worker for ever", CONN,
      "        if time.monotonic() >= deadline:", "        if False:"),
@@ -31,7 +34,7 @@ MUTATIONS = [
 
     # #681, delta review of #818: the birth connect's own bound, and the sentence it ends in.
     ("the birth connect is given a read's few seconds, not the start-up wait", CONN,
-     "    within = max(deadline - time.monotonic(), read_deadline())\n",
+     "    within = _birth_bound(deadline)\n",
      "    within = read_deadline()\n"),
     ("a birth connect that never answers ends in the read deadline's words", CONN,
      "    except TimeoutError:\n        # SAID AS THE OTHER TIMING FAILURE IS",

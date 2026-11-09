@@ -239,8 +239,8 @@ def _manifest(checkout: Path, target: str, language: str):
                            retired=namespace.RETIRED_DIR, current=namespace.DIR)) from None
     if not manifest_file.is_file():
         raise Refused(_say(SAY, "refuse.no_manifest", language, target=target,
-                           manifest=namespace.MANIFEST))
-    shown = (Path(target) / namespace.MANIFEST).as_posix()
+                           manifest=namespace.in_repo(checkout, namespace.MANIFEST)))
+    shown = (Path(target) / namespace.in_repo(checkout, namespace.MANIFEST)).as_posix()
     try:
         data = yaml_io.load(manifest_file.read_text()) or {}
         if not isinstance(data, dict):

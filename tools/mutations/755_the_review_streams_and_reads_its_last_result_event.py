@@ -6,7 +6,7 @@ The claims, each a row:
 
   * the review asks `claude` for `--output-format stream-json --verbose`, so a wrapper in front of
     it sees the review's `rate_limit_event` (row 1 is the defect itself); and `--verbose` with it,
-    because the pinned 2.1.219 refuses `stream-json` under `-p` without it (row 2: the stand-in in
+    because 2.1.219 refuses `stream-json` under `-p` without it (row 2: the stand-in in
     test A refuses as the CLI does, measured 2026-10-19);
   * the verdict is the LAST `type == "result"` event (row 3), not the init event `json_envelope`
     returns first (row 5), not whatever object closes the output (row 6), and not a verdict the
@@ -58,9 +58,11 @@ MUTATIONS = [
      "        if obj:\n            found = obj"),
     ("the review's cost is lost: the PR's Cost: line is the executor's alone again", REVIEWER,
      '"cost_usd": envelope.get("total_cost_usd"),', '"cost_usd": None,'),
+    # re-pinned after #131 gave this return `did_not_complete=rc != 0` on its next line: the
+    # anchor ends at the comma the new argument follows
     ("the refusal softened: an unread review is approved", REVIEWER,
-     'return ReviewResult(decision="rejected", score=0, summary=summary)',
-     'return ReviewResult(decision="approved", score=0, summary=summary)'),
+     'return ReviewResult(decision="rejected", score=0, summary=summary,',
+     'return ReviewResult(decision="approved", score=0, summary=summary,'),
     ("the never-ran test reads the raw stream: a 404 the reviewer read says the reviewer never ran",
      REVIEWER, '"not found" in prose_only(out).lower()', '"not found" in (out or "").lower()'),
     ("the verdict is the first reply text that looks like one: a verdict quoted in a tool's output "

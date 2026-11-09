@@ -44,6 +44,7 @@ from beeverforge.adapters.sandbox.base import (
     Workspace,
     run_and_stream,
 )
+from beeverforge.adapters.sandbox.stopping import Stop, adopted, own_group
 from beeverforge.util.filelock import Waited
 
 log = logging.getLogger("beeverforge.sandbox.worktree")
@@ -772,6 +773,12 @@ def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:
     return env
 
 
+def job_tmpdir(workspace: Workspace) -> Path:
+    """A job's `TMPDIR`: beside its worktree, under the box's root, named so that no worktree can
+    be — a git branch component never starts with a dot, and a worktree is named by its branch."""
+    return workspace.path.parent / f".{workspace.path.name}.tmp"
+
+
 def _redact(text: str) -> str:
     """Strip any embedded credential from an authenticated URL before logging."""
     return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text)
@@ -779,7 +786,11 @@ def _redact(text: str) -> str:
 
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
          env: Mapping[str, str] | None = None) -> tuple[int, str]:
-    # `env=None` inherits the process environment, as every caller but the box's own add does
+    # `env=None` inherits the process environment, as every caller but the box's own add does.
+    # Every git call runs in the shared repo cache with its hooks off (#182): a hook a pass
+    # planted there would run here, on the host, with the host's credentials.
+    if cmd[:1] == ["git"]:
+        cmd = ["git", *gitpin.HOOKLESS, *cmd[1:]]
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -808,6 +819,8 @@ class WorktreeSandbox(SandboxAdapter):
         self._staged: list[Path] = []
         #: What the command currently running has written — the buffer `tail()` reads (C-39).
         self._output = OutputBuffer()
+        #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
+        self.stop: Stop | None = None
 
     def guidelines_path(self, host_dir: Path) -> str | None:
         """Where the operator's guidelines directory is readable FROM INSIDE THIS BOX (#318).
@@ -1289,16 +1302,42 @@ class WorktreeSandbox(SandboxAdapter):
 
         `errors="replace"` is new and deliberate: `text=True` alone decodes strictly, so a single
         stray byte anywhere in four hours of agent output raised `UnicodeDecodeError` out of the
-        sandbox — losing the entire pass to a mojibake character in a filename."""
-        return run_and_stream(
-            subprocess.Popen(
+        sandbox — losing the entire pass to a mojibake character in a filename.
+
+        A JOB'S BOX STARTS EACH COMMAND IN A PROCESS GROUP OF ITS OWN (#44), and only a job's: the
+        one exception to the same-group rule `base.run_and_stream` states at its wall. A person's
+        `stop` has to end the agent pass and everything the harness spawned, and only a group of
+        its own can be killed whole without killing the worker; `self.stop` kills it
+        (`stopping.Stop.request`). What the shared group gave — a signal sent to the worker's whole
+        group (a terminal's Ctrl-C) reaching the harness — is given back on a graceful shutdown by
+        the worker's own cancel, which the activity treats as a stop
+        (`activities._the_work_must_end`); a worker killed with SIGKILL orphans the harness, as a
+        box in the shared group always could. A box with no stop (every judging role) is unchanged.
+
+        …AND MARKED, AND GIVEN A TEMPORARY DIRECTORY OF ITS OWN (review of #453). A job's command
+        carries its stop's mark (`stopping.MARK_VAR`), which a descendant in a session of its own
+        still inherits and the stop kills by; and `TMPDIR` names `job_tmpdir(workspace)`, beside
+        the worktree, which `cleanup` removes with it — so a test run SIGKILLed by a stop, whose
+        own `finally` never runs, leaves nothing in `/tmp`. Made here, before the command, so it
+        exists for the first one. A tool that ignores `TMPDIR`, or a harness that sets its own for
+        the commands it runs (Claude Code does, measured), writes where it always did.
+        """
+        stop = self.stop
+        env = _scrubbed_env(self.extra_env)
+        if stop is not None:
+            tmp = job_tmpdir(workspace)
+            tmp.mkdir(parents=True, exist_ok=True)
+            env.update(stop.env(), TMPDIR=str(tmp))
+        proc = subprocess.Popen(
                 command, shell=True, cwd=workspace.path,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, errors="replace", bufsize=1,
-                env=_scrubbed_env(self.extra_env),
-            ),
-            command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+                env=env, **own_group(stop),
         )
+        with adopted(stop, proc):
+            return run_and_stream(
+                proc, command=command, timeout=timeout, buffer=self._output, on_output=on_output,
+            )
 
     def tail(self) -> list[str] | None:
         """Never None: a local subprocess's pipe is the shortest read there is, and this box says
@@ -1375,9 +1414,11 @@ class WorktreeSandbox(SandboxAdapter):
         # died) overwrites the bot's OWN dedicated beeverforge/<id> branch instead of dead-locking
         # on a non-fast-forward forever. Safe: this branch is unique per job and only ever
         # the bot's; execution is serial (idempotency, engineering.md #3).
+        # --no-verify beside `_run`'s hooks override: a pre-push hook in the shared cache would
+        # be handed the authenticated URL (#182).
         target = remote_url or "origin"
         rc, out = _run(
-            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--", target,
+            gitpin.argv(["-C", str(workspace.path), "push", "--force", "--no-verify", "--", target,
                          workspace.branch])
         )
         if rc != 0:
@@ -1434,3 +1475,6 @@ class WorktreeSandbox(SandboxAdapter):
             log.warning("the box's own tree %s is locked — left as it is", workspace.path)
         elif workspace.path.exists():
             shutil.rmtree(workspace.path, ignore_errors=True)
+        # THE JOB'S `TMPDIR` GOES WITH ITS TREE (review of #453), locked or not: it is never a
+        # person's, and it holds what a killed test run never got to remove
+        shutil.rmtree(job_tmpdir(workspace), ignore_errors=True)

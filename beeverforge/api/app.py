@@ -2473,6 +2473,16 @@ def answer_channel_message(project: str, body: dict, request: Request) -> dict:
         if code in ("gone", "replaced"):
             channel.answer(project, token=token, answer=answer, by=by)  # clears the pending list
             raise HTTPException(status_code=409, detail=sentence)
+        if code == "refused":
+            # THE MODULE DECLINED THE WRITE (#187): its word's status, the way `/api/act` answers
+            # it — never the 200 decision payload below for a write that did not happen
+            from beeverforge.actions.catalog import _REFUSAL_CODE
+
+            status = _STATUS.get(_REFUSAL_CODE.get(getattr(sentence, "refusal", "")), 500)
+            raise HTTPException(status_code=status, detail=str(sentence))
+        if code == "failed":
+            # THE WRITE RAISED (#187): the person's sentence is "something broke", and it is a 500
+            raise HTTPException(status_code=500, detail=sentence)
         # `consume` already recorded the durable answer row inside the gate — recording it again
         # here would double the append-only history for one decision
         return {"project": project, "token": token, "answer": answer, "by": by,

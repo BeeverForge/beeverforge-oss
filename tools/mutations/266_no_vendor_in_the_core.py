@@ -169,10 +169,11 @@ MUTATIONS = [
      "                        addressed=extra.get(transcript.ADDRESSED_MARK) is not False,",
      "                        addressed=True,"),
     # RE-PINNED 2026-09-25 (#335): the history is read into `before`, which the clock also reads
+    # RE-PINNED 2026-11-06 (#437): the same call, now inside `_not_the_platform(...)`
     ("the turn asks its history for what was not addressed to the role", ENGINE,
-     "    before = [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)",
-     "    before = [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel,\n"
-     "                                           overheard=True)"),
+     "        [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel)",
+     "        [t for t in transcript.recent(project, thread=ex.thread, channel=ex.channel,\n"
+     "                                      overheard=True)"),
     ("the turn asks the recall for what was not addressed to the role", ENGINE,
      "                      partition=transcript.partition(project))",
      "                      partition=transcript.partition(project), overheard=True)"),

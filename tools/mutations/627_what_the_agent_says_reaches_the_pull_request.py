@@ -236,24 +236,25 @@ MUTATIONS = [
     ("an agent that wrote nothing gets an empty section", MACHINE,
      "        out.append(_WROTE_NOTHING)\n",
      "        pass\n"),
+    # RE-PINNED 2026-11-04 (#197): the note withholds a credential before its cut.
     ("the journal note carries 2000 characters", MACHINE,
-     'f"agent finished: {agent_result.summary[:200]}"',
-     'f"agent finished: {agent_result.summary[:2000]}"'),
+     'f"agent finished: {_without_credentials(agent_result.summary)[:200]}"',
+     'f"agent finished: {_without_credentials(agent_result.summary)[:2000]}"'),
     # ── never the reviewer, and never the merge ────────────────────────────────────────────────
+    # re-pinned after #131 put the review's pause check between `_count_review` and `advisory`:
+    # the anchor ends at the count, which the re-review's deeper indentation still keeps unique
     ("the first review is handed the agent's account", MACHINE,
      "                    review_input=ReviewInput(\n"
      "                        ticket=ticket, diff=diff, validations=result.validations\n"
      "                    ),\n"
      "                )\n"
-     "                self._count_review(result.review)\n"
-     "                advisory",
+     "                self._count_review(result.review)\n",
      "                    review_input=ReviewInput(\n"
      "                        ticket=ticket.model_copy(update={\"context\": account}), diff=diff,\n"
      "                        validations=result.validations\n"
      "                    ),\n"
      "                )\n"
-     "                self._count_review(result.review)\n"
-     "                advisory",
+     "                self._count_review(result.review)\n",
      REVIEWER_TEST),
     ("ReviewInput gains a field for the account", REVIEWER,
      "    constraints: list[str] = Field(default_factory=list)  # ADRs it must check against\n",

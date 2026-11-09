@@ -60,6 +60,21 @@ def test_a_review_that_did_not_happen_is_not_headed_rejected(summary):
     assert "not a judgement about the diff" in body
 
 
+@pytest.mark.parametrize("review", [
+    ReviewResult(decision="rejected", score=0, did_not_complete=True,
+                 summary="the review did not complete: the reviewer's run ended in error (rc=1)"),
+    ReviewResult(decision="rejected", score=0, pause_reason="rate_limit",
+                 summary="THE REVIEW NEVER RAN (claude_code): rate_limit."),
+], ids=["did-not-complete", "paused"])
+def test_a_review_that_ended_in_error_is_not_headed_rejected(review):
+    """#131's outcomes are read from the review's fields, not its sentence: neither holds "could
+    not be parsed" or a lower-case "never ran", and a phrase match alone headed them rejected."""
+    body = _body(review)
+
+    assert "DID NOT COMPLETE" in body
+    assert "Review — rejected" not in body
+
+
 def test_a_REAL_rejection_still_says_so_loudly():
     """The positive twin. A guard that softened every rejection would be worse than the bug —
     a reviewer that genuinely refused a diff must not be reported as "did not complete"."""
@@ -81,3 +96,17 @@ def test_an_approval_is_untouched():
     body = _body(ReviewResult(decision="approved", score=92, summary="meets every criterion"))
     assert "Review — approved (score 92)" in body
     assert "DID NOT COMPLETE" not in body
+
+
+def test_a_review_that_says_it_never_ran_in_capitals_is_not_a_verdict():
+    """Both reviewers write a run that never reached a verdict as "THE REVIEW NEVER RAN" — in
+    capitals — and the shared reader matched the lowercase phrase only, so the generic reviewer's
+    failure was headed as a plain rejection of the diff (#131's review of its own gap)."""
+    from beeverforge.contracts.review import ReviewResult, not_a_verdict
+
+    never_ran = ReviewResult(decision="rejected", score=0, summary=(
+        "THE REVIEW NEVER RAN (harness): the agent exited 1. This diff has NOT been reviewed."))
+    assert not_a_verdict(never_ran)
+    judged = ReviewResult(decision="rejected", score=0, summary="It never ran the migration.")
+    judged_with_finding = judged.model_copy(update={"score": 10})
+    assert not not_a_verdict(judged_with_finding), "a scored rejection is a verdict"

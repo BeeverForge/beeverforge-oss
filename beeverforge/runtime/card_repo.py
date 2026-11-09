@@ -138,17 +138,17 @@ def _is_default_repo(project, repo: str) -> bool:
     (adversarial review, 2026-08-13). The qualifier must still MATCH — a same-named repository
     in another ADO project is genuinely foreign."""
     default = (project.forge.repo if project.forge else None) or project.tracker.repo or ""
-    if not repo or repo == default:
+    if not repo or repo.casefold() == default.casefold():     # names ignore case (#385)
         return True
     if default and default.count("/") < repo.count("/") \
-            and repo.rsplit("/", 1)[-1] == default:
-        qualifier = repo.rsplit("/", 1)[0]
+            and repo.rsplit("/", 1)[-1].casefold() == default.casefold():
+        qualifier = repo.rsplit("/", 1)[0].casefold()
         tracker_repo = (project.tracker.repo or "") if getattr(project, "tracker", None) else ""
         forge_project = ""
         forge = getattr(project, "forge", None)
         if forge is not None:
             forge_project = str((getattr(forge, "options", None) or {}).get("project", ""))
-        return qualifier in {q for q in (tracker_repo, forge_project) if q}
+        return qualifier in {q.casefold() for q in (tracker_repo, forge_project) if q}
     return False
 
 

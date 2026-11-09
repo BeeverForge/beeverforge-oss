@@ -8,20 +8,21 @@ A judging role's caller builds `sandbox/registry.py::judging_worktree`, which al
 cwd=workspace.path)` on the host, whatever box the project's jobs run in. Most rooms it is handed
 (a fresh temporary directory, the repo cache's master clone, the module's cached view) are ones
 nothing commits from, so no `ask()` edit made there reaches a pull request, but nothing confines a
-write to its room either. One is not: `env context --ask` (`actions/catalog.py::_semantic_pass`)
-asks in the checkout `repo_for` resolves, the path the person typed or a registered `repo_path`,
-which on a local deployment is the repository they commit from (review of e2b57dd1, 2026-10-20).
+write to its room either. One was not, until #167: `env context --ask`
+(`actions/catalog.py::_semantic_pass`) asked in the checkout `repo_for` resolves, the path the person
+typed or a registered `repo_path`, which on a local deployment is the repository they commit from
+(review of e2b57dd1, 2026-10-20). It now asks in a copy of that checkout, removed after it answers.
 And one `ask()` is not handed `judging_worktree` at all: the independent review, which
 `JobRunner._review` runs through `HarnessReviewer.review` in the job's own box on the job's
 workspace, before the push (review of dc0efac4, 2026-10-20).
 
 THE FIRST FOUR TESTS ARE THE MEASUREMENT the documents must agree with: a project that boxes its
 jobs in a container still gets a host room for its judging roles, the real `KimiAdapter.ask` that
-disobeys its instruction leaves its file there, asked the way `env context --ask` asks it leaves
-that file untracked in the person's checkout, and as the reviewer of a job its committed file is
-in the pushed branch. They are green on main by design. The first three turn red the day
-`judging_worktree` routes into the box, the fourth the day the review moves into a judging room,
-which is when the wording must change back.
+disobeys its instruction leaves its file there, asked through `env context --ask` it leaves nothing
+in the person's checkout (#167: that row was the fact the wording named, and flipped with the fix),
+and as the reviewer of a job its committed file is in the pushed branch. The first two turn red the
+day `judging_worktree` routes into the box, the fourth the day the review moves into a judging
+room, which is when the wording must change back.
 
 THE DOCUMENT ROWS READ TEXT, AND HERE THE TEXT IS THE THING. CONTRIBUTING's rule is that a guard
 reads the thing rather than text about it; a docstring, an ADR section and a configuration bullet
@@ -78,8 +79,11 @@ WHERE_THEY_RUN = re.compile(r"judging_worktree|(?<!never )\bon the host\b")
 #: What keeps an `ask()` edit out of a pull request, in the one phrasing every document reuses.
 NOTHING_COMMITS = "nothing commits from"
 
-#: The one judging room the phrase above is not true of, named as the exception beside it.
+#: The one judging room the phrase above was not true of until #167, named as the exception beside
+#: it; no document but ADR-0018's history may say it now.
 ENV_CONTEXT_ASK_EXCEPTION = "except `env context --ask`"
+#: What every document says of `env context --ask` since #167, beside the phrase above.
+ENV_CONTEXT_ASK_COPY = "`env context --ask` asks in a copy of the checkout it is pointed at"
 
 #: The `ask()` that is not handed `judging_worktree` at all: `JobRunner._review` passes the job's
 #: own box and workspace to `HarnessReviewer.review`, which asks there (the review of dc0efac4,
@@ -279,15 +283,16 @@ def test_a_kimi_question_that_writes_leaves_its_file_in_the_host_room(monkeypatc
     assert (room / "wrote.txt").read_text(encoding="utf-8") == "disobeyed\n"
 
 
-def test_a_kimi_question_asked_as_env_context_asks_leaves_its_file_in_the_persons_checkout(
+def test_a_kimi_question_asked_as_env_context_asks_leaves_nothing_in_the_persons_checkout(
         monkeypatch, tmp_path):
-    """Criterion 2's basis for the `env context --ask` exception: `_semantic_pass`
-    (`actions/catalog.py`) asks with `judging_worktree(project, root=checkout)` and
-    `Workspace(path=checkout)`, where `checkout` is what `repo_for` resolved, the person's own
-    repository on a local deployment. Driven the same way with no project (`env context` on a bare
-    path) and the disobeying stub, the file is left untracked in that checkout. The review of
-    e2b57dd1 (2026-10-20) measured `?? wrote.txt` there while four documents called every judging
-    room one nothing commits from. Green on main by design; it is the fact the wording names."""
+    """#167, flipped with the fix. The row used to rebuild `_semantic_pass`'s call by hand and hold
+    the fact the documents named: the disobeying stub's file was left untracked in the person's
+    checkout (`?? wrote.txt`, review of e2b57dd1). It now drives `_semantic_pass` itself, with no
+    project (`env context` on a bare path) and the tech-lead harness set to `kimi`, so the code
+    and this row cannot drift apart: the question is asked in a copy and the checkout is clean."""
+    from beeverforge.actions.catalog import _semantic_pass
+    from beeverforge.onboarding import context as ctx
+
     checkout = tmp_path / "persons-repo"
     checkout.mkdir()
     git = ["git", "-c", "init.defaultBranch=main", "-c", "commit.gpgSign=false",
@@ -298,16 +303,14 @@ def test_a_kimi_question_asked_as_env_context_asks_leaves_its_file_in_the_person
     subprocess.run([*git, "add", "README.md"], check=True, env=env)
     subprocess.run([*git, "commit", "-q", "-m", "mine"], check=True, env=env)
     _disobeying_kimi_on_path(monkeypatch, tmp_path)
+    monkeypatch.setenv("BEEVERFORGE_HARNESS_TECHLEAD", "kimi")
 
-    result = KimiAdapter().ask(
-        sandbox=judging_worktree(None, root=checkout),
-        workspace=Workspace(path=str(checkout), branch="main", base_branch="main"),
-        prompt="What does this repository build?")
+    answer = _semantic_pass(None, checkout, ctx)("What does this repository build?")
 
-    assert result.ok, result.raw_output
+    assert answer == "done"
     status = subprocess.run([*git, "status", "--porcelain"], check=True, env=env,
                             capture_output=True, text=True).stdout
-    assert status.splitlines() == ["?? wrote.txt"], status
+    assert status.splitlines() == [], status
 
 
 def test_a_kimi_review_that_writes_reaches_the_pushed_branch(monkeypatch, tmp_path):
@@ -394,20 +397,27 @@ def test_each_document_names_where_the_kimi_judging_roles_run(name):
 
 
 @pytest.mark.parametrize("name", DOCUMENTS)
-def test_each_document_names_env_context_ask_wherever_it_says_nothing_commits_from(name):
-    """Criterion 2, as the review of e2b57dd1 (2026-10-20) found it: `env context --ask` asks in
-    the person's own checkout (the row above), so a paragraph that calls the judging rooms ones
-    "nothing commits from" names that verb as the exception in the same paragraph. On a72dffe6
-    none did: `kimi.py` and `roles.py` listed "a target checkout" among those rooms, ADR-0018's
-    amendment said of the target checkout for `env context --ask` "Each is a room nothing commits
-    from", and the 0.7.0 note and the configuration bullet said it of every read-only question."""
+def test_each_document_says_env_context_ask_asks_in_a_copy_wherever_it_says_nothing_commits_from(
+        name):
+    """#167, flipped with the fix. Until it, `env context --ask` asked in the person's own
+    checkout, and every paragraph calling the judging rooms ones "nothing commits from" named that
+    verb as the exception (review of e2b57dd1, 2026-10-20). It now asks in a copy, so each such
+    paragraph says so, and none names the old exception, except ADR-0018's §2, which is history:
+    there the old claim stands, and a later dated amendment in the same section says the new one."""
     text = DOCUMENTS[name]()
     assert text, f"{name} is empty: there is nothing to read"
     saying = [p for p in _paragraphs(text) if NOTHING_COMMITS in p]
     assert saying, f"{name} does not say {NOTHING_COMMITS!r}: the row above holds that"
-    silent = [p for p in saying if ENV_CONTEXT_ASK_EXCEPTION not in p]
-    assert not silent, (
-        f"{name} says {NOTHING_COMMITS!r} without {ENV_CONTEXT_ASK_EXCEPTION!r} in: {silent}")
+    if name == ADR:
+        flat = _collapsed(text)
+        assert ENV_CONTEXT_ASK_COPY in flat, f"{name} has no amendment saying {ENV_CONTEXT_ASK_COPY!r}"
+        assert flat.index(ENV_CONTEXT_ASK_COPY) > flat.index(ENV_CONTEXT_ASK_EXCEPTION), (
+            f"{name}'s amendment must come after the claim it amends")
+        return
+    silent = [p for p in saying if ENV_CONTEXT_ASK_COPY not in p]
+    assert not silent, f"{name} says {NOTHING_COMMITS!r} without {ENV_CONTEXT_ASK_COPY!r} in: {silent}"
+    stale = [p for p in saying if ENV_CONTEXT_ASK_EXCEPTION in p]
+    assert not stale, f"{name} still names {ENV_CONTEXT_ASK_EXCEPTION!r}: {stale}"
 
 
 @pytest.mark.parametrize("name", DOCUMENTS)

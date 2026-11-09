@@ -243,6 +243,12 @@ _CACHES = {
     ("beeverforge/adapters/agent/registry.py", "NATIVE_REVIEWERS"):
         "one per harness kind — bounded by the HARNESSES table",
     ("beeverforge/ops/impediment.py", "_LAST"): "BoundedDict(256)",
+    # #437's review — the ref each impediment was filed under, and one lock per impediment
+    ("beeverforge/ops/impediment.py", "_FILED"): "BoundedDict(256)",
+    ("beeverforge/ops/impediment.py", "_LOCKS"):
+        "one lock per (project, cause) — bounded by the registry times the closed set of causes "
+        "in `impediment._TITLES`, never by traffic; NOT a BoundedDict, because evicting a lock a "
+        "thread holds would let a second thread run the same check-and-create",
     # #267 slice 1 — a card's thread, kept until the card changes: a changed card leaves its old
     # key behind, so the bound is the cap and not the board.
     ("beeverforge/product/model.py", "_THREADS"): "BoundedDict(5000)",

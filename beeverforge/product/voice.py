@@ -1098,7 +1098,53 @@ def broke(*, language: str | None = None) -> str:
 #: transcript — a hand-off and a busy acknowledgement are presence, published and never recorded, so
 #: they need no recognition here. These take no interpolation, so a recorded line IS one of them
 #: when it ends with it: the one thing that can precede it is an agent-name prefix (`on_it` et al.).
-_OWN_VOICE = {"broke": _BROKE, "unavailable": _UNAVAILABLE}
+#: When the role's own model call failed (#437): a harness that crashed, refused the model, or is
+#: not logged in. NOT `_UNAVAILABLE`: the requirements were read, and saying they could not be
+#: sends the reader to the wrong place. It promises an alert only in the `_ALERTED` form, which is
+#: said only when an impediment is open on the board.
+_CANNOT_ANSWER = {
+    "pt-BR": ("Não consegui montar uma resposta agora — o problema é do meu lado, não do que você "
+              "perguntou. Tente de novo daqui a pouco, que eu tento outra vez."),
+    "en": ("I couldn't put an answer together just now — the problem is on my side, not in what "
+           "you asked. Try again shortly and I'll have another go."),
+}
+_CANNOT_ANSWER_ALERTED = {
+    "pt-BR": ("Não consegui montar uma resposta agora — o problema é do meu lado, não do que você "
+              "perguntou. O time já foi avisado. Tente de novo daqui a pouco, que eu tento outra "
+              "vez."),
+    "en": ("I couldn't put an answer together just now — the problem is on my side, not in what "
+           "you asked. The team has been alerted. Try again shortly and I'll have another go."),
+}
+#: The same, for the draft that follows an answer (#437): the answer was given, the draft of what
+#: was asked for could not be written.
+_CANNOT_DRAFT = {
+    "pt-BR": ("Não consegui escrever o rascunho agora — o problema é do meu lado. Peça de novo "
+              "daqui a pouco, que eu escrevo."),
+    "en": ("I couldn't write the draft just now — the problem is on my side. Ask again shortly and "
+           "I'll write it."),
+}
+_CANNOT_DRAFT_ALERTED = {
+    "pt-BR": ("Não consegui escrever o rascunho agora — o problema é do meu lado. O time já foi "
+              "avisado. Peça de novo daqui a pouco, que eu escrevo."),
+    "en": ("I couldn't write the draft just now — the problem is on my side. The team has been "
+           "alerted. Ask again shortly and I'll write it."),
+}
+
+
+def cannot_answer(*, alerted: bool, language: str | None = None) -> str:
+    """The role's own model call failed (#437). Names no cause the person could act on, never the
+    requirements, and says the team was alerted only when it was."""
+    return _pick(_CANNOT_ANSWER_ALERTED if alerted else _CANNOT_ANSWER, language)
+
+
+def cannot_draft(*, alerted: bool, language: str | None = None) -> str:
+    """The draft's model call failed after the answer was given (#437)."""
+    return _pick(_CANNOT_DRAFT_ALERTED if alerted else _CANNOT_DRAFT, language)
+
+
+_OWN_VOICE = {"broke": _BROKE, "unavailable": _UNAVAILABLE,
+              "cannot_answer": _CANNOT_ANSWER, "cannot_answer_alerted": _CANNOT_ANSWER_ALERTED,
+              "cannot_draft": _CANNOT_DRAFT, "cannot_draft_alerted": _CANNOT_DRAFT_ALERTED}
 
 
 def own_voice_kind(text: str) -> str:
@@ -4945,9 +4991,9 @@ _CARD_NOTE = {
                       "cartão voltou para o backlog, e o branch e os commits dele estão intactos."),
         "skipped": ("_Pulado {by_who}._{why} A fábrica parou de trabalhar nele e a fila está "
                     "livre. Nada foi entregue: o cartão voltou para o backlog."),
-        "stopped": ("_Parado {by_who}._{why} O job foi encerrado no motor; nada foi mergeado e "
-                    "nenhum branch foi apagado. O cartão voltou para o backlog e pode ser "
-                    "retomado."),
+        "stopped": ("_Parado {by_who}._{why} O workflow dele foi encerrado no motor, e o worker "
+                    "que o roda é avisado para encerrar o agente e não publicar mais nada; nenhum "
+                    "branch foi apagado. O cartão voltou para o backlog e pode ser retomado."),
         "question_answered": "_Respondido {by_who}._{why}",
         "parked": "_Parado à espera de uma pessoa._{why}",
         "delivered": "_Entregue._{why}",
@@ -4973,9 +5019,10 @@ _CARD_NOTE = {
                       "untouched."),
         "skipped": ("_Skipped {by_who}._{why} The factory stopped working on it and the queue is "
                     "free. Nothing was delivered: the card is back in the backlog."),
-        "stopped": ("_Stopped {by_who}._{why} The job was terminated in the engine; nothing was "
-                    "merged and no branch was deleted. The card is back in the backlog and can be "
-                    "picked up again."),
+        "stopped": ("_Stopped {by_who}._{why} Its workflow was ended in the engine, and the "
+                    "worker running it is told to end the agent and publish nothing more; no "
+                    "branch was deleted. The card is back in the backlog and can be picked up "
+                    "again."),
         "question_answered": "_Answered {by_who}._{why}",
         "parked": "_Parked, waiting on a person._{why}",
         "delivered": "_Delivered._{why}",
