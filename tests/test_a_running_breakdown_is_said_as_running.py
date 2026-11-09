@@ -34,6 +34,7 @@ from temporalio.worker import Worker
 from beeverforge.runtime.temporal import TASK_QUEUE
 from beeverforge.runtime.temporal.io import ProductBreakdownInput, breakdown_workflow_id
 from beeverforge.runtime.temporal.workflow import ProductBreakdownWorkflow
+from tests.no_0_7_workflow import Absent, is_0_7s
 from tests.test_the_confirmation_executor import _actor, _returns
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,7 +68,10 @@ class _Watched:
         return await self.client.execute_workflow(*args, **kwargs)
 
     def get_workflow_handle(self, workflow_id, **kwargs):
-        self.attached.append(workflow_id)
+        # 0.7's id is asked by the door first (#500) and answered by this engine, which holds no
+        # 0.7 workflow; it is not an execution a caller WAITED ON, so it is not recorded
+        if not is_0_7s(workflow_id):
+            self.attached.append(workflow_id)
         return self.client.get_workflow_handle(workflow_id, **kwargs)
 
 
@@ -137,6 +141,8 @@ class _Running:
         raise WorkflowAlreadyStartedError(kw["id"], name)
 
     def get_workflow_handle(self, workflow_id, **_kw):
+        if is_0_7s(workflow_id):  # asked first (#500); no 0.7 breakdown runs here
+            return Absent(workflow_id)
         self.attached.append(workflow_id)
         outcome = self.outcome
 

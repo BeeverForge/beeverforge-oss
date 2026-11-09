@@ -45,6 +45,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 #: Captured at import so a monkeypatched test always restores the real resolver, even on failure.
 from beeverforge.actions.catalog import _product_module as _REAL_PRODUCT_MODULE  # noqa: E402
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow  # noqa: E402
 
 PRODUCT_ACTIONS = ("product_status", "product_requirements", "product_say",
                    "product_propose", "product_accept", "product_drop")
@@ -159,6 +160,7 @@ def test_the_card_s_OWN_acceptance_test_propose_accept_and_the_card_appears():
         from beeverforge.actions.base import Actor
         from beeverforge.product.authoring import WriteResult
         from beeverforge.product.role import ProductAnswer, RequirementDraft
+        from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 
         project = type("_P", (), {"name": "acme", "language": "pt-BR"})()
 
@@ -172,7 +174,7 @@ def test_the_card_s_OWN_acceptance_test_propose_accept_and_the_card_appears():
 
         # The engine, doubled: the breakdown runs on the worker (it spends an agent), so what is
         # asserted here is that accepting DISPATCHES it and reports what came back.
-        class _Client:
+        class _Client(HoldsNoFormerWorkflow):
             async def execute_workflow(self, name, inp, **_kw):
                 assert name == "ProductBreakdownWorkflow", name
                 return [{"ok": True, "ref": "acme#41", "detail": "", "url": "", "existed": False}]
@@ -456,7 +458,7 @@ async def test_accepting_FILES_THE_WORK_and_never_costs_the_agreement(
 
 def _engine_returning(filed):
     """A durable engine whose ProductBreakdownWorkflow answers `filed`."""
-    class _Client:
+    class _Client(HoldsNoFormerWorkflow):
         async def execute_workflow(self, *_a, **_kw):
             return filed
 

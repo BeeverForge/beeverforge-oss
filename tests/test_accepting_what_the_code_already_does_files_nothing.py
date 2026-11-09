@@ -45,6 +45,7 @@ from beeverforge.product.corpus import UNRECORDED, load_corpus, parse_requiremen
 from beeverforge.product.loader import ProductContext
 from beeverforge.product.module import ProductModule
 from beeverforge.product.role import RequirementDraft
+from tests.no_0_7_workflow import HoldsNoFormerWorkflow
 from tests.the_breakdown_runs_here import run_here
 from tests.the_chat_turn import chat_turn
 
@@ -185,7 +186,7 @@ def _on_main(origin, name: str) -> str:
     return _git("show", f"main:requirements/{name}", cwd=origin).stdout
 
 
-class _Engine:
+class _Engine(HoldsNoFormerWorkflow):
     """The engine client the catalog row dispatches on. `started` is every workflow it was asked
     to run — the breakdown is an agent pass on the worker, so a start IS the spend."""
 
@@ -580,7 +581,7 @@ def test_the_explicit_door_says_NOTHING_WAS_FILED_when_nothing_was(origin, monke
     assert not down.ok and "nothing was filed" in down.message
     assert "not answering" in down.message, "the refusal does not carry the cause"
 
-    class _Refusing:
+    class _Refusing(HoldsNoFormerWorkflow):
         async def execute_workflow(self, *_a, **_k):
             return [{"ok": False, "ref": "", "url": "", "existed": False,
                      "detail": "the board refused the card."}]
@@ -787,7 +788,7 @@ def edited(tmp_path):
     return src
 
 
-class _Worker:
+class _Worker(HoldsNoFormerWorkflow):
     """The engine WITH THE WORKER BEHIND IT. A start runs the breakdown activity itself, so what a
     case counts is cards on the tracker, not workflow starts that stand for them."""
 

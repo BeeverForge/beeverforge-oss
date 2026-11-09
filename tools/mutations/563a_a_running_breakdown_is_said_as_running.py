@@ -20,9 +20,11 @@ CATALOG = "beeverforge/actions/catalog.py"
 
 MUTATIONS = [
     # 1. the dispatch
+    # RE-PINNED 2026-11-09 (#500): the same `except` now also catches a running 0.7 breakdown
     ("TODAY'S DEFECT: the engine's refusal falls into each door's catch-all", CATALOG,
-     "    except WorkflowAlreadyStartedError:\n        # THE REFUSAL THIS ID WAS SHARED FOR",
-     "    except ZeroDivisionError:\n        # THE REFUSAL THIS ID WAS SHARED FOR"),
+     "    except (WorkflowAlreadyStartedError, _FormerRunning):\n"
+     "        # THE REFUSAL THIS ID WAS SHARED FOR",
+     "    except (ZeroDivisionError, _FormerRunning):\n        # THE REFUSAL THIS ID WAS SHARED FOR"),
     ("the second door files nothing and never reads what the running one filed", CATALOG,
      "            filed = await client.get_workflow_handle(breaking).result() or []\n",
      "            filed = []\n"),

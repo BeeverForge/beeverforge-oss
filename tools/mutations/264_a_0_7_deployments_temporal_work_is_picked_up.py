@@ -172,4 +172,20 @@ MUTATIONS = [
      "        'WorkflowType = \"JobWorkflow\" AND ExecutionStatus = \"Running\"'\n"
      "        ' AND WorkflowId STARTS_WITH \"beeverforge-\"'\n"
      "    ):\n        running += 1"),
+
+    # review of #500: a running 0.7 breakdown is running to the question and to every start
+    ("a running 0.7 breakdown does not stop `start` from starting a second",
+     "beeverforge/product/breaking.py",
+     "    if await former_running(client, name, number):\n"
+     "        log.info(",
+     "    if False:\n"
+     "        log.info("),
+    ("a running 0.7 breakdown is answered as not running",
+     "beeverforge/product/breaking.py",
+     "    if await former_running(client, name, number):\n        return True\n",
+     ""),
+    ("the catalog's door starts a breakdown beside 0.7's running one",
+     "beeverforge/actions/catalog.py",
+     "        former = await former_running(client, project, number)\n",
+     "        former = \"\"\n"),
 ]

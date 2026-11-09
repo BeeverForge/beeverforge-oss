@@ -743,6 +743,54 @@ async def test_a_running_0_7_breakdown_is_read_as_running(monkeypatch):
     assert await breaking.running_numbers(PROJECT, client=held) == {3, 4}
 
 
+async def test_a_running_0_7_breakdown_is_running_to_the_question_and_to_a_start():
+    """Review of #500: listed as running was not enough — `running` and `start` addressed
+    BeeverForge's id only, so the engine accepted a second breakdown beside 0.7's."""
+    from types import SimpleNamespace
+
+    from beeverforge.product import breaking
+
+    held = _Workflows(_Wf(f"openfactory-product-breakdown-{PROJECT}-3"))
+    project = SimpleNamespace(name=PROJECT)
+
+    assert await breaking.running(project, 3, client=held) is True
+    assert await breaking.running(project, 4, client=held) is False
+    assert await breaking.start(project, 3, actor="someone", asked_for=True,
+                                client=held) == breaking.RUNNING
+    assert held.started == []
+    assert await breaking.start(project, 4, actor="someone", asked_for=True,
+                                client=held) == breaking.STARTED
+    assert [s[1] for s in held.started] == [f"beeverforge-product-breakdown-{PROJECT}-4"]
+
+
+async def test_the_catalogs_breakdown_waits_on_a_running_0_7_breakdown_and_starts_none(
+        monkeypatch):
+    from beeverforge.actions import catalog
+
+    held = _Workflows(_Wf(f"openfactory-product-breakdown-{PROJECT}-3"))
+    executed = []
+
+    async def _execute(*a, **k):
+        executed.append(k.get("id"))
+        return []
+
+    held.execute_workflow = _execute
+
+    async def _connected():
+        return held, None
+
+    monkeypatch.setattr(catalog, "_connected", _connected)
+    monkeypatch.setattr(catalog, "_where_it_was_written", lambda *_a: ("", ""))
+    from types import SimpleNamespace
+
+    # the same answer as a second start of BeeverForge's own: one is already running
+    with pytest.raises(catalog._AlreadyBreakingDown):
+        await catalog._broken_down_on_the_worker(
+            project=PROJECT, number=3, by=SimpleNamespace(id="someone"), asked_for=True)
+
+    assert executed == [], "a breakdown was started beside 0.7's"
+
+
 # ── the two workers end together ─────────────────────────────────────────────────────────────────
 
 class _Runs:

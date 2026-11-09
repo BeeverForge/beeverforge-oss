@@ -510,8 +510,11 @@ task queue is `beeverforge-jobs` and its schedules are named `beeverforge-*`; 0.
   `openfactory-coordinator-<project>` for the tech-lead, `openfactory-deploy-…` for a deploy watch,
   `openfactory-product-breakdown-…` for a breakdown), and is read under it beside BeeverForge's:
   the panel lists the job and its **Engine ↗** link finds it, its gates are answered (the answer is
-  sealed for that id), the tech-lead's rounds see it parked, a deploy watch shows on its card, and
-  a running breakdown is not started again. While 0.7's coordinator runs, a decision or an update
+  sealed for that id), the tech-lead's rounds see it parked, and a deploy watch shows on its card.
+  A breakdown 0.7 is still running is read as running wherever the product role, the panel or a
+  conversation asks, and is never started a second time beside it: breaking a requirement down
+  again while it runs is answered the way a second start of BeeverForge's own breakdown is,
+  waiting on the one that runs. While 0.7's coordinator runs, a decision or an update
   is sent to it rather than starting a second one beside it, and forgetting a project closes it
   too.
 - **No job runs twice for one card** because a running 0.7 job holds the floor like any other:

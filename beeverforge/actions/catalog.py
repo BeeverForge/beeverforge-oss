@@ -4043,7 +4043,18 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
     # conversation, so the one the requirement was asked in hears what it filed, when its record
     # names one; otherwise this door's own answer is all that is said, as before
     conversation, room = await asyncio.to_thread(_where_it_was_written, project, number)
+    from beeverforge.product.breaking import former_running
+
+    class _FormerRunning(Exception):
+        """OpenFactory 0.7's breakdown of this requirement is running (review of #500)."""
+
     try:
+        # OPENFACTORY 0.7'S BREAKDOWN, UNTIL 1.0: it keeps 0.7's id, so the engine would accept
+        # this start beside it; read as the refusal below, waiting on 0.7's execution
+        former = await former_running(client, project, number)
+        if former:
+            breaking = former
+            raise _FormerRunning
         return await client.execute_workflow(
             "ProductBreakdownWorkflow",
             ProductBreakdownInput(project=project, number=number, actor=by.id,
@@ -4051,7 +4062,7 @@ async def _broken_down_on_the_worker(*, project: str, number: int, by: Actor,
             id=breaking,
             task_queue=TASK_QUEUE,
         ) or []
-    except WorkflowAlreadyStartedError:
+    except (WorkflowAlreadyStartedError, _FormerRunning):
         # THE REFUSAL THIS ID WAS SHARED FOR, SAID AS WHAT IT IS (#563, ADR-0051 D18). The engine
         # does not hand a second start the running execution's result: it refuses the start, and
         # both callers' catch-alls turned that into "nothing was filed" / "I could not turn it
