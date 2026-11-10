@@ -275,7 +275,12 @@ class ForgeAdapter(Protocol):
         signature above is NOT widened — a declaration is asked with `getattr`, as `closing_keyword`
         is (`contracts/item_space.py::links_work_items`) — because the job hands the argument only
         to a row that declares it, on a card the forge owns. A row that declares nothing is called
-        exactly as before."""
+        exactly as before.
+
+        A WRAPPER AROUND A FORGE MUST FORWARD THE DECLARATIONS, `closing_keyword` and
+        `links_work_items` alike, together with `open_pr`: a declaration the wrapper does not
+        forward reads as one the row never made, so the card is named in the pull request and not
+        attached to it, and nothing raises."""
         ...
 
     def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:

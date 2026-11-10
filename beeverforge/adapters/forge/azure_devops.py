@@ -235,17 +235,41 @@ def _branch_ref(name: str) -> str:
     return n if n.startswith("refs/") else f"refs/heads/{n}"
 
 
+#: THE ANSWERS A CREATE MAY BE REPEATED AFTER, WITHOUT ITS WORK ITEM REFERENCES (#515): the vendor
+#: said no to this request (a 400 or 403 about what it carried, a 404 for an item it cannot read),
+#: so nothing was created and the same request minus the references is safe to send. Everything
+#: else is not repeated blind. No answer at all (a connection that dropped) and a 5xx leave it
+#: unknown whether the pull request was created, and a second create would then be a second pull
+#: request for the same branch pair — those go to the lookup in `open_pr` instead. A 401 or a 409
+#: cannot be the references' doing, and repeating them is a request that fails the same way.
+_LINK_REFUSAL_STATUSES = frozenset({400, 403, 404})
+
+
 def _work_item_refs(work_items: Sequence[str]) -> list[dict[str, str]]:
     """`workItemRefs` for a create: the work items that are NUMBERS, once each, in the order they
-    were handed (#515). A work item id is a plain integer on this vendor; a Jira key, a blank or a
+    were handed (#515). A work item id is a positive integer on this vendor; a Jira key, a `0` or a
     qualified `owner/repo#12` is not one of its items, and sending it would attach the pull
-    request to nothing or to the wrong card."""
-    found: list[str] = []
+    request to nothing or to the wrong card.
+
+    THE NUMBER IS COMPARED, NOT THE TEXT, and sent in its canonical form: `007` and `7` are the one
+    work item, and the vendor is handed it once, as `7`.
+
+    AN ITEM DROPPED FOR NOT BEING A NUMBER IS SAID, by `BEEVERFORGE_PR_LINK_SKIPPED`: the pull
+    request still opens, so without the line it would simply be unlinked and nothing would say why.
+    A blank is nothing handed, and a repeat is the same item again; neither is a drop."""
+    found: list[int] = []
     for item in work_items or ():
-        number = str(item or "").strip()
-        if number.isascii() and number.isdigit() and number not in found:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        number = int(text) if text.isascii() and text.isdigit() else 0
+        if number < 1:
+            log.warning("BEEVERFORGE_PR_LINK_SKIPPED work_item=%r — not a work item number of "
+                        "this vendor (a positive integer), so the pull request is not attached "
+                        "to it", text[:80])
+        elif number not in found:
             found.append(number)
-    return [{"id": number} for number in found]
+    return [{"id": str(number)} for number in found]
 
 
 def _ci_status_from_evaluations(evaluations: list[dict]) -> str:
@@ -780,11 +804,17 @@ class AzureReposForge(ForgeAdapter):
         is not a work item of this vendor.
 
         LINKING IS A COURTESY, NEVER A REASON THE PULL REQUEST DOES NOT OPEN. The work is already
-        pushed. If the vendor refuses the create while it carries the references (a permission on
-        the work item, say), the create is repeated without them and the row logs
-        `BEEVERFORGE_PR_LINK_REFUSED`; a create refused for any other reason refuses again and
-        raises as before. A pull request that was already open is returned as it is: the references
-        belong to the create, and this row has no route that adds them afterwards.
+        pushed. If the vendor REFUSES the create while it carries the references (a 400, 403 or 404
+        — `_LINK_REFUSAL_STATUSES`: it answered, so nothing was created), the create is repeated
+        once without them, and only when that goes through does the row log
+        `BEEVERFORGE_PR_LINK_REFUSED`, because only then is the link known to be what was refused.
+        A create that got no answer, or a 5xx, may have been done: it is NOT repeated blind, it goes
+        to the lookup below that finds the pull request if it exists, and raises if it does not.
+        A pull request that was already open is returned as it is: the references belong to the
+        create, and this row has no route that adds them afterwards.
+
+        A work item handed that is not a number is left out and said so, by
+        `BEEVERFORGE_PR_LINK_SKIPPED` (`_work_item_refs`).
 
         `repo` IS LOAD-BEARING HERE IN A WAY IT IS NOT ON `pr_status`, and the difference is that
         this is a CREATE: there is no id yet to resolve the repository from, so the route has to be
@@ -827,15 +857,19 @@ class AzureReposForge(ForgeAdapter):
             try:
                 created = client.call("POST", route, body=payload)
             except AzureDevOpsError as refused:
-                if not refs:
+                if not refs or getattr(refused, "status", None) not in _LINK_REFUSAL_STATUSES:
                     raise
-                log.warning("BEEVERFORGE_PR_LINK_REFUSED head=%s work_items=%s — the create was "
-                            "refused while it carried the work item references; opening the pull "
-                            "request without them (%s)", head, ",".join(r["id"] for r in refs),
-                            _redact(str(refused))[:160])
                 created = client.call(
                     "POST", route,
                     body={k: v for k, v in payload.items() if k != "workItemRefs"})
+                # SAID ONLY NOW: the same create, minus the references, went through. Before this
+                # line the references were a suspect; after it they are the finding. The vendor's
+                # own sentence goes whole (the client already bounds it): a TF4xxxx message names
+                # the work item and the permission late in the line.
+                log.warning("BEEVERFORGE_PR_LINK_REFUSED head=%s work_items=%s — the create was "
+                            "refused while it carried the work item references and went through "
+                            "without them: the pull request is open and not attached (%s)",
+                            head, ",".join(r["id"] for r in refs), _redact(str(refused)))
         except AzureDevOpsError as exc:
             # Lost a race with a concurrent create? Azure DevOps refuses the second PR for a
             # branch pair, so the winner is findable — and returning it is the whole point of
