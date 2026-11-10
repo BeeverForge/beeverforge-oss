@@ -163,6 +163,10 @@ MUTATIONS = [
      '    [ "$CARRIED" -eq 1 ] || return 0\n', "    return 0\n", INIT_FAILS),
 
     ("an upgrade still says register your first project", INSTALL,
-     '    if [ "$FORCE" -eq 1 ]; then\n        # AN UPGRADE KEEPS',
-     '    if false; then\n        # AN UPGRADE KEEPS', NOT_FIRST),
+     '    if [ "$FORCE" -eq 1 ]; then\n        # NOT "YOUR PROJECTS',
+     '    if false; then\n        # NOT "YOUR PROJECTS', NOT_FIRST),
+
+    ("the last lines do not point back to the removal commands", INSTALL,
+     '    if [ "$CARRIED" -eq 1 ]; then\n        # SAID AGAIN HERE',
+     '    if false; then\n        # SAID AGAIN HERE', NOT_FIRST),
 ]

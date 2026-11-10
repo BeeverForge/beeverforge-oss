@@ -1889,7 +1889,23 @@ def test_an_upgrade_does_not_say_register_your_first_project(tmp_path):
     assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
 
     assert "your first project" not in done.stdout
-    assert "were kept" in done.stdout
+    assert "`beeverforge project list` shows the projects registered here" in done.stdout
+    assert "were kept" not in done.stdout, "a --force that carried nothing cannot say that"
+    assert "the carry step above named the commands that remove 0.7's" in done.stdout
+
+
+@needs_a_posix_shell
+def test_a_failed_carry_never_reaches_the_pointer_to_its_removal_commands(tmp_path):
+    """The pointer is said only after a carry that finished: it points at lines a failed carry
+    never printed."""
+    failing = ("docker", "#!/bin/sh\n"
+                         "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                         "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                         "case \" $* \" in *\" upgrade-from-openfactory \"*) exit 1 ;; esac\n"
+                         "exit 0\n")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
+
+    assert "the carry step above named" not in done.stdout + done.stderr
 
 
 @needs_a_posix_shell

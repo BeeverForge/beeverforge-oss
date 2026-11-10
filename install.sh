@@ -781,9 +781,16 @@ finish() {
     say "  the panel        http://localhost:${port}"
     say "  what is left     cd ${DIR} && docker compose --env-file .env.compose exec worker beeverforge preflight"
     say ""
+    if [ "$CARRIED" -eq 1 ]; then
+        # SAID AGAIN HERE, after a long scroll of pulls and checks: the carry step printed how to
+        # remove 0.7's containers and volumes, and it is the person's step, once BeeverForge works.
+        say "If this upgraded an OpenFactory 0.7 stack, the carry step above named the commands that remove 0.7's containers and volumes once you no longer need them."
+        say ""
+    fi
     if [ "$FORCE" -eq 1 ]; then
-        # AN UPGRADE KEEPS ITS PROJECTS; `project list` names them.
-        say "The projects registered here were kept (\`beeverforge project list\`). To register another:"
+        # NOT "YOUR PROJECTS WERE KEPT": a 0.7 file with no 0.7 volume starts empty, and a --force
+        # over anything else carried nothing. What holds in every case is where to look.
+        say "\`beeverforge project list\` shows the projects registered here. To register another:"
     else
         say "Next, register your first project:"
     fi
