@@ -98,11 +98,13 @@ This is a deployment run with `openfactory up` from a pip install, configured in
 `~/.openfactory/env`.
 
 1. **Replace the package.** Both packages install the `openfactory` command and the `openfactory`
-   import name, so remove OpenFactory before installing BeeverForge:
+   import name, so remove OpenFactory first, in the environment it was installed in, then install
+   BeeverForge the way the [README](../README.md) does:
 
    ```sh
    pip uninstall openfactory
-   pip install 'beeverforge[runtime]'
+   git clone https://github.com/BeeverForge/beeverforge-oss.git && cd beeverforge-oss
+   pip install -e '.[runtime]'
    ```
 
 2. **Run `beeverforge up`.** On a machine that has `~/.openfactory/` and no `~/.beeverforge/`, every
