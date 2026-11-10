@@ -177,6 +177,12 @@ resolve_the_work_directory() {
     if [ -z "${BEEVERFORGE_WORK_DIR:-}" ] && [ -f "$DIR/.env.compose" ]; then
         kept_work_dir=$(grep '^BEEVERFORGE_WORK_DIR=' "$DIR/.env.compose" 2>/dev/null \
                         | tail -n 1 | cut -d= -f2- | unquoted || true)
+        # AN OPENFACTORY 0.7 FILE NAMES IT `OPENFACTORY_WORK_DIR` (#266): its installer wrote it
+        # there, and the jobs in flight have their files in it.
+        if [ -z "$kept_work_dir" ]; then
+            kept_work_dir=$(grep '^OPENFACTORY_WORK_DIR=' "$DIR/.env.compose" 2>/dev/null \
+                            | tail -n 1 | cut -d= -f2- | unquoted || true)
+        fi
     fi
     if [ -n "${BEEVERFORGE_WORK_DIR:-}" ]; then
         WORK_DIR="$BEEVERFORGE_WORK_DIR"
@@ -598,6 +604,24 @@ run_preflight() {
     say "  (the box image is still downloading — it is checked again before this finishes)"
 }
 
+carry_a_0_7_stack() {
+    # AN UPGRADE OVER AN OPENFACTORY 0.7 DEPLOYMENT KEEPS ITS DATA (#266). Compose prefixes every
+    # volume with the project's name, and the rename changed it, so the new stack would start on
+    # empty volumes: no Temporal history, no card in flight, no project. The package decides
+    # whether this is one — the file `init` is about to rewrite holds `OPENFACTORY_*` rows — and
+    # copies the volumes; this script knows nothing about it but the command's name. BEFORE
+    # `run_init`, because `init --force` rewrites those rows under their new names.
+    if [ "$FORCE" -eq 0 ] || [ ! -f "$DIR/.env.compose" ]; then return 0; fi
+    step "Carrying an OpenFactory 0.7 stack's data, if this directory holds one"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "  would run: beeverforge upgrade-from-openfactory --env-file /out/.env.compose"
+        return 0
+    fi
+    in_the_cli upgrade-from-openfactory --env-file /out/.env.compose \
+        || die "the OpenFactory 0.7 stack's data could not be carried, so nothing was started and ${DIR}/.env.compose was left as it was." \
+               "Fix what it reported above and run this installer again with --force."
+}
+
 run_init() {
     step "Writing this deployment's environment"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -841,6 +865,7 @@ main() {
     # AFTER THE PULL, because it asks the cli image; before the first `_cli`, which uses its answer.
     resolve_the_socket_group_a_container_sees
     run_preflight
+    carry_a_0_7_stack
     run_init
     wait_for_images
     confirm_the_box_image

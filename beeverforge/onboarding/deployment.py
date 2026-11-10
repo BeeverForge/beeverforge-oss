@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 
 from beeverforge import plugins
 from beeverforge.adapters.agent.registry import HARNESS_CREDENTIALS
+from beeverforge.former_names import FORMER_PREFIX, PREFIX
 from beeverforge.listeners import ENGINE, ENGINE_UI, LISTENERS, PANEL
 
 #: The fixed vocabularies — questions whose answers are this platform's, not a provider's.
@@ -831,7 +832,12 @@ def carry_over(previous: str, rendered: str, *,
       one;
     - `BEEVERFORGE_VERSION` is never carried (`_NEVER_CARRIED`), nor any row in `ours`, which this
       run's caller DECLARED (the work directory the installer resolved and mounts, say): there the
-      rendered value is the one that is true now.
+      rendered value is the one that is true now;
+    - an OpenFactory 0.7 row, `OPENFACTORY_<NAME>`, is carried AS `BEEVERFORGE_<NAME>` (#266), and
+      a `BEEVERFORGE_<NAME>` the previous file also holds with a value wins over it, as it does in
+      a process's environment (`former_names`). The installer's upgrade of a 0.7 deployment is a
+      re-run over 0.7's file: carried under the old name, every credential sat in the kept section
+      while the row compose interpolates stayed empty.
 
     A value is carried byte for byte, trailing spaces included, since those are what compose read
     before. A line's end (`\n`, `\r\n`) and its indentation are not part of it, and `export NAME=`
@@ -839,10 +845,21 @@ def carry_over(previous: str, rendered: str, *,
     for compose. What is returned names rows, never values."""
     never = _NEVER_CARRIED | ours
     held: dict[str, str] = {}
+    former: dict[str, str] = {}
     for line in previous.splitlines():
         row = _ROW.match(line.lstrip())
-        if row and row.group(1) not in never:
-            held[row.group(1)] = row.group(2)
+        if not row:
+            continue
+        name = row.group(1)
+        if name.startswith(FORMER_PREFIX):
+            name, into = PREFIX + name[len(FORMER_PREFIX):], former
+        else:
+            into = held
+        if name not in never:
+            into[name] = row.group(2)
+    for name, value in former.items():
+        if not held.get(name, "").strip():
+            held[name] = value
 
     kept: list[str] = []
     seen: set[str] = set()
