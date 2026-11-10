@@ -191,6 +191,9 @@ _CACHES = {
     ("beeverforge/former_names.py", "_REPORTED"):
         "one per distinct `OPENFACTORY_*` name a load has found — bounded by the environment, "
         "never by traffic",
+    # #266 — of those, the ones not read because their `BEEVERFORGE_*` name held another value.
+    ("beeverforge/former_names.py", "_IGNORED"):
+        "a subset of `_REPORTED` — bounded by the environment, never by traffic",
     # #266 — the add-on distributions still on OpenFactory 0.7's entry-point group, named once.
     ("beeverforge/plugins.py", "_REPORTED_FORMER"):
         "one per installed distribution declaring rows under `openfactory.adapters` — bounded by "
