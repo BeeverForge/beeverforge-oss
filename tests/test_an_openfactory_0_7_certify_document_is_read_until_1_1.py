@@ -59,6 +59,40 @@ def test_a_pack_written_under_the_current_name_says_nothing_of_the_former(good):
     assert said == f"pack.json matches {schema.PACK_SCHEMA}", said
 
 
+# THE FORMER NAME GATES NOTHING ELSE (review of #522): a pack under it goes through the same
+# checksums and the same signature check as one under the current name, so accepting a second
+# name never accepts a tampered or unsigned pack.
+
+def test_a_tampered_pack_under_the_former_name_fails_its_checksums(good, tmp_path):
+    files = _members(_as(good, tmp_path, FORMER_PACK))
+    tampered = sorted(n for n in files if n not in ("pack.json", "SHA256SUMS"))[0]
+    files[tampered] += b"\n"
+
+    result = _cli("verify", str(_tar(tmp_path / "tampered.tgz", files)), "--allow-unsigned")
+
+    assert result.exit_code == 1, result.output
+    failed = [m for mark, i, m in _lines(result.output) if mark == "✗" and i == "checksums"]
+    assert any(tampered in m for m in failed), result.output
+
+
+def test_an_unsigned_pack_under_the_former_name_is_a_finding(good, tmp_path):
+    result = _cli("verify", str(_as(good, tmp_path, FORMER_PACK)))
+
+    assert result.exit_code == 1, result.output
+    assert ("✗", "signature", v.UNSIGNED) in _lines(result.output)
+
+
+def test_a_signature_under_the_former_name_is_not_taken_as_checked(good, tmp_path):
+    files = _members(_as(good, tmp_path, FORMER_PACK))
+    files["pack.sig"] = b"untrusted comment: nothing"
+
+    result = _cli("verify", str(_tar(tmp_path / "signed.tgz", files)))
+
+    assert result.exit_code == 1, result.output
+    assert any(mark == "✗" and i == "signature" and "cannot check a signature" in m
+               for mark, i, m in _lines(result.output)), result.output
+
+
 @pytest.mark.parametrize("schema_id", ["openfactory.certify/2", "beeverforge.certify/2",
                                        "openfactory.certify", "OPENFACTORY.certify/1"])
 def test_no_other_name_or_version_is_read(good, tmp_path, schema_id):

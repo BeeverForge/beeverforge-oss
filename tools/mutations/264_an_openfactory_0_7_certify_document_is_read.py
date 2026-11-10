@@ -41,6 +41,17 @@ MUTATIONS = [
      '''    if bundle.document.get("schema") == FORMER_PACK_SCHEMA:''',
      '''    if True:'''),
 
+    # review of #522: the former name gates nothing else
+    ("a pack under the former name skips its checksums", VERIFY,
+     "    out = [*_contents(bundle), *_schema(bundle), *_checksums(bundle),",
+     "    former = bundle.document.get(\"schema\") == \"openfactory.certify/1\"\n"
+     "    out = [*_contents(bundle), *_schema(bundle), *([] if former else _checksums(bundle)),"),
+
+    ("a pack under the former name skips its signature", VERIFY,
+     "           *_signature(bundle, allow_unsigned)]",
+     "           *_signature(bundle, allow_unsigned or bundle.document.get(\"schema\") == "
+     "\"openfactory.certify/1\")]"),
+
     ("the register keeps the documents a release longer", REGISTER,
      '''    Removal("openfactory-documents", "1.1",''',
      '''    Removal("openfactory-documents", "1.2",'''),
