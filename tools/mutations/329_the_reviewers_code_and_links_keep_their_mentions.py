@@ -29,8 +29,8 @@ MUTATIONS = [
      "            piece = _quieted(kept)"),
 
     ("the whole text is rewritten after the split, as before", MACHINE,
-     "    return _quieted_outside_code_and_links(words)",
-     "    return _quieted(_quieted_outside_code_and_links(words))"),
+     "    return _closing_references_broken(_quieted_outside_code_and_links(words))",
+     "    return _closing_references_broken(_quieted(_quieted_outside_code_and_links(words)))"),
 
     ("text before a link is left as written", MACHINE,
      "        out += [_quieted(text[start:link.start()]), piece]",
@@ -43,6 +43,40 @@ MUTATIONS = [
     ("a backtick that never closes protects what follows it", MACHINE,
      "            if span is None:\n                break",
      "            if span is None:\n                return \"\".join(out) + _outside_links(text[start:i]) + text[i:]"),
+
+    # review of #521: a table's cell may end a span at its `|`
+    ("a table's paragraph is read span by span", MACHINE,
+     "        if _A_TABLE_DELIMITER.search(text):",
+     "        if False:"),
+
+    ("a delimiter row needs no `|`, so a heading's `---` reads as one", MACHINE,
+     '''_A_TABLE_DELIMITER = re.compile(r"^[ \\t>]*(?=[^\\n]*\\|)\\|?[ \\t]*:?-+:?[ \\t]*"''',
+     '''_A_TABLE_DELIMITER = re.compile(r"^[ \\t>]*\\|?[ \\t]*:?-+:?[ \\t]*"'''),
+
+    ("a table in a quote is read span by span", MACHINE,
+     '''_A_TABLE_DELIMITER = re.compile(r"^[ \\t>]*(?=[^\\n]*\\|)\\|?[ \\t]*:?-+:?[ \\t]*"''',
+     '''_A_TABLE_DELIMITER = re.compile(r"^[ \\t]*(?=[^\\n]*\\|)\\|?[ \\t]*:?-+:?[ \\t]*"'''),
+
+    # review of #521: a squash commit message reads a closing keyword with no code around it
+    ("a closing keyword in kept code still closes", MACHINE,
+     "    return _closing_references_broken(_quieted_outside_code_and_links(words))",
+     "    return _quieted_outside_code_and_links(words)"),
+
+    ("only `closes` is a closing keyword", MACHINE,
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
+     '''    r"\\b((?:close[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",'''),
+
+    ("a closing keyword is read in lower case only", MACHINE,
+     "    re.IGNORECASE)\n#: A row that may open an HTML block",
+     "    )\n#: A row that may open an HTML block"),
+
+    ("a cross-repository reference after a closing keyword is kept", MACHINE,
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+)#(?=\\d)",'''),
+
+    ("every `#<number>` in kept code is rewritten", MACHINE,
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
+     '''    r"()#(?=\\d)",'''),
 
     ("a name is left live outside code", MACHINE,
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',

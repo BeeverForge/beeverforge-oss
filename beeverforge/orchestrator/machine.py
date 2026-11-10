@@ -576,6 +576,19 @@ _A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
 #: A fence line, `` ``` `` or `~~~` and longer, at most three spaces in; a backtick fence's info
 #: string holds no backtick (CommonMark).
 _A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+#: A GFM table's delimiter row (`|---|:-:|`, `--- | ---`), also inside a quote or a list item: it
+#: holds a `|`, so a setext heading's `---` is not one. GFM splits a table's rows into cells BEFORE
+#: it reads their code spans, and an unescaped `|` inside a span ends the cell, so what follows it
+#: is plain text where a name mentions (review of #521, rendered with cmark-gfm).
+_A_TABLE_DELIMITER = re.compile(r"^[ \t>]*(?=[^\n]*\|)\|?[ \t]*:?-+:?[ \t]*"
+                                r"(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$", re.MULTILINE)
+#: A reference a closing keyword is read on, `Closes #12` or `fixes: owner/repo#12` in any case. A
+#: COMMIT MESSAGE has no code span: `gh pr merge --squash` sends no body, so a repository whose
+#: squash default is the pull request's title and description writes the body into the commit,
+#: and a closing keyword there closes the issue it names on the default branch (review of #521).
+_A_CLOSING_REFERENCE = re.compile(
+    r"\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:[\w.-]+/[\w.-]+)?)#(?=\d)",
+    re.IGNORECASE)
 #: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
 #: autolink (`<https://…>`) is not one.
 _AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]", re.MULTILINE)
@@ -588,14 +601,18 @@ def _quieted_outside_code_and_links(words: str) -> str:
     on `POST /markdown`); an entity renders as written and mentions no one. And a rewritten `#1`
     or `@name` changed the code the reviewer quoted, or where the link points, while nothing links
     or mentions there to protect against (#329). When in doubt it rewrites: a fence or a span that
-    never closes, and the rest of the paragraph after it, and all of `words` if a row may open an
+    never closes, and the rest of the paragraph after it, a paragraph that holds a table (a `|`
+    in a span may end its cell, `_A_TABLE_DELIMITER`), and all of `words` if a row may open an
     HTML block, as GitHub renders a live mention after a backtick that never closes."""
     if _AN_HTML_ROW.search(words):
         return _quieted(_AN_AUTOLINK.sub(_unlinked, words))
     rows, out, paragraph, i = words.split("\n"), [], [], 0
 
     def ended() -> list[str]:
-        return [_outside_spans("\n".join(paragraph))] if paragraph else []
+        text = "\n".join(paragraph)
+        if _A_TABLE_DELIMITER.search(text):
+            return [_quieted(_AN_AUTOLINK.sub(_unlinked, text))]
+        return [_outside_spans(text)] if paragraph else []
 
     while i < len(rows):
         fence = _A_FENCE.match(rows[i])
@@ -751,9 +768,17 @@ def _without_reviewer_mentions(words: str) -> str:
     rewrite missed one (`_A_GH_REFERENCE`), keeps them readable and makes them nothing a forge
     links. Every bare `&` is escaped first, so no entity spells one of them. All of it outside
     closed code and the links GitHub makes, where it would change what the reviewer quoted
-    (`_quieted_outside_code_and_links`, #329). Applied before `_as_text`, so a `## ` row is still
-    escaped."""
-    return _quieted_outside_code_and_links(words)
+    (`_quieted_outside_code_and_links`, #329), but for a reference after a closing keyword,
+    which a squash commit message reads with no code around it (`_A_CLOSING_REFERENCE`). Applied
+    before `_as_text`, so a `## ` row is still escaped."""
+    return _closing_references_broken(_quieted_outside_code_and_links(words))
+
+
+def _closing_references_broken(words: str) -> str:
+    """`words` with every reference a closing keyword is read on written `card <number>`: `Closes
+    #12` reads `Closes card 12`, and `fixes owner/repo#12` reads `fixes owner/repo card 12`."""
+    return _A_CLOSING_REFERENCE.sub(
+        lambda m: f"{m[1]}{' ' if m[1][-1:].strip() else ''}card ", words)
 
 
 def _sections_from(rows: list[str]) -> int:
