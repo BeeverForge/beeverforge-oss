@@ -49,10 +49,12 @@ MUTATIONS = [
      "beeverforge/namespace.py",
      "RETIRED_DIR = \".sdlc\"",
      "RETIRED_DIR = \".sdlc\"\nLEGACY_DIR = \".sdlc\""),
+    # RE-PINNED 2026-11-10 (#266: `operator_path` builds on `operator_dir()`, which reads
+    # OpenFactory 0.7's `~/.openfactory/` — the retired `.sdlc` name is still never read).
     ("the operator path migrates from the old home again",
      "beeverforge/namespace.py",
-     "    return Path.home() / DIR / filename",
-     "    new = Path.home() / DIR / filename\n"
+     "    return operator_dir() / filename",
+     "    new = operator_dir() / filename\n"
      "    old = Path.home() / RETIRED_DIR / filename\n"
      "    if not new.exists() and old.exists():\n"
      "        import shutil\n"
