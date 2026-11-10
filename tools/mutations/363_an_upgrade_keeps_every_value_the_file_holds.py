@@ -100,9 +100,10 @@ MUTATIONS = [
      "        if match := _TAKEN.match(line):\n            return [match.group(1)]\n",
      ""),
 
+    # RE-PINNED 2026-11-10 (#266: the loop now also carries a 0.7 row under its new name).
     ("a carried value loses its trailing spaces", DEPLOYMENT,
-     "        row = _ROW.match(line.lstrip())\n        if row and row.group(1) not in never:",
-     "        row = _ROW.match(line.strip())\n        if row and row.group(1) not in never:"),
+     "        row = _ROW.match(line.lstrip())\n        if not row:",
+     "        row = _ROW.match(line.strip())\n        if not row:"),
 
     ("a row written `export NAME=` is neither carried nor reported", DEPLOYMENT,
      "_ROW = re.compile(r\"^(?:export\\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$\")",
