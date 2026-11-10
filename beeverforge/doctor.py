@@ -1441,18 +1441,24 @@ def _former_names(p: Probes) -> Finding:
     """OpenFactory 0.7's names this deployment still uses, each with the name to use (#266) — and
     an empty message, which `diagnose` leaves out, when there are none.
 
-    A PASS, NOT A FAILURE. Every one of them is still read, so the deployment runs as it is; what
-    the operator needs is the list, in one place, before the release that stops reading them."""
+    A PASS, NOT A FAILURE. The deployment runs as it is: each name is either still read or left
+    behind and read by nothing. What the operator needs is the list, in one place, before the
+    release that stops reading them.
+
+    THE LINE TELLS NO ONE STEP FOR ALL OF THEM. A name still read is renamed; an ignored variable
+    or a stale directory is removed, and renaming an ignored variable would overwrite the value
+    that is read. Each entry says its own step, and the prefix and the note send the reader to
+    it."""
     assert p.former_names is not None
     found = p.former_names(p.checkout() if p.checkout else None)
     if not found:
         return Finding("former_names", True, "")
     return Finding(
         "former_names", True,
-        f"OpenFactory 0.7 names still in use — each is still read; use the new name: "
+        f"OpenFactory 0.7 names still in use or left behind — do what each one says: "
         f"{'; '.join(f.sentence() for f in found)}",
-        note="rename each OpenFactory 0.7 name the former_names line lists before the release "
-             "that stops reading it")
+        note="the former_names line lists OpenFactory 0.7 names this deployment still uses or "
+             "left behind — do what each entry says, before the release that stops reading it")
 
 
 def _guidelines(p: Probes) -> Finding:

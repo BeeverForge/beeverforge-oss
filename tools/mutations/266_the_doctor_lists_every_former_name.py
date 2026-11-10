@@ -30,6 +30,20 @@ MUTATIONS = [
     ("the probe reads no ignored names", IN_USE, "ignored=former_names.ignored()", "ignored=()",
      TEST),
 
+    ("a carried variable is said with the value it holds", IN_USE,
+     '        new = f"`{PREFIX}{name[len(FORMER_PREFIX):]}`"\n',
+     '        new = (f"`{PREFIX}{name[12:]}`=" + '
+     '__import__("os").environ.get(PREFIX + name[12:], ""))\n',
+     TEST),
+
+    ("the line says every entry is still read", DOCTOR,
+     '"OpenFactory 0.7 names still in use or left behind — do what each one says: "',
+     '"OpenFactory 0.7 names still in use — each is still read; use the new name: "', TEST),
+
+    ("the note tells the reader to rename each entry", DOCTOR,
+     '"left behind — do what each entry says, before the release that stops reading it")',
+     '"left behind — rename each, before the release that stops reading it")', TEST),
+
     ("the 0.7 operator directory in use is not listed", IN_USE,
      "        if namespace.dir_in(home) == namespace.FORMER_DIR:\n",
      "        if False:\n", TEST),

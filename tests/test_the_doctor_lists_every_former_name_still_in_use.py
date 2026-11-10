@@ -17,7 +17,7 @@ import pytest
 
 from beeverforge import former_in_use, former_names, plugins
 from beeverforge.contracts.project import Project
-from beeverforge.doctor import Probes, _former_names_probe, diagnose
+from beeverforge.doctor import Probes, _former_names_probe, as_document, as_json, diagnose
 from beeverforge.former_in_use import still_in_use
 
 
@@ -37,7 +37,7 @@ def _pairs(found) -> list[tuple[str, str]]:
 
 # ── each source, with the name to use ───────────────────────────────────────────────────────────
 
-def test_each_environment_name_is_listed_with_its_new_name_and_never_its_value():
+def test_each_environment_name_is_listed_with_its_new_name():
     found = still_in_use(environment=["OPENFACTORY_FORGE_TOKEN", "OPENFACTORY_LOG_FORMAT"])
 
     assert _pairs(found) == [("`OPENFACTORY_FORGE_TOKEN`", "`BEEVERFORGE_FORGE_TOKEN`"),
@@ -256,3 +256,54 @@ def test_the_line_is_a_pass_so_it_never_makes_a_deployment_not_ready():
 
     assert _line(with_line).ok
     assert with_line.ok == without.ok
+
+
+def test_entries_left_behind_are_not_said_to_be_read_or_to_be_renamed(tmp_path):
+    """An ignored variable and a stale directory are removed, not renamed: the line's own words
+    must hold for them too."""
+    (tmp_path / ".openfactory").mkdir()
+    (tmp_path / ".beeverforge").mkdir()
+    found = still_in_use(environment=["OPENFACTORY_FORGE_TOKEN"],
+                         ignored=["OPENFACTORY_FORGE_TOKEN"], home=tmp_path)
+
+    line = _line(diagnose(_probes(former_names=lambda checkout: found)))
+
+    for said in (line.message, line.note):
+        assert "still read" not in said
+        assert "rename each" not in said
+    assert "do what each" in line.message and "do what each" in line.note
+
+
+# ── a value never reaches the doctor ────────────────────────────────────────────────────────────
+
+CARRIED = "sentinel-carried-value-0d1f"
+IGNORED = "sentinel-ignored-value-7a3c"
+READ = "sentinel-read-value-55e2"
+
+
+def test_no_value_of_a_former_variable_reaches_the_line_or_the_document(home, monkeypatch):
+    """Many of these variables are credentials: the line names them and never says what they
+    hold — carried, ignored, or the new name's value that wins over an ignored one."""
+    monkeypatch.setattr(former_names, "_REPORTED", set())
+    monkeypatch.setattr(former_names, "_IGNORED", set())
+    monkeypatch.setattr(plugins, "on_the_former_group", lambda: [])
+    monkeypatch.delitem(sys.modules, "openfactory", raising=False)
+    monkeypatch.setattr(sys, "argv", ["/usr/local/bin/beeverforge", "doctor", "someone-app"])
+    # REGISTERED FIRST, so the names `carry_over` sets are restored when the test ends.
+    monkeypatch.delenv("BEEVERFORGE_FORGE_TOKEN", raising=False)
+    monkeypatch.setenv("OPENFACTORY_FORGE_TOKEN", CARRIED)
+    monkeypatch.setenv("OPENFACTORY_BOT_TOKEN", IGNORED)
+    monkeypatch.setenv("BEEVERFORGE_BOT_TOKEN", READ)
+
+    former_names.warn(former_names.carry_over())
+    report = diagnose(_probes(
+        former_names=lambda checkout: former_in_use.probe(checkout=checkout, journals=None)))
+    line = _line(report)
+    document = as_json(as_document(report, project="someone-app"))
+
+    assert "`OPENFACTORY_FORGE_TOKEN`" in line.message
+    assert "`OPENFACTORY_BOT_TOKEN`" in line.message
+    for value in (CARRIED, IGNORED, READ):
+        assert value not in line.message
+        assert value not in line.note
+        assert value not in document
