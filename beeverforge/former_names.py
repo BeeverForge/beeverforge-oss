@@ -101,6 +101,13 @@ def carry_over(environ: MutableMapping[str, str] | None = None) -> CarriedOver:
     return CarriedOver(carried=tuple(carried), ignored=tuple(ignored))
 
 
+def found() -> tuple[str, ...]:
+    """The former names this process has found and said, carried or ignored — for the doctor's
+    list of former names still in use. Every entry calls `warn` after `carry_over`, and
+    `carry_over` has removed them from the environment by then, so this is where they are left."""
+    return tuple(sorted(_REPORTED))
+
+
 def warn(done: CarriedOver, logger: logging.Logger | None = None) -> None:
     """Log what `carry_over` did as ONE warning, naming only what this process has not said yet.
 
