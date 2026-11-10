@@ -47,6 +47,9 @@ THRESHOLDS_FILE = Path(__file__).with_name("thresholds.yaml")
 
 #: The schema id a thresholds file carries.
 THRESHOLDS_SCHEMA = "beeverforge.certify.thresholds/1"
+#: The same file as OpenFactory 0.7 named it, read until the release the deprecation register
+#: names for `openfactory-documents` (#264).
+FORMER_THRESHOLDS_SCHEMA = "openfactory.certify.thresholds/1"
 
 #: The pack's own files `verify` reads by name.
 PACK_JSON, SUMS_FILE, SIGNATURE_FILE = "pack.json", "SHA256SUMS", "pack.sig"
@@ -186,7 +189,8 @@ def load_thresholds(path: Path | None = None) -> list[Threshold]:
         raise ThresholdsError(f"{where} could not be read ({exc.strerror or exc})") from None
     except yaml.YAMLError as exc:
         raise ThresholdsError(f"{where} is not YAML ({str(exc)[:160]})") from None
-    if not isinstance(data, dict) or data.get("schema") != THRESHOLDS_SCHEMA:
+    if not isinstance(data, dict) or data.get("schema") not in (THRESHOLDS_SCHEMA,
+                                                                 FORMER_THRESHOLDS_SCHEMA):
         raise ThresholdsError(f"{where} does not say `schema: {THRESHOLDS_SCHEMA}`")
     listed = data.get("thresholds")
     if not isinstance(listed, list) or not listed:
@@ -392,11 +396,20 @@ def _contents(bundle: Bundle) -> list[Result]:
 
 
 def _schema(bundle: Bundle) -> list[Result]:
-    from beeverforge.certify.schema import PACK_SCHEMA, validate
+    from beeverforge.certify.schema import (
+        FORMER_PACK_SCHEMA,
+        FORMER_READ_UNTIL,
+        PACK_SCHEMA,
+        validate,
+    )
 
     errors = validate(bundle.document)
     if errors:
         return [Result("schema", False, e) for e in errors]
+    if bundle.document.get("schema") == FORMER_PACK_SCHEMA:
+        return [Result("schema", True, f"{PACK_JSON} matches {PACK_SCHEMA}, under the name "
+                                       f"OpenFactory 0.7 wrote, {FORMER_PACK_SCHEMA}: read until "
+                                       f"BeeverForge {FORMER_READ_UNTIL}")]
     return [Result("schema", True, f"{PACK_JSON} matches {PACK_SCHEMA}")]
 
 

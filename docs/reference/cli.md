@@ -225,7 +225,9 @@ sanitised `preflight`, `doctor` and `box status` diagnostics, and `redactions.js
 organisation, repository, project and person is a pseudonym from a per-pack salt; URLs, hosts,
 e-mail addresses, paths and credentials are dropped; the practitioner is the one name kept.
 `--dry-run` prints every file and writes nothing; without `--yes` nothing is written. `pack.json`
-validates against `beeverforge/certify/pack.schema.json` (`beeverforge.certify/1`).
+validates against `beeverforge/certify/pack.schema.json` (`beeverforge.certify/1`). `certify verify`
+also reads a pack and a thresholds file OpenFactory 0.7 wrote, as `openfactory.certify/1` and
+`openfactory.certify.thresholds/1`, until 1.1.
 
 The pack's `outcomes` cover `--window-days` (90 by default): jobs run and how each ended (read
 from the line the workflow writes in the job's journal when it ends, never from the job's last
