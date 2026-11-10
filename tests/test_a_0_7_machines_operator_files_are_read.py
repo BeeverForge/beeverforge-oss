@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,3 +126,63 @@ def test_a_checkout_with_no_journals_yet_gets_the_current_name(home, tmp_path):
 
     assert paths.project_log_dir(_project(checkout)) == (
         tmp_path / "work" / ".beeverforge-logs" / "someone-app")
+
+
+# THE OTHER TWO READERS OF THE HOST FILE: `init --runtime local` writes it, `up` keeps its state
+# beside it, and doctor's remedy for a refused `up` names it. Each was left on `~/.beeverforge/`
+# once; on a 0.7 machine `init` then made the new directory, which hides the 0.7 one for good.
+
+def _local_init():
+    return ("init", "--runtime", "local", "--forge", "local", "--tracker", "local",
+            "--harness", "claude_code", "--channel", "panel", "--panel-local")
+
+
+def test_init_writes_the_host_file_into_the_0_7_directory(home, tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, "tests")
+    from one_machine import cli
+
+    (home / ".openfactory").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    code, out = cli(*_local_init())
+
+    assert code == 0, out
+    assert (home / ".openfactory" / "env").exists(), out
+    assert not (home / ".beeverforge").exists(), "init made the directory that hides 0.7's"
+
+
+def test_up_keeps_its_state_in_the_0_7_directory(home, monkeypatch):
+    from typer.testing import CliRunner
+
+    from beeverforge import cli
+    from beeverforge.listeners import CannotHonour
+    from beeverforge.runtime import host
+
+    (home / ".openfactory").mkdir()
+    seen = {}
+
+    def deployment(*, state, **_):
+        seen["state"] = state
+        raise CannotHonour("stop here")
+
+    monkeypatch.setattr(host, "durable_half", lambda asked: (None, ""))
+    monkeypatch.setattr(host, "deployment", deployment)
+
+    CliRunner().invoke(cli.app, ["up", "--no-engine"])
+
+    assert seen.get("state") == home / ".openfactory"
+    assert not (home / ".beeverforge").exists()
+
+
+def test_doctors_remedy_for_a_refused_up_names_the_0_7_file(home):
+    from beeverforge import doctor
+
+    (home / ".openfactory").mkdir()
+    # Only `processes` is read by this check, so only it is given.
+    probes = SimpleNamespace(processes=lambda: {"refused": (False, "a port is taken")})
+
+    found = doctor._processes(probes)
+
+    assert "~/.openfactory/env" in found.remedy
+    assert "~/.beeverforge/env" not in found.remedy

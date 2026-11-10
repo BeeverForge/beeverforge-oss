@@ -1060,8 +1060,9 @@ def _processes(p: Probes) -> Finding:
             "processes", False,
             f"`beeverforge up` cannot start this deployment as it is declared: "
             f"{answered['refused'][1]}",
-            "change the line it names — in ~/.beeverforge/env, or in the shell that exports it — "
-            "and run `beeverforge up`")
+            # THE FILE THIS MACHINE READS (#266): `~/.openfactory/env` on a 0.7 machine.
+            f"change the line it names — in ~/{namespace.operator_dir().name}/env, or in the "
+            f"shell that exports it — and run `beeverforge up`")
     engine_up, engine_where = answered.get("engine", (False, ""))
     panel_up, panel_where = answered.get("panel", (False, ""))
     # EVERY ADDRESS THE PANEL LINKS TO, the engine's UI included (#183). It was never asked about,

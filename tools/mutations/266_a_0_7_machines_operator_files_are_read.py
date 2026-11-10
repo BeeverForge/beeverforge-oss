@@ -20,6 +20,9 @@ CERTIFY = TEST + "::test_certify_finds_the_0_7_env_file_and_names_it_without_its
 WORD = TEST + "::test_the_0_7_env_files_name_is_kept_by_the_redactor"
 LOGS = TEST + "::test_a_0_7_checkouts_journals_are_read_where_0_7_wrote_them"
 LOGS_WIN = TEST + "::test_once_the_current_journal_directory_exists_it_wins"
+INIT = TEST + "::test_init_writes_the_host_file_into_the_0_7_directory"
+UP = TEST + "::test_up_keeps_its_state_in_the_0_7_directory"
+DOCTOR = TEST + "::test_doctors_remedy_for_a_refused_up_names_the_0_7_file"
 
 MUTATIONS = [
     ("THE FINDING: the operator directory is always `~/.beeverforge/`", NAMESPACE,
@@ -48,4 +51,13 @@ MUTATIONS = [
     ("the 0.7 journals win over the current ones", PATHS,
      "    if former.is_dir() and not current.is_dir():\n",
      "    if former.is_dir():\n", LOGS_WIN),
+
+    ("`init --runtime local` writes `~/.beeverforge/env` on a 0.7 machine", CLI,
+     "        dest = _host_env()\n", "        dest = Path(_HOST_ENV).expanduser()\n", INIT),
+
+    ("`up` keeps its state under `~/.beeverforge/` on a 0.7 machine", CLI,
+     "    state = _host_env().parent\n", "    state = Path(_HOST_ENV).expanduser().parent\n", UP),
+
+    ("doctor's remedy names `~/.beeverforge/env` on a 0.7 machine", "beeverforge/doctor.py",
+     "in ~/{namespace.operator_dir().name}/env", "in ~/.beeverforge/env", DOCTOR),
 ]
