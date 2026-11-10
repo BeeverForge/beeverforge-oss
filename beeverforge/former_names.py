@@ -56,6 +56,9 @@ LAST_READ_BEFORE = removed_in("openfactory-environment")
 #: environment, never by traffic: one entry per distinct `OPENFACTORY_*` name a load has found.
 _REPORTED: set[str] = set()
 
+#: Of those, the ones not read because their new name was set to another value. Bounded likewise.
+_IGNORED: set[str] = set()
+
 
 @dataclass(frozen=True)
 class CarriedOver:
@@ -108,6 +111,12 @@ def found() -> tuple[str, ...]:
     return tuple(sorted(_REPORTED))
 
 
+def ignored() -> tuple[str, ...]:
+    """Of `found()`, the names not read because their new name holds another value: these are
+    removed, not renamed — renaming one would overwrite the value that is read."""
+    return tuple(sorted(_IGNORED))
+
+
 def warn(done: CarriedOver, logger: logging.Logger | None = None) -> None:
     """Log what `carry_over` did as ONE warning, naming only what this process has not said yet.
 
@@ -118,6 +127,7 @@ def warn(done: CarriedOver, logger: logging.Logger | None = None) -> None:
     if not new:
         return
     _REPORTED.update(new.carried + new.ignored)
+    _IGNORED.update(new.ignored)
     from beeverforge.observability import logs
 
     if logs.structured():

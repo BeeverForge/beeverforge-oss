@@ -21,6 +21,15 @@ MUTATIONS = [
     ("an environment name is said without the release that stops reading it", IN_USE,
      '"the environment", environ))', '"the environment"))', TEST),
 
+    ("an ignored environment name is told to be renamed", IN_USE,
+     "        if name in skipped:\n", "        if False:\n", TEST),
+
+    ("the process forgets which environment names it ignored", FORMER_NAMES,
+     "    _IGNORED.update(new.ignored)\n", "", TEST),
+
+    ("the probe reads no ignored names", IN_USE, "ignored=former_names.ignored()", "ignored=()",
+     TEST),
+
     ("the 0.7 operator directory in use is not listed", IN_USE,
      "        if namespace.dir_in(home) == namespace.FORMER_DIR:\n",
      "        if False:\n", TEST),
@@ -44,8 +53,21 @@ MUTATIONS = [
      "    if journals is not None and journals.parent.name == FORMER_LOGS_BESIDE:\n",
      "    if journals is not None:\n", TEST),
 
+    ("stale 0.7 journals are not listed", IN_USE,
+     "        if stale.is_dir():\n", "        if False:\n", TEST),
+
+    ("add-ons that could not be read are read as none", IN_USE,
+     "    if add_ons is None:\n", "    if False:\n", TEST),
+
+    ("the add-on listing answers an unreadable store with an empty list", "beeverforge/plugins.py",
+     '''        log.warning("could not read the %s entry points", FORMER_GROUP, exc_info=True)
+        return None
+''', '''        log.warning("could not read the %s entry points", FORMER_GROUP, exc_info=True)
+        return []
+''', TEST),
+
     ("an add-on on the former group is not listed", IN_USE,
-     "    for row in add_ons:\n", "    for row in ():\n", TEST),
+     "    for row in add_ons or ():\n", "    for row in ():\n", TEST),
 
     ("the `openfactory` import is not listed", IN_USE,
      "    if imported:\n", "    if False:\n", TEST),

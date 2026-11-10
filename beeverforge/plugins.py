@@ -209,15 +209,16 @@ def _warn_former(points: list[tuple[Any, str]]) -> None:
                 FORMER_GROUP_READ_UNTIL, GROUP)
 
 
-def on_the_former_group() -> list[dict[str, str]]:
+def on_the_former_group() -> list[dict[str, str]] | None:
     """Every row still declared under `FORMER_GROUP` and loaded from there — its distribution and
     its name — READ FROM THE METADATA, never loaded, for the doctor's list of old names. Empty when
-    none is, and when the metadata store cannot be read, which is logged."""
+    none is; None when the metadata store cannot be read, which is logged — never empty, because
+    the doctor would then say no add-on is on the former group when it could not look."""
     try:
         points = _points()
     except Exception:  # noqa: BLE001 — a broken store must not take the doctor down
         log.warning("could not read the %s entry points", FORMER_GROUP, exc_info=True)
-        return []
+        return None
     return sorted(({"distribution": _distribution(p), "name": p.name}
                    for p, g in points if g == FORMER_GROUP),
                   key=lambda r: (r["distribution"], r["name"]))

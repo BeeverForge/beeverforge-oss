@@ -180,6 +180,10 @@ GREEN_ANSWERS: dict[str, Any] = {
     # A project WITH its code (#992): no `code` line, and every line that reads the code is
     # asked. A test about a product that started before its code names its own state.
     "before_its_code": ("", ""),
+    # A deployment on the new names (#266): no former name in use, so no `former_names` line, and
+    # nothing here reads this machine's home, environment or add-ons. A test about an upgraded
+    # deployment names what it still uses.
+    "former_names": lambda checkout: [],
 }
 
 

@@ -45,6 +45,15 @@ def test_each_environment_name_is_listed_with_its_new_name_and_never_its_value()
     assert all("read until BeeverForge 1.1" in f.sentence() for f in found)
 
 
+def test_an_environment_name_whose_new_name_is_set_is_to_be_removed_not_renamed():
+    [found] = still_in_use(environment=["OPENFACTORY_FORGE_TOKEN"],
+                           ignored=["OPENFACTORY_FORGE_TOKEN"])
+
+    assert found.old == "`OPENFACTORY_FORGE_TOKEN`"
+    assert found.new == "remove it: `BEEVERFORGE_FORGE_TOKEN` is set, and is the one read"
+    assert "read until" not in found.sentence()
+
+
 def test_the_0_7_operator_directory_in_use_is_listed(tmp_path):
     (tmp_path / ".openfactory").mkdir()
 
@@ -94,7 +103,21 @@ def test_journals_in_the_0_7_directory_are_listed(tmp_path):
 
 
 def test_journals_in_the_current_directory_list_nothing(tmp_path):
+    (tmp_path / ".openfactory-logs" / "someone-else").mkdir(parents=True)
+
     assert still_in_use(journals=tmp_path / ".beeverforge-logs" / "someone-app") == []
+
+
+def test_0_7_journals_beside_the_current_ones_are_listed_as_stale(tmp_path):
+    stale = tmp_path / ".openfactory-logs" / "someone-app"
+    stale.mkdir(parents=True)
+    current = tmp_path / ".beeverforge-logs" / "someone-app"
+
+    [found] = still_in_use(journals=current)
+
+    assert found.old == f"`{stale}`"
+    assert found.new == f"move what is in it into `{current}`, then remove it"
+    assert f"nothing under `{stale}` is" in found.where
 
 
 def test_each_add_on_row_on_the_former_group_is_listed():
@@ -103,6 +126,22 @@ def test_each_add_on_row_on_the_former_group_is_listed():
     assert _pairs(found) == [("`openfactory.adapters` entry point `forge.someone`",
                               "`beeverforge.adapters`")]
     assert "someone-forge" in found[0].where
+
+
+def test_add_ons_that_could_not_be_read_are_said_never_read_as_none():
+    [found] = still_in_use(add_ons=None)
+
+    assert (found.old, found.new) == ("`openfactory.adapters`", "`beeverforge.adapters`")
+    assert "could not be read" in found.where
+
+
+def test_the_add_on_listing_answers_none_when_the_metadata_cannot_be_read(monkeypatch):
+    def broken():
+        raise OSError("the metadata store is unreadable")
+
+    monkeypatch.setattr(plugins, "_points", broken)
+
+    assert plugins.on_the_former_group() is None
 
 
 def test_the_import_and_the_command_are_listed():
@@ -124,15 +163,18 @@ def test_a_deployment_on_the_new_names_lists_nothing(tmp_path):
 
 def test_the_names_a_process_carried_or_ignored_are_found(monkeypatch):
     monkeypatch.setattr(former_names, "_REPORTED", set())
+    monkeypatch.setattr(former_names, "_IGNORED", set())
     env = {"OPENFACTORY_A": "1", "OPENFACTORY_B": "2", "BEEVERFORGE_B": "3"}
 
     former_names.warn(former_names.carry_over(env))
 
     assert former_names.found() == ("OPENFACTORY_A", "OPENFACTORY_B")
+    assert former_names.ignored() == ("OPENFACTORY_B",)
 
 
 def test_the_probe_reads_this_process_and_this_machine(home, tmp_path, monkeypatch):
-    monkeypatch.setattr(former_names, "_REPORTED", {"OPENFACTORY_FORGE_TOKEN"})
+    monkeypatch.setattr(former_names, "_REPORTED", {"OPENFACTORY_FORGE_TOKEN", "OPENFACTORY_X"})
+    monkeypatch.setattr(former_names, "_IGNORED", {"OPENFACTORY_X"})
     monkeypatch.setattr(plugins, "on_the_former_group",
                         lambda: [{"distribution": "someone-forge", "name": "forge.someone"}])
     monkeypatch.setitem(sys.modules, "openfactory", sys.modules["beeverforge"])
@@ -144,8 +186,9 @@ def test_the_probe_reads_this_process_and_this_machine(home, tmp_path, monkeypat
 
     found = _former_names_probe(Project(name="someone-app", repo_path=str(checkout)), checkout)
 
+    assert found[1].new.startswith("remove it")
     assert [f.old for f in found] == [
-        "`OPENFACTORY_FORGE_TOKEN`", "`~/.openfactory/`", "`.openfactory/`",
+        "`OPENFACTORY_FORGE_TOKEN`", "`OPENFACTORY_X`", "`~/.openfactory/`", "`.openfactory/`",
         f"`{tmp_path / 'work' / '.openfactory-logs'}`",
         "`openfactory.adapters` entry point `forge.someone`", "`import openfactory`",
         "the `openfactory` command"]
@@ -153,6 +196,7 @@ def test_the_probe_reads_this_process_and_this_machine(home, tmp_path, monkeypat
 
 def test_the_probe_on_a_new_deployment_finds_nothing(home, tmp_path, monkeypatch):
     monkeypatch.setattr(former_names, "_REPORTED", set())
+    monkeypatch.setattr(former_names, "_IGNORED", set())
     monkeypatch.setattr(plugins, "on_the_former_group", lambda: [])
     monkeypatch.delitem(sys.modules, "openfactory", raising=False)
     monkeypatch.setattr(sys, "argv", ["/usr/local/bin/beeverforge", "doctor", "someone-app"])

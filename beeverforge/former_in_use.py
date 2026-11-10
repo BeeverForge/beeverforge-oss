@@ -12,9 +12,15 @@ NAMES ONLY, NEVER A VALUE. A variable is named, never what it holds: many of the
 EACH SOURCE IS PASSED IN. The doctor's probe reads the machine (`probe`); `still_in_use` only
 assembles what it is handed, so a test states the machine in its arguments.
 
-A STALE `~/.openfactory/` IS LISTED TOO. With both operator directories present the current one
-is read and the former one is not, and no other line of the doctor says so. A repository's stale
-`.openfactory/` is not listed here: the doctor's `folder` line already names it.
+A STALE `~/.openfactory/` IS LISTED TOO, and stale 0.7 journals. With both directories present
+the current one is read and the former one is not, and no other line of the doctor says so. A
+repository's stale `.openfactory/` is not listed here: the doctor's `folder` line already names it.
+
+AN `OPENFACTORY_*` WHOSE NEW NAME IS SET IS REMOVED, NOT RENAMED: the new name holds another value
+and is the one read, and renaming the old one would overwrite it.
+
+COULD NOT LOOK IS SAID, NEVER READ AS NONE. Add-ons whose metadata could not be read are a line of
+the list, not an empty part of it.
 """
 
 from __future__ import annotations
@@ -48,21 +54,27 @@ class StillInUse:
         return f"{self.old} → {self.new} ({self.where}{until})"
 
 
-def still_in_use(*, environment: Iterable[str] = (), home: Path | None = None,
-                 checkout: Path | None = None, journals: Path | None = None,
-                 add_ons: Iterable[dict[str, str]] = (), imported: bool = False,
-                 command: str = "") -> list[StillInUse]:
+def still_in_use(*, environment: Iterable[str] = (), ignored: Iterable[str] = (),
+                 home: Path | None = None, checkout: Path | None = None,
+                 journals: Path | None = None, add_ons: Iterable[dict[str, str]] | None = (),
+                 imported: bool = False, command: str = "") -> list[StillInUse]:
     """Every former name in what it is handed, in a fixed order.
 
-    `environment`: the `OPENFACTORY_*` names this process found; `home`: the operator's home;
-    `checkout`: the project's repository; `journals`: the project's journal directory;
-    `add_ons`: `plugins.on_the_former_group()`'s rows; `imported`: whether this process imported
-    `openfactory`; `command`: the name this process was started under."""
+    `environment`: the `OPENFACTORY_*` names this process found; `ignored`: those of them whose
+    new name was set to another value; `home`: the operator's home; `checkout`: the project's
+    repository; `journals`: the project's journal directory; `add_ons`:
+    `plugins.on_the_former_group()`'s rows, None when they could not be read; `imported`: whether
+    this process imported `openfactory`; `command`: the name this process was started under."""
     found: list[StillInUse] = []
     environ = removed_in("openfactory-environment")
-    for name in sorted(set(environment)):
-        found.append(StillInUse(f"`{name}`", f"`{PREFIX}{name[len(FORMER_PREFIX):]}`",
-                                "the environment", environ))
+    skipped = set(ignored)
+    for name in sorted(set(environment) | skipped):
+        new = f"`{PREFIX}{name[len(FORMER_PREFIX):]}`"
+        if name in skipped:
+            found.append(StillInUse(f"`{name}`", f"remove it: {new} is set, and is the one read",
+                                    "the environment"))
+        else:
+            found.append(StillInUse(f"`{name}`", new, "the environment", environ))
     if home is not None:
         former, current = f"`~/{namespace.FORMER_DIR}/`", f"`~/{namespace.DIR}/`"
         if namespace.dir_in(home) == namespace.FORMER_DIR:
@@ -78,10 +90,22 @@ def still_in_use(*, environment: Iterable[str] = (), home: Path | None = None,
         found.append(StillInUse(f"`{journals.parent}`",
                                 f"`{journals.parent.with_name(LOGS_BESIDE)}`",
                                 "the journals beside the checkout"))
+    elif journals is not None and journals.parent.name == LOGS_BESIDE:
+        stale = journals.parent.with_name(FORMER_LOGS_BESIDE) / journals.name
+        if stale.is_dir():
+            found.append(StillInUse(
+                f"`{stale}`", f"move what is in it into `{journals}`, then remove it",
+                f"the journals beside the checkout: `{journals}` is read and nothing under "
+                f"`{stale}` is"))
     from beeverforge.plugins import FORMER_GROUP, GROUP
 
     adapters = removed_in("openfactory-adapters")
-    for row in add_ons:
+    if add_ons is None:
+        found.append(StillInUse(
+            f"`{FORMER_GROUP}`", f"`{GROUP}`",
+            "the installed add-ons' metadata could not be read, so whether an add-on still "
+            "declares entry points under the former group is not known", adapters))
+    for row in add_ons or ():
         dist = row.get("distribution") or "an add-on"
         found.append(StillInUse(f"`{FORMER_GROUP}` entry point `{row.get('name', '')}`",
                                 f"`{GROUP}`", f"declared by {dist}", adapters))
@@ -101,7 +125,8 @@ def probe(*, checkout: Path | None, journals: Path | None) -> list[StillInUse]:
     carried, the operator's home, the add-ons installed, the import and the command."""
     from beeverforge import former_names, plugins
 
-    return still_in_use(environment=former_names.found(), home=Path.home(), checkout=checkout,
+    return still_in_use(environment=former_names.found(), ignored=former_names.ignored(),
+                        home=Path.home(), checkout=checkout,
                         journals=journals, add_ons=plugins.on_the_former_group(),
                         imported="openfactory" in sys.modules,
                         command=Path(sys.argv[0]).name if sys.argv else "")
