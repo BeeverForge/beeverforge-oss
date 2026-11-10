@@ -566,6 +566,9 @@ class Probes:
     #: for every other project. The lines that read the code have nothing to read, so `diagnose`
     #: says the state once, as the `code` line, in their place.
     before_its_code: tuple[str, str] = ("", "")
+    #: OpenFactory 0.7's names this deployment still uses (`former_in_use.StillInUse`), handed the
+    #: checkout `diagnose` resolved once. None = an older Probes; the check is skipped.
+    former_names: Callable[[pathlib.Path | None], list] | None = None
 
 
 #: The lines `diagnose` does not ask of a project whose product started before its code (#992):
@@ -654,6 +657,10 @@ def diagnose(probes: Probes) -> Report:
     stale = _guarded("folder", lambda: _folder(probes)) if probes.checkout else None
     if stale is not None and stale.message:
         findings.append(stale)
+    former = (_guarded("former_names", lambda: _former_names(probes)) if probes.former_names
+              else None)
+    if former is not None and former.message:
+        findings.append(former)
     findings.append(_guarded("guidelines", lambda: _guidelines(probes)))
     if probes.operator_guidelines:
         findings.append(_guarded("operator_guidelines",
@@ -1428,6 +1435,30 @@ def _folder(p: Probes) -> Finding:
         note=f"remove `{former}` from the repository once you have checked nothing in it is "
              f"newer than its twin under `{current}` — while both are there, `{former}` is "
              f"never read")
+
+
+def _former_names(p: Probes) -> Finding:
+    """OpenFactory 0.7's names this deployment still uses, each with the name to use (#266) — and
+    an empty message, which `diagnose` leaves out, when there are none.
+
+    A PASS, NOT A FAILURE. The deployment runs as it is: each name is either still read or left
+    behind and read by nothing. What the operator needs is the list, in one place, before the
+    release that stops reading them.
+
+    THE LINE TELLS NO ONE STEP FOR ALL OF THEM. A name still read is renamed; an ignored variable
+    or a stale directory is removed, and renaming an ignored variable would overwrite the value
+    that is read. Each entry says its own step, and the prefix and the note send the reader to
+    it."""
+    assert p.former_names is not None
+    found = p.former_names(p.checkout() if p.checkout else None)
+    if not found:
+        return Finding("former_names", True, "")
+    return Finding(
+        "former_names", True,
+        f"OpenFactory 0.7 names still in use or left behind — do what each one says: "
+        f"{'; '.join(f.sentence() for f in found)}",
+        note="the former_names line lists OpenFactory 0.7 names this deployment still uses or "
+             "left behind — do what each entry says, before the release that stops reading it")
 
 
 def _guidelines(p: Probes) -> Finding:
@@ -2633,6 +2664,15 @@ def _reading_probe() -> ReadingState:
                         ocr_detail=ocr_detail, image_row=row_for("image"), ocr_missing=missing)
 
 
+def _former_names_probe(project, checkout: pathlib.Path | None) -> list:
+    """`former_in_use.probe` for `project`: its checkout, and the journal directory its jobs
+    write to."""
+    from beeverforge import former_in_use
+    from beeverforge.paths import project_log_dir
+
+    return former_in_use.probe(checkout=checkout, journals=project_log_dir(project))
+
+
 def probes_for(project) -> Probes:
     """The live probes for a registered project. Each one answers narrowly and never raises past
     `_guarded`."""
@@ -3368,6 +3408,7 @@ def probes_for(project) -> Probes:
         inlined_documents=_inlined_documents,
         checkout=_checkout,
         installation_scope=_installation_scope_probe,
+        former_names=lambda checkout: _former_names_probe(project, checkout),
     )
 
 

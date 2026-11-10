@@ -169,8 +169,8 @@ MUTATIONS = [
 
     # ── reachability (doctor) ───────────────────────────────────────────────────────────────────
     ("the live probe set no longer builds the line's probe", DOCTOR,
-     "        installation_scope=_installation_scope_probe,\n    )",
-     "    )",
+     "        installation_scope=_installation_scope_probe,\n        former_names=",
+     "        former_names=",
      f"{READ}::test_the_live_probes_ask_the_installation_and_doctor_reports_it"),
 
     ("`diagnose` no longer emits the line, so `--json` has no such id", DOCTOR,
