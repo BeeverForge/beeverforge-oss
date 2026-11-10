@@ -40,7 +40,15 @@ What changes outright, with nothing to rename by hand:
 This is the deployment `install.sh` set up: a directory holding `docker-compose.yml` and
 `.env.compose`.
 
-1. **Run the installer over the same directory, with `--force`.**
+1. **Keep a copy of 0.7's `.env.compose`.** The upgrade rewrites it under BeeverForge's names, and
+   only a file holding 0.7's rows tells the installer there is 0.7 data to carry. The copy is what
+   lets you upgrade again after going back (below):
+
+   ```sh
+   cp -p <the 0.7 directory>/.env.compose <the 0.7 directory>/.env.compose.0.7
+   ```
+
+2. **Run the installer over the same directory, with `--force`.**
 
    ```sh
    curl -fsSL https://beeverforge.com/install.sh | sh -s -- --dir <the 0.7 directory> --force
@@ -49,7 +57,7 @@ This is the deployment `install.sh` set up: a directory holding `docker-compose.
    At a terminal, `init` asks its questions as on a fresh install. Unattended, pass its answers
    after a second `--`, as for a fresh install.
 
-2. **What it does, in order.** Because `.env.compose` holds `OPENFACTORY_*` rows, the installer runs
+3. **What it does, in order.** Because `.env.compose` holds `OPENFACTORY_*` rows, the installer runs
    `beeverforge upgrade-from-openfactory` before it rewrites the file:
 
    - it stops 0.7's containers, without removing them;
@@ -62,13 +70,16 @@ This is the deployment `install.sh` set up: a directory holding `docker-compose.
    - the new stack starts on the copied volumes.
 
    A volume a BeeverForge stack already keeps data in is never written over: the installer stops and
-   names it. Running the installer again copies nothing once every copy has finished.
+   names it. Running the installer again copies nothing once every copy has finished. If a carry
+   stopped part-way, the next run empties and copies every volume again from 0.7's, so all of them
+   hold one moment: 0.7's state when that run stopped it, including any work 0.7 did after you
+   started it again meanwhile.
 
-3. **Check it.** `beeverforge project list` shows 0.7's projects. A card 0.7 had in flight is picked
+4. **Check it.** `beeverforge project list` shows 0.7's projects. A card 0.7 had in flight is picked
    up by the BeeverForge worker where it stood, and a parked one resumes as before.
    `beeverforge doctor <project>` lists the former names still in use.
 
-4. **Remove 0.7's containers and volumes once BeeverForge runs as it should.** The carry step
+5. **Remove 0.7's containers and volumes once BeeverForge runs as it should.** The carry step
    prints both commands as it finishes, naming each volume, and the installer's last lines point
    back to them. Until you run them, nothing of 0.7's is deleted.
 
@@ -83,14 +94,33 @@ docker start $(docker ps -aq --filter label=com.docker.compose.project=openfacto
 ```
 
 If the upgrade stops after 0.7's containers were stopped, the installer prints this same command.
-Work done on BeeverForge after the upgrade stays in BeeverForge's volumes and does not reach 0.7.
+0.7's containers keep the environment they were created with, so they start without its old
+`.env.compose`.
+
+**Going back is a decision to stay on 0.7.** Work done on BeeverForge after the upgrade stays in
+BeeverForge's volumes and does not reach 0.7. Work done on 0.7 after going back does not reach
+BeeverForge either: `.env.compose` now holds BeeverForge's names, so a later `--force` run carries
+nothing, and BeeverForge would start again from the copy taken at the upgrade, without a word. To
+upgrade again from 0.7's newest state:
+
+1. remove BeeverForge's stack and volumes with the installer's `--uninstall`, saved as the
+   [README](../README.md)'s "read it first" line does: `sh install.sh --uninstall --dir <the
+   directory>`. It asks first. This deletes everything BeeverForge did since the upgrade;
+2. put back the copy of 0.7's file: `cp -p .env.compose.0.7 .env.compose`;
+3. run the upgrade from step 2 again.
 
 ### BeeverForge installed in another directory
 
 The installer carries 0.7's data only when it runs over 0.7's own directory. A BeeverForge install
-in another directory starts on empty volumes. Once it has started, its volumes hold data, and the
-carry refuses to write over them. To carry 0.7's data, run the installer with `--force` over the 0.7
-directory instead, after removing the separate install's stack and volumes.
+in another directory starts on empty volumes, and they are the very volumes the carry writes to:
+BeeverForge's compose project is always `beeverforge`, whatever the directory, so two installs share
+one set of volumes. Once that install has started, the carry refuses to write over them.
+
+To carry 0.7's data instead, remove the other install with the installer's `--uninstall`
+(`sh install.sh --uninstall --dir <its directory>`, the script saved as the README's "read it first"
+line does). It asks first, and removes its volumes, and with
+them every project, card and setting that install holds. Then run the upgrade above over the 0.7
+directory.
 
 ## A one-machine deployment
 
@@ -112,27 +142,57 @@ This is a deployment run with `openfactory up` from a pip install, configured in
    approvals and the settings are there. Journals stay in `.openfactory-logs/` beside each checkout
    until `.beeverforge-logs/` exists.
 
-3. **Rename the directory when you are ready**, with nothing running: `mv ~/.openfactory
-   ~/.beeverforge`. Once `~/.beeverforge/` exists, it is the one read and `~/.openfactory/` is not,
-   so rename it rather than creating the new one beside it. The same holds for a checkout's journals:
-   move `.openfactory-logs/<project>` to `.beeverforge-logs/<project>` rather than letting a new job
-   create the new one beside it.
+3. **Rename the directory when you are ready**, with nothing running. Once `~/.beeverforge/`
+   exists, it is the one read and `~/.openfactory/` is not, so rename it rather than creating the
+   new one beside it:
+
+   ```sh
+   test -e ~/.beeverforge || mv ~/.openfactory ~/.beeverforge
+   ```
+
+   If `~/.beeverforge/` already exists, this does nothing. `beeverforge doctor` then lists
+   `~/.openfactory/` as stale on its `former_names` line: move what you need from it into
+   `~/.beeverforge/` by hand, then remove it.
+
+   **Then edit `~/.beeverforge/env`.** The `env` 0.7's `init` wrote names the registry, the board
+   database, the repository cache and the metrics database by their full paths under
+   `~/.openfactory/`, and a path written out is read as written. Change each `/.openfactory/` in the
+   file to `/.beeverforge/`, and rename its `OPENFACTORY_*` rows while you are there. Otherwise the
+   machine starts with no registry.
+
+4. **Move each checkout's journals the same way**, from the directory that holds the checkout, so a
+   new job does not start the new directory beside them:
+
+   ```sh
+   mkdir -p .beeverforge-logs && mv .openfactory-logs/<project> .beeverforge-logs/<project>
+   ```
 
 ## The environment
 
-Every `OPENFACTORY_<NAME>` is read as `BEEVERFORGE_<NAME>` when that one is unset, wherever the
-process reads its environment: the shell, `.env`, `~/.openfactory/env` and `.env.compose`. When both
-are set to different values, the `BEEVERFORGE_*` one is read and the other is ignored, and the log
-says so. Rename each variable before 1.1, and remove a former one whose new name is already set:
-renaming it would overwrite the value that is read.
+Every `OPENFACTORY_<NAME>` a BeeverForge process finds in its environment is read as
+`BEEVERFORGE_<NAME>` when that one is unset: from the shell, from `.env` and from
+`~/.openfactory/env`. When both are set to different values, the `BEEVERFORGE_*` one is read and the
+other is ignored, and the log says so. An empty `BEEVERFORGE_*` counts as set. Rename each variable
+before 1.1, and remove a former one whose new name is already set: renaming it would overwrite the
+value that is read.
+
+**Do not start BeeverForge's compose file on a 0.7 `.env.compose`.** Compose fills several rows only
+from their `BEEVERFORGE_*` names, and passes them empty when only the `OPENFACTORY_*` name is there.
+An empty `BEEVERFORGE_*` wins, so the `OPENFACTORY_*` value, a credential among them, is dropped,
+and only a line in the stack's logs says so. Let the installer rewrite the file (step 2 above).
 
 ## The repositories: `beeverforge migrate`
 
-A repository that keeps `.openfactory/` is read there. `beeverforge migrate <project>` proposes the
-rename, one pull request per repository of the product, for a person to merge: it moves the folder
-and rewrites the `.openfactory/` paths written inside it. Files outside the folder that mention
+A repository that keeps `.openfactory/` is read there. `beeverforge migrate <project> --yes` proposes
+the rename, one pull request per repository of the product, for a person to merge: it moves the
+folder and rewrites the `.openfactory/` paths written inside it. Without `--yes` it names the
+repositories it would open a pull request on and stops. Files outside the folder that mention
 `.openfactory/` (a `.gitignore` line, a CI step) are named for you to update. See
 [reference/cli.md](reference/cli.md).
+
+A project registered by its checkout on this machine, as on a one-machine deployment, has no forge to
+propose through, and `migrate` refuses it. Run `git mv .openfactory .beeverforge` in the checkout,
+update the `.openfactory/` paths written inside the folder, and commit it yourself.
 
 While a repository carries both folders, `.beeverforge/` is read and `.openfactory/` is not, and
 `beeverforge doctor` says so on its `folder` line.
