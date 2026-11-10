@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1883,6 +1884,20 @@ def test_an_init_that_fails_after_the_carry_says_the_way_back_to_0_7(tmp_path):
         in said, "the way back to 0.7 was not said"
 
 
+def _a_carry_that_says(said: str) -> tuple[str, str]:
+    """A `docker` whose `upgrade-from-openfactory` run prints `said`, as the package's report
+    would; every other call is the plain stub's."""
+    return ("docker", "#!/bin/sh\n"
+                      "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                      "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                      "case \" $* \" in *\" upgrade-from-openfactory \"*) "
+                      f"printf '%s\\n' {shlex.quote(said)} ;; esac\n"
+                      "exit 0\n")
+
+
+_POINTER = "The carry step above named the commands that remove OpenFactory 0.7's"
+
+
 @needs_a_posix_shell
 def test_an_upgrade_does_not_say_register_your_first_project(tmp_path):
     done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n")
@@ -1891,7 +1906,37 @@ def test_an_upgrade_does_not_say_register_your_first_project(tmp_path):
     assert "your first project" not in done.stdout
     assert "`beeverforge project list` shows the projects registered here" in done.stdout
     assert "were kept" not in done.stdout, "a --force that carried nothing cannot say that"
-    assert "the carry step above named the commands that remove 0.7's" in done.stdout
+
+
+@needs_a_posix_shell
+def test_the_last_lines_point_back_when_the_carry_named_the_removal_commands(tmp_path):
+    said = ("copied openfactory_temporal_db into beeverforge_temporal_db\n"
+            "the OpenFactory 0.7 volumes are untouched: once BeeverForge runs as it should, "
+            "remove 0.7's containers with `docker rm ...` and its volumes with "
+            "`docker volume rm openfactory_temporal_db`")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n",
+                                 stubs=(_a_carry_that_says(said),))
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert "docker volume rm openfactory_temporal_db" in done.stdout, "the carry's report was lost"
+    assert _POINTER in done.stdout
+    assert done.stdout.index("docker volume rm") < done.stdout.index(_POINTER)
+
+
+@pytest.mark.parametrize("said", [
+    "",  # a directory that was never 0.7's: the command says nothing
+    "no OpenFactory 0.7 volume was found on this daemon (compose project `openfactory`), so the "
+    "new stack starts empty",
+], ids=["never-0.7", "no-0.7-volume"])
+@needs_a_posix_shell
+def test_the_last_lines_do_not_point_at_commands_the_carry_never_named(tmp_path, said):
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n",
+                                 stubs=(_a_carry_that_says(said),))
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert said in done.stdout
+    assert _POINTER not in done.stdout
+    assert "the carry step above" not in done.stdout.lower()
 
 
 @needs_a_posix_shell
@@ -1905,7 +1950,7 @@ def test_a_failed_carry_never_reaches_the_pointer_to_its_removal_commands(tmp_pa
                          "exit 0\n")
     done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
 
-    assert "the carry step above named" not in done.stdout + done.stderr
+    assert _POINTER not in done.stdout + done.stderr
 
 
 @needs_a_posix_shell

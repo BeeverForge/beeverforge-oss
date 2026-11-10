@@ -40,6 +40,8 @@ ORDER = INST + "::test_an_upgrade_carries_a_0_7_stack_before_init_rewrites_its_f
 FAILED = INST + "::test_a_failed_carry_stops_the_upgrade_before_init_and_says_so"
 INIT_FAILS = INST + "::test_an_init_that_fails_after_the_carry_says_the_way_back_to_0_7"
 NOT_FIRST = INST + "::test_an_upgrade_does_not_say_register_your_first_project"
+POINTS_BACK = INST + "::test_the_last_lines_point_back_when_the_carry_named_the_removal_commands"
+NEVER_NAMED = INST + "::test_the_last_lines_do_not_point_at_commands_the_carry_never_named"
 LABEL_BLIND = VOL + "::test_a_label_check_that_fails_refuses_and_empties_nothing"
 STAMP_BLIND = VOL + "::test_a_stamp_check_that_fails_refuses_and_empties_nothing"
 ONE_MOMENT = VOL + "::test_a_retry_copies_every_volume_from_one_moment"
@@ -133,8 +135,9 @@ MUTATIONS = [
      "    run_preflight\n    run_init\n    carry_a_0_7_stack\n", ORDER),
 
     ("a failed carry does not stop the upgrade", INSTALL,
-     "    in_the_cli upgrade-from-openfactory --env-file /out/.env.compose \\\n        || die",
-     "    in_the_cli upgrade-from-openfactory --env-file /out/.env.compose \\\n        || true || die",
+     # RE-PINNED 2026-11-10 (the carry's output is captured, for the closing pointer)
+     "--env-file /out/.env.compose) \\\n        || {",
+     "--env-file /out/.env.compose) || true \\\n        || {",
      FAILED),
 
     ("0.7's work directory is not kept", INSTALL,
@@ -157,7 +160,8 @@ MUTATIONS = [
      "`docker compose -p {FORMER_PROJECT} down -v`", REMOVE),
 
     ("a failed carry does not say the way back to 0.7", INSTALL,
-     ' To go back to 0.7 meanwhile: ${BACK_TO_0_7}"\n', '"\n', FAILED),
+     # RE-PINNED 2026-11-10 (the carry's output is captured; its `die` is in a brace group)
+     ' To go back to 0.7 meanwhile: ${BACK_TO_0_7}"; }\n', '"; }\n', FAILED),
 
     ("a failed init after a carry does not say the way back", INSTALL,
      '    [ "$CARRIED" -eq 1 ] || return 0\n', "    return 0\n", INIT_FAILS),
@@ -167,6 +171,13 @@ MUTATIONS = [
      '    if false; then\n        # NOT "YOUR PROJECTS', NOT_FIRST),
 
     ("the last lines do not point back to the removal commands", INSTALL,
-     '    if [ "$CARRIED" -eq 1 ]; then\n        # SAID AGAIN HERE',
-     '    if false; then\n        # SAID AGAIN HERE', NOT_FIRST),
+     '    if [ "$NAMED_REMOVAL" -eq 1 ]; then\n        # SAID AGAIN HERE',
+     '    if false; then\n        # SAID AGAIN HERE', POINTS_BACK),
+
+    ("the last lines point back after any carry, named or not", INSTALL,
+     '    if [ "$NAMED_REMOVAL" -eq 1 ]; then\n        # SAID AGAIN HERE',
+     '    if [ "$CARRIED" -eq 1 ]; then\n        # SAID AGAIN HERE', NEVER_NAMED),
+
+    ("the carry's report is swallowed", INSTALL,
+     '    [ -z "$said" ] || say "$said"\n    CARRIED=1\n', "    CARRIED=1\n", POINTS_BACK),
 ]

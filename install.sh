@@ -610,6 +610,7 @@ run_preflight() {
 # shellcheck disable=SC2016
 BACK_TO_0_7='docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)'
 CARRIED=0
+NAMED_REMOVAL=0
 
 after_a_carry() {
     [ "$CARRIED" -eq 1 ] || return 0
@@ -629,10 +630,17 @@ carry_a_0_7_stack() {
         say "  would run: beeverforge upgrade-from-openfactory --env-file /out/.env.compose"
         return 0
     fi
-    in_the_cli upgrade-from-openfactory --env-file /out/.env.compose \
-        || die "the OpenFactory 0.7 stack's data could not be carried, so BeeverForge was not started and ${DIR}/.env.compose was left as it was. If the lines above say 0.7's containers were stopped, they still are." \
-               "Fix what it reported above and run this installer again with --force. To go back to 0.7 meanwhile: ${BACK_TO_0_7}"
+    # CAPTURED, then printed: the last lines point back to the removal commands only when this
+    # step named them, which it does only after copying 0.7 volumes (not for a directory that was
+    # never 0.7's, nor for a 0.7 file whose stack left no volume). Its refusal goes to stderr, so
+    # it still reaches the person as it happens.
+    said=$(in_the_cli upgrade-from-openfactory --env-file /out/.env.compose) \
+        || { [ -z "${said:-}" ] || say "$said"
+             die "the OpenFactory 0.7 stack's data could not be carried, so BeeverForge was not started and ${DIR}/.env.compose was left as it was. If the lines above say 0.7's containers were stopped, they still are." \
+               "Fix what it reported above and run this installer again with --force. To go back to 0.7 meanwhile: ${BACK_TO_0_7}"; }
+    [ -z "$said" ] || say "$said"
     CARRIED=1
+    case "$said" in *"docker volume rm "*) NAMED_REMOVAL=1 ;; esac
 }
 
 run_init() {
@@ -781,10 +789,10 @@ finish() {
     say "  the panel        http://localhost:${port}"
     say "  what is left     cd ${DIR} && docker compose --env-file .env.compose exec worker beeverforge preflight"
     say ""
-    if [ "$CARRIED" -eq 1 ]; then
+    if [ "$NAMED_REMOVAL" -eq 1 ]; then
         # SAID AGAIN HERE, after a long scroll of pulls and checks: the carry step printed how to
         # remove 0.7's containers and volumes, and it is the person's step, once BeeverForge works.
-        say "If this upgraded an OpenFactory 0.7 stack, the carry step above named the commands that remove 0.7's containers and volumes once you no longer need them."
+        say "The carry step above named the commands that remove OpenFactory 0.7's containers and volumes once you no longer need them."
         say ""
     fi
     if [ "$FORCE" -eq 1 ]; then
