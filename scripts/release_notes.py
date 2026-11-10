@@ -47,6 +47,12 @@ WHAT EACH COMMAND IS FOR (docs/RELEASING.md, "The release notes"):
             run: by the time the page is written the images are published under the tag, and a
             failed release job burns the version (docs/RELEASING.md, "When a release goes wrong")
 
+WHAT IS STILL READ UNDER AN OLD NAME is said in every version's notes, not only in the one whose
+pull request kept it readable (#264): `render` closes "Upgrade notes" with one item made from the
+removal register, `beeverforge/deprecations.py`, each entry's `said` and the release that stops
+reading it. The register is read with `ast`, never imported. One that is there and cannot be read
+fails `preview` and `assemble`, and is a warning on a `page`.
+
 THE STANDARD LIBRARY ONLY, AND NO NETWORK: CI runs this on a bare runner's `python3`, and the
 suite runs it offline (`tests/test_a_release_is_noted_by_its_pull_requests.py`).
 """
@@ -54,6 +60,7 @@ suite runs it offline (`tests/test_a_release_is_noted_by_its_pull_requests.py`).
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import json
 import re
@@ -83,6 +90,11 @@ LABEL = "no-release-note"
 FRAGMENTS = Path("changes")
 CHANGELOG = Path("CHANGELOG.md")
 PYPROJECT = Path("pyproject.toml")
+#: The removal register: what the platform still reads under an OpenFactory 0.7 name, and the
+#: release that stops reading it. Every version's notes say so, under "Upgrade notes" (#264).
+REGISTER = Path("beeverforge/deprecations.py")
+#: `Removal`'s fields, in the order its positional arguments fill them.
+_REMOVAL_FIELDS = ("key", "removed_in", "what", "said")
 
 _NAME = re.compile(r"^(?P<ref>[0-9]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})"
                    r"\.(?P<type>[a-z]+)\.md$")
@@ -193,13 +205,55 @@ def _item(fragment: Fragment) -> str:
     return "\n".join([f"- {first}", *(f"  {line}" if line.strip() else "" for line in rest)])
 
 
-def render(fragments: list[Fragment]) -> str:
-    """The notes: one `###` group per type that has a fragment, in `TYPES` order."""
+def still_read(register: Path = REGISTER) -> tuple[list[tuple[str, str]], str | None]:
+    """`(said, removed_in)` for each entry of the removal register, in its order, and a sentence
+    when the register is there and cannot be read. READ, NEVER IMPORTED: this runs on a bare
+    runner's `python3`, and the register's own module is the package's. No register is no entry:
+    a tree without one has nothing to announce."""
+    if not register.is_file():
+        return [], None
+    try:
+        module = ast.parse(register.read_text(encoding="utf-8"))
+        [listed] = [node.value for node in module.body
+                    if isinstance(node, (ast.Assign, ast.AnnAssign))
+                    and "REMOVALS" in [t.id for t in (node.targets if isinstance(node, ast.Assign)
+                                                      else [node.target])
+                                       if isinstance(t, ast.Name)]]
+        entries = []
+        for call in listed.elts:
+            fields = dict(zip(_REMOVAL_FIELDS, map(ast.literal_eval, call.args), strict=False))
+            for keyword in call.keywords:
+                if keyword.arg not in _REMOVAL_FIELDS:
+                    raise ValueError(f"`{keyword.arg}` is not a field of a removal")
+                fields[keyword.arg] = ast.literal_eval(keyword.value)
+            said, until = fields.get("said"), fields.get("removed_in")
+            if not (isinstance(said, str) and said.strip() and isinstance(until, str)):
+                raise ValueError(f"{fields.get('key')!r} says nothing a reader of the notes reads")
+            entries.append((said, until))
+        return entries, None
+    except (SyntaxError, ValueError, TypeError, AttributeError) as exc:
+        return [], (f"{register.as_posix()} could not be read for the notes ({exc}): every "
+                    f"version's notes say what it still reads, so it is fixed first")
+
+
+def _still_read_item(entries: list[tuple[str, str]]) -> str:
+    """The "Upgrade notes" item that says what is still read under an OpenFactory 0.7 name."""
+    rows = "\n".join(f"  - {said}: until {until}" for said, until in entries)
+    return ("- **OpenFactory 0.7's names are still read**, each until the BeeverForge release "
+            "named, which reads only the new name:\n" + rows)
+
+
+def render(fragments: list[Fragment], still: list[tuple[str, str]] | None = None) -> str:
+    """The notes: one `###` group per type that has a fragment, in `TYPES` order. `still`, the
+    register's entries, closes "Upgrade notes", which it opens when no fragment did."""
     groups = []
     for name, heading in TYPES:
-        mine = sorted((f for f in fragments if f.type == name), key=lambda f: f.order)
-        if mine:
-            groups.append(f"### {heading}\n\n" + "\n".join(_item(f) for f in mine))
+        items = [_item(f) for f in sorted((f for f in fragments if f.type == name),
+                                          key=lambda f: f.order)]
+        if name == "upgrade" and still:
+            items.append(_still_read_item(still))
+        if items:
+            groups.append(f"### {heading}\n\n" + "\n".join(items))
     return "\n\n".join(groups) + "\n"
 
 
@@ -273,14 +327,23 @@ def _usable_fragments() -> list[Fragment] | None:
     return fragments
 
 
+def _readable_register() -> list[tuple[str, str]] | None:
+    entries, problem = still_read()
+    if problem:
+        print(problem, file=sys.stderr)
+        return None
+    return entries
+
+
 def preview(version: str) -> int:
     fragments = _usable_fragments()
-    if fragments is None:
+    still = _readable_register()
+    if fragments is None or still is None:
         return 1
     if not fragments:
         print(f"No release-note fragment in {FRAGMENTS.as_posix()}/: {version} has no notes yet.")
         return 0
-    print(f"## {version} (unreleased)\n\n{render(fragments)}", end="")
+    print(f"## {version} (unreleased)\n\n{render(fragments, still)}", end="")
     return 0
 
 
@@ -303,7 +366,8 @@ def assemble(version: str, date: str) -> int:
               file=sys.stderr)
         return 1
     fragments = _usable_fragments()
-    if fragments is None:
+    still = _readable_register()
+    if fragments is None or still is None:
         return 1
     if not fragments:
         print(f"there is no fragment in {FRAGMENTS.as_posix()}/, so {version} would have no "
@@ -311,7 +375,7 @@ def assemble(version: str, date: str) -> int:
               file=sys.stderr)
         return 1
 
-    notes = render(fragments)
+    notes = render(fragments, still)
     section = f"## {version} ({date})\n\n{notes}\n"
     # NEWEST FIRST: above the first version already there, under the file's own introduction
     lines = written.splitlines(keepends=True)
@@ -350,7 +414,8 @@ def page(tag: str) -> int:
     # A CANDIDATE: the fragments as they stand, so whoever tests it reads what changed. One that
     # is malformed is left out and named in the run, never a reason to fail it (see `page` above).
     fragments, problems = read_fragments()
-    for problem in problems:
+    still, unreadable = still_read()
+    for problem in [*problems, *([unreadable] if unreadable else [])]:
         print(f"::warning::{problem}", file=sys.stderr)
     if not fragments:
         print(f"No release-note fragment yet: the notes of {version} are assembled at its final "
@@ -358,7 +423,7 @@ def page(tag: str) -> int:
         return 0
     print(f"**The notes of {version} so far**, from the pull requests this candidate carries. "
           f"The final release's page carries them as they are published.\n")
-    print(render(fragments), end="")
+    print(render(fragments, still), end="")
     return 0
 
 
