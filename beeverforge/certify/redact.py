@@ -75,7 +75,8 @@ _SHORTEST_SECRET = 6
 #: The platform's own words a token rule would otherwise drop: its file names, its paths, its
 #: schema ids, the pack's own file names. None of them names a customer.
 PLATFORM_WORDS = frozenset({
-    ".env.compose", ".env.compose.example", "~/.beeverforge/env", ".beeverforge/**",
+    ".env.compose", ".env.compose.example", "~/.beeverforge/env", "~/.openfactory/env",
+    ".beeverforge/**",
     ".beeverforge/project.yaml", ".openfactory/**", ".openfactory/project.yaml", "project.yaml",
     "docker-compose.yml", "registry.yaml",
     "org_defaults/floor.yaml", "floor.yaml", "box.env", "platform.version", "pack.json",

@@ -59,7 +59,21 @@ def project_log_dir(project: Project) -> Path:
         from beeverforge.registry import ProjectRegistry
 
         return ProjectRegistry().path.parent / "logs" / project.name
-    return Path(raw).expanduser().parent / ".beeverforge-logs" / project.name
+    beside = Path(raw).expanduser().parent
+    current = beside / LOGS_BESIDE / project.name
+    # A 0.7 CHECKOUT'S JOURNALS ARE WHERE 0.7 WROTE THEM (#266): `.openfactory-logs/<name>` when
+    # that is the only one, so the panel tails a job 0.7 started and `ready_to_resume` finds a
+    # paused one. The current name wins once it exists, as for the repository's folder.
+    former = beside / FORMER_LOGS_BESIDE / project.name
+    if former.is_dir() and not current.is_dir():
+        return former
+    return current
+
+
+#: The directory beside a checkout that holds its projects' journals, and OpenFactory 0.7's name
+#: for it, still read for a project whose journals are only there (#266).
+LOGS_BESIDE = ".beeverforge-logs"
+FORMER_LOGS_BESIDE = ".openfactory-logs"
 
 
 def _beside_would_be_the_root(raw: str) -> bool:

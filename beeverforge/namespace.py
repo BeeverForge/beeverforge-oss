@@ -211,15 +211,35 @@ def resolve(root: Path, relative: str, *, project: str = "") -> Path:
     return new
 
 
+def operator_dir() -> Path:
+    """The operator's directory: `~/.beeverforge/` — or `~/.openfactory/`, OpenFactory 0.7's, on a
+    machine that has only that one (#266).
+
+    THE FOLDER'S RULE, APPLIED TO THE HOME (`dir_in`). A 0.7 machine keeps its registry, approver
+    store, resume handles, gate key, board database and `env` file under `~/.openfactory/`; an
+    upgrade in place that looked only under `~/.beeverforge/` started with no project registered
+    and none of that file's settings. So the current name wins when it is there, the former one is
+    read AND written when it is the only one, and a machine with neither gets the current name.
+    Never moved on the platform's initiative: the operator renames it, and `doctor` says when both
+    are there (the former one is then stale, never read)."""
+    home = Path.home()
+    return home / dir_in(home)
+
+
+def stale_former_operator_dir() -> bool:
+    """Whether the home carries BOTH operator directories — `~/.openfactory/` is then not read."""
+    return stale_former_dir(Path.home())
+
+
 def operator_path(filename: str) -> Path:
-    """The operator's file under `~/.beeverforge/` — the registry, the approver store, the resume
-    handles.
+    """The operator's file under `operator_dir()` — the registry, the approver store, the resume
+    handles, the one-machine deployment's `env`.
 
     Called from the composition points that resolve these paths (`ProjectRegistry.__init__`,
     `approvals.store_path`), never at import — the house has paid for import-time side effects
     before. An explicit override (env var, argument) bypasses this entirely: an explicit path is
     never second-guessed."""
-    return Path.home() / DIR / filename
+    return operator_dir() / filename
 
 
 #: Where a process leaves the build it runs from, for the OTHER halves of the deployment to read

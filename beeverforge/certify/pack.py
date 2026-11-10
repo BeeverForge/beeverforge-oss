@@ -317,9 +317,13 @@ def _withheld(st):
 
 def _env_file(here: Path) -> c.EnvFileReading:
     """The deployment's secrets file as seen from here: `.env.compose` beside the compose file, or
-    the one-machine deployment's `~/.beeverforge/env`. Only its NAME travels, never its path."""
+    the one-machine deployment's `~/.beeverforge/env` — `~/.openfactory/env` on an OpenFactory 0.7
+    machine that keeps only that directory (#266). Only its NAME travels, never its path."""
+    from beeverforge import namespace
+
+    host = namespace.operator_path("env")
     for name, path in ((".env.compose", here / ".env.compose"),
-                       ("~/.beeverforge/env", Path("~/.beeverforge/env").expanduser())):
+                       (f"~/{host.parent.name}/env", host)):
         if path.is_file():
             try:
                 mode = path.stat().st_mode & 0o777
