@@ -177,6 +177,12 @@ resolve_the_work_directory() {
     if [ -z "${BEEVERFORGE_WORK_DIR:-}" ] && [ -f "$DIR/.env.compose" ]; then
         kept_work_dir=$(grep '^BEEVERFORGE_WORK_DIR=' "$DIR/.env.compose" 2>/dev/null \
                         | tail -n 1 | cut -d= -f2- | unquoted || true)
+        # AN OPENFACTORY 0.7 FILE NAMES IT `OPENFACTORY_WORK_DIR` (#266): its installer wrote it
+        # there, and the jobs in flight have their files in it.
+        if [ -z "$kept_work_dir" ]; then
+            kept_work_dir=$(grep '^OPENFACTORY_WORK_DIR=' "$DIR/.env.compose" 2>/dev/null \
+                            | tail -n 1 | cut -d= -f2- | unquoted || true)
+        fi
     fi
     if [ -n "${BEEVERFORGE_WORK_DIR:-}" ]; then
         WORK_DIR="$BEEVERFORGE_WORK_DIR"
@@ -598,6 +604,45 @@ run_preflight() {
     say "  (the box image is still downloading — it is checked again before this finishes)"
 }
 
+# HOW TO GO BACK, said wherever an upgrade stops after the carry may have stopped 0.7's stack:
+# its containers were stopped, not removed, and its volumes were only read.
+# Single-quoted on purpose: a command the person runs, printed as written, never expanded here.
+# shellcheck disable=SC2016
+BACK_TO_0_7='docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)'
+CARRIED=0
+NAMED_REMOVAL=0
+
+after_a_carry() {
+    [ "$CARRIED" -eq 1 ] || return 0
+    printf ' If the carry above stopped an OpenFactory 0.7 stack, it is still stopped; to go back to it meanwhile: %s' "$BACK_TO_0_7"
+}
+
+carry_a_0_7_stack() {
+    # AN UPGRADE OVER AN OPENFACTORY 0.7 DEPLOYMENT KEEPS ITS DATA (#266). Compose prefixes every
+    # volume with the project's name, and the rename changed it, so the new stack would start on
+    # empty volumes: no Temporal history, no card in flight, no project. The package decides
+    # whether this is one — the file `init` is about to rewrite holds `OPENFACTORY_*` rows — and
+    # copies the volumes; this script knows nothing about it but the command's name. BEFORE
+    # `run_init`, because `init --force` rewrites those rows under their new names.
+    if [ "$FORCE" -eq 0 ] || [ ! -f "$DIR/.env.compose" ]; then return 0; fi
+    step "Carrying an OpenFactory 0.7 stack's data, if this directory holds one"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "  would run: beeverforge upgrade-from-openfactory --env-file /out/.env.compose"
+        return 0
+    fi
+    # CAPTURED, then printed: the last lines point back to the removal commands only when this
+    # step named them, which it does only after copying 0.7 volumes (not for a directory that was
+    # never 0.7's, nor for a 0.7 file whose stack left no volume). Its refusal goes to stderr, so
+    # it still reaches the person as it happens.
+    said=$(in_the_cli upgrade-from-openfactory --env-file /out/.env.compose) \
+        || { [ -z "${said:-}" ] || say "$said"
+             die "the OpenFactory 0.7 stack's data could not be carried, so BeeverForge was not started and ${DIR}/.env.compose was left as it was. If the lines above say 0.7's containers were stopped, they still are." \
+               "Fix what it reported above and run this installer again with --force. To go back to 0.7 meanwhile: ${BACK_TO_0_7}"; }
+    [ -z "$said" ] || say "$said"
+    CARRIED=1
+    case "$said" in *"docker volume rm "*) NAMED_REMOVAL=1 ;; esac
+}
+
 run_init() {
     step "Writing this deployment's environment"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -650,7 +695,7 @@ run_init() {
     # shellcheck disable=SC2086
     if [ -f "$DIR/.env.compose" ] && [ "$FORCE" -eq 1 ]; then
         in_the_cli_asking_questions init --out /out/.env.compose --force --runtime compose $INIT_ARGS \
-            || die "\`beeverforge init\` did not finish, so ${DIR}/.env.compose was not written." \
+            || die "\`beeverforge init\` did not finish, so ${DIR}/.env.compose was not written.$(after_a_carry)" \
                    "Fix what it reported above and run this installer again with --force."
     else
         # shellcheck disable=SC2086
@@ -744,7 +789,19 @@ finish() {
     say "  the panel        http://localhost:${port}"
     say "  what is left     cd ${DIR} && docker compose --env-file .env.compose exec worker beeverforge preflight"
     say ""
-    say "Next, register your first project:"
+    if [ "$NAMED_REMOVAL" -eq 1 ]; then
+        # SAID AGAIN HERE, after a long scroll of pulls and checks: the carry step printed how to
+        # remove 0.7's containers and volumes, and it is the person's step, once BeeverForge works.
+        say "The carry step above named the commands that remove OpenFactory 0.7's containers and volumes once you no longer need them."
+        say ""
+    fi
+    if [ "$FORCE" -eq 1 ]; then
+        # NOT "YOUR PROJECTS WERE KEPT": a 0.7 file with no 0.7 volume starts empty, and a --force
+        # over anything else carried nothing. What holds in every case is where to look.
+        say "\`beeverforge project list\` shows the projects registered here. To register another:"
+    else
+        say "Next, register your first project:"
+    fi
     say ""
     say "  cd ${DIR} && docker compose --env-file .env.compose exec worker \\"
     say "    beeverforge project init myapp https://github.com/<owner>/myapp.git"
@@ -841,6 +898,7 @@ main() {
     # AFTER THE PULL, because it asks the cli image; before the first `_cli`, which uses its answer.
     resolve_the_socket_group_a_container_sees
     run_preflight
+    carry_a_0_7_stack
     run_init
     wait_for_images
     confirm_the_box_image

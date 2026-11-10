@@ -2174,6 +2174,52 @@ def autonomy_cmd(
         typer.echo(f"    {said['causes'].get(cause, cause):<44} {n}")
 
 
+# #266: the upgrade in place of a 0.7 compose deployment (`onboarding/upgrade_from_openfactory.py`).
+@app.command("upgrade-from-openfactory")
+def upgrade_from_openfactory_cmd(
+    env_file: str = typer.Option(".env.compose", "--env-file",
+                                 help="The deployment's .env.compose, BEFORE `init --force` "
+                                      "rewrites it: only a file holding OPENFACTORY_* rows is an "
+                                      "OpenFactory 0.7 deployment being upgraded"),
+    image: str = typer.Option("", "--image",
+                              help="The image the copies run in; default: this release's cli "
+                                   "image (BEEVERFORGE_VERSION)"),
+) -> None:
+    """Carry an OpenFactory 0.7 compose stack's volumes into BeeverForge's.
+
+    Run by `install.sh --force` over a 0.7 deployment's directory, before `init` rewrites its
+    `.env.compose`. When that file is a 0.7 one, the 0.7 stack's containers are stopped (not
+    removed) and its database, state, repository cache and journals are copied into the volumes
+    BeeverForge's compose uses; 0.7's volumes are left as they were. Any other file: nothing is
+    done. A target BeeverForge already keeps data in is refused, never written over.
+    """
+    import os
+    import subprocess
+
+    from beeverforge.onboarding import upgrade_from_openfactory as up
+
+    def docker(args: list[str]) -> tuple[int, str]:
+        try:
+            done = subprocess.run(["docker", *args], capture_output=True, text=True)
+        except OSError as exc:
+            return 127, str(exc)
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+    version = (os.environ.get("BEEVERFORGE_VERSION") or "").strip()
+    chosen = image or (f"ghcr.io/beeverforge/beeverforge-cli:{version}" if version else "")
+    if not chosen and up.is_a_0_7_file(Path(env_file)):
+        typer.echo("✗ no image to copy with: pass --image, or set BEEVERFORGE_VERSION to the "
+                   "release being installed")
+        raise typer.Exit(2)
+    try:
+        done = up.carry(Path(env_file), docker=docker, image=chosen)
+    except up.Refused as exc:
+        typer.echo(f"✗ {exc}")
+        raise typer.Exit(1) from exc
+    for line in up.report(done):
+        typer.echo(f"  {line}")
+
+
 @app.command("preflight")
 def preflight_cmd(
     as_json: bool = typer.Option(

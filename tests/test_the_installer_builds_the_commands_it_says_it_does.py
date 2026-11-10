@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -1821,3 +1822,153 @@ def test_the_suite_guard_takes_a_skip_mark_in_each_form_it_is_written(tmp_path):
         "test_planted_by_import.py::test_marked_by_an_imported_name": True,
         "test_planted_by_module.py::test_marked_by_the_module": True,
     }
+
+
+# ── #266: an upgrade over an OpenFactory 0.7 deployment ─────────────────────────────────────────
+
+def _docker_runs(tmp_path) -> list[list[str]]:
+    return [line.split() for line in (tmp_path / "argv.log").read_text().splitlines()
+            if line.startswith("run ")]
+
+
+@needs_a_posix_shell
+def test_an_upgrade_carries_a_0_7_stack_before_init_rewrites_its_file(tmp_path):
+    """THE ORDER IS THE POINT: `init --force` rewrites the `OPENFACTORY_*` rows under their new
+    names, and the package reads those rows to know the directory holds a 0.7 deployment."""
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\nOPENFACTORY_VERSION=v0.7.0\n")
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    runs = _docker_runs(tmp_path)
+    carry = next((i for i, a in enumerate(runs) if "upgrade-from-openfactory" in a), None)
+    init = next((i for i, a in enumerate(runs) if "init" in a), None)
+    assert carry is not None, f"the upgrade never asked the package to carry a 0.7 stack: {runs}"
+    assert init is not None and carry < init, f"the carry ran after init rewrote the file: {runs}"
+    argv = runs[carry]
+    assert argv[argv.index("--env-file") + 1] == "/out/.env.compose", argv
+
+
+@needs_a_posix_shell
+def test_a_failed_carry_stops_the_upgrade_before_init_and_says_so(tmp_path):
+    failing = ("docker", "#!/bin/sh\n"
+                         "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                         "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                         "case \" $* \" in *\" upgrade-from-openfactory \"*) exit 1 ;; esac\n"
+                         "exit 0\n")
+    done, env_file = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
+
+    assert done.returncode != 0
+    said = done.stdout + done.stderr
+    assert "could not be carried" in said
+    assert "nothing was started" not in said, "0.7's containers may have been stopped"
+    assert "docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)" \
+        in said, "the way back to 0.7 was not said"
+    assert not [a for a in _docker_runs(tmp_path) if "init" in a], "init ran after a failed carry"
+    assert env_file.read_text() == "OPENFACTORY_BOT_TOKEN=x\n"
+
+
+@needs_a_posix_shell
+def test_an_init_that_fails_after_the_carry_says_the_way_back_to_0_7(tmp_path):
+    """Found by the upgrade rehearsal: the carry stopped 0.7, `init` then stopped too, and nothing
+    said that 0.7 was left stopped or how to start it again."""
+    failing = ("docker", "#!/bin/sh\n"
+                         "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                         "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                         "case \" $* \" in *\" init \"*) exit 1 ;; esac\n"
+                         "exit 0\n")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
+
+    said = done.stdout + done.stderr
+    assert done.returncode != 0
+    assert "did not finish" in said
+    assert "docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)" \
+        in said, "the way back to 0.7 was not said"
+
+
+def _a_carry_that_says(said: str) -> tuple[str, str]:
+    """A `docker` whose `upgrade-from-openfactory` run prints `said`, as the package's report
+    would; every other call is the plain stub's."""
+    return ("docker", "#!/bin/sh\n"
+                      "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                      "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                      "case \" $* \" in *\" upgrade-from-openfactory \"*) "
+                      f"printf '%s\\n' {shlex.quote(said)} ;; esac\n"
+                      "exit 0\n")
+
+
+_POINTER = "The carry step above named the commands that remove OpenFactory 0.7's"
+
+
+@needs_a_posix_shell
+def test_an_upgrade_does_not_say_register_your_first_project(tmp_path):
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n")
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert "your first project" not in done.stdout
+    assert "`beeverforge project list` shows the projects registered here" in done.stdout
+    assert "were kept" not in done.stdout, "a --force that carried nothing cannot say that"
+
+
+@needs_a_posix_shell
+def test_the_last_lines_point_back_when_the_carry_named_the_removal_commands(tmp_path):
+    said = ("copied openfactory_temporal_db into beeverforge_temporal_db\n"
+            "the OpenFactory 0.7 volumes are untouched: once BeeverForge runs as it should, "
+            "remove 0.7's containers with `docker rm ...` and its volumes with "
+            "`docker volume rm openfactory_temporal_db`")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n",
+                                 stubs=(_a_carry_that_says(said),))
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert "docker volume rm openfactory_temporal_db" in done.stdout, "the carry's report was lost"
+    assert _POINTER in done.stdout
+    assert done.stdout.index("docker volume rm") < done.stdout.index(_POINTER)
+
+
+@pytest.mark.parametrize("said", [
+    "",  # a directory that was never 0.7's: the command says nothing
+    "no OpenFactory 0.7 volume was found on this daemon (compose project `openfactory`), so the "
+    "new stack starts empty",
+], ids=["never-0.7", "no-0.7-volume"])
+@needs_a_posix_shell
+def test_the_last_lines_do_not_point_at_commands_the_carry_never_named(tmp_path, said):
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n",
+                                 stubs=(_a_carry_that_says(said),))
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert said in done.stdout
+    assert _POINTER not in done.stdout
+    assert "the carry step above" not in done.stdout.lower()
+
+
+@needs_a_posix_shell
+def test_a_failed_carry_never_reaches_the_pointer_to_its_removal_commands(tmp_path):
+    """The pointer is said only after a carry that finished: it points at lines a failed carry
+    never printed."""
+    failing = ("docker", "#!/bin/sh\n"
+                         "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                         "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                         "case \" $* \" in *\" upgrade-from-openfactory \"*) exit 1 ;; esac\n"
+                         "exit 0\n")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
+
+    assert _POINTER not in done.stdout + done.stderr
+
+
+@needs_a_posix_shell
+def test_a_fresh_install_never_asks_to_carry_anything(install_run):
+    """No `.env.compose` and no `--force`: nothing to upgrade, so the package is not even asked —
+    a 0.7 stack somebody keeps running beside a fresh install is never looked at."""
+    assert install_run["runs"], "the fresh install recorded no run at all"
+    assert not [a for a in install_run["runs"] if "upgrade-from-openfactory" in a]
+
+
+@needs_a_posix_shell
+def test_a_0_7_files_work_directory_is_the_one_kept(tmp_path):
+    """0.7's installer wrote `OPENFACTORY_WORK_DIR` into the file; the jobs in flight have their
+    files there, so the upgrade mounts that directory, not a new default."""
+    kept = tmp_path / "w07"
+    done, _ = _a_forced_run_over(tmp_path, f"OPENFACTORY_WORK_DIR={kept}\n",
+                                 declared_work_dir=False)
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    init = next(a for a in _docker_runs(tmp_path) if "init" in a)
+    assert f"BEEVERFORGE_WORK_DIR={kept}" in init, init
