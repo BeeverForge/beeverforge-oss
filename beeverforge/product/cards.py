@@ -62,6 +62,31 @@ log = logging.getLogger(__name__)
 #: problem and the draft is asked again.
 TITLE_LIMIT = 80
 
+def shortened_title(title: str, limit: int = TITLE_LIMIT) -> str:
+    """`title` within `limit` characters, in whole words: the trailing clause (after the last comma,
+    semicolon or spaced dash) goes first while what is left keeps at least half the limit, else
+    words from the end. Never a word cut in half, never an ellipsis the floor would count (#476).
+
+    NOT THE `[:80]` THIS MODULE REMOVED. That one cut, mid-word, a title the person had confirmed.
+    This is used once, by `vet_issue`, for a card of a breakdown — no person is in that loop — and
+    only after the redrafts left the title the one thing still wrong."""
+    title = " ".join((title or "").split())
+    if len(title) <= limit:
+        return title
+    for cut in sorted({m.start() for m in re.finditer(r"\s*(?:[,;]|\s[—–-]\s)", title)},
+                      reverse=True):
+        head = title[:cut].rstrip(" ,;—–-")
+        if limit // 2 <= len(head) <= limit:
+            return head
+    out = ""
+    for word in title.split(" "):
+        longer = f"{out} {word}".strip()
+        if len(longer) > limit:
+            break
+        out = longer
+    return out.rstrip(" ,;—–-") or title[:limit].rstrip()
+
+
 #: One draft, and one redraft with what the floor or the judge found — ADR-0006's bound. A third try
 #: at the same conversation is a loop; what is missing then is information only the person has.
 ATTEMPTS = 2
@@ -1140,6 +1165,20 @@ def vet_issue(fields: dict, *, body_of: Callable[[dict], str], source: str, rubr
         fields = {**fields, **{k: again[k] for k in
                                ("title", "objective", "acceptance_criteria", "out_of_scope")
                                if k in again}}
+    # A TITLE THE REDRAFTS LEFT TOO LONG IS SHORTENED, NOT A LOST CARD (#476). When the length of
+    # the title is the ONLY thing the floor still finds, refusing threw away a card whose work was
+    # right — and when it was a requirement's only front, the whole breakdown ended with no card.
+    # The title is shortened in whole words (`shortened_title`) and the card goes through the floor
+    # and the judge once more, with no redraft: anything else they find still refuses it.
+    if problems and {getattr(p, "kind", "") for p in problems} == {"title_too_long"}:
+        long = str(fields.get("title") or "").strip()
+        short = shortened_title(long)
+        if short and len(short) <= TITLE_LIMIT:
+            log.info("BEEVERFORGE_CARD_TITLE_SHORTENED project=%s %d→%d characters: %r",
+                     project_name, len(long), len(short), short)
+            return vet_issue({**fields, "title": short}, body_of=body_of, source=source,
+                             rubric=rubric, judge=judge, redraft=None,
+                             project_name=project_name, language=language)
     return None, "; ".join(review_said(feedback, said, language))
 
 
