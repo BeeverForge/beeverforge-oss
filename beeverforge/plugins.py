@@ -38,6 +38,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from beeverforge.deprecations import removed_in
+
 log = logging.getLogger("beeverforge.plugins")
 
 #: The entry-point group an add-on declares. One group for every axis, with the axis in the NAME
@@ -50,6 +52,17 @@ log = logging.getLogger("beeverforge.plugins")
 #: it constructs. Same group, same `builder()`/`known()`/`shadowed()`, same built-ins-win rule; the
 #: harness registry (`adapters/agent/registry.py`) is the one that validates what came back.
 GROUP = "beeverforge.adapters"
+
+#: OPENFACTORY 0.7'S GROUP, STILL READ UNTIL 1.1 (#264, #266). A 0.7 add-on declares its rows under
+#: `openfactory.adapters`; the rename stopped scanning it, so an upgrade in place loaded none of
+#: them and every project naming one of their kinds was refused as unknown. It is read AFTER
+#: `GROUP`, and a row both groups declare is the `GROUP` one: a package that already moved keeps
+#: what it moved to. Each distribution still on it is named once per process, in one warning, with
+#: the group to move to and the release that stops reading it (`deprecations.py`).
+FORMER_GROUP = "openfactory.adapters"
+
+#: The release that stops reading `FORMER_GROUP` — the register's, not restated here.
+FORMER_GROUP_READ_UNTIL = removed_in("openfactory-adapters")
 
 #: EVERY axis an entry point may name — the published list, and the one the extensibility guard
 #: derives from the registries and compares with (`tests/test_a_stranger_can_add_an_adapter.py`):
@@ -133,14 +146,13 @@ def _load() -> dict[str, dict[str, Callable[..., Any]]]:
         return _cache
     found: dict[str, dict[str, Callable[..., Any]]] = {}
     try:
-        from importlib.metadata import entry_points
-
-        points = entry_points(group=GROUP)
+        points = _points()
     except Exception:  # noqa: BLE001 — a broken metadata store must not take the CLI down
         log.warning("could not read the %s entry points", GROUP, exc_info=True)
         _cache = {}
         return _cache
-    for point in points:
+    _warn_former(points)
+    for point, _group in points:
         axis, kind = _axis_and_kind(point.name)
         if not axis or not kind:
             log.warning("ignoring add-on entry point %r — the name must be `<axis>.<kind>`, e.g. "
@@ -160,6 +172,56 @@ def _load() -> dict[str, dict[str, Callable[..., Any]]]:
     return _cache
 
 
+def _points() -> list[tuple[Any, str]]:
+    """Every add-on entry point, `GROUP`'s then `FORMER_GROUP`'s, each with the group it was
+    declared in. A name `GROUP` already declares is dropped from `FORMER_GROUP`, so ONE row answers
+    each name and it is the new group's (a package that ships both during its own move). Raises
+    what the metadata store raises; the callers decide what a broken store means for them."""
+    from importlib.metadata import entry_points
+
+    current = list(entry_points(group=GROUP))
+    taken = {p.name for p in current}
+    former = [p for p in entry_points(group=FORMER_GROUP) if p.name not in taken]
+    return [(p, GROUP) for p in current] + [(p, FORMER_GROUP) for p in former]
+
+
+def _distribution(point: Any) -> str:
+    dist = getattr(point, "dist", None)
+    return str(getattr(dist, "name", "") or "")
+
+
+#: The distributions this process has already named as still on `FORMER_GROUP`. Bounded by what is
+#: installed, never by traffic.
+_REPORTED_FORMER: set[str] = set()
+
+
+def _warn_former(points: list[tuple[Any, str]]) -> None:
+    """One warning naming each distribution still declaring rows under `FORMER_GROUP`, once per
+    process: `_load` runs again after `reset_cache`, and the operator needs the sentence once."""
+    names = sorted({_distribution(p) or p.name for p, g in points if g == FORMER_GROUP}
+                   - _REPORTED_FORMER)
+    if not names:
+        return
+    _REPORTED_FORMER.update(names)
+    log.warning("add-on %s declare%s rows under `%s`, OpenFactory 0.7's entry-point group; they "
+                "load, and stop loading in BeeverForge %s — declare them under `%s`",
+                ", ".join(names), "s" if len(names) == 1 else "", FORMER_GROUP,
+                FORMER_GROUP_READ_UNTIL, GROUP)
+
+
+def on_the_former_group() -> list[dict[str, str]]:
+    """Every row still declared under `FORMER_GROUP` and loaded from there — its distribution and
+    its name — READ FROM THE METADATA, never loaded, for the doctor's list of old names. Empty when
+    none is, and when the metadata store cannot be read (`installed()` says that one)."""
+    try:
+        points = _points()
+    except Exception:  # noqa: BLE001 — a broken store is reported where the rows are listed
+        return []
+    return sorted(({"distribution": _distribution(p), "name": p.name}
+                   for p, g in points if g == FORMER_GROUP),
+                  key=lambda r: (r["distribution"], r["name"]))
+
+
 def _axis_and_kind(name: str) -> tuple[str, str]:
     """`forge.gitlab` → `("forge", "gitlab")`; either is `""` for a name that is not
     `<axis>.<kind>`. ONE READING OF A NAME, for the rows that are loaded and the rows listed."""
@@ -175,14 +237,12 @@ def installed() -> list[dict[str, str]]:
     the answer as fragile as the code. A name that is not `<axis>.<kind>` is no row (`_load`
     ignores it too), and a metadata store that cannot be read lists nothing and says why."""
     try:
-        from importlib.metadata import entry_points
-
-        points = entry_points(group=GROUP)
+        points = _points()
     except Exception:  # noqa: BLE001 — a broken metadata store must not take the answer down
         log.warning("could not read the %s entry points", GROUP, exc_info=True)
         return []
     rows = []
-    for point in points:
+    for point, _group in points:
         axis, kind = _axis_and_kind(point.name)
         if not axis or not kind:
             continue
