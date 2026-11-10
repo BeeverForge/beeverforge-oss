@@ -67,6 +67,9 @@ log = logging.getLogger("beeverforge.sandbox.container")
 _AUTH_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 _GATE_SECRET = "BEEVERFORGE_GATE_SECRET"
 _WORKDIR = "/workspace"
+#: The mode of a workspace made under `BEEVERFORGE_WORK_DIR`: the owner and the work dir's group or
+#: ACL principals in (an ACL's mask is the group bits), "other" kept out (#519).
+_SHARED_WORKSPACE_MODE = 0o770
 
 #: Where the framework's harness toolbox is mounted inside the box (ADR-0037 D2).
 #:
@@ -587,6 +590,15 @@ class ContainerSandbox(SandboxAdapter):
         if work_dir:
             Path(work_dir).mkdir(parents=True, exist_ok=True)
         host_clone = Path(tempfile.mkdtemp(prefix=f"beeverforge-{safe}-", dir=work_dir or None))
+        if work_dir:
+            # THE BOX MAY NOT BE THE CORE'S UID (#519). `mkdtemp` makes 0700, and a shared work dir
+            # is how a deployment lets a daemon that runs as ANOTHER uid in — a rootless daemon,
+            # measured: `docker run` exited 126, `chdir to cwd ("/workspace") ... permission
+            # denied`. Its default ACL is inherited, but a new directory's ACL mask is its mode's
+            # group bits, `---` for 0700, so the entry reads `#effective:---`; a setgid group work
+            # dir is shut out the same way. 0770 opens the mask and the group, never "other".
+            # `chmod`, not a mode handed to a mkdir, because the umask does not touch it.
+            os.chmod(host_clone, _SHARED_WORKSPACE_MODE)
         base_commit = _materialize_workspace(repo_path=repo_path, host_clone=host_clone,
                                              base_branch=base_branch, branch=branch,
                                              checkout_existing=checkout_existing,
