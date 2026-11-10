@@ -2174,6 +2174,7 @@ def autonomy_cmd(
         typer.echo(f"    {said['causes'].get(cause, cause):<44} {n}")
 
 
+# #266: the upgrade in place of a 0.7 compose deployment (`onboarding/upgrade_from_openfactory.py`).
 @app.command("upgrade-from-openfactory")
 def upgrade_from_openfactory_cmd(
     env_file: str = typer.Option(".env.compose", "--env-file",
@@ -2184,7 +2185,7 @@ def upgrade_from_openfactory_cmd(
                               help="The image the copies run in; default: this release's cli "
                                    "image (BEEVERFORGE_VERSION)"),
 ) -> None:
-    """Carry an OpenFactory 0.7 compose stack's volumes into BeeverForge's (#266).
+    """Carry an OpenFactory 0.7 compose stack's volumes into BeeverForge's.
 
     Run by `install.sh --force` over a 0.7 deployment's directory, before `init` rewrites its
     `.env.compose`. When that file is a 0.7 one, the 0.7 stack's containers are stopped (not
