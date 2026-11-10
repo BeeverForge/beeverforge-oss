@@ -53,7 +53,11 @@ from beeverforge.contracts import (
     parse_decision,
 )
 from beeverforge.contracts.bot import BotIdentity
-from beeverforge.contracts.item_space import closing_keyword, forge_owns_the_card
+from beeverforge.contracts.item_space import (
+    closing_keyword,
+    forge_owns_the_card,
+    links_work_items,
+)
 from beeverforge.contracts.refs import canonical_ref
 from beeverforge.contracts.review import not_a_verdict, unread_words
 from beeverforge.contracts.run import (
@@ -419,6 +423,10 @@ class CardReference:
     closing: str = ""
     #: the verdict everything above follows from — kept, because the card's own TEXT follows it too
     owned: bool = False
+    #: the card's number as the forge's own item, or "" — set only on a card the forge owns (#515).
+    #: What the pull request is attached to, where the forge row declares it can
+    #: (`contracts/item_space.py::links_work_items`)
+    work_item: str = ""
 
     def text(self, words: str) -> str:
         """The card's own text — its title, its objective — as this forge may be handed it.
@@ -460,8 +468,9 @@ def card_reference(ticket: Ticket, *, owned: bool, url: str = "", board: str = "
                    keyword: str = "") -> CardReference:
     """The card, named for a forge that owns it (`owned`) or for one that does not.
 
-    OWNED: the forge's own mention, `#<number>`, which is what links the change to the card
-    natively. `#1234` for a card whose id carries no `#` (an Azure work item's is a bare `1234`,
+    OWNED: the forge's own mention, `#<number>`, which is what links the COMMIT to the card
+    natively (a pull request is attached to it by `work_item`, #515, where the forge row can).
+    `#1234` for a card whose id carries no `#` (an Azure work item's is a bare `1234`,
     and the bare form linked nothing — measured on the ids the tracker row produces), and
     byte-for-byte today's `#12: title` for a GitHub issue in the same repository.
 
@@ -487,7 +496,7 @@ def card_reference(ticket: Ticket, *, owned: bool, url: str = "", board: str = "
     if owned:
         mention = f"#{bare}"
         return CardReference(title=f"{mention}: {ticket.title}", trailer="",
-                             lead=f"Automated by BeeverForge for {mention}.",
+                             lead=f"Automated by BeeverForge for {mention}.", work_item=bare,
                              closing=f"{keyword} {mention}" if keyword else "", owned=True)
     # A `#` left anywhere in the id (a qualified `owner/name#12`) is still a mention to a forge.
     words = " ".join(part for part in bare.split("#") if part).strip() or bare
@@ -528,7 +537,7 @@ def card_reference_for(runner: object, ticket: Ticket) -> CardReference:
     # chain had not happened yet was announced "ready, did it work?" by the next look at the board.
     # The tracker row closes a delivered card at Done on every pairing (#180), so the word only ever
     # bought the close one step early — exactly the step a declared stage is. The mention stays,
-    # and links the change to the card natively.
+    # and links the commit to the card natively.
     manifest = getattr(runner, "manifest", None)
     staged = isinstance(manifest, Manifest) and not after_merge.nothing_follows(
         deploy=getattr(manifest, "post_merge_deploy", None),
@@ -2655,9 +2664,14 @@ class JobRunner:
                 self.manifest, result, profile=getattr(self, "_profile", None))
             result.preview_shape = self._preview_shape(ws)
             self._unless_stopped("open_pr")
+            # THE PULL REQUEST IS ATTACHED TO ITS CARD (#515) only where the forge owns the card
+            # AND declares it can; every other row is handed the call it always was, because an
+            # `open_pr` from outside this tree takes no `work_items`.
+            linked = [card.work_item] if card.work_item and links_work_items(self.forge) else []
             pr = self.forge.open_pr(
                 head=branch, base=base, title=card.title,
                 body=self._pr_body(ticket, result, card=card),
+                **({"work_items": linked} if linked else {}),
             )
             result.pr_url = pr
             self._landed(ticket, "opened", pr=pr, base=base)

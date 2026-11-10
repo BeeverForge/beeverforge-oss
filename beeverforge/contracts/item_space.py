@@ -36,8 +36,19 @@ OWNING A CARD IS NOT PERMISSION TO CLOSE IT. A second, separate declaration: `cl
 optional string on the FORGE row, is the word that forge closes an item with at the merge. Only a
 forge that declares one gets a closing line, and only on a card it owns. The two questions are
 apart on purpose, because one forge's answers differ: Azure Repos owns an Azure Boards card in its
-organisation and links `#1234` natively, but its row already refuses to be a second writer of the
-card's state (`transitionWorkItems: False`), so it declares no keyword and the card is only named.
+organisation and names it `#1234`, but its row already refuses to be a second writer of the card's
+state (`transitionWorkItems: False`), so it declares no keyword and the card is only named.
+
+NAMING A CARD IS NOT LINKING IT (#515). The mention attaches the COMMIT to the work item (`Fixed in
+Commit`) and nothing else: Azure DevOps associates a PULL REQUEST with a work item only where the
+pull request is created with the item as a reference, and the title and body are plain text to it,
+so every pull request the factory opened waited for a person to add the link by hand. A third
+declaration, `links_work_items`, an optional boolean on the FORGE row, says the row can attach the
+pull request to the card and takes `work_items=` on `open_pr`. The job hands it the card's number
+only when the forge declares it AND owns the card, so a local board's `#12` is never attached to
+somebody else's work item, and a row that declares nothing is never handed the argument — an
+out-of-tree `open_pr` that takes none keeps working. Linking attaches and moves nothing: it is not
+closing, and the card's state stays its tracker row's.
 """
 
 from __future__ import annotations
@@ -77,6 +88,14 @@ def closing_keyword(forge: object) -> str:
     if isinstance(word, str) and word.strip().isalpha():
         return word.strip()
     return ""
+
+
+def links_work_items(forge: object) -> bool:
+    """True only when `forge` DECLARES `links_work_items = True`: it can attach a pull request to
+    the card's work item and its `open_pr` takes `work_items=` (#515). Exactly `True`: a mock, a
+    truthy string or a missing attribute is no declaration, and False is the side that never hands
+    an argument to a row that may not take it."""
+    return getattr(forge, "links_work_items", False) is True
 
 
 def forge_owns_the_card(tracker: object, forge: object, ticket: object) -> bool:

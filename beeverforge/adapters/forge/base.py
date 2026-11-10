@@ -268,7 +268,14 @@ class ForgeAdapter(Protocol):
         given "" would have to decide whether a review request exists, and the one thing this
         must never do is let a failure read as "PR opened". The product path catches the raise and
         says exactly what is true — the text is committed and pushed, the review request is not
-        open — which is the answer a person can act on."""
+        open — which is the answer a person can act on.
+
+        A ROW THAT DECLARES `links_work_items = True` ALSO TAKES `work_items: Sequence[str]` (#515):
+        the card's number as that forge's own item, which it attaches the pull request to. The
+        signature above is NOT widened — a declaration is asked with `getattr`, as `closing_keyword`
+        is (`contracts/item_space.py::links_work_items`) — because the job hands the argument only
+        to a row that declares it, on a card the forge owns. A row that declares nothing is called
+        exactly as before."""
         ...
 
     def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:

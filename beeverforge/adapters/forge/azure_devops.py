@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import re
 import urllib.parse
+from collections.abc import Sequence
 
 from beeverforge.adapters.azure_devops import AzureDevOpsClient, AzureDevOpsError
 from beeverforge.adapters.forge.base import (
@@ -234,6 +235,19 @@ def _branch_ref(name: str) -> str:
     return n if n.startswith("refs/") else f"refs/heads/{n}"
 
 
+def _work_item_refs(work_items: Sequence[str]) -> list[dict[str, str]]:
+    """`workItemRefs` for a create: the work items that are NUMBERS, once each, in the order they
+    were handed (#515). A work item id is a plain integer on this vendor; a Jira key, a blank or a
+    qualified `owner/repo#12` is not one of its items, and sending it would attach the pull
+    request to nothing or to the wrong card."""
+    found: list[str] = []
+    for item in work_items or ():
+        number = str(item or "").strip()
+        if number.isascii() and number.isdigit() and number not in found:
+            found.append(number)
+    return [{"id": number} for number in found]
+
+
 def _ci_status_from_evaluations(evaluations: list[dict]) -> str:
     """Aggregate branch-policy evaluations into the port's four-valued CI state.
 
@@ -294,6 +308,14 @@ class AzureReposForge(ForgeAdapter):
     #: through another door, and one this row cannot see or measure. Before #167 the body said
     #: `Closes 1234`, which carried no `#` and closed nothing; declaring nothing keeps that so.
     closing_keyword = ""
+
+    #: THE PULL REQUEST IS ATTACHED TO ITS CARD (#515). The `#1234` in the title and body is text to
+    #: Azure DevOps; the association is made only where the pull request is created with the work
+    #: item as a reference (`workItemRefs`). `open_pr` takes `work_items=` for that and the job
+    #: hands it the card only where this forge owns it. Attaching moves nothing — the tracker row
+    #: stays the one writer of the card's state, as `closing_keyword` above and
+    #: `transitionWorkItems: False` in `merge_pr` insist.
+    links_work_items = True
 
     #: `pr_checks`' ROWS SAY WHAT EACH CHECK IS (#184, `contracts/checks.py`): whether the policy
     #: blocks (`isBlocking`) and whether it is a build or a rule a person settles (its type). The
@@ -746,10 +768,23 @@ class AzureReposForge(ForgeAdapter):
 
     # ---- pull requests ------------------------------------------------------------------------
 
-    def open_pr(self, *, head: str, base: str, title: str, body: str, repo: str = "") -> str:
+    def open_pr(self, *, head: str, base: str, title: str, body: str, repo: str = "",
+                work_items: Sequence[str] = ()) -> str:
         """Open a PR in `repo` ("" = this adapter's own) and return its URL. Idempotent (D-16): an
         ACTIVE PR already open from this branch is returned instead of a second one — a retried
         activity must not double-file.
+
+        `work_items` ATTACHES THE PULL REQUEST TO ITS CARD (#515), as `workItemRefs` on the create.
+        Work item ids are unique across the organisation, so a number is enough and the item may
+        live in another project than the repository. Only a NUMBER is sent: a Jira key or a blank
+        is not a work item of this vendor.
+
+        LINKING IS A COURTESY, NEVER A REASON THE PULL REQUEST DOES NOT OPEN. The work is already
+        pushed. If the vendor refuses the create while it carries the references (a permission on
+        the work item, say), the create is repeated without them and the row logs
+        `BEEVERFORGE_PR_LINK_REFUSED`; a create refused for any other reason refuses again and
+        raises as before. A pull request that was already open is returned as it is: the references
+        belong to the create, and this row has no route that adds them afterwards.
 
         `repo` IS LOAD-BEARING HERE IN A WAY IT IS NOT ON `pr_status`, and the difference is that
         this is a CREATE: there is no id yet to resolve the repository from, so the route has to be
@@ -784,10 +819,23 @@ class AzureReposForge(ForgeAdapter):
             # THE VENDOR'S CEILING, ON THE PATH THAT RUNS FIRST. See `_fit_description`.
             "description": self._fit_description(body),
         }
+        refs = _work_item_refs(work_items)
+        if refs:
+            payload["workItemRefs"] = refs
+        route = f"git/repositories/{urllib.parse.quote(target)}/pullrequests"
         try:
-            created = client.call(
-                "POST", f"git/repositories/{urllib.parse.quote(target)}/pullrequests",
-                body=payload)
+            try:
+                created = client.call("POST", route, body=payload)
+            except AzureDevOpsError as refused:
+                if not refs:
+                    raise
+                log.warning("BEEVERFORGE_PR_LINK_REFUSED head=%s work_items=%s — the create was "
+                            "refused while it carried the work item references; opening the pull "
+                            "request without them (%s)", head, ",".join(r["id"] for r in refs),
+                            _redact(str(refused))[:160])
+                created = client.call(
+                    "POST", route,
+                    body={k: v for k, v in payload.items() if k != "workItemRefs"})
         except AzureDevOpsError as exc:
             # Lost a race with a concurrent create? Azure DevOps refuses the second PR for a
             # branch pair, so the winner is findable — and returning it is the whole point of
