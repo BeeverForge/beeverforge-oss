@@ -48,6 +48,15 @@ _COMPOSE_ENV = ".env.compose"
 _HOST_ENV = "~/.beeverforge/env"
 
 
+def _host_env() -> Path:
+    """`_HOST_ENV` where this machine keeps it: `~/.openfactory/env` on an OpenFactory 0.7 machine
+    with only that directory (`namespace.operator_dir`, #266), so its settings are read and `init`
+    writes them where they are read."""
+    from beeverforge import namespace
+
+    return namespace.operator_path("env")
+
+
 def _load_environment() -> None:
     """Pick up `.env` (bot credentials) — WHEN THE CLI RUNS, never when it is imported.
 
@@ -73,7 +82,8 @@ def _load_environment() -> None:
     to be heard.
     """
     load_dotenv()
-    load_dotenv(Path(_HOST_ENV).expanduser())
+    # UNDER `~/.openfactory/` on a 0.7 machine that has only that directory (#266).
+    load_dotenv(_host_env())
     # AN OPENFACTORY 0.7 ENVIRONMENT IS READ UNDER ITS NEW NAMES (#264), both files included, so
     # after the loads: every command — `serve`, `worker` and `up` among them — reads one spelling.
     former_names.warn(former_names.carry_over())
@@ -773,7 +783,7 @@ def init_deployment(
         # THE DEFAULT DESTINATION FOLLOWS THE ANSWER. `.env.compose` is the compose stack's file,
         # read by `docker compose --env-file`; a host deployment has no compose to read it, and a
         # file named for a stack that is not there is the shape this generator exists to refuse.
-        dest = Path(_HOST_ENV).expanduser()
+        dest = _host_env()
     # NOW the destination is known, and it is the one this run will write.
     _refuse_to_overwrite(dest)
     answers.forge = ask(forge, "forge")
@@ -3333,7 +3343,7 @@ def up(
     binary, missing = host.durable_half(engine)
     if missing:
         typer.echo(f"! {missing}")
-    state = Path(_HOST_ENV).expanduser().parent
+    state = _host_env().parent
     state.mkdir(parents=True, exist_ok=True)
 
     # WHERE EVERYTHING GOES IS RESOLVED ONCE, and handed to everything that is started (#183): the
