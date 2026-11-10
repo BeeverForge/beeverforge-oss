@@ -118,6 +118,11 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 ```
 
+**An add-on written for OpenFactory 0.7** declares its rows under `openfactory.adapters`. That
+group is still read, after `beeverforge.adapters`, until BeeverForge 1.1, and a warning names the
+package while it stays there. Move the table's name to `beeverforge.adapters`; nothing else in the
+package has to change, because `openfactory.<module>` imports also keep working until 1.1.
+
 **Do not put `beeverforge` in `dependencies`.** The release workflow publishes the core's wheel to
 PyPI only once a maintainer has enabled the trusted publisher (`release.yml`'s `pypi` job,
 `docs/RELEASING.md`), so a deployment cannot count on resolving the name from an index. The core

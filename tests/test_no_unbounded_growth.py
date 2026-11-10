@@ -191,6 +191,10 @@ _CACHES = {
     ("beeverforge/former_names.py", "_REPORTED"):
         "one per distinct `OPENFACTORY_*` name a load has found — bounded by the environment, "
         "never by traffic",
+    # #266 — the add-on distributions still on OpenFactory 0.7's entry-point group, named once.
+    ("beeverforge/plugins.py", "_REPORTED_FORMER"):
+        "one per installed distribution declaring rows under `openfactory.adapters` — bounded by "
+        "what is installed, never by traffic",
     # #373 — one refresh machinery per machine identity the registry declares.
     ("beeverforge/adapters/azure_devops.py", "_WORKLOAD"):
         "one per identity client id a registry axis declares (the machine's own under '') — "

@@ -37,6 +37,9 @@ REMOVALS: tuple[Removal, ...] = (
     Removal("openfactory-environment", "1.1",
             "OpenFactory 0.7's `OPENFACTORY_*` environment names, read as `BEEVERFORGE_*` "
             "(`beeverforge/former_names.py`)"),
+    Removal("openfactory-adapters", "1.1",
+            "OpenFactory 0.7's `openfactory.adapters` entry-point group, scanned after "
+            "`beeverforge.adapters` (`FORMER_GROUP` in `beeverforge/plugins.py`)"),
     Removal("openfactory-temporal-names", "1.0",
             "OpenFactory 0.7's Temporal task queue, polled by a second worker, and its "
             "`openfactory-` workflow ids, read beside BeeverForge's "
