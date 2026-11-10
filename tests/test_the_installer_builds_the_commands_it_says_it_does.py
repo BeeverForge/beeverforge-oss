@@ -1856,9 +1856,40 @@ def test_a_failed_carry_stops_the_upgrade_before_init_and_says_so(tmp_path):
     done, env_file = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
 
     assert done.returncode != 0
-    assert "could not be carried" in done.stdout + done.stderr
+    said = done.stdout + done.stderr
+    assert "could not be carried" in said
+    assert "nothing was started" not in said, "0.7's containers may have been stopped"
+    assert "docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)" \
+        in said, "the way back to 0.7 was not said"
     assert not [a for a in _docker_runs(tmp_path) if "init" in a], "init ran after a failed carry"
     assert env_file.read_text() == "OPENFACTORY_BOT_TOKEN=x\n"
+
+
+@needs_a_posix_shell
+def test_an_init_that_fails_after_the_carry_says_the_way_back_to_0_7(tmp_path):
+    """Found by the upgrade rehearsal: the carry stopped 0.7, `init` then stopped too, and nothing
+    said that 0.7 was left stopped or how to start it again."""
+    failing = ("docker", "#!/bin/sh\n"
+                         "printf '%s\\n' \"$*\" >> \"$ARGV_LOG\"\n"
+                         "if [ \"$1\" = context ]; then echo \"unix://${FAKE_SOCKET}\"; fi\n"
+                         "case \" $* \" in *\" init \"*) exit 1 ;; esac\n"
+                         "exit 0\n")
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n", stubs=(failing,))
+
+    said = done.stdout + done.stderr
+    assert done.returncode != 0
+    assert "did not finish" in said
+    assert "docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)" \
+        in said, "the way back to 0.7 was not said"
+
+
+@needs_a_posix_shell
+def test_an_upgrade_does_not_say_register_your_first_project(tmp_path):
+    done, _ = _a_forced_run_over(tmp_path, "OPENFACTORY_BOT_TOKEN=x\n")
+    assert done.returncode == 0, f"the upgrade did not finish:\n{done.stdout}{done.stderr}"
+
+    assert "your first project" not in done.stdout
+    assert "were kept" in done.stdout
 
 
 @needs_a_posix_shell

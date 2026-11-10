@@ -32,6 +32,9 @@ class Daemon:
         self.containers: dict[str, tuple[str, bool]] = {}
         self.calls: list[list[str]] = []
         self.fail_copy_of: str | None = None
+        #: Answers for the checks that cannot see, as the real client prints them.
+        self.fail_inspect: str | None = None
+        self.fail_stamp_check = False
 
     def volume(self, name, *, project="", key="", files=None, **labels):
         lab = dict(labels)
@@ -52,6 +55,8 @@ class Daemon:
             return 0, "\n".join(rows) + ("\n" if rows else "")
         if a[:2] == ["volume", "inspect"]:
             name = a[-1]
+            if self.fail_inspect:
+                return 1, self.fail_inspect
             if name not in self.volumes:
                 return 1, f"Error response from daemon: get {name}: no such volume"
             label = re.search(r'index \.Labels "([^"]+)"', a[3]).group(1)
@@ -73,6 +78,8 @@ class Daemon:
             mounts = {a[i + 1].split(":")[1]: a[i + 1].split(":")[0]
                       for i, x in enumerate(a) if x == "-v"}
             if "test" in a:
+                if self.fail_stamp_check:
+                    return 125, "docker: Error response from daemon: mount refused."
                 return (0, "") if up.STAMP in self.volumes[mounts["/to"]]["files"] else (1, "")
             source, target = mounts["/from"], mounts["/to"]
             assert any(c for c, (p, on) in self.containers.items() if on and p == "openfactory") \
@@ -235,17 +242,19 @@ def test_a_second_run_leaves_what_was_carried(env_0_7):
 def test_a_copy_that_did_not_finish_is_refused_and_made_again_on_the_next_run(env_0_7):
     d = Daemon()
     _a_0_7_stack(d)
-    d.fail_copy_of = "openfactory_openfactory_state"
+    # THE LAST ONE COPIED, so every other target is stamped and this one alone says the carry
+    # did not finish.
+    d.fail_copy_of = "openfactory_temporal_db"
 
-    with pytest.raises(up.Refused, match="copy openfactory_openfactory_state into"):
+    with pytest.raises(up.Refused, match="copy openfactory_temporal_db into"):
         up.carry(env_0_7, docker=d, image=IMAGE)
-    assert up.STAMP not in d.volumes["beeverforge_beeverforge_state"]["files"]
+    assert up.STAMP not in d.volumes["beeverforge_temporal_db"]["files"]
 
     d.fail_copy_of = None
     done = up.carry(env_0_7, docker=d, image=IMAGE)
 
-    assert ("openfactory_openfactory_state", "beeverforge_beeverforge_state") in done.copied
-    assert up.STAMP in d.volumes["beeverforge_beeverforge_state"]["files"]
+    assert ("openfactory_temporal_db", "beeverforge_temporal_db") in done.copied
+    assert up.STAMP in d.volumes["beeverforge_temporal_db"]["files"]
 
 
 def test_a_0_7_file_with_no_0_7_volume_says_the_stack_starts_empty(env_0_7):
@@ -330,3 +339,76 @@ def test_the_command_needs_an_image_to_copy_with(env_0_7, monkeypatch):
 
     assert result.exit_code == 2
     assert "--image" in result.output
+
+
+# ── a check that cannot see is never read as "nothing there" (review of #514) ────────────────────
+
+def _carried_and_in_use(env_0_7) -> Daemon:
+    """A carry that finished, and BeeverForge data written into one target since."""
+    d = Daemon()
+    _a_0_7_stack(d)
+    up.carry(env_0_7, docker=d, image=IMAGE)
+    d.volumes["beeverforge_beeverforge_state"]["files"]["registry.yaml"] = "written since"
+    d.containers["w07"] = ("openfactory", True)
+    d.calls.clear()
+    return d
+
+
+def test_a_label_check_that_fails_refuses_and_empties_nothing(env_0_7):
+    d = _carried_and_in_use(env_0_7)
+    d.fail_inspect = "Cannot connect to the Docker daemon. Is the docker daemon running?"
+
+    with pytest.raises(up.Refused, match="could not check the volume"):
+        up.carry(env_0_7, docker=d, image=IMAGE)
+
+    assert d.volumes["beeverforge_beeverforge_state"]["files"]["registry.yaml"] == "written since"
+    assert not [c for c in d.calls if c[0] in ("run", "stop", "volume") and "create" in c]
+    assert d.containers["w07"] == ("openfactory", True)
+
+
+def test_a_stamp_check_that_fails_refuses_and_empties_nothing(env_0_7):
+    d = _carried_and_in_use(env_0_7)
+    d.fail_stamp_check = True
+
+    with pytest.raises(up.Refused, match="whether the copy into .* finished"):
+        up.carry(env_0_7, docker=d, image=IMAGE)
+
+    assert d.volumes["beeverforge_beeverforge_state"]["files"]["registry.yaml"] == "written since"
+    assert not [c for c in d.calls if c[0] == "run" and "test" not in c], "a copy ran"
+    assert d.containers["w07"] == ("openfactory", True)
+
+
+def test_a_retry_copies_every_volume_from_one_moment(env_0_7):
+    """0.7 is started again after a failed run and moves on; the retry must not pair the earlier
+    copies with later ones."""
+    d = Daemon()
+    _a_0_7_stack(d)
+    d.fail_copy_of = "openfactory_temporal_db"
+    with pytest.raises(up.Refused):
+        up.carry(env_0_7, docker=d, image=IMAGE)
+    assert up.STAMP in d.volumes["beeverforge_beeverforge_state"]["files"], (
+        "the premise: state was copied before the database's copy failed")
+
+    d.fail_copy_of = None
+    d.containers["w07"] = ("openfactory", True)
+    d.volumes["openfactory_openfactory_state"]["files"]["registry.yaml"] = "projects: [later]"
+    d.volumes["openfactory_temporal_db"]["files"]["PG_VERSION"] = "16 (later)"
+    done = up.carry(env_0_7, docker=d, image=IMAGE)
+
+    assert d.volumes["beeverforge_beeverforge_state"]["files"]["registry.yaml"] == (
+        "projects: [later]")
+    assert d.volumes["beeverforge_temporal_db"]["files"]["PG_VERSION"] == "16 (later)"
+    assert len(done.copied) == 4 and done.already == []
+
+
+def test_the_closing_sentence_names_every_0_7_volume_to_remove(env_0_7):
+    d = Daemon()
+    _a_0_7_stack(d)
+
+    said = " ".join(up.report(up.carry(env_0_7, docker=d, image=IMAGE)))
+
+    assert "down -v" not in said
+    assert ("docker volume rm openfactory_openfactory_logs openfactory_openfactory_repos "
+            "openfactory_openfactory_state openfactory_openfactory_toolbox "
+            "openfactory_temporal_db") in said
+    assert "label=com.docker.compose.project=openfactory" in said

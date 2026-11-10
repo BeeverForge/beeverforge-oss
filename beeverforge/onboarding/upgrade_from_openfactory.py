@@ -15,8 +15,10 @@ keeps running beside a fresh install is never stopped by surprise.
   1. Every volume compose labelled for project `openfactory` is read, by its compose key.
   2. Each one BeeverForge carries is checked against its target: a target that exists and was not
      made here is REFUSED, by name (a BeeverForge stack already holds data there, and this never
-     writes over it); one already carried here is skipped; one whose copy did not finish is
-     copied again, from the 0.7 volume, which is never written.
+     writes over it); one already carried here is skipped, unless another one's copy did not
+     finish: then every one is copied again, from the 0.7 volumes, which are never written, so
+     all of them hold the same moment. A check docker could not answer refuses; it is never
+     read as "not there".
   3. The 0.7 stack's containers are stopped — not removed — so the database is copied at rest and
      its ports are free for the new stack.
   4. Each volume is copied, ownership and modes kept, into a target created with compose's own
@@ -78,6 +80,8 @@ class Carried:
     copied: list[tuple[str, str]] = field(default_factory=list)
     already: list[tuple[str, str]] = field(default_factory=list)
     left: list[tuple[str, str]] = field(default_factory=list)
+    #: Every 0.7 volume found, carried or not: the ones the closing sentence names for removal.
+    former: list[str] = field(default_factory=list)
 
 
 def is_a_0_7_file(path: Path) -> bool:
@@ -118,21 +122,37 @@ def _former_volumes(docker: Docker) -> dict[str, str]:
     return found
 
 
+def _could_not_check(what: str, out: str) -> Refused:
+    return Refused(f"could not check {what}: {out.strip()[:300]} — nothing was stopped, copied "
+                   f"or emptied")
+
+
 def _label_of(docker: Docker, volume: str) -> str | None:
-    """The `CARRIED_FROM` label of `volume`; `None` when there is no such volume, `""` when it
-    exists without the label."""
+    """The `CARRIED_FROM` label of `volume`; `None` when the daemon says there is no such volume,
+    `""` when it exists without the label.
+
+    ANY OTHER FAILURE IS A REFUSAL, NOT "NO SUCH VOLUME". Both answers lead to a copy, and a copy
+    empties its target first: a daemon that could not answer about a volume BeeverForge already
+    keeps data in must stop the carry, not empty the volume."""
     rc, out = docker(["volume", "inspect", "--format",
                       f'{{{{index .Labels "{CARRIED_FROM}"}}}}', volume])
     if rc != 0:
-        return None
+        if "no such volume" in out.lower():
+            return None
+        raise _could_not_check(f"the volume {volume}", out)
     value = out.strip()
     return "" if value in ("", "<no value>") else value
 
 
 def _has_stamp(docker: Docker, volume: str, image: str) -> bool:
-    rc, _ = docker(["run", "--rm", "--entrypoint", "test", "-v", f"{volume}:/to:ro", image,
-                    "-e", f"/to/{STAMP}"])
-    return rc == 0
+    """Whether `volume` holds a copy that finished. `test -e` answers 1 for "no stamp"; anything
+    else non-zero is docker failing to look (125 to 127: the image, the daemon, the mount), and
+    that is a refusal, never "no stamp", for the same reason as `_label_of`."""
+    rc, out = docker(["run", "--rm", "--entrypoint", "test", "-v", f"{volume}:/to:ro", image,
+                      "-e", f"/to/{STAMP}"])
+    if rc in (0, 1):
+        return rc == 0
+    raise _could_not_check(f"whether the copy into {volume} finished", out)
 
 
 def carry(env_file: Path, *, docker: Docker, image: str) -> Carried:
@@ -164,8 +184,17 @@ def carry(env_file: Path, *, docker: Docker, image: str) -> Carried:
         else:
             plan.append((source, target))
 
+    done.former = sorted(former.values())
     if not plan:
         return done
+    # ONE MOMENT FOR EVERY VOLUME. A target still to copy means an earlier run stopped part-way,
+    # and 0.7 may have run again since (going back is starting it again). Copying only the rest
+    # would pair a Temporal database from one moment with a state directory from another, so every
+    # target this carry made is copied again, from now. It never reaches BeeverForge's own data:
+    # the carry runs only while `.env.compose` is still 0.7's, which `init` rewrites only after a
+    # carry that finished.
+    plan = sorted(plan + done.already)
+    done.already = []
 
     running = _ok(docker, ["ps", "-q", "--filter",
                            f"label=com.docker.compose.project={FORMER_PROJECT}"],
@@ -209,6 +238,11 @@ def report(done: Carried) -> list[str]:
         lines.append(f"no OpenFactory 0.7 volume was found on this daemon (compose project "
                      f"`{FORMER_PROJECT}`), so the new stack starts empty")
     else:
+        # NAMED, NOT `compose -p openfactory down -v`: that resolves the volumes through the
+        # compose file beside it, which is BeeverForge's now, so what it removes depends on the
+        # compose release rather than on this sentence.
         lines.append(f"the OpenFactory 0.7 volumes are untouched: once BeeverForge runs as it "
-                     f"should, remove them with `docker compose -p {FORMER_PROJECT} down -v`")
+                     f"should, remove 0.7's containers with `docker rm $(docker ps -aq --filter "
+                     f"label=com.docker.compose.project={FORMER_PROJECT})` and its volumes with "
+                     f"`docker volume rm {' '.join(done.former)}`")
     return lines

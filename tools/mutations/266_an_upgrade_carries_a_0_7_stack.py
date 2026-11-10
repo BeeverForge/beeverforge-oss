@@ -38,6 +38,12 @@ TEST = VOL
 INST = "tests/test_the_installer_builds_the_commands_it_says_it_does.py"
 ORDER = INST + "::test_an_upgrade_carries_a_0_7_stack_before_init_rewrites_its_file"
 FAILED = INST + "::test_a_failed_carry_stops_the_upgrade_before_init_and_says_so"
+INIT_FAILS = INST + "::test_an_init_that_fails_after_the_carry_says_the_way_back_to_0_7"
+NOT_FIRST = INST + "::test_an_upgrade_does_not_say_register_your_first_project"
+LABEL_BLIND = VOL + "::test_a_label_check_that_fails_refuses_and_empties_nothing"
+STAMP_BLIND = VOL + "::test_a_stamp_check_that_fails_refuses_and_empties_nothing"
+ONE_MOMENT = VOL + "::test_a_retry_copies_every_volume_from_one_moment"
+REMOVE = VOL + "::test_the_closing_sentence_names_every_0_7_volume_to_remove"
 WORK = INST + "::test_a_0_7_files_work_directory_is_the_one_kept"
 
 MUTATIONS = [
@@ -61,8 +67,9 @@ MUTATIONS = [
      "        elif False:\n", AGAIN),
 
     ("an unfinished copy is taken as finished", UP,
-     "        else:\n            plan.append((source, target))\n\n    if not plan:",
-     "        else:\n            done.already.append((source, target))\n\n    if not plan:",
+     # RE-PINNED 2026-11-10 (review of #514: the former volumes are recorded before the return)
+     "        else:\n            plan.append((source, target))\n\n    done.former",
+     "        else:\n            done.already.append((source, target))\n\n    done.former",
      UNFINISHED),
 
     ("the 0.7 stack is not stopped before the copy", UP,
@@ -133,4 +140,29 @@ MUTATIONS = [
     ("0.7's work directory is not kept", INSTALL,
      "        if [ -z \"$kept_work_dir\" ]; then\n            kept_work_dir=$(grep '^OPENFACTORY_WORK_DIR='",
      "        if false; then\n            kept_work_dir=$(grep '^OPENFACTORY_WORK_DIR='", WORK),
+
+    # review of #514: a check that cannot see is never "nothing there"
+    ("a label check that fails reads as no such volume", UP,
+     '        if "no such volume" in out.lower():\n            return None\n',
+     "        return None\n", LABEL_BLIND),
+
+    ("a stamp check that fails reads as no stamp", UP,
+     "    if rc in (0, 1):\n        return rc == 0\n", "    return rc == 0\n", STAMP_BLIND),
+
+    ("a retry copies only what is left, from a later moment", UP,
+     "    plan = sorted(plan + done.already)\n    done.already = []\n", "", ONE_MOMENT),
+
+    ("the closing sentence goes back to `compose down -v`", UP,
+     "`docker volume rm {' '.join(done.former)}`",
+     "`docker compose -p {FORMER_PROJECT} down -v`", REMOVE),
+
+    ("a failed carry does not say the way back to 0.7", INSTALL,
+     ' To go back to 0.7 meanwhile: ${BACK_TO_0_7}"\n', '"\n', FAILED),
+
+    ("a failed init after a carry does not say the way back", INSTALL,
+     '    [ "$CARRIED" -eq 1 ] || return 0\n', "    return 0\n", INIT_FAILS),
+
+    ("an upgrade still says register your first project", INSTALL,
+     '    if [ "$FORCE" -eq 1 ]; then\n        # AN UPGRADE KEEPS',
+     '    if false; then\n        # AN UPGRADE KEEPS', NOT_FIRST),
 ]

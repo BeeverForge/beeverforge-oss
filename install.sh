@@ -604,6 +604,16 @@ run_preflight() {
     say "  (the box image is still downloading — it is checked again before this finishes)"
 }
 
+# HOW TO GO BACK, said wherever an upgrade stops after the carry may have stopped 0.7's stack:
+# its containers were stopped, not removed, and its volumes were only read.
+BACK_TO_0_7='docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)'
+CARRIED=0
+
+after_a_carry() {
+    [ "$CARRIED" -eq 1 ] || return 0
+    printf ' If the carry above stopped an OpenFactory 0.7 stack, it is still stopped; to go back to it meanwhile: %s' "$BACK_TO_0_7"
+}
+
 carry_a_0_7_stack() {
     # AN UPGRADE OVER AN OPENFACTORY 0.7 DEPLOYMENT KEEPS ITS DATA (#266). Compose prefixes every
     # volume with the project's name, and the rename changed it, so the new stack would start on
@@ -618,8 +628,9 @@ carry_a_0_7_stack() {
         return 0
     fi
     in_the_cli upgrade-from-openfactory --env-file /out/.env.compose \
-        || die "the OpenFactory 0.7 stack's data could not be carried, so nothing was started and ${DIR}/.env.compose was left as it was." \
-               "Fix what it reported above and run this installer again with --force."
+        || die "the OpenFactory 0.7 stack's data could not be carried, so BeeverForge was not started and ${DIR}/.env.compose was left as it was. If the lines above say 0.7's containers were stopped, they still are." \
+               "Fix what it reported above and run this installer again with --force. To go back to 0.7 meanwhile: ${BACK_TO_0_7}"
+    CARRIED=1
 }
 
 run_init() {
@@ -674,7 +685,7 @@ run_init() {
     # shellcheck disable=SC2086
     if [ -f "$DIR/.env.compose" ] && [ "$FORCE" -eq 1 ]; then
         in_the_cli_asking_questions init --out /out/.env.compose --force --runtime compose $INIT_ARGS \
-            || die "\`beeverforge init\` did not finish, so ${DIR}/.env.compose was not written." \
+            || die "\`beeverforge init\` did not finish, so ${DIR}/.env.compose was not written.$(after_a_carry)" \
                    "Fix what it reported above and run this installer again with --force."
     else
         # shellcheck disable=SC2086
@@ -768,7 +779,12 @@ finish() {
     say "  the panel        http://localhost:${port}"
     say "  what is left     cd ${DIR} && docker compose --env-file .env.compose exec worker beeverforge preflight"
     say ""
-    say "Next, register your first project:"
+    if [ "$FORCE" -eq 1 ]; then
+        # AN UPGRADE KEEPS ITS PROJECTS; `project list` names them.
+        say "The projects registered here were kept (\`beeverforge project list\`). To register another:"
+    else
+        say "Next, register your first project:"
+    fi
     say ""
     say "  cd ${DIR} && docker compose --env-file .env.compose exec worker \\"
     say "    beeverforge project init myapp https://github.com/<owner>/myapp.git"
