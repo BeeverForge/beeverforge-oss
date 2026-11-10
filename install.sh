@@ -606,6 +606,8 @@ run_preflight() {
 
 # HOW TO GO BACK, said wherever an upgrade stops after the carry may have stopped 0.7's stack:
 # its containers were stopped, not removed, and its volumes were only read.
+# Single-quoted on purpose: a command the person runs, printed as written, never expanded here.
+# shellcheck disable=SC2016
 BACK_TO_0_7='docker start $(docker ps -aq --filter label=com.docker.compose.project=openfactory)'
 CARRIED=0
 
