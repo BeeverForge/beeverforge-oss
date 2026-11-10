@@ -18,6 +18,7 @@ page — and a reader had to guess which one was current. There is now exactly o
 | | |
 |---|---|
 | [STATUS.md](STATUS.md) | **what works today**, and what does not. Read before deciding anything |
+| [upgrading-from-openfactory.md](upgrading-from-openfactory.md) | **upgrading an OpenFactory 0.7 deployment** in place: what changes, what keeps working and until when, the steps for a compose and a one-machine deployment, and going back |
 | [reference/cli.md](reference/cli.md) | every command, what it does, when you need it |
 | [reference/configuration.md](reference/configuration.md) | the manifest, the registry, the environment — who owns which setting |
 | [reference/product-role.md](reference/product-role.md) | switching on the product owner: context repo, per-person tokens, the release gate |
