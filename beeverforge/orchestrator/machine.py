@@ -576,24 +576,48 @@ _A_BARE_AMPERSAND = re.compile(r"(?<!\\)((?:\\\\)*)&")
 #: A fence line, `` ``` `` or `~~~` and longer, at most three spaces in; a backtick fence's info
 #: string holds no backtick (CommonMark).
 _A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+#: A GFM table's delimiter row (`|---|:-:|`, `--- | ---`), also inside a quote or a list item: it
+#: holds a `|`, so a setext heading's `---` is not one. GFM splits a table's rows into cells BEFORE
+#: it reads their code spans, and an unescaped `|` inside a span ends the cell, so what follows it
+#: is plain text where a name mentions (review of #521, rendered with cmark-gfm).
+_A_TABLE_DELIMITER = re.compile(r"^[ \t>]*(?=[^\n]*\|)\|?[ \t]*:?-+:?[ \t]*"
+                                r"(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$", re.MULTILINE)
+#: A reference a closing keyword is read on, in any case: `Closes #12`, `fixes: owner/repo#12`,
+#: `resolves GH-12` and `closes https://github.com/owner/repo/issues/12` (or `/pull/12`). A
+#: COMMIT MESSAGE has no code span: `gh pr merge --squash` sends no body, so a repository whose
+#: squash default is the pull request's title and description writes the body into the commit,
+#: and a closing keyword there closes the issue it names on the default branch (review of #521).
+#: GitHub documents the first two forms only. The other two are rewritten because a missed one
+#: closes an issue and an extra one only changes the words. Whether they close from a commit
+#: message was NOT MEASURED: that takes a commit on a repository's default branch.
+_A_CLOSING_REFERENCE = re.compile(
+    r"\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+)"
+    r"(?:([\w.-]+/[\w.-]+)?#|GH-|https?://[^/\s]+/([\w.-]+/[\w.-]+)/(?:issues|pull)/)(?=\d)",
+    re.IGNORECASE)
 #: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
 #: autolink (`<https://…>`) is not one.
 _AN_HTML_ROW = re.compile(r"^ {0,3}<(?![A-Za-z][A-Za-z0-9+.-]{1,31}:)[A-Za-z/!?]", re.MULTILINE)
 
 
-def _ampersands_escaped(words: str) -> str:
-    """The reviewer's `words` with every bare `&` escaped, except in a CLOSED fence, a CLOSED code
-    span and a link GitHub makes (`_autolinked`), where a backslash is not an escape: it showed in
-    the code and moved the link (review of #323, measured on `POST /markdown`). An entity there
-    renders as written and mentions no one. When in doubt it escapes: a fence or a span that
-    never closes, and the rest of the paragraph after it, and all of `words` if a row may open an
-    HTML block."""
+def _quieted_outside_code_and_links(words: str) -> str:
+    """The reviewer's `words` with every bare `&` escaped and every mention broken (`_quieted`),
+    except in a CLOSED fence, a CLOSED code span and a link GitHub makes (`_autolinked`). There a
+    backslash is not an escape: it showed in the code and moved the link (review of #323, measured
+    on `POST /markdown`); an entity renders as written and mentions no one. And a rewritten `#1`
+    or `@name` changed the code the reviewer quoted, or where the link points, while nothing links
+    or mentions there to protect against (#329). When in doubt it rewrites: a fence or a span that
+    never closes, and the rest of the paragraph after it, a paragraph that holds a table (a `|`
+    in a span may end its cell, `_A_TABLE_DELIMITER`), and all of `words` if a row may open an
+    HTML block, as GitHub renders a live mention after a backtick that never closes."""
     if _AN_HTML_ROW.search(words):
-        return _escaped_ampersands(_AN_AUTOLINK.sub(_unlinked, words))
+        return _quieted(_AN_AUTOLINK.sub(_unlinked, words))
     rows, out, paragraph, i = words.split("\n"), [], [], 0
 
     def ended() -> list[str]:
-        return [_outside_spans("\n".join(paragraph))] if paragraph else []
+        text = "\n".join(paragraph)
+        if _A_TABLE_DELIMITER.search(text):
+            return [_quieted(_AN_AUTOLINK.sub(_unlinked, text))]
+        return [_outside_spans(text)] if paragraph else []
 
     while i < len(rows):
         fence = _A_FENCE.match(rows[i])
@@ -612,8 +636,8 @@ def _ampersands_escaped(words: str) -> str:
 
 
 def _outside_spans(text: str) -> str:
-    """`text`, one paragraph, with every bare `&` escaped outside its closed code spans and the
-    links GitHub makes of its bare ones. A span here closes on its own row: one that does not, or
+    """`text`, one paragraph, `_quieted` outside its closed code spans and the links GitHub makes
+    of its bare ones. A span here closes on its own row: one that does not, or
     a `<` that reaches past its row or over a backtick (an HTML tag or an autolink outranks a
     span), ends the guessing, and the rest of the paragraph is escaped whole."""
     out, start, i = [], 0, 0
@@ -699,9 +723,10 @@ def _unlinked(autolink: re.Match) -> str:
 
 
 def _outside_links(text: str, before: str = "") -> str:
-    """`text`, after the character `before`, with every bare `&` escaped outside the links GitHub
-    makes of its autolinks (`_unlinked`) and bare links (`_autolinked`), which keep theirs. A bare
-    link inside an autolink is the autolink's."""
+    """`text`, after the character `before`, `_quieted` outside the links GitHub makes of its
+    autolinks (`_unlinked`) and bare links (`_autolinked`), which are kept as written. An
+    autolink it breaks is text, and is quieted too. A bare link inside an autolink is the
+    autolink's."""
     out, start = [], 0
     links = sorted([*_AN_AUTOLINK.finditer(text), *_A_BARE_LINK.finditer(text)],
                    key=lambda m: m.start())
@@ -713,19 +738,29 @@ def _outside_links(text: str, before: str = "") -> str:
             continue  # `\<https://…>`: its `<` is escaped, and the bare link in it is read as one
         if link.re is _AN_AUTOLINK:
             kept = _unlinked(link)
-            piece = kept if kept == link[0] else _escaped_ampersands(kept)
+            piece = kept if kept == link[0] else _quieted(kept)
         elif _autolinked(link[0], prior, text[link.end():link.end() + 1]):
             piece = link[0]
         else:
             continue
-        out += [_escaped_ampersands(text[start:link.start()]), piece]
+        out += [_quieted(text[start:link.start()]), piece]
         start = link.end()
-    return "".join(out) + _escaped_ampersands(text[start:])
+    return "".join(out) + _quieted(text[start:])
 
 
 def _escaped_ampersands(text: str) -> str:
     """`text` with every bare `&` escaped (`_A_BARE_AMPERSAND`)."""
     return _A_BARE_AMPERSAND.sub(lambda m: f"{m.group(1)}\\&", text)
+
+
+def _quieted(words: str) -> str:
+    """`words`, text outside code and links, linking no issue and notifying no one: every bare
+    `&` escaped first, so no entity spells a mention; `#<number>` and `GH-<number>` (any case)
+    written `card <number>` (`without_mentions`, #111); a zero-width space after the `@` of a
+    name, and between `GH` and `-<number>` where main's rewrite missed one (`_A_GH_REFERENCE`)."""
+    words = _escaped_ampersands(words)
+    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
+    return _A_GH_REFERENCE.sub("\\1\u200b", words)
 
 
 def _without_reviewer_mentions(words: str) -> str:
@@ -736,11 +771,24 @@ def _without_reviewer_mentions(words: str) -> str:
     and `GH-<number>` (any case) are written `card <number>` (`without_mentions`, #111); a
     zero-width space after the `@` of a name, and between `GH` and `-<number>` where main's
     rewrite missed one (`_A_GH_REFERENCE`), keeps them readable and makes them nothing a forge
-    links. Every bare `&` outside code and links is escaped first, so no entity spells one of them
-    (`_ampersands_escaped`). Applied before `_as_text`, so a `## ` row is still escaped."""
-    words = _ampersands_escaped(words)
-    words = _A_HANDLE.sub(lambda m: f"@\u200b{m.group(1)}", without_mentions(words))
-    return _A_GH_REFERENCE.sub("\\1\u200b", words)
+    links. Every bare `&` is escaped first, so no entity spells one of them. All of it outside
+    closed code and the links GitHub makes, where it would change what the reviewer quoted
+    (`_quieted_outside_code_and_links`, #329), but for a reference after a closing keyword,
+    which a squash commit message reads with no code around it (`_A_CLOSING_REFERENCE`). Applied
+    before `_as_text`, so a `## ` row is still escaped."""
+    return _closing_references_broken(_quieted_outside_code_and_links(words))
+
+
+def _closing_references_broken(words: str) -> str:
+    """`words` with every reference a closing keyword is read on written `card <number>`: `Closes
+    #12` and `Closes GH-12` read `Closes card 12`, and `fixes owner/repo#12` and a link to that
+    issue or pull request read `fixes owner/repo card 12`."""
+    return _A_CLOSING_REFERENCE.sub(_as_card, words)
+
+
+def _as_card(reference: re.Match[str]) -> str:
+    repository = reference[2] or reference[3]
+    return f"{reference[1]}{f'{repository} ' if repository else ''}card "
 
 
 def _sections_from(rows: list[str]) -> int:
