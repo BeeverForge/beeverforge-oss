@@ -59,7 +59,17 @@ API_VERSION = "7.1"
 
 
 class AzureDevOpsError(RuntimeError):
-    """An ADO call that failed, carrying enough to act on: the route and what the server said."""
+    """An ADO call that failed, carrying enough to act on: the route and what the server said.
+
+    `status` is the HTTP status the server answered with, or None when it gave none (a connection
+    that could not be made, a body that was not JSON, or a sentence of this adapter's own). It is
+    what tells a request the server REFUSED (a 4xx: nothing was done) from one whose outcome is
+    not known (no answer, a 5xx: it may have been done), which is the difference between a call
+    that may be repeated and one that must be looked up first (#515)."""
+
+    def __init__(self, *args: object, status: int | None = None) -> None:
+        super().__init__(*args)
+        self.status = status
 
 
 def coordinates(project, *, ref) -> tuple[str, str]:
@@ -495,7 +505,8 @@ class AzureDevOpsClient:
             # every adapter to find which permission is missing.
             raise AzureDevOpsError(
                 f"{method.upper()} {path} → {exc.code} {exc.reason}"
-                + (f": {_readable(detail)}" if detail else "")
+                + (f": {_readable(detail)}" if detail else ""),
+                status=exc.code,
             ) from exc
         except urllib.error.URLError as exc:
             raise AzureDevOpsError(f"{method.upper()} {path} could not be reached: {exc}") from exc
