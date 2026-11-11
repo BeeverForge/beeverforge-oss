@@ -12,12 +12,13 @@ walks the tree and fails on any `openfactory` name it does not already know.
 WHAT A NAME IS. A word code reads: `openfactory` in any case and spelling (`open_factory`,
 `Open-Factory`), with the path, id and identifier characters around it (`.openfactory/**`,
 `openfactory-jobs`, `OPENFACTORY_*`, `upgrade_from_openfactory`, `OpenFactoryError`,
-`openFactory`). The product's name standing alone, "OpenFactory 0.7", is prose: a message may say
-what a deployment upgrades from, wherever it is. In Python, it is read from every string and bytes
-constant that is not a docstring (f-string pieces included) and every identifier: a name, an
-attribute, an import, a definition, an argument, a keyword, an `except ... as`, a `global` or
-`nonlocal`, a capture in a `match`. A comment is never read. In the other files, from every line
-that is not a comment.
+`openFactory`). The product's name standing alone in text, "OpenFactory 0.7", is prose: a
+message may say what a deployment upgrades from, wherever it is. In Python, it is read from every
+string and bytes constant that is not a docstring (f-string pieces included) and every
+identifier: a name, an attribute, an import, a definition, an argument, a keyword, an `except ...
+as`, a `global` or `nonlocal`, a capture in a `match`. An identifier is never prose, so a class or
+an import called `OpenFactory` is a name. A comment is never read. In the other files, from every
+line that is not a comment.
 
 WHERE IT MAY BE. `LAYER`: the modules that exist to read the old names, where any number may be;
 each must still say one, or its entry is stale. `PINNED`: every other file that serves an old name,
@@ -170,15 +171,22 @@ def _words(node: ast.AST) -> list[str]:
     return []
 
 
-def names_in_words(words: Iterable[str]) -> list[str]:
+def names_in_words(words: Iterable[str], *, prose: bool = True) -> list[str]:
+    """The names in `words`. With `prose`, the words are text a sentence may stand in, so the
+    product's name standing alone is not one; without it, they are identifiers, and every match
+    is a name: `class OpenFactory` is the plainest new name there is."""
     return sorted(name for word in words for name in NAME.findall(word)
-                  if name.strip("*.") != PROSE)
+                  if not (prose and name.strip("*.") == PROSE))
 
 
 def names_in_python(tree: ast.AST) -> list[str]:
-    prose = _docstrings(tree)
-    return names_in_words(word for node in ast.walk(tree) if id(node) not in prose
-                          for word in _words(node))
+    docstrings = _docstrings(tree)
+    nodes = [node for node in ast.walk(tree) if id(node) not in docstrings]
+    text = [node for node in nodes if isinstance(node, ast.Constant)]
+    identifiers = [node for node in nodes if not isinstance(node, ast.Constant)]
+    return sorted([*names_in_words(word for node in text for word in _words(node)),
+                   *names_in_words((word for node in identifiers for word in _words(node)),
+                                   prose=False)])
 
 
 def _code_lines(text: str, path: str) -> list[str]:
@@ -257,9 +265,13 @@ def test_the_scan_sees_every_shape_a_name_takes_in_python():
         "    case [*openfactory_s]:\n"
         "        pass\n"
         "RAW = b'openfactory-raw'\n"
-        "SPELLINGS = ('Open-Factory', 'open_factory', 'Openfactory')\n"
+        "SPELLINGS = ('Open-Factory', 'open_factory', 'Openfactory', 'OpenFactory-cli')\n"
         "# a comment naming openfactory.adapters\n"
         'SAID = "upgrading from OpenFactory 0.7, or from OpenFactory. **OpenFactory 0.7**"\n'
+        "class OpenFactory:\n"
+        "    pass\n"
+        "from x import OpenFactory as OpenFactory\n"
+        "OpenFactory = 1\n"
         'OTHER = "openfactoryx reopenfactory"\n'
     )
 
@@ -269,7 +281,8 @@ def test_the_scan_sees_every_shape_a_name_takes_in_python():
         "openfactory_dir", "openfactory_mode", "openfactory_home", "openfactory_cache",
         "openfactory_g", "openfactory_n", "OpenFactoryError", "openFactory", "myOpenFactory",
         "openfactory_e", "openfactory_v", "openfactory_r", "openfactory_s", "openfactory-raw",
-        "Open-Factory", "open_factory", "Openfactory",
+        "Open-Factory", "open_factory", "Openfactory", "OpenFactory-cli",
+        "OpenFactory", "OpenFactory", "OpenFactory", "OpenFactory",
     ]), names_in_python(planted)
 
 

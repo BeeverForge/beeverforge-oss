@@ -83,15 +83,22 @@ MUTATIONS = [
      "[Yy](?![a-z0-9])", "[Yy]"),
 
     ("the product named in a sentence counts as a name", TEST,
-     '''                  if name.strip("*.") != PROSE)''',
+     '''                  if not (prose and name.strip("*.") == PROSE))''',
      '''                  )'''),
 
     ("anything the product's name starts is prose", TEST,
-     '''                  if name.strip("*.") != PROSE)''',
-     '''                  if not name.strip("*.").startswith(PROSE))'''),
+     '''                  if not (prose and name.strip("*.") == PROSE))''',
+     '''                  if not (prose and name.strip("*.").startswith(PROSE)))'''),
+
+    ("an identifier may be the product's name standing alone", TEST,
+     "                                   prose=False)])",
+     "                                   prose=True)])"),
+
+    ("a module outside the layer names a class `OpenFactory`", DOCTOR, FUTURE,
+     FUTURE + "class OpenFactory:\n    pass\n"),
 
     ("a docstring counts as code", TEST,
-     "    prose = _docstrings(tree)\n", "    prose = set()\n"),
+     "    docstrings = _docstrings(tree)\n", "    docstrings = set()\n"),
 
     ("a string is not read", TEST,
      "    if isinstance(node, ast.Constant) and isinstance(node.value, str):\n"
