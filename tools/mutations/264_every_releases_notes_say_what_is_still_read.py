@@ -60,6 +60,6 @@ MUTATIONS = [
         module = ast.parse(register.read_text(encoding="utf-8"))'''),
 
     ("an entry says nothing to a reader", REGISTER,
-     '''            said="the `openfactory` command, an alias of `beeverforge`"),''',
-     '''            said=""),'''),
+     '''            said="the `openfactory` command, an alias of `beeverforge`",''',
+     '''            said="",'''),
 ]
