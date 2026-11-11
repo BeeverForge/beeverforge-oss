@@ -30,6 +30,6 @@ MUTATIONS = [
      '  // Always report the answer, but only alter the form it belongs to.',
      '  if(!(_bd.form === f && _bd.project === project && _bd.card === card)) return;'),
     ("a network failure escapes without keeping a retryable form", PANEL,
-     '  } catch(e){ r = {ok:false, message:e.message||"the card could not be saved"}; }',
-     "  } catch(e){ throw e; }"),
+     '  } catch(e){\n    // A lost response',
+     '  } catch(e){ throw e;\n    // A lost response'),
 ]

@@ -1308,6 +1308,7 @@ const ACTS={
   pvPendingTalk: ()=>{const a=$("#prodAsk");if(a)a.focus()},
   pvCardBack:    ()=>pvCardBack(),
   pvSuggest:     d=>pvSuggest(d.q),
+  boardOpenCandidate: d=>boardOpenCandidate(Number(d.i)),
 };
 document.addEventListener("click",ev=>{
   const el=ev.target.closest&&ev.target.closest("[data-act]");
@@ -5525,6 +5526,9 @@ function _blank(mode){
 async function boardNewCard(){
   _bd.card = null; _bd.draft = "";
   _bd.form = _blank("new");
+  // Compare against the board as it was when this form opened, not a later polling response.
+  const cards = (_bd.data||{}).cards;
+  _bd.form.knownRefs = Array.isArray(cards) ? cards.map(c=>String(c.ref)) : null;
   paintForm();
   _bgate();
 }
@@ -5606,6 +5610,22 @@ function _bpaintGate(){
     ${esc(g.said)}`;
 }
 
+function _bpaintCandidates(){
+  const el = $("#b_candidates"), f = _bd.form;
+  if(!el || !f) return;
+  const candidates = f.candidates || [];
+  el.innerHTML = candidates.length ? `<p>A card titled “${esc(f.candidateTitle)}” appeared on the board.
+    It may not be yours. Open a card below (this closes your draft), or keep editing and save again.</p>
+    ${candidates.map((c,i)=>`<button class="btn ghost" data-act="boardOpenCandidate" data-i="${i}">open ${esc(c.ref)}</button>`).join(" ")}` : "";
+}
+
+function boardOpenCandidate(index){
+  const f = _bd.form, candidate = f && (f.candidates||[])[index];
+  if(!candidate || f.saving) return;
+  if(f.timer) clearTimeout(f.timer);
+  boardOpenCard(String(candidate.ref));
+}
+
 function paintForm(){
   const drawer = $("#boardview .drawer"), f = _bd.form;
   if(!drawer || !f) return;
@@ -5650,6 +5670,7 @@ function paintForm(){
         <textarea id="b_out" rows="2" oninput="_bset('out_of_scope', this.value)">${esc(f.out_of_scope)}</textarea>
         <p class="hint">One item per line.</p>`}
       <div id="b_gate" class="gate" role="status" aria-live="polite"></div>
+      <div id="b_candidates" role="status" aria-live="polite"></div>
       <div style="margin-top:12px;display:flex;gap:8px">
         <button class="btn" id="b_save" onclick="boardSaveCard()"${f.saving ? " disabled" : ""}>save</button>
         <button class="btn ghost" onclick="boardCancelEdit()">cancel</button></div>
@@ -5658,6 +5679,7 @@ function paintForm(){
         thread instead, which is what the job reads next.</p>` : ""}
     </div></div>`;
   _bpaintGate();
+  _bpaintCandidates();
 }
 
 // ── correcting a card, and taking it off the board (#150) ────────────────────────────────────
@@ -5703,7 +5725,28 @@ async function boardSaveCard(){
     r = f.mode === "new"
       ? await act("card_create", {project, title, body})
       : await act("card_edit", {project, issue:card, title, body});
-  } catch(e){ r = {ok:false, message:e.message||"the card could not be saved"}; }
+  } catch(e){
+    // A lost response may follow a committed write, so check before repeating a create.
+    r = {ok:false, unconfirmed:true,
+         message:"The connection failed. Your draft is kept; check the board before retrying Save."};
+    if(f.mode === "new" && Array.isArray(f.knownRefs)){
+      // Say it before a read over the connection that just failed: a held read hid the failure
+      // and disabled Save for at least 10 seconds in the 2026-11-11 browser review.
+      toast("Save not confirmed", r.message, "err"); r.told = true;
+      try{
+        const d = await api("/api/board/"+encodeURIComponent(project), {signal:AbortSignal.timeout(8000)});
+        if(Array.isArray((d||{}).cards)){
+          const before = new Set(f.knownRefs);
+          const candidates = d.cards.filter(c=>c.ref != null && !before.has(String(c.ref)) &&
+                                               (c.title||"").trim() === title);
+          if(_bd.form === f && _bd.project === project && _bd.card === card){
+            f.candidates = candidates; f.candidateTitle = title;
+            _bpaintCandidates();
+          }
+        }
+      }catch(_){ /* The board could not be read; the save is still unconfirmed. */ }
+    }
+  }
   f.saving = false;
   // Always report the answer, but only alter the form it belongs to.
   const current = _bd.form === f && _bd.project === project && _bd.card === card;
@@ -5712,8 +5755,9 @@ async function boardSaveCard(){
     // A PARTIAL EDIT IS NOT "NOT CHANGED": the row names what landed in `changed`, and the form it
     // was typed in no longer describes the card, so it closes onto the card as it now is.
     const partly = f.mode === "edit" && (r.data||{}).changed;
-    toast(f.mode === "new" ? "Not opened" : partly ? "Partly changed" : "Not changed",
-          r.message||"", "err");
+    if(!r.told)
+      toast(r.unconfirmed ? "Save not confirmed" : f.mode === "new" ? "Not opened" : partly ? "Partly changed" : "Not changed",
+            r.message||"", "err");
     if(partly && current){ if(f.timer) clearTimeout(f.timer); _bd.form = null; _bd.sig = null;
                 await refreshBoard(); }
     return;

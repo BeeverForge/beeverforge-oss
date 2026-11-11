@@ -66,7 +66,11 @@ MUTATIONS = [
      "                                       changed=\",\".join(changed)))"),
 
     ("the new-card button goes back to asking for a title only", PANEL,
-     '  _bd.form = _blank("new");\n  paintForm();\n  _bgate();',
+     '  _bd.form = _blank("new");\n'
+     '  // Compare against the board as it was when this form opened, not a later polling response.\n'
+     '  const cards = (_bd.data||{}).cards;\n'
+     '  _bd.form.knownRefs = Array.isArray(cards) ? cards.map(c=>String(c.ref)) : null;\n'
+     '  paintForm();\n  _bgate();',
      '  const title = prompt("What is the card called?");\n'
      '  if(!title) return;\n'
      '  await act("card_create", {project:_bd.project, title});'),
