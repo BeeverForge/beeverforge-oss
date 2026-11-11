@@ -49,7 +49,7 @@ def test_a_lost_create_keeps_the_draft_and_offers_only_new_matching_cards(new_ca
     if new_cards:
         assert before["candidates"] == new_cards
         assert "may not be yours" in before["html"]
-        assert "boardOpenCandidate(0)" in before["html"]
+        assert 'data-act="boardOpenCandidate" data-i="0"' in before["html"]
         assert "keep editing" in before["html"] and "closes your draft" in before["html"]
         assert got["opened"] == ["2"] and got["form"] is None
     else:
@@ -72,12 +72,48 @@ def test_new_matches_are_escaped_and_can_be_repainted_without_losing_the_draft()
       routes={'/api/board/acme':[{status:200,body:{cards:[
         {ref:'2<evil>',title:'<draft>'},{ref:'3',title:'<draft>'}]}}]};
       await boardNewCard();_bd.form.title='<draft>';_bd.form.raw='Draft';
-      await boardSaveCard();paintForm();
+      await boardSaveCard();nodes['#b_candidates'].innerHTML='';paintForm();
       return {html:nodes['#b_candidates'].innerHTML,form:_bd.form,opened};
     """)
     assert "&lt;draft&gt;" in got["html"] and "2&lt;evil&gt;" in got["html"]
-    assert "boardOpenCandidate(1)" in got["html"]
+    assert 'data-act="boardOpenCandidate" data-i="1"' in got["html"]
     assert got["form"]["raw"] == "Draft" and got["opened"] == []
+
+
+def test_a_candidate_cannot_be_opened_while_a_retry_is_in_flight():
+    got = scenario("""
+      routes={'/api/board/acme':[{status:200,body:{cards:[{ref:'1',title:'Retain this title'},
+                                                          {ref:'2',title:'Keep it'}]}}]};
+      await boardNewCard();_bd.form.title='Keep it';_bd.form.raw='Draft';
+      await boardSaveCard();_bd.form.saving=true;boardOpenCandidate(0);
+      return {opened,form:!!_bd.form};
+    """)
+    assert got["opened"] == [] and got["form"]
+
+
+def test_the_unconfirmed_save_is_said_before_the_board_is_read_again():
+    got = scenario("""
+      api=()=>new Promise(()=>{});
+      await boardNewCard();_bd.form.title='Keep it';_bd.form.raw='Draft';
+      boardSaveCard();for(let i=0;i<20;i++) await Promise.resolve();
+      return {toasts,saving:_bd.form.saving};
+    """)
+    assert [t[0] for t in got["toasts"]] == ["Save not confirmed"]
+    assert got["saving"]
+
+
+def test_a_stalled_board_read_times_out_and_reenables_save():
+    got = scenario("""
+      let timeoutMs;AbortSignal.timeout=ms=>{timeoutMs=ms;const c=new AbortController();
+        setImmediate(()=>c.abort());return c.signal};
+      api=(url,o)=>new Promise((resolve,reject)=>o.signal.addEventListener('abort',()=>reject(Error('timeout'))));
+      await boardNewCard();_bd.form.title='Keep it';_bd.form.raw='Draft';
+      await boardSaveCard();
+      return {timeoutMs,saving:_bd.form.saving,disabled:nodes['#b_save'].disabled,toasts};
+    """)
+    assert got["timeoutMs"] == 8000
+    assert not got["saving"] and not got["disabled"]
+    assert [t[0] for t in got["toasts"]] == ["Save not confirmed"]
 
 
 @pytest.mark.parametrize("navigation", ["form", "project", "card"])

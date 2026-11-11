@@ -1308,6 +1308,7 @@ const ACTS={
   pvPendingTalk: ()=>{const a=$("#prodAsk");if(a)a.focus()},
   pvCardBack:    ()=>pvCardBack(),
   pvSuggest:     d=>pvSuggest(d.q),
+  boardOpenCandidate: d=>boardOpenCandidate(Number(d.i)),
 };
 document.addEventListener("click",ev=>{
   const el=ev.target.closest&&ev.target.closest("[data-act]");
@@ -5615,7 +5616,7 @@ function _bpaintCandidates(){
   const candidates = f.candidates || [];
   el.innerHTML = candidates.length ? `<p>A card titled “${esc(f.candidateTitle)}” appeared on the board.
     It may not be yours. Open a card below (this closes your draft), or keep editing and save again.</p>
-    ${candidates.map((c,i)=>`<button class="btn ghost" onclick="boardOpenCandidate(${i})">open ${esc(c.ref)}</button>`).join(" ")}` : "";
+    ${candidates.map((c,i)=>`<button class="btn ghost" data-act="boardOpenCandidate" data-i="${i}">open ${esc(c.ref)}</button>`).join(" ")}` : "";
 }
 
 function boardOpenCandidate(index){
@@ -5729,8 +5730,11 @@ async function boardSaveCard(){
     r = {ok:false, unconfirmed:true,
          message:"The connection failed. Your draft is kept; check the board before retrying Save."};
     if(f.mode === "new" && Array.isArray(f.knownRefs)){
+      // Say it before a read over the connection that just failed: a held read hid the failure
+      // and disabled Save for at least 10 seconds in the 2026-11-11 browser review.
+      toast("Save not confirmed", r.message, "err"); r.told = true;
       try{
-        const d = await api("/api/board/"+encodeURIComponent(project));
+        const d = await api("/api/board/"+encodeURIComponent(project), {signal:AbortSignal.timeout(8000)});
         if(Array.isArray((d||{}).cards)){
           const before = new Set(f.knownRefs);
           const candidates = d.cards.filter(c=>c.ref != null && !before.has(String(c.ref)) &&
@@ -5751,8 +5755,9 @@ async function boardSaveCard(){
     // A PARTIAL EDIT IS NOT "NOT CHANGED": the row names what landed in `changed`, and the form it
     // was typed in no longer describes the card, so it closes onto the card as it now is.
     const partly = f.mode === "edit" && (r.data||{}).changed;
-    toast(r.unconfirmed ? "Save not confirmed" : f.mode === "new" ? "Not opened" : partly ? "Partly changed" : "Not changed",
-          r.message||"", "err");
+    if(!r.told)
+      toast(r.unconfirmed ? "Save not confirmed" : f.mode === "new" ? "Not opened" : partly ? "Partly changed" : "Not changed",
+            r.message||"", "err");
     if(partly && current){ if(f.timer) clearTimeout(f.timer); _bd.form = null; _bd.sig = null;
                 await refreshBoard(); }
     return;
