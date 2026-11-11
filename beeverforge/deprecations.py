@@ -31,41 +31,57 @@ class Removal:
     #: it with `removed_in` until that release (`scripts/release_notes.py`, #264). No full stop,
     #: no source path
     said: str = ""
+    #: the shipped files that still say the old name for it, by path from the repository's root:
+    #: removing the entry removes the name from each, and the guard that holds new code to
+    #: BeeverForge's names allows an `openfactory` name only in a file an entry or its own list
+    #: of names kept with no end names (`tests/test_new_code_says_no_openfactory_name.py`)
+    paths: tuple[str, ...] = ()
 
 
 REMOVALS: tuple[Removal, ...] = (
     Removal("openfactory-command", "1.1",
             "OpenFactory 0.7's `openfactory` console script, an alias of `beeverforge` "
             "(`beeverforge/former_command.py`, its `[project.scripts]` row in pyproject.toml)",
-            said="the `openfactory` command, an alias of `beeverforge`"),
+            said="the `openfactory` command, an alias of `beeverforge`",
+            paths=("beeverforge/former_command.py", "pyproject.toml",
+                   "beeverforge/former_in_use.py")),
     Removal("openfactory-import", "1.1",
             "OpenFactory 0.7's `openfactory` import name, an alias of the `beeverforge` package "
             "(`openfactory/__init__.py`, its `packages.find` entry in pyproject.toml and its "
             "COPY in the three Dockerfiles)",
-            said="the `openfactory` import name, an alias of the `beeverforge` package"),
+            said="the `openfactory` import name, an alias of the `beeverforge` package",
+            paths=("openfactory/__init__.py", "pyproject.toml", "docker/cli.Dockerfile",
+                   "docker/sandbox.Dockerfile", "docker/worker.Dockerfile",
+                   "beeverforge/former_in_use.py")),
     Removal("openfactory-environment", "1.1",
             "OpenFactory 0.7's `OPENFACTORY_*` environment names, read as `BEEVERFORGE_*` "
             "(`beeverforge/former_names.py`)",
-            said="`OPENFACTORY_*` environment variables, read as their `BEEVERFORGE_*` names"),
+            said="`OPENFACTORY_*` environment variables, read as their `BEEVERFORGE_*` names",
+            paths=("beeverforge/former_names.py", "beeverforge/former_in_use.py")),
     Removal("openfactory-adapters", "1.1",
             "OpenFactory 0.7's `openfactory.adapters` entry-point group, scanned after "
             "`beeverforge.adapters` (`FORMER_GROUP` in `beeverforge/plugins.py`)",
             said="add-ons registered under the `openfactory.adapters` entry-point group, "
-                 "now `beeverforge.adapters`"),
+                 "now `beeverforge.adapters`",
+            paths=("beeverforge/plugins.py", "beeverforge/former_in_use.py")),
     Removal("openfactory-documents", "1.1",
             "OpenFactory 0.7's evidence pack and thresholds file, `openfactory.certify/1` and "
             "`openfactory.certify.thresholds/1`, read by `beeverforge certify verify` "
             "(`FORMER_PACK_SCHEMA` and its `enum` entry in `beeverforge/certify/schema.py` and "
             "`pack.schema.json`, `FORMER_THRESHOLDS_SCHEMA` in `beeverforge/certify/verify.py`)",
             said="OpenFactory 0.7's evidence packs and thresholds files, `openfactory.certify/1` "
-                 "and `openfactory.certify.thresholds/1`, read by `beeverforge certify verify`"),
+                 "and `openfactory.certify.thresholds/1`, read by `beeverforge certify verify`",
+            paths=("beeverforge/certify/schema.py", "beeverforge/certify/verify.py",
+                   "beeverforge/certify/pack.schema.json")),
     Removal("openfactory-temporal-names", "1.0",
             "OpenFactory 0.7's Temporal task queue, polled by a second worker, and its "
             "`openfactory-` workflow ids, read beside BeeverForge's "
             "(`FORMER_TASK_QUEUE` and `FORMER_WORKFLOW_ID_PREFIX` in "
             "`beeverforge/runtime/temporal/__init__.py`)",
             said="work an OpenFactory 0.7 deployment left in Temporal, on its `openfactory-jobs` "
-                 "task queue and under its `openfactory-` workflow ids"),
+                 "task queue and under its `openfactory-` workflow ids",
+            paths=("beeverforge/runtime/temporal/__init__.py",
+                   "beeverforge/runtime/temporal/schedule.py")),
 )
 
 

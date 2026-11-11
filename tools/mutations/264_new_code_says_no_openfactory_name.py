@@ -1,13 +1,16 @@
 """#264: new code outside the compatibility layer says no OpenFactory 0.7 name.
 
-The guard walks everything that ships and fails on an `openfactory` name a file is not pinned to.
-The first rows write a new name into the code, one per shape it takes and per kind of file, and
-the guard must see each. The rest weaken the guard itself, and its planted twins must see that.
+The guard walks the tree and fails on an `openfactory` name a file is not pinned to, and on a file
+allowed one that neither the removal register nor the names kept with no end claims. The first
+rows write a new name into the code, one per shape it takes and per kind of file, or unclaim a
+file in the register, and the guard must see each. The rest weaken the guard itself, and its
+planted twins must see that.
 """
 
 TEST = "tests/test_new_code_says_no_openfactory_name.py"
 DOCTOR = "beeverforge/doctor.py"
 PATHS = "beeverforge/paths.py"
+REGISTER = "beeverforge/deprecations.py"
 
 FUTURE = "from __future__ import annotations\n"
 
@@ -24,6 +27,9 @@ MUTATIONS = [
 
     ("a module outside the layer names a function after 0.7", DOCTOR, FUTURE,
      FUTURE + "def _openfactory_home():\n    return None\n"),
+
+    ("a module outside the layer names a class after 0.7 in CamelCase", DOCTOR, FUTURE,
+     FUTURE + "class OpenFactoryError(Exception):\n    pass\n"),
 
     ("a pinned module says one name more", PATHS,
      'FORMER_LOGS_BESIDE = ".openfactory-logs"',
@@ -43,16 +49,57 @@ MUTATIONS = [
     ("the compose file names a 0.7 volume", "docker-compose.yml",
      "services:\n", "volumes:\n  openfactory_state: {}\nservices:\n"),
 
+    ("a module of the layer stops saying an old name, and its exemption outlives it",
+     "beeverforge/onboarding/migrate_folder.py",
+     'FORMER_DIR = ".openfactory"', 'FORMER_DIR = "." + "open" + "factory"'),
+
+    # ── the register stops claiming a file ─────────────────────────────────────────────────────
+    ("the register's entry no longer claims the file that serves it", REGISTER,
+     '''            paths=("beeverforge/plugins.py", "beeverforge/former_in_use.py")),''',
+     '''            paths=("beeverforge/former_in_use.py",)),'''),
+
+    ("the register claims a file that says no old name", REGISTER,
+     '''            paths=("beeverforge/plugins.py", "beeverforge/former_in_use.py")),''',
+     '''            paths=("beeverforge/plugins.py", "beeverforge/former_in_use.py",
+                   "beeverforge/doctor.py")),'''),
+
+    ("an entry of the register claims no file", REGISTER,
+     '''            paths=("beeverforge/plugins.py", "beeverforge/former_in_use.py")),''',
+     '''            ),'''),
+
     # ── the guard is weakened ──────────────────────────────────────────────────────────────────
+    ("the match reads lower and upper case only", TEST,
+     '''                  r"[Oo][Pp][Ee][Nn][-_]?[Ff][Aa][Cc][Tt][Oo][Rr][Yy](?![a-z0-9])'''
+     '''[\\w.~/*-]*")''',
+     '''                  r"(?:openfactory|OPENFACTORY)(?![A-Za-z0-9])[\\w.~/*-]*")'''),
+
+    ("the match reads no `-` or `_` inside the word", TEST,
+     "[Oo][Pp][Ee][Nn][-_]?[Ff]", "[Oo][Pp][Ee][Nn][Ff]"),
+
+    ("the match never starts at a camelCase hump", TEST,
+     "(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=O))", "(?<![A-Za-z0-9])"),
+
+    ("the match reads a longer word as the name", TEST,
+     "[Yy](?![a-z0-9])", "[Yy]"),
+
     ("the product named in a sentence counts as a name", TEST,
-     "(?:openfactory|OPENFACTORY)", "(?i:openfactory)"),
+     '''                  if name.strip("*.") != PROSE)''',
+     '''                  )'''),
+
+    ("anything the product's name starts is prose", TEST,
+     '''                  if name.strip("*.") != PROSE)''',
+     '''                  if not name.strip("*.").startswith(PROSE))'''),
 
     ("a docstring counts as code", TEST,
      "    prose = _docstrings(tree)\n", "    prose = set()\n"),
 
     ("a string is not read", TEST,
-     "    if isinstance(node, ast.Constant) and isinstance(node.value, str):\n        return [node.value]\n",
+     "    if isinstance(node, ast.Constant) and isinstance(node.value, str):\n"
+     "        return [node.value]\n",
      ""),
+
+    ("a bytes constant is not read", TEST,
+     '        return [node.value.decode("latin-1")]\n', "        return []\n"),
 
     ("a name read or bound is not read", TEST,
      "    if isinstance(node, ast.Name):\n        return [node.id]\n", ""),
@@ -75,7 +122,19 @@ MUTATIONS = [
     ("a keyword is not read", TEST,
      '        return [node.arg or ""]\n', "        return []\n"),
 
-    ("a comment line counts in a shipped file", TEST,
+    ("an `except ... as` name is not read", TEST,
+     "    if isinstance(node, ast.ExceptHandler):\n", "    if False:\n"),
+
+    ("a `global` or `nonlocal` name is not read", TEST,
+     "        return list(node.names)\n", "        return []\n"),
+
+    ("a `match` capture is not read", TEST,
+     "    if isinstance(node, (ast.MatchAs, ast.MatchStar)):\n", "    if False:\n"),
+
+    ("a `match` mapping's rest is not read", TEST,
+     '        return [node.rest or ""]\n', "        return []\n"),
+
+    ("a comment line counts in a file", TEST,
      '    kept = [line for line in lines if not line.lstrip().startswith("#")]\n',
      "    kept = lines\n"),
 
@@ -90,7 +149,7 @@ MUTATIONS = [
      '        text = re.sub(r"<!--.*?-->|/\\*.*?\\*/", "", text, flags=re.S)\n', ""),
 
     ("the scan reads the two packages only", TEST,
-     'for top in ("beeverforge", "openfactory", *SHIPPED):',
+     'for top in ("beeverforge", "openfactory", *SCANNED):',
      'for top in ("beeverforge", "openfactory"):'),
 
     ("the layer exempts every file", TEST,
@@ -101,7 +160,13 @@ MUTATIONS = [
      "            if path not in LAYER and names != PINNED.get(path, [])}",
      "            if path not in LAYER and path not in PINNED and names}"),
 
-    ("a module of the layer stops saying an old name, and its exemption outlives it",
-     "beeverforge/onboarding/migrate_folder.py",
-     'FORMER_DIR = ".openfactory"', 'FORMER_DIR = "." + "open" + "factory"'),
+    ("every file counts as claimed", TEST,
+     "    return sorted(set(allowed) - claimed)\n", "    return []\n"),
+
+    ("a claimed file needs no place in the lists", TEST,
+     "    return sorted([*gone, *(claimed - allowed)])\n", "    return sorted(gone)\n"),
+
+    ("an entry may claim no file", TEST,
+     "    return sorted([*gone, *(claimed - allowed)])\n",
+     "    return sorted(claimed - allowed)\n"),
 ]

@@ -269,7 +269,11 @@ Wednesday  the final, when nothing found in a candidate is open
   name readable "until X" adds its entry there, with `said`, the words a reader of the notes reads:
   every version's notes close their "Upgrade notes" with one item listing each entry's `said` and
   the release that stops reading it, made by `scripts/release_notes.py` from the register, so the
-  names stay announced in every release up to the one that drops them.
+  names stay announced in every release up to the one that drops them. The entry's `paths` names
+  the shipped files that still say the old name: they are the only files besides the
+  compatibility layer allowed an `openfactory` name
+  (`tests/test_new_code_says_no_openfactory_name.py`), so removing the entry fails that test until
+  those files stop saying it.
 
 **Exit:** no open `release-blocker`, and `main`'s CI is green on the commit to be cut.
 

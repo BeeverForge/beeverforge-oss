@@ -94,7 +94,7 @@ PYPROJECT = Path("pyproject.toml")
 #: release that stops reading it. Every version's notes say so, under "Upgrade notes" (#264).
 REGISTER = Path("beeverforge/deprecations.py")
 #: `Removal`'s fields, in the order its positional arguments fill them.
-_REMOVAL_FIELDS = ("key", "removed_in", "what", "said")
+_REMOVAL_FIELDS = ("key", "removed_in", "what", "said", "paths")
 
 _NAME = re.compile(r"^(?P<ref>[0-9]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})"
                    r"\.(?P<type>[a-z]+)\.md$")
