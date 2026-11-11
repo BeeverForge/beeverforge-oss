@@ -266,7 +266,10 @@ Wednesday  the final, when nothing found in a candidate is open
   still reads is one entry there with the release that removes it, and
   `tests/test_what_a_release_removes_is_registered.py` fails once the version on `main` reaches
   that release: remove the old path and its entry before the cut. A pull request that keeps an old
-  name readable "until X" adds its one-line entry there.
+  name readable "until X" adds its entry there, with `said`, the words a reader of the notes reads:
+  every version's notes close their "Upgrade notes" with one item listing each entry's `said` and
+  the release that stops reading it, made by `scripts/release_notes.py` from the register, so the
+  names stay announced in every release up to the one that drops them.
 
 **Exit:** no open `release-blocker`, and `main`'s CI is green on the commit to be cut.
 

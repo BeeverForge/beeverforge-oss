@@ -59,8 +59,9 @@ MUTATIONS = [
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',
      '''    words = re.sub(r"@(\\w)", lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))'''),
 
+    # RE-PINNED 2026-11-10 (#329): the rewrites run per piece outside code and links, in `_quieted`
     ("an entity is left live: `&` is not escaped", MACHINE,
-     '''    words = _ampersands_escaped(words)''',
+     '''    words = _escaped_ampersands(words)''',
      '''    words = words'''),
 
     ("an `&` the reviewer escaped gets a second backslash, which frees it", MACHINE,
@@ -164,7 +165,7 @@ MUTATIONS = [
      "    if autolink[2] in _LINKED_SCHEMES:"),
 
     ("an http autolink's `&` is escaped", MACHINE,
-     "            piece = kept if kept == link[0] else _escaped_ampersands(kept)",
+     "            piece = kept if kept == link[0] else _quieted(kept)",
      "            piece = _escaped_ampersands(kept)"),
 
     ("a bare link inside an autolink is read again on its own", MACHINE,
@@ -172,8 +173,8 @@ MUTATIONS = [
      "        if False:\n            continue"),
 
     ("where a row may open an HTML block, an autolink is left whole", MACHINE,
-     "        return _escaped_ampersands(_AN_AUTOLINK.sub(_unlinked, words))",
-     "        return _escaped_ampersands(words)"),
+     "        return _quieted(_AN_AUTOLINK.sub(_unlinked, words))",
+     "        return _quieted(words)"),
 
     ("a `[` no longer blocks a scheme link", MACHINE,
      '''    elif before == "[" or (before.isascii() and before.isalpha()):''',
