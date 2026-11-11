@@ -21,10 +21,18 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from beeverforge.deprecations import removed_in
+
 #: The schema id `pack.json` carries, and the `$id` of the published schema. MOVES WHEN THE SHAPE
 #: MOVES — a reader that cannot tell version 1 from version 2 half-understands a document it
 #: believes it understands.
 PACK_SCHEMA = "beeverforge.certify/1"
+
+#: The same shape as OpenFactory 0.7 wrote it (#264): its `pack.schema.json` at v0.7.0 differs
+#: from this one in the names only, so a pack a partner made with 0.7 is read, until the release
+#: the deprecation register names. The published schema lists it in `properties.schema.enum`.
+FORMER_PACK_SCHEMA = "openfactory.certify/1"
+FORMER_READ_UNTIL = removed_in("openfactory-documents")
 
 #: Where the published schema lives — inside the package, so the wheel carries it.
 PACK_SCHEMA_FILE = Path(__file__).with_name("pack.schema.json")

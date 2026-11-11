@@ -34,7 +34,9 @@ def test_the_schema_is_the_file_the_package_ships_and_names_its_version():
     published = json.loads(schema.PACK_SCHEMA_FILE.read_text())
 
     assert published["$id"] == schema.PACK_SCHEMA == "beeverforge.certify/1"
-    assert published["properties"]["schema"] == {"const": schema.PACK_SCHEMA}
+    # and the id OpenFactory 0.7 wrote the same shape under, read until 1.1 (#264)
+    assert published["properties"]["schema"] == {
+        "enum": [schema.PACK_SCHEMA, schema.FORMER_PACK_SCHEMA]}
     assert schema.pack_schema() == published
 
 

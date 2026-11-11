@@ -52,6 +52,13 @@ REMOVALS: tuple[Removal, ...] = (
             "`beeverforge.adapters` (`FORMER_GROUP` in `beeverforge/plugins.py`)",
             said="add-ons registered under the `openfactory.adapters` entry-point group, "
                  "now `beeverforge.adapters`"),
+    Removal("openfactory-documents", "1.1",
+            "OpenFactory 0.7's evidence pack and thresholds file, `openfactory.certify/1` and "
+            "`openfactory.certify.thresholds/1`, read by `beeverforge certify verify` "
+            "(`FORMER_PACK_SCHEMA` and its `enum` entry in `beeverforge/certify/schema.py` and "
+            "`pack.schema.json`, `FORMER_THRESHOLDS_SCHEMA` in `beeverforge/certify/verify.py`)",
+            said="OpenFactory 0.7's evidence packs and thresholds files, `openfactory.certify/1` "
+                 "and `openfactory.certify.thresholds/1`, read by `beeverforge certify verify`"),
     Removal("openfactory-temporal-names", "1.0",
             "OpenFactory 0.7's Temporal task queue, polled by a second worker, and its "
             "`openfactory-` workflow ids, read beside BeeverForge's "

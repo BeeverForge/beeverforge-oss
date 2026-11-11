@@ -34,6 +34,7 @@ def _rows() -> dict[str, str]:
     ("add-on entry points under `openfactory.adapters`", "openfactory-adapters"),
     ("`import openfactory`", "openfactory-import"),
     ("the `openfactory` command", "openfactory-command"),
+    ("an evidence pack (`openfactory.certify/1`)", "openfactory-documents"),
     ("the Temporal task queue `openfactory-jobs`", "openfactory-temporal-names"),
 ])
 def test_each_former_name_is_read_until_the_release_the_register_names(starts, key):

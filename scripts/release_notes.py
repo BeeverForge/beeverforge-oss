@@ -209,7 +209,10 @@ def still_read(register: Path = REGISTER) -> tuple[list[tuple[str, str]], str | 
     """`(said, removed_in)` for each entry of the removal register, in its order, and a sentence
     when the register is there and cannot be read. READ, NEVER IMPORTED: this runs on a bare
     runner's `python3`, and the register's own module is the package's. No register is no entry:
-    a tree without one has nothing to announce."""
+    a tree without one has nothing to announce. Nothing here compares `removed_in` with the
+    version rendered: an entry whose release is reached never reaches its notes because
+    `tests/test_what_a_release_removes_is_registered.py` refuses to cut that release while the
+    entry is in the register, so a past-due entry is a failed cut, never a stale row."""
     if not register.is_file():
         return [], None
     try:
