@@ -9,7 +9,7 @@
                "window", "providers", "controls", "outcomes", "proofs", "consent", "salt_id",
                "signature", "unsigned_because", "not_in_this_pack", "checksums"],
   "properties": {
-    "schema": {"const": "beeverforge.certify/1"},
+    "schema": {"enum": ["beeverforge.certify/1", "openfactory.certify/1"]},
     "generated_at": {"$ref": "#/$defs/instant"},
     "platform": {
       "type": "object",

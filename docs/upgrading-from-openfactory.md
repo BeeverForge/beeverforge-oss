@@ -8,7 +8,9 @@ when, and the steps for each kind of deployment.
 ## What keeps working, and until when
 
 Each former name below is still read. `beeverforge doctor <project>` lists every one a deployment
-still uses on its `former_names` line, each with the name to use instead.
+still uses on its `former_names` line, each with the name to use instead. A document handed to
+`beeverforge certify verify` is not part of the deployment: that command says on its own `schema`
+line when it read a document under its OpenFactory 0.7 name.
 
 | OpenFactory 0.7 | BeeverForge | Read until |
 |---|---|---|
@@ -19,6 +21,7 @@ still uses on its `former_names` line, each with the name to use instead.
 | add-on entry points under `openfactory.adapters` | `beeverforge.adapters` | 1.1 |
 | `import openfactory`, `from openfactory.<module> import …` | `beeverforge`, `beeverforge.<module>` | 1.1 |
 | the `openfactory` command | `beeverforge` | 1.1 |
+| an evidence pack (`openfactory.certify/1`) or a thresholds file (`openfactory.certify.thresholds/1`) handed to `beeverforge certify verify` | `beeverforge.certify/1`, `beeverforge.certify.thresholds/1` | 1.1 |
 | the Temporal task queue `openfactory-jobs` and `openfactory-*` workflow ids | BeeverForge's queue and ids | 1.0 |
 
 What changes outright, with nothing to rename by hand:
