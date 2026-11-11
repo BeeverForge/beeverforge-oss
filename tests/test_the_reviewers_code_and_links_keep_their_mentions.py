@@ -120,6 +120,11 @@ def test_a_span_outside_a_table_keeps_its_pipe_and_its_mentions(words: str) -> N
     ("see `RESOLVED owner/repo#5` x", "see `RESOLVED owner/repo card 5` x"),
     ("```\nfixed #6\n```", "fixed card 6"),
     ("see https://ex.com/closes#7 x", "see https://ex.com/closes#7 x"),
+    # review of #521: `GH-N` and a link to the issue are closing references too
+    ("see `Closes GH-12` x", "see `Closes card 12` x"),
+    ("see `fixes https://github.com/owner/repo/issues/8` x", "see `fixes owner/repo card 8` x"),
+    ("Resolves https://github.com/owner/repo/pull/9 now", "Resolves owner/repo card 9 now"),
+    ("see https://github.com/owner/repo/issues/10 x", "see https://github.com/owner/repo/issues/10 x"),
 ])
 def test_a_closing_keyword_in_kept_code_closes_nothing(words: str, kept: str) -> None:
     for where, rows in _both(words):

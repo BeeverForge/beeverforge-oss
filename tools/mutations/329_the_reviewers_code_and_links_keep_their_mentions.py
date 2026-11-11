@@ -63,20 +63,36 @@ MUTATIONS = [
      "    return _quieted_outside_code_and_links(words)"),
 
     ("only `closes` is a closing keyword", MACHINE,
-     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
-     '''    r"\\b((?:close[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",'''),
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+)"''',
+     '''    r"\\b((?:close[sd]?):?\\s+)"'''),
 
     ("a closing keyword is read in lower case only", MACHINE,
      "    re.IGNORECASE)\n#: A row that may open an HTML block",
      "    )\n#: A row that may open an HTML block"),
 
     ("a cross-repository reference after a closing keyword is kept", MACHINE,
-     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
-     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+)#(?=\\d)",'''),
+     '''    r"(?:([\\w.-]+/[\\w.-]+)?#|GH-|https?://[^/\\s]+/([\\w.-]+/[\\w.-]+)/(?:issues|pull)/)(?=\\d)",''',
+     '''    r"(?:()#|GH-|https?://[^/\\s]+/([\\w.-]+/[\\w.-]+)/(?:issues|pull)/)(?=\\d)",'''),
+
+    ("`GH-<number>` after a closing keyword is kept", MACHINE,
+     '''    r"(?:([\\w.-]+/[\\w.-]+)?#|GH-|https?://[^/\\s]+/([\\w.-]+/[\\w.-]+)/(?:issues|pull)/)(?=\\d)",''',
+     '''    r"(?:([\\w.-]+/[\\w.-]+)?#|https?://[^/\\s]+/([\\w.-]+/[\\w.-]+)/(?:issues|pull)/)(?=\\d)",'''),
+
+    ("a link to the issue after a closing keyword is kept", MACHINE,
+     '''    r"(?:([\\w.-]+/[\\w.-]+)?#|GH-|https?://[^/\\s]+/([\\w.-]+/[\\w.-]+)/(?:issues|pull)/)(?=\\d)",''',
+     '''    r"(?:([\\w.-]+/[\\w.-]+)?#|GH-|(?!)())(?=\\d)",'''),
+
+    ("a link's repository is dropped from its card", MACHINE,
+     "    repository = reference[2] or reference[3]",
+     "    repository = reference[2]"),
+
+    ("a link to an issue is rewritten with no closing keyword before it", MACHINE,
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+)"''',
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+|see )"'''),
 
     ("every `#<number>` in kept code is rewritten", MACHINE,
-     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+(?:[\\w.-]+/[\\w.-]+)?)#(?=\\d)",''',
-     '''    r"()#(?=\\d)",'''),
+     '''    r"\\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\\s+)"''',
+     '''    r"()"'''),
 
     ("a name is left live outside code", MACHINE,
      '''    words = _A_HANDLE.sub(lambda m: f"@\\u200b{m.group(1)}", without_mentions(words))''',

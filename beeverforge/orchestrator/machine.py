@@ -582,12 +582,17 @@ _A_FENCE = re.compile(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 #: is plain text where a name mentions (review of #521, rendered with cmark-gfm).
 _A_TABLE_DELIMITER = re.compile(r"^[ \t>]*(?=[^\n]*\|)\|?[ \t]*:?-+:?[ \t]*"
                                 r"(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$", re.MULTILINE)
-#: A reference a closing keyword is read on, `Closes #12` or `fixes: owner/repo#12` in any case. A
+#: A reference a closing keyword is read on, in any case: `Closes #12`, `fixes: owner/repo#12`,
+#: `resolves GH-12` and `closes https://github.com/owner/repo/issues/12` (or `/pull/12`). A
 #: COMMIT MESSAGE has no code span: `gh pr merge --squash` sends no body, so a repository whose
 #: squash default is the pull request's title and description writes the body into the commit,
 #: and a closing keyword there closes the issue it names on the default branch (review of #521).
+#: GitHub documents the first two forms only. The other two are rewritten because a missed one
+#: closes an issue and an extra one only changes the words. Whether they close from a commit
+#: message was NOT MEASURED: that takes a commit on a repository's default branch.
 _A_CLOSING_REFERENCE = re.compile(
-    r"\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:[\w.-]+/[\w.-]+)?)#(?=\d)",
+    r"\b((?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+)"
+    r"(?:([\w.-]+/[\w.-]+)?#|GH-|https?://[^/\s]+/([\w.-]+/[\w.-]+)/(?:issues|pull)/)(?=\d)",
     re.IGNORECASE)
 #: A row that may open an HTML block, where an entity decodes even between backticks or fences: an
 #: autolink (`<https://…>`) is not one.
@@ -776,9 +781,14 @@ def _without_reviewer_mentions(words: str) -> str:
 
 def _closing_references_broken(words: str) -> str:
     """`words` with every reference a closing keyword is read on written `card <number>`: `Closes
-    #12` reads `Closes card 12`, and `fixes owner/repo#12` reads `fixes owner/repo card 12`."""
-    return _A_CLOSING_REFERENCE.sub(
-        lambda m: f"{m[1]}{' ' if m[1][-1:].strip() else ''}card ", words)
+    #12` and `Closes GH-12` read `Closes card 12`, and `fixes owner/repo#12` and a link to that
+    issue or pull request read `fixes owner/repo card 12`."""
+    return _A_CLOSING_REFERENCE.sub(_as_card, words)
+
+
+def _as_card(reference: re.Match[str]) -> str:
+    repository = reference[2] or reference[3]
+    return f"{reference[1]}{f'{repository} ' if repository else ''}card "
 
 
 def _sections_from(rows: list[str]) -> int:
