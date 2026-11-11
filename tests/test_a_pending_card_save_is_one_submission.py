@@ -23,7 +23,7 @@ nodes['#boardview .drawer']={innerHTML:'',classList:{add(){}},setAttribute(){}};
 
 
 def saved(scenario: str) -> dict:
-    return run(scenario, "_blank", "boardSaveCard", "paintForm", stubs=STUBS)
+    return run(scenario, "_blank", "boardSaveCard", "paintForm", "_bpaintCandidates", stubs=STUBS)
 
 
 @pytest.mark.parametrize("mode", ["new", "edit"])
