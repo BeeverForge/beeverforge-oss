@@ -595,10 +595,14 @@ class ContainerSandbox(SandboxAdapter):
             # is how a deployment lets a daemon that runs as ANOTHER uid in — a rootless daemon,
             # measured: `docker run` exited 126, `chdir to cwd ("/workspace") ... permission
             # denied`. Its default ACL is inherited, but a new directory's ACL mask is its mode's
-            # group bits, `---` for 0700, so the entry reads `#effective:---`; a setgid group work
-            # dir is shut out the same way. 0770 opens the mask and the group, never "other".
-            # `chmod`, not a mode handed to a mkdir, because the umask does not touch it.
-            os.chmod(host_clone, _SHARED_WORKSPACE_MODE)
+            # group bits, `---` for 0700, so the entry reads `#effective:---`. 0770 opens the mask
+            # and the group, never "other". `chmod`, not a mode handed to a mkdir, because the
+            # umask does not touch it. What this covers is a work dir shared through a DEFAULT
+            # ACL. The setgid bit a group-shared work dir hands down is kept (dropping it gives
+            # every directory the clone makes the core's own group), but that case also needs the
+            # core to run with umask 0002/0007: under 0022 the clone's subdirectories are 0755
+            # and the box's `git commit` is still refused.
+            os.chmod(host_clone, _SHARED_WORKSPACE_MODE | (host_clone.stat().st_mode & 0o2000))
         base_commit = _materialize_workspace(repo_path=repo_path, host_clone=host_clone,
                                              base_branch=base_branch, branch=branch,
                                              checkout_existing=checkout_existing,

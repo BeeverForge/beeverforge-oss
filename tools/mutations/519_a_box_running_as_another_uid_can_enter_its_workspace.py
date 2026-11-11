@@ -1,4 +1,4 @@
-"""#519: a workspace made in the shared work dir lets the box daemon's group or ACL principal in.
+"""#519: a workspace made in the shared work dir lets the box daemon's ACL principal in.
 
 The reverses matter as much as the forwards: a workspace opened to "other" lets every uid on the
 host into a client's checkout, and one opened without a shared work dir opens the system temp
@@ -10,7 +10,8 @@ BOX = "beeverforge/adapters/sandbox/container.py"
 
 MUTATIONS = [
     ("the workspace stays 0700 — the inherited ACL entry is masked and the box exits 126", BOX,
-     "            os.chmod(host_clone, _SHARED_WORKSPACE_MODE)\n", "            pass\n"),
+     "            os.chmod(host_clone, _SHARED_WORKSPACE_MODE | (host_clone.stat().st_mode & 0o2000))\n",
+     "            pass\n"),
 
     ("…and the reverse: the workspace is opened to every uid on the host", BOX,
      "_SHARED_WORKSPACE_MODE = 0o770\n", "_SHARED_WORKSPACE_MODE = 0o777\n"),

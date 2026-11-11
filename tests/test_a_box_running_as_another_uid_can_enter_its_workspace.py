@@ -9,6 +9,11 @@ refused to start, measured: `docker run` exited 126, `chdir to cwd ("/workspace"
 config.json failed: permission denied`. `chmod 0770` on the directory made the same `docker run`
 write.
 
+What this covers is a work dir shared through a DEFAULT ACL. A work dir shared through a setgid
+group keeps its setgid bit on the workspace (tested below), but that case also needs the core to
+run with umask 0002/0007: under 0022 the clone's subdirectories are 0755 and the box's
+`git commit` is still refused. Nothing here claims more.
+
 The clone is stubbed: what is measured is the directory `prepare` hands to `docker run -v`, not
 git, so these tests run no git and wait on nothing.
 """
@@ -102,3 +107,34 @@ def test_the_work_dirs_default_acl_entry_is_effective_on_the_new_workspace(monke
     assert f"user:{_OTHER_UID}:rwx" in acl, f"the work dir's entry was not inherited: {acl}"
     assert "mask::rwx" in acl, (
         f"the inherited entry for uid {_OTHER_UID} is masked, so that uid cannot enter: {acl}")
+
+
+def test_a_workspace_in_a_setgid_work_dir_keeps_the_setgid_bit(monkeypatch, tmp_path):
+    """A work dir shared through a group is setgid so what is made in it carries the group; a
+    chmod that drops the bit hands every directory the clone makes to the core's own group."""
+    work = tmp_path / "work"
+    work.mkdir()
+    os.chmod(work, 0o2770)
+    host_clone = _workspace(monkeypatch, work)
+    assert host_clone.stat().st_mode & stat.S_ISGID
+
+
+def test_the_workspace_is_open_when_docker_run_mounts_it(monkeypatch, tmp_path):
+    """The mode that matters is the one `docker run` meets: chmod after it is too late, the
+    daemon has already refused to chdir into /workspace (exit 126)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv("BEEVERFORGE_WORK_DIR", str(work))
+    monkeypatch.setattr(mod, "_materialize_workspace", lambda **_: "0" * 40)
+    seen = []
+
+    def host(args, timeout=None, env=None):
+        if args[:2] == ["docker", "run"]:
+            mount = args[args.index("-w") - 1]
+            seen.append(stat.S_IMODE(os.stat(mount.rsplit(":", 1)[0]).st_mode) & 0o777)
+        return 0, ""
+
+    monkeypatch.setattr(mod, "_host", host)
+    ContainerSandbox(image="img", project="acme").prepare(
+        repo_path=Path("unused"), base_branch="main", branch="beeverforge/12")
+    assert seen == [0o770]
