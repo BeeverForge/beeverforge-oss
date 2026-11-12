@@ -19,6 +19,7 @@ import pytest
 
 from beeverforge import agent_answer as aa
 from beeverforge.adapters.agent.base import smoke_challenge, smoke_command_for, smoke_reply_for
+from beeverforge.adapters.agent.registry import _judging, build_executor
 
 _FIXED = lambda: ("What is 78 plus 59? Reply with the number alone.", "137")  # noqa: E731
 
@@ -79,6 +80,57 @@ def test_every_shipped_harness_offers_a_smallest_call(module, klass):
     assert command, f"{klass} offers no smallest call"
     assert "/opt/tb/bin/x" in command, f"{klass} did not use the path the box chose: {command}"
     assert "Q?" in command, f"{klass} does not carry the question: {command}"
+
+
+def _project(**kw):
+    from beeverforge.contracts.project import Project
+
+    return Project(name="p", repo_path="/tmp/p", **kw)
+
+
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+def test_the_question_is_asked_with_the_model_the_project_runs(kind):
+    """THE CHECK MUST ASK THE MODEL THE TICKETS RUN, or it proves a different route.
+
+    `box answer` builds the project's EXECUTOR and asks it one question. The claude adapter keeps
+    two model slots and the registry fills only `executor_model` on an executor build (the
+    judging paths must not move with it, see test_the_model_is_a_per_project_choice.py), while the
+    smallest call read the OTHER slot. So it went out with no `--model`, and Claude Code asked the
+    endpoint for its built-in default name. On a Foundry resource whose only deployment carries
+    another name that is a 404 `model_not_found` (measured 2026-11-12: `claude-sonnet-4-5`, then
+    `claude-sonnet-4`, both refused, the project's own deployment never tried) — the one command
+    that exists to say "the agent can complete a call" said "no" about a route that completes
+    calls, and said it for a reason that has nothing to do with the route.
+
+    codex, kimi and opencode fall back to the project's model in that slot already; the claude row
+    is the one that did not, and the four are held together here so the next harness cannot be
+    the fifth."""
+    agent = build_executor(_project(harness=kind, model="vendor/coder-1"))
+
+    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
+
+    assert "vendor/coder-1" in command, f"{kind} asked without the project's model: {command}"
+
+
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+def test_a_project_with_no_model_is_asked_with_none(kind):
+    """The regression side: every deployment that has not chosen a model must not get one
+    invented. A `--model` out of nowhere would pin it to whatever string this code made up."""
+    agent = build_executor(_project(harness=kind))
+
+    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
+
+    assert "--model" not in command and " -m " not in command, command
+
+
+def test_a_judging_build_is_still_asked_with_its_own_model():
+    """The slot the smallest call prefers is the executor's, and a judging build has none: it
+    must fall through to the model it was built with, not to the harness default."""
+    agent = _judging("claude_code", "techlead", _project(model="judge-1"))
+
+    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
+
+    assert "judge-1" in command, command
 
 
 def test_a_harness_from_elsewhere_is_allowed_not_to_offer_one():
