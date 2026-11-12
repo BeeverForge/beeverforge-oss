@@ -233,6 +233,10 @@ second URL reads as more modular.
 Small and focused beats large and mixed. State what you measured, not just what you changed.
 CI runs the same ruff + pytest you ran locally.
 
+**A person merges every pull request here, including the factory's.** This repository is itself
+worked on by a factory, and its own manifest, `.beeverforge/project.yaml`, declares
+`merge_policy: human`: the factory opens the pull request and stops, and a reviewer merges it.
+
 **Every pull request targets `main`**, even a fix a released version needs: the release manager
 copies it to the release branch afterwards (`backport-X.Y`). The milestone on a pull request says
 which version it may ship in. [docs/RELEASING.md](docs/RELEASING.md) is the whole process.
