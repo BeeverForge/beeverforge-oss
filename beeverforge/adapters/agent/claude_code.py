@@ -827,9 +827,18 @@ class ClaudeCodeAdapter(CodingAgentAdapter):
         BUILT BY THE SAME `_cli` A TICKET GOES THROUGH, so what it exercises is the invocation
         that actually runs — the harness binary at the path the box chose, its own flags, its own
         credential. A probe assembled by hand here would prove a command nothing issues, which is
-        how #122 survived every check: `curl` reached the endpoint while the harness could not."""
-        return self._cli(prompt, harness=harness, tools=[], model=self.planner_model,
-                         phase="chat")
+        how #122 survived every check: `curl` reached the endpoint while the harness could not.
+
+        THE MODEL IS THE ONE `execute` RUNS: `executor_model`, and none when that is none. `box
+        answer` builds the project's executor, and `registry._claude` fills only `executor_model`
+        on that build, so asking with `planner_model` sent no `--model` and the CLI asked the
+        endpoint for its built-in default name: a 404 on a resource that serves the project's
+        deployment under another name (measured 2026-11-12), refused before the route was ever
+        tried. Falling back to `planner_model` would be the same defect the other way round: with
+        `BEEVERFORGE_PLANNER_MODEL` set and no project model, the tickets run the CLI's default and
+        the question would ask the planner's (#535)."""
+        return self._cli(prompt, harness=harness, tools=[],
+                         model=self.executor_model, phase="chat")
 
     def smoke_reply(self, out: str) -> str:
         """What the model said to `smoke_command`: the `result` of the stream's `result` event,

@@ -19,6 +19,7 @@ import pytest
 
 from beeverforge import agent_answer as aa
 from beeverforge.adapters.agent.base import smoke_challenge, smoke_command_for, smoke_reply_for
+from beeverforge.adapters.agent.registry import build_executor
 
 _FIXED = lambda: ("What is 78 plus 59? Reply with the number alone.", "137")  # noqa: E731
 
@@ -79,6 +80,66 @@ def test_every_shipped_harness_offers_a_smallest_call(module, klass):
     assert command, f"{klass} offers no smallest call"
     assert "/opt/tb/bin/x" in command, f"{klass} did not use the path the box chose: {command}"
     assert "Q?" in command, f"{klass} does not carry the question: {command}"
+
+
+def _project(**kw):
+    from beeverforge.contracts.project import Project
+
+    return Project(name="p", repo_path="/tmp/p", **kw)
+
+
+def _model_asked(agent) -> list[str]:
+    """The `--model` the harness would be started with, READ THE WAY THE HARNESS READS IT: the
+    command is split as a shell splits it and the flag's value is taken, so the model's name
+    turning up somewhere else in the command (the question, a path) cannot satisfy a test."""
+    import shlex
+
+    words = shlex.split(smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?"))
+    return [w.split("=", 1)[1] for w in words if w.startswith("--model=")]
+
+
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+def test_the_question_is_asked_with_the_model_the_project_runs(kind):
+    """THE CHECK MUST ASK THE MODEL THE TICKETS RUN, or it proves a different route.
+
+    `box answer` builds the project's EXECUTOR and asks it one question. The claude adapter keeps
+    two model slots and the registry fills only `executor_model` on an executor build (the
+    judging paths must not move with it, see test_the_model_is_a_per_project_choice.py), while the
+    smallest call read the OTHER slot. So it went out with no `--model`, and Claude Code asked the
+    endpoint for its built-in default name. On a Foundry resource whose only deployment carries
+    another name that is a 404 `model_not_found` (measured 2026-11-12: `claude-sonnet-4-5`, then
+    `claude-sonnet-4`, both refused, the project's own deployment never tried) — the one command
+    that exists to say "the agent can complete a call" said "no" about a route that completes
+    calls, and said it for a reason that has nothing to do with the route."""
+    agent = build_executor(_project(harness=kind, model="vendor/coder-1"))
+
+    assert _model_asked(agent) == ["vendor/coder-1"], kind
+
+
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+def test_a_project_with_no_model_is_asked_with_none(kind):
+    """The regression side: every deployment that has not chosen a model must not get one
+    invented. A `--model` out of nowhere would pin it to whatever string this code made up."""
+    agent = build_executor(_project(harness=kind))
+
+    assert _model_asked(agent) == [], kind
+
+
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+@pytest.mark.parametrize("model", ["vendor/coder-1", None])
+def test_a_planner_model_in_the_environment_does_not_move_the_question(kind, model, monkeypatch):
+    """BEEVERFORGE_PLANNER_MODEL is documented (configuration §10) and a production default, so
+    the check has to hold with it set: the question goes out with the model `execute` runs, and
+    with none when that is none. Three harnesses read their planner slot for the question, and
+    that slot is `BEEVERFORGE_PLANNER_MODEL or self.model` — a different model than the tickets'
+    whenever the variable is set, so the check answered about a route the tickets do not take: it
+    said "no" when only the planner's deployment was missing, and "ANSWERED" when only the
+    tickets' was. The suite never saw it because `conftest` removes every BEEVERFORGE_* variable
+    before each test."""
+    monkeypatch.setenv("BEEVERFORGE_PLANNER_MODEL", "vendor/planner-9")
+    agent = build_executor(_project(harness=kind, **({"model": model} if model else {})))
+
+    assert _model_asked(agent) == ([model] if model else []), kind
 
 
 def test_a_harness_from_elsewhere_is_allowed_not_to_offer_one():
