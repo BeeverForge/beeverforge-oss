@@ -1,0 +1,51 @@
+# This repository's own project manifest: how BeeverForge installs and validates the core when
+# it builds the core. The annotated reference for every key is docs/project.yaml.example.
+version: 1
+base_branch: main
+
+# A human merges every change to the core.
+merge_policy: human
+# A rejected review fails the job (bounded review-repair first, then a human) rather than
+# commenting and letting the merge through (ADR-0014).
+review_mode: blocking
+
+# A VENV INSIDE THE CHECKOUT, never the environment the worker itself runs in: the worktree box
+# runs these commands in the worker's own process environment, so a bare `pip install -e .` would
+# re-point the running platform's editable install at a throwaway worktree. `.venv/` is gitignored.
+# Python 3.12 where the machine has it, as CI runs; the dev extra and constraints.txt as
+# `make install` installs them.
+setup:
+  - "$(command -v python3.12 || command -v python3) -m venv .venv"
+  - ".venv/bin/pip install -q -U pip"
+  - ".venv/bin/pip install -q -e '.[dev]' $([ -f constraints.txt ] && echo -c constraints.txt)"
+
+validate:
+  # The suite as CI cuts it (.github/workflows/ci.yml, `make test-unit`/`test-integration`/
+  # `test-alone`): everything in parallel except the tests marked `alone`, which assert their own
+  # CPU time and so run afterwards in one process with no xdist neighbours on their cores.
+  # ~18k tests: 60 minutes, not the 30-minute default.
+  test:
+    timeout_minutes: 60
+    command: |
+      .venv/bin/python -m pytest -q -n 4 -m "not alone"
+      .venv/bin/python -m pytest -q -p no:xdist -m alone
+  lint: ".venv/bin/ruff check beeverforge/ tests/"
+  # ADVISORY: mypy is configured in pyproject.toml but CI does not gate on it yet, and the tree
+  # does not type-check clean, so a blocking gate would fail every change.
+  type:
+    command: ".venv/bin/mypy beeverforge"
+    advisory: true
+  security:
+    command: ".venv/bin/bandit -r beeverforge -ll -q"
+    advisory: true
+    timeout_minutes: 20
+
+# THE ADRs ARE INDEXED (path + title each), NOT INLINED. `docs.constraints` inlines every file it
+# matches, and the prompt travels as a single argv token, so this repository's ADRs together pass
+# Linux's 128 KiB single-argument ceiling (#326). The agent opens the ADRs it needs from the
+# checkout. Move them to `constraints:` once the prompt no longer travels in the argv.
+docs:
+  architecture: docs/adr/**
+
+# Repo-wide gates: the core is one Python package.
+components: {}
