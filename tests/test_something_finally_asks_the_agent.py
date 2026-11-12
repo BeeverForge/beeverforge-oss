@@ -19,7 +19,7 @@ import pytest
 
 from beeverforge import agent_answer as aa
 from beeverforge.adapters.agent.base import smoke_challenge, smoke_command_for, smoke_reply_for
-from beeverforge.adapters.agent.registry import _judging, build_executor
+from beeverforge.adapters.agent.registry import build_executor
 
 _FIXED = lambda: ("What is 78 plus 59? Reply with the number alone.", "137")  # noqa: E731
 
@@ -88,6 +88,16 @@ def _project(**kw):
     return Project(name="p", repo_path="/tmp/p", **kw)
 
 
+def _model_asked(agent) -> list[str]:
+    """The `--model` the harness would be started with, READ THE WAY THE HARNESS READS IT: the
+    command is split as a shell splits it and the flag's value is taken, so the model's name
+    turning up somewhere else in the command (the question, a path) cannot satisfy a test."""
+    import shlex
+
+    words = shlex.split(smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?"))
+    return [w.split("=", 1)[1] for w in words if w.startswith("--model=")]
+
+
 @pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
 def test_the_question_is_asked_with_the_model_the_project_runs(kind):
     """THE CHECK MUST ASK THE MODEL THE TICKETS RUN, or it proves a different route.
@@ -100,16 +110,10 @@ def test_the_question_is_asked_with_the_model_the_project_runs(kind):
     another name that is a 404 `model_not_found` (measured 2026-11-12: `claude-sonnet-4-5`, then
     `claude-sonnet-4`, both refused, the project's own deployment never tried) — the one command
     that exists to say "the agent can complete a call" said "no" about a route that completes
-    calls, and said it for a reason that has nothing to do with the route.
-
-    codex, kimi and opencode fall back to the project's model in that slot already; the claude row
-    is the one that did not, and the four are held together here so the next harness cannot be
-    the fifth."""
+    calls, and said it for a reason that has nothing to do with the route."""
     agent = build_executor(_project(harness=kind, model="vendor/coder-1"))
 
-    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
-
-    assert "vendor/coder-1" in command, f"{kind} asked without the project's model: {command}"
+    assert _model_asked(agent) == ["vendor/coder-1"], kind
 
 
 @pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
@@ -118,19 +122,24 @@ def test_a_project_with_no_model_is_asked_with_none(kind):
     invented. A `--model` out of nowhere would pin it to whatever string this code made up."""
     agent = build_executor(_project(harness=kind))
 
-    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
-
-    assert "--model" not in command and " -m " not in command, command
+    assert _model_asked(agent) == [], kind
 
 
-def test_a_judging_build_is_still_asked_with_its_own_model():
-    """The slot the smallest call prefers is the executor's, and a judging build has none: it
-    must fall through to the model it was built with, not to the harness default."""
-    agent = _judging("claude_code", "techlead", _project(model="judge-1"))
+@pytest.mark.parametrize("kind", ["claude_code", "codex", "kimi", "opencode"])
+@pytest.mark.parametrize("model", ["vendor/coder-1", None])
+def test_a_planner_model_in_the_environment_does_not_move_the_question(kind, model, monkeypatch):
+    """BEEVERFORGE_PLANNER_MODEL is documented (configuration §10) and a production default, so
+    the check has to hold with it set: the question goes out with the model `execute` runs, and
+    with none when that is none. Three harnesses read their planner slot for the question, and
+    that slot is `BEEVERFORGE_PLANNER_MODEL or self.model` — a different model than the tickets'
+    whenever the variable is set, so the check answered about a route the tickets do not take: it
+    said "no" when only the planner's deployment was missing, and "ANSWERED" when only the
+    tickets' was. The suite never saw it because `conftest` removes every BEEVERFORGE_* variable
+    before each test."""
+    monkeypatch.setenv("BEEVERFORGE_PLANNER_MODEL", "vendor/planner-9")
+    agent = build_executor(_project(harness=kind, **({"model": model} if model else {})))
 
-    command = smoke_command_for(agent, harness="/opt/tb/bin/x", prompt="Q?")
-
-    assert "judge-1" in command, command
+    assert _model_asked(agent) == ([model] if model else []), kind
 
 
 def test_a_harness_from_elsewhere_is_allowed_not_to_offer_one():

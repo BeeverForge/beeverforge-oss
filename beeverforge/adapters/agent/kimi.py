@@ -260,8 +260,13 @@ class KimiAdapter:
         BUILT BY THE SAME `_cli` A TICKET GOES THROUGH, so what it exercises is the invocation
         that actually runs — the harness binary at the path the box chose, its own flags, its own
         credential. A probe assembled by hand here would prove a command nothing issues, which is
-        how #122 survived every check: `curl` reached the endpoint while the harness could not."""
-        return self._cli(prompt, harness=harness, model=self.planner_model)
+        how #122 survived every check: `curl` reached the endpoint while the harness could not.
+
+        THE MODEL IS THE ONE `execute` RUNS, NOT THE PLANNER'S. `planner_model` is
+        `BEEVERFORGE_PLANNER_MODEL or self.model`, so with that variable set (a production
+        default) the question went to a different deployment than the tickets: it said "no" when
+        only the planner's was missing, and "ANSWERED" when only the tickets' was (#535)."""
+        return self._cli(prompt, harness=harness, model=self.model)
 
     def smoke_reply(self, out: str) -> str:
         """What the model said to `smoke_command`, read by `_final_text` — the reading this
