@@ -23,11 +23,14 @@ validate:
   # The suite as CI cuts it (.github/workflows/ci.yml, `make test-unit`/`test-integration`/
   # `test-alone`): everything in parallel except the tests marked `alone`, which assert their own
   # CPU time and so run afterwards in one process with no xdist neighbours on their cores.
-  # ~18k tests: 60 minutes, not the 30-minute default.
+  # `--dist loadgroup` keeps the `xdist_group("docker")` tests on one worker, as CI does. The box
+  # runs this string in one shell, which exits with its last command's status, so `set -e` makes
+  # a failure in the first run fail the gate. ~18k tests: 60 minutes, not the 30-minute default.
   test:
     timeout_minutes: 60
     command: |
-      .venv/bin/python -m pytest -q -n 4 -m "not alone"
+      set -e
+      .venv/bin/python -m pytest -q -n 4 --dist loadgroup -m "not alone"
       .venv/bin/python -m pytest -q -p no:xdist -m alone
   lint: ".venv/bin/ruff check beeverforge/ tests/"
   # ADVISORY: mypy is configured in pyproject.toml but CI does not gate on it yet, and the tree
