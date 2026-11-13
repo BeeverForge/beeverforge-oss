@@ -31,6 +31,7 @@ from beeverforge import actions
 from beeverforge import box_prove as bp
 from beeverforge.actions import catalog
 from beeverforge.box_prove import Finding, Proof
+from beeverforge.factory import resolve_box_image as _real_resolve_box_image
 
 
 @pytest.fixture
@@ -234,8 +235,7 @@ async def test_a_ref_that_cannot_be_read_is_said_without_the_credential_in_its_u
     assert "exited 128" in caplog.text and "ghs_live" not in caplog.text
 
 
-async def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, monkeypatch,
-                                                                         tmp_path):
+def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, monkeypatch, tmp_path):
     """The row waits for the code by its declaration (#992), so `perform` says it in the sentence
     every door says. A proof that started would read `repo_path` — empty — as the product."""
     reg = tmp_path / "codeless.yaml"
@@ -249,10 +249,18 @@ async def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, 
 
     monkeypatch.setattr(bp, "prove_the_box", started)
 
-    out = await actions.perform("box_prove", by=_shell(), project="myapp")
+    out = asyncio.run(actions.perform("box_prove", by=_shell(), project="myapp"))
 
     assert not out.ok and out.data["reason"] == actions.NO_CODE_YET, out.message
     assert "first-source myapp" in out.message and demo.boxes == []
+
+    from beeverforge.cli import app as cli
+
+    result = CliRunner().invoke(cli, ["box", "prove", "myapp"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.startswith("✗ ") and "first-source myapp" in result.output, result.output
+    assert demo.boxes == []
 
 
 @pytest.mark.parametrize("in_the_shell", [True, False], ids=["host", "worker"])
@@ -311,6 +319,54 @@ async def test_a_second_ask_while_a_proof_runs_answers_the_same_handle(demo, eng
     assert first.data["handle"] == second.data["handle"]
     assert (first.data["joined"], second.data["joined"]) == (False, True)
     assert len(engine.started) == 1
+
+
+async def test_away_from_the_shell_an_unknown_sandbox_is_refused_before_anything_starts(demo,
+                                                                                         engine):
+    """The worker could not open a box it does not know: answering `running` would be a proof
+    that never runs, said as one that does."""
+    out = await actions.perform("box_prove", by=_panel(), project="demo", sandbox="nonsuch")
+
+    assert not out.ok and out.code == actions.INVALID and out.data["reason"]
+    assert "nonsuch" in out.message and "Nothing was started" in out.message, out.message
+    assert engine.started == [] and demo.boxes == []
+
+
+async def test_away_from_the_shell_an_image_the_box_cannot_honour_is_refused(demo, engine,
+                                                                            monkeypatch, tmp_path):
+    """A project that declares `box.image`, asked to prove in a `worktree` box, which runs none —
+    refused as `_start` refuses it, before the worker is asked."""
+    from beeverforge import factory
+
+    reg = tmp_path / "imaged.yaml"
+    reg.write_text(json.dumps({"projects": {"demo": {
+        "name": "demo", "repo": "acme/demo", "repo_path": "https://github.com/acme/demo.git",
+        "box": {"image": "acme/demo-ci:3"}}}}))
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(reg))
+    monkeypatch.setattr(factory, "resolve_box_image", _real_resolve_box_image)
+
+    out = await actions.perform("box_prove", by=_panel(), project="demo", sandbox="worktree")
+
+    assert not out.ok and out.code == actions.INVALID and out.data["reason"]
+    assert "box.image" in out.message and "worktree" in out.message, out.message
+    assert engine.started == [] and demo.boxes == []
+
+
+async def test_a_repository_s_proof_on_the_worker_is_its_own_flight(demo, engine):
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.card_repo import _runner_view
+
+    _view, key = _runner_view(ProjectRegistry().get("demo"), "acme/web#0")
+    assert key != "demo", "the stand-in repository resolved to the default one"
+
+    default = await actions.perform("box_prove", by=_panel(), project="demo")
+    other = await actions.perform("box_prove", by=_panel(), project="demo", repo="acme/web")
+
+    assert default.ok and other.ok, (default.message, other.message)
+    assert other.data["key"] == key and other.data["handle"] == bp.workflow_id(key)
+    assert other.data["handle"] != default.data["handle"] and other.data["joined"] is False
+    assert [s["id"] for s in engine.started] == [bp.workflow_id("demo"), bp.workflow_id(key)]
+    assert engine.started[1]["arg"].repo == "acme/web"
 
 
 def test_a_ref_and_a_repository_are_their_own_proofs():
@@ -381,11 +437,79 @@ def test_the_workflow_runs_its_one_activity_bounded_and_heartbeating():
     assert bp.PROOF_HEARTBEAT < bp.PROOF_CEILING < bp.PROOF_FLIGHT
 
 
-def test_the_worker_registers_the_workflow_and_its_activity():
-    from beeverforge.runtime.temporal import worker
+async def test_the_worker_s_proof_heartbeats_while_it_runs(monkeypatch):
+    """Driven by the beats, not by a clock: the proof ends only once three beats have been heard,
+    so an activity that ran it without heartbeating never lets it end (bounded, and then red)."""
+    import threading
 
-    source = inspect.getsource(worker)
-    assert "BoxProveWorkflow" in source and "prove_box" in source
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    beats: list[str] = []
+    heard = threading.Event()
+
+    def beat(*details):
+        beats.append(details[0] if details else "")
+        if len(beats) >= 3:
+            heard.set()
+
+    def proving(inp):
+        heard.wait(timeout=5)
+        return f"PROVEN — {inp.project}"
+
+    monkeypatch.setattr(acts.activity, "heartbeat", beat)
+    monkeypatch.setattr(acts, "_TURN_PULSE", 0)
+    monkeypatch.setattr(acts, "_do_prove_box", proving)
+
+    said = await acts.prove_box(BoxProveInput(project="demo"))
+
+    assert said == "PROVEN — demo"
+    assert len(beats) >= 3 and all("demo" in b for b in beats), beats
+
+
+class _Worker:
+    """`temporalio.worker.Worker`, recorded: what each was built with. Runs nothing."""
+
+    built: list[dict] = []
+
+    def __init__(self, _client, **kwargs):
+        _Worker.built.append(kwargs)
+
+    async def run(self):
+        return None
+
+
+def test_the_worker_serves_the_box_proof(monkeypatch):
+    """`worker.main()` booted with the engine faked: every worker it builds serves the workflow,
+    and the activity the workflow runs."""
+    from beeverforge.runtime.temporal import worker
+    from beeverforge.runtime.temporal.activities import prove_box
+    from beeverforge.runtime.temporal.workflow import BoxProveWorkflow
+
+    async def _client():
+        return "the client"
+
+    async def _nothing(*_a, **_k):
+        return []
+
+    _Worker.built = []
+    monkeypatch.setenv("TEMPORAL_ADDRESS", "localhost:7233")
+    monkeypatch.setattr(worker, "Worker", _Worker)
+    monkeypatch.setattr(worker, "load_dotenv", lambda *_a, **_k: False)
+    monkeypatch.setattr(worker, "connect_at_birth", _client)
+    monkeypatch.setattr(worker, "start_channel_listeners", lambda _projects: [])
+    monkeypatch.setattr("beeverforge.registry.seed_registry", lambda *_a, **_k: None)
+    monkeypatch.setattr("beeverforge.runtime.toolbox.populate", lambda *_a, **_k: None)
+    monkeypatch.setattr("beeverforge.observability.health.listen", _nothing)
+    monkeypatch.setattr("beeverforge.namespace.announce_build", lambda *_a, **_k: None)
+    monkeypatch.setattr("beeverforge.runtime.temporal.schedule.ensure_all", _nothing)
+
+    asyncio.run(asyncio.wait_for(worker.main(), timeout=10))
+
+    assert _Worker.built, "the worker built no worker"
+    for built in _Worker.built:
+        assert BoxProveWorkflow in built["workflows"], built["task_queue"]
+        assert prove_box in built["activities"], built["task_queue"]
 
 
 # ── both transports, with the catalogue's authorization ────────────────────────────────────────
@@ -417,31 +541,6 @@ def test_through_the_panel_s_route_an_unknown_project_is_a_404_with_its_reason(d
     assert r.status_code == 404, r.text
     assert r.json()["data"]["reason"] == actions.NOT_FOUND and "Traceback" not in r.text
     assert engine.started == []
-
-
-def test_through_the_panel_s_route_a_credential_without_the_floor_is_refused(demo, engine,
-                                                                            monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from beeverforge.api.app import app
-    from beeverforge.identity.local import (
-        PEOPLE_ENV,
-        PRODUCT_PEOPLE_ENV,
-        PRODUCT_SHARED_ENV,
-        SHARED_ENV,
-    )
-
-    monkeypatch.setenv(PEOPLE_ENV, "op-secret:rob:Rob")
-    monkeypatch.setenv(PRODUCT_PEOPLE_ENV, "ba-secret:bia:Bia Rocha")
-    monkeypatch.delenv(SHARED_ENV, raising=False)
-    monkeypatch.delenv(PRODUCT_SHARED_ENV, raising=False)
-
-    r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "demo"}},
-                             headers={"authorization": "Bearer ba-secret"})
-
-    assert r.status_code == 403, r.text
-    assert engine.started == [] and demo.boxes == []
-    assert bp.load("demo") is None
 
 
 async def test_the_layer_refuses_a_credential_without_the_floor_by_its_reason(demo, engine):

@@ -1097,7 +1097,7 @@ def box_prove_cmd(
     can execute in it, then runs the project's OWN `setup:` and `validate:` against untouched
     `main`. Green means your tests passed inside the factory (ADR-0037 D3).
     """
-    from beeverforge.actions.base import CONFLICT, INVALID, NOT_FOUND
+    from beeverforge.actions.base import CONFLICT, INVALID, NO_CODE_YET, NOT_FOUND
     from beeverforge.box_prove import (
         PROOF_DIR,
         PROVEN,
@@ -1141,9 +1141,11 @@ def box_prove_cmd(
         outcome = _perform("box_prove", project=name, image=image or "",
                            sandbox=_box_kind(sandbox), repo=repo or "", ref=ref or "")
     if not outcome.ok:
-        # A PROOF OF THE SAME KEY RUNNING is its own one sentence (#745); a branch whose manifest
+        # A PROOF OF THE SAME KEY RUNNING is its own one sentence (#745); a project before its
+        # code is refused with the ✗ every verb says it with (#992); a branch whose manifest
         # cannot be read, like an unknown name, is a usage error
-        typer.echo(outcome.message if outcome.code == CONFLICT else f"✗ {outcome.message}")
+        bare = outcome.code == CONFLICT and outcome.data.get("reason") != NO_CODE_YET
+        typer.echo(outcome.message if bare else f"✗ {outcome.message}")
         raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)
     data = dict(outcome.data)
     proof_key = str(data.get("key") or name)

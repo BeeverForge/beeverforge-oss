@@ -7800,24 +7800,36 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
                                 f"runs — `beeverforge box prove {found.name} --ref {ref}`: it is "
                                 f"never recorded, so a proof of it here would answer nobody. "
                                 f"Nothing was started.", project=found.name, ref=ref)
-    client, bad_engine = await _connected()
-    if bad_engine:
-        return bad_engine
+    from beeverforge.adapters.sandbox.registry import installed_box_traits
+    from beeverforge.factory import resolve_box_image
     from beeverforge.runtime.temporal import TASK_QUEUE
-    from beeverforge.runtime.temporal.io import BoxProveInput
+    from beeverforge.runtime.temporal.io import BoxProveInput, default_sandbox
 
     # THE KEY THE WORKER WILL PROVE UNDER, asked of the same view `prove_the_box` takes, so a
     # repository's proof and the default one never share a flight
-    key = found.name
+    view, key = found, found.name
     if repo:
         from beeverforge.runtime.card_repo import _runner_view
 
-        _view, key = _runner_view(found, f"{repo}#0")
+        view, key = _runner_view(found, f"{repo}#0")
+    # A BOX THE WORKER CANNOT RUN IS REFUSED HERE, as `_start` refuses it: an unknown box, or an
+    # image the box cannot honour, would otherwise be answered `running` and fail on the worker
+    # where nobody reads it. The box is stamped into the input, so the worker proves what was asked.
+    box_kind = (sandbox or "").strip().lower() or default_sandbox()
+    try:
+        installed_box_traits(box_kind)
+        resolve_box_image(view, explicit=image or None, sandbox=box_kind)
+    except ValueError as exc:
+        return refused(INVALID, f"{exc} Nothing was started.", project=found.name,
+                       sandbox=box_kind)
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
     handle = box_prove.workflow_id(key, ref)
     try:
         await client.start_workflow(
             "BoxProveWorkflow",
-            BoxProveInput(project=found.name, repo=repo, ref=ref, image=image, sandbox=sandbox),
+            BoxProveInput(project=found.name, repo=repo, ref=ref, image=image, sandbox=box_kind),
             id=handle, task_queue=TASK_QUEUE, execution_timeout=box_prove.PROOF_FLIGHT)
         joined = False
     except Exception as exc:  # a start the engine refused is said, never raised
