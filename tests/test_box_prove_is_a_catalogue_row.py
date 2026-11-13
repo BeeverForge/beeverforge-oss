@@ -169,6 +169,58 @@ async def test_a_proof_already_running_here_is_refused_in_its_own_sentence(demo,
     assert bp.load("demo") is None, "a proof that measured nothing was recorded"
 
 
+async def test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread(demo, monkeypatch,
+                                                                        tmp_path):
+    """The host proves on a thread of its own (`asyncio.to_thread`), so the key is asked of
+    ANOTHER thread here: `held_here` is true only in the holder's, and would miss a leak."""
+    from beeverforge import factory, loader
+    from beeverforge.util.filelock import FileLock
+
+    def free() -> bool:
+        lock = FileLock(bp.proof_lock_path("demo"))
+        try:
+            lock.acquire(timeout=0)
+        except TimeoutError:
+            return False
+        lock.release()
+        return True
+
+    def unreadable(*_a, **_k):
+        raise ValueError("no manifest on feat")
+
+    monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path / "checkout")
+    monkeypatch.setattr(loader, "load_manifest", unreadable)
+    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
+    assert not out.ok and out.code == actions.INVALID, out.message
+    assert free(), "a ref proof whose manifest could not be read kept its key"
+
+    monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: object())
+    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
+    assert out.ok, out.message
+    assert free(), "a ref proof that ran kept its key after it ended"
+
+
+async def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, monkeypatch,
+                                                                         tmp_path):
+    """The row waits for the code by its declaration (#992), so `perform` says it in the sentence
+    every door says. A proof that started would read `repo_path` — empty — as the product."""
+    reg = tmp_path / "codeless.yaml"
+    reg.write_text(json.dumps({"projects": {"myapp": {
+        "name": "myapp", "repo_path": "",
+        "product": {"docs_repo": "acme/myapp-context"}}}}))
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(reg))
+
+    def started(*_a, **_k):
+        raise AssertionError("a proof started for a project with no code")
+
+    monkeypatch.setattr(bp, "prove_the_box", started)
+
+    out = await actions.perform("box_prove", by=_shell(), project="myapp")
+
+    assert not out.ok and out.data["reason"] == actions.NO_CODE_YET, out.message
+    assert "first-source myapp" in out.message and demo.boxes == []
+
+
 @pytest.mark.parametrize("by", [_shell(), _panel()], ids=["host", "worker"])
 async def test_an_unknown_project_answers_a_reason_never_a_traceback(demo, engine, by):
     out = await actions.perform("box_prove", by=by, project="nope")

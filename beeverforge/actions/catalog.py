@@ -7817,13 +7817,13 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
             id=handle, task_queue=TASK_QUEUE, execution_timeout=box_prove.PROOF_FLIGHT)
         joined = False
     except Exception as exc:  # a start the engine refused is said, never raised
-        if "AlreadyStarted" not in type(exc).__name__:
+        joined = "AlreadyStarted" in type(exc).__name__
+        if not joined:
             reference = failure_reference()
             log.exception("the box proof of %s could not be started reference=%s (%s)",
                           key, reference, exc)
             return refused(FAILED, "the box proof could not be started just now.",
                            project=found.name, reference=reference)
-        joined = True
     said = (f"a proof of {key}'s box is already running on the worker — this ask joined it"
             if joined else f"the proof of {key}'s box is running on the worker")
     return done(f"{said}; `doctor {found.name}` says what it found once it ends.",

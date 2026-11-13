@@ -1100,7 +1100,9 @@ def box_prove_cmd(
     from beeverforge.actions.base import CONFLICT, INVALID, NOT_FOUND
     from beeverforge.box_prove import PROOF_DIR, PROVEN, Finding, load, watching
 
-    _with_its_code(_get_project(name), "proving its box")
+    # A PROJECT BEFORE ITS CODE is refused by the row's own declaration (`needs_code`, #992):
+    # `perform` says it in the sentence every door says, before anything is read
+    _get_project(name)
 
     # WHAT THE ROOM SEES WHILE IT HAPPENS. This command pulls an image, installs the client's
     # dependencies and runs their whole suite — and until it streamed, it printed nothing until

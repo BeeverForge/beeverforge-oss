@@ -29,12 +29,15 @@ removed the first one's box. FIVE CLAIMS:
      prove`, `box answer`, and onboarding, whose generic refusal cut a long key's sentence at 160
      characters.
 
-The guards are the three test files below.
+The guards are the four test files below.
 """
 
 TWICE = "tests/test_the_same_project_proved_twice_at_once_is_refused_not_deleted.py"
 APART = "tests/test_two_projects_proved_at_once_never_share_a_working_tree.py"
 DOORS = "tests/test_a_busy_proof_is_refused_in_one_sentence_at_every_door.py"
+#: The `box_prove` row's own tests (#237): the host proves on a thread of its own, so a leaked key
+#: is asked of another thread there — `DOORS`' `held_here` is true only in the holder's.
+ROW = "tests/test_box_prove_is_a_catalogue_row.py"
 TEST = TWICE
 
 PROVE = "beeverforge/box_prove.py"
@@ -138,25 +141,26 @@ MUTATIONS = [
      + "        held = _hold_the_proof_of(subject)\n",
      TWICE),
 
+    # RE-PINNED 2026-11-13 (#237): `box prove`'s body is the `box_prove` row's
+    # (`box_prove.prove_the_box`), so the `--ref` key and the refusal are cut there; the exit code
+    # a busy key answers is still the command's.
     ("`box prove --ref` syncs its checkout before it takes the key, so a refused `--ref` proof "
      "removes and re-adds the tree the running one reads",
-     CLI,
-     "            held = _hold_the_proof_of(proof_key)\n",
+     PROVE,
+     "            held = _hold_the_proof_of(key)\n",
      "            held = None\n", DOORS),
 
     ("`box prove --ref --repo` takes the project's name, not the repository's key, so a refused "
      "proof of that repository rebuilds the checkout the running one reads",
-     CLI,
-     "            held = _hold_the_proof_of(proof_key)\n",
-     "            held = _hold_the_proof_of(name)\n", DOORS),
+     PROVE,
+     "            held = _hold_the_proof_of(key)\n",
+     "            held = _hold_the_proof_of(project.name)\n", DOORS),
 
     ("`box prove --ref` answers a busy key with exit 0, so a pre-merge check reads a refused "
      "proof as a pass",
      CLI,
-     "            held = _hold_the_proof_of(proof_key)\n        except ProveBusy as exc:\n"
-     "            typer.echo(exc.sentence)\n            raise typer.Exit(1) from None\n",
-     "            held = _hold_the_proof_of(proof_key)\n        except ProveBusy as exc:\n"
-     "            typer.echo(exc.sentence)\n            raise typer.Exit(0) from None\n", DOORS),
+     "        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)\n",
+     "        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 0)\n", DOORS),
 
     # ── 4. the key is free again however the proof ends ────────────────────────────────────────
     ("the lock is never let go when the proof ends, so the key stays refused until a restart",
@@ -188,19 +192,21 @@ MUTATIONS = [
 
     ("`box prove --ref` keeps its key when the `--ref` manifest cannot be read, so the project "
      "is refused as busy until the process ends",
-     CLI,
-     "            _let_go(held)\n            raise typer.Exit(2) from None\n",
-     "            raise typer.Exit(2) from None\n", DOORS),
+     PROVE,
+     "            _let_go(held)\n            return Run(key=key, ref=ref,\n",
+     "            return Run(key=key, ref=ref,\n",
+     ROW + "::test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread"),
 
     ("`box prove --ref` keeps its key after the proof ran, so the project is refused as busy "
      "until the process ends",
-     CLI,
-     "    finally:\n        _let_go(held)\n    for f in proof.findings:\n",
-     "    finally:\n        pass\n    for f in proof.findings:\n", DOORS),
+     PROVE,
+     "    finally:\n        _let_go(held)\n    where = None if ref else save(proof)\n",
+     "    finally:\n        pass\n    where = None if ref else save(proof)\n",
+     ROW + "::test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread"),
 
     # ── 5. every door says it in one sentence ──────────────────────────────────────────────────
     ("`box prove` lets the refusal out as a traceback",
-     CLI,
+     PROVE,
      "    except ProveBusy as exc:\n        # BEFORE `save`",
      "    except LookupError as exc:\n        # BEFORE `save`", DOORS),
 
