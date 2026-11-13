@@ -7753,23 +7753,21 @@ async def _doctor(*, project: str, by: Actor) -> Outcome:
     return done(said, **document)
 
 
-def _on_the_host(by: Actor) -> bool:
-    """Whether the caller is a shell where the factory runs — the CLI's own `beeverforge box
-    prove`, and `beeverforge act` beside it — which proves in its own process, as the command
-    always did. Every other caller is somewhere a request is held open."""
-    return getattr(by, "via", "") == "cli"
-
-
 async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", image: str = "",
                      sandbox: str = "") -> Outcome:
     """Prove one project's box (ADR-0037 D3) — `beeverforge box prove` as a row (#237).
 
-    TWO ANSWERS, BY WHERE THE CALLER IS. A shell on the host proves in its own process, as the
-    command always did, and answers the proof document — `data.proof`: what passed, what failed,
-    every finding by its name — and where it was recorded. Any other caller is holding a request
-    open, and a proof pulls an image and runs the client's whole suite: the row STARTS
-    `BoxProveWorkflow` on the worker and answers at once with the running proof's handle, like
-    `product_refresh`. The doctor's `box_proof` says afterwards what it found, from the record.
+    TWO ANSWERS, BY WHERE THE PROOF RUNS. The shell's own `box prove` proves in its process, as
+    the command always did (`box_prove.proving_here`, which no transport can send), and answers
+    the proof document — `data.proof`: what passed, what failed, every finding by its name — and
+    where it was recorded. Every other caller — the panel's route, `beeverforge act` — is
+    somewhere the proof's record is not, and a proof pulls an image and runs the client's whole
+    suite: the row STARTS `BoxProveWorkflow` on the worker and answers at once with the running
+    proof's handle, like `product_refresh`. The doctor's `box_proof` says afterwards what it found,
+    from the record.
+
+    A `ref` IS THE SHELL'S ONLY. It is measured and never recorded, so on the worker its answer
+    would reach nobody: it is refused there, before anything starts, with the command that answers.
 
     ONE FLIGHT PER KEY AND REF (`box_prove.workflow_id`): a second ask while one runs is refused by
     the engine as already started, and this answers the same handle, `joined`.
@@ -7781,21 +7779,27 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
 
     from beeverforge import box_prove
 
-    found, bad = _project(project)
-    if bad:
-        return bad
-    if _on_the_host(by):
-        run = await asyncio.to_thread(box_prove.prove_the_box, found, repo=repo, ref=ref,
-                                      image=image, sandbox=sandbox)
+    shell = box_prove.here()
+    if shell is not None and getattr(shell.project, "name", None) == project:
+        run = await asyncio.to_thread(box_prove.prove_the_box, shell.project, repo=repo, ref=ref,
+                                      image=image, sandbox=sandbox, record=shell.record)
         if run.busy:
-            return refused(CONFLICT, run.refused, project=found.name, key=run.key, ref=run.ref)
+            return refused(CONFLICT, run.refused, project=project, key=run.key, ref=run.ref)
         if run.refused or run.proof is None:
             return refused(INVALID, run.refused or "the proof measured nothing.",
-                           project=found.name, key=run.key, ref=run.ref)
-        return done(run.sentence(), project=found.name, key=run.key, ref=run.ref,
+                           project=project, key=run.key, ref=run.ref)
+        return done(run.sentence(), project=project, key=run.key, ref=run.ref,
                     state=run.state, proof=box_prove.document(run.proof),
                     recorded_at=None if run.recorded_at is None else str(run.recorded_at),
                     handle=None, joined=False)
+    found, bad = _project(project)
+    if bad:
+        return bad
+    if ref:
+        return refused(INVALID, f"a branch's manifest is measured in a shell where the factory "
+                                f"runs — `beeverforge box prove {found.name} --ref {ref}`: it is "
+                                f"never recorded, so a proof of it here would answer nobody. "
+                                f"Nothing was started.", project=found.name, ref=ref)
     client, bad_engine = await _connected()
     if bad_engine:
         return bad_engine
@@ -9876,7 +9880,8 @@ CATALOG: dict[str, ActionSpec] = {
             optional=("repo", "ref", "image", "sandbox"),
             params={"repo": "owner/name — another of the product's repositories, proven on its "
                             "own manifest",
-                    "ref": "a branch or tag whose manifest is measured and never recorded",
+                    "ref": "a branch or tag whose manifest is measured and never recorded — "
+                           "by the shell's own `box prove` only; refused anywhere else",
                     "image": "an image for this proof only",
                     "sandbox": "which box to prove — default: the one this deployment runs"},
         ),

@@ -1,14 +1,15 @@
 """`box_prove` is a catalogue row, and `beeverforge box prove` is a mapping over it (#237, ADR-0039).
 
 A project's proof was a CLI verb only: a screen of one's own could not ask for one, and nothing but
-a shell on the worker could say what the box proved. The row proves one project's box. A shell on
-the host proves it there and answers the proof document: what passed, what failed, and each
-finding by its name. Every other transport starts the proof on the worker and answers at once with
-the handle of the proof that runs, or of the one already running; the doctor's `box_proof` reads
-what it recorded afterwards, as it does today.
+a shell on the worker could say what the box proved. The row proves one project's box. The shell's
+own `box prove` proves it in its process and answers the proof document: what passed, what failed,
+and each finding by its name. Every other caller — the panel's route, `beeverforge act` — starts
+the proof on the worker and answers at once with the handle of the proof that runs, or of the one
+already running; the doctor's `box_proof` reads what it recorded afterwards, as it does today.
 
 What is real: the registry, the row, `perform`'s authorization and audit, both transports, the
-proof's record and the readiness check that reads it. Stood in: the box itself (`box_probes`,
+proof's record and the readiness check that reads it. "The shell" is `box prove`'s own context
+(`box_prove.proving_here`), never a transport's name. Stood in: the box itself (`box_probes`,
 `prove`), the image's resolution and the durable engine. Nothing here waits on real time: the
 worker's half is driven synchronously through the activity's own body.
 """
@@ -102,6 +103,15 @@ def _shell() -> actions.Actor:
     return actions.Actor(id="ops", display="ops", via="cli", admin=True)
 
 
+@contextlib.contextmanager
+def _in_the_shell(name: str = "demo"):
+    """What `beeverforge box prove` sets around the row: its project, proven in its process."""
+    from beeverforge.registry import ProjectRegistry
+
+    with bp.proving_here(ProjectRegistry().get(name), record=bp.save):
+        yield
+
+
 def _panel() -> actions.Actor:
     return actions.Actor(id="ana", display="Ana", via="panel", admin=True)
 
@@ -118,7 +128,8 @@ def test_box_prove_is_a_row_of_the_floor_for_one_project():
 
 
 async def test_on_the_host_it_answers_the_proof_document(demo):
-    out = await actions.perform("box_prove", by=_shell(), project="demo")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo")
 
     assert out.ok, out.message
     proof = out.data["proof"]
@@ -132,7 +143,8 @@ async def test_on_the_host_it_answers_the_proof_document(demo):
 async def test_a_proof_that_fails_is_answered_with_what_failed_and_recorded_as_failed(demo):
     demo.ok = False
 
-    out = await actions.perform("box_prove", by=_shell(), project="demo")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo")
 
     assert out.ok, "the proof ran: a red box is an answer, not a refusal"
     assert out.data["state"] == bp.NOT_PROVEN
@@ -148,7 +160,8 @@ async def test_a_ref_proof_is_measured_and_never_recorded(demo, monkeypatch, tmp
     monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path / "checkout")
     monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: object())
 
-    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat/x")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat/x")
 
     assert out.ok and out.data["ref"] == "feat/x" and out.data["recorded_at"] is None
     assert bp.load("demo") is None, "a branch proof was recorded where the poller looks"
@@ -162,7 +175,8 @@ async def test_a_proof_already_running_here_is_refused_in_its_own_sentence(demo,
 
     monkeypatch.setattr(bp, "box_probes", busy)
 
-    out = await actions.perform("box_prove", by=_shell(), project="demo")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo")
 
     assert not out.ok and out.code == actions.CONFLICT
     assert out.message == bp.ProveBusy("demo").sentence
@@ -190,14 +204,34 @@ async def test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread(demo, m
 
     monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path / "checkout")
     monkeypatch.setattr(loader, "load_manifest", unreadable)
-    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
     assert not out.ok and out.code == actions.INVALID, out.message
     assert free(), "a ref proof whose manifest could not be read kept its key"
 
     monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: object())
-    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
     assert out.ok, out.message
     assert free(), "a ref proof that ran kept its key after it ended"
+
+
+async def test_a_ref_that_cannot_be_read_is_said_without_the_credential_in_its_url(
+        demo, monkeypatch, caplog):
+    """The sentence reaches whoever asked, and a failed clone's text carries its URL."""
+    from beeverforge import factory
+
+    def clone_failed(*_a, **_k):
+        raise RuntimeError("git clone https://x-access-token:ghs_live@github.com/acme/demo.git "
+                           "exited 128")
+
+    monkeypatch.setattr(factory, "resolve_repo_path", clone_failed)
+    with _in_the_shell():
+        out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat")
+
+    assert not out.ok and out.code == actions.INVALID
+    assert "exited 128" in out.message and "ghs_live" not in out.message, out.message
+    assert "exited 128" in caplog.text and "ghs_live" not in caplog.text
 
 
 async def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, monkeypatch,
@@ -221,9 +255,10 @@ async def test_a_project_before_its_code_is_refused_before_a_proof_starts(demo, 
     assert "first-source myapp" in out.message and demo.boxes == []
 
 
-@pytest.mark.parametrize("by", [_shell(), _panel()], ids=["host", "worker"])
-async def test_an_unknown_project_answers_a_reason_never_a_traceback(demo, engine, by):
-    out = await actions.perform("box_prove", by=by, project="nope")
+@pytest.mark.parametrize("in_the_shell", [True, False], ids=["host", "worker"])
+async def test_an_unknown_project_answers_a_reason_never_a_traceback(demo, engine, in_the_shell):
+    with _in_the_shell() if in_the_shell else contextlib.nullcontext():
+        out = await actions.perform("box_prove", by=_panel(), project="nope")
 
     assert not out.ok and out.code == actions.NOT_FOUND
     assert out.data["reason"] == actions.NOT_FOUND
@@ -247,6 +282,26 @@ async def test_away_from_the_host_it_starts_the_proof_on_the_worker_and_answers_
     assert started["execution_timeout"] == bp.PROOF_FLIGHT
     assert out.data["state"] == bp.RUNNING and out.data["proof"] is None
     assert demo.boxes == [], "the request proved the box itself"
+
+
+async def test_a_shell_s_act_away_from_box_prove_proves_on_the_worker_too(demo, engine):
+    """WHERE IT PROVES IS NOT THE TRANSPORT'S NAME. `beeverforge act box_prove` from an operator's
+    laptop is `via="cli"` too; proven there, its record would land in a PROOF_DIR no worker reads,
+    and the doctor would hold the next pickup as if it never ran."""
+    out = await actions.perform("box_prove", by=_shell(), project="demo")
+
+    assert out.ok and out.data["handle"] == bp.workflow_id("demo"), out.message
+    assert len(engine.started) == 1 and demo.boxes == []
+    assert bp.load("demo") is None, "a proof was recorded by the process that asked"
+
+
+async def test_away_from_the_shell_a_ref_is_refused_before_anything_starts(demo, engine):
+    """A ref is measured and never recorded, so on the worker its answer would reach nobody."""
+    out = await actions.perform("box_prove", by=_panel(), project="demo", ref="feat/x")
+
+    assert not out.ok and out.code == actions.INVALID
+    assert "beeverforge box prove demo --ref feat/x" in out.message, out.message
+    assert engine.started == [] and demo.boxes == []
 
 
 async def test_a_second_ask_while_a_proof_runs_answers_the_same_handle(demo, engine):
@@ -335,17 +390,19 @@ def test_the_worker_registers_the_workflow_and_its_activity():
 
 # ── both transports, with the catalogue's authorization ────────────────────────────────────────
 
-def test_through_the_panel_s_route_it_answers_the_handle(demo, engine, monkeypatch):
+def test_through_the_panel_s_route_it_answers_the_handle(demo, engine, monkeypatch, caplog):
     monkeypatch.delenv("BEEVERFORGE_PANEL_TOKEN", raising=False)
     from fastapi.testclient import TestClient
 
     from beeverforge.api.app import app
 
+    caplog.set_level(logging.INFO, logger="beeverforge.actions")
     r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "demo"}})
 
     assert r.status_code == 200, r.text
     assert r.json()["data"]["handle"] == bp.workflow_id("demo")
     assert len(engine.started) == 1
+    assert "action=box_prove" in caplog.text, "the audit line was not written"
 
 
 def test_through_the_panel_s_route_an_unknown_project_is_a_404_with_its_reason(demo, engine,
@@ -397,7 +454,7 @@ async def test_the_layer_refuses_a_credential_without_the_floor_by_its_reason(de
     assert engine.started == [] and demo.boxes == []
 
 
-def test_through_the_shell_s_act_it_answers_the_proof_document(demo, caplog):
+def test_through_the_shell_s_act_it_answers_the_handle(demo, engine, caplog):
     from beeverforge.cli import app as cli
 
     caplog.set_level(logging.INFO, logger="beeverforge.actions")
@@ -405,8 +462,29 @@ def test_through_the_shell_s_act_it_answers_the_proof_document(demo, caplog):
 
     assert result.exit_code == 0, result.output
     body = json.loads(result.output)
-    assert body["data"]["proof"]["passed"] == ["image", "validate"]
+    assert body["data"]["handle"] == bp.workflow_id("demo") and body["data"]["proof"] is None
+    assert len(engine.started) == 1 and demo.boxes == []
     assert "action=box_prove" in caplog.text, "the audit line was not written"
+
+
+def test_through_the_shell_s_act_a_caller_without_the_floor_is_refused(demo, engine, monkeypatch,
+                                                                       caplog):
+    """The shell's actor is unscoped today (ADR-0039 §2); this is the day it is not — a shell whose
+    identity holds only the product's area. `act` hands the refusal on, it does not decide it."""
+    from beeverforge.cli import app as cli
+
+    real = actions.Actor
+    monkeypatch.setattr(actions, "Actor", lambda **kw: real(**kw, scopes=frozenset({
+        actions.PRODUCT})))
+    caplog.set_level(logging.INFO, logger="beeverforge.actions")
+
+    result = CliRunner().invoke(cli, ["act", "box_prove", "-p", "demo", "--json"])
+
+    assert result.exit_code == 1, result.output
+    body = json.loads(result.output)
+    assert body["code"] == actions.DENIED and body["data"]["reason"] == "out_of_scope"
+    assert engine.started == [] and demo.boxes == [] and bp.load("demo") is None
+    assert "DENIED_SCOPE box_prove" in caplog.text, "the refusal was not audited"
 
 
 # ── the verb is a mapping over the row ──────────────────────────────────────────────────────────
@@ -445,7 +523,8 @@ async def test_the_doctor_s_box_proof_reads_what_the_row_recorded(demo):
         return found
 
     assert not check().ok, "a proof was there before the row ran"
-    await actions.perform("box_prove", by=_shell(), project="demo")
+    with _in_the_shell():
+        await actions.perform("box_prove", by=_shell(), project="demo")
 
     found = check()
     assert found.check == "box_proof" and found.ok and "img:1" in found.message

@@ -200,8 +200,8 @@ MUTATIONS = [
     ("`box prove --ref` keeps its key after the proof ran, so the project is refused as busy "
      "until the process ends",
      PROVE,
-     "    finally:\n        _let_go(held)\n    where = None if ref else save(proof)\n",
-     "    finally:\n        pass\n    where = None if ref else save(proof)\n",
+     "    finally:\n        _let_go(held)\n    where = None if ref else record(proof)\n",
+     "    finally:\n        pass\n    where = None if ref else record(proof)\n",
      ROW + "::test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread"),
 
     # ── 5. every door says it in one sentence ──────────────────────────────────────────────────

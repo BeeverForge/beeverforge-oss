@@ -1253,8 +1253,8 @@ def load(project: str, *, root: Path | None = None) -> Proof | None:
 #
 # WHAT `beeverforge box prove` DID, IN ONE PLACE. The command resolved the repository's view, the
 # box and the image, took the key before a `--ref` checkout, proved and recorded — inside the CLI,
-# so nothing else could ask for a proof. This is that body, called by the row on the host and by
-# the worker's activity everywhere else; the command renders what it answers.
+# so nothing else could ask for a proof. This is that body, called by the row for the shell's own
+# `box prove` and by the worker's activity for everybody else; the command renders what it answers.
 
 #: How a proof that was asked for stands. `RUNNING` is the worker's: the row answered its handle.
 PROVEN, NOT_PROVEN, RUNNING = "proven", "not_proven", "running"
@@ -1281,6 +1281,37 @@ def watching(listener: Callable[[str, str], None]):
         yield
     finally:
         _LISTENER.reset(token)
+
+
+@dataclass(frozen=True)
+class Here:
+    """The shell's own `box prove`, proving in its process: the project it resolved, and how it
+    records what it proved — where THIS process's poller and doctor read."""
+
+    project: object
+    record: Callable[[Proof], Path | None]
+
+
+#: Set only by `beeverforge box prove`, around the row. WHERE A PROOF RUNS IS NOT A TRANSPORT'S
+#: NAME: `via == "cli"` is also `beeverforge act` on an operator's laptop, whose proof would be
+#: recorded in a PROOF_DIR no worker reads. A context variable, because a JSON caller cannot send
+#: one — no transport can ask to be proven in the request.
+_HERE: ContextVar[Here | None] = ContextVar("box_prove_here", default=None)
+
+
+@contextmanager
+def proving_here(project, *, record: Callable[[Proof], Path | None]):
+    """Every `box_prove` asked in this context is proven in this process, of `project`."""
+    token = _HERE.set(Here(project=project, record=record))
+    try:
+        yield
+    finally:
+        _HERE.reset(token)
+
+
+def here() -> Here | None:
+    """The shell proving in its own process, or None: the proof belongs on the worker."""
+    return _HERE.get()
 
 
 def _tell(kind: str, text: str) -> None:
@@ -1339,15 +1370,20 @@ class Run:
 
 
 def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
-                sandbox: str = "") -> Run:
+                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None) -> Run:
     """Prove `project`'s box — another of its repositories with `repo`, a branch's manifest with
-    `ref` — and record the proof unless it was a `ref`'s. Never raises for what a person can fix:
-    a `ref` whose manifest cannot be read, or a proof of the key already running, is `refused`.
+    `ref` — and record the proof with `record` (`save` by default) unless it was a `ref`'s. Never
+    raises for what a person can fix: a `ref` whose manifest cannot be read, or a proof of the key
+    already running, is `refused`.
 
     A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
     branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
     work against a manifest nobody merged."""
     import re as _re
+
+    from beeverforge.runtime.boxed_job import redact
+
+    record = save if record is None else record
 
     from beeverforge.adapters.sandbox.registry import installed_box_traits
     from beeverforge.factory import resolve_box_image, resolve_repo_path
@@ -1388,10 +1424,14 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
             ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}", ref=ref)
             ref_manifest = load_manifest(view, repo_root=ref_root)
         except Exception as exc:  # one sentence, the cause, never a traceback
+            # REDACTED, THEN CUT: a failed clone's text carries its URL, token and all, and this
+            # sentence reaches whoever asked — through the panel's route too
+            cause = redact(str(exc))[:200]
+            log.warning("the manifest of %s on %r could not be read (%s)", key, ref, cause)
             _let_go(held)
             return Run(key=key, ref=ref,
                        refused=f"could not read {namespace.MANIFEST} on {ref!r} "
-                               f"({str(exc)[:200]}) — check that the branch exists on the forge "
+                               f"({cause}) — check that the branch exists on the forge "
                                f"and carries the file. Nothing was changed.")
     try:
         with box_probes(view, resolved, key=key, sandbox=box_kind,
@@ -1403,7 +1443,7 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
         return Run(key=key, ref=ref, refused=exc.sentence, busy=True)
     finally:
         _let_go(held)
-    where = None if ref else save(proof)
+    where = None if ref else record(proof)
     return Run(key=key, ref=ref, proof=proof, recorded_at=where)
 
 

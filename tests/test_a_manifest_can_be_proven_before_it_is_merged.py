@@ -207,13 +207,10 @@ def test_resolve_repo_path_syncs_the_ref_when_given_one_and_the_base_branch_othe
 
 def test_the_command_cannot_record_a_ref_proof(monkeypatch):
     """Reachability, by AST — the sibling guard's technique, for the same reason: the helper
-    being right is worth nothing if the command can still reach `save` with a ref in hand.
-
-    THE COMMAND'S BODY IS THE `box_prove` ROW'S SINCE #237 (`box_prove.prove_the_box`), so this
-    reads it there: the command renders what the row answers and reaches `save` nowhere."""
-    tree = parsed(ROOT / "beeverforge" / "box_prove.py")
+    being right is worth nothing if the command can still reach `save` with a ref in hand."""
+    tree = parsed(ROOT / "beeverforge" / "cli.py")
     fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "prove_the_box")
+              if isinstance(n, ast.FunctionDef) and n.name == "box_prove_cmd")
     saves = [n for n in ast.walk(fn)
              if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "save"]
 

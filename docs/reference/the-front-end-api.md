@@ -291,14 +291,15 @@ run a ticket.
 
 `box_prove` (`project`, [`repo`], [`ref`], [`image`], [`sandbox`]) proves one project's box: the
 image, the toolbox, the project's own `setup:` and gates (`beeverforge box prove`). Through the API
-the proof runs on the worker and the answer comes back at once: `data.state` is `running`,
-`data.handle` names the running proof, and `data.joined` is `true` when the ask joined a proof of the
-same project and ref already running. From the shell it proves in place and `data.proof` is the
-proof document: `ok`, `passed` and `failed` (check names), `advisory`, and `findings`, each
-`{check, ok, message, remedy, advisory}`. `data.state` is then `proven` or `not_proven`, and
-`data.recorded_at` is `null` for a `ref`, which is measured and never recorded. An unknown project
-is a 404 that names the registered ones. A proof of the same key already running on the host is a
-409. The doctor's `box_proof` reads what the proof recorded. The row is the floor's, for an admin.
+— and through `beeverforge act` — the proof runs on the worker and the answer comes back at once:
+`data.state` is `running`, `data.handle` names the running proof, and `data.joined` is `true` when
+the ask joined a proof of the same project already running. A `ref` there is a 400: it is measured
+and never recorded, so only `beeverforge box prove` takes one. That command proves in place and
+`data.proof` is the proof document: `ok`, `passed` and `failed` (check names), `advisory`, and
+`findings`, each `{check, ok, message, remedy, advisory}`. `data.state` is then `proven` or
+`not_proven`, and `data.recorded_at` is `null` for a `ref`. An unknown project is a 404 that names
+the registered ones. A proof of the same key already running on the host is a 409. The doctor's
+`box_proof` reads what the proof recorded. The row is the floor's, for an admin.
 
 **Rows of several steps.** `project_init` and `product_init` take several steps with the network
 between them, and say in `data.steps` what each came to: in order, each `{step, state, said}`, the

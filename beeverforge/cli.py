@@ -1098,11 +1098,25 @@ def box_prove_cmd(
     `main`. Green means your tests passed inside the factory (ADR-0037 D3).
     """
     from beeverforge.actions.base import CONFLICT, INVALID, NOT_FOUND
-    from beeverforge.box_prove import PROOF_DIR, PROVEN, Finding, load, watching
+    from beeverforge.box_prove import (
+        PROOF_DIR,
+        PROVEN,
+        Finding,
+        load,
+        proving_here,
+        save,
+        watching,
+    )
 
     # A PROJECT BEFORE ITS CODE is refused by the row's own declaration (`needs_code`, #992):
     # `perform` says it in the sentence every door says, before anything is read
-    _get_project(name)
+    project = _get_project(name)
+
+    # A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
+    # branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
+    # work against a manifest nobody merged. The row asks this before it records, and so does this.
+    def _record(proof):
+        return None if ref else save(proof)
 
     # WHAT THE ROOM SEES WHILE IT HAPPENS. This command pulls an image, installs the client's
     # dependencies and runs their whole suite — and until it streamed, it printed nothing until
@@ -1120,9 +1134,10 @@ def box_prove_cmd(
         elif kind == "line":
             typer.echo(f"      {text.rstrip()}", err=True)
 
-    # THE `box_prove` ROW (#237): the row proves and records, on this shell's own process, and
-    # what stays here is how a terminal shows it — the box's live lines included
-    with watching(_stage):
+    # THE `box_prove` ROW (#237): the row proves and records, in this shell's own process — this
+    # command is the one caller that proves here, where its record is read — and what stays here
+    # is how a terminal shows it, the box's live lines included
+    with watching(_stage), proving_here(project, record=_record):
         outcome = _perform("box_prove", project=name, image=image or "",
                            sandbox=_box_kind(sandbox), repo=repo or "", ref=ref or "")
     if not outcome.ok:

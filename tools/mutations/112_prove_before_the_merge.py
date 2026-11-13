@@ -15,14 +15,22 @@ FACTORY = "beeverforge/factory.py"
 MUTATIONS = [
     # RE-PINNED 2026-11-13 (#237): the command's body is the `box_prove` row's
     # (`box_prove.prove_the_box`), so the rows that cut the proving and the recording cut it there;
-    # what stays in the command is how a terminal says the verdict.
+    # what stays in the command is how a terminal says the verdict, and the recorder it hands the
+    # row (`_record`), which asks the ref again — cut on its own below.
+    # The command's recorder asks the ref again, so through the command this cut cannot be seen;
+    # the row's own test hands the bare `save`, as the worker does.
     ("a branch proof is recorded where the poller looks, unlocking an unmerged manifest", PROVE,
-     "    where = None if ref else save(proof)",
-     "    where = save(proof)"),
+     "    where = None if ref else record(proof)",
+     "    where = record(proof)",
+     "tests/test_box_prove_is_a_catalogue_row.py::test_a_ref_proof_is_measured_and_never_recorded"),
 
     ("…and the reverse: the base branch's proof stops being recorded at all", PROVE,
-     "    where = None if ref else save(proof)",
-     "    where = None if not ref else save(proof)"),
+     "    where = None if ref else record(proof)",
+     "    where = None if not ref else record(proof)"),
+
+    ("the command's own recorder stops recording the base branch's proof", CLI,
+     "        return None if ref else save(proof)",
+     "        return None"),
 
     ("the ref shares the base branch's checkout key and replaces its tree", PROVE,
      '            ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}", ref=ref)',

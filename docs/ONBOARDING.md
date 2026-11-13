@@ -688,13 +688,14 @@ happens**. Green means *your tests passed inside the factory*, and on this door 
 agent tokens.
 
 **The command is the `box_prove` row**, so a screen of your own asks for the same proof with
-`POST /api/act/box_prove` and `{"params": {"project": "myapp"}}` (`repo`, `ref`, `image` and
-`sandbox` are the command's flags). From the shell, `beeverforge box prove` and
-`beeverforge act box_prove -p myapp` prove in place and answer the proof document: what passed,
-what failed, and each finding by its name. Through the panel's API the proof runs on the worker,
-and the answer comes back at once with the running proof's `handle`. A second ask while that proof
-runs gets the same handle back. `beeverforge doctor myapp`'s `box_proof` line says what the proof
-found once it ends.
+`POST /api/act/box_prove` and `{"params": {"project": "myapp"}}` (`repo`, `image` and `sandbox`
+are the command's flags). `beeverforge box prove` proves in place and answers the proof document:
+what passed, what failed, and each finding by its name. Everybody else — the panel's API, and
+`beeverforge act box_prove -p myapp` too, which may be a laptop whose proof no worker would read —
+gets the proof run on the worker, and the answer comes back at once with the running proof's
+`handle`. A second ask while that proof runs gets the same handle back. `beeverforge doctor myapp`'s
+`box_proof` line says what the proof found once it ends. A `ref` is measured and never recorded, so
+it is `beeverforge box prove`'s only: anywhere else it is refused before anything starts.
 
 **On the one-machine door there is no image**, so the proof pins what there is instead: your own
 `setup:` and `validate:` run in a worktree box, the harness's version is recorded the way a
