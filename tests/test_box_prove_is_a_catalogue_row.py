@@ -1,0 +1,400 @@
+"""`box_prove` is a catalogue row, and `beeverforge box prove` is a mapping over it (#237, ADR-0039).
+
+A project's proof was a CLI verb only: a screen of one's own could not ask for one, and nothing but
+a shell on the worker could say what the box proved. The row proves one project's box. A shell on
+the host proves it there and answers the proof document: what passed, what failed, and each
+finding by its name. Every other transport starts the proof on the worker and answers at once with
+the handle of the proof that runs, or of the one already running; the doctor's `box_proof` reads
+what it recorded afterwards, as it does today.
+
+What is real: the registry, the row, `perform`'s authorization and audit, both transports, the
+proof's record and the readiness check that reads it. Stood in: the box itself (`box_probes`,
+`prove`), the image's resolution and the durable engine. Nothing here waits on real time: the
+worker's half is driven synchronously through the activity's own body.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import contextlib
+import inspect
+import json
+import logging
+from types import SimpleNamespace
+
+import pytest
+from typer.testing import CliRunner
+
+from beeverforge import actions
+from beeverforge import box_prove as bp
+from beeverforge.actions import catalog
+from beeverforge.box_prove import Finding, Proof
+
+
+@pytest.fixture
+def demo(tmp_path, monkeypatch):
+    """A registered project `demo`, a box that proves it in no time, and the proofs directory
+    under the test's own one. `world.ok` decides the verdict; `world.boxes` is every box opened."""
+    from beeverforge import factory
+
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(json.dumps({"projects": {"demo": {
+        "name": "demo", "repo": "acme/demo",
+        "repo_path": "https://github.com/acme/demo.git"}}}))
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(reg))
+    monkeypatch.setenv("BEEVERFORGE_SANDBOX", "container")
+    monkeypatch.setattr(bp, "PROOF_DIR", tmp_path / "proofs")
+    monkeypatch.setattr(factory, "resolve_box_image", lambda *_a, **_k: "img:1")
+    world = SimpleNamespace(ok=True, boxes=[])
+
+    @contextlib.contextmanager
+    def box(project, image, **kw):
+        world.boxes.append({"project": project.name, "image": image, **kw})
+        yield SimpleNamespace()
+
+    def prove(key, image, _probes, *, on_stage=None):
+        if on_stage is not None:
+            on_stage("start", "running your gates")
+            on_stage("line", "4 passed")
+        return Proof(project=key, image=image, ok=world.ok, findings=[
+            Finding("image", True, "img:1 resolved"),
+            Finding("validate", world.ok, "4 gate(s) green" if world.ok else "test: exited 1",
+                    "" if world.ok else "fix the failing test")])
+
+    monkeypatch.setattr(bp, "box_probes", box)
+    monkeypatch.setattr(bp, "prove", prove)
+    return world
+
+
+class _Engine:
+    """The durable engine as the row meets it: a workflow started under an id, refused with the
+    engine's own error while one under that id is open. No `execute_workflow`: a row that waited
+    for the proof would fail here."""
+
+    def __init__(self) -> None:
+        self.started: list[dict] = []
+        self.open: set[str] = set()
+
+    async def start_workflow(self, name, arg, *, id, task_queue, **options):
+        from temporalio.exceptions import WorkflowAlreadyStartedError
+
+        if id in self.open:
+            raise WorkflowAlreadyStartedError(id, name)
+        self.open.add(id)
+        self.started.append({"name": name, "arg": arg, "id": id, "task_queue": task_queue,
+                             **options})
+        return SimpleNamespace(id=id)
+
+
+@pytest.fixture
+def engine(monkeypatch):
+    made = _Engine()
+
+    async def _connected():
+        return made, None
+
+    monkeypatch.setattr(catalog, "_connected", _connected)
+    return made
+
+
+def _shell() -> actions.Actor:
+    return actions.Actor(id="ops", display="ops", via="cli", admin=True)
+
+
+def _panel() -> actions.Actor:
+    return actions.Actor(id="ana", display="Ana", via="panel", admin=True)
+
+
+# ── the row ─────────────────────────────────────────────────────────────────────────────────────
+
+def test_box_prove_is_a_row_of_the_floor_for_one_project():
+    found = actions.CATALOG["box_prove"]
+
+    assert found.scope == actions.FLOOR and found.needs_admin
+    assert found.required == ("project",)
+    assert set(found.optional) == {"repo", "ref", "image", "sandbox"}
+    assert not found.pending
+
+
+async def test_on_the_host_it_answers_the_proof_document(demo):
+    out = await actions.perform("box_prove", by=_shell(), project="demo")
+
+    assert out.ok, out.message
+    proof = out.data["proof"]
+    assert proof["ok"] is True and proof["project"] == "demo" and proof["image"] == "img:1"
+    assert proof["passed"] == ["image", "validate"] and proof["failed"] == []
+    assert [f["check"] for f in proof["findings"]] == ["image", "validate"]
+    assert out.data["state"] == bp.PROVEN and out.data["key"] == "demo"
+    assert out.data["recorded_at"] and bp.load("demo").ok, "the proof was not recorded"
+
+
+async def test_a_proof_that_fails_is_answered_with_what_failed_and_recorded_as_failed(demo):
+    demo.ok = False
+
+    out = await actions.perform("box_prove", by=_shell(), project="demo")
+
+    assert out.ok, "the proof ran: a red box is an answer, not a refusal"
+    assert out.data["state"] == bp.NOT_PROVEN
+    assert out.data["proof"]["failed"] == ["validate"]
+    failed = [f for f in out.data["proof"]["findings"] if f["check"] == "validate"]
+    assert failed[0]["remedy"] == "fix the failing test"
+    assert bp.load("demo").ok is False
+
+
+async def test_a_ref_proof_is_measured_and_never_recorded(demo, monkeypatch, tmp_path):
+    from beeverforge import factory, loader
+
+    monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path / "checkout")
+    monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: object())
+
+    out = await actions.perform("box_prove", by=_shell(), project="demo", ref="feat/x")
+
+    assert out.ok and out.data["ref"] == "feat/x" and out.data["recorded_at"] is None
+    assert bp.load("demo") is None, "a branch proof was recorded where the poller looks"
+
+
+async def test_a_proof_already_running_here_is_refused_in_its_own_sentence(demo, monkeypatch):
+    @contextlib.contextmanager
+    def busy(*_a, **_k):
+        raise bp.ProveBusy("demo")
+        yield  # a generator, so `with` can enter it
+
+    monkeypatch.setattr(bp, "box_probes", busy)
+
+    out = await actions.perform("box_prove", by=_shell(), project="demo")
+
+    assert not out.ok and out.code == actions.CONFLICT
+    assert out.message == bp.ProveBusy("demo").sentence
+    assert bp.load("demo") is None, "a proof that measured nothing was recorded"
+
+
+@pytest.mark.parametrize("by", [_shell(), _panel()], ids=["host", "worker"])
+async def test_an_unknown_project_answers_a_reason_never_a_traceback(demo, engine, by):
+    out = await actions.perform("box_prove", by=by, project="nope")
+
+    assert not out.ok and out.code == actions.NOT_FOUND
+    assert out.data["reason"] == actions.NOT_FOUND
+    assert "nope" in out.message and "demo" in out.message, out.message
+    assert engine.started == [] and demo.boxes == []
+
+
+# ── the worker's half: answers at once, one proof per key ───────────────────────────────────────
+
+async def test_away_from_the_host_it_starts_the_proof_on_the_worker_and_answers_its_handle(
+        demo, engine):
+    from beeverforge.runtime.temporal import TASK_QUEUE
+
+    out = await actions.perform("box_prove", by=_panel(), project="demo")
+
+    assert out.ok, out.message
+    (started,) = engine.started
+    assert started["name"] == "BoxProveWorkflow" and started["task_queue"] == TASK_QUEUE
+    assert started["arg"].project == "demo"
+    assert started["id"] == bp.workflow_id("demo") == out.data["handle"]
+    assert started["execution_timeout"] == bp.PROOF_FLIGHT
+    assert out.data["state"] == bp.RUNNING and out.data["proof"] is None
+    assert demo.boxes == [], "the request proved the box itself"
+
+
+async def test_a_second_ask_while_a_proof_runs_answers_the_same_handle(demo, engine):
+    first = await actions.perform("box_prove", by=_panel(), project="demo")
+    second = await actions.perform("box_prove", by=_panel(), project="demo")
+
+    assert first.data["handle"] == second.data["handle"]
+    assert (first.data["joined"], second.data["joined"]) == (False, True)
+    assert len(engine.started) == 1
+
+
+def test_a_ref_and_a_repository_are_their_own_proofs():
+    ids = {bp.workflow_id("demo"), bp.workflow_id("demo", "feat/x"),
+           bp.workflow_id("demo--org--web"), bp.workflow_id("demo", "feat/y")}
+
+    assert len(ids) == 4
+
+
+async def test_with_no_engine_it_is_refused_as_unavailable(demo, monkeypatch):
+    from beeverforge.actions.base import refused
+
+    async def _connected():
+        return None, refused(actions.UNAVAILABLE, "the durable engine is not answering")
+
+    monkeypatch.setattr(catalog, "_connected", _connected)
+    out = await actions.perform("box_prove", by=_panel(), project="demo")
+
+    assert not out.ok and out.code == actions.UNAVAILABLE
+
+
+async def test_a_start_the_engine_refuses_for_another_reason_is_said_with_a_reference(
+        demo, monkeypatch, caplog):
+    class _Broken:
+        async def start_workflow(self, *_a, **_k):
+            raise RuntimeError("namespace not found")
+
+    async def _connected():
+        return _Broken(), None
+
+    monkeypatch.setattr(catalog, "_connected", _connected)
+    out = await actions.perform("box_prove", by=_panel(), project="demo")
+
+    assert not out.ok and out.code == actions.FAILED
+    assert out.data["reference"] and out.data["reference"] in caplog.text
+
+
+def test_the_worker_proves_and_records_it_driven_synchronously(demo):
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    said = acts._do_prove_box(BoxProveInput(project="demo"))
+
+    assert said.startswith("PROVEN"), said
+    assert bp.load("demo").ok and demo.boxes[0]["key"] == "demo"
+
+
+def test_the_worker_says_an_unknown_project_and_raises_nothing(demo):
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    said = acts._do_prove_box(BoxProveInput(project="nope"))
+
+    assert "nope" in said and demo.boxes == []
+
+
+def test_the_workflow_runs_its_one_activity_bounded_and_heartbeating():
+    from beeverforge.runtime.temporal import workflow as wf
+
+    tree = ast.parse(inspect.getsource(wf.BoxProveWorkflow))
+    (call,) = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "execute_activity"]
+    given = {k.arg: ast.unparse(k.value) for k in call.keywords}
+
+    assert ast.unparse(call.args[0]) == "prove_box"
+    assert given == {"start_to_close_timeout": "BOX_PROOF_CEILING",
+                     "heartbeat_timeout": "BOX_PROOF_HEARTBEAT", "retry_policy": "_ONCE"}
+    assert bp.PROOF_HEARTBEAT < bp.PROOF_CEILING < bp.PROOF_FLIGHT
+
+
+def test_the_worker_registers_the_workflow_and_its_activity():
+    from beeverforge.runtime.temporal import worker
+
+    source = inspect.getsource(worker)
+    assert "BoxProveWorkflow" in source and "prove_box" in source
+
+
+# ── both transports, with the catalogue's authorization ────────────────────────────────────────
+
+def test_through_the_panel_s_route_it_answers_the_handle(demo, engine, monkeypatch):
+    monkeypatch.delenv("BEEVERFORGE_PANEL_TOKEN", raising=False)
+    from fastapi.testclient import TestClient
+
+    from beeverforge.api.app import app
+
+    r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "demo"}})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["handle"] == bp.workflow_id("demo")
+    assert len(engine.started) == 1
+
+
+def test_through_the_panel_s_route_an_unknown_project_is_a_404_with_its_reason(demo, engine,
+                                                                               monkeypatch):
+    monkeypatch.delenv("BEEVERFORGE_PANEL_TOKEN", raising=False)
+    from fastapi.testclient import TestClient
+
+    from beeverforge.api.app import app
+
+    r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "nope"}})
+
+    assert r.status_code == 404, r.text
+    assert r.json()["data"]["reason"] == actions.NOT_FOUND and "Traceback" not in r.text
+    assert engine.started == []
+
+
+def test_through_the_panel_s_route_a_credential_without_the_floor_is_refused(demo, engine,
+                                                                            monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from beeverforge.api.app import app
+    from beeverforge.identity.local import (
+        PEOPLE_ENV,
+        PRODUCT_PEOPLE_ENV,
+        PRODUCT_SHARED_ENV,
+        SHARED_ENV,
+    )
+
+    monkeypatch.setenv(PEOPLE_ENV, "op-secret:rob:Rob")
+    monkeypatch.setenv(PRODUCT_PEOPLE_ENV, "ba-secret:bia:Bia Rocha")
+    monkeypatch.delenv(SHARED_ENV, raising=False)
+    monkeypatch.delenv(PRODUCT_SHARED_ENV, raising=False)
+
+    r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "demo"}},
+                             headers={"authorization": "Bearer ba-secret"})
+
+    assert r.status_code == 403, r.text
+    assert engine.started == [] and demo.boxes == []
+    assert bp.load("demo") is None
+
+
+async def test_the_layer_refuses_a_credential_without_the_floor_by_its_reason(demo, engine):
+    ba = actions.Actor(id="bia", display="Bia", via="panel", admin=True,
+                       scopes=frozenset({actions.PRODUCT}))
+
+    out = await actions.perform("box_prove", by=ba, project="demo")
+
+    assert not out.ok and out.code == actions.DENIED and out.data["reason"] == "out_of_scope"
+    assert engine.started == [] and demo.boxes == []
+
+
+def test_through_the_shell_s_act_it_answers_the_proof_document(demo, caplog):
+    from beeverforge.cli import app as cli
+
+    caplog.set_level(logging.INFO, logger="beeverforge.actions")
+    result = CliRunner().invoke(cli, ["act", "box_prove", "-p", "demo", "--json"])
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    assert body["data"]["proof"]["passed"] == ["image", "validate"]
+    assert "action=box_prove" in caplog.text, "the audit line was not written"
+
+
+# ── the verb is a mapping over the row ──────────────────────────────────────────────────────────
+
+def test_the_box_prove_verb_goes_through_the_row(demo, monkeypatch):
+    from beeverforge.cli import app as cli
+
+    seen: list[tuple[str, dict]] = []
+    real = actions.perform
+
+    async def spy(name, *, by, **params):
+        seen.append((name, dict(params)))
+        return await real(name, by=by, **params)
+
+    monkeypatch.setattr(actions, "perform", spy)
+    result = CliRunner().invoke(cli, ["box", "prove", "demo"])
+
+    assert result.exit_code == 0, result.output
+    assert [name for name, _ in seen] == ["box_prove"]
+    assert seen[0][1]["project"] == "demo"
+    assert "PROVEN — demo can build and test in this box (recorded at" in result.output
+    assert "  ok    validate  4 gate(s) green" in result.output
+    assert "running your gates" in result.output, "the progress no longer reaches the terminal"
+
+
+# ── the doctor's read is the one it was ─────────────────────────────────────────────────────────
+
+async def test_the_doctor_s_box_proof_reads_what_the_row_recorded(demo):
+    from beeverforge.onboarding import readiness
+
+    def check():
+        found, _ = readiness._box_proof(SimpleNamespace(
+            proof=lambda: bp.load("demo"), box_honours_image=lambda _s: True,
+            sandbox=lambda: "container", proof_dir=lambda: str(bp._proof_dir()),
+            project_name="demo"), "demo")
+        return found
+
+    assert not check().ok, "a proof was there before the row ran"
+    await actions.perform("box_prove", by=_shell(), project="demo")
+
+    found = check()
+    assert found.check == "box_proof" and found.ok and "img:1" in found.message
+    assert asyncio.iscoroutinefunction(catalog.CATALOG["box_prove"].run)

@@ -27,6 +27,10 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from beeverforge import after_merge
     from beeverforge.adapters.sandbox.timeouts import ACTIVITY_CEILING
+
+    # #237 — an asked box proof's bounds, beside the proof they bound: plain `timedelta`s
+    from beeverforge.box_prove import PROOF_CEILING as BOX_PROOF_CEILING
+    from beeverforge.box_prove import PROOF_HEARTBEAT as BOX_PROOF_HEARTBEAT
     from beeverforge.contracts import DecisionOption, DecisionRequest, JobState, RunResult
     from beeverforge.contracts.checks import (
         ASK,
@@ -90,6 +94,7 @@ with workflow.unsafe.imports_passed_through():
         product_role_say,
         product_sweep,
         promote_staging,
+        prove_box,
         purge_expired_records,
         read_ci_checks,
         reap_previews,
@@ -116,6 +121,7 @@ with workflow.unsafe.imports_passed_through():
         AdjustedInput,
         AdjustInput,
         AskInput,
+        BoxProveInput,
         CiRepairInput,
         CoordinatorInput,
         CoordinatorItem,
@@ -884,6 +890,30 @@ class ProductKnowledgeRefreshWorkflow:
             refresh_product_knowledge, inp,
             start_to_close_timeout=KNOWLEDGE_PASS_CEILING,
             heartbeat_timeout=KNOWLEDGE_PASS_HEARTBEAT,
+            retry_policy=_ONCE,
+        )
+
+
+@workflow.defn
+class BoxProveWorkflow:
+    """One project's box proven on the worker, because somebody asked through the `box_prove` row
+    (#237, ADR-0037 D3).
+
+    STARTED, NEVER AWAITED. The row answers at once with this workflow's id as the running proof's
+    handle — a proof pulls an image and runs the client's whole suite, which a request must not be
+    held open for. What it found is read afterwards from its record, by the doctor's `box_proof`.
+
+    ONE FLIGHT PER KEY AND REF, BY ITS ID (`box_prove.workflow_id`): a second ask while one runs is
+    refused by the engine as already started, and the row answers the same handle. One activity,
+    single attempt, bounded and heartbeating: a proof that fails is recorded as failed and asked
+    again by a person."""
+
+    @workflow.run
+    async def run(self, inp: BoxProveInput) -> str:
+        return await workflow.execute_activity(
+            prove_box, inp,
+            start_to_close_timeout=BOX_PROOF_CEILING,
+            heartbeat_timeout=BOX_PROOF_HEARTBEAT,
             retry_policy=_ONCE,
         )
 

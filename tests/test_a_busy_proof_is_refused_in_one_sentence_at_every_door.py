@@ -45,7 +45,22 @@ def _busy(monkeypatch, refusal) -> list:
     return recorded
 
 
-def _cli_door(monkeypatch) -> None:
+def _registered(monkeypatch, tmp_path, *, repo_path: str = "") -> None:
+    """`acme` in the registry the `box_prove` row resolves it from (#237), and its image."""
+    import json
+
+    from beeverforge import factory
+
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(json.dumps({"projects": {"acme": {
+        "name": "acme", "repo": "org/acme",
+        "repo_path": repo_path or "https://github.com/org/acme.git"}}}))
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(reg))
+    monkeypatch.setattr(factory, "resolve_box_image", lambda *_a, **_kw: "img")
+
+
+def _cli_door(monkeypatch, tmp_path) -> None:
+    _registered(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "_get_project", lambda name: SimpleNamespace(name=name, box=None))
     monkeypatch.setattr(cli, "resolve_box_image", lambda *_a, **_kw: "img")
     monkeypatch.setattr(cli, "_box_kind", lambda _explicit: "container")
@@ -62,11 +77,11 @@ def _says_it_in_one_sentence(result, refusal) -> None:
     assert "Traceback" not in result.output, result.output
 
 
-def test_box_prove_says_the_proof_is_running_and_records_nothing(monkeypatch):
+def test_box_prove_says_the_proof_is_running_and_records_nothing(monkeypatch, tmp_path):
     """`beeverforge box prove acme` while acme is being proven. Before: no `ProveBusy` at all."""
     refusal = box_prove.ProveBusy("acme")
     recorded = _busy(monkeypatch, refusal)
-    _cli_door(monkeypatch)
+    _cli_door(monkeypatch, tmp_path)
 
     result = CliRunner().invoke(cli.app, ["box", "prove", "acme"])
 
@@ -91,8 +106,7 @@ def test_a_refused_ref_proof_leaves_the_running_proofs_checkout_alone(tmp_path, 
     sentinel = first / "the-first-proof-reads-here"
     sentinel.write_text("live\n")
     holder = _another_process_holding("acme", tmp_path / "proofs")
-    monkeypatch.setattr(cli, "_get_project",
-                        lambda _n: SimpleNamespace(name="acme", repo_path=str(repo), box=None))
+    _registered(monkeypatch, tmp_path, repo_path=str(repo))
     monkeypatch.setattr(cli, "resolve_box_image", lambda *_a, **_kw: "img")
     monkeypatch.setattr(cli, "_box_kind", lambda _explicit: "container")
     monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_kw: SimpleNamespace(
@@ -132,7 +146,7 @@ def test_a_refused_ref_proof_of_another_repository_leaves_its_checkout_alone(tmp
     sentinel.write_text("live\n")
     holder = _another_process_holding("acme--org--web", tmp_path / "proofs")
     view = SimpleNamespace(name="acme", repo_path=str(repo), box=None)
-    monkeypatch.setattr(cli, "_get_project", lambda _n: SimpleNamespace(name="acme", box=None))
+    _registered(monkeypatch, tmp_path)
     monkeypatch.setattr(card_repo, "_runner_view", lambda _p, _r: (view, "acme--org--web"))
     monkeypatch.setattr(cli, "resolve_box_image", lambda *_a, **_kw: "img")
     monkeypatch.setattr(cli, "_box_kind", lambda _explicit: "container")
@@ -165,8 +179,7 @@ def test_a_ref_proof_lets_its_key_go_however_it_ends(tmp_path, monkeypatch):
     monkeypatch.setenv("BEEVERFORGE_REPO_CACHE", str(tmp_path / "cache"))
     repo = _repository(tmp_path / "acme")
     subprocess.run(["git", "-C", str(repo), "branch", "feat"], check=True, capture_output=True)
-    monkeypatch.setattr(cli, "_get_project",
-                        lambda _n: SimpleNamespace(name="acme", repo_path=str(repo), box=None))
+    _registered(monkeypatch, tmp_path, repo_path=str(repo))
     monkeypatch.setattr(cli, "resolve_box_image", lambda *_a, **_kw: "img")
     monkeypatch.setattr(cli, "_box_kind", lambda _explicit: "container")
 
@@ -192,7 +205,7 @@ def test_a_ref_proof_lets_its_key_go_however_it_ends(tmp_path, monkeypatch):
     assert not lock.held_here(), "a --ref proof that ran kept its key after it ended"
 
 
-def test_box_answer_says_the_proof_is_running(monkeypatch):
+def test_box_answer_says_the_proof_is_running(monkeypatch, tmp_path):
     """`beeverforge box answer acme` while acme is being proven: one sentence, and no spend
     recorded for a call nobody made."""
     from beeverforge.adapters.agent import registry
@@ -201,7 +214,7 @@ def test_box_answer_says_the_proof_is_running(monkeypatch):
 
     refusal = box_prove.ProveBusy("acme")
     recorded = _busy(monkeypatch, refusal)
-    _cli_door(monkeypatch)
+    _cli_door(monkeypatch, tmp_path)
     monkeypatch.setattr(registry, "build_executor", lambda _project: CodexAdapter())
     monkeypatch.setattr(job_record, "record_one_pass",
                         lambda **kw: recorded.append(("record_one_pass", kw)))

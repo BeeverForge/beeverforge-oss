@@ -7753,6 +7753,84 @@ async def _doctor(*, project: str, by: Actor) -> Outcome:
     return done(said, **document)
 
 
+def _on_the_host(by: Actor) -> bool:
+    """Whether the caller is a shell where the factory runs — the CLI's own `beeverforge box
+    prove`, and `beeverforge act` beside it — which proves in its own process, as the command
+    always did. Every other caller is somewhere a request is held open."""
+    return getattr(by, "via", "") == "cli"
+
+
+async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", image: str = "",
+                     sandbox: str = "") -> Outcome:
+    """Prove one project's box (ADR-0037 D3) — `beeverforge box prove` as a row (#237).
+
+    TWO ANSWERS, BY WHERE THE CALLER IS. A shell on the host proves in its own process, as the
+    command always did, and answers the proof document — `data.proof`: what passed, what failed,
+    every finding by its name — and where it was recorded. Any other caller is holding a request
+    open, and a proof pulls an image and runs the client's whole suite: the row STARTS
+    `BoxProveWorkflow` on the worker and answers at once with the running proof's handle, like
+    `product_refresh`. The doctor's `box_proof` says afterwards what it found, from the record.
+
+    ONE FLIGHT PER KEY AND REF (`box_prove.workflow_id`): a second ask while one runs is refused by
+    the engine as already started, and this answers the same handle, `joined`.
+
+    `ok` IS ABOUT THE ROW HAVING RUN, as `doctor`'s is: a box that is not proven is a done outcome
+    whose document says `"ok": false` and what failed. A refusal is a proof that did not run — an
+    unknown project, a branch whose manifest cannot be read, one of the same key already running."""
+    import asyncio
+
+    from beeverforge import box_prove
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    if _on_the_host(by):
+        run = await asyncio.to_thread(box_prove.prove_the_box, found, repo=repo, ref=ref,
+                                      image=image, sandbox=sandbox)
+        if run.busy:
+            return refused(CONFLICT, run.refused, project=found.name, key=run.key, ref=run.ref)
+        if run.refused or run.proof is None:
+            return refused(INVALID, run.refused or "the proof measured nothing.",
+                           project=found.name, key=run.key, ref=run.ref)
+        return done(run.sentence(), project=found.name, key=run.key, ref=run.ref,
+                    state=run.state, proof=box_prove.document(run.proof),
+                    recorded_at=None if run.recorded_at is None else str(run.recorded_at),
+                    handle=None, joined=False)
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    # THE KEY THE WORKER WILL PROVE UNDER, asked of the same view `prove_the_box` takes, so a
+    # repository's proof and the default one never share a flight
+    key = found.name
+    if repo:
+        from beeverforge.runtime.card_repo import _runner_view
+
+        _view, key = _runner_view(found, f"{repo}#0")
+    handle = box_prove.workflow_id(key, ref)
+    try:
+        await client.start_workflow(
+            "BoxProveWorkflow",
+            BoxProveInput(project=found.name, repo=repo, ref=ref, image=image, sandbox=sandbox),
+            id=handle, task_queue=TASK_QUEUE, execution_timeout=box_prove.PROOF_FLIGHT)
+        joined = False
+    except Exception as exc:  # a start the engine refused is said, never raised
+        if "AlreadyStarted" not in type(exc).__name__:
+            reference = failure_reference()
+            log.exception("the box proof of %s could not be started reference=%s (%s)",
+                          key, reference, exc)
+            return refused(FAILED, "the box proof could not be started just now.",
+                           project=found.name, reference=reference)
+        joined = True
+    said = (f"a proof of {key}'s box is already running on the worker — this ask joined it"
+            if joined else f"the proof of {key}'s box is running on the worker")
+    return done(f"{said}; `doctor {found.name}` says what it found once it ends.",
+                project=found.name, key=key, ref=ref, state=box_prove.RUNNING, proof=None,
+                recorded_at=None, handle=handle, joined=joined)
+
+
 # ── a project's own settings, and its removal (#741) ────────────────────────────────────────────
 #
 # THE REGISTRY IS READ PER RUN, so each of these takes effect on the next job with no restart —
@@ -9786,6 +9864,21 @@ CATALOG: dict[str, ActionSpec] = {
             # A PROJECT BEFORE ITS CODE IS DIAGNOSED, NOT REFUSED (#992): the doctor's answer for
             # one is its `code` line, as `env_check`'s is
             needs_code=False,
+        ),
+        ActionSpec(
+            name="box_prove",
+            summary="prove one project's box — its image, its toolbox, its own `setup:` and "
+                    "gates; answers the proof document, or the handle of the proof running on "
+                    "the worker",
+            run=_box_prove,
+            refuses=(INVALID, NOT_FOUND, CONFLICT, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("repo", "ref", "image", "sandbox"),
+            params={"repo": "owner/name — another of the product's repositories, proven on its "
+                            "own manifest",
+                    "ref": "a branch or tag whose manifest is measured and never recorded",
+                    "image": "an image for this proof only",
+                    "sandbox": "which box to prove — default: the one this deployment runs"},
         ),
     )
 }

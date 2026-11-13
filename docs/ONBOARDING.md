@@ -687,6 +687,15 @@ own `setup:` and your own `validate:` against untouched `main` — **streaming e
 happens**. Green means *your tests passed inside the factory*, and on this door it costs zero
 agent tokens.
 
+**The command is the `box_prove` row**, so a screen of your own asks for the same proof with
+`POST /api/act/box_prove` and `{"params": {"project": "myapp"}}` (`repo`, `ref`, `image` and
+`sandbox` are the command's flags). From the shell, `beeverforge box prove` and
+`beeverforge act box_prove -p myapp` prove in place and answer the proof document: what passed,
+what failed, and each finding by its name. Through the panel's API the proof runs on the worker,
+and the answer comes back at once with the running proof's `handle`. A second ask while that proof
+runs gets the same handle back. `beeverforge doctor myapp`'s `box_proof` line says what the proof
+found once it ends.
+
 **On the one-machine door there is no image**, so the proof pins what there is instead: your own
 `setup:` and `validate:` run in a worktree box, the harness's version is recorded the way a
 toolchain is, and the harness is **asked one real question** — the one place this command is not
