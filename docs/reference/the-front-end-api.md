@@ -289,6 +289,20 @@ credential: its `data` is the `beeverforge.doctor/1` document `beeverforge docto
 and its `ok` is about the doctor having run — the document's own `ok` says whether the project can
 run a ticket.
 
+`box_prove` (`project`, [`repo`], [`ref`], [`image`], [`sandbox`]) proves one project's box: the
+image, the toolbox, the project's own `setup:` and gates (`beeverforge box prove`). Through the API
+— and through `beeverforge act` — the proof runs on the worker and the answer comes back at once:
+`data.state` is `running`, `data.handle` names the running proof, and `data.joined` is `true` when
+the ask joined a proof of the same project already running. A `ref` there is a 400: it is measured
+and never recorded, so only `beeverforge box prove` takes one. A box the worker cannot prove in (an
+unknown one, a remote one, one that bounds nothing on a worker that is not its operator's, or one
+that cannot honour the project's `box.image`) is a 400, and nothing starts. That command proves in place and
+`data.proof` is the proof document: `ok`, `passed` and `failed` (check names), `advisory`, and
+`findings`, each `{check, ok, message, remedy, advisory}`. `data.state` is then `proven` or
+`not_proven`, and `data.recorded_at` is `null` for a `ref`. An unknown project is a 404 that names
+the registered ones. A proof of the same key already running on the host is a 409. The doctor's
+`box_proof` reads what the proof recorded. The row is the floor's, for an admin.
+
 **Rows of several steps.** `project_init` and `product_init` take several steps with the network
 between them, and say in `data.steps` what each came to: in order, each `{step, state, said}`, the
 state one of `done` (this call did it), `already` (it was there before), `skipped` (not this

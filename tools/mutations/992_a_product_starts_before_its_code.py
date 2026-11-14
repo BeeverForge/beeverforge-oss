@@ -185,11 +185,16 @@ MUTATIONS = [
      '    if before_its_code(project):\n        return "no-repo"',
      '    if False:\n        return "no-repo"',
      T + "::test_the_knowledge_refresh_maps_no_code_and_clones_nothing"),
-    ("box prove reads a project before its code", CLI,
-     '    project = _with_its_code(_get_project(name), "proving its box")',
-     "    project = _get_project(name)",
-     T + "::test_a_verb_that_reads_the_code_refuses_it_and_writes_nothing_where_it_stands"
-         "[verb0]"),
+    # RE-PINNED 2026-11-13 (#237): `box prove` maps onto the `box_prove` row, which waits for the
+    # code by its declaration, as `project init` does since #741 — so the cut is the row saying it
+    # does not need the code. Its own test, because the door's still exits 1 with the sentence:
+    # the box's own refusal underneath says it too, after the proof has started.
+    ("box prove reads a project before its code", CAT,
+     '                    "sandbox": "which box to prove — default: the one this deployment runs"},\n',
+     '                    "sandbox": "which box to prove — default: the one this deployment runs"},\n'
+     '            needs_code=False,\n',
+     "tests/test_box_prove_is_a_catalogue_row.py"
+     "::test_a_project_before_its_code_is_refused_before_a_proof_starts"),
     # RE-PINNED 2026-10-23 (#741): `project init` maps onto the `project_init` row, which waits
     # for the code by its declaration — `perform` refuses it before its code, as the command's own
     # check did — so the cut is the row saying it does not need the code.

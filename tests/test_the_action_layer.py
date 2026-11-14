@@ -393,6 +393,11 @@ OWNED = {
     # that called it would land a client's requirements with no source admitted — the command
     # line's any path, everyone else's inbox — and no plan shown before the yes.
     "import_requirements": "product_import",
+    # One project's box proven (#237). The marker is the proof's whole body — the repository's
+    # view, the box, the `--ref` checkout under its key, the proof and its record: `box prove` is
+    # a mapping onto this row, and a front end that called it would be a second place deciding
+    # what a proof records.
+    "prove_the_box": "box_prove",
 }
 
 
