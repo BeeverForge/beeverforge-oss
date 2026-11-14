@@ -121,8 +121,9 @@ def generate_bundle_for(repo_path: Path) -> Path | None:
     OUTSIDE the workspace, always. A bundle written into the agent's tree would be picked up by
     `git add -A` and every client pull request would carry a copy of the map.
 
-    `None` when the tree yields nothing worth mapping — the caller degrades to no injection."""
-    from beeverforge.knowledge.bundle import build_bundle, write_bundle
+    `None` when the tree yields nothing worth mapping, or a map over the ceiling its reader refuses
+    (`BundleOverCeiling`, logged by name) — the caller degrades to no injection."""
+    from beeverforge.knowledge.bundle import BundleOverCeiling, build_bundle, write_bundle
 
     repo_path = Path(repo_path)
     bundle = build_bundle(repo_path, commit=_head_commit(repo_path))
@@ -141,7 +142,12 @@ def generate_bundle_for(repo_path: Path) -> Path | None:
     # right when publishing to a branch (it stops a refresh triggered by the previous refresh
     # from looping). Here the directory is new every time, so the comparison has nothing to
     # compare against and skipping would leave the caller with nothing.
-    written = write_bundle(bundle, pub, force=True)
+    try:
+        written = write_bundle(bundle, pub, force=True)
+    except BundleOverCeiling as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        _log.warning("knowledge: no map this run — %s", exc)
+        return None
     if written is None:
         shutil.rmtree(tmp, ignore_errors=True)
         _log.warning("knowledge: the bundle was generated but not written — no map this run")

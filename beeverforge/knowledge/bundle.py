@@ -140,6 +140,23 @@ def derived_key(bundle: KnowledgeBundle) -> str:
     return _dump(payload)
 
 
+class BundleOverCeiling(ValueError):
+    """A bundle document is larger than `yaml_io.MAX_BYTES`, the ceiling its own reader refuses
+    at. Raised BEFORE anything is written: on disk it would be read back as unreadable and
+    ignored, a map that exists and is never used (#541)."""
+
+
+def _within_ceiling(path: Path, text: str) -> str:
+    """`text`, or `BundleOverCeiling` naming `path` when its reader would refuse it."""
+    size = len(text.encode("utf-8"))
+    if size > yaml_io.MAX_BYTES:
+        raise BundleOverCeiling(
+            f"the knowledge bundle {path} would be {size:,} bytes, over the "
+            f"{yaml_io.MAX_BYTES:,}-byte ceiling a YAML file is read to, so it was not written: "
+            "read back, it would be refused and the map ignored")
+    return text
+
+
 def write_bundle(bundle: KnowledgeBundle, repo_path: Path, *, force: bool = False) -> Path | None:
     """Write `knowledge/modules.yaml` + `knowledge/manifest.yaml` into the repo — `write_bundle_dir`
     at the repository's own `knowledge/`, the layout `beeverforge knowledge build` keeps for an
@@ -162,6 +179,9 @@ def write_bundle_dir(bundle: KnowledgeBundle, dest: Path, *, force: bool = False
     backfill (2026-09-06): the onboarding published concepts and no map, the job found no
     `modules.yaml` at the subpath, judged "no bundle", and injected nothing.
 
+    NEVER A DOCUMENT ITS OWN READER REFUSES: either file over `yaml_io.MAX_BYTES` raises
+    `BundleOverCeiling`, naming it, and neither is written.
+
     Idempotent — rewriting an unchanged repo yields identical bytes."""
     dest = Path(dest)
     if not force:
@@ -169,16 +189,18 @@ def write_bundle_dir(bundle: KnowledgeBundle, dest: Path, *, force: bool = False
         if existing is not None and derived_key(existing) == derived_key(bundle):
             _log.info("knowledge: sources unchanged — bundle left as-is (nothing to commit)")
             return None
+    modules_text = _within_ceiling(
+        dest / MODULES_FILE, _GENERATED_BANNER + _dump(bundle.module_map.model_dump(mode="json")))
+    manifest_text = _within_ceiling(
+        dest / MANIFEST_FILE, _GENERATED_BANNER + _dump(bundle.manifest.model_dump(mode="json")))
     dest.mkdir(parents=True, exist_ok=True)
     # REPLACED, NEVER TRUNCATED. A RepoCache snapshot is built with `copy_function=os.link`, so
     # every file shares its inode with the hidden master (and with any snapshot a concurrent
     # reader holds): an in-place `write_text` there rewrites ALL of them through the link.
     # `os.replace` of a fresh temp file swaps in a NEW inode instead — atomic, and the master
     # keeps the bytes it had (adversarial review, 2026-08-13).
-    _write_atomic(dest / MODULES_FILE,
-                  _GENERATED_BANNER + _dump(bundle.module_map.model_dump(mode="json")))
-    _write_atomic(dest / MANIFEST_FILE,
-                  _GENERATED_BANNER + _dump(bundle.manifest.model_dump(mode="json")))
+    _write_atomic(dest / MODULES_FILE, modules_text)
+    _write_atomic(dest / MANIFEST_FILE, manifest_text)
     return dest
 
 

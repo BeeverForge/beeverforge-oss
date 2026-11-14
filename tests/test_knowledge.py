@@ -196,6 +196,64 @@ def test_key_files_cap_is_disclosed(tmp_path: Path):
     assert "+10 more not listed" in render_module_map(bundle)
 
 
+def test_a_module_of_tests_lists_no_public_surface(tmp_path: Path):
+    """A test's top-level names are `test_…` functions nothing imports: listed, they were 86% of
+    this repository's own map and pushed it to the read ceiling (#541). The module stays — what
+    it is, its files and how many — and only the surface goes. A code module is untouched."""
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "rules.py").write_text("def decide(x):\n    return x\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "__init__.py").write_text('"""The suite."""\n')
+    (tmp_path / "tests" / "test_rules.py").write_text("def test_decide():\n    pass\n")
+    (tmp_path / "addons" / "extra" / "tests").mkdir(parents=True)
+    (tmp_path / "addons" / "extra" / "tests" / "helpers.py").write_text("def make():\n    pass\n")
+    # no test directory, but every file is one test discovery collects
+    (tmp_path / "checks").mkdir()
+    (tmp_path / "checks" / "test_one.py").write_text("def test_a():\n    pass\n")
+    (tmp_path / "checks" / "conftest.py").write_text("def fixture():\n    pass\n")
+    (tmp_path / "web").mkdir()
+    (tmp_path / "web" / "view.spec.ts").write_text("export const spec = 1;\n")
+    (tmp_path / "Shop.Tests").mkdir()
+    (tmp_path / "Shop.Tests" / "Shop.Tests.csproj").write_text("<Project></Project>\n")
+    (tmp_path / "Shop.Tests" / "CartTests.cs").write_text("public class CartTests {}\n")
+    # beside a test file, one that is not makes the module code
+    (tmp_path / "mixed").mkdir()
+    (tmp_path / "mixed" / "test_mixed.py").write_text("def test_m():\n    pass\n")
+    (tmp_path / "mixed" / "engine.py").write_text("def run():\n    pass\n")
+
+    by_name = {m.name: m for m in build_module_map(tmp_path, commit="c").modules}
+
+    for name in ("tests", "addons.extra.tests", "checks", "web", "Shop.Tests"):
+        assert by_name[name].public_surface == [], name
+    suite = by_name["tests"]
+    assert suite.purpose == "The suite."
+    assert suite.key_files == ["tests/__init__.py", "tests/test_rules.py"]
+    assert suite.file_count == 2
+    assert by_name["core"].public_surface == ["decide"]
+    assert by_name["mixed"].public_surface == ["run", "test_m"]
+
+
+def test_a_bundle_its_own_reader_would_refuse_is_never_written(tmp_path: Path, monkeypatch):
+    """Written over the ceiling, the bundle is read back as unreadable and ignored — a map that
+    exists on disk and is never used (#541). The writer refuses first, naming the file, and
+    leaves nothing behind for a reader to ignore."""
+    from beeverforge.knowledge import bundle as bundle_mod
+    from beeverforge.util import yaml_io
+
+    repo = _fixture_repo(tmp_path)
+    built = build_bundle(repo, commit="c", generated_at="t")
+    monkeypatch.setattr(yaml_io, "MAX_BYTES", 600)
+
+    with pytest.raises(bundle_mod.BundleOverCeiling) as refused:
+        write_bundle(built, repo, force=True)
+
+    sentence = str(refused.value)
+    assert str(repo / "knowledge" / "modules.yaml") in sentence
+    assert "600-byte ceiling" in sentence
+    assert not (repo / "knowledge" / "modules.yaml").exists()
+    assert not (repo / "knowledge" / "manifest.yaml").exists()
+
+
 def test_orphan_link_detection(tmp_path: Path):
     repo = _fixture_repo(tmp_path)
     bundle = build_bundle(repo, commit="x", generated_at="t")
