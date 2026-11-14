@@ -2,7 +2,7 @@
 
 Run:  .venv/bin/python tools/mutate.py tools/mutations/237_box_prove_is_a_catalogue_row.py
 
-FOUR CUTS, each required to go red:
+SIX CUTS, each required to go red:
 
   1. A repository's proof on the worker is its own flight: keyed under the project's name, it
      would join the default repository's proof and never run.
@@ -12,6 +12,10 @@ FOUR CUTS, each required to go red:
      the queue with nothing to run it.
   4. The worker's proof heartbeats: run without `_turning`, a worker that dies mid-proof is
      noticed at the proof's ceiling, not within `box_prove.PROOF_HEARTBEAT`.
+  5. The row asks the door's question: without `durable_refusal`, a `worktree` box would run the
+     project's suite on a worker that is not its operator's (ADR-0049 D9).
+  6. The row refuses a remote box: without it, a `fargate` ask is answered `running` and fails on
+     the worker, which has no local box to build.
 
 The guard under test: `tests/test_box_prove_is_a_catalogue_row.py`.
 """
@@ -45,4 +49,14 @@ MUTATIONS = [
      "                          f\"proving the box of {inp.project}\")",
      "    return await asyncio.to_thread(_do_prove_box, inp)",
      TEST + "::test_the_worker_s_proof_heartbeats_while_it_runs"),
+
+    ("the row no longer asks the door's question of the box", CATALOG,
+     "        why = durable_refusal(box_kind)\n",
+     "        why = \"\"\n",
+     TEST + "::test_away_from_the_shell_a_box_the_worker_may_not_prove_in_is_refused[worktree]"),
+
+    ("the row no longer refuses a remote box", CATALOG,
+     "        if not why and installed_box_traits(box_kind).remote:\n",
+     "        if False:\n",
+     TEST + "::test_away_from_the_shell_a_box_the_worker_may_not_prove_in_is_refused[fargate]"),
 ]

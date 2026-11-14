@@ -352,6 +352,35 @@ async def test_away_from_the_shell_an_image_the_box_cannot_honour_is_refused(dem
     assert engine.started == [] and demo.boxes == []
 
 
+@pytest.mark.parametrize("kind", ["fargate", "worktree"])
+async def test_away_from_the_shell_a_box_the_worker_may_not_prove_in_is_refused(demo, engine,
+                                                                               monkeypatch, kind):
+    """`fargate` has no local box to build, so the worker's proof raises after `running` was
+    answered; `worktree` bounds nothing on a worker that is not its operator's (ADR-0049 D9)."""
+    monkeypatch.delenv("BEEVERFORGE_OWN_WORK", raising=False)
+
+    out = await actions.perform("box_prove", by=_panel(), project="demo", sandbox=kind)
+
+    assert not out.ok and out.code == actions.INVALID and kind in out.message, out.message
+    assert "Nothing was started" in out.message and engine.started == [] and demo.boxes == []
+
+
+async def test_a_worker_that_is_its_operator_s_own_proves_in_the_worktree_box(demo, engine,
+                                                                             monkeypatch):
+    monkeypatch.setenv("BEEVERFORGE_OWN_WORK", "1")
+
+    out = await actions.perform("box_prove", by=_panel(), project="demo", sandbox="worktree")
+
+    assert out.ok and engine.started[0]["arg"].sandbox == "worktree", out.message
+
+
+async def test_the_box_the_row_checked_is_the_box_the_worker_is_asked_to_prove(demo, engine):
+    await actions.perform("box_prove", by=_panel(), project="demo", sandbox=" Container ")
+    await actions.perform("box_prove", by=_panel(), project="demo", repo="acme/web")
+
+    assert [s["arg"].sandbox for s in engine.started] == ["container", "container"]
+
+
 async def test_a_repository_s_proof_on_the_worker_is_its_own_flight(demo, engine):
     from beeverforge.registry import ProjectRegistry
     from beeverforge.runtime.card_repo import _runner_view

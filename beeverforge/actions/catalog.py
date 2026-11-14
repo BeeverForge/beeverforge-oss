@@ -7800,7 +7800,7 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
                                 f"runs — `beeverforge box prove {found.name} --ref {ref}`: it is "
                                 f"never recorded, so a proof of it here would answer nobody. "
                                 f"Nothing was started.", project=found.name, ref=ref)
-    from beeverforge.adapters.sandbox.registry import installed_box_traits
+    from beeverforge.adapters.sandbox.registry import durable_refusal, installed_box_traits
     from beeverforge.factory import resolve_box_image
     from beeverforge.runtime.temporal import TASK_QUEUE
     from beeverforge.runtime.temporal.io import BoxProveInput, default_sandbox
@@ -7817,10 +7817,15 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
     # where nobody reads it. The box is stamped into the input, so the worker proves what was asked.
     box_kind = (sandbox or "").strip().lower() or default_sandbox()
     try:
-        installed_box_traits(box_kind)
         resolve_box_image(view, explicit=image or None, sandbox=box_kind)
+        why = durable_refusal(box_kind)
+        if not why and installed_box_traits(box_kind).remote:
+            why = (f"the {box_kind!r} box is remote: a proof builds its box on the worker, and "
+                   f"this one has none there — ask for the 'container' box.")
     except ValueError as exc:
-        return refused(INVALID, f"{exc} Nothing was started.", project=found.name,
+        why = str(exc)
+    if why:
+        return refused(INVALID, f"{why} Nothing was started.", project=found.name,
                        sandbox=box_kind)
     client, bad_engine = await _connected()
     if bad_engine:
