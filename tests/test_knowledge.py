@@ -233,6 +233,17 @@ def test_a_module_of_tests_lists_no_public_surface(tmp_path: Path):
     assert by_name["mixed"].public_surface == ["run", "test_m"]
 
 
+def test_what_names_a_test_is_onboardings_own():
+    """The generator copies onboarding's test names rather than importing them (onboarding
+    imports the knowledge layer). A copy can drift; this keeps the two the same."""
+    from beeverforge.knowledge import generator
+    from beeverforge.onboarding import context
+
+    assert generator._TEST_DIRS == context._TEST_DIRS
+    assert generator._TEST_PREFIX.pattern == context._TEST_PREFIX.pattern
+    assert generator._TEST_SUFFIX.pattern == context._TEST_SUFFIX.pattern
+
+
 def test_a_bundle_its_own_reader_would_refuse_is_never_written(tmp_path: Path, monkeypatch):
     """Written over the ceiling, the bundle is read back as unreadable and ignored — a map that
     exists on disk and is never used (#541). The writer refuses first, naming the file, and
