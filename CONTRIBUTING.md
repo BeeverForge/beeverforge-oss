@@ -16,6 +16,9 @@ make lint                    # ruff check beeverforge/ tests/, then shellcheck o
 make test                    # python -m pytest -q
 ```
 
+The same setup and gates, for a BeeverForge deployment that builds this repository, are in its own
+manifest, `.beeverforge/project.yaml`; `beeverforge box prove` reads it from the checkout.
+
 **The `[dev]` extra is not optional.** It carries the test tools (pytest, pytest-asyncio,
 pytest-randomly, pytest-xdist, ruff) *and* `temporalio`, because the suite covers the durable
 runtime. The suite does not skip what it cannot import: after a plain `pip install -e .`,
