@@ -16,7 +16,7 @@ What it emits, per source directory ("module"):
 - `dependencies`    — other in-repo modules it imports (resolved from the import graph;
                       for .NET, from `<ProjectReference>`).
 - `public_surface`  — exported top-level symbols (Python defs/classes/`__all__`; JS exports;
-                      C# public types and members).
+                      C# public types and members). Empty for a module of tests.
 - `source`          — the anchor file + the commit it was generated from (the §7 link).
 
 And — `survey_extensions` — what it did NOT read, per extension, with counts, PLUS every
@@ -90,6 +90,35 @@ _SKIP_DIRS = {
 
 _PURPOSE_MAX = 200  # a purpose line is a signpost, not prose
 _MAX_KEY_FILES = 40  # a module with hundreds of files: list the first N (sorted), note the rest
+
+# A MODULE OF TESTS HAS NO PUBLIC SURFACE. Its top-level names are `test_…` functions and fixtures
+# that nothing imports, and listed they were 86% of this repository's own `modules.yaml` — enough
+# to push it to the ceiling its reader refuses at (#541). A module is one of tests when a segment
+# of its path is a test directory, or when every file in it is one test discovery collects. The
+# names are `onboarding/context.py`'s (`_TEST_DIRS`, `_TEST_PREFIX`, `_TEST_SUFFIX`), which imports
+# this module and so cannot be imported here. `testing` is absent on purpose: `beeverforge/testing/`
+# is test machinery shipped as product code, and its surface is what other code imports.
+_TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "__tests__", "unittest", "unittests"})
+_TEST_PREFIX = re.compile(r"^[Tt]est[_.-]")
+_TEST_SUFFIX = re.compile(r"([_.-](?:test|tests|spec|specs)|Tests?|Specs?)$")
+_TEST_SUPPORT_FILES = {"conftest.py"}
+
+
+def _is_test_file(rel_file: Path) -> bool:
+    """A file test discovery collects, by its name: `test_x.py`, `x_test.py`, `x.spec.ts`,
+    `CartTests.cs`, `Shop.Tests.csproj`, or pytest's `conftest.py`."""
+    if rel_file.name in _TEST_SUPPORT_FILES:
+        return True
+    stem = rel_file.stem
+    return bool(_TEST_PREFIX.match(stem) or _TEST_SUFFIX.search(stem))
+
+
+def _is_test_module(rel_dir: Path, files: list[Path]) -> bool:
+    """A test tree (`tests/`, `addons/x/tests/`, `__tests__/`), or a directory whose every file
+    is a test. One file that is not makes it code, and its surface is listed."""
+    if any(part in _TEST_DIRS for part in rel_dir.parts):
+        return True
+    return bool(files) and all(_is_test_file(f) for f in files)
 
 
 def _is_skipped_name(name: str) -> bool:
@@ -803,7 +832,7 @@ def build_module_map(repo_path: Path, *, commit: str = "") -> ModuleMap:
                 key_files=key_files,
                 file_count=len(files),
                 dependencies=sorted(deps),
-                public_surface=sorted(public),
+                public_surface=[] if _is_test_module(rel_dir, files) else sorted(public),
                 source=SourceLink(file=anchor, commit=commit),
             )
         )

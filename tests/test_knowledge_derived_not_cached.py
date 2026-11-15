@@ -61,6 +61,41 @@ def test_the_generated_map_is_actually_INJECTED(generated):
     assert len(text) > 500, f"suspiciously small injection: {len(text)} chars"
 
 
+#: The share of the read ceiling this repository's own `modules.yaml` may reach. It was 99.8% when
+#: a test module listed its `test_…` functions as public surface, and a change adding 2 KB of code
+#: made the map unreadable (#541); without them it is about 14%.
+HEADROOM = 0.25
+
+
+def test_this_repositorys_own_map_reads_back_with_room_to_grow(generated):
+    """The red this replaces said "rejected at injection" about a map that was simply too big. This
+    one says which bundle, how big, and against what, while there is still room to act."""
+    from beeverforge.knowledge.bundle import MODULES_FILE
+    from beeverforge.util.yaml_io import MAX_BYTES
+
+    modules = generated / MODULES_FILE
+    size = modules.stat().st_size
+    assert size <= HEADROOM * MAX_BYTES, (
+        f"this repository's own knowledge bundle {modules.name} is {size:,} bytes, "
+        f"{size * 100 // MAX_BYTES}% of the {MAX_BYTES:,}-byte ceiling a YAML file is read to "
+        f"(at most {HEADROOM:.0%} keeps room to grow) — find what made the module map grow")
+
+
+def test_a_map_over_the_ceiling_is_no_map_and_leaves_no_directory(tmp_path, monkeypatch):
+    """The writer refuses a bundle its reader would ignore; the job then degrades to no injection,
+    like any tree that yields no map, and the temp directory made for it is reclaimed."""
+    from beeverforge.util import yaml_io
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text('"""A package."""\n', encoding="utf-8")
+    monkeypatch.setattr(yaml_io, "MAX_BYTES", 100)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+
+    assert generate_bundle_for(tmp_path) is None
+    assert list((tmp_path / "tmp").iterdir()) == [], "the temp root survived the refusal"
+
+
 def test_it_lands_OUTSIDE_the_workspace(generated):
     """A bundle inside the agent's tree would be swept into the ticket's commit by `git add -A`,
     and every client pull request would carry a copy of the map."""
