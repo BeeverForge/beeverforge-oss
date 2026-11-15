@@ -20,18 +20,16 @@ setup:
   - ".venv/bin/pip install -q -e '.[dev]' $([ -f constraints.txt ] && echo -c constraints.txt)"
 
 validate:
-  # The suite as CI cuts it (.github/workflows/ci.yml, `make test-unit`/`test-integration`/
-  # `test-alone`): everything in parallel except the tests marked `alone`, which assert their own
-  # CPU time and so run afterwards in one process with no xdist neighbours on their cores.
-  # `--dist loadgroup` keeps the `xdist_group("docker")` tests on one worker, as CI does. The box
-  # runs this string in one shell, which exits with its last command's status, so `set -e` makes
-  # a failure in the first run fail the gate. ~18k tests: 60 minutes, not the 30-minute default.
+  # The unit selection, as `make test-unit` cuts it. CI's own jobs (.github/workflows/ci.yml) run
+  # the rest before a human merges: the tests that start their own engine or need a real Docker
+  # daemon (`owns_its_engine`, `slow`) and those that assert their own CPU time (`alone`). The
+  # tests that dial the network on purpose (`network`) are all `slow` as well, so they are left
+  # out with them. On a box with two CPUs and a few GB, the full suite with `-n 4` did not finish
+  # in 60 minutes and a worker was OOM-killed, so two workers. One command, so its status is the
+  # gate's. 60 minutes, not the 30-minute default.
   test:
     timeout_minutes: 60
-    command: |
-      set -e
-      .venv/bin/python -m pytest -q -n 4 --dist loadgroup -m "not alone"
-      .venv/bin/python -m pytest -q -p no:xdist -m alone
+    command: '.venv/bin/python -m pytest -q -n 2 -m "not (owns_its_engine or slow or alone)"'
   lint: ".venv/bin/ruff check beeverforge/ tests/"
   # ADVISORY: mypy is configured in pyproject.toml but CI does not gate on it yet, and the tree
   # does not type-check clean, so a blocking gate would fail every change.
