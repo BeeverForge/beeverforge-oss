@@ -54,6 +54,32 @@ _PENDING: dict[str, dict] = {}
 PROPOSAL_TTL_SECONDS = 2 * 60 * 60
 _PENDING_LOCK = threading.Lock()
 
+
+def _product_of(project) -> str:
+    """The product `project` belongs to (`semaphore.product_of`), "" when there is no project."""
+    if project is None:
+        return ""
+    from beeverforge.product.semaphore import product_of
+
+    return product_of(project)
+
+
+def _ours(entry: dict | None, project) -> bool:
+    """Whether a staged `entry` belongs to `project`'s product (#471).
+
+    A KEY IS NOT A PRODUCT. A person's own conversation key (`Actor.conversation`) is the same on
+    every product page, and `_PENDING` holds one entry per key. The proposal one product staged
+    last sat under the key another product read, and that product's yes performed it with its own
+    module, into its own context repository. So `remember` stamps the product on the entry, and an
+    entry of another product is not this one's to return, confirm or drop: that product's durable
+    row still holds it. An entry with no product (staged before the stamp, or by a caller with no
+    project) and a caller with no project keep the old behaviour."""
+    if entry is None:
+        return False
+    theirs = str(entry.get("product") or "")
+    mine = _product_of(project)
+    return not theirs or not mine or theirs == mine
+
 #: What the durable mirror records when a proposal ages out (#274), by nobody: the factory's own
 #: answer, and never one of the two a person gives (`approve`, `reject`), so no reader of either
 #: can take an expiry for a decision. Answering the row is what retires it from
@@ -205,15 +231,21 @@ def pending_for(thread: str, *, project=None) -> dict | None:
     """
     stored = _latest_ask(thread, project)
     with _PENDING_LOCK:
-        entry = _believed(thread, _PENDING.get(thread), stored)
+        held = _PENDING.get(thread)
+        # ANOTHER PRODUCT'S COPY IS NOT THIS ONE'S (#471, `_ours`): not believed, kept or dropped
+        local = held if _ours(held, project) else None
+        entry = _believed(thread, local, stored)
         if entry is None:
             # a copy the store says is decided, or replaced, is not kept to be believed later
-            _PENDING.pop(thread, None)
+            if local is not None:
+                _PENDING.pop(thread, None)
             return None
-        _PENDING[thread] = entry
+        if held is None or local is not None:
+            _PENDING[thread] = entry
         staged = entry.get("staged_at")
         if staged is not None and (time.time() - float(staged)) > PROPOSAL_TTL_SECONDS:
-            _PENDING.pop(thread, None)
+            if _PENDING.get(thread) is entry:
+                _PENDING.pop(thread, None)
             # the tombstone is what lets a late "sim" (or a late click) hear "that expired"
             # instead of a polite conversational answer to a confirmation of nothing
             _EXPIRED_TOMBSTONES[thread] = time.time()
@@ -563,6 +595,8 @@ def remember(thread: str, entry: dict, *, lang=None, project=None, person: str =
     site says it because every staging site already says what this returns.
     """
     entry = {**entry, "staged_at": time.time()}
+    if project is not None:
+        entry["product"] = _product_of(project)  # which product's yes may perform it (#471)
     if person:
         entry["requester"] = str(person)
         entry["conversation"] = _stem(thread, person)
@@ -577,6 +611,8 @@ def remember(thread: str, entry: dict, *, lang=None, project=None, person: str =
     displaced = None
     with _PENDING_LOCK:
         previous = _PENDING.get(thread)
+        if previous is not None and not _ours(previous, project):
+            previous = None  # another product's: not displaced here, its durable row still holds it
         if previous is not None and previous.get("kind") != entry.get("kind"):
             displaced = previous
         if thread not in _PENDING and len(_PENDING) >= _MAX_PENDING:
@@ -707,6 +743,10 @@ def consume(key: str, verified: dict | None, *, fingerprint: str = "",
     """
     if not key or verified is None:
         return None
+    if project is not None and not _ours(verified, project):
+        log.warning("BEEVERFORGE_PRODUCT_OTHER_PRODUCT key=%s — the proposal confirmed here was "
+                    "staged for another product; nothing was performed", key)
+        return None
     # THE OTHER SURFACE MAY HAVE DECIDED FIRST (C-33). The panel resolves through the durable
     # store and cannot pop THIS process's dict — so before honouring a local hit, ask the store
     # whether this token was already answered. Without it, a panel approve followed by a Slack
@@ -728,6 +768,8 @@ def consume(key: str, verified: dict | None, *, fingerprint: str = "",
             log.info("could not check the durable store before consuming", exc_info=True)
     with _PENDING_LOCK:
         current = _PENDING.get(key)
+        if current is not None and not _ours(current, project):
+            current = None  # another product's copy under the same key: ask this product's store
         if current is None and project is not None:
             # THIS process never staged it (the panel's process, or a restarted worker) — OR the
             # other consumer just popped it. Only the durable store can tell the two apart: a
@@ -755,7 +797,8 @@ def consume(key: str, verified: dict | None, *, fingerprint: str = "",
                         "changed "
                         "between being read and being written from; nothing was performed", key)
             return None
-        _PENDING.pop(key, None)
+        if _PENDING.get(key) is current:  # not another product's copy under the same key
+            _PENDING.pop(key, None)
     # NO LONGER A DRAFT WAITING IN ITS CONVERSATION (#266 slice 3): another conversation asking
     # for the same thing must stop hearing that something close is staged, and the write this
     # answer leads to bumps the sequence on its own
@@ -846,7 +889,7 @@ def _staged_here(thread: str, channel: str, project) -> list[tuple[str, dict]]:
                 or conversation_of(key, entry) == thread)
 
     with _PENDING_LOCK:
-        found = {k: e for k, e in _PENDING.items() if here(k, e)}
+        found = {k: e for k, e in _PENDING.items() if here(k, e) and _ours(e, project)}
     for key, entry in _stored(project):
         if key not in found and here(key, entry):
             found[key] = entry
