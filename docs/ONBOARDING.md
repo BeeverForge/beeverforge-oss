@@ -387,7 +387,10 @@ step is where it gets switched ON.
 **Runs on: the WORKER.** The factory does the whole first-time setup itself — and instead of
 proposing a manifest it merely *read*, it **proves** it: the proposed `setup:` and `validate:`
 are executed inside the real box (the same container your tickets will use, streamed live)
-before the proposal ever reaches you.
+before the proposal ever reaches you. That box is built from the same settings as a ticket's box:
+the image, its pull credential, the network, the cache, the size and the variables named in
+`box.env`. A credential your `setup:` needs, such as one for a private package source, reaches
+both boxes only through `box.env`.
 
 ```bash
 docker compose --env-file .env.compose exec worker \

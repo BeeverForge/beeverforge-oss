@@ -320,3 +320,25 @@ What stays open is the other option §7.2 names, where clients push into a repos
 runs for them. That is a choice about who operates a registry, not about where a stored secret
 comes from, and nothing here forecloses it. A credential the machine's own identity provides,
 with nothing stored, is the other half of the credential question and is not decided here.
+
+## Addendum (2026-11-16): the minted credential and the proof box
+
+Issue #191 asked that the proof box receive the credential the platform mints from the
+machine's identity, as the job's box does. Measured on `main`, the premise holds only for a remote
+box: `credentials.box_launch_credentials` is called from `_remote_launch` alone, and a local
+`container` or `worktree` job box is built by `factory.build_runner` with no minted token (the
+worktree box also strips `BEEVERFORGE_BOX_FORGE_TOKEN` and `BEEVERFORGE_BOX_TRACKER_TOKEN` by
+name). A proof is taken only in a local box: `gate_reason` exempts a remote one, and the rehearsal
+refuses to build one. So in every box a proof runs in, the job's box receives no minted token
+either.
+
+- **The proof box is the job's box.** Both are built from `factory.box_knobs`: the registry's
+  `box:` knobs, the `box.env` names and the image's pull credential. A test fails if the proof's
+  knobs drift from the job's (#468).
+- **The rehearsal gets the same credential as the job.** For a local box that is no minted
+  token. It still withholds `box.env`, for the reason `onboarding/firstrun.py` states under
+  "THE CREDENTIAL IS THE GUARANTEE".
+- **A local box is not handed a minted token for `setup:`.** The same box runs agent-written
+  code, and the identity's token reaches the forge and the tracker. A private package source on
+  a deployment that stores no token is a question about how far a credential reaches, for
+  `SECURITY.md`, and is not decided here.

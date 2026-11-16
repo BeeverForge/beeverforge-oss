@@ -100,6 +100,16 @@ kept from reaching the endpoint itself, so `beeverforge doctor` adds a `box_iden
 - **remote box**: it receives the minted token and never the declaration. What the remote
   machine can reach is for its own platform to bound.
 
+**A private package source is not reached through the identity.** Only a remote box's launcher is
+handed the minted token. A container or worktree box is handed none, and neither is the box that
+proves your `setup:` during onboarding, which is built from the same settings as the job's box.
+So a `setup:` that restores from a private feed (a `nuget.config` listing your organisation's
+Azure Artifacts feed, for example) fails in both the proof and the job, with the same error. The
+box runs code the agent wrote, so the identity's token is deliberately kept out of it. To restore
+from a private feed, give the box a credential scoped to reading that feed: name its variable in
+the project's `box.env`, and have your `setup:` hand it to the build tool the way the tool reads
+one.
+
 ## 2 · Tell `init`, fill one row
 
 Already ran `beeverforge init` from ONBOARDING §0 (it is what sent you here)? **Skip the
