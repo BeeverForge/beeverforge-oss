@@ -532,7 +532,7 @@ read or ignored, never their values; rename them to `BEEVERFORGE_*` before 1.1, 
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | the harness. Irreducible |
 | `BEEVERFORGE_GH_APP_ID` · `BEEVERFORGE_GH_APP_KEY` *(path)* or `BEEVERFORGE_GH_APP_KEY_CONTENT` *(the PEM)* · `BEEVERFORGE_GH_APP_INSTALLATION_ID` | the GitHub App |
-| `BEEVERFORGE_BOT_TOKEN` | a static forge/tracker token instead of the App. `BEEVERFORGE_TRACKER_TOKEN` / `BEEVERFORGE_FORGE_TOKEN` override per axis |
+| `BEEVERFORGE_BOT_TOKEN` | a static forge/tracker token instead of the App, for GitHub projects and projects that name no vendor. `BEEVERFORGE_TRACKER_TOKEN` / `BEEVERFORGE_FORGE_TOKEN` override per axis. A vendor that names its own variable (`JIRA_API_TOKEN`, `AZURE_DEVOPS_PAT`) never reads these |
 | `BEEVERFORGE_BOT_NAME` · `BEEVERFORGE_BOT_EMAIL` · `BEEVERFORGE_BOT_LOGIN` | who the factory commits as |
 | *(the chat channel's variables)* | **not read by the core.** The rows that read them ship in the `beeverforge-slack` add-on package and declare their own names (`plugins.environment`); the package's README lists them. Setting them on a core without the package switches nothing on — the channel is the panel and the notifier is the panel's |
 | `BEEVERFORGE_PANEL_TOKEN` | **unset means the panel is OPEN** — and it is the SHARED token; approvals recorded under it have no name |

@@ -211,8 +211,10 @@ The agent acts as a **distinct bot identity**, not as you. Two separate pieces:
 - **Actor** — `BEEVERFORGE_BOT_NAME` / `BEEVERFORGE_BOT_EMAIL` (the git commit author). Falls back
   to "BeeverForge Bot" / `beeverforge-bot@localhost` (`credentials.bot_identity`).
 - **Credentials — one per axis** (the axes are independent):
-  `BEEVERFORGE_BOT_TOKEN` is the default for all; `BEEVERFORGE_TRACKER_TOKEN` / `BEEVERFORGE_FORGE_TOKEN`
-  override per axis when providers differ (e.g. Jira tracker + GitLab forge). Each
+  `BEEVERFORGE_BOT_TOKEN` is the default for GitHub projects and for projects that name no
+  vendor; `BEEVERFORGE_TRACKER_TOKEN` / `BEEVERFORGE_FORGE_TOKEN` override it per axis. A vendor
+  that names its own variable reads that one, or the `token_env` the project names, and never
+  the pair (Jira: `JIRA_API_TOKEN`; Azure DevOps: `AZURE_DEVOPS_PAT`). Each
   token is opaque; how it's minted is per-provider (GitHub App installation token,
   GitLab access token, Jira API token, bot PAT). Tokens come from the env, never the
   registry. `None` → ambient CLI auth (dev only).
