@@ -5438,6 +5438,33 @@ async def refresh_product_knowledge(inp: KnowledgeRefreshInput) -> str:
                           f"refreshing the knowledge of {inp.project}")
 
 
+def _record_a_proof_that_raised(project, inp: BoxProveInput, exc: Exception) -> None:
+    """A proof that raised is recorded as a failed one, so the previous green proof stops standing
+    for a box nobody could measure: `gate_reason` then says the last proof FAILED, with the cause
+    in the record. A branch's proof (`ref`) is a measurement that never recorded, and a failure to
+    record is logged — the raise that follows is the signal, and it must not be replaced."""
+    from beeverforge import box_prove
+    from beeverforge.runtime.boxed_job import redact
+
+    if inp.ref:
+        return
+    try:
+        key = project.name
+        if inp.repo:
+            from beeverforge.runtime.card_repo import _runner_view
+
+            _, key = _runner_view(project, f"{inp.repo}#0")
+        cause = redact(f"{type(exc).__name__}: {exc}")[:200]
+        box_prove.save(box_prove.Proof(
+            project=key, image=inp.image, ok=False, at=box_prove._now(),
+            findings=[box_prove.Finding(
+                "proof", False, f"the proof raised ({cause})",
+                f"look at the worker's log, then run `beeverforge box prove {project.name}`")]))
+    except Exception:
+        activity.logger.warning("the failed box proof of %s could not be recorded", inp.project,
+                                exc_info=True)
+
+
 def _do_prove_box(inp: BoxProveInput) -> str:
     """One project's box proven on the worker, because somebody asked through the `box_prove` row
     (#237): `box_prove.prove_the_box`, the body the shell's own `box prove` runs, recorded where
@@ -5451,8 +5478,12 @@ def _do_prove_box(inp: BoxProveInput) -> str:
         activity.logger.warning("a box proof was asked of %s, which is not registered now — "
                                 "nothing was proven", inp.project)
         return f"{inp.project} is not registered now — nothing was proven"
-    run = box_prove.prove_the_box(project, repo=inp.repo, ref=inp.ref, image=inp.image,
-                                  sandbox=inp.sandbox)
+    try:
+        run = box_prove.prove_the_box(project, repo=inp.repo, ref=inp.ref, image=inp.image,
+                                      sandbox=inp.sandbox)
+    except Exception as exc:
+        _record_a_proof_that_raised(project, inp, exc)
+        raise
     activity.logger.info("BEEVERFORGE_BOX_PROOF %s: %s", run.key, run.sentence())
     return run.sentence()
 

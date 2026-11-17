@@ -443,6 +443,40 @@ def test_the_worker_proves_and_records_it_driven_synchronously(demo):
     assert bp.load("demo").ok and demo.boxes[0]["key"] == "demo"
 
 
+def test_a_worker_proof_that_raises_replaces_the_previous_green_proof(demo, monkeypatch):
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    bp.save(Proof(project="demo", image="img:1", ok=True, findings=[]))
+    assert bp.load("demo").ok
+
+    def _raises(*_a, **_k):
+        raise RuntimeError("the daemon went away")
+
+    monkeypatch.setattr(bp, "prove_the_box", _raises)
+    with pytest.raises(RuntimeError, match="the daemon went away"):
+        acts._do_prove_box(BoxProveInput(project="demo"))
+
+    recorded = bp.load("demo")
+    assert not recorded.ok
+    assert any("the daemon went away" in f.message for f in recorded.failures())
+    reason = bp.gate_reason(SimpleNamespace(name="demo"), sandbox="container")
+    assert reason and "FAILED" in reason
+
+
+def test_a_ref_proof_that_raises_leaves_the_recorded_proof_alone(demo, monkeypatch):
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    bp.save(Proof(project="demo", image="img:1", ok=True, findings=[]))
+    monkeypatch.setattr(bp, "prove_the_box", lambda *_a, **_k: 1 / 0)
+
+    with pytest.raises(ZeroDivisionError):
+        acts._do_prove_box(BoxProveInput(project="demo", ref="feature"))
+
+    assert bp.load("demo").ok
+
+
 def test_the_worker_says_an_unknown_project_and_raises_nothing(demo):
     from beeverforge.runtime.temporal import activities as acts
     from beeverforge.runtime.temporal.io import BoxProveInput
