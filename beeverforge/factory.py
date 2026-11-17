@@ -550,6 +550,7 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
         deployment_forge_token,
         deployment_tracker_provider,
         forge_token_for,
+        stored_token_provider,
         tracker_token_for,
     )
     from beeverforge.loader import load_manifest
@@ -591,10 +592,16 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here)
         tracker=build_tracker(project, token=tracker_token_for(project),
-                              token_provider=(None if tracker_token_for(project)
+                              token_provider=(stored_token_provider(project, "tracker")
+                                              if tracker_token_for(project)
                                               else deployment_tracker_provider(project))),
+        # A TOKEN A ROTATING STORE ANSWERED IS READ AGAIN BEFORE IT EXPIRES (#236): with a stored
+        # token this passed no provider, so the forge pushed for the whole job with the string
+        # read here, and a job longer than the hour an installation token lives pushed with an
+        # expired one. `stored_token_provider` is None for the environment and a PAT, as before.
         forge=build_forge(project, token=forge_token_for(project),
-                          token_provider=(None if forge_token_for(project)
+                          token_provider=(stored_token_provider(project, "forge")
+                                          if forge_token_for(project)
                                           else deployment_forge_provider(project))),
         # WHICH harness writes the code is config, not an import (agent/registry.py)
         agent=build_executor(project, log_dir=project_log_dir(project)),
@@ -628,6 +635,7 @@ def build_promotion_runner(project, issue: str):
         deployment_forge_token,
         deployment_tracker_provider,
         forge_token_for,
+        stored_token_provider,
         tracker_token_for,
     )
     from beeverforge.loader import load_manifest
@@ -650,10 +658,13 @@ def build_promotion_runner(project, issue: str):
         # provider is the AXIS VENDOR's own (the App minter on the reference vendor, None on a
         # vendor that declares none) — see `build_runner` for the measurement.
         tracker=build_tracker(project, token=tracker_token_for(project),
-                              token_provider=(None if tracker_token_for(project)
+                              token_provider=(stored_token_provider(project, "tracker")
+                                              if tracker_token_for(project)
                                               else deployment_tracker_provider(project))),
+        # …and here, for the same reason (#236): see `build_runner`
         forge=build_forge(project, token=forge_token_for(project),
-                          token_provider=(None if forge_token_for(project)
+                          token_provider=(stored_token_provider(project, "forge")
+                                          if forge_token_for(project)
                                           else deployment_forge_provider(project))),
         observer=build_observer(project, token=forge_token_for(project) or app_tok),
         manifest=load_manifest(project, repo_root=repo_path),

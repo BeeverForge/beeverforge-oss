@@ -29,6 +29,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -686,6 +687,114 @@ def deployment_forge_provider(project):
     if axis_refusal(project, "forge"):
         return None
     return _deployment_provider(getattr(project, "forge", None))
+
+
+#: How long a forge or tracker token that a ROTATING store answered is held before the store is
+#: asked again, in seconds (#236). A GitHub installation token lives one hour and its expiry is not
+#: carried in the token, so the lifetime is a setting, an hour unset, and the refresh comes
+#: `REFRESH_MARGIN_SECONDS` before it.
+STORED_TOKEN_TTL_VAR = "BEEVERFORGE_STORED_TOKEN_TTL"
+STORED_TOKEN_TTL_SECONDS = 3600.0
+
+#: The shapes of a token that states no lifetime — GitHub's classic and fine-grained personal
+#: access tokens. Such a token is read once, when the runner is composed, and kept, as before.
+_NO_LIFETIME = ("ghp_", "github_pat_")
+
+
+def _now() -> float:
+    """What a stored token's lifetime is measured by: the time, as a seam of its own, so a test
+    moves a fake clock instead of waiting an hour out."""
+    return time.time()
+
+
+def _stored_token_ttl() -> float:
+    """`STORED_TOKEN_TTL_VAR` in seconds, or the hour; a value that is not a positive number is
+    said and the hour is used."""
+    raw = (os.environ.get(STORED_TOKEN_TTL_VAR) or "").strip()
+    if not raw:
+        return STORED_TOKEN_TTL_SECONDS
+    try:
+        ttl = float(raw)
+    except ValueError:
+        ttl = 0.0
+    if ttl > 0:
+        return ttl
+    log.warning("%s=%r is not a number of seconds above zero — a stored token is held for %d s",
+                STORED_TOKEN_TTL_VAR, raw, int(STORED_TOKEN_TTL_SECONDS))
+    return STORED_TOKEN_TTL_SECONDS
+
+
+def stored_token_provider(project, axis: str):
+    """A provider that READS `project`'s `axis` token through the credential store AGAIN before its
+    lifetime is up — when a store other than the environment holds it — or None (#236).
+
+    THE TOKEN A STORE ANSWERED WAS READ ONCE PER JOB. `build_runner` handed the forge
+    `token=forge_token_for(project)` and a provider only when that answered nothing, so a token the
+    store answered became the adapter's static one: every push and every `gh` call of the job used
+    the string read when the runner was composed. A deployment whose credential store rotates the
+    forge token hands it a GitHub App installation token, which lives an hour, and a job longer
+    than that failed its last `git push` with "Invalid username or token" — twice in one day,
+    measured on the job meant to fix it. The store answers a fresh token whenever it is asked;
+    nothing asked it a second time.
+
+    So the read is the MINT of a `ShortLivedToken`: held for `_stored_token_ttl()`, read again
+    `REFRESH_MARGIN_SECONDS` before that, one read at a time, a still-valid token kept when a read
+    fails. None, and the static token as before, for:
+
+      · the environment, which does not change under a running process;
+      · a token that states no lifetime (`_NO_LIFETIME`, a PAT) — read once and kept;
+      · a vendor that holds a re-minting provider of its own (GitHub's App trio): its minter is
+        what a job without a stored token uses, and beside a stored one the forge is composed
+        exactly as before.
+
+    A REFUSAL MET AT A RE-READ IS FINAL once the held token has expired (#822): the provider
+    raises `LoginRefused` naming the reference, so neither the stale token nor `gh`'s own login is
+    used in its place. A store that answers NOTHING at a re-read is not a refusal: the last token
+    read is kept, which is what the static token did. No value is logged."""
+    from beeverforge.adapters.credential.short_lived import REFRESH_MARGIN_SECONDS, ShortLivedToken
+
+    reference = _held_in_a_store(project, axis)
+    if not reference:
+        return None
+    if _deployment_provider(getattr(project, axis, None)) is not None:
+        return None
+    generic = tracker_token if axis == "tracker" else forge_token
+    first = _axis_credential(project, axis, generic, announce=False)[1]
+    if not first or first.startswith(_NO_LIFETIME):
+        return None
+    ttl, clock = _stored_token_ttl(), _now
+    last, refused, read_at = first, "", clock()
+    # THE READ JUST MADE IS THE FIRST: its lifetime starts now, and the first use asks nothing
+    seeded = True
+
+    def read() -> tuple[str, float] | None:
+        nonlocal last, refused, seeded
+        if seeded:
+            seeded = False
+            return first, read_at + ttl
+        found = _axis_answer(project, axis, generic, announce=False)
+        refused = found.refused
+        if not found.value:
+            return None
+        last = found.value
+        return found.value, clock() + ttl
+
+    held = ShortLivedToken(read, margin=min(REFRESH_MARGIN_SECONDS, ttl / 2), clock=clock)
+
+    def provider() -> str | None:
+        token = held()
+        if token:
+            return token
+        if refused:
+            from beeverforge.adapters.github_cli import LoginRefused
+
+            raise LoginRefused(f"the {axis} credential `{reference}` was refused by the credential "
+                               f"store when it was read again ({refused}) — nothing is used in "
+                               f"its place, not the token it replaces and not this machine's own "
+                               f"login")
+        return last
+
+    return provider
 
 
 def forge_vendor(project) -> str:

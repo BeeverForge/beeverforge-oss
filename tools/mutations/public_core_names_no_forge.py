@@ -21,11 +21,11 @@ _TEMPORAL_TEST = "tests/test_temporal_workflow.py"
 _FIRST_HOUR_TEST = "tests/test_the_first_hour_fails_by_name.py"
 
 _FORGE_PROVIDER_OLD = (
-    "                          token_provider=(None if forge_token_for(project)\n"
+    "                                          if forge_token_for(project)\n"
     "                                          else deployment_forge_provider(project))),\n"
     "        # WHICH harness writes the code is config, not an import (agent/registry.py)\n")
 _FORGE_PROVIDER_NEW = (
-    "                          token_provider=(None if forge_token_for(project)\n"
+    "                                          if forge_token_for(project)\n"
     "                                          else _bot_token_provider())),\n"
     "        # WHICH harness writes the code is config, not an import (agent/registry.py)\n")
 

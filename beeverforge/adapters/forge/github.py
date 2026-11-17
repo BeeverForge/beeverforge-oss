@@ -223,7 +223,9 @@ class GitHubForge(ForgeAdapter):
 
     @property
     def token(self) -> str | None:
-        # resolved at each use so a job that outlives the ~1h App token still pushes (H3)
+        # resolved at each use so a job that outlives the ~1h App token still pushes (H3): the
+        # provider is the App minter, or for a token a rotating store holds the store read again
+        # (`credentials.stored_token_provider`, #236); a static token is the one composed with
         return credential_of(self)
 
     def _env(self) -> dict[str, str]:
