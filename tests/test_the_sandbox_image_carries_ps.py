@@ -13,18 +13,47 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCKERFILE = ROOT / "docker" / "sandbox.Dockerfile"
 
 
-def _install_lines() -> list[str]:
-    """The `apt-get install` commands, comments dropped and continuations joined."""
-    code = "\n".join(line for line in DOCKERFILE.read_text().splitlines()
-                     if not line.lstrip().startswith("#"))
-    return re.findall(r"apt-get install[^&;\n]*(?:\\\n[^&;\n]*)*", code.replace("\\\n", " \\\n"))
+def _run_blocks() -> list[str]:
+    """Each `RUN` instruction as one line: continuations joined, comment lines dropped."""
+    blocks: list[str] = []
+    current: str | None = None
+    for raw in DOCKERFILE.read_text().splitlines():
+        line = raw.strip()
+        if current is None:
+            if re.match(r"RUN\s", line):
+                current = line[3:].strip()
+            else:
+                continue
+        elif line.startswith("#") or not line:
+            continue
+        else:
+            current += " " + line
+        if current.endswith("\\"):
+            current = current[:-1].rstrip()
+        else:
+            blocks.append(current)
+            current = None
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def _installed_packages() -> set[str]:
+    """The words after `apt-get install` in a RUN block, up to the next shell operator."""
+    packages: set[str] = set()
+    for block in _run_blocks():
+        for command in re.split(r"&&|;|\|", block):
+            words = command.split()
+            if words[:2] == ["apt-get", "install"]:
+                packages.update(w for w in words[2:] if not w.startswith("-"))
+    return packages
 
 
 def test_the_sandbox_image_installs_procps():
-    installs = " ".join(_install_lines()).replace("\\", " ").split()
-    assert "procps" in installs
+    assert "procps" in _installed_packages()
 
 
 def test_the_toolchain_record_names_ps():
-    assert "/etc/beeverforge-toolchain" in DOCKERFILE.read_text()
-    assert "ps=" in DOCKERFILE.read_text()
+    writes = [b for b in _run_blocks() if "> /etc/beeverforge-toolchain" in b]
+    assert writes
+    assert any('echo "ps=' in b for b in writes)

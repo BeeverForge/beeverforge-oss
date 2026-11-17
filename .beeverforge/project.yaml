@@ -27,10 +27,20 @@ validate:
   # out with them. On a box with two CPUs and a few GB, the full suite with `-n 4` did not finish
   # in 60 minutes and a worker was OOM-killed, so two workers. One command, so its status is the
   # gate's. 60 minutes, not the 30-minute default.
+  # FOR NOW, THE TESTS IN tests/test_the_set_ends_together.py THAT RUN `ps` ARE LEFT TO CI as well:
+  # they check a pid through `ps` (one also through `pgrep`), and the sandbox image of the RUNNING
+  # release has no procps, so in the box they fail with `FileNotFoundError: ... 'ps'`. #567 puts
+  # procps in docker/sandbox.Dockerfile, but the box runs the published image of the release
+  # already deployed. Remove these `--deselect`s once that release's sandbox image carries procps.
   test:
     timeout_minutes: 60
     command: >-
       .venv/bin/python -m pytest -q -n 2 -m "not (owns_its_engine or slow or alone)"
+      --deselect tests/test_the_set_ends_together.py::test_a_supervisor_asked_to_stop_by_a_signal_stops_the_set
+      --deselect tests/test_the_set_ends_together.py::test_a_supervisor_KILLED_outright_still_takes_its_children_with_it
+      --deselect tests/test_the_set_ends_together.py::test_a_child_that_ignores_the_request_to_stop_is_made_to
+      --deselect tests/test_the_set_ends_together.py::test_one_child_dying_still_ends_the_set
+      --deselect tests/test_the_set_ends_together.py::test_an_orderly_stop_leaves_no_reaper_behind
   lint: ".venv/bin/ruff check beeverforge/ tests/"
   # ADVISORY: mypy is configured in pyproject.toml but CI does not gate on it yet, and the tree
   # does not type-check clean, so a blocking gate would fail every change.
