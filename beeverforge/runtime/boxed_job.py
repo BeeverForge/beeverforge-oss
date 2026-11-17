@@ -400,14 +400,23 @@ def _emit(result) -> None:
     print(RESULT_PREFIX + result.model_dump_json(), flush=True)
 
 
+def forge_credential_of(carried) -> str | None:
+    """The forge credential this box runs with: the project's own resolution, then what the
+    deployment can mint for its vendor — and no pair of this file's own in between (#101).
+
+    This read `forge_token_for(carried) or forge_token() or deployment_forge_token(carried)`, and
+    the middle step bought GitHub nothing — `forge_token_for` already ends in the pair for the row
+    that names no variable — while it handed the pair to every row that names one (a
+    `forge.gitlab` add-on with `env="GITLAB_TOKEN"`, measured in the review of
+    openfactory-core#1142) and to a row with a resolution of its own. One resolution, the axis's;
+    nothing after a refusal (#822), since both steps refuse on their own."""
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+
+    return forge_token_for(carried) or deployment_forge_token(carried)
+
+
 def main() -> int:
     from beeverforge.contracts import JobState, RunResult
-    from beeverforge.credentials import (
-        axis_refusal,
-        deployment_forge_token,
-        forge_token,
-        forge_token_for,
-    )
 
     # A BOX'S ENVIRONMENT IS SET BY WHOEVER STARTS IT (#264): the worker composes it under the new
     # names, but a task definition a 0.7 deployment wrote for its own cloud box carries the old
@@ -445,11 +454,9 @@ def main() -> int:
         # variable was expected beats a 401 that says nothing.
         # …AND NOTHING AFTER A REFUSAL (#822): the deployment's pair and the mint are the steps
         # after the project's own reference, so a refused one is answered by neither.
+        # AND NO PAIR OF THIS FILE'S OWN (#101): `forge_credential_of` says why.
         carried = _project_for(cfg, repo_dir=None)
-        token = (forge_token_for(carried)
-                 or (None if axis_refusal(carried, "forge")
-                     else forge_token())      # honour BEEVERFORGE_BOT_TOKEN for the GitHub path
-                 or deployment_forge_token(carried))
+        token = forge_credential_of(carried)
         phase = os.environ.get("BEEVERFORGE_PROMOTE_PHASE")
         if os.environ.get("BEEVERFORGE_REVIEW_PASS"):
             # BEFORE the repair branch, and that ordering is the guard: a re-review must never be
