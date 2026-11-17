@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -225,25 +226,81 @@ def test_a_value_an_installed_store_answers_differently_later_is_the_one_the_nex
 
 # ── 2. held: one read per lifetime, not one per call ────────────────────────────────────────────
 
-def test_a_token_that_does_not_change_is_read_once_per_lifetime_not_once_per_call(
+def test_a_token_that_does_not_change_is_read_once_per_interval_not_once_per_call(
         tmp_path, addon_store, clock, gh_calls):
+    """The store is asked again every five minutes, never at each push or `gh` call: a store an
+    add-on installs may answer over the network, and the job makes hundreds of calls an hour."""
     held, asked = addon_store
     held[BOT] = FIRST
     runner = _runner(tmp_path)
-    _pushed_with(runner)  # the first use reads it
     asked.clear()
 
-    for minute in range(1, 50):
-        clock.at(minute)
+    for second in range(0, 290, 10):  # inside the first interval: the read that composed it
+        clock.now = T0 + second
         assert _pushed_with(runner) == FIRST
         _gh_with(runner, gh_calls)
+    assert asked == [], f"{len(asked)} store reads inside one interval, where none was due"
 
-    assert asked == [], f"{len(asked)} store reads inside one token's lifetime, where none was due"
+    clock.at(6)  # the interval is up: read again, once, however many calls follow
+    for _ in range(20):
+        assert _pushed_with(runner) == FIRST
+        _gh_with(runner, gh_calls)
+    assert asked.count(BOT) == 2, asked  # once for the forge's provider, once for the tracker's
 
-    clock.at(58)  # inside the refresh margin of the hour: read again, once
-    for _ in range(5):
-        _pushed_with(runner)
+
+def test_eight_callers_at_the_end_of_an_interval_make_one_read_and_get_one_answer(
+        tmp_path, addon_store, clock, monkeypatch):
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    asked.clear()
+    held[BOT] = SECOND
+    clock.at(6)
+
+    release = threading.Event()
+    slow = RotatingStore.resolve
+
+    def a_slow_read(self, name):
+        release.wait(5)  # the first caller holds the read open until every caller has started
+        return slow(self, name)
+
+    monkeypatch.setattr(RotatingStore, "resolve", a_slow_read)
+    answers: list[str | None] = []
+    callers = [threading.Thread(target=lambda: answers.append(runner.forge.token))
+               for _ in range(8)]
+    for caller in callers:
+        caller.start()
+    release.set()
+    for caller in callers:
+        caller.join()
+
+    assert answers == [SECOND] * 8
     assert asked.count(BOT) == 1, asked
+
+
+def test_a_token_rewritten_ten_minutes_into_the_job_is_the_one_its_push_ten_minutes_later_uses(
+        tmp_path, secrets, clock):
+    """A platform rotates on its own schedule: the token read at minute 0 may be fifty minutes
+    old, expire at minute 10, and have a successor on disk that the push must use."""
+    secrets(BOT, FIRST)
+    runner = _runner(tmp_path)
+    assert _pushed_with(runner) == FIRST
+    clock.at(10)
+    secrets(BOT, SECOND)
+    clock.at(20)
+    assert _pushed_with(runner) == SECOND
+
+
+@pytest.mark.parametrize("minutes", [(10, 20), (20, 30), (40, 54), (40, 56)])
+def test_a_rewrite_at_any_minute_is_the_next_pushes_once_an_interval_has_passed(
+        tmp_path, secrets, clock, minutes):
+    rewritten, pushed = minutes
+    secrets(BOT, FIRST)
+    runner = _runner(tmp_path)
+    clock.at(rewritten)
+    secrets(BOT, SECOND)
+    clock.at(pushed)
+    assert _pushed_with(runner) == SECOND
 
 
 # ── 3. the incident: a push after the first token's lifetime ────────────────────────────────────
@@ -273,18 +330,69 @@ def test_both_runners_a_job_composes_read_the_rotated_token(tmp_path, secrets, c
     assert (runner.forge.token, runner.tracker.token) == (SECOND, SECOND)
 
 
-def test_the_lifetime_a_rotated_token_is_held_for_is_configurable(
-        tmp_path, secrets, clock, monkeypatch):
+def test_a_failed_re_read_keeps_the_token_for_the_lifetime_and_the_lifetime_is_configurable(
+        tmp_path, addon_store, clock, monkeypatch):
     """GitHub carries no expiry in an installation token, so the lifetime is a setting, an hour
-    by default; a deployment whose store rotates faster says so."""
+    by default: how long a token is still handed out while the store answers nothing. Past it,
+    the push refuses by name instead of carrying an expired token to a 401."""
     monkeypatch.setenv(TTL_VAR, "900")
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    del held[BOT]
+
+    clock.at(14)
+    assert _pushed_with(runner) == FIRST, "a failed re-read evicted a token still in its lifetime"
+    clock.at(16)
+    with pytest.raises(LoginRefused):
+        runner.forge.push_remote()
+
+
+@pytest.mark.parametrize("ttl", ["inf", "1e400", "nan", "0", "-5", "abc"])
+def test_a_lifetime_that_is_not_a_finite_number_of_seconds_above_zero_is_the_hour(
+        tmp_path, secrets, clock, monkeypatch, caplog, ttl):
+    monkeypatch.setenv(TTL_VAR, ttl)
     secrets(BOT, FIRST)
     runner = _runner(tmp_path)
     _pushed_with(runner)
     secrets(BOT, SECOND)
-    clock.at(11)
-
+    clock.at(61)
     assert _pushed_with(runner) == SECOND
+    assert any(TTL_VAR in r.getMessage() for r in caplog.records)
+
+
+def test_a_store_that_answers_nothing_once_the_token_has_expired_is_said_by_name(
+        tmp_path, addon_store, clock):
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    _pushed_with(runner)
+    del held[BOT]
+    clock.at(70)
+    with pytest.raises(LoginRefused) as said:
+        runner.forge.push_remote()
+    assert f"{KIND}:{BOT}" in str(said.value) and FIRST not in str(said.value)
+
+
+def test_composing_a_runner_reads_the_store_no_more_often_than_before(
+        tmp_path, addon_store):
+    """Engineering lesson 10: a read of an add-on store may be a network round trip. `main`
+    composed a GitHub job runner with 5 reads of the bot token; the first cut of #236 made 11."""
+    held, asked = addon_store
+    held[BOT] = FIRST
+    _runner(tmp_path)
+
+    assert asked.count(BOT) <= 4, asked
+
+
+def test_a_tracker_row_that_takes_no_callers_provider_is_handed_none(tmp_path, secrets):
+    """Jira's row reads its own variable and refuses a caller's provider, so none is built for it:
+    its token is read once, when the runner is composed, as before."""
+    secrets("JIRA_API_TOKEN", "fictitious-jira-236")
+    project = _project(tmp_path).model_copy(update={"tracker": ProviderRef(
+        kind="jira", repo="ACME", options={"site": "acme.example", "email": "a@acme.example"})})
+
+    assert credentials.stored_token_provider(project, "tracker") is None
 
 
 # ── 4. what must not change ─────────────────────────────────────────────────────────────────────
