@@ -545,13 +545,12 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
     from beeverforge.adapters.sandbox.registry import build_sandbox
     from beeverforge.adapters.tracker.registry import build_tracker
     from beeverforge.credentials import (
+        axis_answer_for,
         bot_identity,
         deployment_forge_provider,
         deployment_forge_token,
         deployment_tracker_provider,
-        forge_token_for,
         stored_token_provider,
-        tracker_token_for,
     )
     from beeverforge.loader import load_manifest
     from beeverforge.observability.registry import journal_for
@@ -561,7 +560,14 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
     # RESOLVED, not assumed to be a directory. A registered clone URL is fetched here, once, so
     # every consumer below — the manifest reader, the box's `git clone --local`, the worktree root
     # — gets a real path instead of `https:/github.com/...` (#65).
-    repo_path = resolve_repo_path(project, token=forge_token_for(project)
+    # EACH AXIS'S CREDENTIAL IS READ ONCE, HERE, and handed on (#236, engineering lesson 10): a
+    # read of an add-on's store may be a network round trip, and this function asked each axis
+    # twice and each provider twice more — 11 reads of the bot token per runner at the first cut
+    # of #236, 5 on `main`, 2 now (`credentials.axis_answer_for`).
+    forge_found = axis_answer_for(project, "forge")
+    tracker_found = axis_answer_for(project, "tracker")
+    forge_tok, tracker_tok = forge_found.value, tracker_found.value
+    repo_path = resolve_repo_path(project, token=forge_tok
                                   or deployment_forge_token(project), cache_key=repo_key)
     # The REGISTRY decides which box — a ternary here meant any unknown kind silently produced a
     # worktree, which isolates the code state and nothing else. Untrusted work outside a sandbox,
@@ -591,17 +597,18 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
         change=change,  # #448 slice 4: which change of the card — it names the branch
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here)
-        tracker=build_tracker(project, token=tracker_token_for(project),
-                              token_provider=(stored_token_provider(project, "tracker")
-                                              if tracker_token_for(project)
+        tracker=build_tracker(project, token=tracker_tok,
+                              token_provider=(stored_token_provider(project, "tracker",
+                                                                    tracker_found)
+                                              if tracker_tok
                                               else deployment_tracker_provider(project))),
         # A TOKEN A ROTATING STORE ANSWERED IS READ AGAIN BEFORE IT EXPIRES (#236): with a stored
         # token this passed no provider, so the forge pushed for the whole job with the string
         # read here, and a job longer than the hour an installation token lives pushed with an
         # expired one. `stored_token_provider` is None for the environment and a PAT, as before.
-        forge=build_forge(project, token=forge_token_for(project),
-                          token_provider=(stored_token_provider(project, "forge")
-                                          if forge_token_for(project)
+        forge=build_forge(project, token=forge_tok,
+                          token_provider=(stored_token_provider(project, "forge", forge_found)
+                                          if forge_tok
                                           else deployment_forge_provider(project))),
         # WHICH harness writes the code is config, not an import (agent/registry.py)
         agent=build_executor(project, log_dir=project_log_dir(project)),
@@ -631,12 +638,11 @@ def build_promotion_runner(project, issue: str):
     from beeverforge.adapters.forge.registry import build_forge
     from beeverforge.adapters.tracker.registry import build_tracker
     from beeverforge.credentials import (
+        axis_answer_for,
         deployment_forge_provider,
         deployment_forge_token,
         deployment_tracker_provider,
-        forge_token_for,
         stored_token_provider,
-        tracker_token_for,
     )
     from beeverforge.loader import load_manifest
     from beeverforge.observability.registry import journal_for
@@ -651,22 +657,27 @@ def build_promotion_runner(project, issue: str):
     app_tok = deployment_forge_token(project)  # observer takes a static token (short op)
     # Resolved here too: the promotion path reads the manifest for the deploy/verify commands, and
     # a URL-registered project would otherwise look for it under `https:/...` (#65).
-    repo_path = resolve_repo_path(project, token=forge_token_for(project) or app_tok)
+    # read once and handed on, as in `build_runner` (#236)
+    forge_found = axis_answer_for(project, "forge")
+    tracker_found = axis_answer_for(project, "tracker")
+    forge_tok, tracker_tok = forge_found.value, tracker_found.value
+    repo_path = resolve_repo_path(project, token=forge_tok or app_tok)
     return PromotionRunner(
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here). The re-minting
         # provider is the AXIS VENDOR's own (the App minter on the reference vendor, None on a
         # vendor that declares none) — see `build_runner` for the measurement.
-        tracker=build_tracker(project, token=tracker_token_for(project),
-                              token_provider=(stored_token_provider(project, "tracker")
-                                              if tracker_token_for(project)
+        tracker=build_tracker(project, token=tracker_tok,
+                              token_provider=(stored_token_provider(project, "tracker",
+                                                                    tracker_found)
+                                              if tracker_tok
                                               else deployment_tracker_provider(project))),
         # …and here, for the same reason (#236): see `build_runner`
-        forge=build_forge(project, token=forge_token_for(project),
-                          token_provider=(stored_token_provider(project, "forge")
-                                          if forge_token_for(project)
+        forge=build_forge(project, token=forge_tok,
+                          token_provider=(stored_token_provider(project, "forge", forge_found)
+                                          if forge_tok
                                           else deployment_forge_provider(project))),
-        observer=build_observer(project, token=forge_token_for(project) or app_tok),
+        observer=build_observer(project, token=forge_tok or app_tok),
         manifest=load_manifest(project, repo_root=repo_path),
         events=journal_for(events_file(project, issue)),
         # AND WHICH LANGUAGE IT SAYS ALL OF THAT IN (#160). Every sentence the promotion runner

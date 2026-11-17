@@ -377,12 +377,13 @@ def test_a_store_that_answers_nothing_once_the_token_has_expired_is_said_by_name
 def test_composing_a_runner_reads_the_store_no_more_often_than_before(
         tmp_path, addon_store):
     """Engineering lesson 10: a read of an add-on store may be a network round trip. `main`
-    composed a GitHub job runner with 5 reads of the bot token; the first cut of #236 made 11."""
+    composed a GitHub job runner with 5 reads of the bot token; the first cut of #236 made 11; each
+    axis read once and handed on makes 2."""
     held, asked = addon_store
     held[BOT] = FIRST
     _runner(tmp_path)
 
-    assert asked.count(BOT) <= 4, asked
+    assert asked.count(BOT) <= 2, asked
 
 
 def test_a_tracker_row_that_takes_no_callers_provider_is_handed_none(tmp_path, secrets):
@@ -460,6 +461,34 @@ def test_a_refusal_met_on_the_re_read_is_final_and_no_login_answers_it(
     assert f"{KIND}:{BOT}" in str(refused.value)
     assert runner.forge._gh(["pr", "list", "--repo", "acme/widgets"]).returncode != 0
     assert gh_calls == [], "`gh` ran after the credential it was built with was refused"
+
+
+def test_a_refusal_is_the_answer_of_its_own_read_and_not_of_the_reads_after_it(
+        tmp_path, addon_store, clock, monkeypatch):
+    """Each read says what IT met: a store that refused at minute 70 and holds a token again at
+    minute 71 is the token's; one that holds nothing then is said as nothing, not as the refusal."""
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    honest = RotatingStore.resolve
+
+    def refuse(self, name):
+        raise CredentialRefused(f"the rotating store seals {name}")
+
+    monkeypatch.setattr(RotatingStore, "resolve", refuse)
+    clock.at(70)
+    with pytest.raises(LoginRefused, match="refused"):
+        runner.forge.push_remote()
+
+    monkeypatch.setattr(RotatingStore, "resolve", honest)
+    del held[BOT]
+    clock.at(71)
+    with pytest.raises(LoginRefused, match="answered nothing"):
+        runner.forge.push_remote()
+
+    held[BOT] = SECOND
+    clock.at(72)
+    assert _pushed_with(runner) == SECOND
 
 
 def test_no_token_value_reaches_a_log(tmp_path, secrets, clock, caplog, gh_calls):
