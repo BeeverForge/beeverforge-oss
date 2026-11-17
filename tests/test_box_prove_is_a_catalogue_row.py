@@ -709,6 +709,61 @@ def test_an_abandoned_proof_ends_the_run_in_flight_and_frees_the_key(tmp_path, m
     assert not _busy_for_another_thread("demo"), "the abandoned proof kept the key's lock"
 
 
+def test_an_abandoned_proof_stops_a_box_whose_cleanup_kills_nothing(tmp_path, monkeypatch):
+    """The worktree box's `cleanup` removes the tree and ends no process: the gate runs on to its
+    own timeout and the key stays locked. The run here ends ONLY on the box's `Stop` (no clock), so
+    the key is free only if the proof gave its box a stop and the watcher requested it."""
+    import threading
+
+    from beeverforge import factory, loader
+    from beeverforge.adapters.sandbox import registry as boxes
+
+    started = threading.Event()
+    cleaned: list[str] = []
+
+    class _Box:
+        stop = None
+
+        def prepare(self, **_kw):
+            return "ws"
+
+        def run(self, *, workspace, command, timeout, on_output=None):
+            started.set()
+            stop = self.stop
+            if stop is None:
+                return 0, "no stop was given: ran to its own timeout"
+            stop._event.wait(timeout=30)   # a failsafe only: the stop is what ends it
+            return (1, "killed") if stop.requested else (0, "ran to its own timeout")
+
+        def cleanup(self, *, workspace):
+            cleaned.append(workspace)   # kills nothing, like the worktree box's
+
+    manifest = SimpleNamespace(setup=[], base_branch="main",
+                               validation={"test": {"command": "pytest", "timeout_minutes": 180}})
+    monkeypatch.setattr(bp, "PROOF_DIR", tmp_path / "proofs")
+    monkeypatch.setattr(boxes, "build_sandbox", lambda *_a, **_k: _Box())
+    monkeypatch.setattr(factory, "box_knobs", lambda _p: {})
+    monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path)
+    monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: manifest)
+    abandoned = threading.Event()
+    got: list[tuple[int, str]] = []
+
+    def prove_it():
+        with bp.box_probes(SimpleNamespace(name="demo"), "img:1", key="demo", sandbox="worktree",
+                           abandoned=abandoned) as probes:
+            got.append(probes.run_gate("pytest", 180 * 60, lambda _line: None))
+
+    proving = threading.Thread(target=prove_it)
+    proving.start()
+    assert started.wait(timeout=30)
+    abandoned.set()
+    proving.join(timeout=30)
+
+    assert not proving.is_alive(), "the run in flight outlived the abandonment"
+    assert got and got[0][0] != 0
+    assert not _busy_for_another_thread("demo"), "the abandoned proof kept the key's lock"
+
+
 async def test_prove_box_hands_the_turn_s_event_to_the_body_and_sets_it_on_cancel(monkeypatch):
     """The wiring: `prove_box` gives `_do_prove_box` the event `_turning` sets when the activity is
     cancelled. Cut to `_do_prove_box(inp)` and every body test above stays green."""

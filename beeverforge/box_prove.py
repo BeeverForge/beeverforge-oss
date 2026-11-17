@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from beeverforge import namespace
+from beeverforge.adapters.sandbox.stopping import Stop
 from beeverforge.adapters.sandbox.timeouts import TIMEOUT_MARKER, timed_out
 from beeverforge.observability.job_record import record_one_pass
 from beeverforge.orchestrator.validation import advisory_gates, gate_commands, gate_timeout
@@ -1791,6 +1792,11 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         return per_role, note, fit
 
     finished = threading.Event()
+    # THE PROOF'S BOX GETS A STOP BEFORE ITS FIRST COMMAND, so its commands run in a group the stop
+    # can end (`own_group`/`adopted`) — only when the worker may abandon the proof.
+    stop = Stop() if abandoned is not None else None
+    if stop is not None:
+        box.stop = stop
     try:
         try:
             # A BRANCH OF THIS KEY'S OWN: `prepare` names the worktree box's directory after the
@@ -1806,13 +1812,20 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             start_error = str(exc)[:300]
             log.info("the box could not be started for the proof (%s)", start_error)
 
-        # A COMMAND ALREADY RUNNING WHEN THE ENGINE GAVE UP is ended by taking its box away: the
-        # gate in flight returns and the lock goes with the cleanup below, instead of being kept
-        # until that gate's own `timeout_minutes`. Polled in slices so the watcher ends with the
-        # proof.
+        # A COMMAND ALREADY RUNNING WHEN THE ENGINE GAVE UP is ended by the box's own stop, then
+        # its box is taken away: the gate in flight returns and the lock goes with the cleanup
+        # below, instead of being kept until that gate's own `timeout_minutes`. The stop is what
+        # kills the process on every box — the worktree box's cleanup removes the tree and kills
+        # nothing. Polled in slices so the watcher ends with the proof.
         def _end_the_run_in_flight(gave_up: threading.Event) -> None:
             while not finished.is_set():
                 if gave_up.wait(_WATCH_SLICE):
+                    try:
+                        if stop is not None:
+                            stop.request("the proof was abandoned by the worker")
+                    except Exception as exc:  # noqa: BLE001 — the cleanup below still runs
+                        log.warning("the abandoned proof's run could not be stopped (%s)",
+                                    str(exc)[:160])
                     try:
                         box.cleanup(workspace=workspace)
                     except Exception as exc:  # noqa: BLE001 — the cleanup below reports it again

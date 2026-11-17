@@ -3,7 +3,7 @@
 Run:  .venv/bin/python tools/mutate.py \
       tools/mutations/576_an_abandoned_box_proof_stops_and_records_nothing.py
 
-FIVE CUTS, each required to go red:
+SIX CUTS, each required to go red:
 
   1. `prove_the_box` records an abandoned proof: a late proof replaces the standing record.
   2. `_do_prove_box` records a proof that raised after the abandonment.
@@ -11,6 +11,8 @@ FIVE CUTS, each required to go red:
   4. `prove_box` stops handing the event to the body: nothing could ever stop it.
   5. The watcher does not end the run in flight: a gate mid-run keeps the key's lock until its own
      `timeout_minutes`.
+  6. The watcher does not request the box's stop: the worktree box's cleanup kills nothing, so
+     the run in flight keeps the key's lock until its own timeout.
 
 The guard under test: `tests/test_box_prove_is_a_catalogue_row.py`.
 """
@@ -52,4 +54,11 @@ MUTATIONS = [
      "        if False:\n"
      "            threading.Thread(",
      TEST + "::test_an_abandoned_proof_ends_the_run_in_flight_and_frees_the_key"),
+
+    ("the watcher does not request the box's stop", PROVE,
+     "                        if stop is not None:\n"
+     "                            stop.request(",
+     "                        if False:\n"
+     "                            stop.request(",
+     TEST + "::test_an_abandoned_proof_stops_a_box_whose_cleanup_kills_nothing"),
 ]
