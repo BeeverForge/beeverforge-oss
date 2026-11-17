@@ -335,9 +335,13 @@ either.
 - **The proof box is the job's box.** Both are built from `factory.box_knobs`: the registry's
   `box:` knobs, the `box.env` names and the image's pull credential. A test fails if the proof's
   knobs drift from the job's (#468).
-- **The rehearsal gets the same credential as the job.** For a local box that is no minted
-  token. It still withholds `box.env`, for the reason `onboarding/firstrun.py` states under
-  "THE CREDENTIAL IS THE GUARANTEE".
+- **The rehearsal gets the same minted credential as the job.** For a local box that is none.
+  It does not get the job's other credentials: its box is built in `onboarding/firstrun.py`, not
+  from `factory.box_knobs`. It withholds `box.env`, for the reason `firstrun.py` states under
+  "THE CREDENTIAL IS THE GUARANTEE". It also passes no pull credential for the image. A rehearsal
+  runs only after a passing proof, and that proof pulled the image with the credential, so the
+  rehearsal's box finds the image already present unless it was removed in between. That gap
+  is left open (#581).
 - **A local box is not handed a minted token for `setup:`.** The same box runs agent-written
   code, and the identity's token reaches the forge and the tracker. A private package source on
   a deployment that stores no token is a question about how far a credential reaches, for
