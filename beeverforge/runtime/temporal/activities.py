@@ -49,6 +49,7 @@ from beeverforge.runtime.temporal.io import (
     AdjustedInput,
     AdjustInput,
     AskInput,
+    BoxProveInput,
     CiRepairInput,
     CoordinatorInput,
     CoordinatorItem,
@@ -5435,6 +5436,34 @@ async def refresh_product_knowledge(inp: KnowledgeRefreshInput) -> str:
     mid-pass is noticed within `refresh.PASS_HEARTBEAT`, not at the pass's ceiling."""
     return await _turning(lambda _abandoned: _do_refresh_product_knowledge(inp),
                           f"refreshing the knowledge of {inp.project}")
+
+
+def _do_prove_box(inp: BoxProveInput) -> str:
+    """One project's box proven on the worker, because somebody asked through the `box_prove` row
+    (#237): `box_prove.prove_the_box`, the body the shell's own `box prove` runs, recorded where
+    the poller and the doctor read it. Returns the run's sentence — a project unregistered since
+    the ask is said, never raised: the row already answered, and nobody is waiting on a raise."""
+    from beeverforge import box_prove
+
+    try:
+        project = ProjectRegistry().get(inp.project)
+    except KeyError:
+        activity.logger.warning("a box proof was asked of %s, which is not registered now — "
+                                "nothing was proven", inp.project)
+        return f"{inp.project} is not registered now — nothing was proven"
+    run = box_prove.prove_the_box(project, repo=inp.repo, ref=inp.ref, image=inp.image,
+                                  sandbox=inp.sandbox)
+    activity.logger.info("BEEVERFORGE_BOX_PROOF %s: %s", run.key, run.sentence())
+    return run.sentence()
+
+
+@activity.defn
+async def prove_box(inp: BoxProveInput) -> str:
+    """#237 — an asked box proof, on the worker. It pulls an image and runs the client's whole
+    suite, so it HEARTBEATS while it runs (`_turning`): a worker that dies mid-proof is noticed
+    within `box_prove.PROOF_HEARTBEAT`, not at the proof's ceiling."""
+    return await _turning(lambda _abandoned: _do_prove_box(inp),
+                          f"proving the box of {inp.project}")
 
 
 #: How long one scheduled pass distils conversations for — each is a model call, so a few, and the

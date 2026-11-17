@@ -80,6 +80,7 @@ from beeverforge.runtime.temporal.activities import (
     product_role_say,
     product_sweep,
     promote_staging,
+    prove_box,
     purge_expired_records,
     read_ci_checks,
     reap_previews,
@@ -118,6 +119,7 @@ from beeverforge.runtime.temporal.poller import PollWorkflow
 from beeverforge.runtime.temporal.vocabulary import WORKER_ROLE
 from beeverforge.runtime.temporal.workflow import (
     AskWorkflow,
+    BoxProveWorkflow,
     CardQuestionSweepWorkflow,
     CoordinatorWorkflow,
     DeployWatchWorkflow,
@@ -189,6 +191,8 @@ WORKER_ACTIVITIES = [
     ingest_documents, distil_conversations,
     # #1004 — a product's knowledge brought up to date when somebody asks, not only on the tick
     refresh_product_knowledge,
+    # #237 — one project's box proven when somebody asks through the `box_prove` row
+    prove_box,
     # the tech-lead's chat runs WHERE AGENTS AUTHENTICATE — the panel dispatches here
     techlead_ask,
     # …and so does the product role's drafting, for the same reason and by the same route (#98).
@@ -434,6 +438,8 @@ async def main() -> None:
                    KnowledgeRefreshWorkflow,
                    # an asked refresh of a product's knowledge, one flight per product (#1004)
                    ProductKnowledgeRefreshWorkflow,
+                   # an asked box proof, one flight per key and ref (#237)
+                   BoxProveWorkflow,
                    # one per conversation with the product role (#266 slice 3)
                    ConversationWorkflow,
                    # `beeverforge doctor`'s question: does this worker accept the key there?

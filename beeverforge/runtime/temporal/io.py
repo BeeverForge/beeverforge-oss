@@ -954,6 +954,18 @@ class KnowledgeRefreshInput(BaseModel):
     issue: str = ""
 
 
+class BoxProveInput(BaseModel):
+    """One project's box proof asked through the `box_prove` row, run on the worker (#237): the
+    row's own values, so the worker proves exactly what was asked and resolves the box and the
+    image where the proof runs."""
+
+    project: str
+    repo: str = ""
+    ref: str = ""
+    image: str = ""
+    sandbox: str = ""
+
+
 class ReviewLoopInput(BaseModel):
     """A merged ticket whose independent review rejected it or raised something critical.
 

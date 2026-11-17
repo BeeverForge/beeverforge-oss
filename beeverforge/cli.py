@@ -1097,121 +1097,75 @@ def box_prove_cmd(
     can execute in it, then runs the project's OWN `setup:` and `validate:` against untouched
     `main`. Green means your tests passed inside the factory (ADR-0037 D3).
     """
+    from beeverforge.actions.base import CONFLICT, INVALID, NO_CODE_YET, NOT_FOUND
     from beeverforge.box_prove import (
         PROOF_DIR,
-        ProveBusy,
-        _hold_the_proof_of,
-        _let_go,
-        box_probes,
+        PROVEN,
+        Finding,
         load,
-        prove,
+        proving_here,
         save,
+        watching,
     )
 
-    project = _with_its_code(_get_project(name), "proving its box")
-    proof_key = name
-    view = project
-    if repo:
-        # C-18: the card's-eye view of the project — forge/ci swapped to that repository, the
-        # checkout and the proof keyed so two repos never share either. THE KEY COMES FROM THE
-        # VIEW, never recomputed from the raw flag: a bare name (`--repo dsk-ui`, the natural
-        # ADO spelling) resolves to the DEFAULT repository, and hashing the raw string keyed
-        # the default repo's proof under a foreign name (adversarial review, 2026-08-13).
-        from beeverforge.runtime.card_repo import _runner_view
+    # A PROJECT BEFORE ITS CODE is refused by the row's own declaration (`needs_code`, #992):
+    # `perform` says it in the sentence every door says, before anything is read
+    project = _get_project(name)
 
-        view, proof_key = _runner_view(project, f"{repo}#0")
-        if proof_key == name:
-            typer.echo(f"· --repo {repo} names the project's default repository — proving it "
-                       f"under its own key")
-    box_kind = _box_kind(sandbox)
-    resolved = resolve_box_image(view, explicit=image, sandbox=box_kind)
-    # NAME THE BOX, not only the image (ADR-0049 D9). A worktree proof has no image at all, and
-    # "proving myapp on beeverforge-python" over a box that runs none is the sentence a person
-    # would quote back when the proof turns out to be about something else.
-    from beeverforge.adapters.sandbox.registry import installed_box_traits
-
-    runs_an_image = installed_box_traits(box_kind).honours_image
-    typer.echo(f"proving {proof_key} in the {box_kind} box"
-               + (f" on {resolved}…\n" if runs_an_image and resolved else "…\n"))
+    # A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
+    # branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
+    # work against a manifest nobody merged. The row asks this before it records, and so does this.
+    def _record(proof):
+        return None if ref else save(proof)
 
     # WHAT THE ROOM SEES WHILE IT HAPPENS. This command pulls an image, installs the client's
-    # dependencies and runs their whole suite — and until now it printed nothing until every
-    # station had finished, which on a real repository is minutes of a blank terminal in front of
-    # the people deciding whether to buy. A screen that has not moved is indistinguishable from
-    # one that has hung, and somebody reaches for Ctrl-C.
+    # dependencies and runs their whole suite — and until it streamed, it printed nothing until
+    # every station had finished, which on a real repository is minutes of a blank terminal in
+    # front of the people deciding whether to buy. A screen that has not moved is indistinguishable
+    # from one that has hung, and somebody reaches for Ctrl-C.
     #
     # PROGRESS ON STDERR, RESULTS ON STDOUT. `beeverforge box prove x > proof.txt` still captures
-    # exactly
-    # the findings and the verdict; the live half goes to the terminal, where it is for.
+    # exactly the findings and the verdict; the live half goes to the terminal, where it is for.
     def _stage(kind: str, text: str) -> None:
-        if kind == "start":
+        if kind == "said":
+            typer.echo(text)
+        elif kind == "start":
             typer.echo(f"  … {text}", err=True)
         elif kind == "line":
             typer.echo(f"      {text.rstrip()}", err=True)
 
-    # ONE box for the whole proof — setup and validate must share a container or the install is
-    # thrown away between them, which is what the first real run of this command discovered.
-    ref_root, ref_manifest = None, None
-    held = None
-    if ref:
-        # THE KEY BEFORE THE `--ref` CHECKOUT (engineering lessons §12). `resolve_repo_path` below
-        # removes and re-adds `<cache>/worktrees/<key>@<ref>`, the tree a running `--ref` proof of
-        # this key reads: taken inside `box_probes` only, the lock refused the second proof after
-        # that tree was rebuilt (review of #745, git 2.43.0, 2026-10-21: `sentinel exists: False`).
-        # The lock is re-entrant for this thread, so `box_probes` takes it again at depth 2.
-        try:
-            held = _hold_the_proof_of(proof_key)
-        except ProveBusy as exc:
-            typer.echo(exc.sentence)
-            raise typer.Exit(1) from None
-        # A KEY OF ITS OWN. Syncing a branch under the project's default key would REPLACE the
-        # base branch's checkout with it — the same hole this closes, entered from the other side
-        # — and the next proof would measure a branch while reporting the base branch.
-        import re as _re
-
-        from beeverforge.factory import resolve_repo_path
-        from beeverforge.loader import load_manifest
-
-        safe = _re.sub(r"[^A-Za-z0-9._-]", "-", ref)
-        try:
-            ref_root = resolve_repo_path(view, cache_key=f"{proof_key}@{safe}", ref=ref)
-            ref_manifest = load_manifest(view, repo_root=ref_root)
-        except Exception as exc:  # noqa: BLE001 — one sentence, the cause, never a traceback
-            typer.echo(f"✗ could not read {namespace.MANIFEST} on {ref!r} ({str(exc)[:200]}) — "
-                       f"check that the branch exists on the forge and carries the file. "
-                       f"Nothing was changed.")
-            _let_go(held)
-            raise typer.Exit(2) from None
-
-    try:
-        with box_probes(view, resolved, key=proof_key, sandbox=box_kind,
-                        repo_path=ref_root, manifest=ref_manifest) as probes:
-            proof = prove(proof_key, resolved, probes, on_stage=_stage)
-    except ProveBusy as exc:
-        # BEFORE `save`: a refused proof measured nothing, and recording it as failed would hold
-        # the pickup the running proof is about to decide
-        typer.echo(exc.sentence)
-        raise typer.Exit(1) from None
-    finally:
-        _let_go(held)
-    for f in proof.findings:
+    # THE `box_prove` ROW (#237): the row proves and records, in this shell's own process — this
+    # command is the one caller that proves here, where its record is read — and what stays here
+    # is how a terminal shows it, the box's live lines included
+    with watching(_stage), proving_here(project, record=_record):
+        outcome = _perform("box_prove", project=name, image=image or "",
+                           sandbox=_box_kind(sandbox), repo=repo or "", ref=ref or "")
+    if not outcome.ok:
+        # A PROOF OF THE SAME KEY RUNNING is its own one sentence (#745); a project before its
+        # code is refused with the ✗ every verb says it with (#992); a branch whose manifest
+        # cannot be read, like an unknown name, is a usage error
+        bare = outcome.code == CONFLICT and outcome.data.get("reason") != NO_CODE_YET
+        typer.echo(outcome.message if bare else f"✗ {outcome.message}")
+        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)
+    data = dict(outcome.data)
+    proof_key = str(data.get("key") or name)
+    findings = [Finding.from_dict(f) for f in (data.get("proof") or {}).get("findings", [])]
+    proven = data.get("state") == PROVEN
+    for f in findings:
         typer.echo(f"  {f.mark:<4}  {f.check:<9} {f.message}")
         if not f.ok and f.remedy:
             typer.echo(f"          → {f.remedy}")
 
-    # A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION, and this line is what keeps it one.
-    # `save` writes where the POLLER looks; a branch recorded there would satisfy the gate that
-    # holds pickup on the BASE branch, unlocking work against a manifest nobody merged. The whole
-    # value of `--ref` is reading the answer before the merge, and it survives exactly as long as
-    # the answer cannot be mistaken for permission.
-    where = None if ref else save(proof)
+    # A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION: the row recorded nothing for it, and
+    # the verdict says so in the word it uses.
+    where = None if ref else data.get("recorded_at")
     typer.echo("")
     if ref:
-        typer.echo(f"{'WOULD PROVE' if proof.ok else 'WOULD NOT PROVE'} — measured on {ref!r}, "
+        typer.echo(f"{'WOULD PROVE' if proven else 'WOULD NOT PROVE'} — measured on {ref!r}, "
                    f"which is not the base branch. Nothing was recorded: the gate that holds "
                    f"pickup is a fact about the base branch, and merging is what makes it one.")
-        raise typer.Exit(0 if proof.ok else 1)
-    if proof.ok:
+        raise typer.Exit(0 if proven else 1)
+    if proven:
         if where is None:
             # PROVEN AND NOT RECORDED IS A THIRD OUTCOME, and the one that used to read as success.
             # The proof is real; the record is what the poller consults, so without it the very
@@ -1225,7 +1179,7 @@ def box_prove_cmd(
             raise typer.Exit(1)
         typer.echo(f"PROVEN — {name} can build and test in this box (recorded at {where})")
         # The number that makes the proof worth taking: this is what a client sees first.
-        gates = next((f for f in proof.findings if f.check == "validate"), None)
+        gates = next((f for f in findings if f.check == "validate"), None)
         if gates:
             typer.echo(f"  {gates.message}")
         return

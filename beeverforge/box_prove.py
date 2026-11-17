@@ -43,7 +43,9 @@ import re
 import shlex
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1246,6 +1248,203 @@ def load(project: str, *, root: Path | None = None) -> Proof | None:
                  commands_hash=data.get("commands_hash", ""), at=data.get("at", ""),
                  toolchain=data.get("toolchain", ""), findings=findings)
 
+
+# ── one project's proof, asked: the `box_prove` row's work (#237, ADR-0039) ─────────────────────
+#
+# WHAT `beeverforge box prove` DID, IN ONE PLACE. The command resolved the repository's view, the
+# box and the image, took the key before a `--ref` checkout, proved and recorded — inside the CLI,
+# so nothing else could ask for a proof. This is that body, called by the row for the shell's own
+# `box prove` and by the worker's activity for everybody else; the command renders what it answers.
+
+#: How a proof that was asked for stands. `RUNNING` is the worker's: the row answered its handle.
+PROVEN, NOT_PROVEN, RUNNING = "proven", "not_proven", "running"
+
+#: One proof on the worker: the image pulled, the client's `setup:` and every gate, each gate
+#: bounded by its own limit (`gate_timeout`). The flight is the workflow's, strictly longer.
+PROOF_CEILING = timedelta(hours=2)
+PROOF_HEARTBEAT = timedelta(minutes=2)
+PROOF_FLIGHT = PROOF_CEILING + timedelta(minutes=15)
+
+#: Who hears a proof while it runs: `(kind, text)`, kind one of `said` (a line of the answer's own,
+#: before it), `start` and `line` (`prove`'s `on_stage`). A context variable rather than a
+#: parameter, because the proof is asked through the action layer, whose values are what a JSON
+#: caller could send: the shell sets it around the row and `asyncio.to_thread` carries it over.
+_LISTENER: ContextVar[Callable[[str, str], None] | None] = ContextVar("box_prove_listener",
+                                                                      default=None)
+
+
+@contextmanager
+def watching(listener: Callable[[str, str], None]):
+    """Hear every proof asked in this context while it runs — the terminal's live half."""
+    token = _LISTENER.set(listener)
+    try:
+        yield
+    finally:
+        _LISTENER.reset(token)
+
+
+@dataclass(frozen=True)
+class Here:
+    """The shell's own `box prove`, proving in its process: the project it resolved, and how it
+    records what it proved — where THIS process's poller and doctor read."""
+
+    project: object
+    record: Callable[[Proof], Path | None]
+
+
+#: Set only by `beeverforge box prove`, around the row. WHERE A PROOF RUNS IS NOT A TRANSPORT'S
+#: NAME: `via == "cli"` is also `beeverforge act` on an operator's laptop, whose proof would be
+#: recorded in a PROOF_DIR no worker reads. A context variable, because a JSON caller cannot send
+#: one — no transport can ask to be proven in the request.
+_HERE: ContextVar[Here | None] = ContextVar("box_prove_here", default=None)
+
+
+@contextmanager
+def proving_here(project, *, record: Callable[[Proof], Path | None]):
+    """Every `box_prove` asked in this context is proven in this process, of `project`."""
+    token = _HERE.set(Here(project=project, record=record))
+    try:
+        yield
+    finally:
+        _HERE.reset(token)
+
+
+def here() -> Here | None:
+    """The shell proving in its own process, or None: the proof belongs on the worker."""
+    return _HERE.get()
+
+
+def _tell(kind: str, text: str) -> None:
+    """A line for whoever is watching. A listener that fails is logged, never the proof's."""
+    listener = _LISTENER.get()
+    if listener is None:
+        return
+    try:
+        listener(kind, text)
+    except Exception as exc:  # a status line is worth less than the proof it describes
+        log.warning("a proof's progress could not be told (%s)", exc)
+
+
+def workflow_id(key: str, ref: str = "") -> str:
+    """The id one proof runs under on the worker: one flight per key and ref, so a second ask
+    while it runs joins it. HASHED, never truncated or spelled: a ref is a branch somebody typed."""
+    return "box-prove-" + hashlib.sha256(f"{key}\n{ref}".encode()).hexdigest()
+
+
+def document(proof: Proof) -> dict:
+    """The proof as an answer: what passed, what failed, and every finding by its name."""
+    findings = list(proof.findings or [])
+    return {"project": proof.project, "image": proof.image, "ok": proof.ok,
+            "digest": proof.digest, "at": proof.at,
+            "passed": [f.check for f in findings if f.ok],
+            "failed": [f.check for f in proof.failures()],
+            "advisory": [f.check for f in proof.advisories()],
+            "findings": [f.to_dict() for f in findings]}
+
+
+@dataclass(frozen=True)
+class Run:
+    """One proof asked of a project, as it ended. `refused` is the sentence when nothing was
+    measured — `busy` when it is because a proof of the same key is running here."""
+
+    key: str
+    ref: str = ""
+    proof: Proof | None = None
+    recorded_at: Path | None = None
+    refused: str = ""
+    busy: bool = False
+
+    @property
+    def state(self) -> str:
+        return PROVEN if self.proof is not None and self.proof.ok else NOT_PROVEN
+
+    def sentence(self) -> str:
+        if self.refused:
+            return self.refused
+        verdict = "PROVEN" if self.state == PROVEN else "NOT PROVEN"
+        if self.ref:
+            return f"{verdict} — {self.key} measured on {self.ref!r}; nothing was recorded"
+        if self.recorded_at is None:
+            return f"{verdict} — {self.key}, and the proof could NOT be recorded"
+        return f"{verdict} — {self.key} (recorded at {self.recorded_at})"
+
+
+def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
+                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None) -> Run:
+    """Prove `project`'s box — another of its repositories with `repo`, a branch's manifest with
+    `ref` — and record the proof with `record` (`save` by default) unless it was a `ref`'s. Never
+    raises for what a person can fix: a `ref` whose manifest cannot be read, or a proof of the key
+    already running, is `refused`.
+
+    A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
+    branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
+    work against a manifest nobody merged."""
+    import re as _re
+
+    from beeverforge.runtime.boxed_job import redact
+
+    record = save if record is None else record
+
+    from beeverforge.adapters.sandbox.registry import installed_box_traits
+    from beeverforge.factory import resolve_box_image, resolve_repo_path
+    from beeverforge.loader import load_manifest
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    key, view = project.name, project
+    if repo:
+        # C-18: the card's-eye view of the project — forge/ci swapped to that repository, the
+        # checkout and the proof keyed so two repos never share either. THE KEY COMES FROM THE
+        # VIEW, never recomputed from the raw flag: a bare name resolves to the DEFAULT repository
+        from beeverforge.runtime.card_repo import _runner_view
+
+        view, key = _runner_view(project, f"{repo}#0")
+        if key == project.name:
+            _tell("said", f"· --repo {repo} names the project's default repository — proving it "
+                          f"under its own key")
+    box_kind = (sandbox or "").strip().lower() or default_sandbox()
+    resolved = resolve_box_image(view, explicit=image or None, sandbox=box_kind)
+    # NAME THE BOX, not only the image (ADR-0049 D9): a worktree proof has no image at all
+    runs_an_image = installed_box_traits(box_kind).honours_image
+    _tell("said", f"proving {key} in the {box_kind} box"
+          + (f" on {resolved}…\n" if runs_an_image and resolved else "…\n"))
+
+    ref_root, ref_manifest, held = None, None, None
+    if ref:
+        # THE KEY BEFORE THE `ref` CHECKOUT (engineering lessons §12): `resolve_repo_path` removes
+        # and re-adds `<cache>/worktrees/<key>@<ref>`, the tree a running proof of this key reads.
+        # The lock is re-entrant for this thread, so `box_probes` takes it again at depth 2.
+        try:
+            held = _hold_the_proof_of(key)
+        except ProveBusy as exc:
+            return Run(key=key, ref=ref, refused=exc.sentence, busy=True)
+        # A KEY OF ITS OWN: syncing a branch under the default key would REPLACE the base
+        # branch's checkout with it, and the next proof would measure a branch reporting the base
+        safe = _re.sub(r"[^A-Za-z0-9._-]", "-", ref)
+        try:
+            ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}", ref=ref)
+            ref_manifest = load_manifest(view, repo_root=ref_root)
+        except Exception as exc:  # one sentence, the cause, never a traceback
+            # REDACTED, THEN CUT: a failed clone's text carries its URL, token and all, and this
+            # sentence reaches whoever asked — through the panel's route too
+            cause = redact(str(exc))[:200]
+            log.warning("the manifest of %s on %r could not be read (%s)", key, ref, cause)
+            _let_go(held)
+            return Run(key=key, ref=ref,
+                       refused=f"could not read {namespace.MANIFEST} on {ref!r} "
+                               f"({cause}) — check that the branch exists on the forge "
+                               f"and carries the file. Nothing was changed.")
+    try:
+        with box_probes(view, resolved, key=key, sandbox=box_kind,
+                        repo_path=ref_root, manifest=ref_manifest) as probes:
+            proof = prove(key, resolved, probes, on_stage=_tell)
+    except ProveBusy as exc:
+        # BEFORE `save`: a refused proof measured nothing, and recording it as failed would hold
+        # the pickup the running proof is about to decide
+        return Run(key=key, ref=ref, refused=exc.sentence, busy=True)
+    finally:
+        _let_go(held)
+    where = None if ref else record(proof)
+    return Run(key=key, ref=ref, proof=proof, recorded_at=where)
 
 
 # ── the real probes ─────────────────────────────────────────────────────────────────────────────

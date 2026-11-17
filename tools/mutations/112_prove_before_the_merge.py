@@ -9,44 +9,52 @@ whatever branch was last measured.
 
 TEST = "tests/test_a_manifest_can_be_proven_before_it_is_merged.py"
 CLI = "beeverforge/cli.py"
+PROVE = "beeverforge/box_prove.py"
 FACTORY = "beeverforge/factory.py"
 
 MUTATIONS = [
-    ("a branch proof is recorded where the poller looks, unlocking an unmerged manifest", CLI,
-     "    where = None if ref else save(proof)",
-     "    where = save(proof)"),
+    # RE-PINNED 2026-11-13 (#237): the command's body is the `box_prove` row's
+    # (`box_prove.prove_the_box`), so the rows that cut the proving and the recording cut it there;
+    # what stays in the command is how a terminal says the verdict, and the recorder it hands the
+    # row (`_record`), which asks the ref again — cut on its own below.
+    # The command's recorder asks the ref again, so through the command this cut cannot be seen;
+    # the row's own test hands the bare `save`, as the worker does.
+    ("a branch proof is recorded where the poller looks, unlocking an unmerged manifest", PROVE,
+     "    where = None if ref else record(proof)",
+     "    where = record(proof)",
+     "tests/test_box_prove_is_a_catalogue_row.py::test_a_ref_proof_is_measured_and_never_recorded"),
 
-    ("…and the reverse: the base branch's proof stops being recorded at all", CLI,
-     "    where = None if ref else save(proof)",
-     "    where = None if not ref else save(proof)"),
+    ("…and the reverse: the base branch's proof stops being recorded at all", PROVE,
+     "    where = None if ref else record(proof)",
+     "    where = None if not ref else record(proof)"),
 
-    ("the ref shares the base branch's checkout key and replaces its tree", CLI,
-     '            ref_root = resolve_repo_path(view, cache_key=f"{proof_key}@{safe}", ref=ref)',
-     "            ref_root = resolve_repo_path(view, cache_key=proof_key, ref=ref)"),
+    ("the command's own recorder stops recording the base branch's proof", CLI,
+     "        return None if ref else save(proof)",
+     "        return None"),
 
-    ("the ref is never handed down, so a branch proof silently measures the base branch", CLI,
-     '            ref_root = resolve_repo_path(view, cache_key=f"{proof_key}@{safe}", ref=ref)',
-     '            ref_root = resolve_repo_path(view, cache_key=f"{proof_key}@{safe}")'),
+    ("the ref shares the base branch's checkout key and replaces its tree", PROVE,
+     '            ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}", ref=ref)',
+     "            ref_root = resolve_repo_path(view, cache_key=key, ref=ref)"),
 
-    ("a ref's slash reaches the directory name", CLI,
+    ("the ref is never handed down, so a branch proof silently measures the base branch", PROVE,
+     '            ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}", ref=ref)',
+     '            ref_root = resolve_repo_path(view, cache_key=f"{key}@{safe}")'),
+
+    ("a ref's slash reaches the directory name", PROVE,
      '        safe = _re.sub(r"[^A-Za-z0-9._-]", "-", ref)',
      "        safe = ref"),
 
     ("the measurement is announced in the word the recorded verdict uses", CLI,
-     '        typer.echo(f"{\'WOULD PROVE\' if proof.ok else \'WOULD NOT PROVE\'} — measured on {ref!r}, "',
-     '        typer.echo(f"{\'PROVEN\' if proof.ok else \'NOT PROVEN\'} — measured on {ref!r}, "'),
+     '        typer.echo(f"{\'WOULD PROVE\' if proven else \'WOULD NOT PROVE\'} — measured on {ref!r}, "',
+     '        typer.echo(f"{\'PROVEN\' if proven else \'NOT PROVEN\'} — measured on {ref!r}, "'),
 
     ("a failing branch exits 0, so a script proposing a manifest reads it as fine", CLI,
-     "        raise typer.Exit(0 if proof.ok else 1)",
+     "        raise typer.Exit(0 if proven else 1)",
      "        raise typer.Exit(0)"),
 
-    ("an unreadable ref raises instead of refusing by name", CLI,
-     '            typer.echo(f"✗ could not read {namespace.MANIFEST} on {ref!r} ({str(exc)[:200]}) — "\n'
-     '                       f"check that the branch exists on the forge and carries the file. "\n'
-     '                       f"Nothing was changed.")\n'
-     "            _let_go(held)\n"
-     "            raise typer.Exit(2) from None",
-     "            raise"),
+    ("an unreadable ref raises instead of refusing by name", PROVE,
+     "            _let_go(held)\n            return Run(key=key, ref=ref,\n",
+     "            _let_go(held)\n            raise\n            return Run(key=key, ref=ref,\n"),
 
     # ── the local-path half (review of #119) ────────────────────────────────────────────────────
     ("a locally-registered project ignores the ref and measures the working tree", FACTORY,
