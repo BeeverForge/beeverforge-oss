@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import shlex
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -50,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from beeverforge import namespace
+from beeverforge.adapters.sandbox.stopping import Stop
 from beeverforge.adapters.sandbox.timeouts import TIMEOUT_MARKER, timed_out
 from beeverforge.observability.job_record import record_one_pass
 from beeverforge.orchestrator.validation import advisory_gates, gate_commands, gate_timeout
@@ -1263,6 +1265,9 @@ PROVEN, NOT_PROVEN, RUNNING = "proven", "not_proven", "running"
 #: bounded by its own limit (`gate_timeout`). The flight is the workflow's, strictly longer.
 PROOF_CEILING = timedelta(hours=2)
 PROOF_HEARTBEAT = timedelta(minutes=2)
+
+#: How often the watcher over an abandoned proof looks whether the proof has ended on its own.
+_WATCH_SLICE = 1.0
 PROOF_FLIGHT = PROOF_CEILING + timedelta(minutes=15)
 
 #: Who hears a proof while it runs: `(kind, text)`, kind one of `said` (a line of the answer's own,
@@ -1370,7 +1375,8 @@ class Run:
 
 
 def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
-                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None) -> Run:
+                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None,
+                  abandoned: threading.Event | None = None) -> Run:
     """Prove `project`'s box — another of its repositories with `repo`, a branch's manifest with
     `ref` — and record the proof with `record` (`save` by default) unless it was a `ref`'s. Never
     raises for what a person can fix: a `ref` whose manifest cannot be read, or a proof of the key
@@ -1378,7 +1384,11 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
 
     A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
     branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
-    work against a manifest nobody merged."""
+    work against a manifest nobody merged.
+
+    `abandoned` is the worker's: set when the engine gave the activity up (its ceiling passed, or
+    it was cancelled). A thread cannot be killed, so the body stops itself — no command is started
+    after it, the key's lock is let go, and nothing is recorded for a proof nobody is waiting on."""
     import re as _re
 
     from beeverforge.runtime.boxed_job import redact
@@ -1435,7 +1445,8 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
                                f"and carries the file. Nothing was changed.")
     try:
         with box_probes(view, resolved, key=key, sandbox=box_kind,
-                        repo_path=ref_root, manifest=ref_manifest) as probes:
+                        repo_path=ref_root, manifest=ref_manifest,
+                        **({} if abandoned is None else {"abandoned": abandoned})) as probes:
             proof = prove(key, resolved, probes, on_stage=_tell)
     except ProveBusy as exc:
         # BEFORE `save`: a refused proof measured nothing, and recording it as failed would hold
@@ -1443,6 +1454,11 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
         return Run(key=key, ref=ref, refused=exc.sentence, busy=True)
     finally:
         _let_go(held)
+    if abandoned is not None and abandoned.is_set():
+        # THE FAILED WORKFLOW'S PROOF, MEASURED PARTLY OR NOT AT ALL: recording it would replace a
+        # real proof with one whose commands were refused, or a late one with an older manifest's
+        return Run(key=key, ref=ref, refused=f"the proof of {key} was abandoned — nothing was "
+                                             f"recorded")
     where = None if ref else record(proof)
     return Run(key=key, ref=ref, proof=proof, recorded_at=where)
 
@@ -1451,7 +1467,8 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
 
 @contextmanager
 def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=None,
-               key: str | None = None, sandbox: str | None = None):
+               key: str | None = None, sandbox: str | None = None,
+               abandoned: threading.Event | None = None):
     """The live probes, over a REAL box — the same `ContainerSandbox` a job gets.
 
     ONE CONTAINER FOR THE WHOLE PROOF, and the first real run is why this is stated. The first
@@ -1477,6 +1494,10 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
     box is built, rather than removing the first one's box. The lock is re-entrant for the THREAD
     that holds it (`util/filelock.py`), so a nested proof of one key on one thread is not refused;
     no door nests them.
+
+    `abandoned`, when set, ends the proof's commands: the box runs nothing more (each answers one
+    sentence at once, so `prove` runs out of commands), and the lock is let go as the box is cleaned
+    up. It is how a proof the engine has given up on stops holding the key.
     """
     import subprocess
 
@@ -1615,6 +1636,8 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
 
     def _in_box(command: str, on_line: Callable[[str], None] | None = None,
                 timeout: int = 1800) -> tuple[int, str]:
+        if abandoned is not None and abandoned.is_set():
+            return 1, "the proof was abandoned by the worker — no command was run"
         if workspace is None:
             # SAY WHY. This used to return a bare "the box was never started", which `prove`
             # reported as a SETUP failure with a remedy about private package feeds — while the
@@ -1768,6 +1791,12 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
                                          harness=harness_kind(project, "executor"))
         return per_role, note, fit
 
+    finished = threading.Event()
+    # THE PROOF'S BOX GETS A STOP BEFORE ITS FIRST COMMAND, so its commands run in a group the stop
+    # can end (`own_group`/`adopted`) — only when the worker may abandon the proof.
+    stop = Stop() if abandoned is not None else None
+    if stop is not None:
+        box.stop = stop
     try:
         try:
             # A BRANCH OF THIS KEY'S OWN: `prepare` names the worktree box's directory after the
@@ -1782,6 +1811,31 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         except Exception as exc:  # noqa: BLE001 — an unstartable box IS the finding, not a crash
             start_error = str(exc)[:300]
             log.info("the box could not be started for the proof (%s)", start_error)
+
+        # A COMMAND ALREADY RUNNING WHEN THE ENGINE GAVE UP is ended by the box's own stop, then
+        # its box is taken away: the gate in flight returns and the lock goes with the cleanup
+        # below, instead of being kept until that gate's own `timeout_minutes`. The stop is what
+        # kills the process on every box — the worktree box's cleanup removes the tree and kills
+        # nothing. Polled in slices so the watcher ends with the proof.
+        def _end_the_run_in_flight(gave_up: threading.Event) -> None:
+            while not finished.is_set():
+                if gave_up.wait(_WATCH_SLICE):
+                    try:
+                        if stop is not None:
+                            stop.request("the proof was abandoned by the worker")
+                    except Exception as exc:  # noqa: BLE001 — the cleanup below still runs
+                        log.warning("the abandoned proof's run could not be stopped (%s)",
+                                    str(exc)[:160])
+                    try:
+                        box.cleanup(workspace=workspace)
+                    except Exception as exc:  # noqa: BLE001 — the cleanup below reports it again
+                        log.warning("the abandoned proof's box could not be removed (%s)",
+                                    str(exc)[:160])
+                    return
+
+        if abandoned is not None and workspace is not None:
+            threading.Thread(target=_end_the_run_in_flight, args=(abandoned,), daemon=True,
+                             name=f"prove-watch-{subject}").start()
 
         yield Probes(
             honours_image=traits.honours_image,
@@ -1821,6 +1875,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             inlined_documents=_inlined_documents,
         )
     finally:
+        finished.set()
         try:
             if workspace is not None:
                 box.cleanup(workspace=workspace)

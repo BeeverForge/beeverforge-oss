@@ -45,7 +45,7 @@ MUTATIONS = [
      TEST + "::test_the_worker_serves_the_box_proof"),
 
     ("the activity proves without heartbeating", ACTIVITIES,
-     "    return await _turning(lambda _abandoned: _do_prove_box(inp),\n"
+     "    return await _turning(lambda abandoned: _do_prove_box(inp, abandoned),\n"
      "                          f\"proving the box of {inp.project}\")",
      "    return await asyncio.to_thread(_do_prove_box, inp)",
      TEST + "::test_the_worker_s_proof_heartbeats_while_it_runs"),

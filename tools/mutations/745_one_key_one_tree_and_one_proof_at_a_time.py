@@ -69,6 +69,7 @@ _SYNC_COMMENT = (
 
 _CLEANUP = (
     "    finally:\n"
+    "        finished.set()\n"
     "        try:\n"
     "            if workspace is not None:\n"
     "                box.cleanup(workspace=workspace)\n"
@@ -176,6 +177,7 @@ MUTATIONS = [
      PROVE,
      _CLEANUP,
      "    finally:\n"
+     "        finished.set()\n"
      "        _let_go(held)\n"
      "        try:\n"
      "            if workspace is not None:\n"
@@ -200,8 +202,8 @@ MUTATIONS = [
     ("`box prove --ref` keeps its key after the proof ran, so the project is refused as busy "
      "until the process ends",
      PROVE,
-     "    finally:\n        _let_go(held)\n    where = None if ref else record(proof)\n",
-     "    finally:\n        pass\n    where = None if ref else record(proof)\n",
+     "    finally:\n        _let_go(held)\n    if abandoned is not None and abandoned.is_set():\n",
+     "    finally:\n        pass\n    if abandoned is not None and abandoned.is_set():\n",
      ROW + "::test_a_ref_proof_lets_its_key_go_however_it_ends_to_any_thread"),
 
     # ── 5. every door says it in one sentence ──────────────────────────────────────────────────
