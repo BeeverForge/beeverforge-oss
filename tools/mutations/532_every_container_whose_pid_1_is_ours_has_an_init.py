@@ -64,6 +64,6 @@ MUTATIONS = [
      "ENTRYPOINT []\n"),
     # 2026-10-10, review of #572: the sandbox installs tini itself — its base is an ARG
     ("the sandbox image names a tini it does not install", SANDBOX,
-     "--no-install-recommends gh tini \\\n",
-     "--no-install-recommends gh \\\n"),
+     "--no-install-recommends gh tini procps \\\n",
+     "--no-install-recommends gh procps \\\n"),
 ]
