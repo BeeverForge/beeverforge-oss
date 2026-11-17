@@ -957,8 +957,10 @@ def _callers(name: str) -> set[str]:
 
 
 def test_no_job_opens_a_proposal_only_a_person_does():
-    """Opening a proposal is `beeverforge preview propose` and `onboard --with-preview`. A job,
-    an activity, a workflow, the poller or the panel only ASK whether one is open.
+    """Opening a proposal is always in a person's name: `beeverforge preview propose`, and the
+    `onboard` row's `with_preview` — from the shell, the panel or `act`. A job, a workflow or the
+    poller only ASK whether one is open; the one activity that opens any is `_do_onboard`, and
+    only with the opener made for the person whose onboarding it runs.
 
     TWO CALL SITES, EACH A PERSON'S. `beeverforge/cli.py` is `preview propose`, typed by whoever
     runs it. `beeverforge/actions/catalog.py` is the `onboard` row's opener (#237),

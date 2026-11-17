@@ -1314,6 +1314,17 @@ def steps_of(out) -> list[dict]:
     return steps
 
 
+def _refused_by_the_provider(said: str) -> list[dict]:
+    """One repository a provider refused partway, as its steps: the refusal is the step that
+    failed, said in full, and the rest were not reached. Which step it struck is not known — the
+    forge is asked before the clone and again at the pull request — so it is said at the first."""
+    from beeverforge.actions.base import STEP_FAILED, STEP_SKIPPED, step
+
+    not_reached = "not reached — the provider refused this repository"
+    return [step(READ, STEP_FAILED, said),
+            *(step(s, STEP_SKIPPED, not_reached) for s in (MANIFEST, PROOF, MAP, PULL_REQUEST))]
+
+
 #: How the preview's proposal is opened for one repository, `(project, repo) -> Outcome`, or None
 #: when nobody asked for one. Handed in by the `onboard` row, in the name of the person who asked
 #: (`catalog.previews_opened_as`): opening a proposal is a person's act, so this body never names
@@ -1415,10 +1426,28 @@ def onboard_the_product(project, *, repos: list[str], with_preview: bool = False
     documents = []
     for repo in repos:
         _tell("said", f"\n── {repo}")
-        outcome = onboard_source_repo(project, repo, sandbox=sandbox, stream=heard)
+        try:
+            outcome = onboard_source_repo(project, repo, sandbox=sandbox, stream=heard)
+        except Exception as exc:
+            # A PROVIDER THAT ANSWERED NO IS THIS REPOSITORY'S FAILED STEP, in the sentence that
+            # names its remedy (`cli_refusals`, #111), and the others still run. Anything else is
+            # a defect and keeps its traceback — journaled first, so the panel reading the journal
+            # is told the onboarding stopped rather than watching it go quiet
+            from beeverforge.cli_refusals import as_a_sentence, looks_like_a_provider
+            from beeverforge.onboarding.propose_manifest import scrub
+
+            if not looks_like_a_provider(exc):
+                journal.emit("error", f"{repo}: the onboarding stopped — "
+                                      f"{type(exc).__name__}: {scrub(str(exc))[:300]}",
+                             repo=repo)
+                raise
+            outcome = RepoOutcome(repo=repo,
+                                  detail=scrub(as_a_sentence(exc, doing=f"onboard {repo}")))
+            steps = _refused_by_the_provider(outcome.detail)
+        else:
+            steps = steps_of(outcome)
         mark = "✓" if outcome.ok else "✗"
         _tell("said", f"{mark} {outcome.detail or outcome.pr or outcome.proof}")
-        steps = steps_of(outcome)
         if with_preview:
             steps.append(_preview_step(project, repo, outcome, open_preview))
         for done in steps:

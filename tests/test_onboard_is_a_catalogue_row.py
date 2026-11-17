@@ -194,6 +194,19 @@ async def test_running_it_twice_changes_nothing_the_second_time_and_says_so(demo
     assert second.data["context"]["changed"] is False
 
 
+async def test_a_run_whose_only_change_is_the_context_says_it_changed(demo):
+    """Every repository's pull request was already open; the context is proposed for the first
+    time. That is a change of this run, read off the context box's own `changed`."""
+    demo.opened.update({"acme/demo": "https://github.com/acme/demo/pull/1"})
+
+    with _in_the_shell():
+        out = await actions.perform("onboard", by=_shell(), project="demo")
+
+    assert [r["changed"] for r in out.data["repos"]] == [False]
+    assert out.data["context"]["changed"] is True and out.data["changed"] is True, out.data
+    assert "nothing changed" not in out.message, out.message
+
+
 async def test_a_manifest_proposed_and_not_merged_is_said_proposed_on_the_second_run(demo):
     """`already` is a manifest ON THE DEFAULT BRANCH. One this onboarding proposed and nobody has
     merged yet is not there: the second run says it is proposed, in the pull request it names."""
@@ -275,6 +288,51 @@ async def test_a_repository_that_fails_is_said_by_its_step_and_the_others_still_
     assert read["state"] == actions.STEP_FAILED and "access denied" in read["said"]
     assert [r for r, _ in demo.asked] == ["acme/demo", "acme/web"]
     assert "acme/web" in out.message, out.message
+
+
+async def test_a_provider_that_refuses_one_repository_is_its_failed_step(demo, monkeypatch):
+    """A forge that answered no is that repository's failed step, in the sentence that names the
+    remedy — the others still run, and nothing raises."""
+    asked = []
+
+    def source(project, repo, **_kw):
+        asked.append(repo)
+        if repo == "acme/web":
+            raise RuntimeError("gh api failed: HTTP 401: Bad credentials")
+        return ob.RepoOutcome(repo=repo, ok=True, pr=f"https://github.com/{repo}/pull/1",
+                              proof="proven", modules=1)
+
+    monkeypatch.setattr(ob, "onboard_source_repo", source)
+    with _in_the_shell():
+        out = await actions.perform("onboard", by=_shell(), project="demo", sources="acme/web",
+                                    skip_context=True)
+
+    assert out.ok and out.data["ok"] is False and asked == ["acme/demo", "acme/web"]
+    web = next(r for r in out.data["repos"] if r["repo"] == "acme/web")
+    failed = [s for s in web["steps"] if s["state"] == actions.STEP_FAILED]
+    assert len(failed) == 1, web["steps"]
+    assert "gh auth login" in failed[0]["said"] and "Bad credentials" in failed[0]["said"]
+    assert "gh auth login" in web["detail"]
+    assert ("acme/web", actions.STEP_FAILED) in [
+        (e["data"].get("repo"), e["data"].get("state")) for e in _journal()]
+
+
+def test_a_defect_in_one_repository_is_journaled_as_an_error_and_raised(demo, monkeypatch):
+    """Anything that is not a provider keeps its traceback — but the panel reading the journal is
+    told the onboarding stopped, rather than watching it go quiet."""
+    def source(project, repo, **_kw):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    from beeverforge.registry import ProjectRegistry
+
+    monkeypatch.setattr(ob, "onboard_source_repo", source)
+    with pytest.raises(TypeError):
+        ob.onboard_the_product(ProjectRegistry().get("demo"), repos=["acme/demo", "acme/web"],
+                               skip_context=True, create_context=lambda _name: None)
+
+    errors = [e for e in _journal() if e["kind"] == "error"]
+    assert len(errors) == 1, _journal()
+    assert "acme/demo" in errors[0]["message"] and "TypeError" in errors[0]["message"]
 
 
 async def test_a_context_repository_nobody_declared_is_created_through_product_init(
@@ -372,6 +430,32 @@ async def test_a_second_ask_while_a_run_is_going_answers_the_same_handle(demo, e
     assert (first.data["joined"], second.data["joined"]) == (False, True)
     assert "already running" in second.message, second.message
     assert len(engine.started) == 1
+
+
+async def test_a_joined_ask_names_no_repositories_of_its_own(demo, engine):
+    """The run it joined walks the repositories IT was started with: this ask's list is not what
+    is being onboarded, so it is not answered as if it were."""
+    await actions.perform("onboard", by=_panel(), project="demo")
+    joined = await actions.perform("onboard", by=_panel(), project="demo", sources="acme/web")
+
+    assert joined.ok and joined.data["joined"] is True
+    assert joined.data["repositories"] is None, joined.data
+    assert "the repositories it was started with" in joined.message, joined.message
+
+
+@pytest.mark.parametrize("kind", ["fargate", "worktree", "nonsuch"])
+async def test_away_from_the_shell_a_box_the_worker_cannot_prove_in_is_refused(demo, engine,
+                                                                              monkeypatch, kind):
+    """Each repository is proven in the box on the worker: a remote box has none to build there,
+    `worktree` bounds nothing on a worker that is not its operator's (ADR-0049 D9), and an unknown
+    box is no box — refused before anything starts, as `box_prove` refuses them."""
+    monkeypatch.delenv("BEEVERFORGE_OWN_WORK", raising=False)
+
+    out = await actions.perform("onboard", by=_panel(), project="demo", sandbox=kind)
+
+    assert not out.ok and out.code == actions.INVALID and kind in out.message, out.message
+    assert "Nothing was started." in out.message and out.data["sandbox"] == kind
+    assert engine.started == [] and demo.asked == []
 
 
 def test_one_run_per_project_and_never_two_projects_on_one():
@@ -707,3 +791,15 @@ def test_the_verb_says_a_failed_repository_and_exits_1(demo):
 
     assert result.exit_code == 1, result.output
     assert "✗ acme/demo" in result.output and "access denied" in result.output
+
+
+def test_the_verb_refuses_a_malformed_source_and_exits_2(demo):
+    """A source no forge can name is the person's to fix, a usage answer like every other — exit
+    2, the row's reason printed, and nothing onboarded."""
+    from beeverforge.cli import app as cli
+
+    result = CliRunner().invoke(cli, ["onboard", "demo", "--source", "../../etc", "--yes"])
+
+    assert result.exit_code == 2, result.output
+    assert "'../../etc'" in result.output and "Nothing was done" in result.output
+    assert demo.asked == []

@@ -3,7 +3,7 @@ breaking it.
 
 Run:  .venv/bin/python tools/mutate.py tools/mutations/237_onboard_is_a_catalogue_row.py
 
-NINE CUTS, each required to go red:
+THIRTEEN CUTS, each required to go red:
 
   1. A pull request a second run finds open is said `already`: read as a change of this run, the
      second onboarding would report that it opened what it only found — the re-run safety, cut.
@@ -21,16 +21,28 @@ NINE CUTS, each required to go red:
      would say it did what it only found open.
   9. A preview proposal is opened only in the name of a person who asked: an opener handed to an
      ask that names nobody, the worker would open one on its own account.
+ 10. A box the worker cannot prove in is refused before anything starts: without the `if why:`
+     return, a remote, unbounded or unknown box would be answered `running` and fail on the
+     worker where nobody reads it.
+ 11. A context review a second run finds open is returned, never force-pushed over — the re-run
+     safety of the context step, cut where the port's answer is read.
+ 12. The context's own `changed` is read: a run whose only change is the context would say that
+     nothing changed.
+ 13. The verb answers a usage refusal with exit 2: read as a failure, a malformed --source would
+     exit 1 like a repository that did not finish.
 
-The guard under test: `tests/test_onboard_is_a_catalogue_row.py`.
+The guards under test: `tests/test_onboard_is_a_catalogue_row.py`, and for the context's re-run
+safety `tests/test_onboard_builds_the_context_too.py`.
 """
 
 TEST = "tests/test_onboard_is_a_catalogue_row.py"
+CONTEXT_TEST = "tests/test_onboard_builds_the_context_too.py"
 
 ONBOARD = "beeverforge/onboarding/onboard.py"
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
 WORKER = "beeverforge/runtime/temporal/worker.py"
 CATALOGUE = "beeverforge/actions/catalog.py"
+CLI = "beeverforge/cli.py"
 
 MUTATIONS = [
     ("a pull request found open is said as one this run opened", ONBOARD,
@@ -81,4 +93,34 @@ MUTATIONS = [
      "        return None\n",
      "",
      TEST + "::test_the_worker_proposes_a_preview_only_as_the_person_who_asked"),
+
+    ("a box the worker cannot prove in is answered running", CATALOGUE,
+     "    if why:\n        return refused(INVALID, f\"{why} Nothing was started.\", "
+     "project=found.name,\n                       sandbox=box_kind)\n"
+     "    client, bad_engine = await _connected()\n    if bad_engine:\n        return bad_engine\n"
+     "    from beeverforge.runtime.temporal import TASK_QUEUE\n"
+     "    from beeverforge.runtime.temporal.io import OnboardInput\n",
+     "    client, bad_engine = await _connected()\n    if bad_engine:\n        return bad_engine\n"
+     "    from beeverforge.runtime.temporal import TASK_QUEUE\n"
+     "    from beeverforge.runtime.temporal.io import OnboardInput\n",
+     TEST + "::test_away_from_the_shell_a_box_the_worker_cannot_prove_in_is_refused"),
+
+    ("an open context review is pushed over on a second run", ONBOARD,
+     "        if pushed_already.strip():\n",
+     "        if False:\n",
+     CONTEXT_TEST + "::test_an_open_context_review_is_found_not_force_pushed_over"),
+
+    ("the context's own change is not read", ONBOARD,
+     "                   \"changed\": bool(made.created or made.changed)}",
+     "                   \"changed\": bool(made.created)}",
+     TEST + "::test_a_run_whose_only_change_is_the_context_says_it_changed"),
+
+    ("a usage refusal exits as a failure", CLI,
+     "        typer.echo(f\"✗ {outcome.message}\")\n"
+     "        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)\n"
+     "    outcomes = outcome.data.get(\"repos\")",
+     "        typer.echo(f\"✗ {outcome.message}\")\n"
+     "        raise typer.Exit(1)\n"
+     "    outcomes = outcome.data.get(\"repos\")",
+     TEST + "::test_the_verb_refuses_a_malformed_source_and_exits_2"),
 ]

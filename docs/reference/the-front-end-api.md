@@ -319,8 +319,10 @@ the context repository's outcome, and `data.changed` is `false` when a second ru
 already there. Either way each step is journaled as it ends, at `/api/jobs/<project>/onboard/events`.
 `ok` is about the onboarding having run: the document's own `data.ok` says whether every
 repository finished. An unknown project is a 404 that names the registered ones. A source that is
-not a repository this project's forge can name is a 400 with `data.unreadable`, and so is a
-project that names no repository. Nothing starts. The row is the floor's, for an admin.
+not a repository reference this project's forge can name is a 400 with `data.unreadable`, and so
+is a project that names no repository, and a box the worker cannot prove in (unknown, remote, or
+one that bounds nothing), with `data.sandbox`. Nothing starts. A joined ask's
+`data.repositories` is `null`: the run it joined walks the repositories it was started with. The row is the floor's, for an admin.
 
 **Rows of several steps.** `project_init` and `product_init` take several steps with the network
 between them, and say in `data.steps` what each came to: in order, each `{step, state, said}`, the

@@ -7896,7 +7896,8 @@ async def _onboard(*, project: str, by: Actor, sources: object = None, with_prev
 
     `ok` IS ABOUT THE ROW HAVING RUN, as `doctor`'s is: a repository that failed is a done outcome
     whose document says `"ok": false` and which step failed. A refusal is an onboarding that did
-    not start — an unknown project, a source no forge can name, a project naming no repository."""
+    not start — an unknown project, a source no forge can name, a project naming no repository,
+    and away from the shell a box the worker cannot prove in."""
     import asyncio
 
     from beeverforge.onboarding import onboard
@@ -7911,9 +7912,10 @@ async def _onboard(*, project: str, by: Actor, sources: object = None, with_prev
     # that is no repository reference — a path, free text — would be cloned as one
     unreadable = [s for s in given if not normalize_repo(s)]
     if unreadable:
-        return refused(INVALID, f"{', '.join(repr(s) for s in unreadable)}: not one of "
-                                f"{found.name}'s repositories — name a repository as this "
-                                f"project's forge names one. Nothing was done.",
+        return refused(INVALID, f"{', '.join(repr(s) for s in unreadable)}: is not a "
+                                f"repository reference this project's forge can name — name "
+                                f"each source as {found.name}'s forge names a repository. "
+                                f"Nothing was done.",
                        project=found.name, unreadable=unreadable)
     repos = onboard.repositories(found, given)
     if not repos:
@@ -7928,6 +7930,18 @@ async def _onboard(*, project: str, by: Actor, sources: object = None, with_prev
             create_context=onboard.through_product_init(by), open_preview=previews_opened_as(by))
         return done(document["detail"], state=onboard.ONBOARDED, handle=None, joined=False,
                     repositories=repos, **document)
+    # A BOX THE WORKER CANNOT PROVE IN IS REFUSED HERE, as `box_prove` refuses it: every repository
+    # is proven in it on the worker, and an unknown box, a remote one with nothing to build there,
+    # or one that bounds nothing would otherwise be answered `running` and fail where nobody reads
+    from beeverforge.adapters.sandbox.registry import durable_refusal, installed_box_traits
+
+    why = durable_refusal(box_kind)
+    if not why and installed_box_traits(box_kind).remote:
+        why = (f"the {box_kind!r} box is remote: an onboarding proves each repository's box on "
+               f"the worker, and this one has none there — ask for the 'container' box.")
+    if why:
+        return refused(INVALID, f"{why} Nothing was started.", project=found.name,
+                       sandbox=box_kind)
     client, bad_engine = await _connected()
     if bad_engine:
         return bad_engine
@@ -7952,12 +7966,15 @@ async def _onboard(*, project: str, by: Actor, sources: object = None, with_prev
                           found.name, reference, exc)
             return refused(FAILED, "the onboarding could not be started just now.",
                            project=found.name, reference=reference)
-    said = (f"an onboarding of {found.name} is already running on the worker — this ask joined it"
+    # A JOINED ASK NAMES NO REPOSITORIES: the run it joined walks the ones IT was started with,
+    # which this ask's list need not be
+    said = (f"an onboarding of {found.name} is already running on the worker — this ask joined "
+            f"it, and it onboards the repositories it was started with, not these"
             if joined else f"the onboarding of {found.name} is running on the worker")
     return done(f"{said}; each repository's steps are journaled as they end "
                 f"(`/api/jobs/{found.name}/{onboard.ONBOARDING}/events`).",
                 project=found.name, state=onboard.RUNNING, handle=handle, joined=joined,
-                repositories=repos, repos=None, context=None)
+                repositories=None if joined else repos, repos=None, context=None)
 
 
 # ── a project's own settings, and its removal (#741) ────────────────────────────────────────────

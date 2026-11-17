@@ -462,8 +462,9 @@ The answer comes back at once with the run's `handle`, and a second ask while it
 same handle back. Either way each step is journaled as it ends, and
 `GET /api/jobs/myapp/onboard/events` reads the journal. Run it twice and the second run finds what
 the first left. Every pull request is `already` open, `changed` is false, and the answer says
-nothing changed. A source that is not a repository this project's forge can name is refused
-before anything starts.
+nothing changed. A source that is not a repository reference this project's forge can name is
+refused before anything starts, and so, on the worker, is a box it cannot prove in. A repository a
+provider refuses is that repository's failed step, with the remedy, and the others still run.
 
 ### The manual session — when the developers are in the room
 
@@ -900,8 +901,8 @@ requirements, the documents, decisions and facts — everything that lives in th
 once. Breaking a requirement into cards **waits for a source**: an acceptance records the promise
 and says, in the project's language, that its tasks wait for the code. Everything else that needs
 code refuses the project by name with the one way through — every action row that needs it
-(reason `no_code_yet`), pickup (the poller leaves it off its list), `box prove`, `run`, `poll`
-and `project init` — and `beeverforge doctor myapp` says it once, as its `code` line, instead of a
+(reason `no_code_yet`), pickup (the poller leaves it off its list), `onboard`, `box prove`, `run`,
+`poll` and `project init` — and `beeverforge doctor myapp` says it once, as its `code` line, instead of a
 red line per reader of the code. The readiness check (`beeverforge env check myapp`, the
 `env_check` row) answers too: NOT ready, held on that same line.
 
