@@ -464,6 +464,30 @@ def test_a_worker_proof_that_raises_replaces_the_previous_green_proof(demo, monk
     assert reason and "FAILED" in reason
 
 
+def test_a_repository_proof_that_raises_replaces_the_green_proof_under_that_repository_s_key(
+        demo, monkeypatch):
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.card_repo import _runner_view
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    _view, key = _runner_view(ProjectRegistry().get("demo"), "acme/web#0")
+    assert key != "demo"
+    bp.save(Proof(project=key, image="img:1", ok=True, findings=[]))
+    bp.save(Proof(project="demo", image="img:1", ok=True, findings=[]))
+
+    def _raises(*_a, **_k):
+        raise RuntimeError("the clone went away")
+
+    monkeypatch.setattr(bp, "prove_the_box", _raises)
+    with pytest.raises(RuntimeError, match="the clone went away"):
+        acts._do_prove_box(BoxProveInput(project="demo", repo="acme/web"))
+
+    assert not bp.load(key).ok
+    assert any("the clone went away" in f.message for f in bp.load(key).failures())
+    assert bp.load("demo").ok
+
+
 def test_a_ref_proof_that_raises_leaves_the_recorded_proof_alone(demo, monkeypatch):
     from beeverforge.runtime.temporal import activities as acts
     from beeverforge.runtime.temporal.io import BoxProveInput
