@@ -194,6 +194,34 @@ async def test_running_it_twice_changes_nothing_the_second_time_and_says_so(demo
     assert second.data["context"]["changed"] is False
 
 
+async def test_a_manifest_proposed_and_not_merged_is_said_proposed_on_the_second_run(demo):
+    """`already` is a manifest ON THE DEFAULT BRANCH. One this onboarding proposed and nobody has
+    merged yet is not there: the second run says it is proposed, in the pull request it names."""
+    with _in_the_shell():
+        await actions.perform("onboard", by=_shell(), project="demo", skip_context=True)
+        second = await actions.perform("onboard", by=_shell(), project="demo", skip_context=True)
+
+    (repo,) = second.data["repos"]
+    manifest = next(s for s in repo["steps"] if s["step"] == "manifest")
+    assert manifest["state"] not in (actions.STEP_DONE, actions.STEP_ALREADY), manifest
+    assert manifest["state"] == actions.STEP_SKIPPED and manifest["proposed"] == repo["pr"]
+    assert "proposed" in manifest["said"] and "not merged" in manifest["said"], manifest
+    assert second.data["changed"] is False
+
+
+async def test_a_manifest_on_the_default_branch_is_said_already(demo, monkeypatch):
+    monkeypatch.setattr(ob, "onboard_source_repo", lambda project, repo, **_kw: ob.RepoOutcome(
+        repo=repo, ok=True, proof="proven", modules=1, manifest_already_there=True,
+        detail=f"{repo} already declares everything — nothing to propose (proof: proven)"))
+
+    with _in_the_shell():
+        out = await actions.perform("onboard", by=_shell(), project="demo", skip_context=True)
+
+    (repo,) = out.data["repos"]
+    manifest = next(s for s in repo["steps"] if s["step"] == "manifest")
+    assert manifest["state"] == actions.STEP_ALREADY, manifest
+
+
 async def test_with_preview_each_repository_proposes_its_preview_once(demo, monkeypatch):
     from beeverforge.onboarding import preview_propose
 
@@ -418,6 +446,34 @@ def test_the_worker_asks_product_init_as_whoever_asked(demo, tmp_path, monkeypat
     assert len(seen) == 1, "a floor-scoped asker changed the installation on the worker"
     assert said["context"]["ok"] is False
     assert "changes this installation" in said["context"]["detail"], said["context"]
+
+
+def test_the_worker_proposes_a_preview_only_as_the_person_who_asked(demo, monkeypatch):
+    """The worker runs an onboarding somebody asked for, and the preview's proposal is opened in
+    that person's name, through the row's own opener — never by the worker on its own account."""
+    from beeverforge.onboarding import preview_propose
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import OnboardInput
+
+    asked: list[str] = []
+    monkeypatch.setattr(preview_propose, "propose_preview", lambda project, *, repo: asked.append(
+        repo) or preview_propose.Outcome(ok=True, url=f"https://github.com/{repo}/pull/77"))
+    monkeypatch.setattr(ob, "onboard_source_repo", lambda project, repo, **_kw: ob.RepoOutcome(
+        repo=repo, ok=True, proof="proven", modules=1, manifest_already_there=True))
+
+    said = acts._do_onboard(OnboardInput(project="demo", sources=["acme/demo"], asked_by="ana",
+                                         via="panel", with_preview=True, skip_context=True))
+    (repo,) = said["repos"]
+    assert asked == ["acme/demo"]
+    assert next(s for s in repo["steps"] if s["step"] == "preview")["state"] == actions.STEP_DONE
+
+    asked.clear()
+    said = acts._do_onboard(OnboardInput(project="demo", sources=["acme/demo"], with_preview=True,
+                                         skip_context=True))
+    (repo,) = said["repos"]
+    preview = next(s for s in repo["steps"] if s["step"] == "preview")
+    assert asked == [], "the worker opened a proposal nobody asked for"
+    assert preview["state"] == actions.STEP_SKIPPED and "nobody" in preview["said"], preview
 
 
 def test_the_worker_says_an_unknown_project_and_raises_nothing(demo):

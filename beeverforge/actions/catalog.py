@@ -7852,6 +7852,26 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
                 recorded_at=None, handle=handle, joined=joined)
 
 
+def previews_opened_as(by: Actor):
+    """How an onboarding `by` asked for opens each repository's preview proposal — or None when
+    nobody did, and the onboarding then opens none.
+
+    OPENING A PROPOSAL IS A PERSON'S ACT (#265 slice 4): `preview propose` in a shell, and this,
+    the `onboard` row's `with_preview`. A job, an activity or the poller only ASKS whether one is
+    open. The worker's run of an asked onboarding is handed this by the activity that runs that
+    ask, with the asker it carries; an ask that names nobody gets nothing to open with."""
+    if not (getattr(by, "id", "") or "").strip() or by.id == "worker":
+        return None
+
+    def open_one(project, repo: str):
+        from beeverforge.onboarding.preview_propose import propose_preview
+
+        log.info("the preview of %s is proposed as %s asked (via %s)", repo, by.id, by.via)
+        return propose_preview(project, repo=repo)
+
+    return open_one
+
+
 async def _onboard(*, project: str, by: Actor, sources: object = None, with_preview: bool = False,
                    sandbox: str = "", skip_context: bool = False) -> Outcome:
     """Onboard a project's repositories — `beeverforge onboard` as a row (#237).
@@ -7905,7 +7925,7 @@ async def _onboard(*, project: str, by: Actor, sources: object = None, with_prev
         document = await asyncio.to_thread(
             onboard.onboard_the_product, found, repos=repos, with_preview=with_preview is True,
             sandbox=box_kind, skip_context=skip_context is True,
-            create_context=onboard.through_product_init(by))
+            create_context=onboard.through_product_init(by), open_preview=previews_opened_as(by))
         return done(document["detail"], state=onboard.ONBOARDED, handle=None, joined=False,
                     repositories=repos, **document)
     client, bad_engine = await _connected()

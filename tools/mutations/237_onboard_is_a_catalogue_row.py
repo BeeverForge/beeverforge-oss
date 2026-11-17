@@ -3,7 +3,7 @@ breaking it.
 
 Run:  .venv/bin/python tools/mutate.py tools/mutations/237_onboard_is_a_catalogue_row.py
 
-SEVEN CUTS, each required to go red:
+NINE CUTS, each required to go red:
 
   1. A pull request a second run finds open is said `already`: read as a change of this run, the
      second onboarding would report that it opened what it only found — the re-run safety, cut.
@@ -17,6 +17,10 @@ SEVEN CUTS, each required to go red:
      the queue with nothing to run it.
   7. The worker's onboarding heartbeats: run without `_turning`, a worker that dies mid-onboarding
      is noticed at the run's ceiling, not within `onboard.ONBOARD_HEARTBEAT`.
+  8. A manifest proposed and not merged is said proposed: read as this run's work, a second run
+     would say it did what it only found open.
+  9. A preview proposal is opened only in the name of a person who asked: an opener handed to an
+     ask that names nobody, the worker would open one on its own account.
 
 The guard under test: `tests/test_onboard_is_a_catalogue_row.py`.
 """
@@ -26,6 +30,7 @@ TEST = "tests/test_onboard_is_a_catalogue_row.py"
 ONBOARD = "beeverforge/onboarding/onboard.py"
 ACTIVITIES = "beeverforge/runtime/temporal/activities.py"
 WORKER = "beeverforge/runtime/temporal/worker.py"
+CATALOGUE = "beeverforge/actions/catalog.py"
 
 MUTATIONS = [
     ("a pull request found open is said as one this run opened", ONBOARD,
@@ -64,4 +69,16 @@ MUTATIONS = [
      "    return await _turning(lambda _abandoned: _do_onboard(inp), f\"onboarding {inp.project}\")",
      "    return await asyncio.to_thread(_do_onboard, inp)",
      TEST + "::test_the_worker_s_run_heartbeats_while_it_goes"),
+
+    ("a manifest found proposed is said as one this run read", ONBOARD,
+     "    elif pr and getattr(out, \"existed\", False):\n        steps.append(step(MANIFEST, "
+     "STEP_SKIPPED,",
+     "    elif False:\n        steps.append(step(MANIFEST, STEP_SKIPPED,",
+     TEST + "::test_a_manifest_proposed_and_not_merged_is_said_proposed_on_the_second_run"),
+
+    ("an ask that names nobody is handed an opener", CATALOGUE,
+     "    if not (getattr(by, \"id\", \"\") or \"\").strip() or by.id == \"worker\":\n"
+     "        return None\n",
+     "",
+     TEST + "::test_the_worker_proposes_a_preview_only_as_the_person_who_asked"),
 ]

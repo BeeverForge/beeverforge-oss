@@ -62,6 +62,7 @@ from beeverforge import gitpin, namespace
 from beeverforge.util import yaml_io
 
 if TYPE_CHECKING:
+    from beeverforge.onboarding.preview_propose import Outcome as PreviewOutcome
     from beeverforge.onboarding.spend import Spend
 
 log = logging.getLogger("beeverforge.onboarding.onboard")
@@ -1273,11 +1274,20 @@ def steps_of(out) -> list[dict]:
         return [step(READ, STEP_DONE, f"{repo} cloned"), step(MANIFEST, STEP_FAILED, detail),
                 *(step(s, STEP_SKIPPED, not_reached) for s in (PROOF, MAP, PULL_REQUEST))]
     questions = len(getattr(out, "questions", None) or [])
-    steps = [step(READ, STEP_DONE, f"{repo} cloned and read"),
-             step(MANIFEST, STEP_ALREADY, "the repository already declares it — proven as-is")
-             if declared else
-             step(MANIFEST, STEP_DONE, f"read from the repository — {questions} question(s) "
-                                       f"only a person can answer")]
+    steps = [step(READ, STEP_DONE, f"{repo} cloned and read")]
+    # ALREADY IS A MANIFEST ON THE DEFAULT BRANCH, the one the clone read. One an earlier run
+    # proposed and nobody has merged is not there yet: said proposed, in the pull request found
+    # open, and never as this run's change
+    if declared:
+        steps.append(step(MANIFEST, STEP_ALREADY,
+                          "the repository already declares it — proven as-is"))
+    elif pr and getattr(out, "existed", False):
+        steps.append(step(MANIFEST, STEP_SKIPPED, f"proposed in {pr}, not merged yet — once it "
+                                                  f"merges the next run proves it as declared",
+                          proposed=pr))
+    else:
+        steps.append(step(MANIFEST, STEP_DONE, f"read from the repository — {questions} "
+                                               f"question(s) only a person can answer"))
     if proof == "proven":
         steps.append(step(PROOF, STEP_DONE, "proven in the box"))
     elif proof.startswith("skipped"):
@@ -1304,20 +1314,31 @@ def steps_of(out) -> list[dict]:
     return steps
 
 
-def _preview_step(project, repo: str, outcome) -> dict:
+#: How the preview's proposal is opened for one repository, `(project, repo) -> Outcome`, or None
+#: when nobody asked for one. Handed in by the `onboard` row, in the name of the person who asked
+#: (`catalog.previews_opened_as`): opening a proposal is a person's act, so this body never names
+#: the function that opens one.
+PreviewOpener = Callable[[object, str], "PreviewOutcome"]
+
+
+def _preview_step(project, repo: str, outcome, open_preview: PreviewOpener | None) -> dict:
     """`with_preview`: the preview's own pull request, through the same function `beeverforge
     preview propose` uses (#265 slice 4). The block goes into the manifest ON THE BASE BRANCH, so
     a repository whose manifest this run only proposed gets it once that merges — said, rather
     than a second pull request that fights the first over one file."""
     from beeverforge.actions.base import STEP_ALREADY, STEP_DONE, STEP_FAILED, STEP_SKIPPED, step
-    from beeverforge.onboarding.preview_propose import propose_preview
 
     if not getattr(outcome, "manifest_already_there", False):
         said = (f"proposed once the manifest merges — then `beeverforge preview propose "
                 f"{project.name} --source {repo} --yes`")
         _tell("said", f"  · preview: {said}")
         return step(PREVIEW, STEP_SKIPPED, said)
-    proposed = propose_preview(project, repo=repo)
+    if open_preview is None:
+        said = (f"nobody asked for this onboarding in their name, so no proposal was opened — "
+                f"`beeverforge preview propose {project.name} --source {repo} --yes`")
+        _tell("said", f"  · preview: {said}")
+        return step(PREVIEW, STEP_SKIPPED, said)
+    proposed = open_preview(project, repo)
     if not proposed.ok:
         _tell("said", f"  ✗ preview: {proposed.detail}")
         return step(PREVIEW, STEP_FAILED, proposed.detail)
@@ -1369,11 +1390,13 @@ def _a_context_repository_for(project, create_context: Callable[[str], object],
 
 def onboard_the_product(project, *, repos: list[str], with_preview: bool = False,
                         sandbox: str = "container", skip_context: bool = False,
-                        create_context: Callable[[str], object]) -> dict:
+                        create_context: Callable[[str], object],
+                        open_preview: PreviewOpener | None = None) -> dict:
     """Onboard `project`: each of `repos` — clone, read, prove, map, pull request, and its
     preview's proposal with `with_preview` — then, unless `skip_context`, the context repository,
-    made through `create_context` when nobody declared one. Answers the run's document and
-    journals every step as it ends.
+    made through `create_context` when nobody declared one. Each preview is opened through
+    `open_preview`, the asker's; without one it is said, never opened. Answers the run's document
+    and journals every step as it ends.
 
     SAFE TO RUN AGAIN, BY WHAT IT CALLS: a manifest already declared is proven as-is and not
     re-proposed, a pull request already open is found and not pushed over, a context already
@@ -1397,7 +1420,7 @@ def onboard_the_product(project, *, repos: list[str], with_preview: bool = False
         _tell("said", f"{mark} {outcome.detail or outcome.pr or outcome.proof}")
         steps = steps_of(outcome)
         if with_preview:
-            steps.append(_preview_step(project, repo, outcome))
+            steps.append(_preview_step(project, repo, outcome, open_preview))
         for done in steps:
             journal.step(repo, done)
         documents.append(_repo_document(outcome, steps))

@@ -5472,8 +5472,10 @@ def _do_onboard(inp: OnboardInput) -> dict:
     (#237): `onboard.onboard_the_product`, the body the shell's own `onboard` runs, journaling every
     step where the panel's events route reads it. Returns the run's document — a project
     unregistered since the ask is said, never raised: the row already answered, and nobody is
-    waiting on a raise. The context step performs `product_init` as whoever asked."""
+    waiting on a raise. The context step performs `product_init` as whoever asked, and each
+    preview's proposal is opened in their name (`previews_opened_as`), never the worker's."""
     from beeverforge import actions
+    from beeverforge.actions.catalog import previews_opened_as
     from beeverforge.onboarding import onboard
 
     try:
@@ -5490,7 +5492,7 @@ def _do_onboard(inp: OnboardInput) -> dict:
     document = onboard.onboard_the_product(
         project, repos=onboard.repositories(project, inp.sources), with_preview=inp.with_preview,
         sandbox=inp.sandbox, skip_context=inp.skip_context,
-        create_context=onboard.through_product_init(by))
+        create_context=onboard.through_product_init(by), open_preview=previews_opened_as(by))
     activity.logger.info("BEEVERFORGE_ONBOARD %s: %s", inp.project, document["detail"])
     return document
 
