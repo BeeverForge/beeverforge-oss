@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import shlex
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -1370,7 +1371,8 @@ class Run:
 
 
 def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
-                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None) -> Run:
+                  sandbox: str = "", record: Callable[[Proof], Path | None] | None = None,
+                  abandoned: threading.Event | None = None) -> Run:
     """Prove `project`'s box — another of its repositories with `repo`, a branch's manifest with
     `ref` — and record the proof with `record` (`save` by default) unless it was a `ref`'s. Never
     raises for what a person can fix: a `ref` whose manifest cannot be read, or a proof of the key
@@ -1378,7 +1380,11 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
 
     A REF PROOF IS A MEASUREMENT, NOT AN AUTHORISATION. `save` writes where the POLLER looks; a
     branch recorded there would satisfy the gate that holds pickup on the BASE branch, unlocking
-    work against a manifest nobody merged."""
+    work against a manifest nobody merged.
+
+    `abandoned` is the worker's: set when the engine gave the activity up (its ceiling passed, or
+    it was cancelled). A thread cannot be killed, so the body stops itself — no command is started
+    after it, the key's lock is let go, and nothing is recorded for a proof nobody is waiting on."""
     import re as _re
 
     from beeverforge.runtime.boxed_job import redact
@@ -1435,7 +1441,8 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
                                f"and carries the file. Nothing was changed.")
     try:
         with box_probes(view, resolved, key=key, sandbox=box_kind,
-                        repo_path=ref_root, manifest=ref_manifest) as probes:
+                        repo_path=ref_root, manifest=ref_manifest,
+                        **({} if abandoned is None else {"abandoned": abandoned})) as probes:
             proof = prove(key, resolved, probes, on_stage=_tell)
     except ProveBusy as exc:
         # BEFORE `save`: a refused proof measured nothing, and recording it as failed would hold
@@ -1443,6 +1450,11 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
         return Run(key=key, ref=ref, refused=exc.sentence, busy=True)
     finally:
         _let_go(held)
+    if abandoned is not None and abandoned.is_set():
+        # THE FAILED WORKFLOW'S PROOF, MEASURED PARTLY OR NOT AT ALL: recording it would replace a
+        # real proof with one whose commands were refused, or a late one with an older manifest's
+        return Run(key=key, ref=ref, refused=f"the proof of {key} was abandoned — nothing was "
+                                             f"recorded")
     where = None if ref else record(proof)
     return Run(key=key, ref=ref, proof=proof, recorded_at=where)
 
@@ -1451,7 +1463,8 @@ def prove_the_box(project, *, repo: str = "", ref: str = "", image: str = "",
 
 @contextmanager
 def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=None,
-               key: str | None = None, sandbox: str | None = None):
+               key: str | None = None, sandbox: str | None = None,
+               abandoned: threading.Event | None = None):
     """The live probes, over a REAL box — the same `ContainerSandbox` a job gets.
 
     ONE CONTAINER FOR THE WHOLE PROOF, and the first real run is why this is stated. The first
@@ -1477,6 +1490,10 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
     box is built, rather than removing the first one's box. The lock is re-entrant for the THREAD
     that holds it (`util/filelock.py`), so a nested proof of one key on one thread is not refused;
     no door nests them.
+
+    `abandoned`, when set, ends the proof's commands: the box runs nothing more (each answers one
+    sentence at once, so `prove` runs out of commands), and the lock is let go as the box is cleaned
+    up. It is how a proof the engine has given up on stops holding the key.
     """
     import subprocess
 
@@ -1615,6 +1632,8 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
 
     def _in_box(command: str, on_line: Callable[[str], None] | None = None,
                 timeout: int = 1800) -> tuple[int, str]:
+        if abandoned is not None and abandoned.is_set():
+            return 1, "the proof was abandoned by the worker — no command was run"
         if workspace is None:
             # SAY WHY. This used to return a bare "the box was never started", which `prove`
             # reported as a SETUP failure with a remedy about private package feeds — while the

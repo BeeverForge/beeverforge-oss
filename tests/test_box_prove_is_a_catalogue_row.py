@@ -540,7 +540,7 @@ async def test_the_worker_s_proof_heartbeats_while_it_runs(monkeypatch):
         if len(beats) >= 3:
             heard.set()
 
-    def proving(inp):
+    def proving(inp, _abandoned=None):
         heard.wait(timeout=5)
         return f"PROVEN — {inp.project}"
 
@@ -552,6 +552,111 @@ async def test_the_worker_s_proof_heartbeats_while_it_runs(monkeypatch):
 
     assert said == "PROVEN — demo"
     assert len(beats) >= 3 and all("demo" in b for b in beats), beats
+
+
+# ── a proof the workflow gave up on stops (#576) ───────────────────────────────────────────────
+
+def test_an_abandoned_proof_is_not_recorded(demo, monkeypatch):
+    """The workflow's ceiling passed while the body still ran: the engine sets `abandoned`, and the
+    proof that finishes afterwards records nothing, so it cannot replace the standing record."""
+    import threading
+
+    from beeverforge.registry import ProjectRegistry
+
+    abandoned = threading.Event()
+    bp.save(Proof(project="demo", image="img:1", ok=True, findings=[]))
+
+    def late(key, image, _probes, *, on_stage=None):
+        abandoned.set()   # the engine gave the activity up while a gate was running
+        return Proof(project=key, image=image, ok=False, findings=[Finding("setup", False, "x", "y")])
+
+    monkeypatch.setattr(bp, "prove", late)
+    run = bp.prove_the_box(ProjectRegistry().get("demo"), abandoned=abandoned)
+
+    assert run.refused and run.proof is None and run.recorded_at is None
+    assert bp.load("demo").ok, "the abandoned proof replaced the record"
+
+
+def test_an_abandoned_worker_proof_that_raises_records_nothing(demo, monkeypatch):
+    import threading
+
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    abandoned = threading.Event()
+    abandoned.set()
+    bp.save(Proof(project="demo", image="img:1", ok=True, findings=[]))
+    monkeypatch.setattr(bp, "prove_the_box", lambda *_a, **_k: 1 / 0)
+
+    with pytest.raises(ZeroDivisionError):
+        acts._do_prove_box(BoxProveInput(project="demo"), abandoned)
+
+    assert bp.load("demo").ok
+
+
+def _busy_for_another_thread(key: str) -> bool:
+    """Whether a proof of `key` started by somebody else now would be refused (the lock is
+    re-entrant for the thread that holds it, so the asking is done from another one)."""
+    import threading
+
+    answer: list[bool] = []
+
+    def ask():
+        try:
+            bp._let_go(bp._hold_the_proof_of(key))
+            answer.append(False)
+        except bp.ProveBusy:
+            answer.append(True)
+
+    t = threading.Thread(target=ask)
+    t.start()
+    t.join()
+    return answer[0]
+
+
+def test_an_abandoned_proof_runs_no_more_commands_and_lets_go_of_the_key(tmp_path, monkeypatch):
+    """The real `box_probes` over a box that records what it was asked: after the abandonment the
+    manifest's remaining setup and gates (whose limits add up to more than the ceiling) are not run,
+    and the key's lock is free the moment the box is cleaned up."""
+    import threading
+
+    from beeverforge import factory, loader
+    from beeverforge.adapters.sandbox import registry as boxes
+
+    ran: list[str] = []
+    cleaned: list[object] = []
+
+    class _Box:
+        def prepare(self, **_kw):
+            return "ws"
+
+        def run(self, *, workspace, command, timeout, on_output=None):
+            ran.append(command)
+            return 0, ""
+
+        def cleanup(self, *, workspace):
+            cleaned.append(workspace)
+
+    manifest = SimpleNamespace(setup=["pip install -e ."], base_branch="main",
+                               validation={"test": {"command": "pytest", "timeout_minutes": 180}})
+    monkeypatch.setattr(bp, "PROOF_DIR", tmp_path / "proofs")
+    monkeypatch.setattr(boxes, "build_sandbox", lambda *_a, **_k: _Box())
+    monkeypatch.setattr(factory, "box_knobs", lambda _p: {})
+    monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path)
+    monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: manifest)
+    abandoned = threading.Event()
+
+    with bp.box_probes(SimpleNamespace(name="demo"), "img:1", key="demo", sandbox="container",
+                       abandoned=abandoned) as probes:
+        assert probes.run_in_box("pip install -e .")[0] == 0
+        assert _busy_for_another_thread("demo"), "the key was not held while the proof ran"
+        abandoned.set()   # the ceiling passed
+        rc, said = probes.run_gate("pytest", 180 * 60, lambda _line: None)
+
+    assert rc != 0 and "abandoned" in said
+    assert ran == ["pip install -e ."], "a command started after the proof was abandoned"
+    assert cleaned == ["ws"]
+    assert not _busy_for_another_thread("demo"), "the abandoned proof kept the key's lock"
 
 
 class _Worker:
