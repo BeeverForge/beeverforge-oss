@@ -13,11 +13,17 @@ it (`forge.push_remote()`, which `_publish` hands the box, and the forge's and t
 
   1. a token rewritten in the `file` store, and one an installed store (`credential_store.<kind>`
      in the entry-point group) answers differently later, is the one the next push and the next
-     `gh` call use once the first one's lifetime is up;
-  2. a token that does not change is read once per lifetime, not once per call;
+     `gh` call use within one re-read interval of the rewrite — five minutes, or half the lifetime
+     when the lifetime is under ten minutes — at whatever minute of the job the rewrite comes;
+  2. the store is read once per interval, not once per call, by one caller however many wait —
+     and a read that FAILS is tried again at most once a minute, said once in one true sentence;
   3. a push after the first token's lifetime goes out under a fresh one — driven by a fake clock;
-  4. the `env` store, the App trio and a PAT behave exactly as before; a refusal met on the re-read
-     is final and is never answered by the machine's own login; no token value reaches a log.
+  4. the lifetime (`BEEVERFORGE_STORED_TOKEN_TTL`, an hour unset, at most a day) is how long a
+     token whose re-read failed is still handed out; past it a refusal, or a store that answers
+     nothing, is said by name, never answered by the expired token or the machine's own login;
+  5. composing a runner reads each axis once; the `env` store, the App trio, a PAT, a vendor that
+     reads its own credential and a harness's replaced reader behave exactly as before; no token
+     value reaches a log.
 
 No test here waits on real time: the clock is `credentials._now`, replaced per test.
 
@@ -348,7 +354,7 @@ def test_a_failed_re_read_keeps_the_token_for_the_lifetime_and_the_lifetime_is_c
         runner.forge.push_remote()
 
 
-@pytest.mark.parametrize("ttl", ["inf", "1e400", "nan", "0", "-5", "abc"])
+@pytest.mark.parametrize("ttl", ["inf", "1e400", "1e20", "1e300", "nan", "0", "-5", "abc"])
 def test_a_lifetime_that_is_not_a_finite_number_of_seconds_above_zero_is_the_hour(
         tmp_path, secrets, clock, monkeypatch, caplog, ttl):
     monkeypatch.setenv(TTL_VAR, ttl)
@@ -489,6 +495,71 @@ def test_a_refusal_is_the_answer_of_its_own_read_and_not_of_the_reads_after_it(
     held[BOT] = SECOND
     clock.at(72)
     assert _pushed_with(runner) == SECOND
+
+
+def test_a_store_that_answers_nothing_is_not_asked_again_at_every_call(
+        tmp_path, addon_store, clock, caplog):
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    del held[BOT]
+    clock.at(30)
+    asked.clear()
+    for _ in range(50):
+        assert _pushed_with(runner) == FIRST
+    assert asked.count(BOT) <= 2, f"{asked.count(BOT)} store reads for 50 pushes"
+    assert any("answered nothing" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure", ["refuses", "raises"])
+def test_a_store_that_fails_is_asked_at_most_once_a_minute_and_said_once(
+        tmp_path, addon_store, clock, caplog, monkeypatch, failure):
+    """A store that refuses, or that cannot be reached, while the held token is still inside its
+    lifetime: the token is pushed, the store is asked once in the minute, and what is said is one
+    sentence that says what happens — not one warning, with a traceback, per call."""
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+
+    def fail(self, name):
+        asked.append(name)
+        if failure == "refuses":
+            raise CredentialRefused(f"the rotating store seals {name}")
+        raise ConnectionError("the rotating store did not answer")
+
+    monkeypatch.setattr(RotatingStore, "resolve", fail)
+    clock.at(10)
+    asked.clear()
+    caplog.clear()
+    caplog.set_level(logging.WARNING)
+    for _ in range(10):
+        assert _pushed_with(runner) == FIRST
+    warned = [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    assert len(asked) <= 2, f"{len(asked)} store reads for 10 pushes"
+    assert len(warned) <= 2, [r.getMessage() for r in warned]
+    assert any(TTL_VAR in r.getMessage() for r in warned), "nothing said what happens instead"
+
+
+def test_a_lifetime_under_ten_minutes_is_read_again_every_half_of_it(
+        tmp_path, addon_store, clock, monkeypatch):
+    monkeypatch.setenv(TTL_VAR, "240")
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    held[BOT] = SECOND
+    clock.now = T0 + 119
+    assert _pushed_with(runner) == FIRST
+    clock.now = T0 + 121
+    assert _pushed_with(runner) == SECOND
+
+
+def test_a_harness_that_replaces_the_pair_reader_is_what_the_runner_is_composed_with(
+        tmp_path, monkeypatch, clock):
+    monkeypatch.setenv(BOT, FIRST)
+    monkeypatch.setattr(credentials, "forge_token", lambda: SECOND)
+    runner = _runner(tmp_path)
+    assert runner.forge._static_token == SECOND and runner.forge._token_provider is None
 
 
 def test_no_token_value_reaches_a_log(tmp_path, secrets, clock, caplog, gh_calls):
