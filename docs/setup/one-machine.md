@@ -1,6 +1,6 @@
 # One machine, and nothing else
 
-The shortest way to see this platform work: your own repository, your terminal, and the coding
+The shortest way to see BeeverForge Community work: your own repository, your terminal, and the coding
 agent you already pay for. No account at GitHub or Jira, no personal access token, no Docker, no
 server. The factory writes a branch, opens a pull request **in your repository**, reviews it, and
 fast-forwards your base when you say so — all on the machine you are sitting at.

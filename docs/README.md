@@ -1,6 +1,7 @@
 # The documentation, and which page is for you
 
-**One path, a set of references, and the design rationale behind them.** There used to be three
+**One path, a set of references, and the design rationale behind them**, for BeeverForge
+Community, the open-source edition of BeeverForge. There used to be three
 places that looked like a beginning — this README, a quickstart and an "onboarding a project"
 page — and a reader had to guess which one was current. There is now exactly one.
 

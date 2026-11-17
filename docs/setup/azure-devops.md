@@ -2,7 +2,7 @@
 
 The all-Microsoft scenario, end to end: work items on **Azure Boards**, code and pull requests
 on **Azure Repos**, builds observed on **Azure Pipelines** — no GitHub anywhere, and the `gh`
-CLI is not needed. Each of those is an **adapter**: the platform ships at least two for every
+CLI is not needed. Each of those is an **adapter**: BeeverForge Community ships at least two for every
 axis, so this page is one connector's setup rather than a requirement, and
 [github.md](github.md) is the same walkthrough for the other side. Everything below was exercised against a live Azure DevOps organisation
 (fx-ado, 2026-08-06); where a screen name could still drift with Microsoft's UI, the step says

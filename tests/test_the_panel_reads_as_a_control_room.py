@@ -79,6 +79,19 @@ def _contrast(a: str, b: str) -> float | None:
     return (lb + 0.05) / (la + 0.05)
 
 
+def _over(wash: str, ground: str) -> str | None:
+    """The flat colour a `rgba(r,g,b,a)` wash makes over a flat `ground`, as the browser composites
+    it: each channel is a*wash + (1-a)*ground. None when either is not of that form."""
+    m = re.fullmatch(r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)", wash.strip())
+    under = _rgb(ground)
+    if not m or under is None:
+        return None
+    alpha = float(m.group(4))
+    top = [int(m.group(i)) / 255 for i in (1, 2, 3)]
+    mixed = [alpha * t + (1 - alpha) * u for t, u in zip(top, under, strict=True)]
+    return "#" + "".join(f"{round(c * 255):02x}" for c in mixed)
+
+
 # ── question 1: does anything need me? ──────────────────────────────────────────────────────────
 
 def test_what_needs_a_human_is_ON_THE_PAGE_not_behind_a_click():
@@ -222,24 +235,134 @@ def test_the_type_scale_is_TOKENS_not_literals():
     )
 
 
+# WCAG AA for body text, applied to every colour the panel writes words in, on every ground those
+# words sit on. One floor: a token that is only "secondary" is still read by somebody.
+FLOOR = 4.5
+TEXT = ("txt", "muted", "dim", "amber", "cyan", "ok", "err", "purple")
+GROUNDS = ("bg", "panel", "card", "card2")
+# The ink on the gold buttons and avatars, against both ends of their --amber -> --amber-dim gradient.
+INK_ON_FILL = (("on-amber", "amber"), ("on-amber", "amber-dim"))
+# A state's wash is a tinted surface with that state's own colour written on it (a held project's
+# status, a failing build, the plain button's hover, a scope chip), laid over whichever ground it is on.
+WASHED = (("amber", "amber-wash"), ("err", "err-wash"), ("ok", "ok-wash"))
+
+
+def _shortfalls(tokens: dict[str, str], theme: str) -> list[tuple[str, str, str, float | None]]:
+    """Every (token, ground, theme, ratio) under FLOOR. A token or ground that is missing or not a
+    flat hex colour is a shortfall with ratio None: it cannot be measured, so it is not passed.
+    A washed pair's ground is named `<wash> over --<ground>` and measured as the blend."""
+    measured = [
+        (name, ground, _contrast(tokens.get(name, ""), tokens.get(ground, "")))
+        for name, ground in [(n, g) for n in TEXT for g in GROUNDS] + list(INK_ON_FILL)
+    ]
+    for name, wash in WASHED:
+        for ground in GROUNDS:
+            blend = _over(tokens.get(wash, ""), tokens.get(ground, ""))
+            ratio = None if blend is None else _contrast(tokens.get(name, ""), blend)
+            measured.append((name, f"{wash} over --{ground}", ratio))
+    found = []
+    for name, ground, ratio in measured:
+        if ratio is None or ratio < FLOOR:
+            found.append((name, ground, theme, ratio))
+    return found
+
+
+def _describe(shortfall: tuple[str, str, str, float | None]) -> str:
+    """One line naming the token, the ground, the theme and the ratio, and what to do about it."""
+    name, ground, theme, ratio = shortfall
+    if ratio is None:
+        return (
+            f"--{name} on --{ground} in the {theme} theme cannot be measured: one of them is "
+            f"missing or not a flat hex colour. Give both a flat #rrggbb value"
+        )
+    return (
+        f"--{name} on --{ground} in the {theme} theme is {ratio:.2f}:1, below {FLOOR}:1. Move "
+        f"--{name}'s lightness further from that ground until the pair reaches {FLOOR}:1"
+    )
+
+
 @pytest.mark.parametrize("theme", ["dark", "light"])
 def test_the_text_is_LEGIBLE_on_both_grounds(theme):
     """THE CHECK NOBODY DOES BY EYE, and the one a light theme fails silently.
 
-    WCAG AA is 4.5:1 for body text and 3:1 for large or secondary text. `--muted` is the one that
-    goes wrong: it is chosen against near-black, and the same value on white is a grey nobody can
-    read — the page still 'works', and every other test in this repository passes.
+    WCAG AA is 4.5:1 for body text. Every text colour is measured against every ground it can sit
+    on, the ink on the gold fill against both ends of its gradient, and each state colour against
+    its own wash laid over each ground: a colour chosen against near-black can be a grey nobody
+    reads on the lightest card, and every other test in this repository still passes.
     """
-    t = _tokens(theme)
-    bg = t.get("bg", "")
-    for name, floor in (("txt", 4.5), ("muted", 3.0), ("dim", 2.0)):
-        ratio = _contrast(t.get(name, ""), bg)
-        if ratio is None:
-            pytest.skip(f"--{name} or --bg is not a flat colour on {theme}")
-        assert ratio >= floor, (
-            f"--{name} on --bg is {ratio:.2f}:1 in the {theme} theme, below {floor}:1 — "
-            f"unreadable, and nothing else in this suite would notice"
+    found = _shortfalls(_tokens(theme), theme)
+    assert not found, "\n".join(_describe(s) for s in found)
+
+
+def test_a_text_token_below_the_floor_is_NAMED():
+    """A planted red at 4.24:1 on --card2: the checker must name exactly that token, ground, theme
+    and ratio, so a lowered floor, a dropped ground or a dropped token cannot pass unseen."""
+    tokens = {**_tokens("dark"), "on-amber": "#000000"}
+    tokens.update(dict.fromkeys(("txt", "muted", "dim", "amber", "cyan", "ok", "purple"), "#FFFFFF"))
+    tokens["err"] = "#ff5c6c"
+    # the washed pairs are held by their own test below; this one is about the flat grounds
+    found = [s for s in _shortfalls(tokens, "dark") if s[1] in GROUNDS]
+    assert [(n, g, t) for n, g, t, _ in found] == [("err", "card2", "dark")], (
+        f"the checker returned {found} for a palette whose only shortfall is --err on --card2; "
+        f"it must list every pair under {FLOOR}:1 and nothing else"
+    )
+    ratio = found[0][3]
+    assert ratio is not None and 4.0 < ratio < FLOOR, f"--err on --card2 measured {ratio}"
+    line = _describe(found[0])
+    for part in ("--err", "--card2", "dark", f"{ratio:.2f}"):
+        assert part in line, (
+            f"the shortfall message {line!r} does not name {part!r}; it must name the token, "
+            f"the ground, the theme and the ratio"
         )
+
+
+def test_ink_on_the_gold_fill_below_the_floor_is_NAMED():
+    """The label on a gold button is text too: ink that fails against --amber must be named."""
+    tokens = {**_tokens("light"), "on-amber": "#C0A080"}
+    found = [s for s in _shortfalls(tokens, "light") if s[:2] == ("on-amber", "amber")]
+    assert len(found) == 1 and found[0][3] is not None and found[0][3] < FLOOR, (
+        f"--on-amber #C0A080 on --amber {tokens['amber']} was not reported (got {found}); the "
+        f"checker must measure the ink on the gold fill against {FLOOR}:1"
+    )
+
+
+def test_ink_at_the_dim_end_of_the_gold_gradient_is_NAMED():
+    """The gold buttons and avatars fade from --amber to --amber-dim, so their label is read against
+    both ends. The dim end this panel shipped before (#A47626, 4.06:1 under the dark ink) must be
+    named; measuring --amber alone passed it."""
+    tokens = {**_tokens("dark"), "amber-dim": "#A47626"}
+    found = [s for s in _shortfalls(tokens, "dark") if s[:2] == ("on-amber", "amber-dim")]
+    assert len(found) == 1 and found[0][3] is not None and 4.0 < found[0][3] < FLOOR, (
+        f"--on-amber on --amber-dim #A47626 gave {found}; the checker must measure the ink against "
+        f"the gradient's dim end at {FLOOR}:1"
+    )
+
+
+def test_text_on_its_own_WASH_is_NAMED():
+    """A state colour written on its own wash reads against the blend of the wash and the ground
+    under it, not against the ground. The red this panel shipped before (#ff6b79) passes on bare
+    --card2 (4.62:1) and fails on --err-wash over it: the checker must name exactly that pair."""
+    tokens = {**_tokens("dark"), "err": "#ff6b79"}
+    found = [s for s in _shortfalls(tokens, "dark") if s[0] == "err"]
+    assert [g for _, g, _, _ in found] == ["err-wash over --card2"], (
+        f"--err #ff6b79 gave {found}; it fails only on --err-wash laid over --card2, and the "
+        f"checker must blend each wash over each ground and name that one pair"
+    )
+    ratio = found[0][3]
+    assert ratio is not None and 4.0 < ratio < FLOOR, f"--err on its wash over --card2 measured {ratio}"
+    assert "err-wash over --card2" in _describe(found[0])
+
+
+def test_a_token_that_is_not_a_flat_colour_is_REPORTED():
+    """A token the checker cannot measure is a shortfall, not a skip: a var() would otherwise
+    take a text colour out of the check without anybody noticing."""
+    tokens = {**_tokens("dark"), "purple": "var(--x)"}
+    found = [s for s in _shortfalls(tokens, "dark") if s[0] == "purple"]
+    assert [(g, r) for _, g, _, r in found] == [(g, None) for g in GROUNDS], (
+        f"--purple set to var(--x) gave {found}; every ground must report it as unmeasurable "
+        f"(ratio None) so the value is fixed rather than skipped"
+    )
+    assert "cannot be measured" in _describe(found[0])
 
 
 @pytest.mark.parametrize("theme", ["dark", "light"])
