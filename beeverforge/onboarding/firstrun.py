@@ -1575,8 +1575,9 @@ def probes_for(project, *, image: str | None = None, turn_cap: int = DEFAULT_TUR
 
         SO IT IS NOT `factory.box_knobs` (#191), which the job's box and the proof's are built
         from: that adds `box.env`, which this box holds back for the reason above, and the image's
-        pull credential, which this list does not pass either. Whether the rehearsal also gets
-        what the job's box gets is #191's slice 2, still open."""
+        pull credential, which this list does not pass either. ADR-0037's addendum of 2026-11-16
+        records what the rehearsal gets: the job's minted credential (none, for a local box), and
+        neither `box.env` nor the pull credential (#581)."""
         knobs = {
             key: value
             for key in ("network", "cache_volume", "cpus", "memory")
