@@ -655,8 +655,90 @@ def test_an_abandoned_proof_runs_no_more_commands_and_lets_go_of_the_key(tmp_pat
 
     assert rc != 0 and "abandoned" in said
     assert ran == ["pip install -e ."], "a command started after the proof was abandoned"
-    assert cleaned == ["ws"]
+    assert cleaned and set(cleaned) == {"ws"}   # the watcher may have removed it first
     assert not _busy_for_another_thread("demo"), "the abandoned proof kept the key's lock"
+
+
+def test_an_abandoned_proof_ends_the_run_in_flight_and_frees_the_key(tmp_path, monkeypatch):
+    """A gate is usually MID-RUN when the ceiling passes. The run blocks until its box is taken away
+    (no clock: it waits on an event the cleanup sets), so the key is free only if the abandonment
+    itself ended it — not after the gate's own `timeout_minutes`."""
+    import threading
+
+    from beeverforge import factory, loader
+    from beeverforge.adapters.sandbox import registry as boxes
+
+    started, removed = threading.Event(), threading.Event()
+
+    class _Box:
+        def prepare(self, **_kw):
+            return "ws"
+
+        def run(self, *, workspace, command, timeout, on_output=None):
+            started.set()
+            removed.wait(timeout=30)   # a failsafe only: the cleanup is what ends it
+            return (1, "killed") if removed.is_set() else (0, "ran to its own timeout")
+
+        def cleanup(self, *, workspace):
+            removed.set()
+
+    manifest = SimpleNamespace(setup=[], base_branch="main",
+                               validation={"test": {"command": "pytest", "timeout_minutes": 180}})
+    monkeypatch.setattr(bp, "PROOF_DIR", tmp_path / "proofs")
+    monkeypatch.setattr(boxes, "build_sandbox", lambda *_a, **_k: _Box())
+    monkeypatch.setattr(factory, "box_knobs", lambda _p: {})
+    monkeypatch.setattr(factory, "resolve_repo_path", lambda *_a, **_k: tmp_path)
+    monkeypatch.setattr(loader, "load_manifest", lambda *_a, **_k: manifest)
+    abandoned = threading.Event()
+    got: list[tuple[int, str]] = []
+
+    def prove_it():
+        with bp.box_probes(SimpleNamespace(name="demo"), "img:1", key="demo", sandbox="container",
+                           abandoned=abandoned) as probes:
+            got.append(probes.run_gate("pytest", 180 * 60, lambda _line: None))
+
+    proving = threading.Thread(target=prove_it)
+    proving.start()
+    assert started.wait(timeout=30)
+    assert _busy_for_another_thread("demo")
+    abandoned.set()   # the ceiling passed while the gate runs
+    proving.join(timeout=30)
+
+    assert not proving.is_alive(), "the run in flight outlived the abandonment"
+    assert got and got[0][0] != 0
+    assert not _busy_for_another_thread("demo"), "the abandoned proof kept the key's lock"
+
+
+async def test_prove_box_hands_the_turn_s_event_to_the_body_and_sets_it_on_cancel(monkeypatch):
+    """The wiring: `prove_box` gives `_do_prove_box` the event `_turning` sets when the activity is
+    cancelled. Cut to `_do_prove_box(inp)` and every body test above stays green."""
+    import asyncio
+    import threading
+
+    from beeverforge.runtime.temporal import activities as acts
+    from beeverforge.runtime.temporal.io import BoxProveInput
+
+    seen: list[threading.Event] = []
+    inside = threading.Event()
+
+    def proving(_inp, abandoned=None):
+        seen.append(abandoned)
+        inside.set()
+        abandoned.wait(timeout=30)   # returns when the event is set; the bound is a failsafe
+        return "stopped"
+
+    monkeypatch.setattr(acts.activity, "heartbeat", lambda *_a: None)
+    monkeypatch.setattr(acts, "_TURN_PULSE", 0)
+    monkeypatch.setattr(acts, "_do_prove_box", proving)
+
+    task = asyncio.ensure_future(acts.prove_box(BoxProveInput(project="demo")))
+    while not inside.is_set():
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(seen) == 1 and isinstance(seen[0], threading.Event) and seen[0].is_set()
 
 
 class _Worker:

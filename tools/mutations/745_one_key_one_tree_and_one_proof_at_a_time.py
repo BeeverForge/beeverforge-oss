@@ -69,6 +69,7 @@ _SYNC_COMMENT = (
 
 _CLEANUP = (
     "    finally:\n"
+    "        finished.set()\n"
     "        try:\n"
     "            if workspace is not None:\n"
     "                box.cleanup(workspace=workspace)\n"
@@ -176,6 +177,7 @@ MUTATIONS = [
      PROVE,
      _CLEANUP,
      "    finally:\n"
+     "        finished.set()\n"
      "        _let_go(held)\n"
      "        try:\n"
      "            if workspace is not None:\n"

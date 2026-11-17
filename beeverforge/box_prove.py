@@ -1264,6 +1264,9 @@ PROVEN, NOT_PROVEN, RUNNING = "proven", "not_proven", "running"
 #: bounded by its own limit (`gate_timeout`). The flight is the workflow's, strictly longer.
 PROOF_CEILING = timedelta(hours=2)
 PROOF_HEARTBEAT = timedelta(minutes=2)
+
+#: How often the watcher over an abandoned proof looks whether the proof has ended on its own.
+_WATCH_SLICE = 1.0
 PROOF_FLIGHT = PROOF_CEILING + timedelta(minutes=15)
 
 #: Who hears a proof while it runs: `(kind, text)`, kind one of `said` (a line of the answer's own,
@@ -1787,6 +1790,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
                                          harness=harness_kind(project, "executor"))
         return per_role, note, fit
 
+    finished = threading.Event()
     try:
         try:
             # A BRANCH OF THIS KEY'S OWN: `prepare` names the worktree box's directory after the
@@ -1801,6 +1805,24 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         except Exception as exc:  # noqa: BLE001 — an unstartable box IS the finding, not a crash
             start_error = str(exc)[:300]
             log.info("the box could not be started for the proof (%s)", start_error)
+
+        # A COMMAND ALREADY RUNNING WHEN THE ENGINE GAVE UP is ended by taking its box away: the
+        # gate in flight returns and the lock goes with the cleanup below, instead of being kept
+        # until that gate's own `timeout_minutes`. Polled in slices so the watcher ends with the
+        # proof.
+        def _end_the_run_in_flight(gave_up: threading.Event) -> None:
+            while not finished.is_set():
+                if gave_up.wait(_WATCH_SLICE):
+                    try:
+                        box.cleanup(workspace=workspace)
+                    except Exception as exc:  # noqa: BLE001 — the cleanup below reports it again
+                        log.warning("the abandoned proof's box could not be removed (%s)",
+                                    str(exc)[:160])
+                    return
+
+        if abandoned is not None and workspace is not None:
+            threading.Thread(target=_end_the_run_in_flight, args=(abandoned,), daemon=True,
+                             name=f"prove-watch-{subject}").start()
 
         yield Probes(
             honours_image=traits.honours_image,
@@ -1840,6 +1862,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             inlined_documents=_inlined_documents,
         )
     finally:
+        finished.set()
         try:
             if workspace is not None:
                 box.cleanup(workspace=workspace)
