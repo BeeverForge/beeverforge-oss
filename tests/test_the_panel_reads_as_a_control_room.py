@@ -222,24 +222,93 @@ def test_the_type_scale_is_TOKENS_not_literals():
     )
 
 
+# WCAG AA for body text, applied to every colour the panel writes words in, on every ground those
+# words sit on. One floor: a token that is only "secondary" is still read by somebody.
+FLOOR = 4.5
+TEXT = ("txt", "muted", "dim", "amber", "cyan", "ok", "err", "purple")
+GROUNDS = ("bg", "panel", "card", "card2")
+INK_ON_FILL = (("on-amber", "amber"),)
+
+
+def _shortfalls(tokens: dict[str, str], theme: str) -> list[tuple[str, str, str, float | None]]:
+    """Every (token, ground, theme, ratio) under FLOOR. A token or ground that is missing or not a
+    flat hex colour is a shortfall with ratio None: it cannot be measured, so it is not passed."""
+    pairs = [(name, ground) for name in TEXT for ground in GROUNDS] + list(INK_ON_FILL)
+    found = []
+    for name, ground in pairs:
+        ratio = _contrast(tokens.get(name, ""), tokens.get(ground, ""))
+        if ratio is None or ratio < FLOOR:
+            found.append((name, ground, theme, ratio))
+    return found
+
+
+def _describe(shortfall: tuple[str, str, str, float | None]) -> str:
+    """One line naming the token, the ground, the theme and the ratio, and what to do about it."""
+    name, ground, theme, ratio = shortfall
+    if ratio is None:
+        return (
+            f"--{name} on --{ground} in the {theme} theme cannot be measured: one of them is "
+            f"missing or not a flat hex colour. Give both a flat #rrggbb value"
+        )
+    return (
+        f"--{name} on --{ground} in the {theme} theme is {ratio:.2f}:1, below {FLOOR}:1. Move "
+        f"--{name}'s lightness further from that ground until the pair reaches {FLOOR}:1"
+    )
+
+
 @pytest.mark.parametrize("theme", ["dark", "light"])
 def test_the_text_is_LEGIBLE_on_both_grounds(theme):
     """THE CHECK NOBODY DOES BY EYE, and the one a light theme fails silently.
 
-    WCAG AA is 4.5:1 for body text and 3:1 for large or secondary text. `--muted` is the one that
-    goes wrong: it is chosen against near-black, and the same value on white is a grey nobody can
-    read — the page still 'works', and every other test in this repository passes.
+    WCAG AA is 4.5:1 for body text. Every text colour is measured against every ground it can sit
+    on, and the ink on the gold fill against the fill: a colour chosen against near-black can be a
+    grey nobody reads on the lightest card, and every other test in this repository still passes.
     """
-    t = _tokens(theme)
-    bg = t.get("bg", "")
-    for name, floor in (("txt", 4.5), ("muted", 3.0), ("dim", 2.0)):
-        ratio = _contrast(t.get(name, ""), bg)
-        if ratio is None:
-            pytest.skip(f"--{name} or --bg is not a flat colour on {theme}")
-        assert ratio >= floor, (
-            f"--{name} on --bg is {ratio:.2f}:1 in the {theme} theme, below {floor}:1 — "
-            f"unreadable, and nothing else in this suite would notice"
+    found = _shortfalls(_tokens(theme), theme)
+    assert not found, "\n".join(_describe(s) for s in found)
+
+
+def test_a_text_token_below_the_floor_is_NAMED():
+    """A planted red at 4.24:1 on --card2: the checker must name exactly that token, ground, theme
+    and ratio, so a lowered floor, a dropped ground or a dropped token cannot pass unseen."""
+    tokens = {**_tokens("dark"), "on-amber": "#000000"}
+    tokens.update(dict.fromkeys(("txt", "muted", "dim", "amber", "cyan", "ok", "purple"), "#FFFFFF"))
+    tokens["err"] = "#ff5c6c"
+    found = _shortfalls(tokens, "dark")
+    assert [(n, g, t) for n, g, t, _ in found] == [("err", "card2", "dark")], (
+        f"the checker returned {found} for a palette whose only shortfall is --err on --card2; "
+        f"it must list every pair under {FLOOR}:1 and nothing else"
+    )
+    ratio = found[0][3]
+    assert ratio is not None and 4.0 < ratio < FLOOR, f"--err on --card2 measured {ratio}"
+    line = _describe(found[0])
+    for part in ("--err", "--card2", "dark", f"{ratio:.2f}"):
+        assert part in line, (
+            f"the shortfall message {line!r} does not name {part!r}; it must name the token, "
+            f"the ground, the theme and the ratio"
         )
+
+
+def test_ink_on_the_gold_fill_below_the_floor_is_NAMED():
+    """The label on a gold button is text too: ink that fails against --amber must be named."""
+    tokens = {**_tokens("light"), "on-amber": "#C0A080"}
+    found = [s for s in _shortfalls(tokens, "light") if s[:2] == ("on-amber", "amber")]
+    assert len(found) == 1 and found[0][3] is not None and found[0][3] < FLOOR, (
+        f"--on-amber #C0A080 on --amber {tokens['amber']} was not reported (got {found}); the "
+        f"checker must measure the ink on the gold fill against {FLOOR}:1"
+    )
+
+
+def test_a_token_that_is_not_a_flat_colour_is_REPORTED():
+    """A token the checker cannot measure is a shortfall, not a skip: a var() would otherwise
+    take a text colour out of the check without anybody noticing."""
+    tokens = {**_tokens("dark"), "purple": "var(--x)"}
+    found = [s for s in _shortfalls(tokens, "dark") if s[0] == "purple"]
+    assert [(g, r) for _, g, _, r in found] == [(g, None) for g in GROUNDS], (
+        f"--purple set to var(--x) gave {found}; every ground must report it as unmeasurable "
+        f"(ratio None) so the value is fixed rather than skipped"
+    )
+    assert "cannot be measured" in _describe(found[0])
 
 
 @pytest.mark.parametrize("theme", ["dark", "light"])

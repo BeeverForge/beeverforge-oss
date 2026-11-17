@@ -1,6 +1,6 @@
 # Previews: what the deployment needs to show a change running
 
-A project that declares `preview:` can have a card's change started as the **whole product** —
+A project BeeverForge Community runs that declares `preview:` can have a card's change started as the **whole product** —
 every service running, the ones the change touched built from it, the rest as they are on the base
 branch — before its pull request merges. How a repository comes to declare one is
 [ONBOARDING §11c](../ONBOARDING.md#11c--a-look-before-the-merge-previews). This page is the other

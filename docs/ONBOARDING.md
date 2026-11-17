@@ -1,4 +1,4 @@
-# Bringing up an BeeverForge
+# Bringing up BeeverForge Community
 
 You have cloned the repository (or installed the package) and you have a codebase you want the
 factory to work on. This document is that first session, in order — and a map of what becomes

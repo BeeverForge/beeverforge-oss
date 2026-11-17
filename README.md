@@ -5,9 +5,10 @@
   </picture>
 </p>
 
-# BeeverForge
+# BeeverForge Community
 
-**An autonomous software factory.** It takes tickets from your board and returns reviewed pull
+**An autonomous software factory.** BeeverForge Community, the open-source edition of
+BeeverForge, takes tickets from your board and returns reviewed pull
 requests — planned, implemented, validated by *your* test suite, independently reviewed, and
 merged under the policy you chose. Humans stop authorising every step and start evaluating
 results; production stays behind a human gate, always.

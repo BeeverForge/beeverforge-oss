@@ -1,6 +1,6 @@
 # GitHub setup: the App, the board token, the board
 
-This is everything the GitHub side of a deployment needs. `beeverforge init` and
+This is everything the GitHub side of a BeeverForge Community deployment needs. `beeverforge init` and
 [docs/ONBOARDING.md](../ONBOARDING.md) send you here at the two moments that need it; nothing
 on this page is a step you do on your own initiative.
 
