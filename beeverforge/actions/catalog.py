@@ -7852,6 +7852,94 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
                 recorded_at=None, handle=handle, joined=joined)
 
 
+async def _onboard(*, project: str, by: Actor, sources: object = None, with_preview: bool = False,
+                   sandbox: str = "", skip_context: bool = False) -> Outcome:
+    """Onboard a project's repositories — `beeverforge onboard` as a row (#237).
+
+    Per repository, the registry's own and every one of `sources`: clone and read it, propose its
+    manifest (or prove the one it declares), prove it in the box, measure its module map, open its
+    pull request — and with `with_preview`, its preview's. Then the context repository, created
+    through `product_init` when nobody declared one, and backfilled. `onboard.onboard_the_product`
+    is that body; this decides where it runs.
+
+    TWO ANSWERS, BY WHERE IT RUNS, as `box_prove`'s. The shell's own `onboard` runs it in its
+    process (`onboard.in_this_shell`, which no transport can send) and answers the document: each
+    repository's steps — `{step, state, said}` for read, manifest, proof, map, pull_request and
+    preview — the context's outcome, and `changed`. Every other caller starts `OnboardWorkflow` on
+    the worker and is answered at once with the run's handle: a proof per repository and a backfill
+    are far longer than a request may be held open. Either way every step is journaled, where
+    `/api/jobs/<project>/onboard/events` reads it.
+
+    ONE FLIGHT PER PROJECT (`onboard.workflow_id`): a second ask while one runs is refused by the
+    engine as already started, and this answers the same handle, `joined`. Asked again once it has
+    ended, it is safe: what is there is found, said `already`, and `changed` is false.
+
+    `ok` IS ABOUT THE ROW HAVING RUN, as `doctor`'s is: a repository that failed is a done outcome
+    whose document says `"ok": false` and which step failed. A refusal is an onboarding that did
+    not start — an unknown project, a source no forge can name, a project naming no repository."""
+    import asyncio
+
+    from beeverforge.onboarding import onboard
+    from beeverforge.product.config import normalize_repo
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    given = _listed(sources)
+    # A SOURCE IS ONE OF THE PROJECT'S when this project's forge can name it, `product_init`'s own
+    # rule (`_product_sources`): the context step hands the same list to that row, and a value
+    # that is no repository reference — a path, free text — would be cloned as one
+    unreadable = [s for s in given if not normalize_repo(s)]
+    if unreadable:
+        return refused(INVALID, f"{', '.join(repr(s) for s in unreadable)}: not one of "
+                                f"{found.name}'s repositories — name a repository as this "
+                                f"project's forge names one. Nothing was done.",
+                       project=found.name, unreadable=unreadable)
+    repos = onboard.repositories(found, given)
+    if not repos:
+        return refused(INVALID, f"{found.name} names no repository in its registry entry and no "
+                                f"source was given — there is nothing to onboard. Nothing was "
+                                f"done.", project=found.name)
+    box_kind = (sandbox or "").strip().lower() or "container"
+    if onboard.here() is not None:
+        document = await asyncio.to_thread(
+            onboard.onboard_the_product, found, repos=repos, with_preview=with_preview is True,
+            sandbox=box_kind, skip_context=skip_context is True,
+            create_context=onboard.through_product_init(by))
+        return done(document["detail"], state=onboard.ONBOARDED, handle=None, joined=False,
+                    repositories=repos, **document)
+    client, bad_engine = await _connected()
+    if bad_engine:
+        return bad_engine
+    from beeverforge.runtime.temporal import TASK_QUEUE
+    from beeverforge.runtime.temporal.io import OnboardInput
+
+    handle = onboard.workflow_id(found.name)
+    try:
+        await client.start_workflow(
+            "OnboardWorkflow",
+            OnboardInput(project=found.name, sources=repos, with_preview=with_preview is True,
+                         sandbox=box_kind, skip_context=skip_context is True,
+                         asked_by=by.id, display=by.display, via=by.via,
+                         scopes=None if by.scopes is None else sorted(by.scopes)),
+            id=handle, task_queue=TASK_QUEUE, execution_timeout=onboard.ONBOARD_FLIGHT)
+        joined = False
+    except Exception as exc:  # a start the engine refused is said, never raised
+        joined = "AlreadyStarted" in type(exc).__name__
+        if not joined:
+            reference = failure_reference()
+            log.exception("the onboarding of %s could not be started reference=%s (%s)",
+                          found.name, reference, exc)
+            return refused(FAILED, "the onboarding could not be started just now.",
+                           project=found.name, reference=reference)
+    said = (f"an onboarding of {found.name} is already running on the worker — this ask joined it"
+            if joined else f"the onboarding of {found.name} is running on the worker")
+    return done(f"{said}; each repository's steps are journaled as they end "
+                f"(`/api/jobs/{found.name}/{onboard.ONBOARDING}/events`).",
+                project=found.name, state=onboard.RUNNING, handle=handle, joined=joined,
+                repositories=repos, repos=None, context=None)
+
+
 # ── a project's own settings, and its removal (#741) ────────────────────────────────────────────
 #
 # THE REGISTRY IS READ PER RUN, so each of these takes effect on the next job with no restart —
@@ -9901,6 +9989,24 @@ CATALOG: dict[str, ActionSpec] = {
                            "by the shell's own `box prove` only; refused anywhere else",
                     "image": "an image for this proof only",
                     "sandbox": "which box to prove — default: the one this deployment runs"},
+        ),
+        ActionSpec(
+            name="onboard",
+            summary="onboard a project's repositories — read, manifest, proof, map and pull "
+                    "request per repository, then its context repository; answers each "
+                    "repository's steps, or the handle of the onboarding running on the worker",
+            run=_onboard,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE, FAILED),
+            required=("project",),
+            optional=("sources", "with_preview", "sandbox", "skip_context"),
+            params={"sources": "the product's other repositories, comma-separated, each named as "
+                               "this project's forge names one — the registry's own is always "
+                               "included",
+                    "with_preview": "also propose how each repository is previewed — its own "
+                                    "pull request, after the manifest's",
+                    "sandbox": "which box proves each repository — default: container",
+                    "skip_context": "only the source repositories — leave the context "
+                                    "repository and its backfill for later"},
         ),
     )
 }

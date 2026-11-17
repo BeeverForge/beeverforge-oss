@@ -46,6 +46,9 @@ with workflow.unsafe.imports_passed_through():
     from beeverforge.lifecycle.handed_back import recorded_park
     from beeverforge.namespace import job_branch
 
+    # #237 — an asked onboarding's bounds, beside the run they bound: plain `timedelta`s
+    from beeverforge.onboarding.onboard import ONBOARD_CEILING, ONBOARD_HEARTBEAT
+
     # #1004 — an asked refresh's bounds, beside the pass they bound: plain `timedelta`s
     from beeverforge.product.refresh import PASS_CEILING as KNOWLEDGE_PASS_CEILING
     from beeverforge.product.refresh import PASS_HEARTBEAT as KNOWLEDGE_PASS_HEARTBEAT
@@ -74,6 +77,7 @@ with workflow.unsafe.imports_passed_through():
         notify_coordinator,
         notify_coordinator_say,
         notify_deploy,
+        onboard_product,
         open_review_loop,
         pr_mergeable_state,
         preflight_check,
@@ -137,6 +141,7 @@ with workflow.unsafe.imports_passed_through():
         KnowledgeRefreshInput,
         MergeCheckInput,
         MergedInput,
+        OnboardInput,
         PreflightInput,
         PreviewParams,
         PreviewPlanInput,
@@ -914,6 +919,30 @@ class BoxProveWorkflow:
             prove_box, inp,
             start_to_close_timeout=BOX_PROOF_CEILING,
             heartbeat_timeout=BOX_PROOF_HEARTBEAT,
+            retry_policy=_ONCE,
+        )
+
+
+@workflow.defn
+class OnboardWorkflow:
+    """One project's onboarding on the worker, because somebody asked through the `onboard` row
+    (#237).
+
+    STARTED, NEVER AWAITED. The row answers at once with this workflow's id as the run's handle —
+    a proof per repository and a backfill are far longer than a request may be held open. Each
+    step is journaled as it ends; the run's document is this workflow's result.
+
+    ONE FLIGHT PER PROJECT, BY ITS ID (`onboard.workflow_id`): a second ask while one runs is
+    refused by the engine as already started, and the row answers the same handle. One activity,
+    single attempt, bounded and heartbeating: an onboarding that fails is asked again by a person,
+    and the second run finds what the first left."""
+
+    @workflow.run
+    async def run(self, inp: OnboardInput) -> dict:
+        return await workflow.execute_activity(
+            onboard_product, inp,
+            start_to_close_timeout=ONBOARD_CEILING,
+            heartbeat_timeout=ONBOARD_HEARTBEAT,
             retry_policy=_ONCE,
         )
 

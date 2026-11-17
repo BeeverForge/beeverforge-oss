@@ -451,6 +451,20 @@ Add `--with-preview` and each repository that already declares its manifest also
 request of its own proposing how a preview of it runs; one whose manifest this run only proposed
 is told the command to run once that merges — §11c.
 
+**The command is the `onboard` row**, so a screen of your own asks for the same onboarding with
+`POST /api/act/onboard` and `{"params": {"project": "myapp", "sources": ["<owner>/web"]}}`
+(`with_preview`, `sandbox` and `skip_context` are the command's flags). `beeverforge onboard`
+runs it in place and answers each repository's steps: read, manifest, proof, map and
+pull_request, plus preview with `with_preview`. Each step is `done`, `already`, `skipped` or
+`failed`, and says why. The answer also carries the context repository's outcome, and `changed`.
+Everybody else, `beeverforge act onboard -p myapp` included, gets the onboarding run on the worker.
+The answer comes back at once with the run's `handle`, and a second ask while it runs gets the
+same handle back. Either way each step is journaled as it ends, and
+`GET /api/jobs/myapp/onboard/events` reads the journal. Run it twice and the second run finds what
+the first left. Every pull request is `already` open, `changed` is false, and the answer says
+nothing changed. A source that is not a repository this project's forge can name is refused
+before anything starts.
+
 ### The manual session — when the developers are in the room
 
 `onboard` reads the repository; it cannot ask the person who knows it. When you have a

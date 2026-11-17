@@ -60,6 +60,7 @@ from beeverforge.runtime.temporal.activities import (
     notify_coordinator,
     notify_coordinator_say,
     notify_deploy,
+    onboard_product,
     open_review_loop,
     pr_mergeable_state,
     preflight_check,
@@ -127,6 +128,7 @@ from beeverforge.runtime.temporal.workflow import (
     JobWorkflow,
     KnowledgeRefreshWorkflow,
     MetricsPurgeWorkflow,
+    OnboardWorkflow,
     PreviewReapWorkflow,
     PreviewWorkflow,
     ProductAnswerWorkflow,
@@ -193,6 +195,8 @@ WORKER_ACTIVITIES = [
     refresh_product_knowledge,
     # #237 — one project's box proven when somebody asks through the `box_prove` row
     prove_box,
+    # #237 — one project's repositories onboarded when somebody asks through the `onboard` row
+    onboard_product,
     # the tech-lead's chat runs WHERE AGENTS AUTHENTICATE — the panel dispatches here
     techlead_ask,
     # …and so does the product role's drafting, for the same reason and by the same route (#98).
@@ -440,6 +444,8 @@ async def main() -> None:
                    ProductKnowledgeRefreshWorkflow,
                    # an asked box proof, one flight per key and ref (#237)
                    BoxProveWorkflow,
+                   # an asked onboarding, one flight per project (#237)
+                   OnboardWorkflow,
                    # one per conversation with the product role (#266 slice 3)
                    ConversationWorkflow,
                    # `beeverforge doctor`'s question: does this worker accept the key there?

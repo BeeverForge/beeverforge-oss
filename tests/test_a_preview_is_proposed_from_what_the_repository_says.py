@@ -958,8 +958,14 @@ def _callers(name: str) -> set[str]:
 
 def test_no_job_opens_a_proposal_only_a_person_does():
     """Opening a proposal is `beeverforge preview propose` and `onboard --with-preview`. A job,
-    an activity, a workflow, the poller or the panel only ASK whether one is open."""
-    assert _callers("propose_preview") == {"beeverforge/cli.py"}
+    an activity, a workflow, the poller or the panel only ASK whether one is open.
+
+    `onboard --with-preview` IS THE `onboard` ROW'S since #237: its body (`onboarding/onboard.py`)
+    proposes, because a person asked for that onboarding, through whichever transport — the worker
+    runs it on their behalf, as it proves a box somebody asked for. Nothing the runtime decides on
+    its own reaches it: the scan below still finds no caller there."""
+    assert _callers("propose_preview") == {"beeverforge/cli.py",
+                                           "beeverforge/onboarding/onboard.py"}
     assert _callers("_propose_hosted") | _callers("_propose_local") == {
         "beeverforge/onboarding/preview_propose.py"}
     for module in ("beeverforge/orchestrator", "beeverforge/runtime", "beeverforge/api"):

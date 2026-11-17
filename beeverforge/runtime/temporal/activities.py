@@ -65,6 +65,7 @@ from beeverforge.runtime.temporal.io import (
     KnowledgeRefreshInput,
     MergeCheckInput,
     MergedInput,
+    OnboardInput,
     OverheardInput,
     PreflightInput,
     PreflightVerdict,
@@ -5464,6 +5465,42 @@ async def prove_box(inp: BoxProveInput) -> str:
     within `box_prove.PROOF_HEARTBEAT`, not at the proof's ceiling."""
     return await _turning(lambda _abandoned: _do_prove_box(inp),
                           f"proving the box of {inp.project}")
+
+
+def _do_onboard(inp: OnboardInput) -> dict:
+    """One project's onboarding on the worker, because somebody asked through the `onboard` row
+    (#237): `onboard.onboard_the_product`, the body the shell's own `onboard` runs, journaling every
+    step where the panel's events route reads it. Returns the run's document — a project
+    unregistered since the ask is said, never raised: the row already answered, and nobody is
+    waiting on a raise. The context step performs `product_init` as whoever asked."""
+    from beeverforge import actions
+    from beeverforge.onboarding import onboard
+
+    try:
+        project = ProjectRegistry().get(inp.project)
+    except KeyError:
+        activity.logger.warning("an onboarding was asked of %s, which is not registered now — "
+                                "nothing was onboarded", inp.project)
+        return {"project": inp.project, "ok": False, "changed": False, "proposed": False,
+                "repos": [], "context": None,
+                "detail": f"{inp.project} is not registered now — nothing was onboarded"}
+    by = actions.Actor(id=inp.asked_by or "worker", display=inp.display or inp.asked_by,
+                       via=inp.via, admin=True,
+                       scopes=None if inp.scopes is None else frozenset(inp.scopes))
+    document = onboard.onboard_the_product(
+        project, repos=onboard.repositories(project, inp.sources), with_preview=inp.with_preview,
+        sandbox=inp.sandbox, skip_context=inp.skip_context,
+        create_context=onboard.through_product_init(by))
+    activity.logger.info("BEEVERFORGE_ONBOARD %s: %s", inp.project, document["detail"])
+    return document
+
+
+@activity.defn
+async def onboard_product(inp: OnboardInput) -> dict:
+    """#237 — an asked onboarding, on the worker. It proves every repository in the box and may
+    backfill with agent passes, so it HEARTBEATS while it runs (`_turning`): a worker that dies
+    mid-onboarding is noticed within `onboard.ONBOARD_HEARTBEAT`, not at its ceiling."""
+    return await _turning(lambda _abandoned: _do_onboard(inp), f"onboarding {inp.project}")
 
 
 #: How long one scheduled pass distils conversations for — each is a model call, so a few, and the

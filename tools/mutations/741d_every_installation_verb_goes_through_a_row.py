@@ -305,12 +305,18 @@ MUTATIONS = [
      '    outcome = _perform("product_init", project=name, source=list(source or []), '
      'write=write,\n',
      GUARD),
+    # RE-PINNED (#237): `onboard` is a mapping onto the `onboard` row, whose body asks
+    # `product_init` for the repository — so the command doing it itself is cut beside that call
     ("`onboard` creates the context repository itself", CLI,
-     '    outcome = _perform("product_init", project=name, create_context=True)\n',
-     "    from beeverforge.product.onboard import create_context_repository\n"
-     "    create_context_repository(project, name)\n"
-     '    outcome = _perform("product_init", project=name, create_context=True)\n',
+     '        outcome = _perform("onboard", project=name, sources=list(source or []), '
+     'sandbox=sandbox,\n',
+     "        from beeverforge.product.onboard import create_context_repository\n"
+     "        create_context_repository(project, name)\n"
+     '        outcome = _perform("onboard", project=name, sources=list(source or []), '
+     'sandbox=sandbox,\n',
      GUARD),
+    # RE-PINNED (#237): the command no longer calls the onboarding module; the `onboard` row's
+    # body does, so this cut is a ROW writing the installation undeclared — rule 1's, not the walk's
     ("the onboarding module creates the context repository again, as it did before this slice",
      ONBOARDING,
      "    if not docs_repo:\n"
@@ -321,16 +327,18 @@ MUTATIONS = [
      "            project, getattr(project, \"name\", \"product\"))\n"
      "    if not docs_repo:\n"
      "        out.detail = (f\"{getattr(project, 'name', 'this project')} declares no context \"\n",
-     GUARD),
+     TEST + "::test_a_row_that_writes_the_installation_is_declared_an_installation_row"),
 
     # ── 4. onboard through product_init ─────────────────────────────────────────────────────────
-    ("`onboard` backfills the project it held before the repository was made", CLI,
-     '    return _get_project(name), context["state"] == STEP_DONE, ""\n',
-     '    return project, context["state"] == STEP_DONE, ""\n',
+    # RE-PINNED (#237): the context step moved with the rest of the onboarding into the `onboard`
+    # row's body, `onboarding/onboard.py::_a_context_repository_for`
+    ("`onboard` backfills the project it held before the repository was made", ONBOARDING,
+     '    return ProjectRegistry().get(project.name), context.get("state") == STEP_DONE, ""\n',
+     '    return project, context.get("state") == STEP_DONE, ""\n',
      ONBOARD_TEST),
-    ("`onboard` never says it created the repository", CLI,
-     '    return _get_project(name), context["state"] == STEP_DONE, ""\n',
-     '    return _get_project(name), False, ""\n',
+    ("`onboard` never says it created the repository", ONBOARDING,
+     '    return ProjectRegistry().get(project.name), context.get("state") == STEP_DONE, ""\n',
+     '    return ProjectRegistry().get(project.name), False, ""\n',
      RECORDER),
 
     # ── 5. the walk is held to the app ──────────────────────────────────────────────────────────
