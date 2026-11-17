@@ -49,13 +49,16 @@ FROM ${BEEVERFORGE_BASE_IMAGE}
 # `tini`, the init this image's ENTRYPOINT runs (#532), is installed HERE, in the layer that names
 # it: the base is an ARG (ADR-0043), and a base that lacks it would start no job at all
 # (`exec: "tini": executable file not found`) where before a job merely had no init.
+#
+# `procps` (`ps`, `pgrep`) too (#567): a project's tests check a pid through them, and without it
+# they failed in the box with `FileNotFoundError: ... 'ps'` while passing on a runner that has it.
 RUN mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh tini \
+    && apt-get update && apt-get install -y --no-install-recommends gh tini procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Bake the platform so `python -m beeverforge.runtime.boxed_job` works. The task needs the
@@ -120,4 +123,5 @@ RUN { \
       echo "git=$(git --version 2>&1)"; \
       echo "gh=$(gh --version 2>/dev/null | head -1 || echo none)"; \
       echo "uv=$(uv --version 2>/dev/null || echo none)"; \
+      echo "ps=$(ps --version 2>&1 | head -1 || echo none)"; \
     } > /etc/beeverforge-toolchain && cat /etc/beeverforge-toolchain

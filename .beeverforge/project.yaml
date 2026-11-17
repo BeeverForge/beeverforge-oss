@@ -28,9 +28,10 @@ validate:
   # in 60 minutes and a worker was OOM-killed, so two workers. One command, so its status is the
   # gate's. 60 minutes, not the 30-minute default.
   # FOR NOW, THE TESTS IN tests/test_the_set_ends_together.py THAT RUN `ps` ARE LEFT TO CI as well:
-  # they check a pid through `ps` (one also through `pgrep`), the sandbox image has no procps, and
-  # in the box they failed with `FileNotFoundError: ... 'ps'`. GitHub's runners have it, so CI runs
-  # them. The file's other tests stay in. Remove these `--deselect`s when #567 is fixed.
+  # they check a pid through `ps` (one also through `pgrep`), and the sandbox image of the RUNNING
+  # release has no procps, so in the box they fail with `FileNotFoundError: ... 'ps'`. #567 puts
+  # procps in docker/sandbox.Dockerfile, but the box runs the published image of the release
+  # already deployed. Remove these `--deselect`s once that release's sandbox image carries procps.
   test:
     timeout_minutes: 60
     command: >-
