@@ -24,7 +24,7 @@ from beeverforge.contracts.product import ProductDocs
 from beeverforge.product.config import ProductLink, resolve_product_link
 from beeverforge.product.corpus import Corpus, load_corpus
 from beeverforge.product.domain import Domain, load_domain
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 log = logging.getLogger("beeverforge.product")
 
@@ -106,9 +106,17 @@ def _read_docs_manifest(path) -> tuple[ProductDocs | None, str]:
     if not manifest.is_file():
         return None, f"{shown} is missing from the repository root"
     try:
-        text = manifest.read_text(encoding="utf-8")
+        raw = manifest.read_bytes()
     except OSError as exc:
         return None, f"{shown} could not be read: {exc}"
+    # NOT UTF-8 IS A SENTENCE TOO: a `UnicodeDecodeError` is a ValueError, past `except OSError`.
+    return _parsed(*utf8.decode(raw, shown))
+
+
+def _parsed(text: str | None, refused: str) -> tuple[ProductDocs | None, str]:
+    """The manifest parsed from `utf8.decode`'s answer, or its refusal when there is no text."""
+    if text is None:
+        return None, refused
     return parse_docs_manifest(text)
 
 

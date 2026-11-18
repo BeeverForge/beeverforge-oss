@@ -42,7 +42,7 @@ from beeverforge import namespace
 from beeverforge.contracts.manifest import PreviewConfig
 from beeverforge.contracts.product import ProductDocs, ProductPreview
 from beeverforge.preview.plan import Layout, Refused
-from beeverforge.preview.read import PRODUCT_REMEDY, _read_inside, prescan
+from beeverforge.preview.read import PRODUCT_REMEDY, NotUtf8, _read_inside, prescan
 from beeverforge.product.config import normalize_repo, repo_match
 from beeverforge.util import yaml_io
 
@@ -74,13 +74,20 @@ def read_docs(root: str) -> tuple[ProductDocs | None, str]:
     is written by automation, and a `product.yaml` that is a link to a file of the worker's is not
     the repository's file. Parsed by the product module's own parser, so a preview and the module
     never disagree about what the file says."""
-    from beeverforge.product.loader import parse_docs_manifest
-
     # UNDER THE FOLDER THE CONTEXT REPOSITORY USES — `.openfactory/` when that is its one (#265).
     rel = namespace.in_repo(Path(root), PRODUCT_YAML)
     text = _read_inside(root, posixpath.join(root, rel))
     if text is None:
         return None, (f"`{rel}` is not a file of the context repository's base branch")
+    return _parsed(text)
+
+
+def _parsed(text: str | NotUtf8) -> tuple[ProductDocs | None, str]:
+    """The manifest parsed by the product module's own parser, or why its bytes are not text."""
+    from beeverforge.product.loader import parse_docs_manifest
+
+    if isinstance(text, NotUtf8):
+        return None, text.reason
     return parse_docs_manifest(text)
 
 
@@ -170,16 +177,27 @@ def reached(shape: ProductShape, root: str) -> tuple[str, ...] | Refused:
     checked out on a guess; `read.shape` checks the same again once every tree is on disk."""
     texts: dict[str, str] = {}
     for f in shape.preview.compose.paths:
-        text = _read_inside(root, posixpath.join(root, f))
-        if text is None:
-            return Refused(reasons=(f"`{f}` is not a file of `{shape.members[shape.shape_dir]}`'s "
-                                    f"base branch — `preview.compose` in `{PRODUCT_YAML}` names "
-                                    f"it, and a preview reads the base branch's files only.",))
+        text = _compose_text(shape, root, f)
+        if isinstance(text, Refused):
+            return text
         texts[posixpath.normpath(posixpath.join(shape.shape_dir, f))] = text
     found = prescan(texts, layout_dirs=shape.members, of="this product", remedy=PRODUCT_REMEDY)
     if found.refused:
         return Refused(reasons=found.refused)
     return tuple(found.dirs)
+
+
+def _compose_text(shape: ProductShape, root: str, f: str) -> str | Refused:
+    """The text of the product's compose file `f`, or why it is not a file of the base branch, or
+    why its bytes are not text."""
+    text = _read_inside(root, posixpath.join(root, f))
+    if text is None:
+        return Refused(reasons=(f"`{f}` is not a file of `{shape.members[shape.shape_dir]}`'s "
+                                f"base branch — `preview.compose` in `{PRODUCT_YAML}` names "
+                                f"it, and a preview reads the base branch's files only.",))
+    if isinstance(text, NotUtf8):
+        return Refused(reasons=(text.reason,))
+    return text
 
 
 def strangers(layout: Layout, shape: ProductShape) -> list[str]:
@@ -197,7 +215,8 @@ def strangers(layout: Layout, shape: ProductShape) -> list[str]:
 
 def _declares_preview(root: str, rel: str) -> bool:
     text = _read_inside(root, posixpath.join(root, namespace.in_repo(Path(root), rel)))
-    if text is None:
+    # missing, out of the tree, or not UTF-8 text: declares nothing
+    if not isinstance(text, str):
         return False
     try:
         data = yaml_io.load(text)

@@ -162,7 +162,8 @@ def _dirs_asked(repo: str, found: PreviewProposal, checkout: Path,
     texts = {}
     for rel in found.compose.value or []:
         text = _read_inside(str(checkout), str(checkout / rel))
-        if text is not None:
+        # a file that is missing, out of the tree or not UTF-8 text reaches nothing to ask about
+        if isinstance(text, str):
             texts[posixpath.join(side, rel)] = text
     reached = prescan(texts).dirs
     return [f"`{repo}`'s compose file reaches `../{d}`, which is not the short name of any "
