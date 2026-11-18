@@ -7,6 +7,12 @@ Every pull request carries the line its release's notes will read for it, as a f
 into the version's section here, and its GitHub release page carries the same notes
 ([docs/RELEASING.md](docs/RELEASING.md), "The release notes").
 
+## 0.1.2 (2026-11-18)
+
+### Fixes
+
+- **A GitHub forge and tracker token held in a rotating credential store is read again during a job.** A token answered by the `file` store or an installed store was read once, when the job's runner was composed, so a job that outlived a one-hour installation token failed its final push with "Invalid username or token"; the GitHub forge and tracker now read it again every five minutes (every half lifetime under ten minutes), so a push carries the token the platform rotated in, and when the store refuses it or answers nothing once `BEEVERFORGE_STORED_TOKEN_TTL` (an hour unset) has passed since the last good read, the push refuses by name instead of using the expired token or the machine's own login; a store that fails is asked again at most once a minute, not at every call. A token from the environment, a GitHub PAT, the GitHub App trio and other vendors' tokens behave as before (#236).
+
 ## 0.1.1 (2026-11-09)
 
 ### Fixes
