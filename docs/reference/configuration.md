@@ -421,7 +421,15 @@ held: the PEM for `BEEVERFORGE_GH_APP_KEY_CONTENT`, a path for `BEEVERFORGE_GH_A
 
 - `BEEVERFORGE_CREDENTIAL_DIR` is the directory, `/run/secrets` for a compose stack's `secrets:`
   and a mounted cluster secret volume alike. A reference names one file in it, never a path.
-- **Read at each use, kept by nobody.** A rotated file is the next use's.
+- **Read when it is asked for, kept by nobody.** A rotated file is the next read's. The one
+  reader that holds what it read is a GitHub forge and tracker: a job reads their token when its
+  runner is composed and, when a store other than the environment holds it, again every five
+  minutes, so a push made after a rewrite carries the new token within five minutes of it.
+  Nothing is read more often than that, however many calls the job makes; a read that fails is
+  tried again at most once a minute. When a re-read fails, the token read before it is used until
+  `BEEVERFORGE_STORED_TOKEN_TTL` (an hour unset) has passed since it was read, and then the push
+  refuses by name. A GitHub PAT, and another vendor's token,
+  are read once, when the runner is composed.
 - **Refused by name**, and never replaced by the variable, when:
   - a directory on the name's way may be written by anyone but its owner, on a mount that accepts
     writes. Those directories are the credential directory, the directory the file is in, each
@@ -520,6 +528,7 @@ Secrets and deployment coordinates. The ones you will actually set:
 | `BEEVERFORGE_SANDBOX` | which box every job runs in: `worktree` \| `container` \| the kind an installed box add-on registers (`fargate`, from the AWS add-on). Unset → `container`. **Never inferred** — a cloud deployment DECLARES `BEEVERFORGE_SANDBOX=fargate`; setting only the add-on's cluster coordinates leaves every job in a local container |
 | `BEEVERFORGE_CREDENTIAL_STORE` | which store the deployment's own credentials are asked of before the environment: `env` (unset means this — the environment alone) \| `file` \| the kind an installed add-on registers. Never inferred; a kind nobody installed refuses every credential by name rather than falling back ([the credential store](#the-credential-store)) |
 | `BEEVERFORGE_CREDENTIAL_DIR` | the file store's directory, where the deployment's secret files are mounted (`/run/secrets`). A reference `file:<name>` names one file in it. Withheld from a worktree workload |
+| `BEEVERFORGE_STORED_TOKEN_TTL` | how many seconds a GitHub forge or tracker token answered by a store other than the environment (`file`, an installed one) may still be used after it was read while the store answers nothing better; past it the push and the `gh` call refuse by name. The store is read again every five minutes, or every half of this lifetime when it is under ten minutes. Unset → `3600`, the hour a GitHub App installation token lives, since GitHub carries no expiry in the token; a value that is not a finite number of seconds above zero and at most a day (`86400`) is said and the hour used. A re-read that fails is tried again at most once a minute, said once each time in one sentence. A GitHub PAT (`ghp_…`, `github_pat_…`), a token from the environment, and the token of a vendor whose credential row names its own variable or resolves its own credential (Jira, Azure DevOps, an add-on that declares one) are read once, when the job's runner is composed |
 | `BEEVERFORGE_TOKEN_POOL_SOURCE` | where the panel reads the agent-token pool from (count and ids, never a value): `env` (the default — this process's environment) \| the kind an installed add-on registers (`ssm`, from the AWS add-on). Unset → `env`. Never inferred — the reference cloud deployment declares `ssm` |
 | `BEEVERFORGE_SANDBOX_IMAGE` | deployment-wide box image; a project's `box.image` wins |
 | `BEEVERFORGE_METRICS_SINK` · `BEEVERFORGE_METRICS_DB` | `sqlite` locally, `dynamodb` in the cloud, `null` for neither |

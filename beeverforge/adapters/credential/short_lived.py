@@ -37,9 +37,13 @@ class ShortLivedToken:
     """A token `mint` answers, held until `margin` seconds before it expires — never raises,
     never logs the value. Called like a provider: `token()` is the current token or None."""
 
-    def __init__(self, mint: Mint, *, margin: float = REFRESH_MARGIN_SECONDS) -> None:
+    def __init__(self, mint: Mint, *, margin: float = REFRESH_MARGIN_SECONDS,
+                 clock: Callable[[], float] | None = None) -> None:
         self._mint = mint
         self._margin = margin
+        #: what "now" is, in epoch seconds: `time.time` unless the caller hands its own, so a
+        #: lifetime is driven by a fake clock in a test rather than waited out
+        self._clock = clock or time.time
         self._held: tuple[str, float] | None = None
         #: HELD ACROSS THE MINT, not just across the read: releasing it before the mint would
         #: spawn one mint per waiting thread to obtain N copies of the same token.
@@ -48,14 +52,14 @@ class ShortLivedToken:
     def __call__(self) -> str | None:
         with self._lock:
             held = self._held
-            if held is not None and time.time() < held[1] - self._margin:
+            if held is not None and self._clock() < held[1] - self._margin:
                 return held[0]
             minted = self._mint()
             if minted is not None:
                 self._held = minted
                 return minted[0]
             # A FAILED REFRESH DOES NOT EVICT A TOKEN THAT IS STILL VALID — see the module.
-            if held is not None and time.time() < held[1]:
+            if held is not None and self._clock() < held[1]:
                 return held[0]
             return None
 
