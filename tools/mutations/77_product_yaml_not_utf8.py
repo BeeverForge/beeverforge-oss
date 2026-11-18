@@ -5,7 +5,9 @@ nothing, so a file saved as Latin-1 or UTF-16 raised `UnicodeDecodeError` out of
 module and the preview. `beeverforge/util/utf8.py::decode` now turns the bytes into text or into
 one sentence naming the file, the offset of the first byte that is not UTF-8 text (a NUL counts,
 for UTF-16 without a byte-order mark) and the remedy; the loader reads bytes through it, and the
-preview's `_read_inside` returns `NotUtf8`, which each caller turns into its own refusal.
+preview's `_read_inside` returns `NotUtf8`, which each caller turns into its own refusal. The
+two readers that onboard the product (`product/onboard.py::_existing`) and propose its preview
+(`onboarding/preview_product.py::_with_block`) read the same file through the same decoder.
 
 Each row below is one way that could come undone, and the guard must go red on each.
 """
@@ -17,6 +19,7 @@ _LOADER = "beeverforge/product/loader.py"
 _READ = "beeverforge/preview/read.py"
 _PRODUCT = "beeverforge/preview/product.py"
 _ONBOARD = "beeverforge/onboarding/preview_product.py"
+_ONBOARD_PLAN = "beeverforge/product/onboard.py"
 
 MUTATIONS = [
     ("THE DEFECT: the decoder decodes blindly, so Latin-1, UTF-16 with a mark and invalid bytes "
@@ -62,6 +65,22 @@ MUTATIONS = [
     ("onboarding hands a compose file that is not UTF-8 to the prescan as if it were text",
      _ONBOARD, "        if isinstance(text, str):\n            texts[posixpath.join(side, rel)]",
      "        if text is not None:\n            texts[posixpath.join(side, rel)]"),
+
+    ("onboarding reads a `product.yaml` that is not UTF-8 as text again, so `plan` raises",
+     _ONBOARD_PLAN, "    text, unread = utf8.decode(path.read_bytes(), shown)\n",
+     "    text, unread = path.read_text(encoding=\"utf-8\"), \"\"\n"),
+
+    ("onboarding lets a `product.yaml` it could not read raise out of `plan` instead of refusing it",
+     _ONBOARD_PLAN, "    except (namespace.RetiredNamespace, _NotUtf8) as exc:\n",
+     "    except namespace.RetiredNamespace as exc:\n"),
+
+    ("proposing a preview drafts over a `product.yaml` it could not read instead of refusing it",
+     _ONBOARD, "    if before is None:\n        return unread + \" Nothing was written.\", False\n",
+     "    if False:\n        return unread + \" Nothing was written.\", False\n"),
+
+    ("proposing a preview reads the `product.yaml` it rewrites as text again",
+     _ONBOARD, "    return utf8.decode((checkout / rel).read_bytes(), rel)\n",
+     "    return (checkout / rel).read_text(encoding=\"utf-8\"), \"\"\n"),
 
     ("the remedy is dropped from the sentence",
      _DECODE, "f\"read{hint} — save it as UTF-8.\")", "f\"read{hint}.\")"),

@@ -185,3 +185,54 @@ def test_an_onboarding_compose_file_not_in_utf8_reaches_nothing_to_ask(tmp_path)
     # the file that is not UTF-8 is skipped, and the one that is still asks about `../backend`
     assert len(asked) == 1, asked
     assert "`../backend`" in asked[0], asked
+
+
+# ── the readers that onboard the product and propose its preview ────────────────────────────────
+
+#: the families a person's editor most often saves in, besides UTF-8
+WRITTEN_ELSEWHERE = ("Latin-1", "UTF-16 with a byte-order mark")
+
+
+def _onboarded_project():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(name="shop", product=SimpleNamespace(docs_repo="someone/context",
+                                                                requirements_dir=""))
+
+
+@pytest.mark.parametrize("family", WRITTEN_ELSEWHERE)
+def test_onboarding_refuses_a_product_yaml_not_in_utf8_by_name(tmp_path, family):
+    from beeverforge.product.onboard import plan
+
+    raw, offset = FAMILIES[family]
+    _write(tmp_path, DOCS_MANIFEST, raw)
+
+    onboarded = plan(_onboarded_project(), tmp_path)
+
+    assert onboarded.product_yaml == "", "a plan was drafted over a file it could not read"
+    _named(onboarded.refusal, DOCS_MANIFEST, offset)
+
+
+@pytest.mark.parametrize("family", WRITTEN_ELSEWHERE)
+def test_proposing_a_preview_reads_the_product_yaml_it_rewrites_as_utf8_or_names_it(tmp_path,
+                                                                                       family):
+    from beeverforge.onboarding.preview_product import _with_block
+
+    raw, offset = FAMILIES[family]
+    _write(tmp_path, DOCS_MANIFEST, raw)
+
+    said, _ = _with_block(_onboarded_project(), tmp_path, DOCS_MANIFEST,
+                          {"compose": ".beeverforge/preview.compose.yml"})
+
+    _named(said, DOCS_MANIFEST, offset)
+    # every refusal on the proposal's path says so, and this one wrote nothing
+    assert said.endswith(" Nothing was written."), said
+    assert (tmp_path / DOCS_MANIFEST).read_bytes() == raw
+
+
+def test_proposing_a_preview_still_reads_a_utf8_product_yaml(tmp_path):
+    from beeverforge.onboarding.preview_product import _as_written
+
+    _write(tmp_path, DOCS_MANIFEST, "# café\nproduct: shop\n".encode())
+
+    assert _as_written(tmp_path, DOCS_MANIFEST) == ("# café\nproduct: shop\n", "")

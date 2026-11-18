@@ -36,7 +36,7 @@ from pathlib import Path
 import yaml
 
 from beeverforge import gitpin, namespace
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 #: What `authoring` writes: `requirements/0007-editar-conciliado.md`. A file that does not match
 #: is somebody else's document, whatever else it is.
@@ -62,16 +62,32 @@ class OnboardPlan:
     todo: list[str] = field(default_factory=list)
 
 
-def _existing(path: Path) -> dict:
+class _NotUtf8(ValueError):
+    """A declaration whose bytes are not UTF-8 text; its message is the sentence refusing it."""
+
+
+def _declared_text(path: Path, shown: str) -> str:
+    """The text of the declaration at `path` — `""` when there is none — or `_NotUtf8`, naming
+    `shown`, the offset where its bytes stop being UTF-8 text, and the remedy."""
+    if not path.exists():
+        return ""
+    text, unread = utf8.decode(path.read_bytes(), shown)
+    if text is None:
+        raise _NotUtf8(unread)
+    return text
+
+
+def _existing(path: Path, shown: str) -> dict:
     """What the declaration at `path` says today — `{}` when there is none, or none we can read.
 
     `path` comes from `namespace.resolve`, never from a join: the resolver is the ONE reader that
     knows a docs repository still on the directory's retired name HAS a declaration, and `plan`
-    refuses that repository before this is ever asked."""
-    if not path.exists():
-        return {}
+    refuses that repository before this is ever asked.
+
+    BYTES THAT ARE NOT UTF-8 ARE REFUSED, NEVER READ AS NOTHING: `{}` would have the plan draft a
+    fresh declaration over the client's own. `_NotUtf8` reaches `plan`, which refuses by name."""
     try:
-        data = yaml_io.load(path.read_text(encoding="utf-8"))
+        data = yaml_io.load(_declared_text(path, shown))
     except yaml.YAMLError:
         return {}
     return data if isinstance(data, dict) else {}
@@ -116,9 +132,10 @@ def plan(project, docs_root: Path, *, sources: list[str] | None = None,
         # that same repository by name (review, 2026-08-25). The refusal is the loader's own
         # sentence, and it is this plan's `refusal`: both callers stop on it and write nothing.
         declared = namespace.resolve(docs_root, PRODUCT_YAML, project=project.name)
-    except namespace.RetiredNamespace as exc:
+        # A DECLARATION THAT IS NOT UTF-8 IS REFUSED THE SAME WAY, naming the file and the byte.
+        current = _existing(declared, declared.relative_to(docs_root).as_posix())
+    except (namespace.RetiredNamespace, _NotUtf8) as exc:
         return OnboardPlan(docs_repo=docs_repo, requirements_dir="", refusal=str(exc))
-    current = _existing(declared)
     # THE CLIENT'S CHOICE WINS when they have already made one.
     requirements_dir = str(current.get("requirements_dir")
                            or getattr(cfg, "requirements_dir", "")

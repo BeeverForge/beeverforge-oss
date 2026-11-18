@@ -45,6 +45,7 @@ from beeverforge.onboarding.preview_propose import (
     pr_body,
     relocated,
 )
+from beeverforge.util import utf8
 
 log = logging.getLogger("beeverforge.onboarding.preview_product")
 
@@ -223,6 +224,35 @@ def draft_product(readings: list[tuple[str, PreviewProposal]], *, product: str, 
     return reading, out
 
 
+def _as_written(checkout: Path, rel: str) -> tuple[str | None, str]:
+    """The text of `rel` in `checkout` before a proposal rewrites it — or `(None, sentence)`
+    naming `rel`, the offset where its bytes stop being UTF-8 text, and the remedy.
+
+    Its comments are compared after the rewrite, so the file is read as the person wrote it; a
+    file saved in another encoding is refused here by name, never raised out of the proposal."""
+    return utf8.decode((checkout / rel).read_bytes(), rel)
+
+
+def _with_block(project, checkout: Path, product_yaml: str,
+                block: dict[str, Any]) -> tuple[str, bool]:
+    """Write the drafted `preview:` block into `product_yaml` in `checkout`, merged by `plan`.
+
+    `(refusal, comments_kept)`: a refusal means nothing was written; `comments_kept` says whether
+    every comment the person wrote survived the rewrite."""
+    from beeverforge.product.onboard import plan
+
+    before, unread = _as_written(checkout, product_yaml)
+    if before is None:
+        return unread + " Nothing was written.", False
+    onboarded = plan(project, checkout, preview=block)
+    if onboarded.refusal:
+        return onboarded.refusal, False
+    (checkout / product_yaml).write_text(onboarded.product_yaml, encoding="utf-8")
+    header = {ln for ln in onboarded.product_yaml.splitlines() if ln.startswith("#")}
+    return "", not [ln for ln in before.splitlines()
+                    if ln.lstrip().startswith("#") and ln not in header]
+
+
 def propose_product(project, *, accept: bool = False,
                     answers: dict[str, Any] | None = None) -> Outcome:
     """Draft how this product is previewed, from every source of its `product.yaml`, and propose
@@ -240,7 +270,6 @@ def propose_product(project, *, accept: bool = False,
         _context_token,
         context_clone_url,
         context_forge,
-        plan,
     )
 
     cfg = getattr(project, "product", None)
@@ -329,15 +358,10 @@ def propose_product(project, *, accept: bool = False,
         paths: list[str] = []
         comments_kept = True
         if out.block is not None:
-            before = (checkout / product_yaml).read_text(encoding="utf-8")
-            onboarded = plan(project, checkout, preview=out.block)
-            if onboarded.refusal:
-                return Outcome(repo=context, detail=onboarded.refusal)
-            (checkout / product_yaml).write_text(onboarded.product_yaml, encoding="utf-8")
+            refusal, comments_kept = _with_block(project, checkout, product_yaml, out.block)
+            if refusal:
+                return Outcome(repo=context, detail=refusal)
             paths.append(product_yaml)
-            header = {ln for ln in onboarded.product_yaml.splitlines() if ln.startswith("#")}
-            comments_kept = not [ln for ln in before.splitlines()
-                                 if ln.lstrip().startswith("#") and ln not in header]
         for rel, body in out.files.items():
             target = checkout / rel
             target.parent.mkdir(parents=True, exist_ok=True)
