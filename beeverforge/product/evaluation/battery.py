@@ -35,7 +35,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 #: Who is asking (decision 8). Client is the default because it is who the role meets most.
 Audience = Literal["client", "product admin", "engineer"]
@@ -226,7 +226,7 @@ def load_battery(path: str | Path, *, fixture: str | Path | None = None) -> Batt
     Raises `BatteryRefused` with one sentence naming the file and the question."""
     path = Path(path)
     try:
-        data = yaml_io.load(path.read_text(encoding="utf-8"))
+        data = yaml_io.load(utf8.text_of(path, str(path), BatteryRefused))
     except OSError as exc:
         raise BatteryRefused(f"{path} could not be read: {exc}") from exc
     except yaml.YAMLError as exc:

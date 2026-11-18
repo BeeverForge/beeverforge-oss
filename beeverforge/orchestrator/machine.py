@@ -1706,6 +1706,19 @@ log = logging.getLogger("beeverforge.orchestrator")
 _KNOWLEDGE_SLOW_SECONDS = 5.0
 
 
+def _shape_manifest_text(root: Path, manifest_rel: str) -> str:
+    """The manifest's text for the preview shape, or `""` — no `preview:` block — when it is not
+    UTF-8, logged by name with the decoder's sentence: said, not raised. `OSError` reaches the
+    caller, which already reads an unreadable manifest as no block."""
+    from beeverforge.util import utf8
+
+    text, unread = utf8.decode((root / manifest_rel).read_bytes(), manifest_rel)
+    if text is None:
+        log.warning("BEEVERFORGE_PREVIEW_SHAPE_NOT_UTF8 %s", unread)
+        return ""
+    return text
+
+
 @dataclass
 class JobRunner:
     tracker: TrackerAdapter  # where the ticket lives
@@ -4774,7 +4787,7 @@ class JobRunner:
         folder = namespace.dir_in(root)
         manifest_rel = namespace.in_repo(root, namespace.MANIFEST)
         try:
-            text = (root / manifest_rel).read_text(encoding="utf-8")
+            text = _shape_manifest_text(root, manifest_rel)
             block = (yaml_io.load(text) or {}).get("preview") or {}
         except (OSError, yaml.YAMLError, AttributeError):
             block = {}

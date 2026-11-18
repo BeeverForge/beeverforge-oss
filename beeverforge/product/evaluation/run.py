@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 from beeverforge import namespace
 from beeverforge.product.evaluation.battery import NO_QUESTIONS, Battery, BatteryRefused, Question
 from beeverforge.product.evaluation.score import Judge, Tally, Verdict, score, totals
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 log = logging.getLogger("beeverforge.product.evaluation")
 
@@ -88,7 +88,7 @@ def fixture_name(fixture: str | Path) -> str:
     context = Path(fixture) / "context"
     manifest = context / namespace.in_repo(context, namespace.PRODUCT_MANIFEST)
     try:
-        data = yaml_io.load(manifest.read_text(encoding="utf-8")) or {}
+        data = yaml_io.load(utf8.text_of(manifest, str(manifest), FixtureRefused)) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise FixtureRefused(f"{manifest} could not be read: {exc}") from exc
     name = str(data.get("product") or "").strip() if isinstance(data, dict) else ""

@@ -144,6 +144,6 @@ MUTATIONS = [
      "yaml_io.load(manifest_file.read_text())"),
 
     ("the manifest's one reader parses a manifest it could not read instead of refusing it by name",
-     _UTF8, "    if text is None:\n        raise ValueError(unread)\n",
-     "    if False:\n        raise ValueError(unread)\n"),
+     _UTF8, "    if text is None:\n        raise refused(unread)\n",
+     "    if False:\n        raise refused(unread)\n"),
 ]
