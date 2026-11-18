@@ -231,14 +231,15 @@ def stored_answer(name: str) -> tuple[str, str | None]:
     return (found.reference, found.value) if found.value else ("", None)
 
 
-def chain(names: Iterable[str]) -> Answer:
+def chain(names: Iterable[str], *, quiet: bool = False) -> Answer:
     """The first of `names` that answers — and NOTHING AFTER A REFUSAL: a refused name ends the
     walk with its refusal, because the next name is another credential, and a secret the
     deployment did not choose is not replaced by one it did not name for this (review of #822:
     a refused `BEEVERFORGE_TRACKER_TOKEN` became `BEEVERFORGE_BOT_TOKEN`). Spelled as a table at
-    the call, `chain(("A", "B"))`, which is how `environ.names_read` keeps both names reserved."""
+    the call, `chain(("A", "B"))`, which is how `environ.names_read` keeps both names reserved.
+    `quiet` is `lookup`'s: for a reader that says what a refusal means itself."""
     for name in names:
-        found = lookup(name)
+        found = lookup(name, quiet=quiet)
         if found.value or found.refused:
             return found
     return NOTHING

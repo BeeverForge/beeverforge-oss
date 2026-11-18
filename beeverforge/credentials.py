@@ -347,7 +347,7 @@ def _refused_at(project, axis: str, found, announce: bool):
     return found
 
 
-def _axis_answer(project, axis: str, generic, *, announce: bool = True):
+def _axis_answer(project, axis: str, generic, *, announce: bool = True, quiet: bool = False):
     """What answers for `project`'s credential on `axis` — ONE resolution for both axes — as the
     store's `Answer`: the reference and the value, or the reference the store REFUSED and why.
 
@@ -376,7 +376,8 @@ def _axis_answer(project, axis: str, generic, *, announce: bool = True):
 
     AND A STEP THE STORE REFUSES IS THE ANSWER (review of #822): the reference the project names,
     its vendor's default variable, the deployment's pair — the first refused one ends the walk,
-    and nothing after it is asked."""
+    and nothing after it is asked. `quiet` asks the store quietly (`credential_store.lookup`), for
+    a reader that says what a refusal means in its own sentence (`stored_token_provider`)."""
     Answer = credential_store.Answer
     ref = getattr(project, axis, None)
     options = getattr(ref, "options", None) or {}
@@ -392,7 +393,7 @@ def _axis_answer(project, axis: str, generic, *, announce: bool = True):
     if row is not None and row.source is not None:
         # THE REFERENCE THE ROW WILL READ, asked first: a vendor that resolves its own credential
         # falls back to a login when its secret is absent, and a REFUSED secret is not absent.
-        asked = credential_store.look(named or vendor_default_env(ref) or "")
+        asked = credential_store.look(named or vendor_default_env(ref) or "", quiet=quiet)
         if asked.refused:
             return _refused_at(project, axis, asked, announce)
         if named and announce and not (asked.value or "").strip():
@@ -405,7 +406,7 @@ def _axis_answer(project, axis: str, generic, *, announce: bool = True):
     if named:
         # A REFERENCE (#742): a bare variable name as every registry has written it, resolved
         # through the deployment's store; `file:<name>` or another installed kind, from there alone.
-        found = credential_store.look(named)
+        found = credential_store.look(named, quiet=quiet)
         if found.refused:
             return _refused_at(project, axis, found, announce)
         if found.value:
@@ -424,7 +425,7 @@ def _axis_answer(project, axis: str, generic, *, announce: bool = True):
                         "system")
     default = vendor_default_env(ref)
     if default:
-        found = credential_store.lookup(default)
+        found = credential_store.lookup(default, quiet=quiet)
         if found.refused:
             return _refused_at(project, axis, found, announce)
         if (found.value or "").strip():
@@ -446,7 +447,7 @@ def _axis_answer(project, axis: str, generic, *, announce: bool = True):
     if value:
         return Answer(reference=f"generic:{axis}", value=value)
     # the pair answered nothing: say whether that was a refusal, which the generic reader folds
-    found = credential_store.chain(_GENERIC[axis])
+    found = credential_store.chain(_GENERIC[axis], quiet=quiet)
     return _refused_at(project, axis, found, announce) if found.refused \
         else credential_store.NOTHING
 
@@ -699,6 +700,11 @@ def deployment_forge_provider(project):
 #: hour and its expiry is not carried in the token, so the lifetime is a setting, an hour unset.
 STORED_TOKEN_TTL_VAR = "BEEVERFORGE_STORED_TOKEN_TTL"
 STORED_TOKEN_TTL_SECONDS = 3600.0
+#: The longest lifetime the setting may name: a day. A finite but huge one is not a lifetime: the
+#: refresh arithmetic cancels in floating point once it dwarfs the epoch (review of a6a8e4e, a
+#: call a second for 30 minutes: `1e20` read the store 0 times, the refresh off, and `1e300` read
+#: it 1799 times, once per call), and `1e12` kept a token whose re-read failed for 31,700 years.
+STORED_TOKEN_TTL_MAX_SECONDS = 86400.0
 
 #: How often such a token is read again: every five minutes, or every half lifetime when the
 #: lifetime is under ten minutes. NOT counted back from the lifetime's end (review of #236): the
@@ -725,8 +731,9 @@ def _now() -> float:
 
 def _stored_token_ttl() -> float:
     """`STORED_TOKEN_TTL_VAR` in seconds, or the hour; a value that is not a FINITE number of
-    seconds above zero is said and the hour is used. `inf` (or `1e400`, which `float` reads as
-    it) would hold a token whose re-read failed for ever, in silence."""
+    seconds above zero and at most `STORED_TOKEN_TTL_MAX_SECONDS` is said and the hour is used.
+    `inf` (or `1e400`, which `float` reads as it) would hold a token whose re-read failed for
+    ever, in silence."""
     raw = (os.environ.get(STORED_TOKEN_TTL_VAR) or "").strip()
     if not raw:
         return STORED_TOKEN_TTL_SECONDS
@@ -734,14 +741,15 @@ def _stored_token_ttl() -> float:
         ttl = float(raw)
     except ValueError:
         ttl = 0.0
-    if math.isfinite(ttl) and ttl > 0:
+    if math.isfinite(ttl) and 0 < ttl <= STORED_TOKEN_TTL_MAX_SECONDS:
         return ttl
-    log.warning("%s=%r is not a finite number of seconds above zero — a stored token is held for "
-                "%d s", STORED_TOKEN_TTL_VAR, raw, int(STORED_TOKEN_TTL_SECONDS))
+    log.warning("%s=%r is not a number of seconds above zero and at most %d — a stored token is "
+                "held for %d s", STORED_TOKEN_TTL_VAR, raw, int(STORED_TOKEN_TTL_MAX_SECONDS),
+                int(STORED_TOKEN_TTL_SECONDS))
     return STORED_TOKEN_TTL_SECONDS
 
 
-def axis_answer_for(project, axis: str, *, announce: bool = True):
+def axis_answer_for(project, axis: str, *, announce: bool = True, quiet: bool = False):
     """`project`'s credential on `axis` as the store's `Answer` — ONE resolution, the value
     `forge_token_for` / `tracker_token_for` answer and the reference of the STORE that held it,
     the deployment-wide pair's included, where `_axis_answer` says only `generic:<axis>`.
@@ -758,11 +766,11 @@ def axis_answer_for(project, axis: str, *, announce: bool = True):
     def generic() -> str | None:
         if reader is not _PAIR_READERS[axis]:
             return reader()  # a seam a harness replaced: its value, and no store to name
-        found = credential_store.chain(_GENERIC[axis])
+        found = credential_store.chain(_GENERIC[axis], quiet=quiet)
         pair.append(found)
         return found.value
 
-    found = _axis_answer(project, axis, generic, announce=announce)
+    found = _axis_answer(project, axis, generic, announce=announce, quiet=quiet)
     if found.value and found.reference == f"generic:{axis}" and pair and pair[-1].value:
         return credential_store.Answer(reference=pair[-1].reference, value=found.value)
     return found
@@ -815,15 +823,32 @@ def stored_token_provider(project, axis: str, found=None):
     ttl, clock = _stored_token_ttl(), _now
     interval = min(STORED_TOKEN_REREAD_SECONDS, ttl / 2)
     refused, read_at = "", clock()
+    retry_at = 0.0
     # THE READ JUST MADE IS THE FIRST: its interval starts now, and a first use inside it asks
     # nothing. Only inside it — a runner whose first use comes later reads again, like any use.
     seeded = True
 
     def fresh() -> tuple[str, float] | None:
-        nonlocal refused
-        again = axis_answer_for(project, axis, announce=False)
+        nonlocal refused, retry_at
+        if clock() < retry_at:
+            return None  # a read failed under a minute ago: the held token answers, or nothing
+        # QUIET, because the sentence below is the one that says what happens: the store's own
+        # ("nothing is used in its place") is false while the held token is still handed out
+        again = axis_answer_for(project, axis, announce=False, quiet=True)
         refused = again.refused
-        return (again.value, clock() + ttl) if again.value else None
+        if again.value:
+            return again.value, clock() + ttl
+        # ONE FAILED READ A MINUTE, NOT ONE PER CALL (review of a6a8e4e). Inside the lifetime and
+        # past the interval, `ShortLivedToken` mints at every call while a mint fails: a store
+        # down from job minute 10 was asked 4 times per push, each with a warning and, for a store
+        # that raised, a traceback — and a store that times out stalled every push behind it.
+        retry_at = clock() + min(60.0, interval)
+        log.warning("the %s credential `%s` %s when it was read again — the token read before it "
+                    "is used until %s has passed since it was read, and the store is asked again "
+                    "in a minute", axis, reference,
+                    f"was refused ({refused})" if refused else "answered nothing",
+                    STORED_TOKEN_TTL_VAR)
+        return None
 
     def read() -> tuple[str, float] | None:
         nonlocal seeded

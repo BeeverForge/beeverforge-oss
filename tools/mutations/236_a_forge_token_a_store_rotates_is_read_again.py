@@ -9,7 +9,9 @@ environment, a vendor that reads its own credential, a PAT, the App trio, a refu
 that answers nothing said by name, each read's own answer, and no value in a log.
 
 The review of ebf9c9d found three cuts that survived (an unchecked lifetime, the expired token
-handed out when the store answers nothing, a sticky refusal); each is a row here and red.
+handed out when the store answers nothing, a sticky refusal), and the review of a6a8e4e two more
+(a lifetime under ten minutes, a harness's replaced pair reader) and a store that fails asked at
+every call; each is a row here and red.
 """
 
 TEST = "tests/test_a_forge_token_a_store_rotates_is_read_again.py"
@@ -20,7 +22,7 @@ SHORT = "beeverforge/adapters/credential/short_lived.py"
 MUTATIONS = [
     # ── the re-read, and where it is handed ────────────────────────────────────────────────────
     ("the re-read is cut: the store is never asked again, the first token is answered", CRED,
-     "        again = axis_answer_for(project, axis, announce=False)\n",
+     "        again = axis_answer_for(project, axis, announce=False, quiet=True)\n",
      "        again = credential_store.Answer(reference=reference, value=first)\n"),
 
     ("the job runner's forge is composed with no provider beside a stored token, as on main",
@@ -82,12 +84,20 @@ MUTATIONS = [
      "    raw = \"\"\n"),
 
     ("an infinite lifetime is accepted (review: survived)", CRED,
-     "    if math.isfinite(ttl) and ttl > 0:\n",
+     "    if math.isfinite(ttl) and 0 < ttl <= STORED_TOKEN_TTL_MAX_SECONDS:\n",
      "    if ttl > 0:\n"),
 
     ("any lifetime is accepted unchecked (review: survived)", CRED,
-     "    if math.isfinite(ttl) and ttl > 0:\n",
+     "    if math.isfinite(ttl) and 0 < ttl <= STORED_TOKEN_TTL_MAX_SECONDS:\n",
      "    if True:\n"),
+
+    ("a finite but huge lifetime is accepted: 1e20 turns the refresh off", CRED,
+     "    if math.isfinite(ttl) and 0 < ttl <= STORED_TOKEN_TTL_MAX_SECONDS:\n",
+     "    if math.isfinite(ttl) and ttl > 0:\n"),
+
+    ("a lifetime under ten minutes is still read again every five (review: survived)", CRED,
+     "    interval = min(STORED_TOKEN_REREAD_SECONDS, ttl / 2)\n",
+     "    interval = STORED_TOKEN_REREAD_SECONDS\n"),
 
     # ── what composing costs ───────────────────────────────────────────────────────────────────
     ("the provider reads the token again instead of taking the one the runner read", FACTORY,
@@ -142,7 +152,24 @@ MUTATIONS = [
      "        refused = refused or again.refused\n"),
 
     ("the re-read token reaches a log", CRED,
-     "        return (again.value, clock() + ttl) if again.value else None\n",
+     "        if again.value:\n            return again.value, clock() + ttl\n",
      "        log.info(\"re-read %s\", again.value)\n"
-     "        return (again.value, clock() + ttl) if again.value else None\n"),
+     "        if again.value:\n            return again.value, clock() + ttl\n"),
+
+    # ── a store that fails (review of a6a8e4e) ─────────────────────────────────────────────────
+    ("a failed re-read is retried at every call", CRED,
+     "        if clock() < retry_at:\n            return None",
+     "        if False:\n            return None"),
+
+    ("the re-read asks the store loudly: its \"nothing is used\" lines beside the held token", CRED,
+     "        again = axis_answer_for(project, axis, announce=False, quiet=True)\n",
+     "        again = axis_answer_for(project, axis, announce=False, quiet=False)\n"),
+
+    ("a failed re-read is not said: the provider's sentence is dropped", CRED,
+     "        log.warning(\"the %s credential `%s` %s when it was read again",
+     "        log.debug(\"the %s credential `%s` %s when it was read again"),
+
+    ("a harness's replaced pair reader is bypassed (review: survived)", CRED,
+     "        if reader is not _PAIR_READERS[axis]:\n",
+     "        if False:\n"),
 ]
