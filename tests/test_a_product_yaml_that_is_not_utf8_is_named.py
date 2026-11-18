@@ -164,3 +164,24 @@ def test_a_source_manifest_not_in_utf8_declares_no_preview(tmp_path):
            "# café\npreview:\n  compose: [c.yml]\n".encode("latin-1"))
 
     assert _declares_preview(str(tmp_path), ".beeverforge/project.yaml") is False
+
+
+def test_an_onboarding_compose_file_not_in_utf8_reaches_nothing_to_ask(tmp_path):
+    from beeverforge.onboarding.infer import Proposal
+    from beeverforge.onboarding.preview_infer import PreviewProposal
+    from beeverforge.onboarding.preview_product import _dirs_asked
+
+    _write(tmp_path, "compose.yaml",
+           b"services:\n  web:\n    build: ../backend\n")
+    raw, _ = FAMILIES["Latin-1"]
+    _write(tmp_path, "ops.yaml", raw)
+    found = PreviewProposal(repo="someone/web", name="web", case="compose",
+                            compose=Proposal(field="preview.compose",
+                                             value=["compose.yaml", "ops.yaml"]))
+
+    asked = _dirs_asked("someone/web", found, Path(os.path.realpath(tmp_path)),
+                        {"web": "someone/web"})
+
+    # the file that is not UTF-8 is skipped, and the one that is still asks about `../backend`
+    assert len(asked) == 1, asked
+    assert "`../backend`" in asked[0], asked

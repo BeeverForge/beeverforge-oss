@@ -16,6 +16,7 @@ _DECODE = "beeverforge/util/utf8.py"
 _LOADER = "beeverforge/product/loader.py"
 _READ = "beeverforge/preview/read.py"
 _PRODUCT = "beeverforge/preview/product.py"
+_ONBOARD = "beeverforge/onboarding/preview_product.py"
 
 MUTATIONS = [
     ("THE DEFECT: the decoder decodes blindly, so Latin-1, UTF-16 with a mark and invalid bytes "
@@ -57,6 +58,10 @@ MUTATIONS = [
     ("a source's own manifest that is not UTF-8 is handed to the YAML loader",
      _PRODUCT, "    if not isinstance(text, str):\n        return False\n",
      "    if text is None:\n        return False\n"),
+
+    ("onboarding hands a compose file that is not UTF-8 to the prescan as if it were text",
+     _ONBOARD, "        if isinstance(text, str):\n            texts[posixpath.join(side, rel)]",
+     "        if text is not None:\n            texts[posixpath.join(side, rel)]"),
 
     ("the remedy is dropped from the sentence",
      _DECODE, "f\"read{hint} — save it as UTF-8.\")", "f\"read{hint}.\")"),
