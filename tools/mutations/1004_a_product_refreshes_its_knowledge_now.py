@@ -105,10 +105,11 @@ MUTATIONS = [
      "    out[\"running_since\"] = None"),
 
     ("a record that cannot be read reads as a product never refreshed", REFRESH,
-     "        out[\"degraded\"] = [\"the record of the product's knowledge refreshes could not be "
+     "        out[\"degraded\"] = [str(exc) if isinstance(exc, _NotUtf8) else\n"
+     "                           \"the record of the product's knowledge refreshes could not be "
      "read — \"\n"
      "                           \"when it was last brought up to date is unknown, not never\"]\n",
-     ""),
+     "        out[\"degraded\"] = [str(exc)] if isinstance(exc, _NotUtf8) else []\n"),
 
     ("a partial refresh is not counted as a refresh", REFRESH,
      "        if done.outcome in (REFRESHED, DEGRADED):",

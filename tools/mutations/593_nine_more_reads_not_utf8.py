@@ -55,10 +55,10 @@ MUTATIONS = [
      "    text, unread = utf8.decode(matches[0].read_bytes(),\n",
      "    text, unread = matches[0].read_text(encoding=\"utf-8\"), \"\"\n    (\n"),
 
-    ("superseding stamps past a requirement it could not read instead of counting it as failed",
+    ("superseding passes over a requirement it could not read instead of counting it as failed",
      _AUTHORING,
-     "        file, text = _retired(folder, requirements_dir, n)\n        if text is None:\n",
-     "        file, text = _retired(folder, requirements_dir, n)\n        if False:\n"),
+     "        if found is None:\n            failed.append(n)\n",
+     "        if found is None:\n            pass\n"),
 
     ("the requirement writers read the file as text again, past the decoder",
      _AUTHORING,
@@ -102,7 +102,8 @@ MUTATIONS = [
      "    text, unread = raw.decode(\"utf-8\"), \"\"\n"),
 
     ("the refresh record's state drops the decoder's sentence for the generic line",
-     _REFRESH, "    except _NotUtf8 as exc:\n", "    except ZeroDivisionError as exc:\n"),
+     _REFRESH, "str(exc) if isinstance(exc, _NotUtf8) else",
+     "str(exc) if isinstance(exc, ZeroDivisionError) else"),
 
     ("a record that is not UTF-8 is refused as a plain ValueError, its sentence lost to the state",
      _REFRESH, "        raise _NotUtf8(unread)\n", "        raise ValueError(\"not UTF-8\")\n"),

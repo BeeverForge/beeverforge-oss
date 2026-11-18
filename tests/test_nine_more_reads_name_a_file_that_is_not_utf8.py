@@ -273,6 +273,24 @@ def test_a_template_not_in_utf8_is_refused_in_the_decoders_words(tmp_path, famil
     _named(why, TEMPLATE_FILE)
 
 
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_template_not_in_utf8_is_a_template_refused_finding_in_the_corpus(tmp_path, family):
+    from beeverforge.product.corpus import load_corpus
+    from beeverforge.product.template import TEMPLATE_FILE
+
+    _put(tmp_path / TEMPLATE_FILE, b"fields: []\n# " + FAMILIES[family])
+    (tmp_path / "0001-x.md").write_text("# REQ-0001 — x\n\n- **Status:** proposed\n",
+                                        encoding="utf-8")
+
+    corpus = load_corpus(tmp_path)
+
+    assert corpus.template is None
+    refused = [f for f in corpus.findings if f.code == "template-refused"]
+    assert len(refused) == 1, corpus.findings
+    assert refused[0].path == TEMPLATE_FILE
+    _named(refused[0].message, TEMPLATE_FILE)
+
+
 # ── the upgrade from an OpenFactory 0.7 stack ───────────────────────────────────────────────────
 
 def _env_0_7(tmp_path: Path, family: str) -> tuple[Path, bytes]:

@@ -1525,18 +1525,19 @@ def land_open_proposals(*, docs_repo: str, forge=None, base: str = "main",
     return landed
 
 
-def _retired(folder: Path, requirements_dir: str, n: int) -> tuple[Path, str | None]:
-    """Requirement `n`'s file and text — the text None, said in the log, when there is no such
-    file or its bytes are not UTF-8 text. NEVER WRITTEN OVER: a file that could not be read is not
+def _retired(folder: Path, requirements_dir: str, n: int) -> tuple[Path, str] | None:
+    """Requirement `n`'s file and its text, or None, said in the log, when there is no such file
+    or its bytes are not UTF-8 text. NEVER WRITTEN OVER: a file that could not be read is not
     stamped, and the caller refuses to land half a supersession."""
     matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
     if not matches:
         log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_MISSING requirement %04d does not exist", n)
-        return folder, None
+        return None
     text, unread = utf8.decode(matches[0].read_bytes(),
                                f"{requirements_dir.strip('/')}/{matches[0].name}")
     if text is None:
         log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_NOT_UTF8 %s", unread)
+        return None
     return matches[0], text
 
 
@@ -1562,10 +1563,11 @@ def _mark_superseded(root: Path, requirements_dir: str, numbers: list[int], *,
     failed: list[int] = []
     folder = root / requirements_dir.strip("/")
     for n in numbers or []:
-        file, text = _retired(folder, requirements_dir, n)
-        if text is None:
+        found = _retired(folder, requirements_dir, n)
+        if found is None:
             failed.append(n)
             continue
+        file, text = found
         if re.search(r"superseded[-\s]?by", text, re.IGNORECASE):
             continue
         if _is_dropped(text):

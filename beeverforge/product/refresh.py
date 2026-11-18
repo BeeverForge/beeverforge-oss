@@ -374,15 +374,11 @@ def state(project, *, now: datetime | None = None) -> dict:
                  "running_since": None}
     try:
         held = _read(record_path(project))
-    except _NotUtf8 as exc:
-        log.warning("the knowledge refresh record of %s could not be read (%s)",
-                    getattr(project, "name", "?"), exc)
-        out["degraded"] = [str(exc)]
-        return out
     except Exception as exc:  # noqa: BLE001 — "could not be read" is an answer too
         log.warning("the knowledge refresh record of %s could not be read (%s)",
                     getattr(project, "name", "?"), exc)
-        out["degraded"] = ["the record of the product's knowledge refreshes could not be read — "
+        out["degraded"] = [str(exc) if isinstance(exc, _NotUtf8) else
+                           "the record of the product's knowledge refreshes could not be read — "
                            "when it was last brought up to date is unknown, not never"]
         return out
     last = held.get("last") if isinstance(held.get("last"), dict) else {}
