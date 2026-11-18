@@ -181,10 +181,10 @@ def load_thresholds(path: Path | None = None) -> list[Threshold]:
     where = Path(path) if path is not None else THRESHOLDS_FILE
     import yaml
 
-    from beeverforge.util import yaml_io
+    from beeverforge.util import utf8, yaml_io
 
     try:
-        data = yaml_io.load(where.read_text(encoding="utf-8"))
+        data = yaml_io.load(utf8.text_of(where, str(where), ThresholdsError))
     except OSError as exc:
         raise ThresholdsError(f"{where} could not be read ({exc.strerror or exc})") from None
     except yaml.YAMLError as exc:

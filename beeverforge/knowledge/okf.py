@@ -25,6 +25,7 @@ sentence to enter the bundle.
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from pathlib import Path
@@ -39,7 +40,9 @@ from beeverforge.knowledge.contracts import (
     Gap,
     OkfManifest,
 )
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
+
+log = logging.getLogger("beeverforge.knowledge.okf")
 
 #: The bundle's own directory name, and the manifest inside it. `.okf/` rather than `knowledge/`
 #: so the name cannot collide with a client directory called `knowledge` — which
@@ -243,16 +246,26 @@ def parse_manifest(text: str) -> OkfManifest | None:
 
 
 def read_manifest(bundle_dir: Path) -> OkfManifest | None:
-    """The published `okf.yaml`, or `None` when there is none or it cannot be read.
+    """The published `okf.yaml`, or `None` when there is none or it cannot be read — a manifest
+    that is not UTF-8 included, logged by name with the byte where it stops being UTF-8.
 
     THE FIRST READER OF THIS FILE. Until the refresh learned to renew concepts, the manifest was
     written by the backfill and read by nothing — which is how it could share a filename with the
     module map's manifest for two days without anybody noticing (see `OKF_MANIFEST_FILE`)."""
-    path = Path(bundle_dir) / OKF_MANIFEST_FILE
+    return parse_manifest(_manifest_text(Path(bundle_dir) / OKF_MANIFEST_FILE))
+
+
+def _manifest_text(path: Path) -> str:
+    """The manifest's text, or `""` — which `parse_manifest` reads as no manifest — when it
+    cannot be read, a manifest that is not UTF-8 logged by name with the decoder's sentence."""
     try:
-        return parse_manifest(path.read_text(encoding="utf-8"))
+        text, unread = utf8.decode(path.read_bytes(), str(path))
     except OSError:
-        return None
+        return ""
+    if text is None:
+        log.warning("BEEVERFORGE_OKF_MANIFEST_NOT_UTF8 %s", unread)
+        return ""
+    return text
 
 
 def write_okf(bundle_dir: Path, *, manifest: OkfManifest, concepts: list[Concept]) -> list[Path]:

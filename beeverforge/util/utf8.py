@@ -33,13 +33,14 @@ def decode(raw: bytes, shown: str) -> tuple[str | None, str]:
     return text, ""
 
 
-def text_of(path: Path, shown: str) -> str:
-    """The file at `path` as UTF-8 text, whatever the machine's locale — or a `ValueError`
-    carrying `decode`'s sentence, for a reader that already refuses a file it cannot use by
-    catching `ValueError` (the project's manifest, as `loader` and `explain` read it)."""
+def text_of(path: Path, shown: str, refused: type[ValueError] = ValueError) -> str:
+    """The file at `path` as UTF-8 text, whatever the machine's locale — or `refused` carrying
+    `decode`'s sentence alone: a `ValueError` for a reader that already refuses a file it cannot
+    use by catching one (the project's manifest, as `loader` and `explain` read it), or the
+    reader's own refusal (a thresholds file, a battery, a fixture's product manifest)."""
     text, unread = decode(path.read_bytes(), shown)
     if text is None:
-        raise ValueError(unread)
+        raise refused(unread)
     return text
 
 
