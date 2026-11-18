@@ -160,7 +160,10 @@ def _ask(kind: str, name: str, *, quiet: bool = False) -> Answer:
     """What the store `kind` answers for `name`. Never raises: an unknown kind and a store that
     refuses or fails are an `Answer` that says why, by reference, and holds nothing. `quiet` is
     for a reader that asks only WHETHER it refuses (the doctor) and says so itself, or that uses
-    nothing it reads (a scrub): what it is told goes to DEBUG, never to a warning."""
+    nothing it reads (a scrub): what it is told goes to DEBUG, never to a warning. The third quiet
+    reader is the re-read of a held token (`credentials.stored_token_provider`), which says the
+    failure in its own WARNING; so a quiet failure still carries what the store raised in its
+    message, and only the traceback is left to the loud path."""
     reference = f"{kind}:{name}"
     try:
         store = build_store(kind)
@@ -181,9 +184,12 @@ def _ask(kind: str, name: str, *, quiet: bool = False) -> Answer:
         # of every store at each call, and a store that fails wrote one warning with a traceback
         # per entry per scrub, each about a credential nobody was about to use. A reader that
         # uses the credential asks loudly and says it at WARNING, with the traceback.
+        # AND WHAT IT RAISED IS SAID EITHER WAY (review of e8138e9): quiet left only the class name,
+        # so a store defect met by the re-read of a held token reached no log, at any level
         log.log(logging.DEBUG if quiet else logging.WARNING,
-                "the %s credential store failed reading `%s`; it is treated as a refusal and "
-                "nothing is used in its place", kind, name, exc_info=not quiet)
+                "the %s credential store failed reading `%s` (%s: %s); it is treated as a refusal "
+                "and nothing is used in its place", kind, name, type(exc).__name__, exc,
+                exc_info=not quiet)
         return Answer(reference=reference,
                       refused=f"the {kind} store failed reading `{name}` ({type(exc).__name__})")
     return Answer(reference=reference, value=value) if value else NOTHING
@@ -231,14 +237,15 @@ def stored_answer(name: str) -> tuple[str, str | None]:
     return (found.reference, found.value) if found.value else ("", None)
 
 
-def chain(names: Iterable[str]) -> Answer:
+def chain(names: Iterable[str], *, quiet: bool = False) -> Answer:
     """The first of `names` that answers — and NOTHING AFTER A REFUSAL: a refused name ends the
     walk with its refusal, because the next name is another credential, and a secret the
     deployment did not choose is not replaced by one it did not name for this (review of #822:
     a refused `BEEVERFORGE_TRACKER_TOKEN` became `BEEVERFORGE_BOT_TOKEN`). Spelled as a table at
-    the call, `chain(("A", "B"))`, which is how `environ.names_read` keeps both names reserved."""
+    the call, `chain(("A", "B"))`, which is how `environ.names_read` keeps both names reserved.
+    `quiet` is `lookup`'s: for a reader that says what a refusal means itself."""
     for name in names:
-        found = lookup(name)
+        found = lookup(name, quiet=quiet)
         if found.value or found.refused:
             return found
     return NOTHING

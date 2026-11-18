@@ -41,8 +41,8 @@ MUTATIONS = [
     ("no refresh margin, so a token with seconds left is handed to a request whose round trip is "
      "bounded at 60 — a 401 on the last station of a job that had done all its work",
      "beeverforge/adapters/credential/short_lived.py",
-     "            if held is not None and time.time() < held[1] - self._margin:",
-     "            if held is not None and time.time() < held[1]:"),
+     "            if held is not None and self._clock() < held[1] - self._margin:",
+     "            if held is not None and self._clock() < held[1]:"),
 
     ("the margin is zero by another route — same failure, spelled in the constant",
      "beeverforge/adapters/credential/short_lived.py",
@@ -63,13 +63,13 @@ MUTATIONS = [
     ("a failed refresh evicts a credential still valid for fifty minutes, turning a laptop off the "
      "VPN for one minute into the mid-job auth failure this path exists to prevent",
      "beeverforge/adapters/credential/short_lived.py",
-     "            if held is not None and time.time() < held[1]:\n                return held[0]\n            return None",
+     "            if held is not None and self._clock() < held[1]:\n                return held[0]\n            return None",
      "            return None"),
 
     ("a failed refresh hands back an EXPIRED token, so the 401 blames the credential instead of "
      "the refresh that failed",
      "beeverforge/adapters/credential/short_lived.py",
-     "            if held is not None and time.time() < held[1]:\n                return held[0]\n            return None",
+     "            if held is not None and self._clock() < held[1]:\n                return held[0]\n            return None",
      "            if held is not None:\n                return held[0]\n            return None"),
 
     # ── what the CLI actually answers ───────────────────────────────────────────────────────────
