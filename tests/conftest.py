@@ -148,10 +148,25 @@ class _HandDown:
 #: calls an entry point that deployment's live credentials under the new names.
 OPERATOR_PREFIXES = ("BEEVERFORGE_", "TEMPORAL_", "OPENFACTORY_")
 
+#: THE SUITE'S OWN LOCALE, for every test and every subprocess one starts. A tool speaks the
+#: machine's language: under `LANG=pt_BR.UTF-8` git said `Permissão negada` where
+#: `test_a_file_the_scan_could_not_READ_is_never_reported_as_a_CREDENTIAL` looks for
+#: `Permission denied`, and that test was red on an untouched tree — and the next test that reads a
+#: tool's sentence would fail the same way. `C.UTF-8` is English messages with UTF-8 text; where a
+#: libc lacks it, the C library falls back to `C`, still English. `LANGUAGE` is deleted beside it,
+#: because GNU gettext reads it AHEAD of `LC_ALL` for its message catalogues: a pinned `LC_ALL`
+#: under the shell's `LANGUAGE=pt_BR` still speaks Portuguese.
+#: `tests/test_the_suite_pins_its_own_locale.py` is the guard.
+SUITE_LOCALE = "C.UTF-8"
+#: The operator's own `LC_ALL`/`LANGUAGE` (None when unset), put back by `pytest_unconfigure`.
+#: Locale names, not secrets, so the values themselves are kept.
+_OPERATOR_LOCALE: dict[str, str | None] = {}
+
 
 def _isolate_the_operator(suite_home: Path, workerinput: dict | None = None) -> None:
     """Capture the operator's home and ambient `BEEVERFORGE_*`/`TEMPORAL_*`, then take both away:
-    point `HOME` at a directory of the suite's own and delete every one of those variables.
+    point `HOME` at a directory of the suite's own and delete every one of those variables. Pin
+    the locale too (`SUITE_LOCALE`), so a tool's sentence reads the same on every machine.
 
     Called from `pytest_configure`, BEFORE collection — the same window the registry hook below
     runs in, and for the same reason: a module or a module-scoped fixture that resolves a default
@@ -181,6 +196,16 @@ def _isolate_the_operator(suite_home: Path, workerinput: dict | None = None) -> 
     gh_config = suite_home / ".config" / "gh"
     gh_config.mkdir(parents=True, exist_ok=True)
     os.environ["GH_CONFIG_DIR"] = str(gh_config)
+    _pin_the_locale()
+
+
+def _pin_the_locale() -> None:
+    """`SUITE_LOCALE` for everything the suite starts, whatever the shell had (`SUITE_LOCALE`
+    says why). A constant, so an xdist worker pins it for itself and nothing is handed down."""
+    for name in ("LC_ALL", "LANGUAGE"):
+        _OPERATOR_LOCALE.setdefault(name, os.environ.get(name))
+    os.environ["LC_ALL"] = SUITE_LOCALE
+    os.environ.pop("LANGUAGE", None)
 
 
 def _digest(value: str) -> str:
@@ -817,6 +842,10 @@ def pytest_unconfigure(config) -> None:
         shutil.rmtree(home, ignore_errors=True)
     if _OPERATOR_HOME is not None:
         os.environ["HOME"] = str(_OPERATOR_HOME)
+    for name, value in _OPERATOR_LOCALE.items():
+        os.environ.pop(name, None)
+        if value is not None:
+            os.environ.setdefault(name, value)
 
 
 @pytest.fixture(autouse=True)

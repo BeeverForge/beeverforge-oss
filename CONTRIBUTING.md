@@ -51,6 +51,10 @@ names a temporary registry before collection and a separate one for every test, 
 never reads or writes the registry named by your `BEEVERFORGE_REGISTRY` or the default file in
 your home directory. You do not need to unset it. A regression guard runs a known registry writer
 and an import-time writer with a sentinel registry and verifies that the sentinel is unchanged.
+Before collection it also points `HOME` at a directory of its own, deletes every
+`BEEVERFORGE_*`, `TEMPORAL_*` and `OPENFACTORY_*` variable your shell carries, and runs every test
+and every subprocess a test starts under `LC_ALL=C.UTF-8` with `LANGUAGE` cleared, so a tool's
+message reads the same whatever your shell's locale. You do not need to export any of these.
 
 **Running it.** `make test` is `python -m pytest -q`: the whole suite (`tests/`, and
 `addons/*/tests` where the tree has them) in one process, in a random order — pytest-randomly
