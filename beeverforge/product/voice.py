@@ -2641,6 +2641,11 @@ _IMPORT_SAID = {
                   "então nada entrou."),
         "en": ("importing this would leave the product's requirements inconsistent ({broken}), so "
                "nothing landed.")},
+    "not_utf8": {
+        "pt-BR": ("um arquivo de requisito que a importação mudaria não está em UTF-8, então nada "
+                  "entrou: {unread}"),
+        "en": ("a requirement file the import would change is not UTF-8 text, so nothing landed: "
+               "{unread}")},
     "failed": {"pt-BR": "não consegui importar {origin} agora — nada foi escrito.",
                "en": "I could not import {origin} just now — nothing was written."},
 }
