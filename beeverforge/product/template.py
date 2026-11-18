@@ -48,7 +48,7 @@ from pydantic import (
     field_validator,
 )
 
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 #: the product's template, inside the directory of the requirements it describes
 TEMPLATE_FILE = "template.yaml"
@@ -234,6 +234,16 @@ def read_template(text: str) -> RequirementTemplate:
         raise ValueError(f"{where}: {first['msg'].removeprefix('Value error, ')}") from None
 
 
+def _template_text(path: Path) -> tuple[str | None, str]:
+    """The template's text, or why it cannot be read: the system's words, or the decoder's
+    sentence naming the byte and the remedy when it is not UTF-8 text."""
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        return None, f"{TEMPLATE_FILE} cannot be read: {error}"
+    return utf8.decode(raw, TEMPLATE_FILE)
+
+
 def load_template(requirements_dir: str | Path) -> tuple[RequirementTemplate | None, str]:
     """A product's template from its requirements directory: `(template, "")`; `(None, "")` when
     it has none; `(None, why)` when it has one that cannot be used — which the caller logs by name,
@@ -241,10 +251,9 @@ def load_template(requirements_dir: str | Path) -> tuple[RequirementTemplate | N
     path = Path(requirements_dir) / TEMPLATE_FILE
     if not path.is_file():
         return None, ""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        return None, f"{TEMPLATE_FILE} cannot be read: {error}"
+    text, unread = _template_text(path)
+    if text is None:
+        return None, unread
     try:
         found = read_template(text)
     except ValueError as error:

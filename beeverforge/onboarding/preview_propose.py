@@ -51,7 +51,7 @@ from beeverforge.onboarding.preview_infer import (
     infer_preview,
     weakest,
 )
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 from beeverforge.util.bounded import BoundedDict
 
 log = logging.getLogger("beeverforge.onboarding.preview_propose")
@@ -975,6 +975,21 @@ def relocated(out: Draft, folder: str) -> Draft:
     return Draft.model_validate_json(in_folder(out.model_dump_json(), folder))
 
 
+def _manifest_text(checkout: Path, manifest: Path, *, repo: str, name: str) -> str | Outcome:
+    """The manifest the `preview:` block goes into, as text — or the refusal: there is none, or
+    its bytes are not UTF-8 text, named with the byte and the remedy. Nothing is written either
+    way."""
+    if not manifest.is_file():
+        return Outcome(repo=repo, detail=(
+            f"`{repo}` declares no manifest on its base branch, and the `preview:` block goes "
+            f"into it — `beeverforge onboard {name} --yes` proposes the manifest; propose "
+            f"the preview once that is merged. Nothing was written."))
+    text, unread = utf8.decode(manifest.read_bytes(), manifest.relative_to(checkout).as_posix())
+    if text is None:
+        return Outcome(repo=repo, detail=unread + " Nothing was written.")
+    return text
+
+
 def _draft_into(checkout: Path, project, *, repo: str, accept: bool,
                 answers: dict[str, Any] | None) -> _Written | Outcome:
     """Read `checkout`, draft, and WRITE the draft into it — files and the manifest's block.
@@ -986,12 +1001,9 @@ def _draft_into(checkout: Path, project, *, repo: str, accept: bool,
         manifest = namespace.resolve(checkout, manifest_rel, project=project.name)
     except namespace.RetiredNamespace as exc:
         return Outcome(repo=repo, detail=str(exc))
-    if not manifest.is_file():
-        return Outcome(repo=repo, detail=(
-            f"`{repo}` declares no manifest on its base branch, and the `preview:` block goes "
-            f"into it — `beeverforge onboard {project.name} --yes` proposes the manifest; propose "
-            f"the preview once that is merged. Nothing was written."))
-    text = manifest.read_text(encoding="utf-8")
+    text = _manifest_text(checkout, manifest, repo=repo, name=project.name)
+    if isinstance(text, Outcome):
+        return text
     proposal = infer_preview(checkout, name=_short(repo) or project.name)
     folder = namespace.dir_in(checkout)
     out = relocated(draft(proposal, accept=accept, answers=answers), folder)

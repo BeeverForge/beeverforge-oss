@@ -37,6 +37,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from beeverforge.util import utf8
+
 log = logging.getLogger("beeverforge.product.refresh")
 
 #: Who ran a pass: the knowledge pipeline's schedule, or somebody who asked (`product_refresh`).
@@ -267,12 +269,30 @@ def record_path(project) -> Path:
     return product_state_dir(product_key(project)) / RECORD_FILE
 
 
+class _NotUtf8(ValueError):
+    """The record's bytes are not UTF-8 text: the decoder's sentence, naming the file, the offset
+    and the remedy, is the exception's whole text."""
+
+
+def _record_text(path: Path) -> str | None:
+    """The record's text — None when no pass ever wrote it; `_NotUtf8` when its bytes are not
+    UTF-8 text."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    text, unread = utf8.decode(raw, str(path))
+    if text is None:
+        raise _NotUtf8(unread)
+    return text
+
+
 def _read(path: Path) -> dict:
     """The record as it stands — `{}` when no pass ever wrote it. Raises `OSError`/`ValueError` when
-    it exists and cannot be read: "unknown" and "never" are two different answers."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    it exists and cannot be read: "unknown" and "never" are two different answers. Bytes that are
+    not UTF-8 text raise `_NotUtf8`, a `ValueError` whose text names the file and the byte."""
+    text = _record_text(path)
+    if text is None:
         return {}
     held = json.loads(text)
     if not isinstance(held, dict):
@@ -354,6 +374,11 @@ def state(project, *, now: datetime | None = None) -> dict:
                  "running_since": None}
     try:
         held = _read(record_path(project))
+    except _NotUtf8 as exc:
+        log.warning("the knowledge refresh record of %s could not be read (%s)",
+                    getattr(project, "name", "?"), exc)
+        out["degraded"] = [str(exc)]
+        return out
     except Exception as exc:  # noqa: BLE001 — "could not be read" is an answer too
         log.warning("the knowledge refresh record of %s could not be read (%s)",
                     getattr(project, "name", "?"), exc)
@@ -362,12 +387,7 @@ def state(project, *, now: datetime | None = None) -> dict:
         return out
     last = held.get("last") if isinstance(held.get("last"), dict) else {}
     out["refreshed_at"] = held.get("refreshed_at") or None
-    for key in ("outcome", "by", "finished_at"):
-        out[key] = last.get(key) or None
-    for key in ("documents", "index", "semantic"):
-        out[key] = str(last.get(key) or "")
-    out["sources"] = [str(s) for s in last.get("sources") or []]
-    out["degraded"] = [str(s) for s in last.get("degraded") or []]
+    out.update(_last_pass(last or {}))
     running = [v for v in (held.get("running") or {}).values() if isinstance(v, dict)]
     live = sorted(str(v.get("started_at")) for v in running
                   if not _stale(v.get("started_at"), now))
@@ -383,6 +403,15 @@ def state(project, *, now: datetime | None = None) -> dict:
                    degraded=[f"a refresh started at {newest.get('started_at')} never finished — "
                              f"the worker running it stopped before it ended; ask again"])
     return out
+
+
+def _last_pass(last: dict) -> dict:
+    """What `state` says of the last pass, from its row in the record."""
+    said: dict = {key: last.get(key) or None for key in ("outcome", "by", "finished_at")}
+    said.update({key: str(last.get(key) or "") for key in ("documents", "index", "semantic")})
+    said["sources"] = [str(s) for s in last.get("sources") or []]
+    said["degraded"] = [str(s) for s in last.get("degraded") or []]
+    return said
 
 
 def sentence_for(project_name: str, flight: str) -> str:

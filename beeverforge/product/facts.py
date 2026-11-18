@@ -56,6 +56,7 @@ from pathlib import Path
 
 from beeverforge.memory.ledger import DECISION, Loop, fold, waiting
 from beeverforge.techlead.pack import _MIN_BODY, _PREFIX, _exclude, manifest, pack_dir
+from beeverforge.util import utf8
 
 log = logging.getLogger("beeverforge.product")
 
@@ -329,22 +330,43 @@ def add_file(into: Path, name: str, body: str) -> bool:
         target = into / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
-        _name_in_readme(into, name)
-        return True
+        return _named_in_readme(into, name)
     except OSError as exc:  # noqa: BLE001 — a search that could not be written is said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False
 
 
-def _name_in_readme(into: Path, name: str) -> None:
+def _named_in_readme(into: Path, name: str) -> bool:
+    """`_name_in_readme`, said: False, with the reason in the log, when the README could not be
+    read."""
+    unread = _name_in_readme(into, name)
+    if unread:
+        log.warning("could not add %s to the product facts: %s", name, unread)
+        return False
+    return True
+
+
+def _name_in_readme(into: Path, name: str) -> str:
+    """Name `name` in the pack's README — `""`, or the sentence saying why the README could not
+    be read, which is then left as it is."""
     readme = into / "README.md"
-    text = readme.read_text(encoding="utf-8")
-    line = f"- `{into.name}/{name}`"
-    if line not in text:
-        marker = "\n\n## What could NOT be read"
-        text = (text.replace(marker, f"\n{line}{marker}", 1) if marker in text
-                else f"{text.rstrip()}\n{line}\n")
-        readme.write_text(text, encoding="utf-8")
+    text, unread = utf8.decode(readme.read_bytes(), f"{into.name}/README.md")
+    if text is None:
+        return unread
+    named = _with_line(text, f"- `{into.name}/{name}`")
+    if named != text:
+        readme.write_text(named, encoding="utf-8")
+    return ""
+
+
+def _with_line(text: str, line: str) -> str:
+    """The README's `text` naming `line`: before the closing section on what could not be read,
+    or at its end."""
+    if line in text:
+        return text
+    marker = "\n\n## What could NOT be read"
+    return (text.replace(marker, f"\n{line}{marker}", 1) if marker in text
+            else f"{text.rstrip()}\n{line}\n")
 
 
 #: The one kind of file a pack holds that is not text: an image a person attached (#336), put in
@@ -364,8 +386,7 @@ def add_image(into: Path, name: str, data: bytes) -> bool:
         target = into / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-        _name_in_readme(into, name)
-        return True
+        return _named_in_readme(into, name)
     except OSError as exc:  # noqa: BLE001 — said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False

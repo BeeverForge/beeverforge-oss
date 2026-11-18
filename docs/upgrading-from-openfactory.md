@@ -78,6 +78,11 @@ This is the deployment `install.sh` set up: a directory holding `docker-compose.
    hold one moment: 0.7's state when that run stopped it, including any work 0.7 did after you
    started it again meanwhile.
 
+   A `.env.compose` whose bytes are not UTF-8 text stops the installer before anything is stopped
+   or copied, and the file is left as it was. The refusal names the file and the byte offset where
+   it stops being UTF-8 text; save it as UTF-8 and run the installer again with `--force` to resume
+   the upgrade.
+
 4. **Check it.** `beeverforge project list` shows 0.7's projects. A card 0.7 had in flight is picked
    up by the BeeverForge worker where it stood, and a parked one resumes as before.
    `beeverforge doctor <project>` lists the former names still in use.

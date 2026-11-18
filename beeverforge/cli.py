@@ -2171,11 +2171,12 @@ def upgrade_from_openfactory_cmd(
 
     version = (os.environ.get("BEEVERFORGE_VERSION") or "").strip()
     chosen = image or (f"ghcr.io/beeverforge/beeverforge-cli:{version}" if version else "")
-    if not chosen and up.is_a_0_7_file(Path(env_file)):
-        typer.echo("✗ no image to copy with: pass --image, or set BEEVERFORGE_VERSION to the "
-                   "release being installed")
-        raise typer.Exit(2)
     try:
+        # the early check refuses as the carry does: a file that is not UTF-8 text is said here
+        if not chosen and up.is_a_0_7_file(Path(env_file)):
+            typer.echo("✗ no image to copy with: pass --image, or set BEEVERFORGE_VERSION to the "
+                       "release being installed")
+            raise typer.Exit(2)
         done = up.carry(Path(env_file), docker=docker, image=chosen)
     except up.Refused as exc:
         typer.echo(f"✗ {exc}")

@@ -51,6 +51,7 @@ from beeverforge.product.corpus import (
 )
 from beeverforge.product.role import IssueDraft, RequirementDraft
 from beeverforge.product.template import EMPTY, RequirementTemplate, load_template
+from beeverforge.util import utf8
 
 log = logging.getLogger("beeverforge.product")
 
@@ -1524,6 +1525,21 @@ def land_open_proposals(*, docs_repo: str, forge=None, base: str = "main",
     return landed
 
 
+def _retired(folder: Path, requirements_dir: str, n: int) -> tuple[Path, str | None]:
+    """Requirement `n`'s file and text — the text None, said in the log, when there is no such
+    file or its bytes are not UTF-8 text. NEVER WRITTEN OVER: a file that could not be read is not
+    stamped, and the caller refuses to land half a supersession."""
+    matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
+    if not matches:
+        log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_MISSING requirement %04d does not exist", n)
+        return folder, None
+    text, unread = utf8.decode(matches[0].read_bytes(),
+                               f"{requirements_dir.strip('/')}/{matches[0].name}")
+    if text is None:
+        log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_NOT_UTF8 %s", unread)
+    return matches[0], text
+
+
 def _mark_superseded(root: Path, requirements_dir: str, numbers: list[int], *,
                      by: int) -> tuple[list[str], list[int]]:
     """Stamp `superseded-by` on each retired requirement — `(paths changed, numbers that FAILED)`.
@@ -1546,13 +1562,10 @@ def _mark_superseded(root: Path, requirements_dir: str, numbers: list[int], *,
     failed: list[int] = []
     folder = root / requirements_dir.strip("/")
     for n in numbers or []:
-        matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
-        if not matches:
-            log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_MISSING requirement %04d does not exist", n)
+        file, text = _retired(folder, requirements_dir, n)
+        if text is None:
             failed.append(n)
             continue
-        file = matches[0]
-        text = file.read_text(encoding="utf-8")
         if re.search(r"superseded[-\s]?by", text, re.IGNORECASE):
             continue
         if _is_dropped(text):
@@ -2238,6 +2251,26 @@ def add_decision_row(text: str, *, day: str, decision: str, who: str,
     return text[:start] + "\n".join([*lines, row]) + "\n" + text[end:], "written"
 
 
+def _requirement_text(target: Path, path: str, *,
+                      missing: WriteResult) -> tuple[str, WriteResult | None]:
+    """The requirement's text, or the writer's refusal: `missing` when there is no file, and the
+    decoder's sentence when its bytes are not UTF-8 text — a file that is then never written over,
+    the person told how to fix it."""
+    if not target.is_file():
+        return "", missing
+    text, unread = utf8.decode(target.read_bytes(), path)
+    if text is None:
+        return "", _unread(path, unread)
+    return text, None
+
+
+def _unread(path: str, sentence: str) -> WriteResult:
+    """A requirement whose bytes are not UTF-8 text, refused with the decoder's `sentence` (the
+    file, the byte, the remedy): a file this module cannot read is a failure, as a status it does
+    not recognise is."""
+    return WriteResult(ok=False, refusal=NOT_REFUSED, ref=path, detail=sentence)
+
+
 def record_decision(*, docs_repo: str, clone_url: str, path: str, number: int,
                     decision: str, decided_by: str, where: str = "", base: str = "main",
                     today: str | None = None,
@@ -2273,10 +2306,10 @@ a conversation that scrolls. The role said it better than anybody: *"if this onl
             return WriteResult(ok=False, refusal=NOT_REFUSED,
                                detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
         target = tmp / path
-        if not target.is_file():
-            return WriteResult(ok=False, refusal=NOT_FOUND,
-                               detail=_w(language, "decision_not_found", number=number))
-        text = target.read_text(encoding="utf-8")
+        text, refused = _requirement_text(target, path, missing=WriteResult(
+            ok=False, refusal=NOT_FOUND, detail=_w(language, "decision_not_found", number=number)))
+        if refused:
+            return refused
         updated, outcome = add_decision_row(text, day=day, decision=decision,
                                             who=decided_by, where=where, language=language)
         if outcome == "duplicate":
@@ -2346,10 +2379,10 @@ def accept_requirement(*, docs_repo: str, clone_url: str, path: str, number: int
             return WriteResult(ok=False, refusal=NOT_REFUSED,
                                detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
         target = tmp / path
-        if not target.is_file():
-            return WriteResult(ok=False, detail=_w(language, "accept_not_found", number=number),
-                               refusal=NOT_FOUND)
-        text = target.read_text(encoding="utf-8")
+        text, refused = _requirement_text(target, path, missing=WriteResult(
+            ok=False, detail=_w(language, "accept_not_found", number=number), refusal=NOT_FOUND))
+        if refused:
+            return refused
         updated, outcome = _set_status_accepted(text, accepted_by=accepted_by, day=day)
         if outcome == "already":
             return WriteResult(ok=True, ref=path, existed=True,
@@ -2427,10 +2460,10 @@ def drop_requirement(*, docs_repo: str, clone_url: str, path: str, number: int,
             return WriteResult(ok=False, refusal=NOT_REFUSED,
                                detail=f"could not clone {docs_repo}: {_scrub(out)[-200:]}")
         target = tmp / path
-        if not target.is_file():
-            return WriteResult(ok=False, refusal=NOT_FOUND,
-                               detail=_w(language, "drop_not_found", number=number))
-        text = target.read_text(encoding="utf-8")
+        text, refused = _requirement_text(target, path, missing=WriteResult(
+            ok=False, refusal=NOT_FOUND, detail=_w(language, "drop_not_found", number=number)))
+        if refused:
+            return refused
         updated, outcome = _set_status_dropped(text, dropped_by=dropped_by, day=day, reason=reason)
         if outcome == "already":
             return WriteResult(ok=True, ref=path, existed=True,

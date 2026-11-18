@@ -295,6 +295,13 @@ DECIDED_ELSEWHERE = {
         "test_dropping_a_requirement_another_already_replaced_is_a_refusal_with_a_next_step",
         "tests/test_requirement_can_be_dropped.py::"
         "test_dropping_a_requirement_file_NOBODY_can_parse_is_a_failure"),
+    "_unread:sentence": (
+        "tests/test_nine_more_reads_name_a_file_that_is_not_utf8.py::"
+        "test_recording_a_decision_refuses_a_requirement_not_in_utf8",
+        "tests/test_nine_more_reads_name_a_file_that_is_not_utf8.py::"
+        "test_accepting_refuses_a_requirement_not_in_utf8",
+        "tests/test_nine_more_reads_name_a_file_that_is_not_utf8.py::"
+        "test_dropping_refuses_a_requirement_not_in_utf8"),
 }
 
 
