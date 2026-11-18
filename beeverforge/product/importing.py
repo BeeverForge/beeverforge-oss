@@ -1048,15 +1048,12 @@ def _supersede_failed(unread: str) -> str:
 
 def _not_utf8(root: Path, folder: str, numbers: list[int]) -> str:
     """Why a requirement `land` had to mark replaced could not be, when it is a file that is not
-    UTF-8: the decoder's sentence for the first such file among `numbers`, found by number prefix
-    and shown as `_mark_superseded` shows it. Empty when none is — a missing file, or one with no
-    status line, stays `supersede_failed`."""
-    for n in numbers:
-        for path in sorted((root / folder).glob(f"{n:04d}-*.md"))[:1]:
-            _text, unread = utf8.decode(path.read_bytes(), f"{folder}/{path.name}")
-            if unread:
-                return unread
-    return ""
+    UTF-8: the decoder's sentence for the first such file among `numbers`, from the lookup
+    `_mark_superseded` itself reads through (`authoring.unread_requirement`). Empty when none is —
+    a missing file, or one with no status line, stays `supersede_failed`."""
+    from beeverforge.product.authoring import unread_requirement
+
+    return next((unread for n in numbers if (unread := unread_requirement(root, folder, n))), "")
 
 
 class _Outside(OSError):

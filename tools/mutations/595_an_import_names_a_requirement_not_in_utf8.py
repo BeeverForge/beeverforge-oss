@@ -15,6 +15,7 @@ guard must go red on each.
 TEST = "tests/test_an_import_names_a_requirement_not_in_utf8.py"
 
 IMPORTING = "beeverforge/product/importing.py"
+AUTHORING = "beeverforge/product/authoring.py"
 
 MUTATIONS = [
     ("joining decisions reads the requirement as text again, so a Latin-1 one raises",
@@ -37,8 +38,9 @@ MUTATIONS = [
      "                    done.unread = _not_utf8(root, folder, failed)\n",
      "                    done.unread = \"\"\n"),
 
-    ("the revision's helper decodes nothing, so a requirement that is not UTF-8 reads as text",
-     IMPORTING,
-     "            _text, unread = utf8.decode(path.read_bytes(), f\"{folder}/{path.name}\")\n",
-     "            _text, unread = path.read_bytes().decode(\"utf-8\", \"replace\"), \"\"\n"),
+    ("the revision's lookup hands back no sentence, so a requirement that is not UTF-8 reads as "
+     "one that was readable",
+     AUTHORING,
+     "    return _numbered(root / requirements_dir.strip(\"/\"), requirements_dir, n)[2]\n",
+     "    return \"\"\n"),
 ]
