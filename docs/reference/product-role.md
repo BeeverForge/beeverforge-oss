@@ -15,7 +15,9 @@ The role refuses to run half-configured, so three places name each other:
 | the context repo | `.beeverforge/product.yaml` — `product: <name>` + `sources:` (EVERY repo implementing it) |
 | each source repo | `docs_repo: <org>/<name>-context` in its `.beeverforge/project.yaml` |
 
-A mismatch is reported as a sentence naming both sides, not a stack trace. Two of the three are
+A mismatch is reported as a sentence naming both sides, not a stack trace. `product.yaml` is read
+as UTF-8: a file saved in another encoding (Latin-1, UTF-16) is refused with a sentence naming the
+byte offset where it stops being UTF-8 and the remedy, save it as UTF-8. Two of the three are
 written for you:
 
 ```bash

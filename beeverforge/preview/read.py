@@ -31,13 +31,14 @@ import os
 import posixpath
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 import yaml
 from pydantic import BaseModel, ConfigDict
 
 from beeverforge.contracts.manifest import PreviewConfig
 from beeverforge.preview.plan import Layout, Refused, Side
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 #: The only variables the compose CLI is run with. `--env-file /dev/null` keeps the project's
 #: `.env` out of interpolation, and a reduced environment keeps the worker's own out: a
@@ -295,15 +296,56 @@ def canonicalise(base_root: str, files: Sequence[str], *,
     return doc
 
 
-def _read_inside(root: str, path: str) -> str | None:
+@dataclass(frozen=True)
+class NotUtf8:
+    """A file inside the checkout whose bytes are not UTF-8 text: `reason` is the one sentence
+    naming it, the offset and the remedy, which every caller turns into its own refusal."""
+
+    reason: str
+
+
+def _read_inside(root: str, path: str, shown: str | None = None) -> str | NotUtf8 | None:
     """The text of `path` when it is a file INSIDE `root` once every link is followed; None
-    otherwise. A compose file that is a link out of the checkout is not the checkout's file."""
+    otherwise. A compose file that is a link out of the checkout is not the checkout's file.
+
+    `NotUtf8` when the file is there and is not UTF-8 text, named as `shown` (by default `path`
+    relative to `root`) — a refusal for the caller to give, never a `UnicodeDecodeError`."""
     real_root = os.path.realpath(root)
     real = os.path.realpath(path)
     if not (real == real_root or real.startswith(real_root + os.sep)) or not os.path.isfile(real):
         return None
-    with open(real, encoding="utf-8") as fh:
-        return fh.read()
+    return _text_of(real, shown=shown, root=root, path=path)
+
+
+def _text_of(real: str, *, shown: str | None, root: str, path: str) -> str | NotUtf8:
+    """The bytes at `real` as UTF-8 text, or `NotUtf8` naming the file as `shown` — by default
+    `path` relative to `root`, the way the checkout spells it."""
+    with open(real, "rb") as fh:
+        raw = fh.read()
+    text, refused = utf8.decode(raw, shown or os.path.relpath(path, root).replace(os.sep, "/"))
+    return NotUtf8(refused) if text is None else text
+
+
+def _compose_texts(root: str, files: Iterable[str], *, tree: str, repo: str, side: Side
+                   ) -> tuple[dict[str, str], tuple[str, ...]]:
+    """The files `preview.compose` names, layout-relative → text, and why each one that cannot be
+    read is not: missing from the side, or not UTF-8 text."""
+    texts: dict[str, str] = {}
+    missing: list[str] = []
+    unread: list[str] = []
+    for f in files:
+        text = _read_inside(root, posixpath.join(root, f))
+        if text is None:
+            missing.append(f)
+        elif isinstance(text, NotUtf8):
+            unread.append(text.reason)
+        else:
+            texts[posixpath.normpath(posixpath.join(tree, f))] = text
+    return texts, tuple(
+        f"`{f}` is not a file of `{repo}`'s base branch — `preview.compose` names it, and a "
+        f"preview reads the base branch's files only." if side == "base" else
+        f"`{f}` is not a file of `{repo}`'s change — its `preview.compose` names it."
+        for f in missing) + tuple(unread)
 
 
 def texts_of(layout: Layout, cfg: PreviewConfig, *, tree: str, side: Side = "base",
@@ -319,32 +361,24 @@ def texts_of(layout: Layout, cfg: PreviewConfig, *, tree: str, side: Side = "bas
     root = layout.root(tree, side)
     side_all = posixpath.join(layout.workdir, side)
     whose = "base branch" if side == "base" else "change"
-    texts: dict[str, str] = {}
-    missing: list[str] = []
     repo = layout.trees[tree].repo if tree in layout.trees else tree
-    for f in cfg.compose:
-        text = _read_inside(root, posixpath.join(root, f))
-        if text is None:
-            missing.append(f)
-        else:
-            texts[posixpath.normpath(posixpath.join(tree, f))] = text
-    if missing:
-        return Refused(reasons=tuple(
-            f"`{f}` is not a file of `{repo}`'s base branch — `preview.compose` names it, and a "
-            f"preview reads the base branch's files only." if side == "base" else
-            f"`{f}` is not a file of `{repo}`'s change — its `preview.compose` names it."
-            for f in missing))
+    texts, unread = _compose_texts(root, cfg.compose, tree=tree, repo=repo, side=side)
+    if unread:
+        return Refused(reasons=unread)
     found = prescan(texts, layout_dirs=layout.trees, of=of, remedy=remedy)
     seen = set(texts)
     queue = [p for p in found.extends if p not in seen]
     while queue:
         rel = queue.pop(0)
         seen.add(rel)
-        text = _read_inside(side_all, posixpath.join(side_all, rel))
+        text = _read_inside(side_all, posixpath.join(side_all, rel), shown=rel.split('/', 1)[-1])
         if text is None:
             found = found + Prescan(refused=(
                 f"`{rel.split('/', 1)[-1]}` is named by an `extends:` and is not a file of the "
                 f"{whose}.",))
+            continue
+        if isinstance(text, NotUtf8):
+            found = found + Prescan(refused=(text.reason,))
             continue
         texts[rel] = text
         more = prescan({rel: text}, layout_dirs=layout.trees, relative_to=posixpath.dirname(rel),
