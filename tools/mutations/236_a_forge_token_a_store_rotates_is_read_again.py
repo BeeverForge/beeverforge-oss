@@ -18,6 +18,7 @@ TEST = "tests/test_a_forge_token_a_store_rotates_is_read_again.py"
 CRED = "beeverforge/credentials.py"
 FACTORY = "beeverforge/factory.py"
 SHORT = "beeverforge/adapters/credential/short_lived.py"
+REG = "beeverforge/adapters/credential_store/registry.py"
 
 MUTATIONS = [
     # ── the re-read, and where it is handed ────────────────────────────────────────────────────
@@ -152,9 +153,9 @@ MUTATIONS = [
      "        refused = refused or again.refused\n"),
 
     ("the re-read token reaches a log", CRED,
-     "        if again.value:\n            return again.value, clock() + ttl\n",
+     "        if again.value:\n            good_at = clock()\n",
      "        log.info(\"re-read %s\", again.value)\n"
-     "        if again.value:\n            return again.value, clock() + ttl\n"),
+     "        if again.value:\n            good_at = clock()\n"),
 
     # ── a store that fails (review of a6a8e4e) ─────────────────────────────────────────────────
     ("a failed re-read is retried at every call", CRED,
@@ -172,4 +173,44 @@ MUTATIONS = [
     ("a harness's replaced pair reader is bypassed (review: survived)", CRED,
      "        if reader is not _PAIR_READERS[axis]:\n",
      "        if False:\n"),
+
+    # ── review of e8138e9 ───────────────────────────────────────────────────────────────────────
+    ("a store's failure is said without what it raised", REG,
+     "type(exc).__name__, exc,\n", "type(exc).__name__, \"\",\n"),
+
+    ("the store's reason dropped from the provider's warning (review: survived)", CRED,
+     "f\"was refused ({refused})\" if refused else \"answered nothing\"",
+     "\"was refused\" if refused else \"answered nothing\""),
+
+    ("`_axis_answer`'s second pair read made loud on the re-read (review: survived)", CRED,
+     "    found = credential_store.chain(_GENERIC[axis], quiet=quiet)\n    return _refused_at(",
+     "    found = credential_store.chain(_GENERIC[axis])\n    return _refused_at("),
+
+    ("`axis_answer_for`'s pair reader made loud on the re-read (review: survived)", CRED,
+     "        found = credential_store.chain(_GENERIC[axis], quiet=quiet)\n        pair.append(",
+     "        found = credential_store.chain(_GENERIC[axis])\n        pair.append("),
+
+    ("`axis_answer_for` quiet by default, so composition asks quietly (review: survived)", CRED,
+     "def axis_answer_for(project, axis: str, *, announce: bool = True, quiet: bool = False):",
+     "def axis_answer_for(project, axis: str, *, announce: bool = True, quiet: bool = True):"),
+
+    ("`chain` quiet by default for every caller (review: survived)", REG,
+     "def chain(names: Iterable[str], *, quiet: bool = False) -> Answer:",
+     "def chain(names: Iterable[str], *, quiet: bool = True) -> Answer:"),
+
+    ("the retry floor ignores the interval: always a minute (review: survived)", CRED,
+     "        retry_at = clock() + min(60.0, interval)\n",
+     "        retry_at = clock() + 60.0\n"),
+
+    ("the warning says the held token is used past its lifetime", CRED,
+     "                     f\"since it was read\" if clock() < good_at + ttl\n",
+     "                     f\"since it was read\" if True\n"),
+
+    ("a good re-read does not move the lifetime on: the warning counts from composition", CRED,
+     "            good_at = clock()\n            return again.value, good_at + ttl\n",
+     "            return again.value, clock() + ttl\n"),
+
+    ("the retry is said as a minute whatever it is", CRED,
+     "                    int(retry_at - clock()))\n",
+     "                    60)\n"),
 ]

@@ -824,12 +824,13 @@ def stored_token_provider(project, axis: str, found=None):
     interval = min(STORED_TOKEN_REREAD_SECONDS, ttl / 2)
     refused, read_at = "", clock()
     retry_at = 0.0
+    good_at = read_at  # the last read that answered: what a held token's lifetime runs from
     # THE READ JUST MADE IS THE FIRST: its interval starts now, and a first use inside it asks
     # nothing. Only inside it — a runner whose first use comes later reads again, like any use.
     seeded = True
 
     def fresh() -> tuple[str, float] | None:
-        nonlocal refused, retry_at
+        nonlocal refused, retry_at, good_at
         if clock() < retry_at:
             return None  # a read failed under a minute ago: the held token answers, or nothing
         # QUIET, because the sentence below is the one that says what happens: the store's own
@@ -837,17 +838,24 @@ def stored_token_provider(project, axis: str, found=None):
         again = axis_answer_for(project, axis, announce=False, quiet=True)
         refused = again.refused
         if again.value:
-            return again.value, clock() + ttl
-        # ONE FAILED READ A MINUTE, NOT ONE PER CALL (review of a6a8e4e). Inside the lifetime and
-        # past the interval, `ShortLivedToken` mints at every call while a mint fails: a store
-        # down from job minute 10 was asked 4 times per push, each with a warning and, for a store
-        # that raised, a traceback — and a store that times out stalled every push behind it.
+            good_at = clock()
+            return again.value, good_at + ttl
+        # ONE FAILED READ PER `min(a minute, interval)`, NOT ONE PER CALL (review of a6a8e4e).
+        # Inside the lifetime and past the interval, `ShortLivedToken` mints at every call while a
+        # mint fails: a store down from job minute 10 was asked 4 times per push, each with a
+        # warning and, for a store that raised, a traceback — and a store that times out stalled
+        # every push behind it.
         retry_at = clock() + min(60.0, interval)
-        log.warning("the %s credential `%s` %s when it was read again — the token read before it "
-                    "is used until %s has passed since it was read, and the store is asked again "
-                    "in a minute", axis, reference,
-                    f"was refused ({refused})" if refused else "answered nothing",
-                    STORED_TOKEN_TTL_VAR)
+        # WHAT HAPPENS MEANWHILE, said as it is (review of e8138e9): past the lifetime nothing is
+        # used, and the retry is in `retry_at - now` seconds, which is under a minute when the
+        # interval is
+        meanwhile = (f"the token read before it is used until {STORED_TOKEN_TTL_VAR} has passed "
+                     f"since it was read" if clock() < good_at + ttl
+                     else "nothing is used in its place")
+        log.warning("the %s credential `%s` %s when it was read again — %s, and the store is asked "
+                    "again in %d s", axis, reference,
+                    f"was refused ({refused})" if refused else "answered nothing", meanwhile,
+                    int(retry_at - clock()))
         return None
 
     def read() -> tuple[str, float] | None:

@@ -663,6 +663,27 @@ def test_a_failed_re_read_says_when_it_is_retried_and_what_is_used_meanwhile(
     assert "the token read before it is used" not in past[0], past
 
 
+def test_a_good_re_read_moves_the_lifetime_the_warning_speaks_of_on(
+        tmp_path, addon_store, clock, monkeypatch, caplog):
+    """TTL 600: the store answers a new token at second 300 and nothing after it. At second 600
+    the composed token's lifetime is over, the re-read one's is not: it is pushed, and the
+    sentence says so."""
+    monkeypatch.setenv(TTL_VAR, "600")
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    held[BOT] = SECOND
+    clock.now = T0 + 300
+    assert _pushed_with(runner) == SECOND
+    del held[BOT]
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    clock.now = T0 + 600
+    assert _pushed_with(runner) == SECOND
+    said = [r.getMessage() for r in caplog.records if r.name == credentials.log.name]
+    assert len(said) == 1 and "the token read before it is used until" in said[0], said
+
+
 def test_no_token_value_reaches_a_log(tmp_path, secrets, clock, caplog, gh_calls):
     caplog.set_level(logging.DEBUG)
     secrets(BOT, FIRST)
