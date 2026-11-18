@@ -320,43 +320,36 @@ def write_facts(root: Path, *, files: dict[str, str], gaps: list[str]) -> Path |
 def add_file(into: Path, name: str, body: str) -> bool:
     """One more file in a pack already written — a round of the role's `[[BUSCA: …]]` searches
     (#269 slice 2) — and its line in the manifest, so the README still names every file. Admitted
-    like every other name (`_one_file_under`); False when it is not, or could not be written."""
+    like every other name (`_one_file_under`); False when it is not, or could not be written —
+    nothing at all is written when the README is not UTF-8 text and so could not name it."""
     if not _one_file_under(name) or not str(name).startswith(f"{FOUND_DIR}/"):
         log.warning("refusing to add %r to the product facts: not a file under %s/", name,
                     FOUND_DIR)
         return False
     try:
-        into = Path(into)
-        target = into / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
-        return _named_in_readme(into, name)
+        return _added(Path(into), name, lambda target: target.write_text(body, encoding="utf-8"))
     except OSError as exc:  # noqa: BLE001 — a search that could not be written is said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False
 
 
-def _named_in_readme(into: Path, name: str) -> bool:
-    """`_name_in_readme`, said: False, with the reason in the log, when the README could not be
-    read."""
-    unread = _name_in_readme(into, name)
-    if unread:
-        log.warning("could not add %s to the product facts: %s", name, unread)
-        return False
-    return True
-
-
-def _name_in_readme(into: Path, name: str) -> str:
-    """Name `name` in the pack's README — `""`, or the sentence saying why the README could not
-    be read, which is then left as it is."""
+def _added(into: Path, name: str, write) -> bool:
+    """`write` the file `name` under `into` and name it in the pack's README — or, when the README
+    is not UTF-8 text, write nothing and say so: a file the README cannot name is not added, so
+    the README still names every file the pack holds."""
     readme = into / "README.md"
     text, unread = utf8.decode(readme.read_bytes(), f"{into.name}/README.md")
     if text is None:
-        return unread
+        log.warning("could not add %s to the product facts: %s Nothing was written.", name,
+                    unread)
+        return False
+    target = into / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write(target)
     named = _with_line(text, f"- `{into.name}/{name}`")
     if named != text:
         readme.write_text(named, encoding="utf-8")
-    return ""
+    return True
 
 
 def _with_line(text: str, line: str) -> str:
@@ -376,17 +369,14 @@ _ATTACHED_IMAGE = re.compile(r"^attached-\d{1,2}\.(?:png|jpe?g|gif|webp)$")
 
 def add_image(into: Path, name: str, data: bytes) -> bool:
     """An image attached to the message, as itself, under `found/` — False when the name is not
-    one an attachment is given, or it could not be written."""
+    one an attachment is given, or it could not be written (as for `add_file`, nothing is written
+    when the README is not UTF-8 text)."""
     folder, _, leaf = str(name).partition("/")
     if folder != FOUND_DIR or not _ATTACHED_IMAGE.match(leaf):
         log.warning("refusing to add %r to the product facts: not an attached image", name)
         return False
     try:
-        into = Path(into)
-        target = into / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        return _named_in_readme(into, name)
+        return _added(Path(into), name, lambda target: target.write_bytes(data))
     except OSError as exc:  # noqa: BLE001 — said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False

@@ -16,6 +16,8 @@ from the other's domain.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 _UTF16_MARKS = (b"\xff\xfe", b"\xfe\xff")
 
 
@@ -29,6 +31,16 @@ def decode(raw: bytes, shown: str) -> tuple[str | None, str]:
     if "\x00" in text:
         return None, _refusal(raw, shown, raw.index(b"\x00"))
     return text, ""
+
+
+def text_of(path: Path, shown: str) -> str:
+    """The file at `path` as UTF-8 text, whatever the machine's locale — or a `ValueError`
+    carrying `decode`'s sentence, for a reader that already refuses a file it cannot use by
+    catching `ValueError` (the project's manifest, as `loader` and `explain` read it)."""
+    text, unread = decode(path.read_bytes(), shown)
+    if text is None:
+        raise ValueError(unread)
+    return text
 
 
 def _refusal(raw: bytes, shown: str, at: int) -> str:

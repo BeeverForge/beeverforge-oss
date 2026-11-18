@@ -6,7 +6,7 @@ of NULs. Each now reads bytes through `beeverforge/util/utf8.py::decode` and tur
 into the refusal its function already gives: proposing a preview, the three requirement writers,
 superseding, the facts pack's README, the refresh record, the requirement template, the upgrade
 from a 0.7 stack (in `carry` and in the command's early check), and the project's manifest as
-`load_manifest` and `explain` read it.
+`load_manifest` and `explain` read it, through one `utf8.text_of`.
 
 Each row below puts one read back to a text read, or drops its refusal, and the guard must go red
 on each.
@@ -23,6 +23,7 @@ _UPGRADE = "beeverforge/onboarding/upgrade_from_openfactory.py"
 _CLI = "beeverforge/cli.py"
 _LOADER = "beeverforge/loader.py"
 _EXPLAIN = "beeverforge/orchestrator/explain.py"
+_UTF8 = "beeverforge/util/utf8.py"
 
 _REFUSED = ("        if refused:\n"
             "            return refused\n")
@@ -91,14 +92,18 @@ MUTATIONS = [
      "    text, unread = utf8.decode(readme.read_bytes(), f\"{into.name}/README.md\")\n",
      "    text, unread = readme.read_text(encoding=\"utf-8\"), \"\"\n"),
 
-    ("the facts pack rewrites a README it could not read",
-     _FACTS, "    if text is None:\n        return unread\n",
-     "    if False:\n        return unread\n"),
-
-    ("adding to the facts pack says it was added when the README could not be read",
+    ("the facts pack adds the file and rewrites a README it could not read, saying it was added",
      _FACTS,
-     "    if unread:\n        log.warning(\"could not add %s to the product facts: %s\"",
-     "    if False:\n        log.warning(\"could not add %s to the product facts: %s\""),
+     "    if text is None:\n        log.warning(\"could not add %s to the product facts: %s "
+     "Nothing was written.\"",
+     "    if False:\n        log.warning(\"could not add %s to the product facts: %s "
+     "Nothing was written.\""),
+
+    ("the facts pack writes the file before it decides the README, so a refused file is on disk",
+     _FACTS,
+     "    readme = into / \"README.md\"\n    text, unread = utf8.decode(readme.read_bytes(), ",
+     "    (into / name).parent.mkdir(parents=True, exist_ok=True)\n    write(into / name)\n"
+     "    readme = into / \"README.md\"\n    text, unread = utf8.decode(readme.read_bytes(), "),
 
     ("the refresh record is decoded blindly again, so the state says only \"could not be read\"",
      _REFRESH, "    text, unread = utf8.decode(raw, str(path))\n",
@@ -131,19 +136,14 @@ MUTATIONS = [
      "        if False:\n"),
 
     ("loading a manifest reads it as text in the machine's locale again, so a Latin-1 one raises",
-     _LOADER,
-     "    text, unread = utf8.decode(manifest_file.read_bytes(), str(manifest_file))\n",
-     "    text, unread = manifest_file.read_text(), \"\"\n"),
-
-    ("loading a manifest parses one it could not read instead of refusing it by name",
-     _LOADER, "    if text is None:\n        raise ValueError(unread)\n",
-     "    if False:\n        raise ValueError(unread)\n"),
+     _LOADER, "yaml_io.load(utf8.text_of(manifest_file, str(manifest_file)))",
+     "yaml_io.load(manifest_file.read_text())"),
 
     ("explaining a project reads its manifest as text again, refused in the codec's words",
-     _EXPLAIN, "    text, unread = utf8.decode(manifest_file.read_bytes(), shown)\n",
-     "    text, unread = manifest_file.read_text(), \"\"\n"),
+     _EXPLAIN, "yaml_io.load(utf8.text_of(manifest_file, shown))",
+     "yaml_io.load(manifest_file.read_text())"),
 
-    ("explaining a project parses a manifest it could not read instead of refusing it by name",
-     _EXPLAIN, "    if text is None:\n        raise ValueError(unread)\n",
+    ("the manifest's one reader parses a manifest it could not read instead of refusing it by name",
+     _UTF8, "    if text is None:\n        raise ValueError(unread)\n",
      "    if False:\n        raise ValueError(unread)\n"),
 ]

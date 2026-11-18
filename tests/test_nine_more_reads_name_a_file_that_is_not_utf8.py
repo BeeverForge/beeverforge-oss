@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,19 +33,45 @@ git_bed = the_git_bed.git_bed
 
 REMEDY = "save it as UTF-8"
 
-#: one file per encoding family, as a person's editor might have saved it
+#: the codec each family's editor saves the WHOLE file in, from its first byte
 FAMILIES = {
-    "Latin-1": "café\n".encode("latin-1"),
-    # the little-endian mark written explicitly, whatever the machine's byte order
-    "UTF-16 with a byte-order mark": b"\xff\xfe" + "books\n".encode("utf-16-le"),
-    "UTF-16-LE without a byte-order mark": "books\n".encode("utf-16-le"),
+    "Latin-1": "latin-1",
+    "UTF-16 with a byte-order mark": "utf-16",
+    "UTF-16-LE without a byte-order mark": "utf-16-le",
+    # THE TRAP: UTF-16 of ASCII text alone is valid UTF-8, NUL being a code point, so only the
+    # decoder's NUL check stops it; the `é` above has the codec stop it first
+    "UTF-16-LE without a byte-order mark, ASCII only": "utf-16-le",
 }
 
+_ASCII_ONLY = "UTF-16-LE without a byte-order mark, ASCII only"
 
-def _named(said: str, shown: str) -> None:
+
+def _saved(text: str, family: str) -> bytes:
+    """`text` as the family's editor saves it, whole: every fixture begins with an ASCII character
+    and holds an `é` (each accent dropped in the family that is ASCII only), so Latin-1 is not UTF-8 at the
+    `é`, and UTF-16 is not from its first bytes."""
+    assert text[0].isascii() and "é" in text, text
+    if family == _ASCII_ONLY:
+        text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return text.encode(FAMILIES[family])
+
+
+def _offset(text: str, family: str) -> int:
+    """Where the decoder must say `_saved(text, family)` stops being UTF-8. Latin-1: at the first
+    character that is not ASCII, each one before it being one byte. UTF-16 with a mark: at its
+    first byte, 0xff or 0xfe. UTF-16-LE without one: every ASCII character is two bytes, its NUL
+    high byte still valid UTF-8, so the codec stops at the `é`'s low byte, 0xe9, followed by a
+    NUL that cannot continue it — before the decoder looks for a NUL at all. ASCII only: the
+    whole file decodes, and the decoder refuses its first NUL, the first character's high byte."""
+    first = next(i for i, c in enumerate(text) if not c.isascii())
+    return {"Latin-1": first, "UTF-16 with a byte-order mark": 0,
+            _ASCII_ONLY: 1}.get(family, 2 * first)
+
+
+def _named(said: str, shown: str, at: int) -> None:
     """One sentence naming the file, the offset and the remedy — no exception's words."""
     assert f"`{shown}`" in said, said
-    assert "offset" in said, said
+    assert f"offset {at} (" in said, said
     assert REMEDY in said, said
     assert "\n" not in said, said
     assert "Error" not in said, said
@@ -67,7 +94,8 @@ def test_proposing_a_preview_refuses_a_manifest_not_in_utf8(tmp_path, family):
     from beeverforge.onboarding.preview_propose import Outcome, _draft_into
 
     rel = ".beeverforge/project.yaml"
-    raw = b"name: podbeam\n" + FAMILIES[family]
+    text = "name: podbeam\ndescription: café\n"
+    raw = _saved(text, family)
     manifest = _put(tmp_path / rel, raw)
     project = SimpleNamespace(name="podbeam", manifest_path=rel)
 
@@ -75,7 +103,7 @@ def test_proposing_a_preview_refuses_a_manifest_not_in_utf8(tmp_path, family):
 
     assert isinstance(out, Outcome), out
     assert not out.ok
-    _named(out.detail, rel)
+    _named(out.detail, rel, _offset(text, family))
     assert out.detail.endswith("Nothing was written."), out.detail
     assert manifest.read_bytes() == raw
     assert _files(tmp_path) == {rel}
@@ -87,7 +115,8 @@ def test_proposing_a_preview_refuses_a_manifest_not_in_utf8(tmp_path, family):
 def test_superseding_counts_a_requirement_not_in_utf8_as_failed(tmp_path, caplog, family):
     from beeverforge.product.authoring import _mark_superseded
 
-    raw = b"# REQ-0003\n\n- **Status:** accepted\n" + FAMILIES[family]
+    text = "# REQ-0003\n\n- **Status:** accepted\n\ncafé\n"
+    raw = _saved(text, family)
     file = _put(tmp_path / "requirements" / "0003-x.md", raw)
 
     with caplog.at_level(logging.WARNING):
@@ -99,7 +128,7 @@ def test_superseding_counts_a_requirement_not_in_utf8_as_failed(tmp_path, caplog
             if "BEEVERFORGE_PRODUCT_SUPERSEDE_NOT_UTF8" in r.getMessage()]
     assert len(said) == 1, [r.getMessage() for r in caplog.records]
     _named(said[0].split("BEEVERFORGE_PRODUCT_SUPERSEDE_NOT_UTF8 ", 1)[1],
-           "requirements/0003-x.md")
+           "requirements/0003-x.md", _offset(text, family))
     assert file.read_bytes() == raw
 
 
@@ -128,9 +157,9 @@ def _origin(bed, tmp_path: Path, raw: bytes) -> Path:
     return origin
 
 
-def _a_requirement(family: str) -> bytes:
-    return ("# REQ-0002 — Pacote de fecho\n\n- **Status:** proposed\n\n## Decisões\n\n"
-            "| Data | Decisão | Quem | Onde |\n|---|---|---|---|\n").encode() + FAMILIES[family]
+#: a requirement as its author wrote it; the dash is ASCII, so Latin-1 can save it whole
+REQUIREMENT = ("# REQ-0002 - Pacote de fecho\n\n- **Status:** proposed\n\n## Decisões\n\n"
+               "| Data | Decisão | Quem | Onde |\n|---|---|---|---|\n\ncafé\n")
 
 
 def _writers():
@@ -156,7 +185,7 @@ def _writers():
 def _refused_and_left(bed, tmp_path: Path, writer: str, family: str) -> None:
     from beeverforge.product.authoring import NOT_REFUSED
 
-    raw = _a_requirement(family)
+    raw = _saved(REQUIREMENT, family)
     origin = _origin(bed, tmp_path, raw)
     before = _git("rev-parse", "main", cwd=origin)
 
@@ -165,7 +194,7 @@ def _refused_and_left(bed, tmp_path: Path, writer: str, family: str) -> None:
     assert res.ok is False, res
     assert res.refusal == NOT_REFUSED, res
     assert res.ref == REQ, res
-    _named(res.detail, REQ)
+    _named(res.detail, REQ, _offset(REQUIREMENT, family))
     assert _git("rev-parse", "main", cwd=origin) == before
     assert _git("show", f"main:{REQ}", cwd=origin) == raw
 
@@ -207,7 +236,8 @@ ADDERS = {"add_file": _add_file, "add_image": _add_image}
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_facts_readme_not_in_utf8_is_said_and_left(tmp_path, caplog, adder, family):
     into = tmp_path / "facts"
-    raw = b"# Product facts\n\n" + FAMILIES[family]
+    text = "# Product facts\n\ncafé\n"
+    raw = _saved(text, family)
     readme = _put(into / "README.md", raw)
 
     with caplog.at_level(logging.WARNING):
@@ -216,8 +246,11 @@ def test_a_facts_readme_not_in_utf8_is_said_and_left(tmp_path, caplog, adder, fa
     assert added is False
     said = [r.getMessage() for r in caplog.records if REMEDY in r.getMessage()]
     assert len(said) == 1, [r.getMessage() for r in caplog.records]
-    _named(said[0], "facts/README.md")
+    _named(said[0], "facts/README.md", _offset(text, family))
+    assert said[0].endswith("Nothing was written."), said[0]
     assert readme.read_bytes() == raw
+    # the file is not written either: one the README cannot name is not in the pack
+    assert _files(into) == {"README.md"}
 
 
 # ── the refresh record of a product's knowledge ─────────────────────────────────────────────────
@@ -235,13 +268,14 @@ def record(tmp_path, monkeypatch):
 def test_a_refresh_record_not_in_utf8_is_named_in_its_state(record, family):
     from beeverforge.product import refresh
 
-    _put(record, b'{"by": "' + FAMILIES[family] + b'"}')
+    text = '{"by": "café"}'
+    _put(record, _saved(text, family))
 
     seen = refresh.state(SimpleNamespace(name="podbeam"))
 
     assert seen["outcome"] is None and seen["refreshed_at"] is None
     assert len(seen["degraded"]) == 1, seen
-    _named(seen["degraded"][0], str(record))
+    _named(seen["degraded"][0], str(record), _offset(text, family))
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -250,29 +284,34 @@ def test_a_refresh_record_not_in_utf8_is_named_in_the_log(record, caplog, family
 
     from beeverforge.product import refresh
 
-    _put(record, b'{"by": "' + FAMILIES[family] + b'"}')
+    text = '{"by": "café"}'
+    _put(record, _saved(text, family))
 
     with caplog.at_level(logging.WARNING):
         refresh._update(SimpleNamespace(name="podbeam"), lambda held: held.update(seen=True))
 
     said = [r.getMessage() for r in caplog.records if REMEDY in r.getMessage()]
     assert len(said) == 1, [r.getMessage() for r in caplog.records]
-    assert f"`{record}`" in said[0] and "offset" in said[0], said[0]
+    assert f"`{record}`" in said[0], said[0]
+    assert f"offset {_offset(text, family)} (" in said[0], said[0]
     assert json.loads(record.read_text(encoding="utf-8")) == {"seen": True}
 
 
 # ── a product's requirement template ────────────────────────────────────────────────────────────
 
+TEMPLATE = "fields: []\n# café\n"
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_template_not_in_utf8_is_refused_in_the_decoders_words(tmp_path, family):
     from beeverforge.product.template import TEMPLATE_FILE, load_template
 
-    _put(tmp_path / TEMPLATE_FILE, b"fields: []\n# " + FAMILIES[family])
+    _put(tmp_path / TEMPLATE_FILE, _saved(TEMPLATE, family))
 
     found, why = load_template(tmp_path)
 
     assert found is None
-    _named(why, TEMPLATE_FILE)
+    _named(why, TEMPLATE_FILE, _offset(TEMPLATE, family))
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -280,7 +319,7 @@ def test_a_template_not_in_utf8_is_a_template_refused_finding_in_the_corpus(tmp_
     from beeverforge.product.corpus import load_corpus
     from beeverforge.product.template import TEMPLATE_FILE
 
-    _put(tmp_path / TEMPLATE_FILE, b"fields: []\n# " + FAMILIES[family])
+    _put(tmp_path / TEMPLATE_FILE, _saved(TEMPLATE, family))
     (tmp_path / "0001-x.md").write_text("# REQ-0001 — x\n\n- **Status:** proposed\n",
                                         encoding="utf-8")
 
@@ -290,13 +329,16 @@ def test_a_template_not_in_utf8_is_a_template_refused_finding_in_the_corpus(tmp_
     refused = [f for f in corpus.findings if f.code == "template-refused"]
     assert len(refused) == 1, corpus.findings
     assert refused[0].path == TEMPLATE_FILE
-    _named(refused[0].message, TEMPLATE_FILE)
+    _named(refused[0].message, TEMPLATE_FILE, _offset(TEMPLATE, family))
 
 
 # ── the upgrade from an OpenFactory 0.7 stack ───────────────────────────────────────────────────
 
+ENV_0_7 = "OPENFACTORY_BOT_TOKEN=x\n# café\n"
+
+
 def _env_0_7(tmp_path: Path, family: str) -> tuple[Path, bytes]:
-    raw = b"OPENFACTORY_BOT_TOKEN=x\n# " + FAMILIES[family]
+    raw = _saved(ENV_0_7, family)
     return _put(tmp_path / ".env.compose", raw), raw
 
 
@@ -315,7 +357,7 @@ def test_carrying_refuses_a_0_7_file_not_in_utf8_before_docker_is_asked(tmp_path
         up.carry(env, docker=docker, image="img")
 
     said = str(refused.value)
-    _named(said, str(env))
+    _named(said, str(env), _offset(ENV_0_7, family))
     assert "nothing was stopped, copied or emptied" in said, said
     assert asked == []
     assert env.read_bytes() == raw
@@ -338,16 +380,19 @@ def test_the_upgrade_command_refuses_a_0_7_file_not_in_utf8(tmp_path, monkeypatc
     assert result.exit_code == 1, result.output
     lines = [line for line in result.output.splitlines() if line.startswith("✗ ")]
     assert len(lines) == 1, result.output
-    _named(lines[0], str(env))
+    _named(lines[0], str(env), _offset(ENV_0_7, family))
     assert env.read_bytes() == raw
 
 
 # ── the project's manifest: loading it, the doctor's check of it, and `explain` ─────────────────
 
+MANIFEST = "version: 1\nname: café\n"
+
+
 def _manifest_not_in_utf8(root: Path, family: str) -> tuple[Path, bytes]:
     from beeverforge import namespace
 
-    raw = b"version: 1\nname: " + FAMILIES[family]
+    raw = _saved(MANIFEST, family)
     return _put(root / namespace.MANIFEST, raw), raw
 
 
@@ -366,7 +411,7 @@ def test_loading_a_manifest_not_in_utf8_refuses_it_by_name(tmp_path, family):
         load_manifest(_Project(), repo_root=tmp_path)
 
     assert not isinstance(refused.value, UnicodeDecodeError), repr(refused.value)
-    _named(str(refused.value), str(manifest))
+    _named(str(refused.value), str(manifest), _offset(MANIFEST, family))
     assert manifest.read_bytes() == raw
 
 
@@ -385,7 +430,7 @@ def test_the_doctor_names_a_manifest_not_in_utf8(tmp_path, family):
     found = _manifest(probes)
 
     assert not found.ok
-    _named(found.message, str(manifest))
+    _named(found.message, str(manifest), _offset(MANIFEST, family))
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -399,5 +444,5 @@ def test_explaining_a_project_refuses_a_manifest_not_in_utf8(tmp_path, family):
 
     said = str(refused.value)
     assert said.startswith("The manifest at "), said
-    _named(said, f"{tmp_path.as_posix()}/.beeverforge/project.yaml")
+    _named(said, f"{tmp_path.as_posix()}/.beeverforge/project.yaml", _offset(MANIFEST, family))
     assert (tmp_path / ".beeverforge" / "project.yaml").read_bytes() == raw

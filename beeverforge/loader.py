@@ -70,7 +70,7 @@ def load_manifest(project: Project, *, repo_root: Path | None = None) -> Manifes
             f"project {project.name!r} has no manifest at {manifest_file}. {how}."
         )
     try:
-        data = yaml_io.load(_manifest_text(manifest_file)) or {}
+        data = yaml_io.load(utf8.text_of(manifest_file, str(manifest_file))) or {}
     except yaml.YAMLError as exc:
         raise ValueError(f"{manifest_file} is not valid YAML: {exc}") from exc
     if not isinstance(data, dict):
@@ -86,16 +86,6 @@ def load_manifest(project: Project, *, repo_root: Path | None = None) -> Manifes
         # One deployment hosts N projects. "manifest version 42 is not supported" is true and
         # useless without the path: the operator has to know WHICH client's repository to open.
         raise ValueError(f"{manifest_file} (project {project.name!r}) is invalid: {exc}") from exc
-
-
-def _manifest_text(manifest_file: Path) -> str:
-    """The manifest as UTF-8 text, whatever the machine's locale — or the `ValueError` a manifest
-    it cannot use raises, carrying the decoder's sentence (the file, the byte offset, the remedy)
-    when it was saved as Latin-1 or UTF-16."""
-    text, unread = utf8.decode(manifest_file.read_bytes(), str(manifest_file))
-    if text is None:
-        raise ValueError(unread)
-    return text
 
 
 def _what_only_the_registry_knows(project) -> dict[str, str]:
