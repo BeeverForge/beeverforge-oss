@@ -242,7 +242,7 @@ def _manifest(checkout: Path, target: str, language: str):
                            manifest=namespace.in_repo(checkout, namespace.MANIFEST)))
     shown = (Path(target) / namespace.in_repo(checkout, namespace.MANIFEST)).as_posix()
     try:
-        data = yaml_io.load(manifest_file.read_text()) or {}
+        data = yaml_io.load(_manifest_text(manifest_file, shown)) or {}
         if not isinstance(data, dict):
             raise ValueError(f"a YAML mapping, not {type(data).__name__}")
         # VALIDATED WITHOUT THE REGISTRY'S CONTEXT, as every `Manifest(...)` outside
@@ -256,6 +256,17 @@ def _manifest(checkout: Path, target: str, language: str):
     except (ValueError, OSError, yaml.YAMLError) as exc:
         why = " ".join(str(exc).split()).rstrip(". ")
     raise Refused(_say(SAY, "refuse.invalid_manifest", language, manifest=shown, why=why))
+
+
+def _manifest_text(manifest_file: Path, shown: str) -> str:
+    """The manifest as UTF-8 text — or a `ValueError` carrying the decoder's sentence (the file,
+    the byte offset, the remedy), which `_manifest` refuses as a manifest that does not load."""
+    from beeverforge.util import utf8
+
+    text, unread = utf8.decode(manifest_file.read_bytes(), shown)
+    if text is None:
+        raise ValueError(unread)
+    return text
 
 
 def _profile(manifest, checkout: Path, language: str):

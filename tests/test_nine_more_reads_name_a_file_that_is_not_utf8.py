@@ -10,7 +10,9 @@ Each read keeps the shape its function already uses for its other failures: prop
 returns an `Outcome` that wrote nothing; the requirement writers return a `WriteResult` and leave
 the file as it was; superseding counts the number as failed; the facts pack leaves its README and
 returns `False`; the refresh record's state names the file; a product's template is refused in
-the decoder's words; and the upgrade from a 0.7 stack refuses before docker is asked anything.
+the decoder's words; the upgrade from a 0.7 stack refuses before docker is asked anything; and
+the project's manifest is refused as one that does not load, by `load_manifest` (so by the
+doctor's check) and by `explain`, whose refusal now carries the decoder's sentence.
 """
 
 from __future__ import annotations
@@ -338,3 +340,64 @@ def test_the_upgrade_command_refuses_a_0_7_file_not_in_utf8(tmp_path, monkeypatc
     assert len(lines) == 1, result.output
     _named(lines[0], str(env))
     assert env.read_bytes() == raw
+
+
+# ── the project's manifest: loading it, the doctor's check of it, and `explain` ─────────────────
+
+def _manifest_not_in_utf8(root: Path, family: str) -> tuple[Path, bytes]:
+    from beeverforge import namespace
+
+    raw = b"version: 1\nname: " + FAMILIES[family]
+    return _put(root / namespace.MANIFEST, raw), raw
+
+
+class _Project:
+    name = "podbeam"
+    manifest_path = ".beeverforge/project.yaml"
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_loading_a_manifest_not_in_utf8_refuses_it_by_name(tmp_path, family):
+    from beeverforge.loader import load_manifest
+
+    manifest, raw = _manifest_not_in_utf8(tmp_path, family)
+
+    with pytest.raises(ValueError) as refused:
+        load_manifest(_Project(), repo_root=tmp_path)
+
+    assert not isinstance(refused.value, UnicodeDecodeError), repr(refused.value)
+    _named(str(refused.value), str(manifest))
+    assert manifest.read_bytes() == raw
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_the_doctor_names_a_manifest_not_in_utf8(tmp_path, family):
+    from beeverforge.doctor import Probes, _manifest
+    from beeverforge.loader import load_manifest
+
+    manifest, _ = _manifest_not_in_utf8(tmp_path, family)
+    probes = Probes(docker_running=lambda: (True, ""), harness_on_path=lambda kind: True,
+                    manifest=lambda: load_manifest(_Project(), repo_root=tmp_path),
+                    forge_reachable=lambda: (True, ""), board_columns=lambda: None,
+                    pickup_column=lambda: "TO-DO", floor_enforced=lambda: True,
+                    harness_kind=lambda: "claude_code", product_link=lambda: None)
+
+    found = _manifest(probes)
+
+    assert not found.ok
+    _named(found.message, str(manifest))
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_explaining_a_project_refuses_a_manifest_not_in_utf8(tmp_path, family):
+    from beeverforge.orchestrator import explain as ex
+
+    _, raw = _manifest_not_in_utf8(tmp_path, family)
+
+    with pytest.raises(ex.Refused) as refused:
+        ex.explain(str(tmp_path))
+
+    said = str(refused.value)
+    assert said.startswith("The manifest at "), said
+    _named(said, f"{tmp_path.as_posix()}/.beeverforge/project.yaml")
+    assert (tmp_path / ".beeverforge" / "project.yaml").read_bytes() == raw

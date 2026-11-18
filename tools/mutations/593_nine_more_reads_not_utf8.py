@@ -4,8 +4,9 @@ Each read used `read_text(encoding="utf-8")`, so a Latin-1 or UTF-16 file raised
 `UnicodeDecodeError` out of the command, and UTF-16 without a byte-order mark was read as text full
 of NULs. Each now reads bytes through `beeverforge/util/utf8.py::decode` and turns its sentence
 into the refusal its function already gives: proposing a preview, the three requirement writers,
-superseding, the facts pack's README, the refresh record, the requirement template, and the upgrade
-from a 0.7 stack (in `carry` and in the command's early check).
+superseding, the facts pack's README, the refresh record, the requirement template, the upgrade
+from a 0.7 stack (in `carry` and in the command's early check), and the project's manifest as
+`load_manifest` and `explain` read it.
 
 Each row below puts one read back to a text read, or drops its refusal, and the guard must go red
 on each.
@@ -20,6 +21,8 @@ _REFRESH = "beeverforge/product/refresh.py"
 _TEMPLATE = "beeverforge/product/template.py"
 _UPGRADE = "beeverforge/onboarding/upgrade_from_openfactory.py"
 _CLI = "beeverforge/cli.py"
+_LOADER = "beeverforge/loader.py"
+_EXPLAIN = "beeverforge/orchestrator/explain.py"
 
 _REFUSED = ("        if refused:\n"
             "            return refused\n")
@@ -126,4 +129,21 @@ MUTATIONS = [
      "text is said here\n        if not chosen and up.is_a_0_7_file(Path(env_file)):\n",
      "    if not chosen and up.is_a_0_7_file(Path(env_file)):\n        pass\n    try:\n"
      "        if False:\n"),
+
+    ("loading a manifest reads it as text in the machine's locale again, so a Latin-1 one raises",
+     _LOADER,
+     "    text, unread = utf8.decode(manifest_file.read_bytes(), str(manifest_file))\n",
+     "    text, unread = manifest_file.read_text(), \"\"\n"),
+
+    ("loading a manifest parses one it could not read instead of refusing it by name",
+     _LOADER, "    if text is None:\n        raise ValueError(unread)\n",
+     "    if False:\n        raise ValueError(unread)\n"),
+
+    ("explaining a project reads its manifest as text again, refused in the codec's words",
+     _EXPLAIN, "    text, unread = utf8.decode(manifest_file.read_bytes(), shown)\n",
+     "    text, unread = manifest_file.read_text(), \"\"\n"),
+
+    ("explaining a project parses a manifest it could not read instead of refusing it by name",
+     _EXPLAIN, "    if text is None:\n        raise ValueError(unread)\n",
+     "    if False:\n        raise ValueError(unread)\n"),
 ]
