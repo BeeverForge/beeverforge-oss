@@ -562,6 +562,107 @@ def test_a_harness_that_replaces_the_pair_reader_is_what_the_runner_is_composed_
     assert runner.forge._static_token == SECOND and runner.forge._token_provider is None
 
 
+def test_a_store_that_raises_on_a_re_read_says_what_it_raised_somewhere(
+        tmp_path, addon_store, clock, caplog, monkeypatch):
+    caplog.set_level(logging.DEBUG)
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+
+    def fail(self, name):
+        asked.append(name)
+        raise AttributeError("'NoneType' object has no attribute 'json'")
+
+    monkeypatch.setattr(RotatingStore, "resolve", fail)
+    clock.at(10)
+    caplog.clear()
+    assert _pushed_with(runner) == FIRST
+    assert any("has no attribute 'json'" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_the_first_read_and_the_pair_are_asked_loudly(tmp_path, addon_store, caplog, monkeypatch):
+    from beeverforge.adapters.credential_store import registry as store
+
+    def fail(self, name):
+        raise AttributeError("a defect in the store")
+
+    monkeypatch.setattr(RotatingStore, "resolve", fail)
+    caplog.set_level(logging.WARNING)
+    credentials.axis_answer_for(_project(tmp_path), "forge")
+    assert any(r.name == store.log.name and r.exc_info for r in caplog.records), caplog.text
+    caplog.clear()
+    store.chain((BOT,))
+    assert any(r.name == store.log.name and r.exc_info for r in caplog.records), caplog.text
+
+
+def test_a_failed_re_read_names_the_stores_reason_once(tmp_path, addon_store, clock, caplog,
+                                                        monkeypatch):
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+
+    def fail(self, name):
+        asked.append(name)
+        raise CredentialRefused(f"the rotating store seals {name}")
+
+    monkeypatch.setattr(RotatingStore, "resolve", fail)
+    clock.at(10)
+    caplog.clear()
+    caplog.set_level(logging.WARNING)
+    for _ in range(10):
+        assert _pushed_with(runner) == FIRST
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warned) == 1 and "the rotating store seals" in warned[0], warned
+
+
+def _a_push_every_second_with_a_store_that_answers_nothing(tmp_path, addon_store, clock,
+                                                            monkeypatch, caplog, until: int):
+    """TTL 60, so the interval is 30 s: a push every second from 0 to `until`, the store
+    answering nothing from the start. Answers `{second: what was said}` for each second the store
+    was asked, and the seconds a push refused."""
+    monkeypatch.setenv(TTL_VAR, "60")
+    held, asked = addon_store
+    held[BOT] = FIRST
+    runner = _runner(tmp_path)
+    del held[BOT]
+    caplog.set_level(logging.WARNING)
+    read_at: dict[int, list[str]] = {}
+    refused: list[int] = []
+    for second in range(until + 1):
+        clock.now = T0 + second
+        asked.clear()
+        caplog.clear()
+        try:
+            runner.forge.push_remote()
+        except LoginRefused:
+            refused.append(second)
+        if asked:
+            read_at[second] = [r.getMessage() for r in caplog.records
+                               if r.name == credentials.log.name]
+    return read_at, refused
+
+
+def test_a_lifetime_of_a_minute_retries_a_failed_read_every_half_of_it(
+        tmp_path, addon_store, clock, monkeypatch, caplog):
+    read_at, refused = _a_push_every_second_with_a_store_that_answers_nothing(
+        tmp_path, addon_store, clock, monkeypatch, caplog, until=95)
+
+    assert sorted(read_at) == [30, 60, 90], sorted(read_at)
+    assert refused[0] == 60, refused
+
+
+def test_a_failed_re_read_says_when_it_is_retried_and_what_is_used_meanwhile(
+        tmp_path, addon_store, clock, monkeypatch, caplog):
+    read_at, _ = _a_push_every_second_with_a_store_that_answers_nothing(
+        tmp_path, addon_store, clock, monkeypatch, caplog, until=61)
+
+    inside, past = read_at[30], read_at[60]
+    assert len(inside) == 1 and "in 30 s" in inside[0], inside
+    assert "the token read before it is used until" in inside[0], inside
+    assert len(past) == 1 and "nothing is used in its place" in past[0], past
+    assert "the token read before it is used" not in past[0], past
+
+
 def test_no_token_value_reaches_a_log(tmp_path, secrets, clock, caplog, gh_calls):
     caplog.set_level(logging.DEBUG)
     secrets(BOT, FIRST)
