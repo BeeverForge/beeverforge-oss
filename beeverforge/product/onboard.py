@@ -77,8 +77,9 @@ def _declared_text(path: Path, shown: str) -> str:
     return text
 
 
-def _existing(path: Path, shown: str) -> dict:
-    """What the declaration at `path` says today — `{}` when there is none, or none we can read.
+def _existing(path: Path, shown: str = PRODUCT_YAML) -> dict:
+    """What the declaration at `path` says today — `{}` when there is none, or it is not YAML we
+    can read; `_NotUtf8` when its bytes are not UTF-8 text. `shown` is how the refusal names it.
 
     `path` comes from `namespace.resolve`, never from a join: the resolver is the ONE reader that
     knows a docs repository still on the directory's retired name HAS a declaration, and `plan`
