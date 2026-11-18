@@ -78,24 +78,34 @@ def _logged(caplog, code: str) -> str:
 
 # ── the preview shape a pull request carries: the repository's manifest ─────────────────────────
 
-@pytest.mark.parametrize("family", FAMILIES)
-def test_the_preview_shape_treats_a_manifest_not_in_utf8_as_no_preview_block(
-        tmp_path, caplog, family):
+def _preview_shape_of(root: Path) -> list[str]:
+    """The preview shape `JobRunner` writes into the pull request for the repository at `root`,
+    when the change edits the manifest."""
     from types import SimpleNamespace
 
     from beeverforge import namespace
     from beeverforge.adapters.sandbox.base import Workspace
     from beeverforge.orchestrator.machine import JobRunner
 
-    rel = ".beeverforge/project.yaml"
-    text = "name: podbeam\npreview:\n  compose: [deploy/café.yml]\n"
-    _put(tmp_path / rel, _saved(text, family))
     holder = SimpleNamespace(_protected=(namespace.MANIFEST,),
                              _SHAPE_NAMES=JobRunner._SHAPE_NAMES)
-    ws = Workspace(path=tmp_path, host_path=tmp_path, branch="b", base_branch="main")
+    ws = Workspace(path=root, host_path=root, branch="b", base_branch="main")
+    return JobRunner._preview_shape(holder, ws)
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_the_preview_shape_treats_a_manifest_not_in_utf8_as_no_preview_block(
+        tmp_path, caplog, family):
+    rel = ".beeverforge/project.yaml"
+    text = "name: podbeam\npreview:\n  compose: [deploy/café.yml]\n"
+    # THE SAME MANIFEST IN UTF-8 DECLARES A BLOCK, so the `[]` below is the decode path setting
+    # the block aside, not a manifest that never had one
+    _put(tmp_path / "utf8" / rel, text.encode("utf-8"))
+    assert _preview_shape_of(tmp_path / "utf8") == ["deploy/café.yml absent"]
+    _put(tmp_path / "saved" / rel, _saved(text, family))
 
     with caplog.at_level(logging.WARNING):
-        shape = JobRunner._preview_shape(holder, ws)
+        shape = _preview_shape_of(tmp_path / "saved")
 
     assert shape == []
     _named(_logged(caplog, "BEEVERFORGE_PREVIEW_SHAPE_NOT_UTF8"), rel, _offset(text, family))
