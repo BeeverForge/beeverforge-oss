@@ -214,9 +214,10 @@ MUTATIONS = [
      "                           search=(None", STEP),
 
     # RE-PINNED 2026-09-25 (#336): the manifest line is written by one helper, for a file and an
-    # attached image alike
+    # attached image alike. RE-PINNED (#593): the README is decoded first, and the line it gains
+    # is composed by `_with_line`
     ("a round's file is never named in the manifest", FACTS,
-     "        readme.write_text(text, encoding=\"utf-8\")",
+     "        readme.write_text(named, encoding=\"utf-8\")",
      "        pass", STEP),
 
     # ── 6. every search is recorded ───────────────────────────────────────────────────────────

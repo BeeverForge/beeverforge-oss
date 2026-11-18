@@ -56,6 +56,7 @@ from pathlib import Path
 
 from beeverforge.memory.ledger import DECISION, Loop, fold, waiting
 from beeverforge.techlead.pack import _MIN_BODY, _PREFIX, _exclude, manifest, pack_dir
+from beeverforge.util import utf8
 
 log = logging.getLogger("beeverforge.product")
 
@@ -319,32 +320,46 @@ def write_facts(root: Path, *, files: dict[str, str], gaps: list[str]) -> Path |
 def add_file(into: Path, name: str, body: str) -> bool:
     """One more file in a pack already written — a round of the role's `[[BUSCA: …]]` searches
     (#269 slice 2) — and its line in the manifest, so the README still names every file. Admitted
-    like every other name (`_one_file_under`); False when it is not, or could not be written."""
+    like every other name (`_one_file_under`); False when it is not, or could not be written —
+    nothing at all is written when the README is not UTF-8 text and so could not name it."""
     if not _one_file_under(name) or not str(name).startswith(f"{FOUND_DIR}/"):
         log.warning("refusing to add %r to the product facts: not a file under %s/", name,
                     FOUND_DIR)
         return False
     try:
-        into = Path(into)
-        target = into / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
-        _name_in_readme(into, name)
-        return True
+        return _added(Path(into), name, lambda target: target.write_text(body, encoding="utf-8"))
     except OSError as exc:  # noqa: BLE001 — a search that could not be written is said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False
 
 
-def _name_in_readme(into: Path, name: str) -> None:
+def _added(into: Path, name: str, write) -> bool:
+    """`write` the file `name` under `into` and name it in the pack's README — or, when the README
+    is not UTF-8 text, write nothing and say so: a file the README cannot name is not added, so
+    the README still names every file the pack holds."""
     readme = into / "README.md"
-    text = readme.read_text(encoding="utf-8")
-    line = f"- `{into.name}/{name}`"
-    if line not in text:
-        marker = "\n\n## What could NOT be read"
-        text = (text.replace(marker, f"\n{line}{marker}", 1) if marker in text
-                else f"{text.rstrip()}\n{line}\n")
-        readme.write_text(text, encoding="utf-8")
+    text, unread = utf8.decode(readme.read_bytes(), f"{into.name}/README.md")
+    if text is None:
+        log.warning("could not add %s to the product facts: %s Nothing was written.", name,
+                    unread)
+        return False
+    target = into / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write(target)
+    named = _with_line(text, f"- `{into.name}/{name}`")
+    if named != text:
+        readme.write_text(named, encoding="utf-8")
+    return True
+
+
+def _with_line(text: str, line: str) -> str:
+    """The README's `text` naming `line`: before the closing section on what could not be read,
+    or at its end."""
+    if line in text:
+        return text
+    marker = "\n\n## What could NOT be read"
+    return (text.replace(marker, f"\n{line}{marker}", 1) if marker in text
+            else f"{text.rstrip()}\n{line}\n")
 
 
 #: The one kind of file a pack holds that is not text: an image a person attached (#336), put in
@@ -354,18 +369,14 @@ _ATTACHED_IMAGE = re.compile(r"^attached-\d{1,2}\.(?:png|jpe?g|gif|webp)$")
 
 def add_image(into: Path, name: str, data: bytes) -> bool:
     """An image attached to the message, as itself, under `found/` — False when the name is not
-    one an attachment is given, or it could not be written."""
+    one an attachment is given, or it could not be written (as for `add_file`, nothing is written
+    when the README is not UTF-8 text)."""
     folder, _, leaf = str(name).partition("/")
     if folder != FOUND_DIR or not _ATTACHED_IMAGE.match(leaf):
         log.warning("refusing to add %r to the product facts: not an attached image", name)
         return False
     try:
-        into = Path(into)
-        target = into / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        _name_in_readme(into, name)
-        return True
+        return _added(Path(into), name, lambda target: target.write_bytes(data))
     except OSError as exc:  # noqa: BLE001 — said by the caller
         log.warning("could not add %s to the product facts (%s)", name, exc)
         return False

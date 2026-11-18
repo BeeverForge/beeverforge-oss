@@ -12,7 +12,7 @@ from beeverforge import namespace
 from beeverforge.contracts import Manifest
 from beeverforge.contracts.manifest import CI_THAT_READS_NO_DEPLOY
 from beeverforge.contracts.project import Project
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 log = logging.getLogger("beeverforge.loader")
 
@@ -70,7 +70,7 @@ def load_manifest(project: Project, *, repo_root: Path | None = None) -> Manifes
             f"project {project.name!r} has no manifest at {manifest_file}. {how}."
         )
     try:
-        data = yaml_io.load(manifest_file.read_text()) or {}
+        data = yaml_io.load(utf8.text_of(manifest_file, str(manifest_file))) or {}
     except yaml.YAMLError as exc:
         raise ValueError(f"{manifest_file} is not valid YAML: {exc}") from exc
     if not isinstance(data, dict):

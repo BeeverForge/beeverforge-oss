@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from beeverforge.former_names import FORMER_PREFIX
+from beeverforge.util import utf8
 
 #: The compose project names, as each release's `docker-compose.yml` declares them (`name:`).
 FORMER_PROJECT = "openfactory"
@@ -84,12 +85,28 @@ class Carried:
     former: list[str] = field(default_factory=list)
 
 
+def _text_of(path: Path) -> str | None:
+    """`path`'s text — None when it cannot be opened; `Refused`, naming the byte and the remedy,
+    when its bytes are not UTF-8 text."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    text, unread = utf8.decode(raw, str(path))
+    if text is None:
+        raise Refused(f"{unread.removesuffix('.')} — nothing was stopped, copied or emptied")
+    return text
+
+
 def is_a_0_7_file(path: Path) -> bool:
     """Whether `path` is an OpenFactory 0.7 deployment's `.env.compose`: it sets an
-    `OPENFACTORY_*` row. Absent or unreadable is no."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    `OPENFACTORY_*` row. Absent is no; bytes that are not UTF-8 text are refused.
+
+    NOT UTF-8 IS NOT "NO". Read as no, the installer would go on, `init` would rewrite the file,
+    and the new stack would start on empty volumes — the defect this module exists to prevent. So
+    the file is named, with the byte and the remedy, before anything is stopped or copied."""
+    text = _text_of(path)
+    if text is None:
         return False
     return any(line.lstrip().removeprefix("export ").lstrip().startswith(FORMER_PREFIX)
                and "=" in line for line in text.splitlines())

@@ -230,7 +230,7 @@ def _manifest(checkout: Path, target: str, language: str):
     from pydantic import ValidationError
 
     from beeverforge.contracts import Manifest
-    from beeverforge.util import yaml_io
+    from beeverforge.util import utf8, yaml_io
 
     try:
         manifest_file = namespace.resolve(checkout, namespace.MANIFEST, project=checkout.name)
@@ -242,7 +242,7 @@ def _manifest(checkout: Path, target: str, language: str):
                            manifest=namespace.in_repo(checkout, namespace.MANIFEST)))
     shown = (Path(target) / namespace.in_repo(checkout, namespace.MANIFEST)).as_posix()
     try:
-        data = yaml_io.load(manifest_file.read_text()) or {}
+        data = yaml_io.load(utf8.text_of(manifest_file, shown)) or {}
         if not isinstance(data, dict):
             raise ValueError(f"a YAML mapping, not {type(data).__name__}")
         # VALIDATED WITHOUT THE REGISTRY'S CONTEXT, as every `Manifest(...)` outside
