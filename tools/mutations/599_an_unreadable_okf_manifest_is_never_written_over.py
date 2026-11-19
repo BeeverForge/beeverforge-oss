@@ -32,6 +32,22 @@ MUTATIONS = [
      "        raise ManifestUnreadable(path, f\"it is not YAML: {exc}\") from exc\n",
      "    except yaml.YAMLError:\n        return None\n"),
 
+    ("the strict reader reads a manifest that is not a mapping as no manifest",
+     _OKF,
+     "        raise ManifestUnreadable(path, f\"it is not a mapping but a YAML {type(data).__name__}\")\n",
+     "        return None\n"),
+
+    ("the strict reader reads a manifest that is not a valid manifest as no manifest",
+     _OKF,
+     "    except (TypeError, ValueError) as exc:\n"
+     "        raise ManifestUnreadable(path, f\"it is not a valid manifest: {exc}\") from exc\n",
+     "    except (TypeError, ValueError):\n        return None\n"),
+
+    ("the strict reader reads a manifest the system cannot read as no manifest",
+     _OKF,
+     "    except OSError as exc:\n        raise ManifestUnreadable(path, str(exc)) from exc\n",
+     "    except OSError:\n        return None\n"),
+
     ("the renewal folds an unreadable manifest into a fresh one and writes the round",
      _RENEW,
      "        return Renewal(len(existing), 0, 0, 0, MANIFEST_UNREADABLE, reason=str(exc))\n",

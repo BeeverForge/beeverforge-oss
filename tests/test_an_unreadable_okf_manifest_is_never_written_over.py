@@ -268,10 +268,10 @@ def test_a_missing_manifest_still_gets_a_fresh_one(tmp_path):
 
 # ── the refresh activity ────────────────────────────────────────────────────────────────────────
 
-def _refreshed_with_a_request(tmp_path, monkeypatch):
+def _queued(tmp_path, monkeypatch):
     """The setup of the request test in `test_capabilities_and_checks.py`: a published, seeded
-    bundle the refresh calls "unchanged", and one request about its repository queued."""
-    from beeverforge.knowledge.okf import ManifestUnreadable
+    bundle the refresh calls "unchanged", and one request about its repository queued. Returns
+    the activity module, its input, the inbox and the context repository."""
     from beeverforge.runtime.temporal.io import KnowledgeRefreshInput
     from tests.test_knowledge_pipeline import _client_repo, _context_repo, _patch_activity
     from tests.test_the_merge_re_authors_what_it_invalidated import _seed_concepts
@@ -287,6 +287,14 @@ def _refreshed_with_a_request(tmp_path, monkeypatch):
     assert acts._do_refresh_knowledge(inp) == "unchanged"
     inbox = asked.inbox_for(acts.ProjectRegistry().get("p"))
     assert asked.request(inbox, repo="owner/repo", path="core/__init__.py", at="2026-09-24T10")
+    return acts, inp, inbox, context
+
+
+def _refreshed_with_a_request(tmp_path, monkeypatch):
+    """`_queued`, with the recording refusing for a planted reason."""
+    from beeverforge.knowledge.okf import ManifestUnreadable
+
+    acts, inp, inbox, _ = _queued(tmp_path, monkeypatch)
 
     def unreadable(bundle_dir, requested):
         raise ManifestUnreadable(Path(bundle_dir) / OKF_MANIFEST_FILE, "planted")
@@ -332,6 +340,33 @@ def test_a_publish_for_other_reasons_still_leaves_the_requests_pending(
     assert acts._do_refresh_knowledge(inp) == "published+concepts:1"
 
     _named_and_pending(caplog, inbox)
+
+
+def test_a_real_unreadable_manifest_stops_the_renewal_and_the_recording_in_one_round(
+        tmp_path, monkeypatch, caplog):
+    """End to end, no fake on the recording: the published manifest itself is Latin-1. The renewal
+    and the recording both refuse in the same round, both name the file, the request stays
+    pending and nothing is published over the context repository."""
+    from tests.test_knowledge_pipeline import _SUBPATH, _git
+
+    acts, inp, inbox, context = _queued(tmp_path, monkeypatch)
+    clone = tmp_path / "ctx-plant"
+    _git(tmp_path, "clone", "-q", str(context), str(clone))
+    _latin1(clone / _SUBPATH / OKF_MANIFEST_FILE)
+    _git(clone, "commit", "-qam", "a manifest saved as Latin-1")
+    _git(clone, "push", "-q", "origin", "HEAD")
+    head = _git(context, "rev-parse", "main")
+    caplog.set_level(logging.INFO)
+
+    assert acts._do_refresh_knowledge(inp) == "unchanged"
+
+    messages = [r.getMessage() for r in caplog.records]
+    for key in ("BEEVERFORGE_OKF_MANIFEST_UNREADABLE",
+                "BEEVERFORGE_KNOWLEDGE_REQUESTS_NOT_RECORDED"):
+        [line] = [m for m in messages if key in m]
+        assert OKF_MANIFEST_FILE in line and "(0xe9) cannot be read" in line and REMEDY in line
+    assert [g.path for g in asked.pending(inbox, "owner/repo")] == ["core/__init__.py"]
+    assert _git(context, "rev-parse", "main") == head, "a round over an unreadable manifest published"
 
 
 # ── the covering ────────────────────────────────────────────────────────────────────────────────
