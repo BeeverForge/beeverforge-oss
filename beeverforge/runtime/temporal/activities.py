@@ -5126,6 +5126,27 @@ def _ref_in(text: str) -> str:
     return m.group(1).lstrip("#") if m else ""
 
 
+def _record_requests(dest: Path, wanted: list, *, project: str, repo: str) -> tuple[list, list]:
+    """Record the requested gaps `wanted` into the bundle at `dest`; return what was recorded and
+    the requests that may now be marked taken.
+
+    A MANIFEST THAT CANNOT BE READ TAKES NO REQUEST: nothing was recorded, so none is marked
+    taken — they stay pending for the round after the file is fixed."""
+    from beeverforge.knowledge.gaps import record_in_bundle
+    from beeverforge.knowledge.okf import ManifestUnreadable
+
+    try:
+        recorded = record_in_bundle(dest, wanted) if wanted else []
+    except ManifestUnreadable as exc:
+        activity.logger.warning("BEEVERFORGE_KNOWLEDGE_REQUESTS_NOT_RECORDED project=%s "
+                                "repo=%s %s", project, repo, exc)
+        recorded, wanted = [], []
+    if recorded:
+        activity.logger.info("BEEVERFORGE_KNOWLEDGE_REQUESTS_RECORDED project=%s repo=%s "
+                             "gaps=%d", project, repo, len(recorded))
+    return recorded, wanted
+
+
 def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
     """The Knowledge Pipeline (§11), post-merge: regenerate the module map from the base branch's
     NEW state and publish it into the project's CONTEXT repository (D-2/D-3 — never the client's
@@ -5273,22 +5294,10 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
         # gaps merged by key into the manifest this round publishes. Only into a bundle that was
         # published: the request was judged against one, and a source with none owes a backfill.
         from beeverforge.knowledge import requests as asked
-        from beeverforge.knowledge.gaps import record_in_bundle
-        from beeverforge.knowledge.okf import ManifestUnreadable
 
         inbox = asked.inbox_for(project)
         wanted = asked.pending(inbox, repo) if published is not None else []
-        try:
-            recorded = record_in_bundle(dest, wanted) if wanted else []
-        except ManifestUnreadable as exc:
-            # A MANIFEST THAT CANNOT BE READ TAKES NO REQUEST: nothing was recorded, so none is
-            # marked taken — they stay pending for the round after the file is fixed.
-            activity.logger.warning("BEEVERFORGE_KNOWLEDGE_REQUESTS_NOT_RECORDED project=%s "
-                                    "repo=%s %s", inp.project, repo, exc)
-            recorded, wanted = [], []
-        if recorded:
-            activity.logger.info("BEEVERFORGE_KNOWLEDGE_REQUESTS_RECORDED project=%s repo=%s "
-                                 "gaps=%d", inp.project, repo, len(recorded))
+        recorded, wanted = _record_requests(dest, wanted, project=inp.project, repo=repo)
         if not map_changed and not renewal.wrote and not recorded:
             # nothing new among them: each is in the manifest already, or described since
             asked.taken(inbox, repo, [g.key for g in wanted], at=now)

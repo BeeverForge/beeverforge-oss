@@ -83,14 +83,7 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
         return Covered(0, (), tuple(wanted), f"the authoring failed: {str(exc)[:120]}")
     if not authored.concepts:
         return Covered(0, (), tuple(wanted), authored.mode)
-    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)
-    manifest = manifest.model_copy(update={
-        "source_commit": commit or manifest.source_commit, "generated_at": generated_at,
-        # a manifest published without its scope statement gets it here — the sentence that
-        # stops a reader treating a machine reading as a specification (the renewal's lesson)
-        "scope_limit": manifest.scope_limit or SCOPE_LIMIT,
-        # THE RECORD FIRST, BY KEY: an answered question is not shadowed by its re-derivation
-        "gaps": merge_gaps(manifest.gaps, authored.gaps)})
+    manifest = _manifest_with(previous, authored, commit=commit, generated_at=generated_at)
     write_okf(bundle, manifest=manifest, concepts=authored.concepts)
     (bundle / OKF_INDEX_FILE).write_text(render_index(manifest, read_concepts(bundle)),
                                          encoding="utf-8")
@@ -98,6 +91,20 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
     covered = tuple(p for p in wanted if p in cited)
     return Covered(len(authored.concepts), covered, tuple(p for p in wanted if p not in cited),
                    authored.mode)
+
+
+def _manifest_with(previous: OkfManifest | None, authored, *, commit: str,
+                   generated_at: str) -> OkfManifest:
+    """The manifest to write beside what was authored: the one read (or a fresh one when there
+    was none), stamped with this commit and carrying the authored gaps merged into its own."""
+    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)
+    return manifest.model_copy(update={
+        "source_commit": commit or manifest.source_commit, "generated_at": generated_at,
+        # a manifest published without its scope statement gets it here — the sentence that
+        # stops a reader treating a machine reading as a specification (the renewal's lesson)
+        "scope_limit": manifest.scope_limit or SCOPE_LIMIT,
+        # THE RECORD FIRST, BY KEY: an answered question is not shadowed by its re-derivation
+        "gaps": merge_gaps(manifest.gaps, authored.gaps)})
 
 
 __all__ = ["Covered", "cover_paths"]

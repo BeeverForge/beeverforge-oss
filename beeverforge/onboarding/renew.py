@@ -90,6 +90,10 @@ class Renewal(NamedTuple):
     def summary(self) -> str:
         if self.mode == MANIFEST_UNREADABLE:
             return f"manifest cannot be read — {self.reason}"
+        return self._counts()
+
+    def _counts(self) -> str:
+        """The summary of a round that read its manifest: what it checked and what it did."""
         tail = " — inventory refreshed" if self.inventoried else ""
         if self.checked == 0:
             return "no concepts published" + tail
@@ -158,8 +162,7 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     rewritten, new_gaps, mode = authored.concepts, authored.gaps, authored.mode
     covered = {(c.type, c.title) for c in rewritten}
     left = [b for b in broken if (b.type, b.title) not in covered]
-    why = ("over budget this round" if authored.ran
-           else f"nobody could write one — {authored.mode}")
+    why = _why_not_rewritten(authored)
     # A BUNDLE WITH CONCEPTS AND NO MANIFEST — never published by this code, and reachable by a
     # hand-deleted file or a `manifest.yaml` the module map overwrote before `okf.yaml` existed —
     # is renewed from a manifest that still carries the scope statement. Without it the index
@@ -181,6 +184,13 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     (bundle_dir / OKF_INDEX_FILE).write_text(
         render_index(manifest, read_concepts(bundle_dir)), encoding="utf-8")
     return Renewal(len(existing), len(broken), len(rewritten), len(left), mode, inventoried)
+
+
+def _why_not_rewritten(authored) -> str:
+    """Why a broken concept this round's authoring did not re-author was left as a gap."""
+    if authored.ran:
+        return "over budget this round"
+    return f"nobody could write one — {authored.mode}"
 
 
 def _shape(inventory: Inventory) -> tuple:

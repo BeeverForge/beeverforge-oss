@@ -51,6 +51,6 @@ MUTATIONS = [
 
     ("the refresh marks the requests taken though the manifest could not record them",
      _ACTIVITY,
-     "            recorded, wanted = [], []\n",
-     "            recorded = []\n"),
+     "        recorded, wanted = [], []\n",
+     "        recorded = []\n"),
 ]
