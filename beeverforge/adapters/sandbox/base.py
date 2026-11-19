@@ -93,6 +93,31 @@ class BranchHeldElsewhere(RuntimeError):
                 (str(self), self.branch, self.path, self.main, self.locked))
 
 
+class DaemonTimedOut(RuntimeError):
+    """A host command the box needed did not finish within its bound (#608): a `docker rm -f` the
+    daemon did not complete even after one retry, or another step of starting the box. `name` is
+    the box's container.
+
+    A RUNTIME ERROR WITH ONE SENTENCE, NOT `subprocess.TimeoutExpired`. Measured on a deployment:
+    the daemon was slow to remove a box whose processes the OOM killer had just killed, the
+    timeout escaped `prepare` as a traceback, and the removal finished on its own minutes later.
+    At the end of a run the same timeout, raised in `run()`'s `finally`, replaced a hold reached
+    after 2 h 18 min of repair passes. IN THE PORT MODULE because the machine catches it whatever
+    the box is: at the start it parks the job with the sentence, at the cleanup it reports it and
+    keeps the run's own outcome."""
+
+    def __init__(self, message: str, *, name: str) -> None:
+        super().__init__(message)
+        self.name = name
+
+    def __reduce__(self):
+        return (_rebuild_daemon_timed_out, (str(self), self.name))
+
+
+def _rebuild_daemon_timed_out(message: str, name: str) -> DaemonTimedOut:
+    return DaemonTimedOut(message, name=name)
+
+
 def _rebuild_branch_held(message: str, branch: str, path: str, main: bool,
                          locked: bool) -> BranchHeldElsewhere:
     return BranchHeldElsewhere(message, branch=branch, path=path, main=main, locked=locked)
