@@ -52,10 +52,13 @@ import ast
 import functools
 import pathlib
 
+import pytest
 from test_the_environment_carries_the_products_name import _holds_a_credential
 
 from beeverforge import environ
 from tests.the_tree_read_once import parsed
+
+pytestmark = pytest.mark.whole_tree
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "beeverforge"

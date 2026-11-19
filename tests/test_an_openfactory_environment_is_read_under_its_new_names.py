@@ -355,6 +355,7 @@ def _starts_a_process(tree: ast.Module) -> bool:
     return False
 
 
+@pytest.mark.whole_tree
 def test_every_module_a_process_starts_from_is_accounted_for():
     starts = {p.relative_to(PACKAGE).as_posix() for p in sorted(PACKAGE.rglob("*.py"))
               if _starts_a_process(parsed(p))}
@@ -382,6 +383,7 @@ def test_each_entry_carries_the_old_names_and_says_so(module, function):
         f"{module}:{function} carries before it loads `.env`, so a 0.7 `.env` is not carried")
 
 
+@pytest.mark.whole_tree
 def test_every_function_that_loads_an_env_file_carries_after_it():
     """Derived, not listed: a new place that loads `.env` is a new place an old name arrives."""
     missing = []

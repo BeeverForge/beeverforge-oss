@@ -108,6 +108,7 @@ def test_jira_escapes_a_title_before_putting_it_in_a_query():
     assert '\\"extrato\\"' in seen["jql"], f"unescaped title reached the query: {seen['jql']}"
 
 
+@pytest.mark.whole_tree
 def test_no_core_module_names_a_concrete_tracker():
     """The seam's whole claim: adding a provider is one row in the registry, not a sweep through
     the composition root."""

@@ -116,10 +116,12 @@ def test_every_declared_core_file_exists():
     assert not missing, missing
 
 
+@pytest.mark.whole_tree
 def test_the_guard_walks_something():
     assert len(FILES) >= 15
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
 def test_the_core_does_not_import_the_shell(path):
     offenders = [
@@ -133,6 +135,7 @@ def test_the_core_does_not_import_the_shell(path):
     )
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
 def test_the_core_needs_no_vendor_library(path):
     offenders = [
@@ -146,6 +149,7 @@ def test_the_core_needs_no_vendor_library(path):
     )
 
 
+@pytest.mark.whole_tree
 def test_the_core_imports_cleanly_with_nothing_but_pydantic():
     """The installability claim, asserted rather than assumed: a subprocess that blocks every
     forbidden third-party package must still import the whole Core."""
@@ -175,6 +179,7 @@ def test_the_core_imports_cleanly_with_nothing_but_pydantic():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+@pytest.mark.whole_tree
 def test_the_only_thing_the_core_reads_is_its_own_presets():
     """The bound on the deviation above. `yaml` is allowed because the Core reads a table shipped
     inside its own package — so the guard is that it reads NOTHING ELSE. Without this, allowing
@@ -205,6 +210,7 @@ def test_the_presets_directory_is_inside_the_package():
 
 # ── the shell may depend on the Core, and does ──────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_dependency_actually_points_the_right_way():
     """A boundary nothing crosses in EITHER direction is not a boundary, it is dead code. The
     shell must genuinely consume the Core, or this whole guard is protecting nothing."""

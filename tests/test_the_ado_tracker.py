@@ -218,6 +218,7 @@ def test_a_malformed_state_map_is_logged_and_never_crashes_the_build(caplog):
     assert "state_map" in caplog.text
 
 
+@pytest.mark.whole_tree
 def test_nothing_outside_the_registry_names_this_class():
     """The seam's whole claim: adding Azure DevOps is one row plus one module, not a sweep through
     the composition root. This is the same guard the GitHub and Jira classes carry."""

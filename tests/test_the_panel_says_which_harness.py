@@ -155,6 +155,7 @@ def test_the_panel_does_not_read_the_model_from_the_environment_ITSELF():
         assert var not in src, f"{var} is read directly in the panel; ask model_for instead"
 
 
+@pytest.mark.whole_tree
 def test_no_library_module_loads_dotenv_ON_IMPORT():
     """The class guard. `cli.py` carries a docstring about this exact defect — a bare
     `load_dotenv()` at module scope, found when `pytest-randomly` ordered an importing test ahead

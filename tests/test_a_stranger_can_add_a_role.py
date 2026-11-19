@@ -670,6 +670,7 @@ def test_an_add_on_whose_answers_CODE_parses_gets_no_directive_and_one_a_person_
         assert _prompt_the_harness_receives(adapter, phase).startswith(directive), (kind, phase)
 
 
+@pytest.mark.whole_tree
 def test_every_phase_the_tree_passes_sits_in_EXACTLY_one_set():
     """The measurement behind the blocker: the guard above walks the four adapter files'
     `_invoke`/`_run` calls and cannot see `product/role.py`, where the two verdict phases are

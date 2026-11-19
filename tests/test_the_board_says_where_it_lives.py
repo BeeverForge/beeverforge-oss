@@ -306,6 +306,7 @@ def _excused(raw: list[str], stmt_line: int, line_no: int) -> bool:
     return False
 
 
+@pytest.mark.whole_tree
 def test_no_neutral_module_BUILDS_a_vendor_URL():
     """The class, not the site. A vendor's URL shape belongs in `adapters/<vendor>/` — the panel
     is the one somebody notices, and it took two goes to find it there.
@@ -319,6 +320,7 @@ def test_no_neutral_module_BUILDS_a_vendor_URL():
         f"on the line when the shape really is the point: {offenders}")
 
 
+@pytest.mark.whole_tree
 def test_the_ratchet_actually_WALKS_the_package():
     """THE BUG THIS GUARD HAD. `inspect.getfile(BoardAdapter).parent.parent` is
     `beeverforge/adapters` — and the walk skips every path containing `adapters`, so it inspected

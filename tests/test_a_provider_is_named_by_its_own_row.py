@@ -272,6 +272,7 @@ def _generic_modules() -> list[str]:
 
 # ═══ the rule, over the whole package ═══════════════════════════════════════════════════════════
 
+@pytest.mark.whole_tree
 def test_the_rule_reads_the_package_and_knows_the_shipped_names() -> None:
     """A negative guard needs its positive twin: an empty list of files, or of names, passes."""
     assert len(_generic_modules()) > 100 and "beeverforge/runtime/temporal/view.py" in \
@@ -279,6 +280,7 @@ def test_the_rule_reads_the_package_and_knows_the_shipped_names() -> None:
     assert {"GitHub Actions", "Azure Pipelines", "GitHub", "Azure DevOps"} <= _shipped_names()
 
 
+@pytest.mark.whole_tree
 def test_no_generic_module_spells_a_providers_display_name() -> None:
     names = _shipped_names() | STRANGERS
     offenders = []
@@ -385,6 +387,7 @@ def test_the_second_rule_knows_the_vendors_words() -> None:
     assert {"AZURE_DEVOPS_PAT", "JIRA_API_TOKEN"} <= _shipped_variables()
 
 
+@pytest.mark.whole_tree
 def test_no_generic_module_says_a_vendors_sentence() -> None:
     offenders = []
     for rel in _generic_modules():

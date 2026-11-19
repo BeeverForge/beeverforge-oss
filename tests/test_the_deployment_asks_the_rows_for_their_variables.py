@@ -78,6 +78,7 @@ def _rows(text: str) -> set[str]:
 
 # ── the negative: the core's text spells no variable the core does not read ─────────────────────
 
+@pytest.mark.whole_tree
 def test_the_renderer_spells_no_variable_the_public_core_does_not_read(tmp_path):
     tree = parsed(MODULE)
     mentioned: set[str] = set()
@@ -114,6 +115,7 @@ def test_the_port_allowance_is_the_published_ports_and_nothing_the_worker_forwar
     assert forwarded and not (ports & forwarded), sorted(ports & forwarded)
 
 
+@pytest.mark.whole_tree
 def test_the_public_core_derivation_drops_what_only_a_leaving_module_reads(tmp_path):
     """Verify the verifier: the scratch core reads the panel token, and a variable that ONLY an
     excluded module reads is not in the set — here or in the export, where the module is gone."""
@@ -130,6 +132,7 @@ def test_the_public_core_derivation_drops_what_only_a_leaving_module_reads(tmp_p
     assert not (excluded_only & read)
 
 
+@pytest.mark.whole_tree
 def test_with_only_the_panel_row_the_rendered_file_names_no_add_on_variable(monkeypatch, tmp_path):
     install(monkeypatch, declared_rows=False)
     rows = _rows(render(Answers(channel="panel")).text)

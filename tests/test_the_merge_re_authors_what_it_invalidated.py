@@ -432,6 +432,7 @@ def test_the_activity_reaches_the_renewal_on_the_real_path():
     assert "renew_concepts(project, dest, Path(repo_path)" in src
 
 
+@pytest.mark.whole_tree
 def test_propose_concepts_has_exactly_the_callers_the_design_names():
     """ONE PATH. The backfill ranks and authors; everything that authors BY PATH — the renewal's
     broken concepts, the gate's undescribed files (#56) — goes through `concepts.author_for_paths`,

@@ -80,6 +80,7 @@ def _capabilities_asked_of_a_forge() -> dict[str, list[str]]:
     return asked
 
 
+@pytest.mark.whole_tree
 def test_no_capability_is_asked_of_a_forge_row_that_no_shipped_row_declares():
     """An optional capability is asked with `getattr` so that a row which never heard of it keeps
     working. The price of that courtesy is that NOTHING fails when no row has heard of it: the

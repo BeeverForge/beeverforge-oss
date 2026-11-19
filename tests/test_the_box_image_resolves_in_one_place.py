@@ -112,6 +112,7 @@ def test_fargate_without_a_declaration_is_fine():
 
 # ── one literal, one resolver ───────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_image_name_is_written_down_exactly_once():
     """Six literals is six places to disagree. The guard is what keeps the seventh from appearing
     the next time somebody needs a default."""

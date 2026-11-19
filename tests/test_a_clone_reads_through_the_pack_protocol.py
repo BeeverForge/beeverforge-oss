@@ -21,6 +21,8 @@ import ast
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 STRAY = "tmp_idx_left_by_a_repack"
 
@@ -97,6 +99,7 @@ def _clones(source: str) -> list[str]:
     return [str(n) for n in sorted(found)]
 
 
+@pytest.mark.whole_tree
 def test_every_clone_the_platform_runs_passes_no_local():
     """A GUARD ON THE CLASS: the next clone written into the platform reads a path the same way."""
     missing = [f"{path.relative_to(ROOT)}:{line}"

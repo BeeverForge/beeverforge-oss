@@ -137,6 +137,7 @@ def _every_function() -> dict[tuple[str, str], ast.AST]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_every_writer_of_a_new_card_is_named_and_asks_before_it_writes():
     functions = _every_function()
     writers = {key for key, fn in functions.items()

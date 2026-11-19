@@ -295,6 +295,7 @@ def _allowed(path: str, where: str) -> bool:
     return "*" in rows or any(where == row or where.startswith(f"{row}.") for row in rows)
 
 
+@pytest.mark.whole_tree
 def test_nothing_the_worker_or_the_panel_runs_writes_past_the_log():
     """Read off every module's syntax tree: each write to the process's own stdout or stderr goes
     through `logs.announce`, which prints or logs as the process's lines are — or it sits where
@@ -339,6 +340,7 @@ def test_the_sweep_sees_every_way_of_writing_and_where_it_is(way):
         assert found == {where}, (way, where, found)
 
 
+@pytest.mark.whole_tree
 def test_every_place_the_sweep_lets_write_still_writes():
     """A row with no write left under it is a door left open for whatever comes next; a process's
     command that no longer exists guards nothing."""
@@ -564,6 +566,7 @@ def _the_lines_said_for_a_person() -> dict[tuple[str, str, str], list[str]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_a_line_that_must_never_be_silent_is_said_at_warning():
     """Read off every call site of `logs.announce`: each is classed in `LINE_LEVELS`, once, and
     hands the level its class says — so a degraded or failed path is a WARNING with JSON lines, and

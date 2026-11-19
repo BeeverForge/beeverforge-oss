@@ -191,6 +191,7 @@ def test_the_former_queue_is_served_by_the_same_workflows_and_activities(booted)
     assert former.get("max_concurrent_activities") == own.get("max_concurrent_activities")
 
 
+@pytest.mark.whole_tree
 def test_nothing_new_is_started_on_the_former_queue():
     """The former queue is POLLED, never a destination: no module but the one that defines it and
     the worker that polls it names it, and its spelling appears nowhere else in the package. A
@@ -629,6 +630,7 @@ async def test_an_engine_failure_other_than_not_found_is_not_retried_on_0_7s_id(
     assert FORMER_JOB not in asked
 
 
+@pytest.mark.whole_tree
 def test_no_job_is_addressed_by_beeverforges_id_alone():
     """Every handle on an existing job goes through `job_handle`: a `get_workflow_handle` given
     `job_id(...)`, or an f-string spelling `beeverforge-{project}-{issue}`, would miss a 0.7 job."""

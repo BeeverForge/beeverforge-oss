@@ -141,6 +141,7 @@ def _offenders(root: Path = ROOT) -> list[str]:
     return offenders
 
 
+@pytest.mark.whole_tree
 def test_the_tracked_tree_names_no_owner():
     files = _tracked()
     assert len(files) > 200, f"only {len(files)} tracked files — the listing is not the repository"
@@ -155,6 +156,7 @@ def test_the_tracked_tree_names_no_owner():
         + "\n  ".join(offenders))
 
 
+@pytest.mark.whole_tree
 def test_no_BINARY_artefact_is_tracked():
     """The half a text search cannot see. `.coverage` is a SQLite file whose rows are ABSOLUTE
     paths from whoever ran the suite — it was committed by accident and published the maintainer's
@@ -225,6 +227,7 @@ def _foreign_coordinates(root: Path = ROOT) -> list[str]:
     return offenders
 
 
+@pytest.mark.whole_tree
 def test_no_namespace_in_the_tree_belongs_to_an_UNDECLARED_ORGANISATION():
     """The derived half of the doctrine, and the guard the leak of 2026-08-26 needed.
 
@@ -251,6 +254,7 @@ def test_no_namespace_in_the_tree_belongs_to_an_UNDECLARED_ORGANISATION():
         + "\n  ".join(offenders))
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("coordinate", _FOREIGN_COORDINATES)
 def test_a_FOREIGN_namespace_root_IS_REPORTED(tmp_path, coordinate):
     """The positive twin: plant a coordinate rooted in a name nobody declared and watch it fire.
@@ -266,6 +270,7 @@ def test_a_FOREIGN_namespace_root_IS_REPORTED(tmp_path, coordinate):
         f"beeverforge/onboarding/context.py:1  {coordinate}"]
 
 
+@pytest.mark.whole_tree
 def test_but_a_VENDORS_and_OUR_OWN_roots_are_left_alone(tmp_path):
     """Its other half. A rule that fires on `Microsoft.VSTS.Common.StackRank` — the field name an
     Azure DevOps adapter is REQUIRED to send — is a rule that gets deleted, not obeyed; and one
@@ -295,6 +300,7 @@ def test_the_rule_leaves_ORDINARY_TWO_SEGMENT_CODE_alone():
             f"the rule fires on ordinary code: {innocent!r}")
 
 
+@pytest.mark.whole_tree
 def test_every_DECLARED_root_is_used_by_something():
     """The twin that keeps the allow-list honest. Declaring a root is the claim "a vendor
     publishes this" or "we made this name up", and an entry nothing uses is a hole waiting for
@@ -322,6 +328,7 @@ def _repo_with_a_swept_marker(tmp_path: Path) -> None:
         "marker.json": '{"file": "/Users/example-maintainer/Projects/x.py"}'})
 
 
+@pytest.mark.whole_tree
 def test_a_tracked_file_DELETED_from_the_working_tree_is_still_judged(tmp_path):
     """The blind spot, rebuilt from scratch — because on THIS repository it can no longer be
     reproduced: the offending file has been untracked, so a guard asserting against the live tree
@@ -344,6 +351,7 @@ def test_a_tracked_file_DELETED_from_the_working_tree_is_still_judged(tmp_path):
         "the index content came back without what it carries")
 
 
+@pytest.mark.whole_tree
 def test_but_a_file_STAGED_FOR_DELETION_is_not_shipped_and_is_not_judged(tmp_path):
     """The positive twin. Falling back to the index must not resurrect a file somebody has already
     removed — that would make the guard fire on content no clone will ever receive, which is how a
@@ -358,6 +366,7 @@ def test_but_a_file_STAGED_FOR_DELETION_is_not_shipped_and_is_not_judged(tmp_pat
     assert _content("marker.json", tmp_path) is None
 
 
+@pytest.mark.whole_tree
 def test_a_synthetic_shape_in_a_NON_exempt_tracked_file_is_reported(tmp_path):
     """The scan's own road, on a tree of its own — the twin every bite test below is not. Those
     verify the pattern; none of them walked a tree, so a scan reading every non-exempt file with
@@ -371,6 +380,7 @@ def test_a_synthetic_shape_in_a_NON_exempt_tracked_file_is_reported(tmp_path):
     assert _offenders(tmp_path) == ["README.md:3  Exampleperson", "docs/guide.md:3  ExampleCo"]
 
 
+@pytest.mark.whole_tree
 def test_the_scan_reads_the_ONE_object_its_twins_read(tmp_path, monkeypatch):
     """`identity.refused(root)` is what the twins verify, so it must be what the scan reads — a
     scan building its own pattern from the same source is indistinguishable on any tree until
@@ -507,6 +517,7 @@ def _repo_with_an_exempt_file_naming_a_real_person(tmp_path: Path) -> None:
     (tmp_path / "tests" / ".identity-forbidden.txt").write_text(_A_REAL_LIST)
 
 
+@pytest.mark.whole_tree
 def test_an_EXEMPT_file_is_still_scanned_for_the_real_names(tmp_path):
     """The exemption is per token, not per file. The reviewer's cut: `# evidence: the login was
     <login>` appended to an exempt guard file, and the guard stayed green because the file was
@@ -523,6 +534,7 @@ def test_an_EXEMPT_file_is_still_scanned_for_the_real_names(tmp_path):
         f"the exempt file's own synthetic shape is reported as an offence: {offenders}")
 
 
+@pytest.mark.whole_tree
 def test_but_WITHOUT_a_real_list_an_exempt_file_has_nothing_further_to_refuse(tmp_path):
     """The other direction: on a fork (no real list) the exempt files plant synthetic shapes and
     nothing else is known — the scan must not turn an empty real list into a pattern that fires
@@ -582,6 +594,7 @@ def test_a_MALFORMED_real_list_raises_rather_than_forbidding_nothing():
         identity.parse("acmeholdings   a token before any section header\n")
 
 
+@pytest.mark.whole_tree
 def test_a_MALFORMED_real_list_fails_the_scan_with_the_line_that_is_wrong(tmp_path):
     """…and it fails the SCAN, at test time, with `parse`'s sentence naming the line — the shape
     a maintainer can act on. (What it must NOT do is abort collection; the next test is that.)"""

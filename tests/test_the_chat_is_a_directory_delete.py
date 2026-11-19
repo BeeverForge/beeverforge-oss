@@ -105,10 +105,12 @@ def _core_sources() -> list[pathlib.Path]:
 
 # ── 1. the import graph: the core never names the chat connector ────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_sweep_walks_the_core():
     assert len(_core_sources()) > 100, "the sweep found almost nothing — it is walking the wrong tree"
 
 
+@pytest.mark.whole_tree
 def test_no_core_module_imports_the_chat_connector():
     """The registries held the rows until 2026-08-26 — lazily, inside the builders — and this
     sweep sees a lazy import as well as a module-level one."""
@@ -404,6 +406,7 @@ def _string_constants(path: pathlib.Path) -> set[str]:
             if isinstance(n, ast.Constant) and isinstance(n.value, str)}
 
 
+@pytest.mark.whole_tree
 def test_no_core_module_names_a_telegram_variable():
     """The Telegram row switched itself on from two variables the CORE read — the inference the
     cloud cut removed from the box axis, on the notifier axis. The variables are the row's now."""

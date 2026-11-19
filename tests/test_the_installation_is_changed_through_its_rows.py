@@ -702,6 +702,7 @@ def _catalog_writes() -> dict[str, set[str]]:
     return {name: set(_reached(*_home(spec.run))[0]) for name, spec in catalog.CATALOG.items()}
 
 
+@pytest.mark.whole_tree
 def test_what_writes_the_installation_is_read_off_the_modules_that_write_it():
     """The rule below is only as good as this reading, so it is checked to see something: the
     registry's adding and removing, a person's invitation and withdrawal, the poller's hold."""
@@ -725,6 +726,7 @@ def test_what_writes_the_installation_is_read_off_the_modules_that_write_it():
     assert len(held) == 2 and all(h["enable"] is catalog.CATALOG["enable"] for h in held), held
 
 
+@pytest.mark.whole_tree
 def test_the_cached_reading_reads_exactly_what_the_plain_walk_reads():
     """The reading is held once per function per process (`_reached`), and that cache must read
     what the plain walk reads, row by row and command by command: the writers a row's runner
@@ -773,6 +775,7 @@ def d():
 '''
 
 
+@pytest.mark.whole_tree
 def test_the_cached_reading_is_the_plain_walk_round_every_cycle(monkeypatch):
     """The package's own graph may hold no cycle a wrong cache trips over, so the cache is held to
     the plain walk on one that does: read from each function in every order — so a later reading
@@ -805,6 +808,7 @@ def test_the_cached_reading_is_the_plain_walk_round_every_cycle(monkeypatch):
     assert not differ, "the cached reading and the plain walk disagree:\n" + "\n".join(differ[:5])
 
 
+@pytest.mark.whole_tree
 def test_what_the_reading_reads_once_is_what_a_full_walk_reads():
     """The tables the walk reads through are each read once per process, and each more narrowly
     than a full walk of the tree: a function's nodes off its fields (`_nodes`), its imports off
@@ -835,6 +839,7 @@ def test_what_the_reading_reads_once_is_what_a_full_walk_reads():
 
 # ── 1. a row that writes the installation says so, and only such a row ─────────────────────────
 
+@pytest.mark.whole_tree
 def test_a_row_that_writes_the_installation_is_declared_an_installation_row():
     writes = {name: what for name, what in _catalog_writes().items() if what}
     declared = {name for name, spec in catalog.CATALOG.items() if spec.installation}
@@ -1330,6 +1335,7 @@ def one_project(tmp_path, monkeypatch):
     return path
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("name", TAKES_A_PROJECT)
 def test_every_installation_row_that_takes_a_project_refuses_one_nobody_registered(
         name, one_project):
@@ -1948,10 +1954,12 @@ OVER_IT = {"project_add": _add_elsewhere, "project_init": _init_elsewhere,
            "product_start": _start_before_its_code}
 
 
+@pytest.mark.whole_tree
 def test_every_row_that_registers_is_asked_to_write_over_a_project():
     assert sorted(OVER_IT) == REGISTERS, (REGISTERS, sorted(OVER_IT))
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("name", REGISTERS)
 def test_a_row_that_registers_never_writes_over_what_is_registered(name, a_machine):
     """Whatever the request says, a project that is registered keeps its address, its axes and its
@@ -2534,6 +2542,7 @@ def test_the_walk_reaches_every_command_the_app_registers_and_reads_each_body():
     assert not unread, f"commands whose body the walk cannot read: {unread}"
 
 
+@pytest.mark.whole_tree
 def test_no_command_writes_the_installation_but_through_a_row():
     """A command that changes the installation is a mapping onto a row: what it writes, it writes
     through `perform`, which asks who is acting and logs it. Every command is walked into the
@@ -2559,6 +2568,7 @@ def test_no_command_writes_the_installation_but_through_a_row():
     assert not said, "\n".join(said)
 
 
+@pytest.mark.whole_tree
 def test_every_installation_row_is_the_mapping_of_a_command():
     """THE POSITIVE TWIN, and #741's other half: the shell's verbs are mappings over the
     installation's rows. Each installation row is handed to `perform`, by name, from a command the

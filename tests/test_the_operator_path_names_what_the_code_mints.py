@@ -161,6 +161,7 @@ def _retired_hits(text: str) -> list[tuple[int, str]]:
     return [(n, line.strip()) for n, line in enumerate(text.splitlines(), 1) if word.search(line)]
 
 
+@pytest.mark.whole_tree
 def test_no_operator_document_spells_the_retired_name():
     """The class, over every page and template an operator reads.
 
@@ -178,6 +179,7 @@ def test_no_operator_document_spells_the_retired_name():
         f"ABOUT the retirement, put the file in EARNED with the reason.")
 
 
+@pytest.mark.whole_tree
 def test_the_dossier_is_inside_the_walk_and_only_its_named_pages_are_exempt():
     """The twin of narrowing the prefix. `docs/core/` ships, and the exemption was earned by four
     of its pages; the rest must be in the scanned set, where a retired name appearing tomorrow is
@@ -194,6 +196,7 @@ def test_the_dossier_is_inside_the_walk_and_only_its_named_pages_are_exempt():
         "name, and the directory ships in the public tree")
 
 
+@pytest.mark.whole_tree
 def test_the_exemption_is_exactly_what_the_public_cut_excludes():
     """The exemption has no list of its own: a document may carry the retired name only if the
     table sends it out of the public tree. Verified in both directions, so neither a page added
@@ -278,6 +281,7 @@ def test_the_bot_identity_a_document_states_is_the_one_the_code_falls_back_to(mo
         f"`credentials.bot_identity` answers {identity.name!r}")
 
 
+@pytest.mark.whole_tree
 def test_no_document_hands_the_reader_an_export_of_a_name_the_platform_abandoned():
     """The worse half of the same defect: a fallback stated wrongly misleads, but a copy-pasted
     `export` stamps the abandoned name into every commit the factory makes in somebody's

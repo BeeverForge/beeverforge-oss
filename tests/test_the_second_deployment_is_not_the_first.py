@@ -152,6 +152,7 @@ def test_and_either_of_AWSs_OWN_names_declares_one(monkeypatch, var):
     assert environ.cloud_region(required=True) == "sa-east-1"
 
 
+@pytest.mark.whole_tree
 def test_no_module_carries_the_first_deployments_region_as_a_fallback():
     """The measurement, over the package. Four modules had it; a fifth is one grep away.
 

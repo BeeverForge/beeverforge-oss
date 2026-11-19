@@ -176,6 +176,7 @@ def test_the_scan_can_SEE_an_old_prefix_construction():
 ALLOWED: dict[str, str] = {}
 
 
+@pytest.mark.whole_tree
 def test_nothing_constructs_the_old_branch_prefix():
     """No module may BUILD `sdlc/…` as a name. There is no legacy constant to build it from any
     more — the only way to spell it is to type it, which is what this catches."""

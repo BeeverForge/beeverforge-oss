@@ -204,6 +204,7 @@ def files_that_show_a_registry_setting() -> list[str]:
                   and _registry_settings(rel, (ROOT / rel).read_text()))
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("rel", files_that_show_a_registry_setting())
 def test_every_registry_setting_a_shipped_file_shows_still_builds_a_channel(core_only, rel):
     """Including the ones in comments. A template's header is where an operator looks for the
@@ -228,6 +229,7 @@ def test_every_registry_setting_a_shipped_file_shows_still_builds_a_channel(core
         + "\n  ".join(refused))
 
 
+@pytest.mark.whole_tree
 def test_the_walk_over_shipped_files_still_has_the_two_it_was_written_for():
     """The floor, and it names the two the rule started as: a derived walk that quietly stops
     matching parametrises over nothing and passes in silence."""
@@ -411,6 +413,7 @@ def core_documents() -> list[str]:
                   and not rel.startswith("docs/adr/"))
 
 
+@pytest.mark.whole_tree
 def test_no_core_documents_environment_table_declares_an_add_on_packages_variable():
     declared = package_variables()
     assert declared, "no package row declares a variable — this measures nothing"
@@ -431,6 +434,7 @@ def test_no_core_documents_environment_table_declares_an_add_on_packages_variabl
         "checked said it would:\n  " + "\n  ".join(offenders))
 
 
+@pytest.mark.whole_tree
 def test_a_core_document_still_declares_the_CORES_own_variables():
     """The positive twin: the rule above is satisfied by a tree with no environment table at all,
     which is the same operator with nowhere to look. What the core reads is still written down."""

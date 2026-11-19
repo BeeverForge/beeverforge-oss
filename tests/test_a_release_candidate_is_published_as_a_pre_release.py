@@ -21,6 +21,7 @@ from __future__ import annotations
 import pathlib
 import subprocess
 
+import pytest
 import yaml
 from packaging.version import Version
 
@@ -98,6 +99,7 @@ def test_the_supported_versions_have_one_home():
     assert "only the `main` branch" not in section, section
 
 
+@pytest.mark.whole_tree
 def test_the_release_process_and_its_agent_are_tracked():
     """`.claude/` is local scratch and ignored, except the agents a maintainer runs on this
     repository: the release agent is how the process is replicated by whoever holds the role, so

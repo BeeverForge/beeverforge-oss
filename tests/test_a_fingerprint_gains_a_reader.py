@@ -356,6 +356,7 @@ def test_the_command_exits_zero_on_a_fresh_bundle(tmp_path):
 
 # ── the measurement in the ADR ──────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_fingerprint_has_a_reader_now():
     """ADR-0045's definition of done, as a guard: the grep that came back empty on 2026-09-04 does
     not come back empty. Pinned so a refactor cannot quietly remove the only reader and return the

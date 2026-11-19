@@ -64,6 +64,16 @@ is `python -m pytest -q tests/<the file>.py`. Each xdist worker holds the parsed
 runs a guard that reads it (`tests/the_tree_read_once.py`: ~260 MB, and ~450 MB more in a worker
 that runs a guard reading `tests/` too), so a box running `-n 12` should budget that per worker.
 
+**The `whole_tree` marker.** A test that walks or parses this repository's own tree (`rglob`,
+`os.walk` or `git ls-files` over the checkout, directly or through a helper) carries
+`@pytest.mark.whole_tree`, or `pytestmark = pytest.mark.whole_tree` where every test in the module
+does; a walk of a `tmp_path` or a fixture directory is not marked. A gate on a small box — few CPUs,
+little memory — can add `-m "not whole_tree"` to leave those tests out. CI still runs them, in the
+same jobs as before (no job's selection mentions the marker), and a human merges only after that.
+`tests/test_a_whole_tree_test_carries_its_marker.py` fails on a tree-walking test without the marker
+and on a marked test that walks nothing, naming the file and the call, so write the marker when it
+tells you to rather than guessing.
+
 **The shard table.** CI splits the unit run into four jobs with `--shard=k/4`
 (`make test-unit TEST_SHARD=k TEST_SHARDS=4` runs one locally). A shard is whole test files, and a
 shard never imports a file another shard owns. The files are balanced by

@@ -8,6 +8,8 @@ import ast
 import pathlib
 import re
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "beeverforge"
@@ -26,6 +28,7 @@ def _signed_lowercase() -> list[str]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_catalogued_sentence_starts_in_lowercase_after_its_signature():
     found = _signed_lowercase()
     assert not found, (

@@ -265,6 +265,7 @@ def _capability_uses(root: pathlib.Path) -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_the_slack_package_builds_no_agent_no_board_and_no_sandbox():
     """The card's "done when", asserted rather than believed."""
     offenders = _capability_uses(_SLACK)

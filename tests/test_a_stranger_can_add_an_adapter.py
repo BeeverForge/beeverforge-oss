@@ -217,6 +217,7 @@ def registries(root: pathlib.Path = ROOT) -> dict[str, set[str]]:
 REGISTRIES = registries()
 
 
+@pytest.mark.whole_tree
 def test_the_derivation_finds_the_registries_it_was_written_for():
     """The walk has to see the tree it describes, or every guard below measures nothing."""
     assert len(REGISTRIES) >= 12, sorted(REGISTRIES)
@@ -227,6 +228,7 @@ def test_the_derivation_finds_the_registries_it_was_written_for():
         assert rel in REGISTRIES, f"{rel} is not recognised as a registry: {sorted(REGISTRIES)}"
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("rel", sorted(REGISTRIES))
 def test_every_registry_CONSULTS_the_loader(rel):
     """One case per DERIVED registry. "Extensible" that holds for the axes somebody listed and
@@ -242,6 +244,7 @@ def test_every_registry_CONSULTS_the_loader(rel):
         f"the axis name is what joins an entry point to a registry, and a stranger reads the list")
 
 
+@pytest.mark.whole_tree
 def test_the_published_axes_are_EXACTLY_what_the_registries_ask_for():
     """The positive twin of the guard above: every axis in the published list is asked for by a
     registry. An axis listed and asked for by nobody is a door painted on a wall."""
@@ -251,6 +254,7 @@ def test_the_published_axes_are_EXACTLY_what_the_registries_ask_for():
         f"unpublished: {sorted(asked - set(plugins.AXES))}")
 
 
+@pytest.mark.whole_tree
 def test_the_derivation_can_SEE_a_planted_closed_registry(tmp_path):
     """Verify the verifier: a registry in the exact shape ours have, minus the loader call, must
     be found and reported with an empty set — and a module that merely raises "unknown" without

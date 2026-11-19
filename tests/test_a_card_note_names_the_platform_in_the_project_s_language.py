@@ -81,6 +81,7 @@ def _actors_the_code_passes() -> dict[str, list[str]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_every_platform_actor_the_code_passes_to_the_door_has_a_voice_entry():
     found = _actors_the_code_passes()
     assert {"the workflow", "observed", "the job"} <= set(found), (

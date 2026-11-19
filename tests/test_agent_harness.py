@@ -107,6 +107,7 @@ def test_adding_a_harness_is_one_table_entry():
     assert set(harnesses.HARNESSES) >= {"claude_code", "codex", "kimi", "opencode"}
 
 
+@pytest.mark.whole_tree
 def test_no_call_site_instantiates_a_concrete_harness():
     """The regression guard for the actual bug: concrete adapters hardcoded across factory /
     activities / the Slack bot. Everything outside the adapter packages must resolve."""

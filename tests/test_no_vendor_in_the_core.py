@@ -329,6 +329,7 @@ def test_a_click_on_a_chat_add_on_is_authorised_as_the_person_it_names(monkeypat
     assert speaker.is_guest(asked[1]["user"])
 
 
+@pytest.mark.whole_tree
 def test_nothing_the_core_writes_wears_a_vendor_mention():
     """`asked_by`, `accepted_by`, a closing note, the admins named under a proposal: they named
     the person in one chat vendor's mention syntax, which #279 noted. No string the core BUILDS

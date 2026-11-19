@@ -16,6 +16,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 #: Where a harness turns a project's model into a command line.
 HARNESS_DIRS = (ROOT / "beeverforge" / "adapters" / "agent",
@@ -40,6 +42,7 @@ def _bare_model_flags(text: str) -> list[tuple[int, str]]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_harness_passes_the_model_as_a_separate_token():
     offenders = {}
     for d in HARNESS_DIRS:

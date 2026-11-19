@@ -74,6 +74,7 @@ def _env_reads(path: pathlib.Path) -> list[str]:
     return reads
 
 
+@pytest.mark.whole_tree
 def test_exactly_one_module_reads_the_installation_credential():
     """The negative half. Four readers is four places to disagree about precedence, and four
     places a per-project override would have to be threaded through."""

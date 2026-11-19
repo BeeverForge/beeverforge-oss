@@ -22,6 +22,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -92,6 +94,7 @@ def test_the_stamp_is_the_shape_the_reader_expects():
     assert set(json.loads(payload)) == {"code", "built_at"}
 
 
+@pytest.mark.whole_tree
 def test_every_documented_update_rebuilds():
     """A `git pull` shown beside a compose `up` without `--build` is an instruction to run the
     old code — which is exactly what happened."""

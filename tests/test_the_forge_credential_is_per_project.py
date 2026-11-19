@@ -156,6 +156,7 @@ def test_a_forge_credential_is_resolved_PER_PROJECT(path, func_name):
     )
 
 
+@pytest.mark.whole_tree
 def test_the_remaining_process_wide_readers_do_not_grow():
     """A ratchet, not a ban. The four sites left are GitHub-bound by construction and say so.
 

@@ -542,6 +542,7 @@ def test_a_label_never_signs_a_revocation(
     assert [person.id for person in people.PeopleStore().people()] == ["ana@acme.example"]
 
 
+@pytest.mark.whole_tree
 def test_the_label_is_read_in_one_place():
     """Every reader of the header goes through `_label_of`, whose answer is only ever a hint.
     Read from the package's syntax, not its text, so a comment naming the header counts for

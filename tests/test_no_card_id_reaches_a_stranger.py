@@ -29,6 +29,7 @@ import pathlib
 import re
 
 import click
+import pytest
 import typer
 from typer.testing import CliRunner
 
@@ -173,6 +174,7 @@ def _log_texts(source: str) -> list[tuple[int, str]]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_log_line_names_a_card():
     texts = [(path.relative_to(ROOT).as_posix(), line, text)
              for path in sorted(ROOT.joinpath("beeverforge").rglob("*.py"))

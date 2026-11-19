@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 #: Every place a card list is fetched. `item-list` is the CLI subcommand that bills per card.
@@ -49,6 +51,7 @@ def _calls_with_costly_cli() -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_only_the_documented_fallback_may_use_the_per_card_CLI():
     """One escape hatch, named: a user-owned project the org query cannot address. Everything else
     must go through the paginated query."""
@@ -73,6 +76,7 @@ def test_the_pickup_queue_reads_through_the_cheap_path():
     assert _COSTLY not in body, "the poller's read bills per card again"
 
 
+@pytest.mark.whole_tree
 def test_the_product_role_shares_the_same_cheap_reader():
     """Nina's incremental snapshot made her reads rare; this keeps each one cheap. Both halves are
     needed — the incremental fix alone still paid 303 points every six hours per project, and the

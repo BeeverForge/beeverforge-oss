@@ -67,6 +67,7 @@ def _env_names(literals: set[str]) -> set[str]:
     return {s for s in literals if re.fullmatch(r"BEEVERFORGE_[A-Z0-9_]+", s)}
 
 
+@pytest.mark.whole_tree
 def test_every_name_in_the_table_is_read_by_the_code():
     names = _env_names(_literals())
 
@@ -75,6 +76,7 @@ def test_every_name_in_the_table_is_read_by_the_code():
     assert missing == [], f"the table lists names the code never reads: {missing}"
 
 
+@pytest.mark.whole_tree
 def test_every_floor_limit_and_state_name_the_code_reads_is_in_the_table():
     read = {n for n in _env_names(_literals()) if IN_SCOPE.match(n) or n in NAMED}
 
@@ -139,6 +141,7 @@ def _read_as(old: str) -> str | None:
     return next((k for k, v in env.items() if k != old and v == "fake-value"), None)
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("name", sorted(_rows()))
 def test_an_openfactory_spelling_is_said_read_only_while_the_code_reads_it(name):
     from beeverforge import former_names

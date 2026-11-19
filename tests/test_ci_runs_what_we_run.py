@@ -231,6 +231,7 @@ def _toy_project_subset() -> tuple[str, ...]:
     return _relative({p for p in reach if p.name.startswith("test_")})
 
 
+@pytest.mark.whole_tree
 def test_collection_survives_a_machine_without_THE_OPTIONAL_TOY_PROJECTS():
     """AND IT HAPPENED AGAIN, for fifteen days — the two guards above ran in a subprocess but
     INHERITED THIS MACHINE'S ENVIRONMENT, where `~/Projects/…` holds the toy projects. So both
@@ -300,6 +301,7 @@ def test_collection_survives_a_machine_without_THE_OPTIONAL_TOY_PROJECTS():
         f"suite reports green about coverage that did not run")
 
 
+@pytest.mark.whole_tree
 def test_no_guard_here_collects_the_whole_suite(monkeypatch: pytest.MonkeyPatch) -> None:
     """THE COST THESE GUARDS USED TO PAY, refused (#336). Each of the three above collected all
     885 test files in a child pytest, about 15 s apiece beside busy workers, and the slowest

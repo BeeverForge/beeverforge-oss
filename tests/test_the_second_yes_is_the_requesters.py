@@ -116,6 +116,7 @@ def test_a_requirement_written_for_nobody_is_acceptable_by_an_admin(tmp_path, mo
     assert _module(tmp_path, monkeypatch, req).accept(7, actor=ADMIN).ok, writer
 
 
+@pytest.mark.whole_tree
 def test_every_writer_of_the_field_has_a_row_above():
     """REACHABILITY. A writer this test does not know is a writer the gate has not been measured
     against — which is precisely how the phrase got in."""

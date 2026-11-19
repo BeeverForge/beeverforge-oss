@@ -288,6 +288,7 @@ def _modules() -> list[Path]:
     return sorted(p for p in PACKAGE.rglob("*.py") if "__pycache__" not in p.parts)
 
 
+@pytest.mark.whole_tree
 def test_no_module_that_defines_an_activity_opens_an_engine_client_of_its_own():
     with_activities = 0
     offenders: list[str] = []
@@ -364,6 +365,7 @@ def _sdk_client_calls(tree: ast.AST) -> list[str]:
     return sites
 
 
+@pytest.mark.whole_tree
 def test_the_SDK_call_is_spelled_ONCE_in_the_package_and_the_five_ask_the_seam():
     """ONE seam, not five edits that each spell `activity.client()`: the next activity that needs
     the engine has to find the seam and its refusals, not an SDK call whose own errors are a bare

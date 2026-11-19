@@ -42,11 +42,12 @@ import re
 import subprocess
 import tomllib
 
-import yaml
-
 # `pytest` was imported for the wholesale `pytest.skip` this file used to take the day anything
 # started publishing. It no longer skips: publishing became a PER-DISTRIBUTION fact on 2026-08-30
 # (the core is served, the add-on packages are not), so the rule narrows instead of standing down.
+import pytest
+import yaml
+
 from beeverforge import plugins
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -232,6 +233,7 @@ def _the_publish_is_gated_on_something_this_suite_cannot_see() -> bool:
     return False
 
 
+@pytest.mark.whole_tree
 def test_a_publish_nobody_has_enabled_is_not_evidence_that_an_index_serves_the_name():
     """The gate detection, asserted on its own rather than only through its consequences.
 
@@ -257,6 +259,7 @@ def test_a_publish_nobody_has_enabled_is_not_evidence_that_an_index_serves_the_n
         f"wherever a document tells somebody to type it")
 
 
+@pytest.mark.whole_tree
 def test_the_packages_the_platforms_own_rows_ship_in_are_still_on_no_index():
     """The premise, restated the day it changed. It is no longer "this tree publishes nothing" —
     it is "this tree publishes the core, and the add-on packages remain unpublished", which is the
@@ -276,6 +279,7 @@ def test_the_packages_the_platforms_own_rows_ship_in_are_still_on_no_index():
 
 # ── the rule ────────────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_nothing_hands_a_reader_a_pip_install_of_a_name_no_index_serves():
     """The rule, now aimed at the distributions an index does NOT serve.
 
@@ -328,6 +332,7 @@ def test_the_scan_can_SEE_the_sentence_that_was_here_and_leaves_a_real_path_alon
         assert _bare_name_installs(followable, distributions) == [], followable
 
 
+@pytest.mark.whole_tree
 def test_the_page_the_index_shows_may_name_the_core_and_NOTHING_ELSE_is_relaxed():
     """The one exemption (#368), held to its two edges — on the worst case, where every one of our
     distributions counts as unpublished, so the answer does not depend on today's gate.

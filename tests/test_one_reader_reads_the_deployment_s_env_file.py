@@ -163,12 +163,14 @@ def _hand_written_parsers(package: pathlib.Path = ROOT / "beeverforge") -> list[
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_env_file_is_parsed_by_hand():
     """A GUARD on the shape of the defect: a function that skips `#` lines and splits on `=`.
     `envfile` is the one reader; a fourth would drift from it the way the second and third did."""
     assert _hand_written_parsers() == []
 
 
+@pytest.mark.whole_tree
 def test_the_guard_sees_a_parser_written_by_hand(tmp_path):
     """THE GUARD CALLS ITS OWN RULE: the parser this replaced, put back, is found — planted in a
     package of the test's own, never in the tree the rest of the suite is reading."""

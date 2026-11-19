@@ -519,6 +519,7 @@ def test_this_tree_is_one_the_check_accepts():
     assert _run(ROOT, "preview", "0.0.0").returncode == 0
 
 
+@pytest.mark.whole_tree
 def test_the_changelog_is_in_the_tree_from_the_first_release_made_this_way():
     tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "CHANGELOG.md"], cwd=ROOT,
                              capture_output=True, check=False)

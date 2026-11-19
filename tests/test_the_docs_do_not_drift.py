@@ -56,6 +56,7 @@ def _carries_a_measurable_number() -> list[str]:
     return ["README.md", "CONTRIBUTING.md", *sorted(docs)]
 
 
+@pytest.mark.whole_tree
 def test_the_documents_a_count_guard_covers_are_DERIVED_and_not_a_list_of_four():
     """The twin of the widening. A set that shrank back to a handful, or to nothing, would make
     both guards below pass by scanning almost no prose — which is exactly how they passed while
@@ -300,6 +301,7 @@ def test_the_onboarding_explains_the_line_set_model_prints():
         assert phrase in section, f"§11 never mentions {why} — only the code says it"
 
 
+@pytest.mark.whole_tree
 def test_no_doc_tells_an_operator_to_tail_a_container_that_does_not_exist():
     """A `docker compose logs <service>` in a document is a command somebody will paste.
 
@@ -391,6 +393,7 @@ def test_the_works_today_page_carries_the_commit_it_describes():
         f"naming it")
 
 
+@pytest.mark.whole_tree
 def test_the_adr_count_the_docs_CLAIM_is_the_number_of_ADRs_there_are():
     """A number a command can measure, typed by hand, is a number that rots — and it had: four
     documents said "42 decision records" over 41 ADRs, because `docs/adr/` also holds its own
@@ -505,6 +508,7 @@ def test_a_link_from_one_ADR_to_another_resolves():
     assert not broken, "an ADR links to a record that does not exist:\n  " + "\n  ".join(broken)
 
 
+@pytest.mark.whole_tree
 def test_the_status_page_is_the_ONE_place_a_test_COUNT_is_written():
     """The other half of the same rule. A count in the README and a count in STATUS drift apart the
     first time only one of them is edited — so exactly one document carries it, and this asserts
@@ -822,6 +826,7 @@ def _command_lines() -> list[tuple[str, int, str, str | None]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_every_command_a_page_hands_a_reader_EXISTS():
     """`docs/setup/one-machine.md` — the page whose whole promise is that a stranger can follow
     it — said `beeverforge panel`, and there is no such command: the reader's first look at the
@@ -841,6 +846,7 @@ def test_every_command_a_page_hands_a_reader_EXISTS():
                       "\n".join(wrong)
 
 
+@pytest.mark.whole_tree
 def test_the_scan_is_actually_reading_the_pages():
     """The other half of any scanning guard: a pattern that matches nothing passes forever."""
     lines = _command_lines()

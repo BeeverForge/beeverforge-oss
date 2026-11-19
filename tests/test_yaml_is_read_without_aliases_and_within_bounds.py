@@ -155,6 +155,7 @@ def _modules() -> dict[str, str]:
             for p in sorted(PACKAGE.rglob("*.py"))}
 
 
+@pytest.mark.whole_tree
 def test_no_module_but_the_door_reads_or_writes_yaml():
     found = [line for rel, source in _modules().items()
              if rel != DOOR and rel not in OUTSIDE_THE_DOOR for line in _ways_in(source, rel)]
@@ -468,6 +469,7 @@ NOT_A_FILE: dict[str, str] = {
 }
 
 
+@pytest.mark.whole_tree
 def test_every_reader_through_the_door_is_driven_or_says_why_not():
     found = _every_reader()
     listed = set(READERS) | set(NOT_A_FILE)
@@ -742,6 +744,7 @@ def test_the_door_reads_only_with_its_own_loaders():
     assert yaml_io.load("# nothing\n") is None
 
 
+@pytest.mark.whole_tree
 def test_every_yaml_file_the_package_ships_reads_through_the_door():
     shipped = sorted(p for p in PACKAGE.rglob("*") if p.suffix in (".yaml", ".yml"))
     assert shipped, "the package ships YAML files, and none was found"

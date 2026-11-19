@@ -70,11 +70,13 @@ def _kernel_files():
         yield from sorted(p for p in d.rglob("*.py") if "__pycache__" not in str(p))
 
 
+@pytest.mark.whole_tree
 def test_the_guard_walks_something():
     """A guard that walks nothing passes for ever."""
     assert len(list(_kernel_files())) >= 10
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("path", list(_kernel_files()), ids=lambda p: p.name)
 def test_no_kernel_identifier_names_a_vendor(path):
     offenders = [
@@ -90,6 +92,7 @@ def test_no_kernel_identifier_names_a_vendor(path):
 
 # ── the half that fails silently ────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_no_reader_anywhere_still_asks_for_a_renamed_field():
     """The trap, and the reason this card is not a rename.
 
@@ -260,6 +263,7 @@ def test_the_renderers_still_exist_somewhere_neutral():
     assert callable(handoff_to_markdown) and callable(handoff_to_plain)
 
 
+@pytest.mark.whole_tree
 def test_the_kernel_reads_no_environment():
     """`contracts/bot.py` read `os.environ` — a domain model reaching for process state. A vendor
     NAME guard would never catch it, so it gets its own rule."""

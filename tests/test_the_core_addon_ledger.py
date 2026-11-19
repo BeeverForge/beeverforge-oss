@@ -231,6 +231,7 @@ def _planted_tree(tmp_path: pathlib.Path) -> pathlib.Path:
 _PLANTED_LEDGER = ({"beeverforge/adapters/github_app.py"}, {"beeverforge/runtime/fargate/"}, set())
 
 
+@pytest.mark.whole_tree
 def test_the_scan_can_SEE_an_import_of_a_vendor_module_BY_PATH(tmp_path):
     """The twin for the half that was blind: absolute and relative, module scope and lazy, the
     module itself and a name from inside a vendor package — every shape the eleven real
@@ -249,6 +250,7 @@ def test_the_scan_can_SEE_an_import_of_a_vendor_module_BY_PATH(tmp_path):
     assert not _may_import_a_vendor_path("beeverforge/api/core_b.py")
 
 
+@pytest.mark.whole_tree
 def test_the_exemption_by_shape_is_a_REGISTRY_and_not_every_file_under_adapters(tmp_path):
     """The twin of `_REGISTRY`. No core file under `adapters/` imports a vendor path on the real
     tree today, so the exemption could widen to `adapters/.*\\.py` and nothing would notice
@@ -268,6 +270,7 @@ def test_the_exemption_by_shape_is_a_REGISTRY_and_not_every_file_under_adapters(
 
 # ── direction one: the tree may not grow an edge the ledger does not name ───────────────────────
 
+@pytest.mark.whole_tree
 def test_every_vendor_import_is_on_the_ledger():
     """Direction one: the tree may not grow a vendor dependency — an SDK import or a by-path
     import of a vendor-owned module — that the ledger does not name."""
@@ -281,6 +284,7 @@ def test_every_vendor_import_is_on_the_ledger():
 
 # ── direction two: the ratchet ──────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_every_mixed_entry_is_still_EARNED():
     """Direction two, the ratchet: paid debt must leave the list. An entry for a module that no
     longer reaches any vendor reads as open debt that somebody already closed — delete it, and
@@ -321,6 +325,7 @@ def test_every_vendor_entry_EXISTS():
         f"deleted without the line following: {missing}")
 
 
+@pytest.mark.whole_tree
 def test_every_allowed_importer_is_still_an_importer():
     """The twin of the exemption list: an allowed importer that no longer imports a vendor path,
     or no longer exists, is an exemption nobody needs — and an exemption list that can only grow

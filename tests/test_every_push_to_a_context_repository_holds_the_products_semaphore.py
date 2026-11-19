@@ -427,6 +427,7 @@ def code() -> _Code:
     return _Code()
 
 
+@pytest.mark.whole_tree
 def test_every_push_onto_a_context_repositorys_base_holds_the_products_semaphore(code):
     pushes = code.base_pushes()
     assert any(rel == "beeverforge/knowledge/pipeline.py" for rel, _line, _fn in pushes), (
@@ -449,6 +450,7 @@ def test_every_push_onto_a_context_repositorys_base_holds_the_products_semaphore
     assert not stale, f"declared births that no longer push: {sorted(stale)}"
 
 
+@pytest.mark.whole_tree
 def test_every_publish_names_the_product_whose_semaphore_it_takes(code):
     """`project` is a required keyword, so a call without it fails — but only when it runs. A
     command nobody's test runs (`beeverforge knowledge build`) is read here instead."""

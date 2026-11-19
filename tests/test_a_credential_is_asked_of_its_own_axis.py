@@ -353,6 +353,7 @@ def _last_resorts(root: Path) -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_neutral_module_makes_ONE_VENDOR_the_last_resort():
     """The ratchet. This class was spelled at eighteen sites; a nineteenth must fail the suite
     rather than wait for somebody to run `doctor` against a real deployment again.
@@ -423,6 +424,7 @@ def test_and_the_wrapper_that_made_it_possible_is_GONE():
     assert not hasattr(cli, "_github_app_token_from_env")
 
 
+@pytest.mark.whole_tree
 def test_the_ratchet_walks_a_package_that_still_exists():
     package = Path(inspect.getfile(deployment_forge_token)).parent
     seen = sum(1 for path in package.rglob("*.py")
@@ -454,6 +456,7 @@ def _crossed(root: Path) -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_every_converted_site_asks_the_axis_that_MATCHES_its_resolver():
     """The mechanical risk of a sweep this wide: pairing `tracker_token_for` with
     `deployment_forge_token`, which reads as asking and answers for the other system."""

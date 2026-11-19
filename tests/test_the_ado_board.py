@@ -276,6 +276,7 @@ def test_a_columns_map_that_will_not_parse_is_LOUD_and_falls_back(caplog):
     assert "not a JSON object" in caplog.text
 
 
+@pytest.mark.whole_tree
 def test_nothing_outside_the_factory_names_this_vendors_board():
     """The same rule the GitHub board is held to: a caller that constructs a vendor board by name
     is a caller a second deployment has to edit."""

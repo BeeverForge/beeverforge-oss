@@ -91,6 +91,7 @@ def _silent_handlers() -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_exception_is_swallowed_without_a_trace():
     """A bare `except: pass` is a failure that never happened as far as anybody can tell.
 
@@ -172,6 +173,7 @@ def test_carrying_the_exception_onward_DOES_count():
     assert handler.name and handler.name in body
 
 
+@pytest.mark.whole_tree
 def test_deliberate_silence_must_be_argued_in_the_source():
     """`# not-a-failure:` is the only exemption, and it lives beside the handler on purpose: an
     allowlist in a test file is a claim nobody re-reads when the code moves."""

@@ -34,6 +34,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -237,6 +239,7 @@ def compare(found: dict[str, list[str]],
     return new, dead
 
 
+@pytest.mark.whole_tree
 def test_no_new_portuguese_literal_and_no_dead_exemption():
     new, dead = compare(welded(), _exempt())
     assert not new, (
@@ -257,6 +260,7 @@ def test_every_recogniser_is_declared_where_it_lives_and_carries_english():
             f"only is the same defect on the way in")
 
 
+@pytest.mark.whole_tree
 def test_a_catalogues_english_is_english():
     """The half a catalogue is FOR: a Portuguese sentence filed under `en` is the defect itself."""
     wrong = []

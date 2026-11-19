@@ -55,6 +55,7 @@ def _files_naming_a_vendor_board() -> set[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_nothing_outside_the_provider_constructs_a_vendor_board():
     stray = _files_naming_a_vendor_board() - _MAY_NAME_A_VENDOR
     assert not stray, (
@@ -98,6 +99,7 @@ def test_a_jira_project_satisfies_the_same_contract_as_the_github_one():
     assert isinstance(board, BoardAdapter)
 
 
+@pytest.mark.whole_tree
 def test_the_contract_is_derived_from_what_production_actually_calls():
     """A protocol invented ahead of its callers grows methods nobody implements. Every name here
     must be called somewhere in sdlc/.

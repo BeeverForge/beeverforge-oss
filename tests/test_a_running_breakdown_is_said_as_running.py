@@ -237,6 +237,7 @@ async def test_a_running_breakdown_that_filed_nothing_is_said_with_its_reason(mo
     assert out.message.endswith("it filed nothing: the board refused the card."), out.message
 
 
+@pytest.mark.whole_tree
 def test_the_breakdown_s_id_is_spelled_in_one_place():
     """Every door asks the engine for the SAME execution only while they spell it alike."""
     spelled = [str(path.relative_to(ROOT)) for path in sorted((ROOT / "beeverforge").rglob("*.py"))

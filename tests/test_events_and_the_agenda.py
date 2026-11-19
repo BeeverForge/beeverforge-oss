@@ -1173,6 +1173,7 @@ _PRODUCERS = {"beeverforge/product/door.py", "beeverforge/product/events.py",
               "beeverforge/product/module.py"}
 
 
+@pytest.mark.whole_tree
 def test_ONLY_the_factorys_own_producers_tell_the_door_an_event():
     callers: dict[str, set[str]] = {}
     for path in sorted((ROOT / "beeverforge").rglob("*.py")):

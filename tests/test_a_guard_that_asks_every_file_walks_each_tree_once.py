@@ -47,6 +47,7 @@ def _counting(monkeypatch: pytest.MonkeyPatch, owner: object, name: str) -> list
     return seen
 
 
+@pytest.mark.whole_tree
 def test_the_schedule_guard_walks_no_file_twice_for_a_second_name(
         monkeypatch: pytest.MonkeyPatch) -> None:
     first, second = sorted(schedules._ensure_functions())[:2]
@@ -86,6 +87,7 @@ def test_the_ledger_walks_no_file_twice_for_a_second_question(
     )
 
 
+@pytest.mark.whole_tree
 def test_a_file_that_changed_is_walked_again(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each rewrite keeps the length of the text, so a memo keyed on the path or on the length

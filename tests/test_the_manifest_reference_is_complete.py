@@ -65,6 +65,7 @@ def test_a_deployment_setting_is_not_a_manifest_field(deployment_field):
         Manifest(**{deployment_field: "x"})
 
 
+@pytest.mark.whole_tree
 def test_nothing_tells_an_operator_to_put_a_deployment_setting_in_the_manifest():
     """THE LIVE DEFECT THIS GUARD WAS WRITTEN FOR. `doctor` answered a missing harness with
     "set `harness:` in .beeverforge/project.yaml" — and `Manifest` forbids unknown keys, so an

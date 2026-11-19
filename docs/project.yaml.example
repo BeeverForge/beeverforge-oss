@@ -95,6 +95,9 @@ validate:
   # security: "bandit -r . -q"
   # migrations: "alembic heads | grep -c '(head)' | grep -qx 1"
   # web: "cd web && npm test -- --run"
+  # A gate on a small box (few CPUs, little memory) can leave out the tests that read the whole
+  # source tree — this project's own suite marks them `whole_tree` — by adding
+  # `-m "not whole_tree"` to its `test:` command. CI still runs them before a human merges.
 
 # ── Preview: the product, assembled for a change, before its PR merges (ADR-0050) ──
 # Default: none — no preview of this project, and nothing changes. Declared, a card whose pull

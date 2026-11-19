@@ -53,6 +53,7 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
 from card_writers_outside_the_door import OUTSIDE_THE_DOOR
 
 from tests.the_tree_read_once import parsed
@@ -295,6 +296,7 @@ def _the_door_s_loops(tree: ast.AST) -> tuple[set[str], set[str]]:
     return module, functions
 
 
+@pytest.mark.whole_tree
 def test_nothing_outside_the_door_changes_a_card_unless_it_is_named():
     found, _ = card_writes(ROOT / "beeverforge", rel_to=ROOT)
     strays = sorted(found - set(OUTSIDE_THE_DOOR))
@@ -304,6 +306,7 @@ def test_nothing_outside_the_door_changes_a_card_unless_it_is_named():
         "so every consumer hears it:\n  " + "\n  ".join(map(str, strays)))
 
 
+@pytest.mark.whole_tree
 def test_the_list_names_only_writers_that_are_still_there():
     """An entry whose call moved through the door is gone from the list the same day — a list
     that claims a writer the tree no longer has would let a new one hide under its name."""
@@ -338,6 +341,7 @@ def test_every_writer_on_the_list_says_why_and_which_slice_moves_it():
         assert slice_ == "3", f"{key}: slices 1 and 2 have landed, so their writers are not here"
 
 
+@pytest.mark.whole_tree
 def test_the_walk_reads_the_package_and_sees_a_writer_planted_in_it(tmp_path):
     """The walk would pass over an empty tree: it reads what it says it reads, and a write planted
     in a file it reads is found — in each of the three forms."""

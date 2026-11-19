@@ -122,6 +122,7 @@ _MAY_NAME_A_VENDOR = {
 }
 
 
+@pytest.mark.whole_tree
 def test_no_module_outside_its_provider_constructs_a_vendor_class():
     """The seam's entire claim, asserted. Before today, eleven forge constructions and a dozen
     tracker constructions lived across the CLI, the panel, the worker and the box — so a client on
@@ -168,6 +169,7 @@ def test_adding_a_provider_is_one_row_plus_one_module():
 
 # ── the conversation channel ────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_core_never_imports_slack_directly():
     """The axis with the biggest coupling and no protocol at all: 1,500 lines of Socket Mode,
     threads and mrkdwn, imported by the worker and the activities by name. Telegram is deferred

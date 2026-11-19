@@ -483,6 +483,7 @@ def test_the_guard_sees_a_forge_cli_call():
     assert not _reaches_a_forge_cli(ast.parse('rerun_failed_of(forge, pr)'))
 
 
+@pytest.mark.whole_tree
 def test_generic_code_never_reaches_a_forge_cli():
     """#258 review items 3 and 8: the re-run goes through the forge's row, never `gh` from the
     core. Green on main by design (no caller yet); the mutation plan writes `forge._gh([...])`

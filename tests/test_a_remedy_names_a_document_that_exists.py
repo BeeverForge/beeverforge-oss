@@ -20,6 +20,8 @@ import ast
 import pathlib
 import re
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 #: A repository-relative document path, as package sentences spell them — WITH OR WITHOUT the
@@ -132,6 +134,7 @@ def test_the_judgement_REPORTS_a_pointer_that_resolves_to_nothing():
     assert dangling(planted) == {"beeverforge/rotted.py": [(11, "docs/core/99-gone.md")]}
 
 
+@pytest.mark.whole_tree
 def test_every_document_a_package_sentence_points_at_EXISTS():
     missing = dangling(_package_document_paths())
     assert not missing, (
@@ -140,6 +143,7 @@ def test_every_document_a_package_sentence_points_at_EXISTS():
         f"end wearing a remedy's clothes")
 
 
+@pytest.mark.whole_tree
 def test_the_scan_has_a_subject():
     """The other twin: the package DOES name documents in its sentences — ten sites when this
     was written (cli.py, cli_refusals.py, doctor.py, deployment.py, github.py, bundle.py). A

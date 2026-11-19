@@ -709,6 +709,7 @@ def test_it_surveys_the_real_toy_projects(name: str) -> None:
     assert result.stacks or result.modules or result.terms
 
 
+@pytest.mark.whole_tree
 def test_it_surveys_this_repository_and_finds_its_own_vocabulary() -> None:
     """The biggest real codebase on hand (183 source files across 36 modules), used here for the
     two things a toy project cannot exercise: an entry point declared in packaging metadata, and
