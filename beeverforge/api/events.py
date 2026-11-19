@@ -194,6 +194,12 @@ class Staged(EventData):
     reject: str
 
 
+class ConfirmationOptions(Staged):
+    """A proposal's confirmation, including the sentence for an answer typed without buttons."""
+
+    typed: str
+
+
 class SubscribedData(EventData):
     """The socket follows a conversation now: the room, or one of the person's own."""
 
@@ -233,14 +239,14 @@ class SaidData(EventData):
 
 
 class ReplyData(EventData):
-    """The role answered. `options` are the choices it offers, `null` when it offers none."""
+    """The role answered. `options` is its proposal's confirmation, or `null` without one."""
 
     seq: int
     id: str
     text: str
     type: str
     in_reply_to: str
-    options: list[Any] | None
+    options: ConfirmationOptions | None
     final: bool
 
 
