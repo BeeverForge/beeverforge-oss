@@ -21,6 +21,8 @@ import ast
 import inspect
 from pathlib import Path
 
+import pytest
+
 from beeverforge.contracts.project import Project
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,7 @@ def test_the_portuguese_layout_names_its_own_language():
     assert context_layout(None).architecture_dir == "docs/architecture"
 
 
+@pytest.mark.whole_tree
 def test_the_codebase_NARRATES_in_english():
     """The product speaks the client's language; the CODEBASE speaks English (2026-08-15).
 

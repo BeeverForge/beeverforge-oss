@@ -101,6 +101,7 @@ def test_an_old_spelling_in_the_environment_is_NOT_served(monkeypatch):
 
 # ── one spelling per secret: the scrub lists the name the platform reads ────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_worktree_scrub_denies_the_forge_token_and_the_pool(monkeypatch, tmp_path):
     """The property, on the real list: an agent workspace env must hold neither the forge token
     nor the token pool under any spelling the platform reads."""
@@ -189,6 +190,7 @@ def test_the_scan_can_SEE_a_legacy_env_read():
     assert names == ["SDLC_BOT_TOKEN", "SDLC_ISSUE", "SDLC_REGISTRY", "SDLC_SANDBOX"], names
 
 
+@pytest.mark.whole_tree
 def test_nothing_reads_the_old_environment_names():
     offenders = {}
     for path in sorted(ROOT.joinpath("beeverforge").rglob("*.py")):
@@ -200,6 +202,7 @@ def test_nothing_reads_the_old_environment_names():
         f"the old spelling is not served by anything")
 
 
+@pytest.mark.whole_tree
 def test_no_env_dict_is_assembled_with_the_old_names():
     """The write side: the worker hands the box its env as dict literals (`SDLC_ISSUE: …` once).
     A dict key is not an environ read, so the read guard cannot see it — and a box env assembled
@@ -487,6 +490,7 @@ def test_a_credential_served_under_several_names_is_denied_under_all_of_them(mon
             f"side door standing open under the name nobody listed")
 
 
+@pytest.mark.whole_tree
 def test_the_deny_lists_remove_the_names_they_carry_and_nothing_else(monkeypatch, tmp_path):
     """The verifier for the measurement below, in both directions: everything denied is gone — or
     the scrub has stopped scrubbing and the table would look reassuring — and nothing else is, or
@@ -499,6 +503,7 @@ def test_the_deny_lists_remove_the_names_they_carry_and_nothing_else(monkeypatch
     assert universe - reaching == universe & DENIED
 
 
+@pytest.mark.whole_tree
 def test_SECURITY_names_every_credential_a_worktree_workload_can_read(monkeypatch, tmp_path):
     """The document's table, name for name, against the measurement.
 
@@ -533,6 +538,7 @@ def test_SECURITY_names_every_credential_a_worktree_workload_can_read(monkeypatc
     assert _names_of("`GH_TOKEN`, `box.env`, HOME, `docker-compose.yml`") == {"GH_TOKEN"}
 
 
+@pytest.mark.whole_tree
 def test_SECURITY_names_the_container_boxs_allow_list(monkeypatch, tmp_path):
     """The other half of the paragraph, and the reason it is not alarmist: the DEFAULT box builds
     the workload's environment by allow list, so the table above is the worktree box's exposure
@@ -550,6 +556,7 @@ def test_SECURITY_names_the_container_boxs_allow_list(monkeypatch, tmp_path):
         set(_AUTH_ENV_VARS) | {declared})
 
 
+@pytest.mark.whole_tree
 def test_an_add_on_packages_own_credentials_reach_the_workload_the_same_way(tmp_path):
     """The table is measured over the CORE, and the document says so. The credentials an installed
     add-on package brings are not in it and are not scrubbed either — this proves that omission is

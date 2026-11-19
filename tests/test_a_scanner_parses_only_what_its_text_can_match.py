@@ -96,6 +96,7 @@ def test_source_text_decodes_as_python_does(tmp_path: Path) -> None:
     assert "café" in source_text(path)
 
 
+@pytest.mark.whole_tree
 def test_a_scanner_reads_a_declared_coding_without_raising(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A file none of the filters can match is skipped, whatever coding it declares; reading it as
@@ -174,6 +175,7 @@ _NOT_REGISTRIES = {
 _WORDLESS = {"table_only.py": _TABLE + "def door(kind):\n    return WIDGETS[kind]\n"}
 
 
+@pytest.mark.whole_tree
 def test_the_registry_filter_is_necessary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _plant(tmp_path / "beeverforge", {**_REGISTRIES, **_NOT_REGISTRIES, **_WORDLESS})
     seen = _recording(monkeypatch, adapter)
@@ -221,6 +223,7 @@ _UNCALLED = {
 }
 
 
+@pytest.mark.whole_tree
 def test_the_call_site_filter_is_necessary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "beeverforge"
     _plant(root, {**_CALLS, **_UNCALLED})
@@ -238,6 +241,7 @@ def test_the_call_site_filter_is_necessary(tmp_path: Path, monkeypatch: pytest.M
                 f"{name} calls a checked method and the text filter would have skipped it")
 
 
+@pytest.mark.whole_tree
 def test_the_call_site_filter_follows_the_checked_names(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "beeverforge"

@@ -80,11 +80,13 @@ def _call_sites(root: Path = Path("beeverforge")):
             yield from _sites_in(parsed(path), path)
 
 
+@pytest.mark.whole_tree
 def test_there_are_call_sites_to_check():
     """A guard that silently checks nothing is the failure mode one level up."""
     assert list(_call_sites()), "no Temporal call sites found — the scan is broken"
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("site", list(_call_sites()), ids=lambda s: f"{s[0]}:{s[1]}")
 def test_the_call_fits_the_real_sdk_signature(site):
     path, line, name, n_pos, kwargs = site

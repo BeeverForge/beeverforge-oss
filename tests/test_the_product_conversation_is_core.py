@@ -131,6 +131,7 @@ def _work_done_in(packages) -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_the_walk_covers_every_channel_package_the_tree_ships():
     """A guard that walks nothing passes for ever — so what the tree SHIPS decides what must be
     walked, not a name written here. A channel add-on is a `runtime/<kind>/` package whose
@@ -168,6 +169,7 @@ def test_the_walk_can_SEE_a_channel_doing_the_work(tmp_path):
     assert all("render" not in h for h in hits), hits
 
 
+@pytest.mark.whole_tree
 def test_no_channel_package_does_the_product_role_s_work():
     """ADR-0038 D3 as code. Measured at zero on 2026-08-25, the day the conversation left the
     Slack package; a hit here is a capability growing back inside a transport."""
@@ -178,6 +180,7 @@ def test_no_channel_package_does_the_product_role_s_work():
         + "\n  ".join(hits))
 
 
+@pytest.mark.whole_tree
 def test_the_product_package_imports_no_channel_package():
     """The other direction of the same line: core may not reach INTO a channel add-on, at module
     scope or inside a function. The Slack package is one import away from being unremovable."""
@@ -253,6 +256,7 @@ RESCUED = ("settle_acceptance", "close_decisions_answered", "record_decisions",
            "proposal_expired", "consume", "release")
 
 
+@pytest.mark.whole_tree
 def test_the_rescued_capabilities_are_reached_from_the_panel_s_OWN_entry_point():
     """From `conversation_turn` — the activity every conversation's turn runs on the worker, the
     panel's `product_say` included since #266 slice 3 put it through the door (it was
@@ -273,6 +277,7 @@ def test_the_rescued_capabilities_are_reached_from_the_panel_s_OWN_entry_point()
     assert "deliver" not in alive, "the panel turn goes through the chat adapter — two paths again"
 
 
+@pytest.mark.whole_tree
 def test_the_chat_handler_and_the_panel_turn_share_ONE_settling_stage():
     """Two transports, one implementation (ADR-0038 D3, C-23's bar): both callers reach the ONE
     turn engine (#266 slice 2), which settles, and `settle_acceptance` is called by exactly one
@@ -718,6 +723,7 @@ async def test_the_ONE_ROW_hands_the_panel_the_token_of_what_it_staged(monkeypat
 STAGING_PRODUCERS = ("remember", "offer_draft", "_run_intent")
 
 
+@pytest.mark.whole_tree
 def test_EVERY_staging_producer_is_on_the_panel_s_path():
     """THE GAP, MEASURED — AND CLOSED (#266 slice 2). With the Slack package out of the graph, no
     seed reached a staging producer for a year while the panel's turn reached the consumer side
@@ -737,6 +743,7 @@ def test_EVERY_staging_producer_is_on_the_panel_s_path():
     assert consumers <= panel, f"the consumer side left the panel's turn: {consumers - panel}"
 
 
+@pytest.mark.whole_tree
 def test_the_walk_can_SEE_a_staging_producer():
     """The twin: the same reader sees `remember(...)` and `staging.remember(...)` inside a
     function — so the zero above measures the panel deployment and not a blind walker — and on a

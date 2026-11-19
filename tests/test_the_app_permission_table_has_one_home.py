@@ -22,6 +22,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.whole_tree
+
 _ROOT = Path(__file__).resolve().parents[1]
 _CANONICAL = Path("docs/setup/github.md")
 

@@ -290,6 +290,7 @@ ELSEWHERE = {
 }
 
 
+@pytest.mark.whole_tree
 def test_every_reader_elsewhere_that_builds_a_store_by_its_kind_is_a_case_here():
     """A new reader that asks the registry about a store by its kind joins `ELSEWHERE`, or fails
     here by name."""

@@ -159,6 +159,7 @@ def _answer_callers(root: Path, *, rel_to: Path) -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_NOTHING_outside_the_engine_calls_the_role_s_answer():
     """ADR-0051 D12, #266 slice 2's acceptance: a second caller of the model's answer is a second
     conversation starting over — the shape four partial copies of this one took. The job's own

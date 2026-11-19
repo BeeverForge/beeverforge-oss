@@ -101,10 +101,12 @@ def unresolved_imports(path: pathlib.Path, source: str,
 SOURCES = sorted(p for p in (ROOT / "beeverforge").rglob("*.py") if "__pycache__" not in str(p))
 
 
+@pytest.mark.whole_tree
 def test_the_sweep_walks_something():
     assert len(SOURCES) >= 100
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: str(p.relative_to(ROOT)))
 def test_every_internal_import_names_something_that_exists(path):
     problems = unresolved_imports(path, path.read_text())

@@ -109,6 +109,7 @@ def _scope_body(tree: ast.Module, name: str) -> list[ast.AST]:
     return []
 
 
+@pytest.mark.whole_tree
 def test_every_temporary_directory_is_released_or_declared():
     offenders = []
     for path, tree in _modules():
@@ -136,6 +137,7 @@ def test_every_temporary_directory_is_released_or_declared():
           "_LIVES_FOR_THE_PROCESS in this file WITH the reason.")
 
 
+@pytest.mark.whole_tree
 def test_the_declared_exemptions_still_exist():
     """An exemption for a site that moved is a hole nobody can see. Sabotage-proofing the guard."""
     seen = set()
@@ -358,6 +360,7 @@ def _written_names(tree: ast.Module) -> set[str]:
     return written
 
 
+@pytest.mark.whole_tree
 def test_every_module_level_cache_has_a_declared_bound():
     """A dict declared empty at module level and written by key IS a cache, whatever it is called.
 

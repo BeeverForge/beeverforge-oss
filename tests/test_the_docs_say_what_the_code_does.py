@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from beeverforge.runtime.temporal import workflow
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +43,7 @@ def test_the_merge_wait_cadence_on_the_page_is_the_workflows():
     assert f"poll {fast} min for {window} h then {slow} min" in FLOW.read_text(encoding="utf-8")
 
 
+@pytest.mark.whole_tree
 def test_no_document_outside_the_records_names_an_sdlc_command():
     named = [str(p.relative_to(ROOT)) for p in [*(ROOT / "docs").rglob("*.md"),
                                                  ROOT / "README.md", ROOT / "CONTRIBUTING.md"]

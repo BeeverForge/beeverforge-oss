@@ -245,6 +245,7 @@ def test_a_resolved_impediment_is_closed_as_DELIVERED_and_through_the_seam(tmp_p
     assert (card.state, card.state_reason, card.delivered) == ("closed", "completed", True)
 
 
+@pytest.mark.whole_tree
 def test_no_generic_caller_closes_a_card_on_the_row_directly():
     """#203's guard looks for a direct call that PASSES `delivered=`. The split's call passed
     nothing, so that guard could not see the one caller that never chose a word. Outside the

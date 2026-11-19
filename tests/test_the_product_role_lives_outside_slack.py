@@ -945,6 +945,7 @@ def test_the_asking_turn_is_EXCLUDED_from_its_own_history():
 _CHANNELS_STILL_DISPATCHING: set[str] = set()
 
 
+@pytest.mark.whole_tree
 def test_the_CORE_reads_a_typed_sentence_now_and_not_only_the_channel():
     """The positive successor to a guard that measured this as a gap, and has outlived it.
 

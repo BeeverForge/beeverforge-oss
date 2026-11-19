@@ -284,6 +284,7 @@ def test_the_registrys_budget_is_clamped_and_a_bad_one_is_the_default(said, kept
     assert Project(name="a", repo_path=".", adjust_passes=said).adjust_passes == kept
 
 
+@pytest.mark.whole_tree
 def test_every_door_that_starts_a_job_stamps_the_projects_budget():
     """PARSED, so a launch site added later without the budget fails here: a job started without
     it silently runs on 2 whatever the project says — measured, the panel's scan and start rows

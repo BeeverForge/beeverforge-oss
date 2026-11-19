@@ -183,6 +183,7 @@ def _offenders(path: pathlib.Path, *, package: str | None = None) -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_function_calls_a_name_that_is_a_module():
     offenders: list[str] = []
     for path in sorted(PKG.rglob("*.py")):

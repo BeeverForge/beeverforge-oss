@@ -20,6 +20,8 @@ import ast
 import functools
 from pathlib import Path
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 SCHEDULE = Path("beeverforge/runtime/temporal/schedule.py")
@@ -103,6 +105,7 @@ def _calls_in_the_module(tree: ast.Module) -> frozenset[str]:
     return frozenset(_calls_in(tree))
 
 
+@pytest.mark.whole_tree
 def test_every_ensure_is_called_from_production_code():
     """A test calling it does not count. Tests prove it works; only production code makes it run."""
     unreachable = []

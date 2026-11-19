@@ -91,12 +91,14 @@ def _mentions_int(annotation) -> bool:
 
 # ── the negative half: nothing unambiguously a ref is typed as a number ──────────────────────────
 
+@pytest.mark.whole_tree
 def test_no_unambiguous_ticket_ref_is_typed_as_an_integer():
     offenders = _int_annotated_refs()
     assert not offenders, "a ticket ref is typed as a number:\n" + "\n".join(
         f"  {f}:{line}  {where}: {ann}" for f, line, where, ann in offenders)
 
 
+@pytest.mark.whole_tree
 def test_the_guard_can_actually_SEE_an_offender(tmp_path, monkeypatch):
     """THE POSITIVE TWIN OF THE GUARD ITSELF. A scan that silently matched nothing — a broken
     walk, a typo in the name set, an `rglob` pointed at an empty tree — would pass the test above

@@ -254,6 +254,7 @@ def test_the_longest_file_goes_to_the_least_loaded_shard_ties_by_path():
     assert _shard_owners(dict(reversed(table.items())), 3) == _shard_owners(table, 3)
 
 
+@pytest.mark.whole_tree
 def test_every_file_of_the_tree_lands_in_one_shard_for_any_n():
     """Every test file of every test root, a file added tomorrow that the table does not list,
     and a listed file that is gone: each in exactly one shard of 1..N, with the committed table."""

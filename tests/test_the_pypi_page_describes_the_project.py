@@ -60,6 +60,7 @@ def _page() -> str:
 
 # ── the declaration ─────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_package_declares_the_page_and_the_page_exists():
     """Declared as markdown, present in the tree, and TRACKED — an untracked page builds on the
     machine that wrote it and on no other, which is the shape of the `floor.yaml` defect the wheel
@@ -278,6 +279,7 @@ def _imports_fcntl_at_module_scope() -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_the_metadata_beside_the_page_says_where_to_read_more_and_where_it_runs():
     """The sidebar of the index's page: the documentation, the changelog and the security policy
     each one click away, and the operating systems the package can actually run on.

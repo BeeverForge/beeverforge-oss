@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -55,6 +56,7 @@ def test_make_lint_checks_the_installer():
         "`make lint` runs shellcheck over something other than install.sh")
 
 
+@pytest.mark.whole_tree
 def test_it_checks_every_shell_script_that_ships():
     """DERIVED, not a name typed here. `docker/install-addons.sh` is the other one — it decides
     whether the public build installs the core alone or aborts, and a reviewer once replaced its

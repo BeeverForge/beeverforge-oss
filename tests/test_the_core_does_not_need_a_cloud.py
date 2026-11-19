@@ -105,6 +105,7 @@ def _cloud_imports_at_module_scope() -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_every_cloud_import_is_function_level():
     """A module-scope import makes the SDK mandatory for anyone who imports that module.
 

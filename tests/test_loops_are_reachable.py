@@ -16,6 +16,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 PROD = [p for p in Path("beeverforge").rglob("*.py")]
@@ -75,6 +77,7 @@ def _store_calls(method: str) -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_the_ledger_is_both_WRITTEN_and_READ_by_production_code():
     """A ledger only written is a log nobody reads; a ledger only read is always empty. Either one
     alone looks exactly like an agent with nothing to remember."""
@@ -204,6 +207,7 @@ def _open_loop_sites() -> dict[str, list[tuple[str, str]]]:
     return sites
 
 
+@pytest.mark.whole_tree
 def test_every_loop_kind_is_opened_from_a_REAL_entry_point():
     """A kind nobody opens is a row that never exists; the feature is inert and the tests pass.
 
@@ -229,6 +233,7 @@ def test_every_loop_kind_is_opened_from_a_REAL_entry_point():
     assert not problems, "; ".join(problems)
 
 
+@pytest.mark.whole_tree
 def test_loops_are_CLOSED_by_production_code_not_only_by_tests():
     """Opened and never closed is worse than not tracking at all: the list grows for ever and
     everyone learns to ignore it."""
@@ -257,6 +262,7 @@ def _functions_referencing(kind_const: str):
 _CLOSERS = ("close_by_observation", "answered", "delivered")
 
 
+@pytest.mark.whole_tree
 def test_EVERY_kind_has_a_reachable_closer():
     """Opened and never closed is worse than not tracking: the list grows for ever and everyone
     learns to ignore it. Per kind: some REACHABLE production function must reference the kind (as
@@ -305,11 +311,13 @@ def test_a_loop_kind_with_no_observable_close_is_closed_by_a_PERSON():
     assert parse_command("ok") is None
 
 
+@pytest.mark.whole_tree
 def test_something_actually_CHASES():
     chasers = [f for f in _calls_anywhere("chase_due") if "beeverforge/memory" not in f]
     assert chasers, "nothing chases — a question that goes quiet stays quiet for ever"
 
 
+@pytest.mark.whole_tree
 def test_the_product_role_NAMES_the_person_it_needs_an_answer_from():
     """`people.mention` existed and was tested from the day the product role shipped, and was
     called by nothing. "Somebody should clarify #412" is a message everybody reads and nobody owns —
@@ -318,6 +326,7 @@ def test_the_product_role_NAMES_the_person_it_needs_an_answer_from():
     assert callers, "mention() is still reached by nothing; every question goes to the room"
 
 
+@pytest.mark.whole_tree
 def test_a_review_that_rejected_something_reaches_a_person():
     """#478 merged with a rejected review and a critical finding, and it reached no channel, no
     comment and no person. Advisory review is the design; silence was not."""

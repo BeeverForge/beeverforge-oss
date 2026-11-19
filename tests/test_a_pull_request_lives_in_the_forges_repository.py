@@ -239,6 +239,7 @@ def _reads_ticket_repo(tree: ast.AST) -> list[int]:
     return lines
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("package", ["beeverforge/preview", "beeverforge/orchestrator"])
 def test_nothing_that_names_where_a_change_lives_reads_the_tickets_repo(package):
     """`Ticket.repo` is the tracker's; the preview and the job name the forge's (#403)."""

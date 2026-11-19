@@ -147,6 +147,7 @@ def _conceptual() -> list[str]:
             and not rel.startswith(HISTORY_PREFIXES)]
 
 
+@pytest.mark.whole_tree
 def test_no_conceptual_document_names_a_vendors_product():
     """The rule, over every document at once — including one added tomorrow."""
     conceptual = _conceptual()
@@ -184,6 +185,7 @@ def test_the_neutral_documents_still_SAY_that_a_cloud_is_possible():
     assert "add-on" in architecture or "add-ons" in architecture
 
 
+@pytest.mark.whole_tree
 def test_a_chat_channel_is_never_presented_as_required():
     """ADR-0038's half, in prose. The panel is the reference surface; a channel is where a team
     that already talks somewhere gets the same thing delivered. A conceptual document naming one

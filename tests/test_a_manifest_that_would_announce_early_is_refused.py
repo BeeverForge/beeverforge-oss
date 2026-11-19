@@ -174,6 +174,7 @@ def _markdown_environment_blocks() -> list[tuple[str, dict]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_every_environments_example_in_the_docs_loads():
     example = _commented_environments((ROOT / "docs" / "project.yaml.example").read_text())
     blocks = [("docs/project.yaml.example", example), *_markdown_environment_blocks()]

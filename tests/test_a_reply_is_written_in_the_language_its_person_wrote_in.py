@@ -107,6 +107,7 @@ def _owners(tree: ast.Module) -> dict[int, str]:
     return owner
 
 
+@pytest.mark.whole_tree
 def test_no_prompt_writes_a_language_section_of_its_own():
     found = []
     for path in sorted(Path("beeverforge").rglob("*.py")):

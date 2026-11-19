@@ -332,6 +332,7 @@ def test_a_new_name_is_unknown_wherever_it_is_said_outside_the_layer():
                                             "beeverforge/plugins.py"]), unknown(said)
 
 
+@pytest.mark.whole_tree
 def test_no_file_says_an_openfactory_name_it_is_not_pinned_to():
     said = _said()
 

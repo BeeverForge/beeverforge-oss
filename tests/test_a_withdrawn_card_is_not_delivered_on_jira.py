@@ -456,6 +456,7 @@ def test_the_real_jira_row_is_closed_through_the_seam_with_the_word(site):
     assert jira.posts("/transitions")[0]["fields"] == {"resolution": {"name": WONT_DO}}
 
 
+@pytest.mark.whole_tree
 def test_no_generic_caller_passes_the_word_to_a_row_directly():
     """The seam is one place only while nothing walks around it. A `.close_ticket(…, delivered=…)`
     outside the tracker rows is a call that meets an old add-on with a raw `TypeError`."""

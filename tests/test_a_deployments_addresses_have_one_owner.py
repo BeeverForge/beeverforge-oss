@@ -575,6 +575,7 @@ def test_the_literal_scan_can_FAIL():
     assert _port_literals("timeout = 80800; build = '1.8080.2'", ports) == []
 
 
+@pytest.mark.whole_tree
 def test_no_deployment_port_is_spelled_outside_the_one_definition():
     from beeverforge.listeners import LISTENERS
 

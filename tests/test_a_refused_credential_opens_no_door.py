@@ -1316,6 +1316,7 @@ def falls_back_without_asking(root: pathlib.Path = PACKAGE) -> list[tuple[str, i
     return out
 
 
+@pytest.mark.whole_tree
 def test_every_construction_point_asks_the_refusal_before_it_falls_back():
     """THE RULE AT EVERY CONSTRUCTION POINT (review of #822): the worker built its tracker and
     forge with the App minter, and Jira's row with `JIRA_API_TOKEN`, after the project's own
@@ -1329,6 +1330,7 @@ def test_every_construction_point_asks_the_refusal_before_it_falls_back():
         + "\n  ".join(f"{path}:{line}: {what}()" for path, line, what in offenders))
 
 
+@pytest.mark.whole_tree
 def test_the_construction_rule_sees_the_worker_and_every_builder(tmp_path):
     """Its verifiers: the points the review named are among those it reads, and a fall-back planted
     without the question is seen while one that asks is not."""
@@ -1393,6 +1395,7 @@ NOT_A_CONSUMER: dict[str, str] = {
 }
 
 
+@pytest.mark.whole_tree
 def test_every_module_that_asks_the_store_is_a_consumer_here():
     """A new reader of the store — or a new place that hands an adapter the deployment's own when
     the project holds nothing — joins `CONSUMERS` or fails here by name, so the next door is held
@@ -1485,6 +1488,7 @@ def gh_starts(root: pathlib.Path = PACKAGE) -> set[tuple[str, str]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_every_gh_the_package_starts_is_reached_by_a_case_after_a_refusal():
     """A NEW `gh` CALL JOINS A CASE (review of 1b5ec71d): the CI observer and board creation still
     ran `gh` on the machine's own login after a refusal because no case reached them. Each `gh`
@@ -1498,6 +1502,7 @@ def test_every_gh_the_package_starts_is_reached_by_a_case_after_a_refusal():
     assert set(GH_STARTS.values()) <= set(CONSUMERS), sorted(set(GH_STARTS.values()) - set(CONSUMERS))
 
 
+@pytest.mark.whole_tree
 def test_the_gh_reading_sees_a_call_written_or_bound_and_nothing_else(tmp_path):
     pkg = tmp_path / "beeverforge"
     pkg.mkdir()

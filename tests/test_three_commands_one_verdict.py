@@ -480,6 +480,7 @@ def test_the_roles_check_says_which_installation_it_read():
     assert f.ok and "local" in f.message
 
 
+@pytest.mark.whole_tree
 def test_every_call_site_this_file_cites_actually_exists():
     """A CITATION IS A CLAIM, and this file is almost entirely citations — the whole argument for
     every check is "here is the line that acts on this fact".
@@ -542,6 +543,7 @@ def _role_prompt_call_sites(root: Path) -> dict[str, set[str]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_the_role_list_still_covers_every_call_site():
     """A LITERAL THAT CANNOT DRIFT. `ROLE_PROMPTS` is deliberately not a glob — a glob returns
     nothing exactly when the packaging bug is present, so the check would report "0 roles, all

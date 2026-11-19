@@ -19,6 +19,8 @@ import subprocess
 
 import pytest
 
+pytestmark = pytest.mark.whole_tree
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SKIP = (".venv", "node_modules", ".git", "__pycache__", "site-packages", ".claude")
 

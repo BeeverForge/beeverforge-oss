@@ -191,6 +191,7 @@ def _sources() -> list[Path]:
     return files
 
 
+@pytest.mark.whole_tree
 def test_the_main_block_is_the_last_statement_of_every_module_that_has_one():
     """C2: a `__main__` block is its module's last top-level statement, so `python -m` runs it
     after every `def` it may call. On c0a50f3 `schedule.py`'s block was at line 300 with ten

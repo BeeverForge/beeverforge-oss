@@ -287,6 +287,7 @@ def _tracked() -> frozenset[str]:
     return frozenset(p for p in out.stdout.split("\0") if p)
 
 
+@pytest.mark.whole_tree
 def test_the_citation_scan_can_SEE_the_citations_that_were_here_and_reads_the_live_ones():
     """Verify the verifier, both ways: the three dead citations must be flagged, and a citation
     that IS true must not be — a scan that flagged everything would be turned off within a week."""

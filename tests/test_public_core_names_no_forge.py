@@ -87,12 +87,14 @@ def _offenders(package: pathlib.Path = PKG) -> list[str]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_core_module_imports_the_reference_trackers_modules_by_name():
     assert _offenders() == [], (
         "a core module reaches the reference tracker by name — ask the port "
         "(`build_tracker(project).budget()`, `board_setup.registry.board_creator(kind)`) instead")
 
 
+@pytest.mark.whole_tree
 def test_and_the_walk_can_SEE_a_function_level_import(tmp_path):
     """The positive twin: a planted core module importing the vendor inside a function is found,
     and the same import inside `adapters/` or `factory.py` is not."""

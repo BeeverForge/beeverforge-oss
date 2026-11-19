@@ -27,6 +27,8 @@ import pathlib
 import re
 import subprocess
 
+import pytest
+
 from beeverforge import plugins
 from tests.the_tree_read_once import parsed
 
@@ -49,6 +51,7 @@ def _doctrine() -> list[str]:
     return [p for p in out.stdout.split("\0") if p and not p.startswith(HISTORY)]
 
 
+@pytest.mark.whole_tree
 def test_the_doctrine_set_holds_the_document_this_guard_was_written_for():
     """The twin of the exclusion. `HISTORY` is a prefix list, and a prefix list can grow to
     swallow the very document these guards exist for — `('docs/adr/', 'docs/core/')` left every
@@ -69,6 +72,7 @@ def test_the_doc_names_the_group_the_loader_actually_reads():
         f"the loader reads is documented nowhere a stranger looks")
 
 
+@pytest.mark.whole_tree
 def test_no_doctrine_document_names_a_group_that_does_not_exist():
     """The twin of the statement above, over every document at once. `beeverforge.forge` was
     in §3 as an example of the shape — and an example is what a stranger copies."""
@@ -94,6 +98,7 @@ def test_the_group_pattern_can_SEE_the_spelling_that_was_wrong():
     assert GROUP_IN_A_DOC.findall(f'[project.entry-points."{plugins.GROUP}"]') == [plugins.GROUP]
 
 
+@pytest.mark.whole_tree
 def test_no_doctrine_document_says_an_add_on_has_nowhere_to_register():
     """The sentence that told a stranger not to try at all."""
     offenders = [rel for rel in _doctrine() if NOWHERE in (ROOT / rel).read_text()]
@@ -147,6 +152,7 @@ def _axes_the_doc_claims(text: str) -> set[str]:
     return set(re.findall(r"`([a-z_]+)`", m.group(1)))
 
 
+@pytest.mark.whole_tree
 def test_the_doc_lists_exactly_the_axes_that_consult_the_loader():
     """The 4-versus-rest split cannot drift: when a fifth registry is wired the sentence has to
     change, and when the sentence claims an axis the registries do not ask for, a stranger writes
@@ -159,6 +165,7 @@ def test_the_doc_lists_exactly_the_axes_that_consult_the_loader():
         f"{sorted(from_tree)}")
 
 
+@pytest.mark.whole_tree
 def test_the_registry_walk_can_SEE_a_planted_call(tmp_path):
     """The twin: a registry that asks the loader for a new axis must be counted, in the exact
     shape the four real ones use."""

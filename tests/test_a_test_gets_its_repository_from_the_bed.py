@@ -466,6 +466,7 @@ def test_the_bed_and_this_guard_are_not_counted(tmp_path):
     assert the_git_bed.count_git_inits(tmp_path) == 1
 
 
+@pytest.mark.whole_tree
 def test_tests_build_no_more_repositories_than_the_bed_left():
     said = the_git_bed.over_the_line(the_git_bed.count_git_inits(TESTS), BASELINE)
     assert not said, said

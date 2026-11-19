@@ -156,6 +156,7 @@ def _coordinate_hits(root: pathlib.Path = ROOT) -> list[str]:
     return hits
 
 
+@pytest.mark.whole_tree
 def test_no_live_infrastructure_coordinate_is_published():
     """The non-negotiable half. An account id in a public repo is a disclosure, not a typo.
 
@@ -187,6 +188,7 @@ def test_this_scan_can_SEE_a_coordinate_it_is_given():
     )
 
 
+@pytest.mark.whole_tree
 def test_a_synthetic_shape_in_a_NON_exempt_published_file_is_reported(tmp_path):
     """The scan's own road, on a tree of its own. The twin above verifies the pattern; nothing
     walked a tree, so a scan reading every non-exempt file with the real-only pattern (nothing
@@ -203,6 +205,7 @@ def test_a_synthetic_shape_in_a_NON_exempt_published_file_is_reported(tmp_path):
         "docs/guide.md:3 (the organisation that builds the product)"]
 
 
+@pytest.mark.whole_tree
 def test_the_scan_reads_the_ONE_object_its_twins_read(tmp_path, monkeypatch):
     """`identity.refused(root)` is what the twins verify, so it must be what the scan reads — a
     scan building its own pattern from the same source is indistinguishable on any tree until
@@ -229,6 +232,7 @@ def _a_tree_whose_exempt_file_names_a_real_person(root: pathlib.Path) -> str:
     return exempt
 
 
+@pytest.mark.whole_tree
 def test_an_EXEMPT_file_is_read_for_the_real_names_it_may_not_carry(tmp_path):
     """Per token, not per file. The reviewer's cut appended a real login to an exempt guard file
     and this scan, which skipped the file outright, stayed green. Proven on a tree of its own so
@@ -238,6 +242,7 @@ def test_an_EXEMPT_file_is_read_for_the_real_names_it_may_not_carry(tmp_path):
     assert _coordinate_hits(tmp_path) == [f"{exempt}:1 (a maintainer's login)"]
 
 
+@pytest.mark.whole_tree
 def test_but_the_shapes_an_EXEMPT_file_plants_are_not_offences(tmp_path):
     """The other direction: without a real list the exempt file is exempt from everything the
     tree knows, and the scan must not turn an empty real list into a match-everything pattern."""
@@ -247,6 +252,7 @@ def test_but_the_shapes_an_EXEMPT_file_plants_are_not_offences(tmp_path):
     assert _coordinate_hits(tmp_path) == []
 
 
+@pytest.mark.whole_tree
 def test_the_scan_judges_what_could_ship_and_not_what_the_machine_holds(tmp_path):
     """Both directions, on a repository of its own. A file a `git add -A` would stage next is
     reported; a file the repository has declared local — gitignored, like the live registry and
@@ -267,6 +273,7 @@ def test_the_scan_judges_what_could_ship_and_not_what_the_machine_holds(tmp_path
         "the scan reports what the repository declared local, or misses what would ship next")
 
 
+@pytest.mark.whole_tree
 def test_a_MALFORMED_real_list_fails_the_scan_with_the_line_that_is_wrong(tmp_path):
     """A hand-edited list fails the tests that read it, at test time, naming the line — never
     collection (`test_a_MALFORMED_real_list_does_not_abort_COLLECTION` next door collects a copy
@@ -434,6 +441,7 @@ def test_every_command_the_onboarding_guide_prints_is_one_that_EXISTS():
     assert not missing, f"the onboarding guide prints commands that do not exist: {missing}"
 
 
+@pytest.mark.whole_tree
 def test_provenance_is_ANONYMISED_and_not_deleted():
     """The other half, and the one that is easy to get wrong in the destructive direction.
 

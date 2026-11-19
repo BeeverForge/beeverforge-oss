@@ -185,6 +185,7 @@ def _welded_sites(*, registered: bool = False) -> list[tuple[str, int, str]]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_outward_surface_composes_a_sentence_of_its_own():
     """The measurement this card exists to keep at zero."""
     unregistered = [s for s in _welded_sites() if s[0] not in NOT_A_PERSONS_LANGUAGE]
@@ -195,6 +196,7 @@ def test_no_outward_surface_composes_a_sentence_of_its_own():
         + "\n".join(f"  {f}:{ln}  {text!r}" for f, ln, text in unregistered))
 
 
+@pytest.mark.whole_tree
 def test_and_every_REGISTERED_exception_is_still_real():
     """A registry nobody prunes becomes the thing it was protecting against. Each entry has to
     still name a live site — otherwise it is a standing permission for the next one."""
@@ -205,6 +207,7 @@ def test_and_every_REGISTERED_exception_is_still_real():
     assert not stale, f"registered as system-surface and no longer welded at all: {stale}"
 
 
+@pytest.mark.whole_tree
 def test_the_sites_found_by_following_a_name_can_only_SHRINK():
     """Three, found 2026-09-19, each still welded — so an entry cannot outlive its site — and
     never a fourth: a new one is fixed where it is written, which is what the walk is for."""
@@ -217,6 +220,7 @@ def test_the_sites_found_by_following_a_name_can_only_SHRINK():
     assert len(SEEN_ONLY_SINCE_THE_WALK_FOLLOWS_A_NAME) <= 2
 
 
+@pytest.mark.whole_tree
 def test_the_walk_actually_INSPECTS_the_package():
     """The failure this file would otherwise have: a detector that matches nothing passes for a
     clean codebase. Measured on a sibling guard the same week — a wrong `.parent` made a ratchet

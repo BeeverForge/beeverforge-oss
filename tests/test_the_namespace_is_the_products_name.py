@@ -261,6 +261,7 @@ ALLOWED = {
 }
 
 
+@pytest.mark.whole_tree
 def test_nothing_in_the_package_spells_the_old_name_as_code():
     """Derived by walking `beeverforge/` rather than by listing suspects, so a new reader — a path,
     a branch, a label, a button id, a stream prefix, an environment variable, a remedy sentence —
@@ -347,6 +348,7 @@ def test_the_shipped_file_scan_can_SEE_the_old_name_and_leaves_comments_alone():
 NAMED_SHIPPED_FILES = ("beeverforge/api/panel.html", "beeverforge/org_defaults/floor.yaml")
 
 
+@pytest.mark.whole_tree
 def test_no_shipped_file_outside_python_spells_the_old_name():
     """Derived by walking `beeverforge/` for every shipped file the AST scan does not read."""
     offenders = {}

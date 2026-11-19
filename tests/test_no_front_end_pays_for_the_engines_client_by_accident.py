@@ -280,6 +280,7 @@ def _this_tree() -> tuple[Reach, ...]:
 
 # ── the guard ────────────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_sweep_knows_which_modules_cost_the_library():
     """A sweep that finds nothing because it recognises nothing is the failure to rule out first."""
     costly = costly_modules(ROOT)
@@ -296,6 +297,7 @@ def test_the_sweep_knows_which_modules_cost_the_library():
         f"importing these costs `{LIBRARY}` although they live outside {ENGINE_DIR}: {outside}")
 
 
+@pytest.mark.whole_tree
 def test_every_reach_for_the_engine_from_outside_it_is_guarded_or_named():
     reaches = _this_tree()
     assert len(reaches) >= 20, f"the sweep found only {len(reaches)} — it is not reading the tree"
@@ -312,6 +314,7 @@ def test_every_reach_for_the_engine_from_outside_it_is_guarded_or_named():
         + "\n  ".join(strangers))
 
 
+@pytest.mark.whole_tree
 def test_the_named_list_names_only_what_is_there():
     """Held exactly, so it cannot become a list of permissions nobody re-reads."""
     unguarded = {r.key for r in _this_tree() if not r.guard}
@@ -320,6 +323,7 @@ def test_the_named_list_names_only_what_is_there():
                       f"the entry if so. {_RE_POINT}: {gone}")
 
 
+@pytest.mark.whole_tree
 def test_the_action_rows_are_only_reached_through_the_layer_that_guards_them():
     """"An action row's body" is a guard only while nothing outside the layer calls into the
     catalog's engine-reaching functions directly. Whatever the rest of the package imports from

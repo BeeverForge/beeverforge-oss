@@ -113,10 +113,12 @@ def _core_sources() -> list[pathlib.Path]:
                   if not any(str(p.relative_to(ROOT)).startswith(a) for a in AWS_PATHS))
 
 
+@pytest.mark.whole_tree
 def test_the_sweep_walks_the_core():
     assert len(_core_sources()) >= 100
 
 
+@pytest.mark.whole_tree
 def test_no_core_module_imports_the_aws_connector():
     """The guard. Fourteen sites when it was first run (activities.py ×5, view.py ×3, app.py,
     metrics_view.py, query.py, transcript.py, observability/registry.py, session_store.py); a

@@ -173,6 +173,7 @@ def _sync_calls(root: Path | None = None) -> list[tuple[str, int, ast.AST | None
     return out
 
 
+@pytest.mark.whole_tree
 def test_no_checkout_in_the_package_ASSUMES_a_branch_name():
     """The ratchet. This class has now been repeated five times across three modules, once under a
     comment naming itself as a repeat — so the guard is not "the sites I fixed stay fixed", it is
@@ -188,6 +189,7 @@ def test_no_checkout_in_the_package_ASSUMES_a_branch_name():
         f"repository points: {offenders}")
 
 
+@pytest.mark.whole_tree
 def test_the_ratchet_walks_the_sites_it_claims_to():
     """A rglob that matched nothing would report no offenders either. The count is a floor: new
     call sites are fine, zero is the walk having stopped working."""
@@ -198,6 +200,7 @@ def test_the_ratchet_walks_the_sites_it_claims_to():
         "the module this card is about is not in the walk at all")
 
 
+@pytest.mark.whole_tree
 def test_and_the_ratchet_can_SEE_one(tmp_path):
     """Verify the verifier — through `_sync_calls` ITSELF, not a re-implementation of its predicate.
 

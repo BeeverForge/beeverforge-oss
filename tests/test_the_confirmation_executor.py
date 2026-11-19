@@ -97,6 +97,7 @@ def _staged_kinds() -> set[str]:
     return kinds
 
 
+@pytest.mark.whole_tree
 def test_the_scan_finds_the_staging_sites_at_all():
     """The positive twin, first. `assert every kind is handled` passes just as happily over a scan
     that found nothing — this repository has shipped three guards that were green over live
@@ -108,6 +109,7 @@ def test_the_scan_finds_the_staging_sites_at_all():
         f"an empty set, which reads as compliance")
 
 
+@pytest.mark.whole_tree
 def test_every_staged_kind_has_an_executor():
     """The whole point of a dispatch table over a chain of `if`: the question is answerable.
 
@@ -122,6 +124,7 @@ def test_every_staged_kind_has_an_executor():
         f"lado' about a proposal they correctly approved")
 
 
+@pytest.mark.whole_tree
 def test_the_table_has_no_executor_for_a_kind_nobody_stages():
     """The other direction, and it is not symmetry for its own sake: a branch kept alive for a
     kind no site produces is code nothing can reach, which is this repository's signature defect

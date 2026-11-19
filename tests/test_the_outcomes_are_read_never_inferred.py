@@ -457,6 +457,7 @@ def _copies(source: str) -> list[str]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_module_keeps_a_copy_of_the_classes_or_the_states_past_the_merge():
     """A GUARD ON THE SHAPE OF THE DEFECT: a tuple, list or set literal holding these words beside
     each other is a copy. The classifier's own constants and the enum are where they live, and

@@ -89,6 +89,7 @@ def _gits_on_their_own_environment(source: str) -> list[str]:
     return [str(n) for n in sorted(set(found))]
 
 
+@pytest.mark.whole_tree
 def test_no_git_the_suite_starts_loses_the_suites_config():
     """A GUARD ON THE CLASS (review of #595): the fixture above reaches only a git that inherits
     the environment, and a fixture that built its own committed, pushed and was cloned by path."""

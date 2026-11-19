@@ -69,6 +69,7 @@ def store(monkeypatch):
 
 
 # ── 1. reach ───────────────────────────────────────────────────────────────────────────────────
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("fn", ["record", "recent", "render"])
 def test_production_code_calls_it(fn):
     """Not "a test calls it" — production. The whole module is worthless otherwise."""

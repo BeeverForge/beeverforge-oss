@@ -165,6 +165,7 @@ def _core_documents() -> list[str]:
             if rel.startswith("docs/core/") and rel.endswith(".md")]
 
 
+@pytest.mark.whole_tree
 def test_the_design_directory_is_cut_file_by_file_and_never_as_a_directory():
     """Both halves, because either alone reads as compliance. A `docs/core/` row would take the
     extensibility document with it — the one a third party has for "how do I add a provider" — and
@@ -210,6 +211,7 @@ def test_the_design_index_SHIPS_and_every_document_it_names_ships_with_it():
         + "\n  ".join(broken))
 
 
+@pytest.mark.whole_tree
 def test_every_design_document_that_STAYS_is_reached_from_the_index():
     """The reachability half, and it is the one this codebase gets wrong: a design document that
     ships and is linked from nowhere is built, tested, reached by nothing, one level up. Every
@@ -634,6 +636,7 @@ def test_the_read_scan_can_SEE_the_shapes_it_is_named_for():
     assert _read_text_paths(beside) == [(5, "docs/site-guide.md")]
 
 
+@pytest.mark.whole_tree
 def test_no_guard_reads_a_path_the_public_cut_EXCLUDES():
     """The standing rule this cut leaves behind. A guard that `read_text()`s an excluded path is
     green here and raises `FileNotFoundError` in the export, where the reason it exists is the
@@ -732,6 +735,7 @@ def test_the_published_names_include_the_export_and_the_packages():
 
 # ── the private tree keeps what it excludes ─────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_excluded_documents_are_STILL_HERE_and_tracked():
     """Excluded is not deleted, and the difference is the whole reason this is a table rather than
     a `git rm`. `test_the_public_cut_is_written_down.py` holds every row to the tree; this states

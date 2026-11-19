@@ -956,6 +956,7 @@ def _callers(name: str) -> set[str]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_job_opens_a_proposal_only_a_person_does():
     """Opening a proposal is `beeverforge preview propose` and `onboard --with-preview`. A job,
     an activity, a workflow, the poller or the panel only ASK whether one is open."""

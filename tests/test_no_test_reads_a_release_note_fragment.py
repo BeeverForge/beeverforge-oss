@@ -15,6 +15,8 @@ import ast
 import runpy
 from pathlib import Path
 
+import pytest
+
 from tests.the_tree_read_once import parsed
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +46,7 @@ def test_the_guard_finds_a_fragment_named_as_a_separate_path_component(tmp_path,
     assert _fragments_named(source) == ["example.fix.md"]
 
 
+@pytest.mark.whole_tree
 def test_no_test_or_plan_names_a_fragment_in_its_code():
     sources = (sorted((ROOT / "tests").rglob("*.py"))
                + sorted((ROOT / "tools" / "mutations").glob("*.py")))

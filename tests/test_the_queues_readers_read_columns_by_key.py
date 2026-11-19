@@ -622,6 +622,7 @@ def _docstrings(tree: ast.AST) -> set[int]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_neutral_code_names_a_column_by_the_platforms_literal():
     """THE CLASS #502 IS ONE OF. A literal `"TO-DO"` in neutral code is a column compared, moved or
     defaulted by a name only a board this platform created carries — every one of them read

@@ -157,6 +157,7 @@ def _ledger_marks() -> dict[str, str]:
 
 # ── the list is real ────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_status_page_lists_the_excluded_paths_and_each_one_is_tracked():
     _private_tree()
     excluded = _excluded()
@@ -209,6 +210,7 @@ def test_the_ledger_marks_every_vendor_entry_the_way_the_export_treats_it():
 
 # ── what stays is reached, what leaves is reached only through the named doors ──────────────────
 
+@pytest.mark.whole_tree
 def test_every_vendor_entry_that_stays_is_imported_by_a_module_that_stays():
     vendor_modules, vendor_packages, _ = _ledger()
     excluded = _excluded()
@@ -220,6 +222,7 @@ def test_every_vendor_entry_that_stays_is_imported_by_a_module_that_stays():
         f"them — built, tested, reached by nothing: {orphans}")
 
 
+@pytest.mark.whole_tree
 def test_every_leaving_entry_is_reached_and_only_through_a_registry_row_or_an_entry_point():
     _private_tree()
     excluded = _excluded()
@@ -245,6 +248,7 @@ def test_every_leaving_entry_is_reached_and_only_through_a_registry_row_or_an_en
     assert not unreached, f"these leave and nothing reaches them at all: {unreached}"
 
 
+@pytest.mark.whole_tree
 def test_no_registry_holds_a_chat_row_any_more_and_the_documents_say_so():
     """Both directions, flipped on 2026-08-26: NO module that stays reaches a leaving path — the
     two registries that held a chat row (`REGISTRY_DOORS`) hold the panel only — and the two
@@ -440,6 +444,7 @@ def _links_into_excluded(documents: list[tuple[str, str]], excluded: dict[str, s
     return hits
 
 
+@pytest.mark.whole_tree
 def test_no_document_that_stays_links_to_a_document_that_leaves():
     """Six documents linked `docs/DEPLOYMENT.md` and `docs/runtime-architecture.md` while both
     left with the cloud package — every link resolved HERE and dangled in the export, where the
@@ -470,6 +475,7 @@ def test_the_link_walk_can_SEE_a_link_to_a_leaving_document():
         "CONTRIBUTING.md:infra/deploy.sh"]
 
 
+@pytest.mark.whole_tree
 def test_every_relative_link_in_the_add_on_packages_documents_resolves():
     """The two documents moved under `addons/beeverforge-aws/docs/` keep links into `docs/`;
     the adopter-surface link guard does not walk the packages, so this one does."""
@@ -649,6 +655,7 @@ def _compose_dockerfiles() -> set[str]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_no_dockerfile_names_a_path_the_export_removes_in_a_form_its_absence_breaks():
     excluded = _excluded()
     files = [rel for rel in _tracked() if _is_dockerfile(rel) and not _is_excluded(rel, excluded)]
@@ -666,6 +673,7 @@ def test_no_dockerfile_names_a_path_the_export_removes_in_a_form_its_absence_bre
         + "\n  ".join(findings))
 
 
+@pytest.mark.whole_tree
 def test_every_dockerfile_the_first_command_builds_is_in_the_walk():
     """The positive twin of the walk itself. `_is_dockerfile` is a name test, and a name test can
     quietly stop matching — so the images `docker compose … up --build` names are read out of the
@@ -766,6 +774,7 @@ def _install_step(rel: str) -> list[str]:
     return []
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("rel", _images_that_bake_the_platform())
 def test_the_install_step_is_the_script_and_nothing_around_it(rel):
     """What the guards below run is the SCRIPT; what the image runs is the RUN instruction. The
@@ -832,6 +841,7 @@ def _run_install_step(rel: str, root: pathlib.Path, *, with_packages: bool,
     return run, targets
 
 
+@pytest.mark.whole_tree
 def test_the_images_that_bake_the_platform_are_the_ones_this_walk_found():
     found = _images_that_bake_the_platform()
     missing = [rel for rel in IMAGES_THAT_BAKE_THE_PLATFORM if rel not in found]
@@ -840,6 +850,7 @@ def test_the_images_that_bake_the_platform_are_the_ones_this_walk_found():
         f"have measured {found} and said nothing about the rest")
 
 
+@pytest.mark.whole_tree
 @pytest.mark.skipif(not shutil.which("sh"), reason="no POSIX shell on this machine")
 @pytest.mark.parametrize("rel", _images_that_bake_the_platform())
 def test_the_install_step_installs_NOTHING_from_the_packages_where_they_are_absent(rel, tmp_path):
@@ -860,6 +871,7 @@ def test_the_install_step_installs_NOTHING_from_the_packages_where_they_are_abse
         f"that stopped installing the platform, which is not the fix")
 
 
+@pytest.mark.whole_tree
 @pytest.mark.skipif(not shutil.which("sh"), reason="no POSIX shell on this machine")
 @pytest.mark.parametrize("rel", _images_that_bake_the_platform())
 def test_the_install_step_installs_EVERY_package_the_tree_carries(rel, tmp_path):
@@ -877,6 +889,7 @@ def test_the_install_step_installs_EVERY_package_the_tree_carries(rel, tmp_path)
         f"`BEEVERFORGE_SANDBOX=fargate` by name, in the tree that has them")
 
 
+@pytest.mark.whole_tree
 @pytest.mark.skipif(not shutil.which("sh"), reason="no POSIX shell on this machine")
 @pytest.mark.parametrize("rel", _images_that_bake_the_platform())
 def test_a_failing_package_install_takes_the_build_down_instead_of_being_swallowed(rel, tmp_path):
@@ -894,6 +907,7 @@ def test_a_failing_package_install_takes_the_build_down_instead_of_being_swallow
         f"{rel}'s install step carried on to the next package after one failed: {targets}")
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("rel", _images_that_bake_the_platform())
 def test_each_image_still_copies_the_packages_directory_as_an_optional_glob(rel):
     """The install step above can only install what the build context holds. `addon[s]` copies the
@@ -1011,6 +1025,7 @@ def test_a_recipe_never_announces_a_file_it_did_not_create(tmp_path):
         f"a copy that FAILED was announced as done:\n{failed.stdout}{failed.stderr}")
 
 
+@pytest.mark.whole_tree
 def test_no_shipped_example_or_workflow_names_a_path_the_export_removes():
     """The same rule over the rest of what the export ships and something reads: the compose file
     the first command runs, every `*.example` template, and the CI workflow a fork inherits."""
@@ -1180,6 +1195,7 @@ def _documents_that_drive_a_leaving_directory() -> dict[str, set[str]]:
     return found
 
 
+@pytest.mark.whole_tree
 def test_a_document_that_drives_a_leaving_directory_exists_at_all():
     """The floor, and it is the honest kind: if every such document has left the public cut, the
     guard below is parametrised over nothing and passes in silence. Delete it in that commit
@@ -1190,6 +1206,7 @@ def test_a_document_that_drives_a_leaving_directory_exists_at_all():
         "removes any more — the banner rule below now measures nothing")
 
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("rel", sorted(_documents_that_drive_a_leaving_directory()))
 def test_a_document_that_drives_a_leaving_directory_says_so_in_its_OPENING(rel):
     opening = _opening((ROOT / rel).read_text())

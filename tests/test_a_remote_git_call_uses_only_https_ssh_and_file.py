@@ -246,6 +246,7 @@ def _unpinned(tree: ast.AST) -> list[str]:
     return [str(n) for n in sorted(found)]
 
 
+@pytest.mark.whole_tree
 def test_every_remote_reaching_git_call_goes_through_the_pin():
     """A GUARD ON THE CLASS: the next remote call written into the core is pinned too."""
     missing = [f"{path.relative_to(ROOT)}:{line}"

@@ -98,6 +98,7 @@ def _violations(text: str) -> list[tuple[int, str]]:
     return out
 
 
+@pytest.mark.whole_tree
 def test_every_git_argv_for_a_remote_puts_its_values_behind_the_marker():
     offenders = {}
     for path in sorted(PKG.rglob("*.py")):

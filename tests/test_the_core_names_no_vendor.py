@@ -318,6 +318,7 @@ def offenders(root: pathlib.Path = ROOT) -> list[str]:
 
 # ── the tree ────────────────────────────────────────────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 def test_the_guard_reads_the_whole_package():
     """A guard that walks nothing passes for ever — and one that walks only Python misses the
     page every person reads."""
@@ -327,6 +328,7 @@ def test_the_guard_reads_the_whole_package():
     assert any(p.suffix == ".md" for p in files) and any(p.suffix == ".yaml" for p in files)
 
 
+@pytest.mark.whole_tree
 def test_no_vendor_is_named_outside_a_comment_in_the_core():
     """THE GUARD (#266 slice 6, ADR-0051 D16). A vendor's name the core runs or shows is a core
     with a default vendor: the chat vendor is an add-on, and the core names nobody."""
@@ -349,6 +351,7 @@ def test_every_allowed_entry_is_still_in_the_tree():
     assert not stale, f"allowed and no longer present — remove them: {stale}"
 
 
+@pytest.mark.whole_tree
 def test_nothing_in_the_core_reads_a_docstring_at_run_time():
     """What makes a docstring a comment. The day the core shows one — a help text, a tool's
     description handed to a model — this exemption turns into a hole, and this fails first."""
@@ -414,6 +417,7 @@ def test_yaml_and_prompts_are_held_outside_their_comments():
     assert not text_findings("<!-- the Slack add-on -->\nAnswer here.\n")
 
 
+@pytest.mark.whole_tree
 def test_a_planted_name_in_the_TREE_is_found_by_the_guard(tmp_path):
     """Red with a planted vendor name, by the same walk the tree is held to: a copy of one real
     file of the core, one string changed."""
@@ -429,6 +433,7 @@ def test_a_planted_name_in_the_TREE_is_found_by_the_guard(tmp_path):
     assert found and "beeverforge/product/door.py" in found[0] and "'slack'" in found[0], found
 
 
+@pytest.mark.whole_tree
 def test_an_allowed_file_is_not_a_free_pass(tmp_path):
     """The allow-list names STRINGS, not files: a new vendor-named value in `plugins.py` is caught
     like anywhere else — by the same walk the tree is held to."""

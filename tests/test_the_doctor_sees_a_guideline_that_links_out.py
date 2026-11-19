@@ -80,6 +80,7 @@ def _the_doctors_line(project: Project) -> doctor.Finding:
 
 # ── 1. the doctor sees the link, through its real probes ───────────────────────────────────────
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("entry", ["rules/standards.md", "rules/relative.md"])
 def test_a_guideline_committed_as_a_link_out_of_the_repository_fails_the_doctor(shop, entry):
     f = _the_doctors_line(_declare(shop, "rules/house.md", entry))
@@ -92,12 +93,14 @@ def test_a_guideline_committed_as_a_link_out_of_the_repository_fails_the_doctor(
     assert "BEEVERFORGE_GUIDELINES_DIR" in f.remedy and "link" in f.remedy
 
 
+@pytest.mark.whole_tree
 def test_a_link_to_the_repository_itself_fails_by_that_name(shop):
     f = _the_doctors_line(_declare(shop, "rules/up"))
 
     assert not f.ok and "rules/up" in f.message and "the repository itself" in f.message
 
 
+@pytest.mark.whole_tree
 def test_links_that_stay_inside_the_repository_pass_and_the_line_names_the_checkout(shop):
     f = _the_doctors_line(_declare(shop, "rules/house.md", "rules/inlink.md"))
 
@@ -108,6 +111,7 @@ def test_links_that_stay_inside_the_repository_pass_and_the_line_names_the_check
 
 # ── 2. the doctor and the job agree, entry by entry ────────────────────────────────────────────
 
+@pytest.mark.whole_tree
 @pytest.mark.parametrize("entry", [
     "rules/house.md", "rules/inlink.md", "rules/standards.md", "rules/relative.md", "rules/up",
     ".", "../central/standards.md", "CENTRAL_ABSOLUTE",
@@ -141,6 +145,7 @@ def test_with_no_checkout_at_hand_the_line_says_it_read_the_text_only():
                                                f"{f.message}"
 
 
+@pytest.mark.whole_tree
 def test_a_checkout_the_doctor_cannot_resolve_is_no_checkout_not_a_crash(shop, monkeypatch):
     project = _declare(shop, "rules/standards.md")
     real = doctor.probes_for(project)
