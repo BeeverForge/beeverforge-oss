@@ -128,6 +128,19 @@ def test_a_job_that_ends_in_another_state_writes_its_own_ending():
     assert sorted(r["state"] for r in _endings()) == ["done", "merged"]
 
 
+@pytest.mark.parametrize("state", ["on_hold", "paused"])
+def test_a_parked_job_writes_no_ending_and_the_one_it_ends_with_is_counted_once(state):
+    assert record_job_ending(project="acme", issue="9", state=state) is False
+    assert _endings() == []
+    assert record_job_ending(project="acme", issue="9", state="merged", pr_url=PR)
+    assert [r["state"] for r in _endings()] == ["merged"]
+
+
+def test_a_failed_job_writes_its_ending():
+    assert record_job_ending(project="acme", issue="9", state="failed")
+    assert [r["state"] for r in _endings()] == ["failed"]
+
+
 def test_an_ending_nobody_can_write_never_raises(monkeypatch):
     def broken():
         raise RuntimeError("no store")

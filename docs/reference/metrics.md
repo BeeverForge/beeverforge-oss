@@ -17,7 +17,9 @@ A `job` row says what happened to a ticket's job. There are two sorts:
 Both drivers write it — the durable workflow's `record_outcome` and the attended driver (`beeverforge
 run`, `beeverforge poll`) — through one function, `observability/job_record.record_job_ending`. It
 holds whether the pull request was merged by the factory, by an operator's merge action or by a
-person on the forge. It is written once per job, state and pull request: a replay writes nothing
+person on the forge. A job that only parks (`on_hold`, `paused`: it can resume and will end again)
+writes no ending row, so a job is counted when it ends and not when it is parked; `failed` is an
+ending. It is written once per job, state and pull request: a replay writes nothing
 again, and a job that ends `merged` and later `done` has one row for each.
 
 To count the jobs that ended past the merge, count the ending rows whose `state` is in

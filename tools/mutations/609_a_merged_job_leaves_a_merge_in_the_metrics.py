@@ -7,6 +7,7 @@
   · THE DOOR records the job's telling of a merge on a card the forge already closed — only that
     telling, only with a pull request, writing nothing to the card — and refuses the box's and the
     settle's `merged` there;
+  · A PARKED JOB (`on_hold`, `paused`) writes no ending: it has not ended;
   · THE READERS that took every `job` row for an attempt skip the ending.
 """
 
@@ -51,6 +52,11 @@ MUTATIONS = [
     ("the door takes a telling with no pull request on a closed card", CARD,
      'and "stages_follow" in (facts or {}) and bool((facts or {}).get("pr_url")))\n',
      'and "stages_follow" in (facts or {}))\n'),
+    ("a parked job writes an ending", JOB_RECORD,
+     "    if state in PARKED:\n        return False\n", ""),
+    ("the versions seen count the ending as an attempt", "beeverforge/observability/query.py",
+     "            if extra.get(\"ending\"):\n", "            if False:\n",
+     "tests/test_the_outcomes_are_read_never_inferred.py"),
     ("the dashboard takes the ending for the job's attempt", "beeverforge/api/metrics_view.py",
      '            if r.get("kind") == "job" and not (r.get("extra") or {}).get("ending")}',
      '            if r.get("kind") == "job"}'),

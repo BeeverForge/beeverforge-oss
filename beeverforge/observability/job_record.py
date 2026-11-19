@@ -96,6 +96,10 @@ def record_job(*, project: str, issue: str, ts: str, state: str = "", title: str
         log.info("job telemetry for %s#%s was not recorded (%s)", project, issue, str(exc)[:160])
 
 
+#: The outcomes that PARK a job rather than end it: it can resume, and will end again.
+PARKED = frozenset({"on_hold", "paused"})
+
+
 def record_job_ending(*, project: str, issue: str, state: str, pr_url: str = "") -> bool:
     """A job's ENDING as ONE `job` row — its final state, its pull request and its platform stamp,
     marked `extra.ending` so a consumer picks it without guessing from timestamps (#609). Returns
@@ -112,6 +116,12 @@ def record_job_ending(*, project: str, issue: str, state: str, pr_url: str = "")
     second driver writes nothing again, while a job that ends `merged` and later `done` says both.
     A store that cannot write by key is written as an ordinary row, and a second one is possible.
 
+    ONLY AN OUTCOME THAT ENDS THE JOB IS AN ENDING. A job that parks (`on_hold`: an impediment, an
+    operator's cancel, a terminated workflow; `paused`: a usage limit) can be resumed and will end
+    again, so a row for the park would count a job that has not ended and a second one when it
+    does. Those write nothing (`PARKED`); the journal's own line still records the park. `failed`
+    is an ending: the job stopped, and a retry that ends differently writes its own row.
+
     BEST-EFFORT, like every write on this axis: it never raises and never changes the job."""
     import hashlib
     from datetime import UTC, datetime
@@ -119,6 +129,8 @@ def record_job_ending(*, project: str, issue: str, state: str, pr_url: str = "")
     from beeverforge.observability.metrics import KeyedSink, MetricRecord
     from beeverforge.observability.registry import deployment_metrics_sink
 
+    if state in PARKED:
+        return False
     try:
         sink = deployment_metrics_sink()
         row = MetricRecord(
