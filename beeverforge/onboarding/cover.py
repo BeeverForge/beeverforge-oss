@@ -27,8 +27,9 @@ from beeverforge.knowledge.gaps import answered_gaps, merge_gaps
 from beeverforge.knowledge.okf import (
     OKF_INDEX_FILE,
     SCOPE_LIMIT,
+    ManifestUnreadable,
+    load_manifest,
     read_concepts,
-    read_manifest,
     render_index,
     write_okf,
 )
@@ -60,12 +61,17 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
     NEVER RAISES: the covering is the factory's own diligence before a change, and a diligence
     that crashed the job it was protecting would be the argument for switching it off. Writes
     nothing when nothing was authored, so a bundle a harness could not serve is left exactly as
-    it was fetched."""
+    it was fetched — and a manifest that exists and cannot be read is a reason to author nothing:
+    it holds the answered questions, and what was authored could only be written over it."""
     wanted = [p for p in dict.fromkeys(str(p).strip() for p in paths) if p]
     if not wanted:
         return Covered(0, (), (), "nothing to cover")
     bundle = Path(bundle_dir)
-    previous = read_manifest(bundle)
+    try:
+        previous = load_manifest(bundle)
+    except ManifestUnreadable as exc:
+        log.warning("BEEVERFORGE_KNOWLEDGE_COVER_MANIFEST_UNREADABLE %s", exc)
+        return Covered(0, (), tuple(wanted), str(exc))
     try:
         # WHAT WAS ALREADY ANSWERED RIDES INTO THE PROMPT, so the author does not mint the same
         # question in new words — the way a gather that asked once would ask for ever.
@@ -77,14 +83,7 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
         return Covered(0, (), tuple(wanted), f"the authoring failed: {str(exc)[:120]}")
     if not authored.concepts:
         return Covered(0, (), tuple(wanted), authored.mode)
-    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)
-    manifest = manifest.model_copy(update={
-        "source_commit": commit or manifest.source_commit, "generated_at": generated_at,
-        # a manifest published without its scope statement gets it here — the sentence that
-        # stops a reader treating a machine reading as a specification (the renewal's lesson)
-        "scope_limit": manifest.scope_limit or SCOPE_LIMIT,
-        # THE RECORD FIRST, BY KEY: an answered question is not shadowed by its re-derivation
-        "gaps": merge_gaps(manifest.gaps, authored.gaps)})
+    manifest = _manifest_with(previous, authored, commit=commit, generated_at=generated_at)
     write_okf(bundle, manifest=manifest, concepts=authored.concepts)
     (bundle / OKF_INDEX_FILE).write_text(render_index(manifest, read_concepts(bundle)),
                                          encoding="utf-8")
@@ -92,6 +91,20 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
     covered = tuple(p for p in wanted if p in cited)
     return Covered(len(authored.concepts), covered, tuple(p for p in wanted if p not in cited),
                    authored.mode)
+
+
+def _manifest_with(previous: OkfManifest | None, authored, *, commit: str,
+                   generated_at: str) -> OkfManifest:
+    """The manifest to write beside what was authored: the one read (or a fresh one when there
+    was none), stamped with this commit and carrying the authored gaps merged into its own."""
+    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)
+    return manifest.model_copy(update={
+        "source_commit": commit or manifest.source_commit, "generated_at": generated_at,
+        # a manifest published without its scope statement gets it here — the sentence that
+        # stops a reader treating a machine reading as a specification (the renewal's lesson)
+        "scope_limit": manifest.scope_limit or SCOPE_LIMIT,
+        # THE RECORD FIRST, BY KEY: an answered question is not shadowed by its re-derivation
+        "gaps": merge_gaps(manifest.gaps, authored.gaps)})
 
 
 __all__ = ["Covered", "cover_paths"]

@@ -369,6 +369,10 @@ READERS: dict[str, Reader] = {
         Reader(lambda tmp, t, mp: okf.parse_concept(_fenced(t)), absent=None),
     "beeverforge/knowledge/okf.py::parse_manifest":
         Reader(lambda tmp, t, mp: okf.parse_manifest(t), absent=None),
+    # the writers' strict reader: a manifest it cannot read is refused by name, never `None`
+    "beeverforge/knowledge/okf.py::_strict_manifest":
+        Reader(lambda tmp, t, mp: _raised(lambda: okf.load_manifest(
+            _put(tmp / okf.OKF_MANIFEST_FILE, t).parent), okf.ManifestUnreadable)),
     # the published map is the core's own file, read with the refusing loader: the counting one
     # `text.load_yaml` holds for the formats the layer derives from would read its aliases (#1002)
     "beeverforge/knowledge/system/render.py::read_published":
