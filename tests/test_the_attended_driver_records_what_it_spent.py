@@ -55,11 +55,16 @@ def _rows(kind: str) -> list[dict]:
     return deployment_metrics_sink().records_of_kind("myapp", kind)
 
 
+def _attempts() -> list[dict]:
+    """The per-attempt `job` rows: the job's ending row (`extra.ending`, #609) is the next test's."""
+    return [r for r in _rows("job") if not (r.get("extra") or {}).get("ending")]
+
+
 def test_a_card_the_TERMINAL_drove_leaves_a_job_row(measured):
     code, out = om.cli("poll", "myapp")
 
     assert "→ #1" in out and code == 0, out
-    jobs = _rows("job")
+    jobs = _attempts()
     assert len(jobs) == 1, f"the attended driver recorded {len(jobs)} job rows: {jobs}"
     assert jobs[0]["ticket"] == "1"
 
@@ -67,7 +72,7 @@ def test_a_card_the_TERMINAL_drove_leaves_a_job_row(measured):
 def test_the_row_carries_what_the_ATTEMPT_did(measured):
     om.cli("poll", "myapp")
 
-    (job,) = _rows("job")
+    (job,) = _attempts()
     assert job["state"], "the row does not say how the attempt ended"
     assert job["wall_s"] is not None and job["wall_s"] >= 0, "nothing was timed"
     assert job["pr_url"], "the pull request this job opened is not on its row"

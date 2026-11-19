@@ -3605,6 +3605,7 @@ def _drive_one(view, issue: str, *, sandbox: str, image: str, review: bool = Tru
         BY_THE_ATTENDED_DRIVER,
         record_ending,
         record_job,
+        record_job_ending,
     )
 
     started = time.monotonic()
@@ -3616,6 +3617,8 @@ def _drive_one(view, issue: str, *, sandbox: str, image: str, review: bool = Tru
                wall_s=round(time.monotonic() - started, 1),
                total_cost_usd=result.total_cost_usd, pr_url=result.pr_url or "",
                knowledge=result.knowledge, agent_runs=result.agent_runs)
+    # AND ITS ENDING ROW IN THE METRICS (#609), the one the workflow's `record_outcome` writes too
+    record_job_ending(project=view.name, issue=str(issue), state=state, pr_url=result.pr_url or "")
     # AND HOW IT ENDED, IN ITS JOURNAL (#551): the line `query.outcomes` reads a job's ending
     # from, written by the same function the workflow's `record_outcome` writes it with. Without
     # it every job this driver ran read as never ended, and a one-machine deployment's evidence
