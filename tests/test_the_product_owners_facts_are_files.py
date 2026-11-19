@@ -267,3 +267,33 @@ def test_the_role_is_built_with_the_pack_written_first(tmp_path, monkeypatch):
 def test_the_client_s_document_says_what_the_role_can_open():
     text = (ROOT / "docs/reference/product-role.md").read_text()
     assert "facts pack" in text and "could **not** be read" in text
+
+
+_OPEN_LEAD = "**What the role can open while it answers:**"
+
+
+def _paragraph(text: str, lead: str) -> str:
+    """The paragraph of `text` whose first line starts with `lead`, up to the first blank line,
+    with its whitespace collapsed — "" when no line starts with `lead`."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        if lines and not line.strip():
+            break
+        if lines or line.startswith(lead):
+            lines.append(line)
+    return " ".join(" ".join(lines).split())
+
+
+def test_the_client_s_document_says_the_role_opens_its_OWN_facts_pack():
+    """Not "facts pack" anywhere in the file: the paragraph that tells the client what the role
+    opens while it answers must say the role opens its own pack."""
+    text = (ROOT / "docs/reference/product-role.md").read_text(encoding="utf-8")
+    paragraph = _paragraph(text, _OPEN_LEAD)
+    assert paragraph, (
+        f"docs/reference/product-role.md has no paragraph starting with {_OPEN_LEAD} — the "
+        "client's document no longer says what the role can open while it answers; restore "
+        "that paragraph")
+    assert "its own **facts pack**" in paragraph, (
+        f"the paragraph {_OPEN_LEAD} in docs/reference/product-role.md no longer says the role "
+        "opens its own **facts pack** while it answers, so the client is not told the pack "
+        "exists; put the phrase back in that paragraph")

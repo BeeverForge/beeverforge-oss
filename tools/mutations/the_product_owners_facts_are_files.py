@@ -61,9 +61,15 @@ MUTATIONS = [
      '    if facts and root and (Path(facts) / "README.md").is_file():\n',
      "    if facts and root:\n"),
 
-    ("documentation-only loses the pack", MODULE,
-     '            return _with_facts({"docs": ".", "code": ""}, facts, root)\n',
-     '            return {"docs": ".", "code": ""}\n'),
+    # NOT A CUT: "documentation-only loses the pack" (the early return in `mounted()` without
+    # `_with_facts`) is an equivalent mutant. In beeverforge/product/module.py, `mounted()`
+    # (~2096) takes `if not root or docs is None:` only when the root is unset: `_docs_root`
+    # (~176) returns None only when `_combined` is unset, the attribute `mounted()` reads as
+    # `root`. `_with_facts` (~189) adds `facts` only when `root` is set, so on that branch it adds
+    # nothing and the cut returns the same dict; no test forces an impossible state to tell them
+    # apart. A documentation-only workspace WITH a root goes through the final
+    # `return _with_facts(out, facts, root)` (~2122), held by the `docs_only` case of
+    # `test_mounted_reports_the_facts_only_when_the_manifest_is_ON_DISK`.
 
     ("the section speaks without a mount", ROLE,
      '        where = self.mounted.get("facts") or ""\n        if not where:\n            return []\n',
