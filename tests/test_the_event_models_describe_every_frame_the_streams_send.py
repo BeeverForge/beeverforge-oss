@@ -218,6 +218,29 @@ def test_every_kind_has_a_representative_frame_here():
     assert {kind for _stream, kind, _frame in _frames()} == set(KINDS)
 
 
+def test_a_proposal_reply_carries_the_confirmation_the_product_role_produces():
+    from beeverforge.api.events import validate
+    from beeverforge.api.product_chat import frames_of
+    from beeverforge.product.engine import Confirmation, Reply
+
+    confirmation = Confirmation(token="t", approve="Yes", reject="No", typed="You can type yes.")
+    reply = Reply(text="Record this?", options=confirmation, in_reply_to="m1")
+    frame = frames_of({"seq": 4, "type": "answer", "final": True,
+                       "replies": [reply.model_dump(mode="json")]}, _subscriber())[0]
+    assert frame["options"] == confirmation.model_dump(mode="json")
+    event = _map(CHAT, "reply", frame, id="e-1", at=AT, product=PRODUCT)
+    typed = validate(event)
+    assert typed.data.options.model_dump() == confirmation.model_dump()
+
+    # It is one confirmation object, not an array of choices.
+    event["data"]["options"] = [confirmation.model_dump()]
+    with pytest.raises(ValidationError):
+        validate(event)
+    event["data"]["options"] = confirmation.model_dump(exclude={"typed"})
+    with pytest.raises(ValidationError):
+        validate(event)
+
+
 @pytest.mark.parametrize(("stream", "kind", "frame"), _frames(),
                          ids=[f"{s}:{k}" for s, k, _f in _frames()])
 def test_every_frame_maps_onto_the_envelope_and_validates(stream, kind, frame):

@@ -342,6 +342,36 @@
       "title": "ChannelMessage",
       "type": "object"
     },
+    "ConfirmationOptions": {
+      "additionalProperties": true,
+      "description": "A proposal's confirmation, including the sentence for an answer typed without buttons.",
+      "properties": {
+        "token": {
+          "title": "Token",
+          "type": "string"
+        },
+        "approve": {
+          "title": "Approve",
+          "type": "string"
+        },
+        "reject": {
+          "title": "Reject",
+          "type": "string"
+        },
+        "typed": {
+          "title": "Typed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "approve",
+        "reject",
+        "typed"
+      ],
+      "title": "ConfirmationOptions",
+      "type": "object"
+    },
     "EarlierData": {
       "additionalProperties": true,
       "description": "The page of turns before the one shown, as the page asked.",
@@ -1592,7 +1622,7 @@
     },
     "ReplyData": {
       "additionalProperties": true,
-      "description": "The role answered. `options` are the choices it offers, `null` when it offers none.",
+      "description": "The role answered. `options` is its proposal's confirmation, or `null` without one.",
       "properties": {
         "seq": {
           "title": "Seq",
@@ -1617,14 +1647,12 @@
         "options": {
           "anyOf": [
             {
-              "items": {},
-              "type": "array"
+              "$ref": "#/$defs/ConfirmationOptions"
             },
             {
               "type": "null"
             }
-          ],
-          "title": "Options"
+          ]
         },
         "final": {
           "title": "Final",
