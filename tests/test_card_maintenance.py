@@ -1244,7 +1244,7 @@ def test_a_close_the_real_forge_refused_is_never_announced_as_a_close(world, mon
 
     assert res.ok is False, "a close the forge refused was reported to the client as done"
     assert res.detail and "gh " not in res.detail
-    assert gh.matching("issue comment") == [], \
+    assert gh.matching("issue comment 288") == [], \
         "the surviving card was told it absorbed a close that never happened"
     assert [t for t, _ in world.factory.created] == [
         impediment.title_for("books", PRODUCT_CANNOT_WRITE)]

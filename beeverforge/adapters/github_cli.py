@@ -14,6 +14,7 @@ repository the suite runs from, through the operator's own `gh` login: 31 commen
 from __future__ import annotations
 
 import errno
+import re
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,29 @@ BODY_LIMIT = 65_536
 #: one with "title is too long (maximum is 256 characters)", the validation message of its issue
 #: and pull-request model. Not measured here: no scratch repository was at hand on 2026-11-19.
 TITLE_LIMIT = 256
+
+#: Every lone surrogate: what `surrogateescape` decodes a byte that is not UTF-8 into. A string
+#: holding one cannot be written to `gh` as UTF-8, and `subprocess.run` raises `UnicodeEncodeError`.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def marked(text: str) -> str:
+    """`text` with each lone surrogate replaced by U+FFFD, so a text holding bytes that were not
+    UTF-8 is still sent and only those bytes are marked. A NUL or another control character is
+    left as written: stdin carries any byte. Both GitHub adapters use it, the forge for a
+    pull-request text and the tracker for a comment or a close reason (#128)."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
+def body_too_long(text: str, what: str) -> str:
+    """Why GitHub would not take `text` as a body, in one sentence with the remedy, or `""`:
+    `what` (`"the comment"`) has more characters than `BODY_LIMIT`. The text is never cut to fit;
+    the caller refuses it on its own failure path. Both GitHub adapters use it (#128)."""
+    if len(text) > BODY_LIMIT:
+        return (f"{what} has {len(text):,} characters, over the {BODY_LIMIT:,} GitHub accepts; "
+                f"shorten the text, it is never cut.")
+    return ""
+
 
 #: The flags this platform passes from configuration whose EMPTY value `gh` fills in by guessing,
 #: each with what it would guess from (review of #489). An empty `--head` on `pr create` is the

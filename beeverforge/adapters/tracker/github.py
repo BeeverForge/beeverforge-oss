@@ -17,7 +17,9 @@ import time
 from beeverforge.adapters.github_cli import (
     BODY_LIMIT,
     argv_too_long,
+    body_too_long,
     credential_of,
+    marked,
     nothing_named,
     refused,
 )
@@ -168,7 +170,8 @@ class GitHubIssuesTracker(TrackerAdapter):
             return argv_too_long(args, exc, log)
         return p
 
-    def _write(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    def _write(self, args: list[str], timeout: int = 60, *,
+               stdin: str | None = None) -> subprocess.CompletedProcess[str]:
         """Run a mutating `gh` call and RAISE when the forge refused it.
 
         `gh` reports failure only in its exit code, and this adapter had no one place that read it —
@@ -180,7 +183,7 @@ class GitHubIssuesTracker(TrackerAdapter):
         change is on the ticket, and best-effort is the CALLER's decision, written as a `try` where
         the next reader can see it.
         """
-        p = self._gh(args, timeout=timeout)
+        p = self._gh(args, timeout=timeout, stdin=stdin)
         if p.returncode != 0:
             raise RuntimeError(
                 f"gh {' '.join(args[:2])} failed ({p.returncode}): "
@@ -319,7 +322,21 @@ class GitHubIssuesTracker(TrackerAdapter):
 
     def comment(self, ref: str, body: str) -> None:
         repo, num = self._locate(ref)
-        self._write(["issue", "comment", num, "--repo", repo, "--body", body])
+        self._post_comment(repo, num, body, what="the comment")
+
+    def _post_comment(self, repo: str, num: str, text: str, *, what: str) -> None:
+        """`gh issue comment --body-file -` with `text` on STDIN, never as an argument (#128).
+
+        GitHub accepts 65,536 characters; one argv element holds 131,072 bytes, so a 3-byte script
+        text GitHub would take was refused by the kernel from about 43,690 characters. A text over
+        GitHub's limit is refused by name before `gh` runs, never cut, and a lone surrogate is
+        marked U+FFFD (`github_cli.marked`): the forge's rules for a pull-request text (#127).
+        Through `_write`, so a refusal raises and `_gh`'s guards still apply."""
+        why = body_too_long(text, what)
+        if why:
+            raise RuntimeError(why)
+        self._write(["issue", "comment", num, "--repo", repo, "--body-file", "-"],
+                    stdin=marked(text))
 
     def comments(self, ref: str, *, limit: int = 0) -> list[TicketComment] | None:
         """`gh issue view --json comments`, which answers OLDEST FIRST (verified live on #81 of
@@ -624,11 +641,32 @@ class GitHubIssuesTracker(TrackerAdapter):
         # prose went into a comment and GitHub defaulted `stateReason` to COMPLETED — so a card
         # closed as a duplicate was indistinguishable, to every reader downstream, from one that
         # shipped. `not_planned` is what `Ticket.delivered` reads.
+        #
+        # THE REASON IS A COMMENT ON STDIN, POSTED FIRST (#128): `gh issue close` has no file form
+        # for `--comment`, and a reason in argv was refused by the kernel from about 43,690 3-byte
+        # characters. Readers see it before the close, as they did; a refused comment closes
+        # nothing, and a blank reason is not posted.
         repo, num = self._locate(ref)
-        self._write(["issue", "close", num, "--repo", repo,
-                     "--reason", "completed" if delivered else "not planned",
-                     "--comment", reason])
+        posted = bool(reason.strip())
+        if posted:
+            self._post_comment(repo, num, reason, what="the close reason")
+        self._close_bare(repo, num, delivered=delivered, posted=posted)
         self._off_the_queue(ref, delivered=delivered)
+
+    def _close_bare(self, repo: str, num: str, *, delivered: bool, posted: bool) -> None:
+        """`gh issue close --reason`, with no `--comment`. A refusal after the reason was posted
+        says so, since the issue then carries a reason for a close that did not happen; with
+        nothing posted, `gh`'s own refusal is raised unchanged."""
+        try:
+            self._write(["issue", "close", num, "--repo", repo,
+                         "--reason", "completed" if delivered else "not planned"])
+        except RuntimeError as exc:
+            if not posted:
+                raise
+            raise RuntimeError(
+                f"the close reason was posted as a comment but the issue is still open ({exc}); "
+                f"close it by hand, or give the factory's credential the right to close issues "
+                f"in {repo}.") from exc
 
     def _off_the_queue(self, ref: str, *, delivered: bool) -> None:
         """A CLOSED CARD LEAVES ITS COLUMN WITH ITS CLOSE (#414), as the local row's close moves it

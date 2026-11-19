@@ -67,9 +67,7 @@ def _github(tmp_path, monkeypatch) -> Row:
 
     def gh(args, timeout=60, *, stdin=None):
         if args[:2] == ["issue", "comment"]:
-            row.posted.append(args[args.index("--body") + 1])
-        if "--comment" in args:
-            row.posted.append(args[args.index("--comment") + 1])
+            row.posted.append(stdin)
         out = ""
         if args[:2] == ["issue", "view"]:
             out = "OPEN" if "--jq" in args else '{"labels": []}'
