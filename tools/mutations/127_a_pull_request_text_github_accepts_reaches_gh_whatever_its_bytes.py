@@ -20,6 +20,11 @@ are the review's three findings, each check removed: a title holding a NUL reach
 `subprocess.run` (row 9), a title over GitHub's limit is sent (row 10), a text over GitHub's limit
 is sent (row 11), and a lone surrogate is no longer marked, in both texts (row 12), in the title
 alone (row 13) or in the body alone (row 14).
+
+RE-PINNED (#128): the forge's surrogate marking and body-length check moved to `github_cli`, as
+`marked` and `body_too_long`, which the GitHub tracker now shares for a comment and a close reason.
+Each row keeps its meaning: row 11 drops the body check where `_unsendable` asks for it, row 12
+makes the shared `marked` the identity, and rows 13 and 14 skip it for the title or the body.
 """
 
 TEST = "tests/test_a_pull_request_text_github_accepts_reaches_gh_whatever_its_bytes.py"
@@ -87,18 +92,18 @@ MUTATIONS = [
      "    if False:\n"),
 
     ("a text over GitHub's limit is sent, and only GitHub refuses it", FORGE,
-     "    if len(body) > BODY_LIMIT:\n",
-     "    if False:\n"),
+     '    return body_too_long(body, "the pull-request text")\n',
+     '    return ""\n'),
 
-    ("a lone surrogate is not marked, so `subprocess.run` raises `UnicodeEncodeError`", FORGE,
+    ("a lone surrogate is not marked, so `subprocess.run` raises `UnicodeEncodeError`", CLI,
      '    return _SURROGATE.sub("\\ufffd", text)\n',
      "    return text\n"),
 
     ("the title's lone surrogates are not marked, only the text's", FORGE,
-     "            title = _marked(title)\n",
+     "            title = marked(title)\n",
      "            title = str(title)\n"),
 
     ("the text's lone surrogates are not marked, only the title's", FORGE,
-     "        body = _marked(body)\n",
+     "        body = marked(body)\n",
      "        body = str(body)\n"),
 ]

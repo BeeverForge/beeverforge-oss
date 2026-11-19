@@ -10,6 +10,10 @@ remedy for that command (a comment's text goes on stdin with `--body-file -`; a 
 since `gh issue close` has no `--body-file`, is posted as a comment on stdin before a bare
 close), and the bound is logged.
 
+Since #128 no call site builds such an argv any more: `comment` and `close_ticket` send their text
+on stdin. The answer stays for any call that does, so the two long-text rows drive `_write` with
+the argv those methods used to build.
+
 `subprocess.run` is replaced by a fake that applies the kernel's rule; `gh` is never spawned. The
 bound is read from `MAX_ARG_STRLEN`, never typed here.
 """
@@ -96,7 +100,7 @@ def test_the_ceiling_is_logged_when_hit(kernel, caplog):
 
 def test_a_long_comment_fails_by_name_not_as_oserror(kernel):
     with pytest.raises(RuntimeError) as caught:
-        GitHubIssuesTracker("o/r").comment("#1", BIG)
+        GitHubIssuesTracker("o/r")._write(_comment_args())
     assert not isinstance(caught.value, OSError)
     message = str(caught.value)
     assert "`gh issue comment`" in message
@@ -108,7 +112,8 @@ def test_a_long_comment_fails_by_name_not_as_oserror(kernel):
 def test_a_long_close_reason_fails_by_name_not_as_oserror(kernel):
     # `gh issue close` has no `--body-file`: its remedy is the comment on stdin, then a bare close
     with pytest.raises(RuntimeError) as caught:
-        GitHubIssuesTracker("o/r").close_ticket("#1", BIG)
+        GitHubIssuesTracker("o/r")._write(
+            ["issue", "close", "1", "--repo", "o/r", "--reason", "completed", "--comment", BIG])
     assert not isinstance(caught.value, OSError)
     message = str(caught.value)
     assert "`gh issue close`" in message

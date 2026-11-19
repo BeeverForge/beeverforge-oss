@@ -23,11 +23,12 @@ from beeverforge.adapters.forge.base import (
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
 from beeverforge.adapters.github_cli import (
-    BODY_LIMIT,
     TITLE_LIMIT,
     LoginRefused,
     argv_too_long,
+    body_too_long,
     credential_of,
+    marked,
     nothing_named,
     refused,
 )
@@ -50,18 +51,6 @@ def discover_token() -> str | None:
         return None
     return (done.stdout or "").strip() or None if done.returncode == 0 else None
 
-#: Every lone surrogate: what `surrogateescape` decodes a byte that is not UTF-8 into. A string
-#: holding one cannot be written to `gh` as UTF-8, and `subprocess.run` raises `UnicodeEncodeError`.
-_SURROGATE = re.compile("[\ud800-\udfff]")
-
-
-def _marked(text: str) -> str:
-    """`text` with each lone surrogate replaced by U+FFFD, so a pull-request text holding bytes that
-    were not UTF-8 is still sent and only those bytes are marked. A NUL or another control
-    character in a BODY is left as written: stdin carries any byte."""
-    return _SURROGATE.sub("\ufffd", text)
-
-
 def _unsendable(title: str | None, body: str) -> str:
     """Why GitHub would not take this pull-request text, in one sentence with the remedy, or `""`.
     Neither is ever cut to fit: a refusal says so and the caller's own failure path answers it."""
@@ -71,10 +60,7 @@ def _unsendable(title: str | None, body: str) -> str:
     if title is not None and len(title) > TITLE_LIMIT:
         return (f"the pull request's title has {len(title):,} characters, over the "
                 f"{TITLE_LIMIT:,} GitHub accepts; shorten the title, it is never cut.")
-    if len(body) > BODY_LIMIT:
-        return (f"the pull-request text has {len(body):,} characters, over the {BODY_LIMIT:,} "
-                f"GitHub accepts; shorten the text, it is never cut.")
-    return ""
+    return body_too_long(body, "the pull-request text")
 
 
 _EVENT_FLAG = {
@@ -307,11 +293,11 @@ class GitHubForge(ForgeAdapter):
                title: str | None = None) -> subprocess.CompletedProcess[str]:
         """The one way a pull-request text reaches `gh`: `args`, then `--title` when there is one,
         then `--body-file -` with the text on stdin. Each text has its lone surrogates marked
-        (`_marked`); one GitHub would not take (`_unsendable`) is a failed call before `gh` runs,
-        which each caller answers on its own failure path."""
-        body = _marked(body)
+        (`github_cli.marked`); one GitHub would not take (`_unsendable`) is a failed call before
+        `gh` runs, which each caller answers on its own failure path."""
+        body = marked(body)
         if title is not None:
-            title = _marked(title)
+            title = marked(title)
             args = [*args, "--title", title]
         args = [*args, "--body-file", "-"]
         why = _unsendable(title, body)
