@@ -56,16 +56,17 @@ MUTATIONS = [
      "            self._bring_up_to_date(existing, repo=target, title=title, body=body)\n",
      ""),
 
+    # RE-PINNED (#127): the body now goes on stdin with `--body-file -`; both cuts mean the same.
     ("the edit carries the title and drops the body — the part a person approves on", GITHUB,
-     "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", repo, \"--title\", title, "
-     "\"--body\", body])\n",
+     "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", repo, \"--title\", title,\n"
+     "                             \"--body-file\", \"-\"], stdin=body)\n",
      "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", repo, \"--title\", title])\n"),
 
     ("the edit is aimed at this adapter's own repository, not the one the lookup searched",
      GITHUB,
-     "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", repo, \"--title\", title, ",
+     "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", repo, \"--title\", title,\n",
      "            done = self._gh([\"pr\", \"edit\", pr, \"--repo\", self.repo, \"--title\", "
-     "title, "),
+     "title,\n"),
 
     # ── claim 3: Azure Repos ──────────────────────────────────────────────────────────────────
     ("Azure answers the open pull request and patches nothing", AZURE,

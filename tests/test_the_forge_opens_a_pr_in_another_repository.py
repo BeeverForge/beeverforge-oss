@@ -79,9 +79,11 @@ class FakeGh:
     def __init__(self, routes: dict[str, _Run]):
         self.routes = routes
         self.calls: list[list[str]] = []
+        self.stdins: list[str | None] = []
 
-    def __call__(self, args, timeout=120):
+    def __call__(self, args, timeout=120, *, stdin=None):
         self.calls.append(list(args))
+        self.stdins.append(stdin)
         key = " ".join(args)
         for pattern, answer in self.routes.items():
             if pattern in key:

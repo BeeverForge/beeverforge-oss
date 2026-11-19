@@ -242,7 +242,7 @@ def forge_answers(monkeypatch, **over):
         got = answers[key]
         return got if hasattr(got, "returncode") else answered(got)
 
-    def no_gh(self, args, timeout=120):
+    def no_gh(self, args, timeout=120, *, stdin=None):
         import pytest
 
         pytest.fail(f"certify ran `gh {' '.join(args)}` for real")

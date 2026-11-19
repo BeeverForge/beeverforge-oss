@@ -13,7 +13,14 @@ repository the suite runs from, through the operator's own `gh` login: 31 commen
 
 from __future__ import annotations
 
+import errno
 import subprocess
+from typing import TYPE_CHECKING
+
+from beeverforge.adapters.agent.base import MAX_ARG_STRLEN
+
+if TYPE_CHECKING:
+    import logging
 
 #: The flags this platform passes from configuration whose EMPTY value `gh` fills in by guessing,
 #: each with what it would guess from (review of #489). An empty `--head` on `pr create` is the
@@ -79,3 +86,26 @@ def refused(args: list[str], why: str) -> subprocess.CompletedProcess[str]:
     """A `gh` call that was never run, answered the way a failed one is: every caller already
     reads a non-zero exit as "the forge did not do it", and a write raises on it."""
     return subprocess.CompletedProcess(["gh", *args], 2, "", why)
+
+
+def argv_too_long(args: list[str], exc: OSError,
+                  log: logging.Logger) -> subprocess.CompletedProcess[str]:
+    """An argv the kernel refused (`E2BIG`), answered as a failed call the way `refused()`
+    answers one, so a text too long for one argument fails by name instead of as a traceback.
+    Logged on the CALLER's logger (`log`), so each adapter's marker stays under its own name.
+    Any other `OSError` is not this one and is raised unchanged."""
+    if exc.errno != errno.E2BIG:
+        raise exc
+    command = " ".join(["gh", *args[:2]])
+    if args[:2] == ["issue", "close"]:
+        # `gh issue close` has no `--body-file` (only `-c/--comment`, `--duplicate-of`,
+        # `-r/--reason`), so its remedy is the comment on stdin first, then the bare close.
+        remedy = ("so the reason must be posted first as a comment on stdin "
+                  "(`gh issue comment --body-file -`), then the issue closed without `--comment`")
+    else:
+        remedy = "so the text must go to `gh` on stdin with `--body-file -`"
+    why = (f"`{command}` was refused by the kernel before it started (E2BIG): one argument is "
+           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, {remedy}.")
+    log.warning("BEEVERFORGE_GH_ARGV_TOO_LONG %s: an argument over %s bytes (MAX_ARG_STRLEN)",
+                command, f"{MAX_ARG_STRLEN:,}")
+    return refused(args, why)
