@@ -263,15 +263,17 @@ def test_a_text_over_githubs_limit_is_refused_by_name_before_gh_runs(monkeypatch
     """A text over GitHub's 65,536 characters was sent, and only GitHub refused it. Each write now
     refuses it before `gh` runs, never cut, through its own failure path, and the refusal names
     the limit and the remedy."""
+    from beeverforge.adapters.github_cli import BODY_LIMIT
+
     open_pr, write, verb = REFUSED[row]
     gh = KernelGH(open_pr=open_pr)
     monkeypatch.setattr(subprocess, "run", gh)
 
     with caplog.at_level(logging.WARNING, logger="beeverforge.forge.github"):
-        raised = write(GitHubForge("o/r"), "x" * (GitHubIssuesTracker.body_limit + 1))
+        raised = write(GitHubForge("o/r"), "x" * (BODY_LIMIT + 1))
 
     said = raised + caplog.text
-    assert f"{GitHubIssuesTracker.body_limit:,}" in said and "shorten" in said, said
+    assert f"{BODY_LIMIT:,}" in said and "shorten" in said, said
     assert gh.writes(verb) == [], "the text was sent over GitHub's limit"
 
 
