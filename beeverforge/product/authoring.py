@@ -1525,20 +1525,38 @@ def land_open_proposals(*, docs_repo: str, forge=None, base: str = "main",
     return landed
 
 
+def _numbered(folder: Path, requirements_dir: str,
+              n: int) -> tuple[Path | None, str | None, str]:
+    """Requirement `n`'s file, found by number prefix, with its text and the decoder's sentence:
+    `(None, None, "")` when there is no such file, `(file, None, sentence)` when its bytes are not
+    UTF-8 text, the file shown as `<requirements_dir>/<name>`."""
+    matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
+    if not matches:
+        return None, None, ""
+    text, unread = utf8.decode(matches[0].read_bytes(),
+                               f"{requirements_dir.strip('/')}/{matches[0].name}")
+    return matches[0], text, unread
+
+
+def unread_requirement(root: Path, requirements_dir: str, n: int) -> str:
+    """Why requirement `n` could not be marked replaced when its file is not UTF-8 — the decoder's
+    sentence, the same `_mark_superseded` logs — and empty otherwise (no such file, or a readable
+    one)."""
+    return _numbered(root / requirements_dir.strip("/"), requirements_dir, n)[2]
+
+
 def _retired(folder: Path, requirements_dir: str, n: int) -> tuple[Path, str] | None:
     """Requirement `n`'s file and its text, or None, said in the log, when there is no such file
     or its bytes are not UTF-8 text. NEVER WRITTEN OVER: a file that could not be read is not
     stamped, and the caller refuses to land half a supersession."""
-    matches = sorted(folder.glob(f"{n:04d}-*.md")) if folder.is_dir() else []
-    if not matches:
+    file, text, unread = _numbered(folder, requirements_dir, n)
+    if file is None:
         log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_MISSING requirement %04d does not exist", n)
         return None
-    text, unread = utf8.decode(matches[0].read_bytes(),
-                               f"{requirements_dir.strip('/')}/{matches[0].name}")
     if text is None:
         log.warning("BEEVERFORGE_PRODUCT_SUPERSEDE_NOT_UTF8 %s", unread)
         return None
-    return matches[0], text
+    return file, text
 
 
 def _mark_superseded(root: Path, requirements_dir: str, numbers: list[int], *,

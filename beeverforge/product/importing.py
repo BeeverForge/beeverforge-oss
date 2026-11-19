@@ -115,6 +115,7 @@ from beeverforge.product.corpus import (
     find_decisions_table,
     load_corpus,
 )
+from beeverforge.util import utf8
 
 log = logging.getLogger("beeverforge.product.importing")
 
@@ -922,12 +923,15 @@ def _set_field(lines: list[str], pattern: re.Pattern[str], label: str, value: st
 class Landed:
     """What `land` wrote into a checkout: the paths to commit, and — when it could not write all
     of it — why, as a key of `voice.import_said` (nothing is committed then). `broken` names, for
-    `corpus_broken`, what the landing would have broken: `<file>: <finding's code>`."""
+    `corpus_broken`, what the landing would have broken: `<file>: <finding's code>`. `unread`
+    is, for `not_utf8`, the decoder's sentence about the requirement file it would have changed
+    and could not read as UTF-8: the file, the byte offset, and the remedy."""
 
     paths: list[str] = field(default_factory=list)
     failed: str = ""
     record: dict = field(default_factory=dict)
     broken: list[str] = field(default_factory=list)
+    unread: str = ""
 
 
 def land(the_plan: Plan, brought: Brought, *, root: Path, requirements_dir: str, by: str,
@@ -943,7 +947,7 @@ def land(the_plan: Plan, brought: Brought, *, root: Path, requirements_dir: str,
     of it, the findings named — the plan's rules are meant to make that impossible, and this is
     what says so when they did not."""
     from beeverforge.policy.context_writes import import_record
-    from beeverforge.product.authoring import _mark_superseded, add_decision_row, fact_file
+    from beeverforge.product.authoring import _mark_superseded, fact_file
 
     folder = requirements_dir.strip("/") or "requirements"
     done = Landed()
@@ -974,20 +978,15 @@ def land(the_plan: Plan, brought: Brought, *, root: Path, requirements_dir: str,
                 retired, failed = _mark_superseded(
                     root, folder, [n for n in row.replaces if n not in minted], by=row.number)
                 if failed:
-                    done.failed = "supersede_failed"
+                    done.unread = _not_utf8(root, folder, failed)
+                    done.failed = _supersede_failed(done.unread)
                     return done
                 done.paths += retired
             elif row.kind == SAME and row.rows:
-                if _linked(root, row.path):
-                    raise _Outside(row.path)
-                twin = root / row.path
-                text = twin.read_text(encoding="utf-8")
-                for day, decided, who in _joining(by_source[row.source],
-                                                  _as_requirement(twin, text)):
-                    text, _outcome = add_decision_row(text, day=day, decision=decided, who=who,
-                                                      where=f"import {the_plan.id}",
-                                                      language=language)
-                _write(root, row.path, text.encode("utf-8"))
+                done.unread = _join(root, row, by_source[row.source], the_plan.id, language)
+                if done.unread:
+                    done.failed = "not_utf8"
+                    return done
                 done.paths.append(row.path)
         for placed in the_plan.facts:
             if placed.kind != NEW:
@@ -1017,6 +1016,44 @@ def land(the_plan: Plan, brought: Brought, *, root: Path, requirements_dir: str,
                   "is a link, or under one; nothing was committed", exc)
         done.failed = "outside"
     return done
+
+
+def _join(root: Path, row: Row, source: Requirement, ident: str, language: str | None) -> str:
+    """Join the folder's decisions `row` brings into the product's own requirement at `row.path`,
+    and write it — or, when that file is not UTF-8 text, write nothing and return the decoder's
+    sentence (the file, the byte offset, the remedy). Empty when it was joined."""
+    from beeverforge.product.authoring import add_decision_row
+
+    if _linked(root, row.path):
+        raise _Outside(row.path)
+    twin = root / row.path
+    read, unread = utf8.decode(twin.read_bytes(), row.path)
+    if read is None:
+        log.error("BEEVERFORGE_PRODUCT_IMPORT_NOT_UTF8 import=%s path=%s — %s; nothing was "
+                  "committed", ident, row.path, unread)
+        return unread
+    text = read
+    for day, decided, who in _joining(source, _as_requirement(twin, text)):
+        text, _outcome = add_decision_row(text, day=day, decision=decided, who=who,
+                                          where=f"import {ident}", language=language)
+    _write(root, row.path, text.encode("utf-8"))
+    return ""
+
+
+def _supersede_failed(unread: str) -> str:
+    """The key a revision that could not mark its old side replaced fails with: `not_utf8` when a
+    file was not UTF-8 text (`unread` its sentence), `supersede_failed` otherwise."""
+    return "not_utf8" if unread else "supersede_failed"
+
+
+def _not_utf8(root: Path, folder: str, numbers: list[int]) -> str:
+    """Why a requirement `land` had to mark replaced could not be, when it is a file that is not
+    UTF-8: the decoder's sentence for the first such file among `numbers`, from the lookup
+    `_mark_superseded` itself reads through (`authoring.unread_requirement`). Empty when none is —
+    a missing file, or one with no status line, stays `supersede_failed`."""
+    from beeverforge.product.authoring import unread_requirement
+
+    return next((unread for n in numbers if (unread := unread_requirement(root, folder, n))), "")
 
 
 class _Outside(OSError):
@@ -1463,12 +1500,16 @@ def _moved(the_plan: Plan, *, language: str | None = None) -> str:
 
 def _land_failed(done: Landed, *, language: str | None = None) -> str:
     """Why `land` wrote nothing to commit — a write tried and not made, never a decision: a
-    requirement it could not mark replaced, a link on the way, or a corpus it would have broken,
-    named."""
+    requirement it could not mark replaced, a link on the way, a corpus it would have broken,
+    named, or a requirement file it would change that is not UTF-8, in the decoder's words."""
     from beeverforge.product.voice import import_said
 
-    return import_said(done.failed, language=language,
-                       broken="; ".join(done.broken[:5]) or "—")
+    return import_said(done.failed, language=language, **_failure_values(done))
+
+
+def _failure_values(done: Landed) -> dict[str, str]:
+    """The details `land`'s failure sentences take, each "—" when that failure carries none."""
+    return {"broken": "; ".join(done.broken[:5]) or "—", "unread": done.unread or "—"}
 
 
 __all__ = [
