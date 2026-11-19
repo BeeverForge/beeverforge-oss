@@ -29,9 +29,9 @@ MUTATIONS = [
      'hashlib.sha256(f"{state}\\n{pr_url or \'\'}".encode())',
      'hashlib.sha256(f"{pr_url or \'\'}".encode())'),
     ("a failed write of the ending raises", JOB_RECORD,
-     '    except Exception as exc:  # noqa: BLE001 — telemetry is additive; never fail the job\n'
+     '    except Exception as exc:\n'
      '        log.info("the ending of',
-     '    except KeyError as exc:  # noqa: BLE001 — telemetry is additive; never fail the job\n'
+     '    except KeyError as exc:\n'
      '        log.info("the ending of'),
     ("the workflow's exit writes no ending", ACTIVITIES,
      "    await asyncio.to_thread(_the_row)     # never raises: telemetry is additive\n", ""),

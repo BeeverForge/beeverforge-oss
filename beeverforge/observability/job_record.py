@@ -129,7 +129,7 @@ def record_job_ending(*, project: str, issue: str, state: str, pr_url: str = "")
             return bool(sink.record(row))
         seal = hashlib.sha256(f"{state}\n{pr_url or ''}".encode()).hexdigest()[:20]
         return sink.record_if_absent(row, key=f"job#{issue}#ending#{seal}")
-    except Exception as exc:  # noqa: BLE001 — telemetry is additive; never fail the job
+    except Exception as exc:
         log.info("the ending of %s#%s was not recorded (%s)", project, issue, str(exc)[:160])
         return False
 
