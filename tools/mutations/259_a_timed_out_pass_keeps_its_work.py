@@ -162,15 +162,17 @@ MUTATIONS = [
      "                    self._say_on_ticket(ticket.id, said)\n                    return\n",
      "                    return\n", RM_FAILS),
 
+    # RE-PINNED 2026-11-19 (#608): the cleanup goes through `_clean_up_the_box`, which reports a
+    # box the daemon would not remove instead of raising over the run's outcome.
     ("the runner never keeps what the timed-out pass wrote", MACHINE,
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
-     "            self.sandbox.cleanup(workspace=ws)",
-     "            self.sandbox.cleanup(workspace=ws)", KEPT),
+     "            self._clean_up_the_box(ticket, ws)",
+     "            self._clean_up_the_box(ticket, ws)", KEPT),
 
     ("the runner keeps after its worktree is gone", MACHINE,
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
-     "            self.sandbox.cleanup(workspace=ws)",
-     "            self.sandbox.cleanup(workspace=ws)\n"
+     "            self._clean_up_the_box(ticket, ws)",
+     "            self._clean_up_the_box(ticket, ws)\n"
      "            self._keep_what_the_attempt_wrote(ticket, ws)", KEPT),
 
     # ── the workflow parks it resumable from its branch ──────────────────────────────────────

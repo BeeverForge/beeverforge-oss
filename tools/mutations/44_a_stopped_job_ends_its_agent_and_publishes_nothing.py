@@ -108,9 +108,10 @@ MUTATIONS = [
 
     # ── the cleanup ──
     # RE-PINNED 2026-11-09 (#259): a timed-out attempt keeps its work first, in the same places
+    # RE-PINNED 2026-11-19 (#608): through `_clean_up_the_box`
     ("a stopped job leaves its worktree behind", MACHINE,
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
-     "            self.sandbox.cleanup(workspace=ws)\n",
+     "            self._clean_up_the_box(ticket, ws)\n",
      "            self._keep_what_the_attempt_wrote(ticket, ws)\n"
      "            pass\n", MID_AGENT),
 
@@ -143,6 +144,7 @@ MUTATIONS = [
 
     # ── a stop the heartbeat has not heard yet (review of #453) ──
     # RE-PINNED 2026-11-09 (#259): a timed-out attempt keeps its work first, in the same places
+    # RE-PINNED 2026-11-19 (#608): through `_clean_up_the_box`
     ("the runner asks only the heartbeat's flag, never the engine", MACHINE,
      "        if stop is not None and not stop.still_keeping() and stop.confirm():\n",
      "        if stop is not None and not stop.still_keeping() and stop.requested:\n", UNHEARD),
