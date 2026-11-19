@@ -33,6 +33,7 @@ code, never the body.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import io
 import json
@@ -148,6 +149,26 @@ def _main_says(code: int) -> str:
     return f"jira GET issue/{REF} failed: {code} {json.dumps(_ISSUE_404, ensure_ascii=False)}"
 
 
+def _secret_forms(*, email: str = EMAIL, token: str = TOKEN) -> list[tuple[str, str]]:
+    """Every form the credential travels in, named: the token as typed, the base64 `email:token`
+    pair, and the `Authorization` value the tracker sends. Built here, never by `_headers`, so a
+    change to the adapter cannot also change what the tests look for."""
+    pair = base64.b64encode(f"{email}:{token}".encode()).decode()
+    return [("plaintext", token), ("encoded pair", pair), ("header", f"Basic {pair}")]
+
+
+def _leaked(text: str, forms: list[tuple[str, str]] | None = None) -> list[str]:
+    """The names of the forms of the credential `text` carries. Only names: an assertion that
+    compared the secret itself would print it, and the text holding it, when it failed."""
+    return [name for name, secret in (forms or _secret_forms()) if secret in text]
+
+
+def _leaked_in_log(records, forms: list[tuple[str, str]] | None = None) -> list[str]:
+    """The names of the forms of the credential any captured log record's message carries."""
+    found = {name for r in records for name in _leaked(r.getMessage(), forms)}
+    return [name for name, _secret in (forms or _secret_forms()) if name in found]
+
+
 # ── C1: a 404 whose `myself` answers 401 is the mismatch, named ──────────────────────────────────
 
 def test_a_404_whose_myself_answers_401_is_refused_with_code_401_naming_the_email_and_the_remedy(
@@ -177,9 +198,15 @@ def test_the_refusal_never_carries_the_token(site, caplog):
             _tracker().get_ticket(REF)
 
     assert raised.value.code == 401, str(raised.value)
-    assert TOKEN not in str(raised.value)
-    assert TOKEN not in repr(raised.value.args)
-    assert all(TOKEN not in r.getMessage() for r in caplog.records)
+    leaked = _leaked(str(raised.value))
+    assert leaked == [], (f"the refusal's text carries the token as {leaked}: keep the "
+                          "credential out of the sentence, name only the email")
+    leaked = _leaked(repr(raised.value.args))
+    assert leaked == [], (f"the refusal's args carry the token as {leaked}: keep the "
+                          "credential out of what JiraRefused is given")
+    leaked = _leaked_in_log(caplog.records)
+    assert leaked == [], (f"a log line carries the token as {leaked}: keep the credential "
+                          "out of what the tracker logs")
 
 
 def test_myself_is_asked_with_the_same_credential_as_the_call_that_404d(site):
@@ -261,6 +288,9 @@ def test_a_myself_that_cannot_answer_keeps_the_original_404(site, myself, caplog
         # a probe that could not be made says so in the log, never in silence (lesson 6)
         said = [r.getMessage() for r in caplog.records]
         assert any("GET myself could not be asked" in m for m in said), said
+        leaked = _leaked_in_log(caplog.records)
+        assert leaked == [], (f"the probe-failure log line carries the token as {leaked}: log "
+                              "the reason the probe failed, never the request's credential")
     assert raised.value.code == 404
     assert str(raised.value) == _main_says(404)
     assert isinstance(raised.value.__cause__, urllib.error.HTTPError)
@@ -427,7 +457,9 @@ def test_with_a_token_and_no_email_the_refusal_names_tracker_options_email(site,
     assert "tracker.options.email" in said[:120], said
     assert "different accounts" not in said
     assert "no API token" not in said
-    assert TOKEN not in said
+    leaked = _leaked(said, _secret_forms(email=email))
+    assert leaked == [], (f"the no-email refusal carries the token as {leaked}: keep the "
+                          "credential out of the sentence, name only the missing email")
 
 
 def test_with_no_token_and_no_email_the_refusal_still_says_no_token(site):
