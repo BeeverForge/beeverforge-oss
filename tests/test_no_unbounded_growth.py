@@ -60,7 +60,7 @@ _LIVES_FOR_THE_PROCESS = {
 #: Ownership handed to the caller. The releaser is NAMED, because "it returns the path" is not
 #: evidence — `ProductModule._workspace` returned its path too, and nothing ever released it.
 _RELEASED_BY_CALLER = {
-    ("beeverforge/adapters/sandbox/container.py", "prepare"): "ContainerSandbox.cleanup()",
+    ("beeverforge/adapters/sandbox/container.py", "_start"): "ContainerSandbox.cleanup()",
     ("beeverforge/techlead/conversation.py", "clone_repo"):
         "conversation._answer()'s finally, via scratch.discard()",
     ("beeverforge/techlead/diagnosis.py", "_checkout"):

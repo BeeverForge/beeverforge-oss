@@ -24,9 +24,11 @@ MUTATIONS = [
      '                               f"interrupted attempt before starting fresh", logging.WARNING)\n',
      ""),
 
+    # RE-PINNED 2026-11-19 (#608): the removal goes through `remove_the_box`, which retries a
+    # timeout once and then refuses by name.
     ("an unremovable corpse is reported as removed", BOX,
-     '            rm_rc, rm_out = _host(["docker", "rm", "-f", cname])\n'
+     '            rm_rc, rm_out = remove_the_box(cname, sleep=self.sleep, at_start=True)\n'
      "            if rm_rc != 0:",
-     '            rm_rc, rm_out = _host(["docker", "rm", "-f", cname])\n'
+     '            rm_rc, rm_out = remove_the_box(cname, sleep=self.sleep, at_start=True)\n'
      "            if False:"),
 ]
