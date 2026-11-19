@@ -43,7 +43,7 @@ from pydantic import ValidationError
 
 from beeverforge.contracts import aliases
 from beeverforge.contracts.project import BoxConfig, Project
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 
 log = logging.getLogger("beeverforge.registry")
 
@@ -305,7 +305,7 @@ class ProjectRegistry:
         if not self.path.exists():
             return {}
         try:
-            data = yaml_io.load(self.path.read_text()) or {}
+            data = yaml_io.load(utf8.text_of(self.path, str(self.path))) or {}
         except yaml.YAMLError as exc:
             raise ValueError(f"{self.path} is not valid YAML: {exc}") from exc
         if not isinstance(data, dict):
@@ -889,7 +889,8 @@ def seed_registry(*, seed: Path | str | None = None, live: Path | str | None = N
         existing = ProjectRegistry(live_path)._load_raw()
         if existing:
             return False
-        projects = (yaml_io.load(seed_path.read_text()) or {}).get("projects") or {}
+        seeded = yaml_io.load(utf8.text_of(seed_path, str(seed_path))) or {}
+        projects = seeded.get("projects") or {}
         if not projects:
             return False
         ProjectRegistry(live_path)._save_raw(projects)

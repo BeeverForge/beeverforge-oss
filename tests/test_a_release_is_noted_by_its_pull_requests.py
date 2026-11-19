@@ -360,13 +360,13 @@ def test_the_preview_writes_nothing(tree):
 def test_a_final_page_carries_its_section_and_a_candidate_page_the_fragments(tree):
     (tree / "CHANGELOG.md").write_text(PREAMBLE + "\n## 0.7.0 (2026-10-21)\n\n### Fixes\n\n"
                                        "- Shipped in the final (#1).\n")
-    _fragment(tree, "600.fix.md", "Waiting for the next one.")
+    _fragment(tree, "9600.fix.md", "Waiting for the next one.")
 
     final = _run(tree, "page", "v0.7.0").stdout
     candidate = _run(tree, "page", "v0.8.0-rc.1").stdout
 
     assert "Shipped in the final (#1)." in final and "Waiting" not in final, final
-    assert "Waiting for the next one (#600)." in candidate and "Shipped" not in candidate
+    assert "Waiting for the next one (#9600)." in candidate and "Shipped" not in candidate
     assert "0.8.0 so far" in candidate, candidate
 
 
@@ -382,22 +382,22 @@ def test_a_page_without_its_notes_says_so_and_never_fails_the_run(tree, tag, sai
 
 
 def test_a_candidate_page_leaves_a_broken_fragment_out_and_says_so_in_the_run(tree):
-    _fragment(tree, "600.fix.md", "A good line.")
+    _fragment(tree, "9600.fix.md", "A good line.")
     _fragment(tree, "601.fixes.md", "A misnamed one.")
 
     done = _run(tree, "page", "v0.8.0-rc.1")
 
-    assert done.returncode == 0 and "A good line (#600)." in done.stdout, done.stdout
+    assert done.returncode == 0 and "A good line (#9600)." in done.stdout, done.stdout
     assert "::warning::changes/601.fixes.md" in done.stderr, done.stderr
 
 
 def test_a_candidate_page_leaves_out_a_fragment_that_ends_with_its_own_reference(tree):
-    _fragment(tree, "600.fix.md", "A good line.")
+    _fragment(tree, "9600.fix.md", "A good line.")
     _fragment(tree, "654.fix.md", "A line (#654).")
 
     done = _run(tree, "page", "v0.8.0-rc.1")
 
-    assert done.returncode == 0 and "A good line (#600)." in done.stdout, done.stdout
+    assert done.returncode == 0 and "A good line (#9600)." in done.stdout, done.stdout
     assert "(#654)" not in done.stdout, "the page printed the line that reads its number twice"
     assert "::warning::changes/654.fix.md" in done.stderr, done.stderr
 
@@ -415,17 +415,17 @@ def _page_from(tree: Path, tag: str, *, with_notes: bool = True) -> subprocess.C
 @pytest.mark.parametrize("tag", ["v0.7.0", "v0.7.0-rc.1"])
 def test_the_release_page_carries_the_notes_under_the_install_block(tree, tag):
     if "-" in tag:
-        _fragment(tree, "600.fix.md", "The line of this release.")
+        _fragment(tree, "9600.fix.md", "The line of this release.")
     else:
         (tree / "CHANGELOG.md").write_text(PREAMBLE + "\n## 0.7.0 (2026-10-21)\n\n### Fixes\n\n"
-                                           "- The line of this release (#600).\n")
+                                           "- The line of this release (#9600).\n")
 
     page = _page_from(tree, tag)
 
     assert page.returncode == 0, page.stderr
     out = page.stdout
     assert out.index("### Install") < out.index("Verify the assets") < out.index("### Fixes"), out
-    assert "- The line of this release (#600).\n" in out, out
+    assert "- The line of this release (#9600).\n" in out, out
 
 
 def test_a_page_whose_notes_cannot_be_written_is_still_published(tree):
