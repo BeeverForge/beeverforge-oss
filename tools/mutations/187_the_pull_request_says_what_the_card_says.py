@@ -96,14 +96,13 @@ MUTATIONS = [
      '                        "-q", ".body"])\n'
      "        if False:"),
 
-    # RE-PINNED (#127): the text now goes on stdin with `--body-file -`; the cut is the same.
+    # RE-PINNED (#127): the text now goes on stdin with `--body-file -`, through the forge's one
+    # pull-request write, `_write`; the cut is the same.
     ("a refused write reports success, so the caller believes the pull request was re-dated",
      "beeverforge/adapters/forge/github.py",
-     '        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body-file", "-"],\n'
-     '                        stdin=body)\n'
+     '        done = self._write(["pr", "edit", pr, "--repo", repo or self.repo], body=body)\n'
      "        if done.returncode != 0:",
-     '        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body-file", "-"],\n'
-     '                        stdin=body)\n'
+     '        done = self._write(["pr", "edit", pr, "--repo", repo or self.repo], body=body)\n'
      "        if False:"),
 
     ("the second vendor's write is aimed at nothing and reports success anyway",

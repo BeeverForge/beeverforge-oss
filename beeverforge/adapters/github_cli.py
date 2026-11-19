@@ -22,6 +22,19 @@ from beeverforge.adapters.agent.base import MAX_ARG_STRLEN
 if TYPE_CHECKING:
     import logging
 
+#: THE LONGEST BODY GITHUB ACCEPTS, in characters (#624): an issue, pull request or comment body,
+#: read by the tracker as `body_limit` and checked by the forge before a pull-request write. GitHub
+#: does not document it; its API refuses a longer one with "body is too long (maximum is 65536
+#: characters)", as reported in golang/go#45998 (2021) and w3c/webref#245. Not measured here: no
+#: scratch repository was at hand on 2026-10-17.
+BODY_LIMIT = 65_536
+
+#: THE LONGEST TITLE GITHUB ACCEPTS for an issue or a pull request, in characters, checked by the
+#: forge before a pull-request write. GitHub does not document it either; its API refuses a longer
+#: one with "title is too long (maximum is 256 characters)", the validation message of its issue
+#: and pull-request model. Not measured here: no scratch repository was at hand on 2026-11-19.
+TITLE_LIMIT = 256
+
 #: The flags this platform passes from configuration whose EMPTY value `gh` fills in by guessing,
 #: each with what it would guess from (review of #489). An empty `--head` on `pr create` is the
 #: branch checked out in the working directory; an empty `--base` its default branch; an empty

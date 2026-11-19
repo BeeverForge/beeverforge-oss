@@ -13,6 +13,13 @@ on stdin. Row 5 drops `input=stdin` from the forge's one `subprocess.run`, so ev
 escapes as a raw `OSError`. Row 7 catches it and re-raises instead of answering a named failed
 call. Row 8 widens the catch the other way, in the shared helper: every `OSError` is answered as a
 failed call, so a denied `gh` (EACCES) or a missing one (ENOENT) reaching the forge is swallowed.
+
+RE-PINNED (review of 6079738): the four writes now reach `gh` through one helper, `_write`, so
+rows 1-4 put each write back on `_gh` with the text in argv, the same defect as before. Rows 9-14
+are the review's three findings, each check removed: a title holding a NUL reaches
+`subprocess.run` (row 9), a title over GitHub's limit is sent (row 10), a text over GitHub's limit
+is sent (row 11), and a lone surrogate is no longer marked, in both texts (row 12), in the title
+alone (row 13) or in the body alone (row 14).
 """
 
 TEST = "tests/test_a_pull_request_text_github_accepts_reaches_gh_whatever_its_bytes.py"
@@ -23,25 +30,28 @@ CLI = "beeverforge/adapters/github_cli.py"
 
 MUTATIONS = [
     ("THE DEFECT, `open_pr`: `gh pr create` carries the text in argv", FORGE,
-     '             "--title", title, "--body-file", "-"],\n'
-     '            stdin=body,\n',
-     '             "--title", title, "--body", body],\n'),
+     '        p = self._write(\n'
+     '            ["pr", "create", "--repo", target, "--head", head, "--base", base],\n'
+     '            title=title, body=body,\n'
+     '        )\n',
+     '        p = self._gh(\n'
+     '            ["pr", "create", "--repo", target, "--head", head, "--base", base,\n'
+     '             "--title", title, "--body", body],\n'
+     '        )\n'),
 
     ("THE DEFECT, `_bring_up_to_date`: `gh pr edit --title` carries the text in argv", FORGE,
-     '            done = self._gh(["pr", "edit", pr, "--repo", repo, "--title", title,\n'
-     '                             "--body-file", "-"], stdin=body)\n',
+     '            done = self._write(["pr", "edit", pr, "--repo", repo], title=title, body=body)\n',
      '            done = self._gh(["pr", "edit", pr, "--repo", repo, "--title", title,\n'
      '                             "--body", body])\n'),
 
     ("THE DEFECT, `review_pr`: `gh pr review` carries the text in argv", FORGE,
-     '        self._gh(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event],\n'
-     '                  "--body-file", "-"], stdin=body)\n',
+     '        self._write(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event]], '
+     'body=body)\n',
      '        self._gh(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event],\n'
      '                  "--body", body])\n'),
 
     ("THE DEFECT, `set_pr_body`: `gh pr edit` carries the text in argv", FORGE,
-     '        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body-file", "-"],\n'
-     '                        stdin=body)\n',
+     '        done = self._write(["pr", "edit", pr, "--repo", repo or self.repo], body=body)\n',
      '        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body", body])\n'),
 
     ("the forge's `_gh` takes `stdin` and never hands it to `gh`", FORGE,
@@ -67,4 +77,28 @@ MUTATIONS = [
      "        raise exc\n",
      "    if False:\n"
      "        raise exc\n"),
+
+    ("a title holding a NUL reaches `subprocess.run`, which raises `ValueError`", FORGE,
+     '    if title is not None and "\\x00" in title:\n',
+     "    if False:\n"),
+
+    ("a title over GitHub's limit is sent as is", FORGE,
+     "    if title is not None and len(title) > TITLE_LIMIT:\n",
+     "    if False:\n"),
+
+    ("a text over GitHub's limit is sent, and only GitHub refuses it", FORGE,
+     "    if len(body) > BODY_LIMIT:\n",
+     "    if False:\n"),
+
+    ("a lone surrogate is not marked, so `subprocess.run` raises `UnicodeEncodeError`", FORGE,
+     '    return _SURROGATE.sub("\\ufffd", text)\n',
+     "    return text\n"),
+
+    ("the title's lone surrogates are not marked, only the text's", FORGE,
+     "            title = _marked(title)\n",
+     "            title = str(title)\n"),
+
+    ("the text's lone surrogates are not marked, only the title's", FORGE,
+     "        body = _marked(body)\n",
+     "        body = str(body)\n"),
 ]

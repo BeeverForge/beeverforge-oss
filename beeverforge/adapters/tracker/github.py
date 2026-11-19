@@ -15,6 +15,7 @@ import subprocess
 import time
 
 from beeverforge.adapters.github_cli import (
+    BODY_LIMIT,
     argv_too_long,
     credential_of,
     nothing_named,
@@ -78,11 +79,9 @@ class GitHubIssuesTracker(TrackerAdapter):
     observes = frozenset({"closed", "reopened", "promoted", "reordered"})
 
     #: THE LONGEST BODY GITHUB ACCEPTS, in characters (#624; read by the split through `getattr`,
-    #: `activities.CARD_BODY_LIMIT`). GitHub does not document it; its API refuses a longer issue,
-    #: pull request or comment body with "body is too long (maximum is 65536 characters)", as
-    #: reported in golang/go#45998 (2021) and w3c/webref#245. Not measured here: no scratch
-    #: repository was at hand on 2026-10-17.
-    body_limit = 65_536
+    #: `activities.CARD_BODY_LIMIT`). Where the figure comes from is cited at
+    #: `github_cli.BODY_LIMIT`, which the forge checks a pull-request text against too.
+    body_limit = BODY_LIMIT
 
     def __init__(
         self,

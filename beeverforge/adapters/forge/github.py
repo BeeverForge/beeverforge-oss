@@ -23,6 +23,8 @@ from beeverforge.adapters.forge.base import (
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
 from beeverforge.adapters.github_cli import (
+    BODY_LIMIT,
+    TITLE_LIMIT,
     LoginRefused,
     argv_too_long,
     credential_of,
@@ -47,6 +49,33 @@ def discover_token() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return (done.stdout or "").strip() or None if done.returncode == 0 else None
+
+#: Every lone surrogate: what `surrogateescape` decodes a byte that is not UTF-8 into. A string
+#: holding one cannot be written to `gh` as UTF-8, and `subprocess.run` raises `UnicodeEncodeError`.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _marked(text: str) -> str:
+    """`text` with each lone surrogate replaced by U+FFFD, so a pull-request text holding bytes that
+    were not UTF-8 is still sent and only those bytes are marked. A NUL or another control
+    character in a BODY is left as written: stdin carries any byte."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
+def _unsendable(title: str | None, body: str) -> str:
+    """Why GitHub would not take this pull-request text, in one sentence with the remedy, or `""`.
+    Neither is ever cut to fit: a refusal says so and the caller's own failure path answers it."""
+    if title is not None and "\x00" in title:
+        return ("the pull request's title holds a NUL character, which no command-line argument "
+                "can carry; remove it from the title.")
+    if title is not None and len(title) > TITLE_LIMIT:
+        return (f"the pull request's title has {len(title):,} characters, over the "
+                f"{TITLE_LIMIT:,} GitHub accepts; shorten the title, it is never cut.")
+    if len(body) > BODY_LIMIT:
+        return (f"the pull-request text has {len(body):,} characters, over the {BODY_LIMIT:,} "
+                f"GitHub accepts; shorten the text, it is never cut.")
+    return ""
+
 
 _EVENT_FLAG = {
     "approve": "--approve",
@@ -274,6 +303,23 @@ class GitHubForge(ForgeAdapter):
         except OSError as exc:
             return argv_too_long(args, exc, log)
 
+    def _write(self, args: list[str], *, body: str,
+               title: str | None = None) -> subprocess.CompletedProcess[str]:
+        """The one way a pull-request text reaches `gh`: `args`, then `--title` when there is one,
+        then `--body-file -` with the text on stdin. Each text has its lone surrogates marked
+        (`_marked`); one GitHub would not take (`_unsendable`) is a failed call before `gh` runs,
+        which each caller answers on its own failure path."""
+        body = _marked(body)
+        if title is not None:
+            title = _marked(title)
+            args = [*args, "--title", title]
+        args = [*args, "--body-file", "-"]
+        why = _unsendable(title, body)
+        if why:
+            log.warning("BEEVERFORGE_PR_TEXT_REFUSED `gh %s`: %s", " ".join(args[:2]), why)
+            return refused(args, why)
+        return self._gh(args, stdin=body)
+
     def push_remote(self) -> str | None:
         # GitHub scheme: the token is the password for the x-access-token user.
         if not self.token:
@@ -498,10 +544,9 @@ class GitHubForge(ForgeAdapter):
             # hands the same text, a later attempt on this head describes the commit now on it.
             self._bring_up_to_date(existing, repo=target, title=title, body=body)
             return existing
-        p = self._gh(
-            ["pr", "create", "--repo", target, "--head", head, "--base", base,
-             "--title", title, "--body-file", "-"],
-            stdin=body,
+        p = self._write(
+            ["pr", "create", "--repo", target, "--head", head, "--base", base],
+            title=title, body=body,
         )
         if p.returncode != 0:
             try:  # lost a race with a concurrent create?
@@ -529,8 +574,7 @@ class GitHubForge(ForgeAdapter):
         half that worked — but the pull request now describes an earlier attempt, and the log says
         so by name."""
         try:
-            done = self._gh(["pr", "edit", pr, "--repo", repo, "--title", title,
-                             "--body-file", "-"], stdin=body)
+            done = self._write(["pr", "edit", pr, "--repo", repo], title=title, body=body)
         except (subprocess.SubprocessError, OSError) as exc:
             done = subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=str(exc))
         if done.returncode != 0:
@@ -560,8 +604,7 @@ class GitHubForge(ForgeAdapter):
         return p.stdout.strip() or None
 
     def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:
-        self._gh(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event],
-                  "--body-file", "-"], stdin=body)
+        self._write(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event]], body=body)
 
     def request_reviewers(self, *, pr: str, reviewers: list[str]) -> None:
         if not reviewers:
@@ -1027,8 +1070,7 @@ class GitHubForge(ForgeAdapter):
 
     def set_pr_body(self, *, pr: str, body: str, repo: str = "") -> bool:
         """`gh pr edit --body-file -`, the text on stdin — True when the forge took it."""
-        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body-file", "-"],
-                        stdin=body)
+        done = self._write(["pr", "edit", pr, "--repo", repo or self.repo], body=body)
         if done.returncode != 0:
             log.warning("could not update the description of %s (%s)", pr,
                         (done.stderr or "").strip()[:160])
