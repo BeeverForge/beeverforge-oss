@@ -91,13 +91,13 @@ MUTATIONS = [
      "        if False:"),
 
     ("a product's template that would lose every card is used", CARDS,
-     "        problem = template_problem(text, kind)",
-     '        problem = ""'),
+     "    return text, template_problem(text, kind)\n",
+     '    return text, ""\n'),
 
     ("an unreadable product rubric is used instead of refused", CARDS,
-     '            return Rubric.parse(own.read_text(), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")\n'
+     '            return Rubric.parse(utf8.text_of(own, str(own)), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")\n'
      "        except Exception as exc:",
-     '            return Rubric.parse(own.read_text(), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")\n'
+     '            return Rubric.parse(utf8.text_of(own, str(own)), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")\n'
      "        except ZeroDivisionError as exc:"),
 
     ("the verdict is left to a log line a warnings-only worker never writes", CARDS,

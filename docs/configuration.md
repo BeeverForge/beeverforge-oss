@@ -1000,12 +1000,15 @@ the rubric is runtime behaviour.
   fields are all empty is left out. Your template must keep `{description}` under `## O que foi
   pedido` (the section a correction rewrites) and `{done_when}` under a heading the parser reads as
   acceptance criteria. Otherwise it is refused, `BEEVERFORGE_CARD_TEMPLATE_REFUSED` is logged, and the
-  shipped template is used. The lines above the template (who asked, where, the card's kind) are always
-  written by the code.
+  shipped template is used. A template whose bytes are not UTF-8 is refused the same way, and the log
+  names the file, the byte offset where it stops being UTF-8, and "save it as UTF-8"; a
+  `template.<language>.md` refused this way falls back to your `template.md` first. The lines above
+  the template (who asked, where, the card's kind) are always written by the code.
 - **Rubric.** Keep every criterion's ladder complete, one description per level: a gap is how a
   well-formed empty card scores high. Change `version` whenever a level's meaning changes, because the
   version is logged with every verdict. A rubric that cannot be read is refused
-  (`BEEVERFORGE_CARD_RUBRIC_REFUSED`), and the shipped one is used.
+  (`BEEVERFORGE_CARD_RUBRIC_REFUSED`), and the shipped one is used. That includes a rubric whose bytes
+  are not UTF-8: the log names the file, the byte offset and "save it as UTF-8".
 - **The judge's engine.** It is the reviewer's, `harness: {reviewer: …}` / `BEEVERFORGE_REVIEWER_MODEL`.
   A judge on a different model family from the product role shares fewer of its blind spots. With no
   harness that can judge, the card is shown with a line saying it was not reviewed.

@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from beeverforge.util import yaml_io
+from beeverforge.util import utf8, yaml_io
 from beeverforge.util.bounded import BoundedDict
 
 log = logging.getLogger(__name__)
@@ -376,7 +376,7 @@ class Rubric:
 
 
 def _shipped(name: str) -> str:
-    return (_DEFAULTS / name).read_text()
+    return (_DEFAULTS / name).read_text(encoding="utf-8")
 
 
 def _in_language(name: str, language: str | None) -> str:
@@ -408,7 +408,7 @@ def load_rubric(docs_path: str = "") -> Rubric:
     own = _own(docs_path, RUBRIC_FILE)
     if own is not None:
         try:
-            return Rubric.parse(own.read_text(), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")
+            return Rubric.parse(utf8.text_of(own, str(own)), source=f"{OVERRIDE_DIR}/{RUBRIC_FILE}")
         except Exception as exc:  # noqa: BLE001 — a product's file must never lose the card
             log.warning("BEEVERFORGE_CARD_RUBRIC_REFUSED path=%s — %s; the shipped rubric is used",
                         own, exc)
@@ -431,13 +431,22 @@ def load_template(docs_path: str = "", kind: str = "ticket", language: str | Non
         own = _own(docs_path, candidate)
         if own is None:
             continue
-        text = own.read_text()
-        problem = template_problem(text, kind)
+        text, problem = _own_template(own, kind)
         if not problem:
             return text
         log.warning("BEEVERFORGE_CARD_TEMPLATE_REFUSED path=%s — %s; the shipped template is used",
                     own, problem)
     return _shipped_for(name, language)
+
+
+def _own_template(own: Path, kind: str) -> tuple[str, str]:
+    """A product's template file and why it cannot be a template for `kind` — `""` when it can.
+    Bytes that are not UTF-8 text cannot: the decoder's sentence names the file, the offset and
+    the remedy, so the refusal tells its author what to re-save."""
+    text, unread = utf8.decode(own.read_bytes(), str(own))
+    if text is None:
+        return "", unread
+    return text, template_problem(text, kind)
 
 
 def template_problem(text: str, kind: str = "ticket") -> str:
