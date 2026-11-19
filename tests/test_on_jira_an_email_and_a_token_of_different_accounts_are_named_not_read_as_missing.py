@@ -169,6 +169,29 @@ def _leaked_in_log(records, forms: list[tuple[str, str]] | None = None) -> list[
     return [name for name, _secret in (forms or _secret_forms()) if name in found]
 
 
+def _redacted(text: str, forms: list[tuple[str, str]] | None = None) -> str:
+    """`text` with every form of the credential replaced by its name, the longest form first (the
+    header holds the pair), so a failure can show what a surface read without the secret."""
+    for name, secret in sorted(forms or _secret_forms(), key=lambda f: -len(f[1])):
+        if secret:
+            text = text.replace(secret, f"<{name}>")
+    return text
+
+
+def _expect(holds: bool, expected: str, *, on: str, text: str | None = None,
+            forms: list[tuple[str, str]] | None = None) -> None:
+    """Fail, when `holds` is false, with what was expected and the surface checked. A bare
+    `assert` would print the refusal or the log it compared, credential and all; this shows that
+    text only through `_redacted`."""
+    if not holds:
+        shown = "" if text is None else f"; it read: {_redacted(text, forms)}"
+        pytest.fail(f"expected {expected}, on {on}{shown}")
+
+
+def _logged(records) -> str:
+    return " | ".join(r.getMessage() for r in records)
+
+
 # ── C1: a 404 whose `myself` answers 401 is the mismatch, named ──────────────────────────────────
 
 def test_a_404_whose_myself_answers_401_is_refused_with_code_401_naming_the_email_and_the_remedy(
@@ -180,13 +203,17 @@ def test_a_404_whose_myself_answers_401_is_refused_with_code_401_naming_the_emai
         _tracker().get_ticket(REF)
 
     exc = raised.value
-    assert exc.code == 401, str(exc)
-    assert isinstance(exc, RuntimeError), "every catch-all caller parks on a RuntimeError"
     text = str(exc)
-    assert EMAIL in text
-    assert "different accounts" in text
-    assert "pair" in text.lower()
-    assert isinstance(exc.__cause__, urllib.error.HTTPError) and exc.__cause__.code == 404
+    _expect(exc.code == 401, "code 401", on="the refusal", text=text)
+    is_runtime = isinstance(exc, RuntimeError)
+    assert is_runtime, "every catch-all caller parks on a RuntimeError"
+    _expect(EMAIL in text, "the email a person typed", on="the refusal's text", text=text)
+    _expect("different accounts" in text, "'different accounts'", on="the refusal's text",
+            text=text)
+    _expect("pair" in text.lower(), "'pair'", on="the refusal's text", text=text)
+    cause = exc.__cause__
+    from_404 = isinstance(cause, urllib.error.HTTPError) and cause.code == 404
+    assert from_404, "the refusal is raised from the original 404"
 
 
 def test_the_refusal_never_carries_the_token(site, caplog):
@@ -197,7 +224,7 @@ def test_the_refusal_never_carries_the_token(site, caplog):
         with pytest.raises(JiraRefused) as raised:
             _tracker().get_ticket(REF)
 
-    assert raised.value.code == 401, str(raised.value)
+    _expect(raised.value.code == 401, "code 401", on="the refusal", text=str(raised.value))
     leaked = _leaked(str(raised.value))
     assert leaked == [], (f"the refusal's text carries the token as {leaked}: keep the "
                           "credential out of the sentence, name only the email")
@@ -218,8 +245,10 @@ def test_myself_is_asked_with_the_same_credential_as_the_call_that_404d(site):
 
     assert [path for _m, path, _a in jira.requests] == [ISSUE, MYSELF]
     (issue_auth, myself_auth) = [auth for _m, _p, auth in jira.requests]
-    assert issue_auth and issue_auth.startswith("Basic ")
-    assert myself_auth == issue_auth
+    basic = bool(issue_auth) and issue_auth.startswith("Basic ")
+    assert basic, "the call that 404'd sent a Basic Authorization header"
+    same = myself_auth == issue_auth
+    assert same, "GET myself sent the Authorization header of the call that 404'd"
 
 
 def test_myself_waits_no_longer_than_the_call_that_404d(site):
@@ -247,7 +276,7 @@ def test_a_404_on_the_agile_api_asks_myself_of_the_core_api(site):
 
     assert jira.asked(MYSELF) == 1
     assert jira.asked("/rest/agile/1.0/myself") == 0
-    assert raised.value.code == 401, str(raised.value)
+    _expect(raised.value.code == 401, "code 401", on="the refusal", text=str(raised.value))
 
 
 # ── C2: a probe that says anything else, or nothing, keeps the 404 ───────────────────────────────
@@ -259,8 +288,10 @@ def test_a_404_whose_myself_answers_200_is_the_original_404_unchanged(site):
     with pytest.raises(JiraRefused) as raised:
         _tracker().get_ticket(REF)
 
-    assert str(raised.value) == _main_says(404)
-    assert raised.value.code == 404
+    _expect(str(raised.value) == _main_says(404), "the original 404 sentence, unchanged",
+            on="the refusal's text", text=str(raised.value))
+    code = raised.value.code
+    assert code == 404
     assert jira.asked(MYSELF) == 1
 
 
@@ -286,14 +317,18 @@ def test_a_myself_that_cannot_answer_keeps_the_original_404(site, myself, caplog
     assert jira.asked(MYSELF) == 1
     if isinstance(myself, BaseException):
         # a probe that could not be made says so in the log, never in silence (lesson 6)
-        said = [r.getMessage() for r in caplog.records]
-        assert any("GET myself could not be asked" in m for m in said), said
+        said = any("GET myself could not be asked" in r.getMessage() for r in caplog.records)
+        _expect(said, "a line saying 'GET myself could not be asked'",
+                on="the jira tracker's log records", text=_logged(caplog.records))
         leaked = _leaked_in_log(caplog.records)
         assert leaked == [], (f"the probe-failure log line carries the token as {leaked}: log "
                               "the reason the probe failed, never the request's credential")
-    assert raised.value.code == 404
-    assert str(raised.value) == _main_says(404)
-    assert isinstance(raised.value.__cause__, urllib.error.HTTPError)
+    code = raised.value.code
+    assert code == 404
+    _expect(str(raised.value) == _main_says(404), "the original 404 sentence, unchanged",
+            on="the refusal's text", text=str(raised.value))
+    from_404 = isinstance(raised.value.__cause__, urllib.error.HTTPError)
+    assert from_404, "the refusal is raised from the original 404"
 
 
 # ── C3: once per 404, and never for any other answer ─────────────────────────────────────────────
@@ -308,7 +343,8 @@ def test_myself_is_asked_once_per_404_and_never_for_any_other_answer(site):
         jira = site(routes={("GET", ISSUE): code})
         with pytest.raises(JiraRefused) as raised:
             _tracker().get_ticket(REF)
-        assert raised.value.code == code
+        refused = raised.value.code
+        assert refused == code
         assert jira.asked(MYSELF) == 0, f"a {code} is not a 404 and asks nothing"
 
     jira = site(routes={("GET", ISSUE): 404}, myself=_MYSELF_200)
@@ -327,7 +363,8 @@ def test_myself_is_asked_once_per_404_and_never_for_any_other_answer(site):
     with pytest.raises(JiraRefused) as raised:
         _tracker().get_ticket(REF)
     assert jira.asked(MYSELF) == 1, "a myself that 404s is not itself probed"
-    assert raised.value.code == 404
+    code = raised.value.code
+    assert code == 404
 
 
 # ── C4: what a person reads names the mismatch ───────────────────────────────────────────────────
@@ -339,8 +376,9 @@ def test_a_card_read_through_the_door_says_the_account_is_mismatched_not_that_it
 
     seen = Ports(SimpleNamespace(name="dar"), tracker=_tracker()).seen(REF)
 
-    assert seen.cannot_tell
-    assert "different accounts" in seen.cannot_tell, seen.cannot_tell
+    said = seen.cannot_tell or ""
+    _expect("different accounts" in said, "'different accounts'", on="the door's cannot_tell",
+            text=said)
 
 
 def test_the_cause_comes_first_in_the_sentence_so_a_park_line_keeps_it(site):
@@ -354,7 +392,9 @@ def test_the_cause_comes_first_in_the_sentence_so_a_park_line_keeps_it(site):
     with pytest.raises(JiraRefused) as raised:
         _tracker(email=email)._all_comments(REF)
 
-    assert "different accounts" in str(raised.value)[:120], str(raised.value)
+    _expect("different accounts" in str(raised.value)[:120],
+            "'different accounts' in the first 120 characters", on="the refusal's text",
+            text=str(raised.value))
 
 
 def test_a_board_read_with_a_mismatched_pair_is_unreadable_and_the_log_names_the_pair(
@@ -368,8 +408,9 @@ def test_a_board_read_with_a_mismatched_pair_is_unreadable_and_the_log_names_the
         board = _tracker().list_tickets()
 
     assert board is None
-    said = " ".join(r.getMessage() for r in caplog.records)
-    assert "different accounts" in said, said
+    said = _logged(caplog.records)
+    _expect("different accounts" in said, "a line saying 'different accounts'",
+            on="the jira tracker's warning log records", text=said)
 
 
 @pytest.mark.parametrize("token", [TOKEN, None], ids=["another-accounts-token", "no-token"])
@@ -383,7 +424,8 @@ def test_a_job_parked_on_the_refusal_is_classified_as_a_credential(site, token):
         _tracker(token=token).get_ticket(REF)
 
     park = f"ticket: {str(raised.value)[:120]}"
-    assert classify(park).cause == CREDENTIAL, park
+    _expect(classify(park).cause == CREDENTIAL, "a credential cause", on="the park line",
+            text=park)
 
 # ── C5: no token at all is not "different accounts" ─────────────────────────────────────────────
 
@@ -396,10 +438,12 @@ def test_with_no_token_the_refusal_says_no_token_reached_the_tracker(site, token
     with pytest.raises(JiraRefused) as raised:
         _tracker(token=token).get_ticket(REF)
 
-    assert raised.value.code == 401, str(raised.value)
-    assert "no API token" in str(raised.value)
-    assert "different accounts" not in str(raised.value)
-    assert "token_env" in str(raised.value)
+    said = str(raised.value)
+    _expect(raised.value.code == 401, "code 401", on="the refusal", text=said)
+    _expect("no API token" in said, "'no API token'", on="the refusal's text", text=said)
+    _expect("different accounts" not in said, "no 'different accounts'",
+            on="the refusal's text", text=said)
+    _expect("token_env" in said, "'token_env'", on="the refusal's text", text=said)
 
 
 # ── the cost: a read that answers asks nothing more ──────────────────────────────────────────────
@@ -437,7 +481,8 @@ def test_with_no_token_the_refusal_names_the_variable_a_project_that_names_none_
     site(routes={("GET", ISSUE): 404}, myself=401)
     with pytest.raises(JiraRefused) as raised:
         _tracker(token=token).get_ticket(REF)
-    assert SHIPPED_ENV["jira"] in str(raised.value), str(raised.value)
+    _expect(SHIPPED_ENV["jira"] in str(raised.value), f"the variable {SHIPPED_ENV['jira']}",
+            on="the refusal's text", text=str(raised.value))
 
 
 # ── C6: a token and no email ─────────────────────────────────────────────────────────────────────
@@ -453,11 +498,16 @@ def test_with_a_token_and_no_email_the_refusal_names_tracker_options_email(site,
         _tracker(email=email, token=TOKEN).get_ticket(REF)
 
     said = str(raised.value)
-    assert raised.value.code == 401, said
-    assert "tracker.options.email" in said[:120], said
-    assert "different accounts" not in said
-    assert "no API token" not in said
-    leaked = _leaked(said, _secret_forms(email=email))
+    forms = _secret_forms(email=email)
+    _expect(raised.value.code == 401, "code 401", on="the refusal", text=said, forms=forms)
+    _expect("tracker.options.email" in said[:120],
+            "'tracker.options.email' in the first 120 characters", on="the refusal's text",
+            text=said, forms=forms)
+    _expect("different accounts" not in said, "no 'different accounts'",
+            on="the refusal's text", text=said, forms=forms)
+    _expect("no API token" not in said, "no 'no API token'", on="the refusal's text", text=said,
+            forms=forms)
+    leaked = _leaked(said, forms)
     assert leaked == [], (f"the no-email refusal carries the token as {leaked}: keep the "
                           "credential out of the sentence, name only the missing email")
 
@@ -469,7 +519,8 @@ def test_with_no_token_and_no_email_the_refusal_still_says_no_token(site):
     with pytest.raises(JiraRefused) as raised:
         _tracker(email="", token=None).get_ticket(REF)
 
-    assert "no API token" in str(raised.value), str(raised.value)
+    _expect("no API token" in str(raised.value), "'no API token'", on="the refusal's text",
+            text=str(raised.value))
 
 
 def test_a_job_parked_on_the_no_email_refusal_is_classified_as_a_credential(site):
@@ -480,4 +531,5 @@ def test_a_job_parked_on_the_no_email_refusal_is_classified_as_a_credential(site
         _tracker(email="", token=TOKEN).get_ticket(REF)
 
     park = f"ticket: {str(raised.value)[:120]}"
-    assert classify(park).cause == CREDENTIAL, park
+    _expect(classify(park).cause == CREDENTIAL, "a credential cause", on="the park line",
+            text=park)
