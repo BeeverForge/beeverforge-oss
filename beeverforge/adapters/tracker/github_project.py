@@ -304,6 +304,10 @@ class GitHubProjectBoard:
             log.info("gh could not type the owner of %s/%s — resolving the project through "
                      "GraphQL, organisation first and user second", self.owner, self.number)
             proj, fields = self._meta_via_graphql(exc)
+        self._learn_meta(proj["id"], fields)
+
+    def _learn_meta(self, project_id: str, fields: list[dict]) -> None:
+        """Remember the project id and the Status options, from whichever read carried them."""
         for f in fields:
             if f.get("name") == "Status":
                 self._status_field_id = f["id"]
@@ -311,7 +315,7 @@ class GitHubProjectBoard:
         # The early-return key is written LAST: a raise on either fetch above must leave the
         # instance untouched so the next call retries, not half-initialised forever (a one-blip
         # rate limit used to poison every subsequent set_column on this instance).
-        self._project_id = proj["id"]
+        self._project_id = project_id
 
     def _meta_via_graphql(self, first: Exception) -> tuple[dict, list[dict]]:
         """`(project, fields)` for a board `gh` could not address — one query, no owner typing.
@@ -453,6 +457,10 @@ class GitHubProjectBoard:
         query = f"""
         query($owner:String!, $number:Int!, $cursor:String) {{
           {root}(login:$owner) {{ projectV2(number:$number) {{
+            id
+            field(name:"Status") {{
+              ... on ProjectV2SingleSelectField {{ id options {{ id name }} }}
+            }}
             items(first:100, after:$cursor) {{
               pageInfo {{ hasNextPage endCursor }}
               nodes {{
@@ -496,6 +504,14 @@ class GitHubProjectBoard:
                 log.info("board %s/%s: the %s root carried no project",
                          self.owner, self.number, root)
                 return None
+            # THE COLUMNS THAT EXIST TRAVEL WITH THE CARDS THEY HOLD. The same document that places
+            # the cards names the Status options, so a view that wants both (`board_view`) pays
+            # for the pages once and `_ensure_meta` has nothing left to fetch.
+            status = project.get("field") or {}
+            if project.get("id") and not self._project_id:
+                self._learn_meta(project["id"], [{"name": "Status", "id": status["id"],
+                                                  "options": status.get("options") or []}]
+                                 if status.get("id") else [])
             items = project.get("items") or {}
             for node in items.get("nodes") or []:
                 content = node.get("content") or {}
