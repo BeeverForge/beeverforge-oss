@@ -647,26 +647,35 @@ class GitHubIssuesTracker(TrackerAdapter):
         # characters. Readers see it before the close, as they did; a refused comment closes
         # nothing, and a blank reason is not posted.
         repo, num = self._locate(ref)
-        posted = bool(reason.strip())
-        if posted:
-            self._post_comment(repo, num, reason, what="the close reason")
-        self._close_bare(repo, num, delivered=delivered, posted=posted)
+        if self._post_reason(repo, num, reason):
+            self._close_after_reason(repo, num, delivered=delivered)
+        else:
+            self._close_bare(repo, num, delivered=delivered)
         self._off_the_queue(ref, delivered=delivered)
 
-    def _close_bare(self, repo: str, num: str, *, delivered: bool, posted: bool) -> None:
-        """`gh issue close --reason`, with no `--comment`. A refusal after the reason was posted
-        says so, since the issue then carries a reason for a close that did not happen; with
-        nothing posted, `gh`'s own refusal is raised unchanged."""
+    def _post_reason(self, repo: str, num: str, reason: str) -> bool:
+        """Post a close reason as a comment, and say whether one was posted: a blank reason is
+        not, since an empty comment tells a reader nothing."""
+        if not reason.strip():
+            return False
+        self._post_comment(repo, num, reason, what="the close reason")
+        return True
+
+    def _close_after_reason(self, repo: str, num: str, *, delivered: bool) -> None:
+        """The close of an issue whose reason is already posted. A refusal says so, since the
+        issue then carries a reason for a close that did not happen."""
         try:
-            self._write(["issue", "close", num, "--repo", repo,
-                         "--reason", "completed" if delivered else "not planned"])
+            self._close_bare(repo, num, delivered=delivered)
         except RuntimeError as exc:
-            if not posted:
-                raise
             raise RuntimeError(
                 f"the close reason was posted as a comment but the issue is still open ({exc}); "
                 f"close it by hand, or give the factory's credential the right to close issues "
                 f"in {repo}.") from exc
+
+    def _close_bare(self, repo: str, num: str, *, delivered: bool) -> None:
+        """`gh issue close --reason`, with no `--comment`. A refusal raises `gh`'s own error."""
+        self._write(["issue", "close", num, "--repo", repo,
+                     "--reason", "completed" if delivered else "not planned"])
 
     def _off_the_queue(self, ref: str, *, delivered: bool) -> None:
         """A CLOSED CARD LEAVES ITS COLUMN WITH ITS CLOSE (#414), as the local row's close moves it

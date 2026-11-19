@@ -26,10 +26,13 @@ CLI = "beeverforge/adapters/github_cli.py"
 _COMMENT = ('        self._write(["issue", "comment", num, "--repo", repo, "--body-file", "-"],\n'
             '                    stdin=marked(text))\n')
 
-_POST = ('        if posted:\n'
-         '            self._post_comment(repo, num, reason, what="the close reason")\n')
+_POST = ('        self._post_comment(repo, num, reason, what="the close reason")\n'
+         '        return True\n')
 
-_BARE = '        self._close_bare(repo, num, delivered=delivered, posted=posted)\n'
+_CLOSE = ('        if self._post_reason(repo, num, reason):\n'
+          '            self._close_after_reason(repo, num, delivered=delivered)\n'
+          '        else:\n'
+          '            self._close_bare(repo, num, delivered=delivered)\n')
 
 MUTATIONS = [
     ("THE DEFECT, `comment`: the text goes back into argv as `--body`", GH,
@@ -42,13 +45,13 @@ MUTATIONS = [
      '                         "--comment", reason])\n'),
 
     ("the issue is closed before its reason is posted", GH,
-     _POST + _BARE,
-     _BARE + _POST),
+     _CLOSE,
+     '        self._close_bare(repo, num, delivered=delivered)\n'
+     '        self._post_reason(repo, num, reason)\n'),
 
     ("the close reason is never posted", GH,
      _POST,
-     '        if False:\n'
-     '            self._post_comment(repo, num, reason, what="the close reason")\n'),
+     '        return True\n'),
 
     ("the tracker sends a lone surrogate unmarked", GH,
      '                    stdin=marked(text))\n',
@@ -77,18 +80,23 @@ MUTATIONS = [
      "        p = self._gh(args, timeout=timeout)\n"),
 
     ("a blank reason is posted as an empty comment", GH,
-     "        posted = bool(reason.strip())\n",
-     "        posted = True\n"),
+     "        if not reason.strip():\n"
+     "            return False\n",
+     "        if False:\n"
+     "            return False\n"),
 
     ("a refused close after the comment raises gh's bare error", GH,
-     "            if not posted:\n"
-     "                raise\n",
-     "            if True:\n"
-     "                raise\n"),
+     "        except RuntimeError as exc:\n"
+     "            raise RuntimeError(\n"
+     "                f\"the close reason was posted",
+     "        except RuntimeError as exc:\n"
+     "            raise\n"
+     "            raise RuntimeError(\n"
+     "                f\"the close reason was posted"),
 
     ("a refused close with nothing posted says a reason was posted", GH,
-     "            if not posted:\n"
-     "                raise\n",
-     "            if False:\n"
-     "                raise\n"),
+     "        else:\n"
+     "            self._close_bare(repo, num, delivered=delivered)\n",
+     "        else:\n"
+     "            self._close_after_reason(repo, num, delivered=delivered)\n"),
 ]
