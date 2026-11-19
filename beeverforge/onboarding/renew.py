@@ -50,8 +50,9 @@ from beeverforge.knowledge.inventory import (
 from beeverforge.knowledge.okf import (
     OKF_INDEX_FILE,
     SCOPE_LIMIT,
+    ManifestUnreadable,
+    load_manifest,
     read_concepts,
-    read_manifest,
     render_index,
     write_okf,
 )
@@ -62,6 +63,8 @@ log = logging.getLogger("beeverforge.onboarding.renew")
 #: other kind (`Gap.kind` is deliberately not an enum); named here so the reader and the writer
 #: agree on the string.
 STALE_GAP = "stale"
+#: The mode of a round that found a manifest it cannot read, and so wrote nothing.
+MANIFEST_UNREADABLE = "manifest-unreadable"
 
 
 class Renewal(NamedTuple):
@@ -75,6 +78,8 @@ class Renewal(NamedTuple):
     #: the inventory was re-taken and had CHANGED — files, kinds, fingerprints or risks — so the
     #: bundle on disk changed even when every concept was fresh (#48 joins the renewal path)
     inventoried: bool = False
+    #: why nothing was written, when the mode alone cannot say it — the manifest's sentence
+    reason: str = ""
 
     @property
     def wrote(self) -> bool:
@@ -83,6 +88,8 @@ class Renewal(NamedTuple):
         return (self.broken > 0 or self.inventoried) and self.mode != "failed"
 
     def summary(self) -> str:
+        if self.mode == MANIFEST_UNREADABLE:
+            return f"manifest cannot be read — {self.reason}"
         tail = " — inventory refreshed" if self.inventoried else ""
         if self.checked == 0:
             return "no concepts published" + tail
@@ -112,6 +119,14 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     existing = read_concepts(bundle_dir)
     if not existing and read_inventory(bundle_dir) is None:
         return Renewal(0, 0, 0, 0, "nothing-published")
+    # THE MANIFEST BEFORE ANY WRITE: one that exists and cannot be read holds the answered
+    # questions, and a fresh one written over it would lose them — so the round writes nothing,
+    # not even the inventory, and says which file and why.
+    try:
+        previous = load_manifest(bundle_dir)
+    except ManifestUnreadable as exc:
+        log.warning("BEEVERFORGE_OKF_MANIFEST_UNREADABLE %s", exc)
+        return Renewal(len(existing), 0, 0, 0, MANIFEST_UNREADABLE, reason=str(exc))
     # THE INVENTORY FIRST, EVERY ROUND (#48 joins the renewal path). The backfill took it once; a
     # bundle whose concepts were all fresh kept an inventory of a tree that no longer existed —
     # the coverage table divided by yesterday's files, a credential risk that was fixed still a
@@ -123,7 +138,7 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     broken = list(report.broken)
     if not broken:
         if inventoried:
-            manifest = _manifest_for(bundle_dir, inventory, existing, commit=commit,
+            manifest = _manifest_for(previous, inventory, existing, commit=commit,
                                      generated_at=generated_at)
             write_okf(bundle_dir, manifest=manifest, concepts=[])
             (bundle_dir / OKF_INDEX_FILE).write_text(render_index(manifest, existing),
@@ -139,7 +154,7 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     # one, and two copies would have answered the same question differently.
     authored = author_for_paths(project, source, _broken_paths(broken), commit=commit,
                                 generated_at=generated_at,
-                                answered=answered_gaps(read_manifest(bundle_dir)))
+                                answered=answered_gaps(previous))
     rewritten, new_gaps, mode = authored.concepts, authored.gaps, authored.mode
     covered = {(c.type, c.title) for c in rewritten}
     left = [b for b in broken if (b.type, b.title) not in covered]
@@ -158,7 +173,7 @@ def _renew(project, bundle_dir: Path, source: Path, *, commit: str, generated_at
     # its predecessor's path, so the coverage table counts the untouched plus the rewritten.
     now = {(c.type, c.title): c for c in existing}
     now.update({(c.type, c.title): c for c in rewritten})
-    manifest = _manifest_for(bundle_dir, inventory, list(now.values()), commit=commit,
+    manifest = _manifest_for(previous, inventory, list(now.values()), commit=commit,
                              generated_at=generated_at, new_gaps=new_gaps, stale_gaps=stale_gaps)
     write_okf(bundle_dir, manifest=manifest, concepts=rewritten)
     # THE INDEX LISTS WHAT IS THERE NOW — the untouched, the rewritten and the gaps — not only what
@@ -205,19 +220,18 @@ def _coverage_rows(previous: list[CoverageRow], concepts: list[Concept],
     return rows
 
 
-def _manifest_for(bundle_dir: Path, inventory: Inventory, concepts: list[Concept], *,
+def _manifest_for(previous: OkfManifest | None, inventory: Inventory, concepts: list[Concept], *,
                   commit: str, generated_at: str, new_gaps: list[Gap] | None = None,
                   stale_gaps: list[Gap] | None = None) -> OkfManifest:
     """The manifest this round publishes: the previous one's gaps minus what is re-derived here
     (`stale`, and every inventory gap — a risk that was fixed leaves rather than accumulating
     beside its successor), plus this round's; the coverage table from the tree and the concepts
-    as they are now.
+    as they are now. `previous` is the manifest the round loaded, or `None` when there was none.
 
     AN ANSWERED QUESTION IS KEPT, AND KEPT FIRST. It is the record of what a person decided,
     and `merge_gaps` lets it shadow its own re-derivation — the same caveat the author raises
     again lands on the answered one's key and is dropped, so the answer holds across rounds."""
-    manifest = read_manifest(bundle_dir) or OkfManifest(bundle_kind="source-repo",
-                                                        scope_limit=SCOPE_LIMIT)
+    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)
     kept = [g for g in manifest.gaps if g.kind != STALE_GAP and g.kind not in INVENTORY_GAP_KINDS]
     gaps = merge_gaps(kept, list(new_gaps or []) + list(stale_gaps or [])
                       + inventory_gaps(inventory))

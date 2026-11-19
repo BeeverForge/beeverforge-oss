@@ -76,9 +76,10 @@ MUTATIONS = [
      "        renewal = renew_concepts(project, dest, Path(repo_path), commit=commit, generated_at=now)",
      '        renewal = __import__("beeverforge.onboarding.renew", fromlist=["Renewal"]).Renewal(0, 0, 0, 0, "skipped")'),
 
+    # RE-PINNED (an unreadable manifest is never written over): `_manifest_for` is handed the
+    # manifest the round loaded instead of reading it; the fresh default is the same line's tail
     ("a renewal that finds no manifest publishes an index with no scope statement",
      "beeverforge/onboarding/renew.py",
-     '    manifest = read_manifest(bundle_dir) or OkfManifest(bundle_kind="source-repo",\n'
-     '                                                        scope_limit=SCOPE_LIMIT)',
-     '    manifest = read_manifest(bundle_dir) or OkfManifest(bundle_kind="source-repo")'),
+     '    manifest = previous or OkfManifest(bundle_kind="source-repo", scope_limit=SCOPE_LIMIT)',
+     '    manifest = previous or OkfManifest(bundle_kind="source-repo")'),
 ]

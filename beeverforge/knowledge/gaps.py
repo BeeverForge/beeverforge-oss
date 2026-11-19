@@ -123,13 +123,16 @@ def record_in_bundle(bundle_dir: Path, requested: Iterable[Gap]) -> list[Gap]:
     writing it, in the bundle it is about to publish. A request about a file a concept now cites
     is not recorded — somebody described it since it was asked — and one already in the manifest
     is the same gap, whatever happened to it there (answered stays answered). Writes nothing when
-    nothing is new, so a round with no new request publishes nothing for it."""
+    nothing is new, so a round with no new request publishes nothing for it.
+
+    A MANIFEST THAT EXISTS AND CANNOT BE READ raises `ManifestUnreadable` before anything is
+    written: it holds the answered questions, and a fresh one in its place would lose them."""
     from beeverforge.knowledge.contracts import OkfManifest
     from beeverforge.knowledge.okf import (
         OKF_INDEX_FILE,
         SCOPE_LIMIT,
+        load_manifest,
         read_concepts,
-        read_manifest,
         render_index,
         write_okf,
     )
@@ -137,7 +140,7 @@ def record_in_bundle(bundle_dir: Path, requested: Iterable[Gap]) -> list[Gap]:
     bundle = Path(bundle_dir)
     concepts = read_concepts(bundle)
     cited = {s.path for c in concepts for s in c.sources}
-    manifest = read_manifest(bundle) or OkfManifest(bundle_kind="source-repo",
+    manifest = load_manifest(bundle) or OkfManifest(bundle_kind="source-repo",
                                                     scope_limit=SCOPE_LIMIT)
     held = {g.key for g in manifest.gaps}
     new = [g for g in dict((g.key, g) for g in requested).values()

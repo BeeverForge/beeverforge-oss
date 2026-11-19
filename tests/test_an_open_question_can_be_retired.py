@@ -175,7 +175,7 @@ def test_the_renewal_keeps_the_answered_question_and_appends_no_twin(tmp_path):
     bundle = _bundle(tmp_path, repo, gaps=[_answered()])
     inventory = take_inventory(repo, commit="c2")
 
-    manifest = _manifest_for(bundle, inventory, [], commit="c2", generated_at="t2",
+    manifest = _manifest_for(read_manifest(bundle), inventory, [], commit="c2", generated_at="t2",
                              new_gaps=[_question(), _question("billing", "Who owns tax?")])
 
     questions = [g for g in manifest.gaps if g.kind == "open-question"]

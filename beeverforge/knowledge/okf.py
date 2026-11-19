@@ -255,6 +255,55 @@ def read_manifest(bundle_dir: Path) -> OkfManifest | None:
     return parse_manifest(_manifest_text(Path(bundle_dir) / OKF_MANIFEST_FILE))
 
 
+class ManifestUnreadable(ValueError):
+    """A bundle's `okf.yaml` that EXISTS and cannot be read — told apart from "there is none".
+
+    `str(exc)` is one sentence: the file, why it cannot be read, and the remedy. A writer that
+    gets this writes nothing: the file holds the answered questions, and a fresh manifest in its
+    place would lose them and ask them again."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = Path(path)
+        self.reason = " ".join(str(reason).split()).rstrip(".")
+        super().__init__(
+            f"the knowledge bundle's manifest `{self.path}` cannot be read ({self.reason}) — "
+            f"fix it or restore it from the context repository's history; it holds the "
+            f"answered questions, so it was left as it is")
+
+
+def load_manifest(bundle_dir: Path) -> OkfManifest | None:
+    """The published `okf.yaml` for a caller that WRITES one back: `None` only when there is none
+    (no file, or an empty one), and `ManifestUnreadable` when there is one this cannot read — not
+    UTF-8, not YAML, not a mapping, not a valid manifest, or an `OSError` other than a missing
+    file. `read_manifest` stays the lenient reader for the callers that only read."""
+    path = Path(bundle_dir) / OKF_MANIFEST_FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ManifestUnreadable(path, str(exc)) from exc
+    text, unread = utf8.decode(raw, str(path))
+    if text is None:
+        raise ManifestUnreadable(path, unread)
+    return _strict_manifest(path, text)
+
+
+def _strict_manifest(path: Path, text: str) -> OkfManifest | None:
+    try:
+        data = yaml_io.load(text)
+    except yaml.YAMLError as exc:
+        raise ManifestUnreadable(path, f"it is not YAML: {exc}") from exc
+    if data is None or data == {}:
+        return None  # empty is "no manifest", as `parse_manifest` reads it
+    if not isinstance(data, dict):
+        raise ManifestUnreadable(path, f"it is not a mapping but a YAML {type(data).__name__}")
+    try:
+        return OkfManifest(**data)
+    except (TypeError, ValueError) as exc:
+        raise ManifestUnreadable(path, f"it is not a valid manifest: {exc}") from exc
+
+
 def _manifest_text(path: Path) -> str:
     """The manifest's text, or `""` — which `parse_manifest` reads as no manifest — when it
     cannot be read, a manifest that is not UTF-8 logged by name with the decoder's sentence."""
@@ -367,6 +416,8 @@ __all__ = [
     "OKF_DIRNAME",
     "OKF_INDEX_FILE",
     "OKF_MANIFEST_FILE",
+    "ManifestUnreadable",
+    "load_manifest",
     "parse_manifest",
     "read_manifest",
     "BusinessRule",

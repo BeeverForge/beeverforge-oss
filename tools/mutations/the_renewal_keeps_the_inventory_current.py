@@ -32,8 +32,8 @@ MUTATIONS = [
 
     ("the fresh path does not republish the manifest it changed",
      "beeverforge/onboarding/renew.py",
-     "        if inventoried:\n            manifest = _manifest_for(bundle_dir, inventory, existing, commit=commit,",
-     "        if False:\n            manifest = _manifest_for(bundle_dir, inventory, existing, commit=commit,"),
+     "        if inventoried:\n            manifest = _manifest_for(previous, inventory, existing, commit=commit,",
+     "        if False:\n            manifest = _manifest_for(previous, inventory, existing, commit=commit,"),
 
     ("the shape ignores fingerprints, so moved bytes are the same inventory",
      "beeverforge/onboarding/renew.py",

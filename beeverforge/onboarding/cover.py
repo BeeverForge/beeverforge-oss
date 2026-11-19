@@ -27,8 +27,9 @@ from beeverforge.knowledge.gaps import answered_gaps, merge_gaps
 from beeverforge.knowledge.okf import (
     OKF_INDEX_FILE,
     SCOPE_LIMIT,
+    ManifestUnreadable,
+    load_manifest,
     read_concepts,
-    read_manifest,
     render_index,
     write_okf,
 )
@@ -60,12 +61,17 @@ def cover_paths(project, bundle_dir: Path, source: Path, paths: list[str], *, co
     NEVER RAISES: the covering is the factory's own diligence before a change, and a diligence
     that crashed the job it was protecting would be the argument for switching it off. Writes
     nothing when nothing was authored, so a bundle a harness could not serve is left exactly as
-    it was fetched."""
+    it was fetched — and a manifest that exists and cannot be read is a reason to author nothing:
+    it holds the answered questions, and what was authored could only be written over it."""
     wanted = [p for p in dict.fromkeys(str(p).strip() for p in paths) if p]
     if not wanted:
         return Covered(0, (), (), "nothing to cover")
     bundle = Path(bundle_dir)
-    previous = read_manifest(bundle)
+    try:
+        previous = load_manifest(bundle)
+    except ManifestUnreadable as exc:
+        log.warning("BEEVERFORGE_KNOWLEDGE_COVER_MANIFEST_UNREADABLE %s", exc)
+        return Covered(0, (), tuple(wanted), str(exc))
     try:
         # WHAT WAS ALREADY ANSWERED RIDES INTO THE PROMPT, so the author does not mint the same
         # question in new words — the way a gather that asked once would ask for ever.

@@ -5274,10 +5274,18 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
         # published: the request was judged against one, and a source with none owes a backfill.
         from beeverforge.knowledge import requests as asked
         from beeverforge.knowledge.gaps import record_in_bundle
+        from beeverforge.knowledge.okf import ManifestUnreadable
 
         inbox = asked.inbox_for(project)
         wanted = asked.pending(inbox, repo) if published is not None else []
-        recorded = record_in_bundle(dest, wanted) if wanted else []
+        try:
+            recorded = record_in_bundle(dest, wanted) if wanted else []
+        except ManifestUnreadable as exc:
+            # A MANIFEST THAT CANNOT BE READ TAKES NO REQUEST: nothing was recorded, so none is
+            # marked taken — they stay pending for the round after the file is fixed.
+            activity.logger.warning("BEEVERFORGE_KNOWLEDGE_REQUESTS_NOT_RECORDED project=%s "
+                                    "repo=%s %s", inp.project, repo, exc)
+            recorded, wanted = [], []
         if recorded:
             activity.logger.info("BEEVERFORGE_KNOWLEDGE_REQUESTS_RECORDED project=%s repo=%s "
                                  "gaps=%d", inp.project, repo, len(recorded))
