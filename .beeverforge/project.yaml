@@ -25,8 +25,9 @@ validate:
   # daemon (`owns_its_engine`, `slow`) and those that assert their own CPU time (`alone`). The
   # tests that dial the network on purpose (`network`) are all `slow` as well, so they are left
   # out with them. On a box with two CPUs and a few GB, the full suite with `-n 4` did not finish
-  # in 60 minutes and a worker was OOM-killed, so two workers. One command, so its status is the
-  # gate's. 60 minutes, not the 30-minute default.
+  # in 60 minutes and a worker was OOM-killed; two workers were the next step, and the notes below
+  # say why the gate now runs one. One command, so its status is the gate's. 75 minutes, not the
+  # 30-minute default.
   # THE TESTS THAT READ THE WHOLE TREE (`whole_tree`) ARE LEFT TO CI TOO. With them, the two
   # workers each grew to about 1.7 GB and were OOM-killed in a 3.6 GiB box, so the gate failed on
   # changes it had nothing against; each of them holds a parsed copy of the package (~260 MB a
