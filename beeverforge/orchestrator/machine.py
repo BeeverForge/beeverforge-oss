@@ -33,6 +33,7 @@ from beeverforge.adapters.notify.base import Notifier as NotifierT
 from beeverforge.adapters.reviewer.base import ReviewerAdapter, ReviewInput
 from beeverforge.adapters.sandbox.base import (
     BranchHeldElsewhere,
+    DaemonTimedOut,
     PushRefused,
     SandboxAdapter,
     Workspace,
@@ -2127,6 +2128,11 @@ class JobRunner:
             # session is still the one to continue once the tree is freed (ADR-0013 D1).
             return self._hold(ticket, owner, str(exc), JobState.ON_HOLD, branch=branch,
                               hold_cause=TREE, resume_handle=resume_handle)
+        except DaemonTimedOut as exc:
+            # THE HOST'S DAEMON DID NOT ANSWER IN TIME (#608): no agent ran, and the sentence names
+            # the command that frees it. The handle travels, as it does for a held branch.
+            return self._hold(ticket, owner, str(exc), JobState.ON_HOLD, branch=branch,
+                              resume_handle=resume_handle)
         try:
             try:
                 # `at_base` is `not resuming` and not `True`: a resume restores the paused
@@ -2792,7 +2798,7 @@ class JobRunner:
             # through a failed commit's `RuntimeError`, or through a hold. A person's stop keeps
             # nothing (`Stop.keep`), and a walk nobody stopped is not touched.
             self._keep_what_the_attempt_wrote(ticket, ws)
-            self.sandbox.cleanup(workspace=ws)
+            self._clean_up_the_box(ticket, ws)
             vars(self).pop("_landed_here", None)  # this walk's fact, never the next one's
             # the fetched knowledge bundle is a temp checkout — one leaked per job
             # would fill the worker's finite disk.
@@ -2939,6 +2945,10 @@ class JobRunner:
             return self._hold(ticket, owner, str(exc), JobState.ON_HOLD, branch=branch,
                               pr_url=pr_url, merge_refused=True, code_changed=False,
                               hold_cause=TREE)
+        except DaemonTimedOut as exc:
+            # The daemon did not answer in time (#608): nothing was written, as above.
+            return self._hold(ticket, owner, str(exc), JobState.ON_HOLD, branch=branch,
+                              pr_url=pr_url, merge_refused=True, code_changed=False)
         try:
             # WHAT THE REVIEWER READ, MEASURED BEFORE THIS PASS CAN TOUCH IT (#179). Every exit
             # below goes through `as_left`, including the ones that give up before the agent
@@ -3175,7 +3185,7 @@ class JobRunner:
                 auto_merge=True, review=review, validations=validations,
             )))
         finally:
-            self.sandbox.cleanup(workspace=ws)
+            self._clean_up_the_box(ticket, ws)
             # the fetched knowledge bundle is a temp checkout — one leaked per job
             # would fill the worker's finite disk.
             self._drop_published_bundle()
@@ -3295,6 +3305,11 @@ class JobRunner:
             return self._hold(ticket, self._owner_of(ticket_ref), str(exc), JobState.ON_HOLD,
                               branch=branch, pr_url=pr_url, merge_refused=True,
                               code_changed=False, hold_cause=TREE)
+        except DaemonTimedOut as exc:
+            # The daemon did not answer in time (#608): nothing was read, as above.
+            return self._hold(ticket, self._owner_of(ticket_ref), str(exc), JobState.ON_HOLD,
+                              branch=branch, pr_url=pr_url, merge_refused=True,
+                              code_changed=False)
         try:
             diff = self._pr_diff(ws, base)
             if diff is None:
@@ -3329,7 +3344,7 @@ class JobRunner:
                 code_changed=False,
             ))
         finally:
-            self.sandbox.cleanup(workspace=ws)
+            self._clean_up_the_box(ticket, ws)
             self._drop_published_bundle()
 
     # -- journal helpers --
@@ -3719,6 +3734,22 @@ class JobRunner:
         except Exception as exc:  # noqa: BLE001
             # A notifier that has been failing for a week looks exactly like a quiet week.
             log.warning("notification not delivered (%s): %s", str(exc)[:120], message[:120])
+
+    def _clean_up_the_box(self, ticket: Ticket, ws: Workspace) -> None:
+        """`sandbox.cleanup`, from a run's `finally`, where a raise REPLACES the run's outcome.
+
+        Measured on a deployment (#608): the box's `docker rm -f` timed out there, and a run that
+        had ended on hold after 2 h 18 min of repair passes surfaced as a failed activity with a
+        traceback; the hold's reason never reached the card and nothing was pushed. So a box the
+        daemon would not remove is told, once, on the card and in the log, naming it and the
+        command that removes it, and the run returns the result it reached."""
+        try:
+            self.sandbox.cleanup(workspace=ws)
+        except DaemonTimedOut as exc:
+            said = str(exc)
+            said = said[:1].upper() + said[1:]
+            log.warning("BEEVERFORGE_BOX_LEFT_BEHIND ticket=%s %s", ticket.id, said)
+            self._say_on_ticket(ticket.id, said)
 
     def _say_on_ticket(self, ticket_id: str, body: str) -> None:
         """Write a comment that DESCRIBES what this machine just did, or is about to do.
