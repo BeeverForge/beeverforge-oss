@@ -27,6 +27,11 @@ validate:
   # out with them. On a box with two CPUs and a few GB, the full suite with `-n 4` did not finish
   # in 60 minutes and a worker was OOM-killed, so two workers. One command, so its status is the
   # gate's. 60 minutes, not the 30-minute default.
+  # THE TESTS THAT READ THE WHOLE TREE (`whole_tree`) ARE LEFT TO CI TOO. With them, the two
+  # workers each grew to about 1.7 GB and were OOM-killed in a 3.6 GiB box, so the gate failed on
+  # changes it had nothing against; each of them holds a parsed copy of the package (~260 MB a
+  # worker) and together they are about a third of the unit selection's time. CI runs them before
+  # a human merges.
   # FOR NOW, THE TESTS IN tests/test_the_set_ends_together.py THAT RUN `ps` ARE LEFT TO CI as well:
   # they check a pid through `ps` (one also through `pgrep`), and the sandbox image of the RUNNING
   # release has no procps, so in the box they fail with `FileNotFoundError: ... 'ps'`. #567 puts
@@ -35,7 +40,7 @@ validate:
   test:
     timeout_minutes: 60
     command: >-
-      .venv/bin/python -m pytest -q -n 2 -m "not (owns_its_engine or slow or alone)"
+      .venv/bin/python -m pytest -q -n 2 -m "not (owns_its_engine or slow or alone or whole_tree)"
       --deselect tests/test_the_set_ends_together.py::test_a_supervisor_asked_to_stop_by_a_signal_stops_the_set
       --deselect tests/test_the_set_ends_together.py::test_a_supervisor_KILLED_outright_still_takes_its_children_with_it
       --deselect tests/test_the_set_ends_together.py::test_a_child_that_ignores_the_request_to_stop_is_made_to
