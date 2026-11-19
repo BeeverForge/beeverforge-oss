@@ -323,7 +323,7 @@ class _Gh:
     def __init__(self, code: int = 0, out: str = "") -> None:
         self.code, self.out, self.calls = code, out, []
 
-    def __call__(self, args):
+    def __call__(self, args, *, stdin=None):
         self.calls.append(args)
         return type("_P", (), {"returncode": self.code, "stdout": self.out, "stderr": "boom"})()
 

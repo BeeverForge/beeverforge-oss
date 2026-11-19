@@ -8,15 +8,19 @@ label. Runs as the bot when a token is provided (GH_TOKEN), else ambient auth.
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
 import subprocess
 import time
 
-from beeverforge.adapters.agent.base import MAX_ARG_STRLEN
-from beeverforge.adapters.github_cli import credential_of, nothing_named, refused
+from beeverforge.adapters.github_cli import (
+    BODY_LIMIT,
+    argv_too_long,
+    credential_of,
+    nothing_named,
+    refused,
+)
 from beeverforge.adapters.tracker.base import (
     Budget,
     TicketComment,
@@ -67,27 +71,6 @@ def _summary(row: dict, *, ref: str) -> TicketSummary:
     )
 
 
-def _argv_too_long(args: list[str], exc: OSError) -> subprocess.CompletedProcess[str]:
-    """An argv the kernel refused (`E2BIG`, #130), answered as a failed call the way `refused()`
-    answers one, so a text too long for one argument fails by name instead of as a traceback.
-    Any other `OSError` is not this one and is raised unchanged."""
-    if exc.errno != errno.E2BIG:
-        raise exc
-    command = " ".join(["gh", *args[:2]])
-    if args[:2] == ["issue", "close"]:
-        # `gh issue close` has no `--body-file` (only `-c/--comment`, `--duplicate-of`,
-        # `-r/--reason`), so its remedy is the comment on stdin first, then the bare close.
-        remedy = ("so the reason must be posted first as a comment on stdin "
-                  "(`gh issue comment --body-file -`), then the issue closed without `--comment`")
-    else:
-        remedy = "so the text must go to `gh` on stdin with `--body-file -`"
-    why = (f"`{command}` was refused by the kernel before it started (E2BIG): one argument is "
-           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, {remedy}.")
-    log.warning("BEEVERFORGE_GH_ARGV_TOO_LONG %s: an argument over %s bytes (MAX_ARG_STRLEN)",
-                command, f"{MAX_ARG_STRLEN:,}")
-    return refused(args, why)
-
-
 class GitHubIssuesTracker(TrackerAdapter):
     #: WHAT THIS ROW CAN REPORT OF A CHANGE MADE ON GITHUB ITSELF (ADR-0055 D8,
     #: `tracker/base.py::observes`): a close and why (`stateReason`, on every summary), a reopen,
@@ -96,11 +79,9 @@ class GitHubIssuesTracker(TrackerAdapter):
     observes = frozenset({"closed", "reopened", "promoted", "reordered"})
 
     #: THE LONGEST BODY GITHUB ACCEPTS, in characters (#624; read by the split through `getattr`,
-    #: `activities.CARD_BODY_LIMIT`). GitHub does not document it; its API refuses a longer issue,
-    #: pull request or comment body with "body is too long (maximum is 65536 characters)", as
-    #: reported in golang/go#45998 (2021) and w3c/webref#245. Not measured here: no scratch
-    #: repository was at hand on 2026-10-17.
-    body_limit = 65_536
+    #: `activities.CARD_BODY_LIMIT`). Where the figure comes from is cited at
+    #: `github_cli.BODY_LIMIT`, which the forge checks a pull-request text against too.
+    body_limit = BODY_LIMIT
 
     def __init__(
         self,
@@ -170,7 +151,7 @@ class GitHubIssuesTracker(TrackerAdapter):
                 "Install it (https://cli.github.com) and run `gh auth login` (or set "
                 "BEEVERFORGE_BOT_TOKEN / the GitHub App variables).") from None
         except OSError as exc:
-            return _argv_too_long(args, exc)
+            return argv_too_long(args, exc, log)
         # RESILIENCE: GitHub's SECONDARY / abuse-detection limits clear in seconds — one brief
         # backoff + retry rides them out instead of failing the whole ticket. (A primary limit,
         # minutes away, still fails here and the caller degrades; the poller's own budget check
@@ -184,7 +165,7 @@ class GitHubIssuesTracker(TrackerAdapter):
                 env=self._env(),
             )
         except OSError as exc:
-            return _argv_too_long(args, exc)
+            return argv_too_long(args, exc, log)
         return p
 
     def _write(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:

@@ -171,13 +171,16 @@ def test_github_brings_the_open_pull_request_up_to_date():
                     repo=docs)
 
     assert url == f"https://github.com/{docs}/pull/2"
-    edits = [a for a in f._gh.calls if a[:2] == ["pr", "edit"]]  # noqa: SLF001
+    fake = f._gh  # noqa: SLF001 - the fake gh_forge installs on the adapter's own seam
+    edits = [(a, stdin) for a, stdin in zip(fake.calls, fake.stdins, strict=True)
+             if a[:2] == ["pr", "edit"]]
     assert len(edits) == 1, (
         "the open pull request was answered and left as the first attempt had it")
-    argv = edits[0]
+    argv, stdin = edits[0]
     assert argv[2] == url and argv[argv.index("--repo") + 1] == docs
     assert argv[argv.index("--title") + 1] == "add the export (2)"
-    assert argv[argv.index("--body") + 1] == "score 80"
+    assert argv[argv.index("--body-file") + 1] == "-"
+    assert stdin == "score 80"
     assert not any(a[:2] == ["pr", "create"] for a in f._gh.calls)  # noqa: SLF001
 
 

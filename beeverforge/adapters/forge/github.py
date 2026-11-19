@@ -22,7 +22,15 @@ from beeverforge.adapters.forge.base import (
     truncated_tail,
 )
 from beeverforge.adapters.forge.base import truncated as _truncated
-from beeverforge.adapters.github_cli import LoginRefused, credential_of, nothing_named, refused
+from beeverforge.adapters.github_cli import (
+    BODY_LIMIT,
+    TITLE_LIMIT,
+    LoginRefused,
+    argv_too_long,
+    credential_of,
+    nothing_named,
+    refused,
+)
 
 log = logging.getLogger("beeverforge.forge.github")
 
@@ -41,6 +49,33 @@ def discover_token() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return (done.stdout or "").strip() or None if done.returncode == 0 else None
+
+#: Every lone surrogate: what `surrogateescape` decodes a byte that is not UTF-8 into. A string
+#: holding one cannot be written to `gh` as UTF-8, and `subprocess.run` raises `UnicodeEncodeError`.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _marked(text: str) -> str:
+    """`text` with each lone surrogate replaced by U+FFFD, so a pull-request text holding bytes that
+    were not UTF-8 is still sent and only those bytes are marked. A NUL or another control
+    character in a BODY is left as written: stdin carries any byte."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
+def _unsendable(title: str | None, body: str) -> str:
+    """Why GitHub would not take this pull-request text, in one sentence with the remedy, or `""`.
+    Neither is ever cut to fit: a refusal says so and the caller's own failure path answers it."""
+    if title is not None and "\x00" in title:
+        return ("the pull request's title holds a NUL character, which no command-line argument "
+                "can carry; remove it from the title.")
+    if title is not None and len(title) > TITLE_LIMIT:
+        return (f"the pull request's title has {len(title):,} characters, over the "
+                f"{TITLE_LIMIT:,} GitHub accepts; shorten the title, it is never cut.")
+    if len(body) > BODY_LIMIT:
+        return (f"the pull-request text has {len(body):,} characters, over the {BODY_LIMIT:,} "
+                f"GitHub accepts; shorten the text, it is never cut.")
+    return ""
+
 
 _EVENT_FLAG = {
     "approve": "--approve",
@@ -234,7 +269,9 @@ class GitHubForge(ForgeAdapter):
             env["GH_TOKEN"] = self.token
         return env
 
-    def _gh(self, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    def _env_or_refusal(
+            self, args: list[str]) -> dict[str, str] | subprocess.CompletedProcess[str]:
+        """The environment `gh` runs `args` in, or the failed call that answers them unrun."""
         # NEVER A GUESSED REPOSITORY, OWNER OR BRANCH (`adapters/github_cli.py`), as the
         # tracker's row
         why = nothing_named(args)
@@ -242,14 +279,46 @@ class GitHubForge(ForgeAdapter):
             log.warning("BEEVERFORGE_GH_NOTHING_NAMED %s", why)
             return refused(args, why)
         try:
-            env = self._env()
+            return self._env()
         except LoginRefused as exc:
             # A FAILED CALL, SAID, as every other refusal of this method is — `gh` never runs
             log.warning("BEEVERFORGE_GH_LOGIN_REFUSED %s", exc)
             return refused(args, str(exc))
-        return subprocess.run(
-            ["gh", *args], capture_output=True, text=True, timeout=timeout, env=env
-        )
+
+    def _gh(self, args: list[str], timeout: int = 120, *,
+            stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+        # A PULL-REQUEST TEXT GOES ON STDIN (`stdin=`, with `--body-file -`), never as one argv
+        # element, as the tracker's row: Linux refuses an element of MAX_ARG_STRLEN bytes or more
+        # with E2BIG before `gh` starts, and GitHub's limit is in characters, so a 3-byte script
+        # crossed the byte ceiling at about 43,690 characters. One that still reaches the kernel is
+        # answered by name (`github_cli.argv_too_long`); any other OSError is raised unchanged.
+        env = self._env_or_refusal(args)
+        if isinstance(env, subprocess.CompletedProcess):
+            return env
+        try:
+            return subprocess.run(
+                ["gh", *args], input=stdin, capture_output=True, text=True, timeout=timeout,
+                env=env,
+            )
+        except OSError as exc:
+            return argv_too_long(args, exc, log)
+
+    def _write(self, args: list[str], *, body: str,
+               title: str | None = None) -> subprocess.CompletedProcess[str]:
+        """The one way a pull-request text reaches `gh`: `args`, then `--title` when there is one,
+        then `--body-file -` with the text on stdin. Each text has its lone surrogates marked
+        (`_marked`); one GitHub would not take (`_unsendable`) is a failed call before `gh` runs,
+        which each caller answers on its own failure path."""
+        body = _marked(body)
+        if title is not None:
+            title = _marked(title)
+            args = [*args, "--title", title]
+        args = [*args, "--body-file", "-"]
+        why = _unsendable(title, body)
+        if why:
+            log.warning("BEEVERFORGE_PR_TEXT_REFUSED `gh %s`: %s", " ".join(args[:2]), why)
+            return refused(args, why)
+        return self._gh(args, stdin=body)
 
     def push_remote(self) -> str | None:
         # GitHub scheme: the token is the password for the x-access-token user.
@@ -475,9 +544,9 @@ class GitHubForge(ForgeAdapter):
             # hands the same text, a later attempt on this head describes the commit now on it.
             self._bring_up_to_date(existing, repo=target, title=title, body=body)
             return existing
-        p = self._gh(
-            ["pr", "create", "--repo", target, "--head", head, "--base", base,
-             "--title", title, "--body", body]
+        p = self._write(
+            ["pr", "create", "--repo", target, "--head", head, "--base", base],
+            title=title, body=body,
         )
         if p.returncode != 0:
             try:  # lost a race with a concurrent create?
@@ -494,8 +563,8 @@ class GitHubForge(ForgeAdapter):
         return p.stdout.strip()
 
     def _bring_up_to_date(self, pr: str, *, repo: str, title: str, body: str) -> bool:
-        """`gh pr edit --title --body` on the open pull request `open_pr` is answering with (#304).
-        True when the forge took it.
+        """`gh pr edit --title --body-file -`, the text on stdin, on the open pull request
+        `open_pr` is answering with (#304). True when the forge took it.
 
         IN THE REPOSITORY THE LOOKUP FOUND IT IN, so the write goes where the read went — on the
         product path that is the documentation repository, not this adapter's own.
@@ -505,7 +574,7 @@ class GitHubForge(ForgeAdapter):
         half that worked — but the pull request now describes an earlier attempt, and the log says
         so by name."""
         try:
-            done = self._gh(["pr", "edit", pr, "--repo", repo, "--title", title, "--body", body])
+            done = self._write(["pr", "edit", pr, "--repo", repo], title=title, body=body)
         except (subprocess.SubprocessError, OSError) as exc:
             done = subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=str(exc))
         if done.returncode != 0:
@@ -535,7 +604,7 @@ class GitHubForge(ForgeAdapter):
         return p.stdout.strip() or None
 
     def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:
-        self._gh(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event], "--body", body])
+        self._write(["pr", "review", pr, "--repo", self.repo, _EVENT_FLAG[event]], body=body)
 
     def request_reviewers(self, *, pr: str, reviewers: list[str]) -> None:
         if not reviewers:
@@ -1000,8 +1069,8 @@ class GitHubForge(ForgeAdapter):
         return (got.stdout or "").rstrip("\n")
 
     def set_pr_body(self, *, pr: str, body: str, repo: str = "") -> bool:
-        """`gh pr edit --body` — True when the forge took it."""
-        done = self._gh(["pr", "edit", pr, "--repo", repo or self.repo, "--body", body])
+        """`gh pr edit --body-file -`, the text on stdin — True when the forge took it."""
+        done = self._write(["pr", "edit", pr, "--repo", repo or self.repo], body=body)
         if done.returncode != 0:
             log.warning("could not update the description of %s (%s)", pr,
                         (done.stderr or "").strip()[:160])

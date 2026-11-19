@@ -27,7 +27,7 @@ class RecordingGh:
         self.sha = sha
         self.calls: list[list[str]] = []
 
-    def __call__(self, args, timeout=120):
+    def __call__(self, args, timeout=120, *, stdin=None):
         self.calls.append(args)
         sub = args[0]
         if sub == "pr" and args[1] == "list":

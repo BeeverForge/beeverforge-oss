@@ -13,7 +13,27 @@ repository the suite runs from, through the operator's own `gh` login: 31 commen
 
 from __future__ import annotations
 
+import errno
 import subprocess
+from typing import TYPE_CHECKING
+
+from beeverforge.adapters.agent.base import MAX_ARG_STRLEN
+
+if TYPE_CHECKING:
+    import logging
+
+#: THE LONGEST BODY GITHUB ACCEPTS, in characters (#624): an issue, pull request or comment body,
+#: read by the tracker as `body_limit` and checked by the forge before a pull-request write. GitHub
+#: does not document it; its API refuses a longer one with "body is too long (maximum is 65536
+#: characters)", as reported in golang/go#45998 (2021) and w3c/webref#245. Not measured here: no
+#: scratch repository was at hand on 2026-10-17.
+BODY_LIMIT = 65_536
+
+#: THE LONGEST TITLE GITHUB ACCEPTS for an issue or a pull request, in characters, checked by the
+#: forge before a pull-request write. GitHub does not document it either; its API refuses a longer
+#: one with "title is too long (maximum is 256 characters)", the validation message of its issue
+#: and pull-request model. Not measured here: no scratch repository was at hand on 2026-11-19.
+TITLE_LIMIT = 256
 
 #: The flags this platform passes from configuration whose EMPTY value `gh` fills in by guessing,
 #: each with what it would guess from (review of #489). An empty `--head` on `pr create` is the
@@ -79,3 +99,26 @@ def refused(args: list[str], why: str) -> subprocess.CompletedProcess[str]:
     """A `gh` call that was never run, answered the way a failed one is: every caller already
     reads a non-zero exit as "the forge did not do it", and a write raises on it."""
     return subprocess.CompletedProcess(["gh", *args], 2, "", why)
+
+
+def argv_too_long(args: list[str], exc: OSError,
+                  log: logging.Logger) -> subprocess.CompletedProcess[str]:
+    """An argv the kernel refused (`E2BIG`), answered as a failed call the way `refused()`
+    answers one, so a text too long for one argument fails by name instead of as a traceback.
+    Logged on the CALLER's logger (`log`), so each adapter's marker stays under its own name.
+    Any other `OSError` is not this one and is raised unchanged."""
+    if exc.errno != errno.E2BIG:
+        raise exc
+    command = " ".join(["gh", *args[:2]])
+    if args[:2] == ["issue", "close"]:
+        # `gh issue close` has no `--body-file` (only `-c/--comment`, `--duplicate-of`,
+        # `-r/--reason`), so its remedy is the comment on stdin first, then the bare close.
+        remedy = ("so the reason must be posted first as a comment on stdin "
+                  "(`gh issue comment --body-file -`), then the issue closed without `--comment`")
+    else:
+        remedy = "so the text must go to `gh` on stdin with `--body-file -`"
+    why = (f"`{command}` was refused by the kernel before it started (E2BIG): one argument is "
+           f"over the {MAX_ARG_STRLEN:,}-byte argv ceiling, {remedy}.")
+    log.warning("BEEVERFORGE_GH_ARGV_TOO_LONG %s: an argument over %s bytes (MAX_ARG_STRLEN)",
+                command, f"{MAX_ARG_STRLEN:,}")
+    return refused(args, why)
