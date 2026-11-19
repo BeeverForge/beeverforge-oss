@@ -11,12 +11,15 @@ Rows 1-4 are the defect as it shipped, one per write: the text back in argv as `
 on stdin. Row 5 drops `input=stdin` from the forge's one `subprocess.run`, so every write sends
 `--body-file -` with nothing behind it. Row 6 removes the forge's catch of an E2BIG, so a refusal
 escapes as a raw `OSError`. Row 7 catches it and re-raises instead of answering a named failed
-call.
+call. Row 8 widens the catch the other way, in the shared helper: every `OSError` is answered as a
+failed call, so a denied `gh` (EACCES) or a missing one (ENOENT) reaching the forge is swallowed.
 """
 
 TEST = "tests/test_a_pull_request_text_github_accepts_reaches_gh_whatever_its_bytes.py"
 
 FORGE = "beeverforge/adapters/forge/github.py"
+
+CLI = "beeverforge/adapters/github_cli.py"
 
 MUTATIONS = [
     ("THE DEFECT, `open_pr`: `gh pr create` carries the text in argv", FORGE,
@@ -58,4 +61,10 @@ MUTATIONS = [
      '            return argv_too_long(args, exc, log)\n',
      '        except OSError as exc:\n'
      '            raise exc\n'),
+
+    ("every OSError reaching the forge is answered as a failed call, not only E2BIG", CLI,
+     "    if exc.errno != errno.E2BIG:\n"
+     "        raise exc\n",
+     "    if False:\n"
+     "        raise exc\n"),
 ]
