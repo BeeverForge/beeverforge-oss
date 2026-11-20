@@ -77,6 +77,7 @@ never raises for its coding.
 from __future__ import annotations
 
 import ast
+import functools
 import gc
 import hashlib
 import os
@@ -132,8 +133,23 @@ def fact[T](path: str | os.PathLike[str], read: Callable[[ast.Module], T]) -> T:
     return _facts[key, read]
 
 
+_memos: list = []  # each a `functools.cache` wrapper, cleared by `forget()`
+
+
+def per_module[F: Callable[..., object]](fn: F) -> F:
+    """`functools.cache` for a walk keyed on a tree or a node, emptied with the trees (#619).
+
+    A memo keyed on a tree holds that tree for as long as the memo lives: under a module-level
+    `functools.cache` the trees `forget()` dropped stayed alive, and every module that parsed the
+    file again added one more copy. `forget()` clears every memo made here when it drops the
+    trees, so the memo and its trees go together."""
+    memo = functools.cache(fn)
+    _memos.append(memo)
+    return memo  # the same call signature as `fn`, as `functools.cache` gives it
+
+
 def forget() -> int:
-    """Drop every cached tree and fact, and undo the freezes that kept the trees from the
+    """Drop every cached tree, fact and `per_module` memo, and undo the freezes that kept the trees from the
     collector; how many trees were dropped.
 
     Called when the test module that parsed them is done (`conftest.pytest_runtest_teardown`).
@@ -141,6 +157,8 @@ def forget() -> int:
     collection at every module's end would walk the whole heap ~960 times a run."""
     dropped = len(_trees)
     _facts.clear()
+    for memo in _memos:
+        memo.cache_clear()
     if dropped:
         _trees.clear()
         gc.unfreeze()

@@ -10,7 +10,9 @@ THE CLAIMS:
   3. **A fact keeps the answer, not the tree.** `fact()` parses a content once per reader, serves
      a tree the cache already holds without parsing again, reads the bytes read this time, and is
      forgotten with the trees.
-  4. **The two guards over every test file keep no tree**: they ask `fact`, not `parsed`.
+  4. **A memo keyed on a tree goes with the trees** (`per_module`): it walks a tree once, and
+     `forget()` empties it, so it holds no tree the cache dropped.
+  5. **The two guards over every test file keep no tree**: they ask `fact`, not `parsed`.
 """
 
 TEST = "tests/test_a_worker_lets_go_of_the_trees_a_module_parsed.py"
@@ -64,6 +66,16 @@ MUTATIONS = [
 
     ("forget() keeps the facts",
      HELPER, "    _facts.clear()\n", ""),
+
+    ("forget() leaves the per-module memos, so they keep the dropped trees alive",
+     HELPER, "    for memo in _memos:\n        memo.cache_clear()\n", ""),
+
+    ("a per-module memo is not registered, so forget() never empties it",
+     HELPER, "    _memos.append(memo)\n", ""),
+
+    ("a per-module memo memoises nothing",
+     HELPER, "    memo = functools.cache(fn)\n",
+     "    memo = fn\n    memo.cache_clear = lambda: None\n"),
 
     # ── 4. the two guards over every test file ─────────────────────────────────────────────────
     ("the CPU-time guard reads every test file through the cache again",

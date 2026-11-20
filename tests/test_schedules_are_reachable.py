@@ -17,12 +17,11 @@ reason and after the same kind of incident.
 from __future__ import annotations
 
 import ast
-import functools
 from pathlib import Path
 
 import pytest
 
-from tests.the_tree_read_once import parsed
+from tests.the_tree_read_once import parsed, per_module
 
 SCHEDULE = Path("beeverforge/runtime/temporal/schedule.py")
 
@@ -95,7 +94,7 @@ def _callers_of(name: str) -> list[str]:
     return hits
 
 
-@functools.cache
+@per_module
 def _calls_in_the_module(tree: ast.Module) -> frozenset[str]:
     """`_calls_in` over a whole module, walked ONCE per tree. Eight `ensure_*` names each ask every
     file of both trees, and before 2026-10-22 each ask re-read and re-parsed all 1,300 of them —

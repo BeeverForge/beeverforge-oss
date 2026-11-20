@@ -97,13 +97,13 @@ MUTATIONS = [
     # ── 4. each tree walked once ───────────────────────────────────────────────────────────────
     ("the schedule walk is not memoised: a second name walks every module again",
      SCHEDULES,
-     "@functools.cache\ndef _calls_in_the_module(",
+     "@per_module\ndef _calls_in_the_module(",
      "def _calls_in_the_module(",
      WALKS),
 
     ("the ledger walk is not memoised: a second question walks the file again",
      LEDGER,
-     "@functools.cache\ndef _imports_resolved_against(",
+     "@per_module\ndef _imports_resolved_against(",
      "def _imports_resolved_against(",
      WALKS),
 

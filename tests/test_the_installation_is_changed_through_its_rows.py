@@ -65,7 +65,7 @@ from tests.test_a_person_is_invited_not_signed_up import (
     invite_and_register,
     local,  # noqa: F401 — the fixture
 )
-from tests.the_tree_read_once import could_say, parsed
+from tests.the_tree_read_once import could_say, parsed, per_module
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG_PY = ROOT / "beeverforge" / "actions" / "catalog.py"
@@ -153,7 +153,7 @@ def _could_define(text: str, said: re.Pattern[str]) -> bool:
         not unicodedata.is_normalized("NFKC", text) and could_say(text, said))
 
 
-@functools.cache
+@per_module
 def _nodes(node: ast.AST) -> tuple[ast.AST, ...]:
     """`ast.walk(node)`, in its order, walked once per process: the trees are shared and never
     changed (`the_tree_read_once`). Breadth first over each node's fields in their order, as
@@ -169,7 +169,7 @@ def _nodes(node: ast.AST) -> tuple[ast.AST, ...]:
     return tuple(out)
 
 
-@functools.cache
+@per_module
 def _read_nodes(fn: ast.AST) -> tuple[ast.AST, ...]:
     """The nodes of `fn` the walk reads, in `ast.walk`'s order: a name, an attribute and a call —
     the only nodes `_written` and `_entered` give anything for."""
@@ -186,7 +186,7 @@ def _module_file(dotted: str) -> Path | None:
     return None
 
 
-@functools.cache
+@per_module
 def _from_the_package(node: ast.AST) -> dict[str, str]:
     """What `node` imports from the package: local name → dotted path, a module's (`from
     beeverforge.product import before_code`, `import beeverforge.product.onboard as onboard`,
@@ -236,7 +236,7 @@ class _Read(typing.NamedTuple):
     imports: dict[str, str]        # what it imports from the package, anywhere in it
 
 
-@functools.cache
+@per_module
 def _module(path: Path) -> _Read:
     tree = parsed(path)
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
@@ -415,13 +415,13 @@ def _bound(node: ast.AST):
             yield target.id, node.iter, True
 
 
-@functools.cache
+@per_module
 def _binds(fn: ast.AST) -> tuple[tuple[str, ast.AST, bool], ...]:
     """What every node of `fn` binds (`_bound`), in `ast.walk`'s order, read once per process."""
     return tuple(bound for n in _nodes(fn) if isinstance(n, _BINDERS) for bound in _bound(n))
 
 
-@functools.cache
+@per_module
 def _stored(fn: ast.AST) -> frozenset[str]:
     """The names `fn` stores to anywhere in it, read once per process."""
     return frozenset(n.id for n in _nodes(fn)
