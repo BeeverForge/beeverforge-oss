@@ -254,11 +254,18 @@ def _worktree(**kw):
     from beeverforge.adapters.sandbox import WorktreeSandbox
 
     root = kw.get("root")
+    if not root:
+        # The deployment's root, beside the repository cache: the one a job's box gets from
+        # `factory.py` for a project served from the cache. Never the working directory, which
+        # can be a person's checkout and which a later command run elsewhere does not share.
+        # Asked now, not at import, so a changed BEEVERFORGE_REPO_CACHE is honoured.
+        from beeverforge.runtime.repo_cache import default_root
+
+        root = default_root() / ".beeverforge-worktrees"
     # `extra_env` too: `factory.py` forwards `box.env` for every box, and a worktree that dropped
     # it would authenticate the harness in the container and not on the host — the same
     # declaration honoured by one box and silently ignored by the other.
-    return WorktreeSandbox(root=Path(root) if root else Path.cwd() / ".beeverforge-worktrees",
-                           extra_env=tuple(kw.get("extra_env") or ()))
+    return WorktreeSandbox(root=Path(root), extra_env=tuple(kw.get("extra_env") or ()))
 
 
 def judging_worktree(project, *, root):
