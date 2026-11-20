@@ -514,3 +514,14 @@ def test_certify_deployment_fills_its_outcomes_from_the_journals_and_the_store(t
     assert "## Outcomes over the window" in files["summary.md"]
     everything = "\n".join(files.values()).lower()
     assert not [w for w in bed.FORBIDDEN if w.lower() in everything]
+
+
+def test_a_jobs_ending_row_is_not_one_more_attempt_in_the_versions_seen(d):
+    stamp = {"version": "0.6.0", "build": "abc123"}
+    d.job_row("acme", "9", at(2), stamp)
+    d.sink.record(MetricRecord(project="acme", ticket="9", ts=at(1).isoformat(), kind="job",
+                               role="_job_", state="merged",
+                               extra={"platform": stamp, "ending": True}))
+
+    assert d.outcomes()["versions"] == {"seen": [{"version": "0.6.0", "build": "abc123",
+                                                  "attempts": 1}], "unstamped": 0}

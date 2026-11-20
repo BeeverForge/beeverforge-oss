@@ -454,8 +454,10 @@ def _from_the_store(block: dict, gaps: dict, rows: list[dict], names: list[str],
             passes.setdefault((owner, canonical_ref(row.get("ticket"))), []).append(
                 (when, role, row.get("cost_usd")))
         elif kind == "job" and inside(when):
-            stamp = (row.get("extra") or {}).get("platform") if isinstance(
-                row.get("extra"), dict) else None
+            extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+            if extra.get("ending"):
+                continue      # the job's ending (#609) is not one more attempt
+            stamp = extra.get("platform")
             version = str((stamp or {}).get("version") or "")
             build = str((stamp or {}).get("build") or "")
             if _VERSION.fullmatch(version) and _BUILD.fullmatch(build):
