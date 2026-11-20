@@ -16,6 +16,7 @@ WHAT HOLDS NOW, and is held here:
     goes on, the trees stay, so its tests still share one tree per content;
   - that hook is the one the session calls, after the runner's own teardown, so module fixtures
     holding a tree are already released when the cache lets go;
+  - a memo keyed on a tree (`per_module`) is emptied with the cache, so it holds no tree past it;
   - a guard that only needs a fact from every file asks `fact`, which keeps the fact and never the
     tree, and the two guards over every test file ask it.
 """
@@ -160,6 +161,30 @@ def test_a_cached_tree_answers_a_fact_without_a_second_parse(
     monkeypatch.undo()
 
     assert read and not parses, "a tree the cache holds was parsed again for a fact"
+
+
+# ── a memo keyed on a tree ──────────────────────────────────────────────────────────────────────
+
+def test_a_memo_on_a_tree_goes_with_the_trees(tmp_path: Path) -> None:
+    """A module-level `functools.cache` keyed on a tree held every tree it was ever asked about,
+    after the cache had dropped them, and one more copy each time another module parsed the file
+    again. A `per_module` memo walks a tree once while the module runs and lets go with the cache."""
+    walks = []
+
+    @trees.per_module
+    def walked(tree):
+        walks.append(1)
+        return len(tree.body)
+
+    path, tree = _a_tree(tmp_path)
+    assert walked(tree) == walked(tree) == 1
+    assert len(walks) == 1, "the memo walked the same tree twice"
+    gone = weakref.ref(tree)
+    del tree
+
+    trees.forget()
+
+    assert gone() is None, "a memo kept alive a tree the cache had dropped"
 
 
 # ── the two guards over every test file ─────────────────────────────────────────────────────────
