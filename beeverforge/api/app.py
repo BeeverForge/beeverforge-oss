@@ -2092,8 +2092,10 @@ def board_view(project: str, card: str = "", pr: str = "") -> dict:
         return {"project": proj.name, "columns": None, "cards": None, "poll_seconds": None,
                 "board": False, "card": None}
 
-    names = board.column_names()
+    # THE PLACEMENT FIRST: a GitHub row learns the column names from the read that places the
+    # cards, so asking for the names afterwards costs nothing (#591).
     placed = board.columns()
+    names = board.column_names()
     summaries = tracker.list_tickets(state="open")
 
     cards = None
