@@ -60,9 +60,10 @@ message reads the same whatever your shell's locale. You do not need to export a
 `addons/*/tests` where the tree has them) in one process, in a random order — pytest-randomly
 shuffles every run. The same suite across every core is `python -m pytest -q -n auto`; the fixed
 order the house rules below also ask for is `python -m pytest -q -n auto -p no:randomly`; one file
-is `python -m pytest -q tests/<the file>.py`. Each xdist worker holds the parsed package once it
-runs a guard that reads it (`tests/the_tree_read_once.py`: ~260 MB, and ~450 MB more in a worker
-that runs a guard reading `tests/` too), so a box running `-n 12` should budget that per worker.
+is `python -m pytest -q tests/<the file>.py`. A worker holds the parsed package only while the test
+module that asked for it runs (`tests/the_tree_read_once.py`: ~260 MB, dropped when the next test
+is in another file), so a box running `-n 12` should budget that per worker at its peak, not for
+the whole run.
 
 **The `whole_tree` marker.** A test that walks or parses this repository's own tree (`rglob`,
 `os.walk` or `git ls-files` over the checkout, directly or through a helper) carries

@@ -2,7 +2,7 @@
 
 WHY THE MARKER EXISTS. About 290 tests read the whole checkout — `rglob("*.py")` over the package,
 `git ls-files` over the repository — and the guards among them each hold a parsed copy of it
-(`tests/the_tree_read_once.py`: ~260 MB a worker). A gate on a box with few CPUs and little memory
+(`tests/the_tree_read_once.py`: ~260 MB a worker, while the module that asked runs). A gate on a box with few CPUs and little memory
 can leave them out with `-m "not whole_tree"`; CI still runs them before a human merges. A label
 that nobody holds to the code is a promise, so this file holds it both ways:
 
@@ -11,7 +11,10 @@ that nobody holds to the code is a promise, so this file holds it both ways:
   - a test that carries the marker and walks nothing is a test the small box needlessly drops.
 
 WHAT "WALKS" MEANS is `tests/whole_tree_walks.py`: it is read from the source, never by running a
-test, and a walk of a `tmp_path` or a fixture directory does not count.
+test, and a walk of a `tmp_path` or a fixture directory does not count. Nor does a glob that does
+not recurse: the two guards in `test_ci_runs_every_test_exactly_once.py` that read every
+`tests/test_*.py` stay unmarked on purpose (#619). They run in the unit selection and keep no tree
+(`the_tree_read_once.fact`), so the small box pays ~4 s of parsing and no memory for them.
 """
 
 from __future__ import annotations

@@ -1146,10 +1146,18 @@ async def test_no_route_the_gate_leaves_open_takes_a_thread_or_reads_the_registr
         registry, monkeypatch, held_executor):
     """THE GATE'S RULE, "AN UNGATED PATH NEVER TAKES A THREAD" (`app.py::_ask_the_gate`), WITH JSON
     ON. The second review's probe, made deterministic: the gate on, the registry hung, the default
-    executor given one thread and that one held — and ten unauthenticated requests to every open
+    executor given one thread and that one held — and two unauthenticated requests to every open
     route about a project, at once. Each answers; none was handed to the executor; the registry was
     not read. Before the fix each of them read the registry on that executor, so they queued behind
-    it and so did every request the gate checks."""
+    it and so did every request the gate checks.
+
+    TWO, NOT TEN (#619). The proof is per request: the executor counts every hand-off and the hung
+    registry counts every read, and one thread is held, so a single request that took a thread
+    hangs the whole gather. Two at once on each of the eight routes (16 in flight) still has a
+    second request on a route while the first is unanswered, which is what a queue behind the
+    first would need. Ten on each held 80 in flight and raised the worker's resident memory by
+    165 MB for good (two: 59 MB, one: 30 MB, measured alone 2026-11-20): the allocator keeps the
+    pages after Python frees the objects."""
     import httpx
 
     from beeverforge.api.app import app
@@ -1163,7 +1171,7 @@ async def test_no_route_the_gate_leaves_open_takes_a_thread_or_reads_the_registr
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                      base_url="http://panel", timeout=10) as client:
             answers = await asyncio.wait_for(
-                asyncio.gather(*(client.get(path) for path in paths for _ in range(10))), 8.0)
+                asyncio.gather(*(client.get(path) for path in paths for _ in range(2))), 8.0)
     finally:
         hung.gate.set()
 

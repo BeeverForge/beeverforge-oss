@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.the_tree_read_once import forget as forget_the_trees
+
 #: Everything that would let a test ACT on real infrastructure. Deliberately not "every secret" —
 #: the criterion is authority, not confidentiality.
 LIVE_CREDENTIALS = (
@@ -834,6 +836,17 @@ def pytest_configure(config) -> None:
                 f"tree reads the file while this run is still writing it")
         config.pluginmanager.register(_RecordIds(record), "beeverforge-suite-record-ids")
     _the_shard(config)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem) -> None:
+    """A TEST MODULE'S TREES GO WITH IT (#619). When the next test is in another file, or there is
+    none, the tree cache drops what this module parsed and undoes its freezes
+    (`tests/the_tree_read_once.forget`). Without it one process running the unit selection ended
+    at 1,887 MB, holding every tree any guard had parsed. `trylast`, so the runner's own teardown
+    has already released the module's fixtures, and with them any tree a fixture held."""
+    if nextitem is None or nextitem.path != item.path:
+        forget_the_trees()
 
 
 def pytest_unconfigure(config) -> None:
