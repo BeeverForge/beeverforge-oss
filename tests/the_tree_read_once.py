@@ -35,18 +35,37 @@ under `LC_ALL=C` Python 3.12 turns on its UTF-8 mode (PEP 538/540; `sys.flags.ut
 a bare `read_text()` reads UTF-8 there too, and a cut that drops `encoding="utf-8"` passed this
 helper's three test files under pt_BR.UTF-8 and under `LC_ALL=C` alike (13 passed, 2026-10-22).
 
-WHAT IT COSTS: the package's trees are ~260 MB of Python objects in the worker that first asked;
-the suite's own trees another ~450 MB in a worker that runs one of the two guards that read
-`tests/` too. Measured 2026-10-22 against the sizes above; a worker already holds 300–500 MB.
+WHAT IT COSTS, AND FOR HOW LONG (#619). The package's trees are ~260 MB of Python objects and the
+suite's own trees another ~450 MB (measured 2026-10-22). Until #619 a worker held every tree it had
+parsed until it exited: one process running the unit selection with `not whole_tree` ended at
+1,887 MB (main at 2852852), 345 MB of it from the two guards that parsed every test file. So the
+cache now lives as long as the TEST MODULE that filled it: when the next test is in another file,
+or there is none, `conftest.pytest_runtest_teardown` calls `forget()`, which drops every tree and
+undoes the freezes below. Nothing is collected there: a tree is acyclic, so dropping the dict's
+reference frees it at once, and a full collection per module over a ~1 GB heap would cost a second
+each over ~960 modules. Within a module its tests still share one tree per content, which is where
+the repeated parses were (`test_schedules_are_reachable` asked eight times in one test). A module
+that asks again after another ran parses again; the parse of the package is 1.24 s and the
+modules of the unit selection that parse files at test time pay it again: in one process over
+that selection, `ast.parse` took 235 s against main's 166 s, and the run ended at 1,474 MB against
+main's 1,901 MB (2026-11-20, same box, back to back).
 
-AND THE COLLECTOR NEVER WALKS THEM. Every AST node is tracked by the cyclic GC, so a worker holding
-both trees (~3.9 M objects) paid 1.1 s for every full collection, measured 2026-10-22 on an idle
-box (1.115 s for 3,919,209 objects); the touched files' run on 5a3cccd8 paused over 1.0 s 67 times
-against main's 1, and one pause outlasted the engine probe's 1.0 s and read as
-`EngineNotListening`. With the freeze, 0 pauses over 0.5 s in two runs (main: 11 and 14). `parsed` calls `gc.freeze()` after each
-insert, which moves every object alive at that moment into the permanent generation. The price:
-cyclic garbage alive at the instant of a freeze is never collected (+24 MB peak RSS in one
-process over the 142 touched files: 1,533,600 KB without the freeze, 1,558,312 KB with it).
+A FACT, NOT THE TREE. A guard that needs one small answer from each of many files — the two in
+`test_ci_runs_every_test_exactly_once.py` that read every `tests/test_*.py` — asks `fact(path,
+read)`: the tree is parsed, `read` is asked of it, and only the answer is kept, keyed on the content
+and on `read`. The answer must hold no node of the tree, or it holds the tree.
+
+AND THE COLLECTOR NEVER WALKS THEM WHILE THEY ARE HELD. Every AST node is tracked by the cyclic GC,
+so a worker holding both trees (~3.9 M objects) paid 1.1 s for every full collection, measured
+2026-10-22 on an idle box (1.115 s for 3,919,209 objects); the touched files' run on 5a3cccd8
+paused over 1.0 s 67 times against main's 1, and one pause outlasted the engine probe's 1.0 s and
+read as `EngineNotListening`. With the freeze, 0 pauses over 0.5 s in two runs (main: 11 and 14).
+`parsed` calls `gc.freeze()` after each insert, which moves every object alive at that moment into
+the permanent generation. The price: cyclic garbage alive at the instant of a freeze is not
+collected while it is frozen (+24 MB peak RSS in one process over the 142 touched files: 1,533,600
+KB without the freeze, 1,558,312 KB with it). Each freeze is paired with the `gc.unfreeze()` in
+`forget()`, so that garbage and everything else frozen goes back to the oldest generation when the
+module is done, and the heap is frozen only while a module holds trees.
 
 READ THE TEXT BEFORE ASKING FOR THE TREE (#1069). A guard that scans a tree at import runs in every
 xdist worker's collection, so it asks `could_say(text, pattern)` first and parses only a file whose
@@ -60,15 +79,24 @@ never raises for its coding.
 from __future__ import annotations
 
 import ast
+import functools
 import gc
 import hashlib
 import os
 import re
 import tokenize
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 
 _trees: dict[bytes, ast.Module] = {}
+
+
+def _content(path: str | os.PathLike[str]) -> tuple[str, bytes]:
+    """The text of `path` read as UTF-8, and the key of exactly those bytes."""
+    text = Path(path).read_text(encoding="utf-8")
+    key = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+    return text, key
 
 
 def parsed(path: str | os.PathLike[str]) -> ast.Module:
@@ -78,16 +106,65 @@ def parsed(path: str | os.PathLike[str]) -> ast.Module:
     case to tolerate, exactly as it was with the inline parse. A `SyntaxError` is raised, not
     cached: the next read of a file somebody is mid-way through editing parses again.
     """
-    text = Path(path).read_text(encoding="utf-8")
-    key = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+    text, key = _content(path)
     tree = _trees.get(key)
     if tree is None:
         tree = ast.parse(text, filename=os.fspath(path))
         _trees[key] = tree
-        # Out of the collector: a full collection walking the ~3.9 M nodes of both trees took 1.1 s
-        # on an idle box, over the engine probe's 1.0 s (2026-10-22); freezing took 2 µs.
+        # Out of the collector while the module holds it: a full collection walking the ~3.9 M
+        # nodes of both trees took 1.1 s on an idle box, over the engine probe's 1.0 s
+        # (2026-10-22); freezing took 2 µs. `forget()` undoes it (#619).
         gc.freeze()
     return tree
+
+
+_facts: dict[tuple[bytes, Callable[[ast.Module], object]], object] = {}
+
+
+def fact[T](path: str | os.PathLike[str], read: Callable[[ast.Module], T]) -> T:
+    """`read(parsed(path))`, keeping the answer and not the tree (#619).
+
+    For a guard that asks one small thing of many files: the answer is kept per content and per
+    `read`, the tree is dropped as soon as `read` returns, unless the cache already held it. The
+    answer must not hold a node of the tree; if it does, it holds the whole tree."""
+    text, key = _content(path)
+    if (key, read) not in _facts:
+        held = _trees.get(key)
+        _facts[key, read] = read(
+            held if held is not None else ast.parse(text, filename=os.fspath(path)))
+    return _facts[key, read]
+
+
+_memos: list = []  # each a `functools.cache` wrapper, cleared by `forget()`
+
+
+def per_module[F: Callable[..., object]](fn: F) -> F:
+    """`functools.cache` for a walk keyed on a tree or a node, emptied with the trees (#619).
+
+    A memo keyed on a tree holds that tree for as long as the memo lives: under a module-level
+    `functools.cache` the trees `forget()` dropped stayed alive, and every module that parsed the
+    file again added one more copy. `forget()` clears every memo made here when it drops the
+    trees, so the memo and its trees go together."""
+    memo = functools.cache(fn)
+    _memos.append(memo)
+    return memo  # the same call signature as `fn`, as `functools.cache` gives it
+
+
+def forget() -> int:
+    """Drop every cached tree, fact and `per_module` memo, and undo the freezes that kept the trees from the
+    collector; how many trees were dropped.
+
+    Called when the test module that parsed them is done (`conftest.pytest_runtest_teardown`).
+    No collection: the trees are acyclic, so dropping them frees them here, and a full
+    collection at every module's end would walk the whole heap ~960 times a run."""
+    dropped = len(_trees)
+    _facts.clear()
+    for memo in _memos:
+        memo.cache_clear()
+    if dropped:
+        _trees.clear()
+        gc.unfreeze()
+    return dropped
 
 
 def cached() -> int:

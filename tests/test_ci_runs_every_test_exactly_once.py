@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tests.the_tree_read_once import parsed
+from tests.the_tree_read_once import fact, parsed
 
 ROOT = Path(__file__).resolve().parent.parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
@@ -567,18 +567,29 @@ def _marked_alone(decorators: list[ast.expr]) -> bool:
     return any("alone" in ast.unparse(d) for d in decorators)
 
 
+def _cpu_readers_unmarked_in(tree: ast.Module) -> tuple[str, ...]:
+    """The tests of one module that read their own CPU time without `alone`: names, never nodes,
+    so the answer `fact` keeps holds nothing of the tree (#619)."""
+    module_alone = any(isinstance(n, ast.Assign) and any(
+        isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets)
+        and "alone" in ast.unparse(n.value) for n in tree.body)
+    return tuple(node.name for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name.startswith("test_") and _reads_cpu_time(node)
+                 and not (module_alone or _marked_alone(node.decorator_list)))
+
+
+def _unmarked_cpu_readers(root: Path = ROOT) -> list[str]:
+    """Every test under `root/tests` that reads its own CPU time and is not marked `alone`. It
+    reads every test file, so it asks each one a `fact` and keeps no tree (#619: through the cache
+    the trees of all 961 files stayed in the worker, +345 MB with the guard below)."""
+    return [f"{path.relative_to(root).as_posix()}::{name}"
+            for path in sorted((root / "tests").glob("test_*.py"))
+            for name in fact(path, _cpu_readers_unmarked_in)]
+
+
 def test_every_test_that_asserts_its_own_cpu_time_is_marked_alone():
-    unmarked = []
-    for path in sorted((ROOT / "tests").glob("test_*.py")):
-        tree = parsed(path)
-        module_alone = any(isinstance(n, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets)
-            and "alone" in ast.unparse(n.value) for n in tree.body)
-        for node in tree.body:
-            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name.startswith("test_") and _reads_cpu_time(node)
-                    and not (module_alone or _marked_alone(node.decorator_list))):
-                unmarked.append(f"{path.relative_to(ROOT)}::{node.name}")
+    unmarked = _unmarked_cpu_readers()
 
     assert not unmarked, (f"{unmarked} read their own CPU time beside xdist neighbours, where it "
                           f"is inflated: mark them `alone`")
@@ -605,21 +616,28 @@ def _in_the_docker_group(decorators: list[ast.expr]) -> bool:
                                   'pytest.mark.xdist_group("docker")') for d in decorators)
 
 
-def _real_daemon_tests() -> dict[str, bool]:
-    """Every test gated on a real Docker daemon, and whether it is in the `docker` group: by the
-    module's `pytestmark`, or by its own decorators."""
-    found = {}
-    for path in sorted((ROOT / "tests").glob("test_*.py")):
-        tree = parsed(path)
-        marks = next((n.value.elts for n in tree.body if isinstance(n, ast.Assign)
-                      and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets)
-                      and isinstance(n.value, ast.List)), [])
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
-                every = [*marks, *node.decorator_list]
-                if _needs_the_daemon(every):
-                    found[f"{path.relative_to(ROOT)}::{node.name}"] = _in_the_docker_group(every)
-    return found
+def _daemon_tests_in(tree: ast.Module) -> tuple[tuple[str, bool], ...]:
+    """The tests of one module gated on a real Docker daemon, and whether each is in the `docker`
+    group: names and flags, never nodes, so the answer `fact` keeps holds nothing of the tree."""
+    marks = next((n.value.elts for n in tree.body if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in n.targets)
+                  and isinstance(n.value, ast.List)), [])
+    found = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            every = [*marks, *node.decorator_list]
+            if _needs_the_daemon(every):
+                found.append((node.name, _in_the_docker_group(every)))
+    return tuple(found)
+
+
+def _real_daemon_tests(root: Path = ROOT) -> dict[str, bool]:
+    """Every test under `root/tests` gated on a real Docker daemon, and whether it is in the
+    `docker` group: by the module's `pytestmark`, or by its own decorators. A `fact` per file, so
+    no tree stays in the worker (#619)."""
+    return {f"{path.relative_to(root).as_posix()}::{name}": grouped
+            for path in sorted((root / "tests").glob("test_*.py"))
+            for name, grouped in fact(path, _daemon_tests_in)}
 
 
 def test_every_test_on_the_real_daemon_is_in_the_docker_group():

@@ -124,7 +124,7 @@ MUTATIONS = [
     ("the integration run ignores the groups", "Makefile",
      "	python -m pytest -q -n auto --dist loadgroup -m", "	python -m pytest -q -n auto -m"),
     ("the reader misses a gate on a single function", TEST,
-     "                every = [*marks, *node.decorator_list]", "                every = marks"),
+     "            every = [*marks, *node.decorator_list]", "            every = marks"),
 
     ("the guard on CI's pytest stops following the Makefile", GUARD,
      "            lines += shown.stdout.splitlines()", "            pass",

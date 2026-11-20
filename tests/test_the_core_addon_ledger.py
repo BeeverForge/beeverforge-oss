@@ -40,14 +40,13 @@ not tag files by name.
 from __future__ import annotations
 
 import ast
-import functools
 import pathlib
 import re
 
 import add_ons
 import pytest
 
-from tests.the_tree_read_once import parsed
+from tests.the_tree_read_once import fact, parsed, per_module
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "core" / "07-extensibility.md"
@@ -108,7 +107,7 @@ def _imported_modules(path: pathlib.Path, rel: str) -> set[str]:
     return set(_imports_resolved_against(parsed(path), package))
 
 
-@functools.cache
+@per_module
 def _imports_resolved_against(tree: ast.Module, package: str) -> frozenset[str]:
     """The walk of `_imported_modules`, ONCE per (tree, package). `test_the_public_cut_is_written_down`
     asks it for every core file once per vendor entry — 46.42 s in CI for one test (run
@@ -129,15 +128,22 @@ def _imports_resolved_against(tree: ast.Module, package: str) -> frozenset[str]:
     return frozenset(found)
 
 
-def _vendor_sdk_imports(path: pathlib.Path) -> set[str]:
-    """Every vendor SDK this module imports, at any depth — module scope or lazy."""
+def _sdk_imports_in(tree: ast.Module) -> frozenset[str]:
+    """Every vendor SDK a module's tree imports, at any depth — module scope or lazy: names only,
+    so the `fact` kept for it holds nothing of the tree."""
     hits: set[str] = set()
-    for node in ast.walk(parsed(path)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             hits |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             hits.add(node.module.split(".")[0])
-    return {h for h in hits if h in VENDOR_SDKS}
+    return frozenset(h for h in hits if h in VENDOR_SDKS)
+
+
+def _vendor_sdk_imports(path: pathlib.Path) -> set[str]:
+    """Every vendor SDK this module imports. Asked of every file under `tests/`, so a `fact`: the
+    trees of ~1,000 test files held at once raised the worker's resident memory by 266 MB (#619)."""
+    return set(fact(path, _sdk_imports_in))
 
 
 def _on_the_vendor_side(rel: str, vendor_modules: set[str], vendor_packages: set[str]) -> bool:
