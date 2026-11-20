@@ -167,8 +167,13 @@ def _scrub_remote(path: Path, clone_url: str) -> None:
 
 def _git(args: list[str], cwd: Path | None = None,
          env: dict[str, str] | None = None) -> tuple[int, str]:
+    # The credential prompt is off, merged last so neither the caller nor the process turns it
+    # back on: a call with no credential would wait on `Username for ...` at the terminal, and
+    # the worker until the timeout.
     p = subprocess.run(["git", *gitpin.HOOKLESS, *args], cwd=cwd, capture_output=True, text=True,
-                       timeout=_GIT_TIMEOUT, env={**os.environ, **env} if env else None)
+                       timeout=_GIT_TIMEOUT, env={**os.environ, **(env or {}),
+                                                  "GIT_TERMINAL_PROMPT": "0",
+                                                  "GCM_INTERACTIVE": "never"})
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 

@@ -812,6 +812,15 @@ def _origin_of(repo_path) -> str | None:
     return os.path.normpath(os.path.join(str(repo_path), url))
 
 
+def _prompt_off(env: Mapping[str, str] | None) -> dict[str, str]:
+    """`env` with git's credential prompt off, merged last so neither the caller nor the process
+    turns it back on: a call with no credential would wait on `Username for ...` at the terminal,
+    and the worker until the timeout. A given `env` is the whole environment (the box's add
+    scrubs credentials from it), so it is never merged with `os.environ`."""
+    base = os.environ if env is None else env
+    return {**base, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
          env: Mapping[str, str] | None = None) -> tuple[int, str]:
     # `env=None` inherits the process environment, as every caller but the box's own add does.
@@ -819,6 +828,7 @@ def _run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120,
     # planted there would run here, on the host, with the host's credentials.
     if cmd[:1] == ["git"]:
         cmd = ["git", *gitpin.HOOKLESS, *cmd[1:]]
+        env = _prompt_off(env)
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
