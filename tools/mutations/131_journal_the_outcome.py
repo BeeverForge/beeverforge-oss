@@ -17,8 +17,8 @@ MUTATIONS = [
 
     ("the normal ending records a guess instead of the result",
      "beeverforge/runtime/temporal/workflow.py",
-     "        await self._journal_outcome(params, result.state.value, result.note or \"\")",
-     '        await self._journal_outcome(params, "done", result.note or "")'),
+     "        await self._journal_outcome(params, result.state.value, result.note or \"\",",
+     '        await self._journal_outcome(params, "done", result.note or "",'),
 
     ("the new command loses its replay gate",
      "beeverforge/runtime/temporal/workflow.py",
