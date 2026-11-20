@@ -2249,7 +2249,7 @@ def _say_to_the_channel(project: str, registry_name: str, phrase: str, level: st
                                  str(getattr(row, "language", "") or ""),
                                  project=project, **fields),
             level=level)
-    except Exception as exc:  # noqa: BLE001 — a channel is an ADD-ON; the log is the record
+    except Exception as exc:  # a channel is an ADD-ON; the log is the record
         # WARNING, not DEBUG. A channel push is best-effort and must never hold the gate, but
         # "best-effort" is the reason to log it, not the reason to hide it — DEBUG is what let a
         # method that does not exist go unnoticed through two deployments.

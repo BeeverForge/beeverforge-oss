@@ -4084,7 +4084,7 @@ async def _no_more_than_the_floor_has_free(admitted: list[str]) -> list[str]:
         return admitted
     try:
         free = await _floor_free()
-    except Exception as exc:  # noqa: BLE001 — the poller's count stands; this only narrows it
+    except Exception as exc:  # the poller's count stands; this only narrows it
         activity.logger.info("the floor could not be counted after the box gate (%s)", exc)
         return admitted
     return admitted[:free]
@@ -4119,7 +4119,7 @@ async def _prove_an_expired_box(project: str, repo: str, key: str, held: str) ->
             return
         bp.note_reprove_started(key, held)
         activity.logger.info("BEEVERFORGE_BOX_REPROVE %s: %s — %s", key, held, outcome.message)
-    except Exception:  # noqa: BLE001 — the hold stands, and the next tick asks again
+    except Exception:  # the hold stands, and the next tick asks again
         activity.logger.warning("the proof of %s's expired box could not be started", key,
                                 exc_info=True)
 
