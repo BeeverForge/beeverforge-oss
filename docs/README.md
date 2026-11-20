@@ -22,6 +22,7 @@ page — and a reader had to guess which one was current. There is now exactly o
 | [upgrading-from-openfactory.md](upgrading-from-openfactory.md) | **upgrading an OpenFactory 0.7 deployment** in place: what changes, what keeps working and until when, the steps for a compose and a one-machine deployment, and going back |
 | [reference/cli.md](reference/cli.md) | every command, what it does, when you need it |
 | [reference/configuration.md](reference/configuration.md) | the manifest, the registry, the environment — who owns which setting |
+| [reference/metrics.md](reference/metrics.md) | the `job` rows (attempt or ending) and the `card_transition` rows (transition or effect): what to count, and by which field |
 | [reference/product-role.md](reference/product-role.md) | switching on the product owner: context repo, per-person tokens, the release gate |
 | [reference/product-role-evaluation.md](reference/product-role-evaluation.md) | the product role's evaluation battery: writing its questions, running it, reading a score |
 | [project.yaml.example](project.yaml.example) | the annotated manifest |

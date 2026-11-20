@@ -269,7 +269,10 @@ def dashboard(records: list[dict], project: str | None = None) -> dict:
 
     scoped = [r for r in records if str(r.get("pk") or r.get("project") or "") == project]
     runs = [r for r in scoped if r.get("kind") == "agent_run"]
-    jobs = {str(r.get("ticket")): r for r in scoped if r.get("kind") == "job"}
+    # THE ENDING ROW (#609) is the job's last word, not an attempt: it carries no wall clock, and
+    # taken as the ticket's `job` it would blank the attempt's
+    jobs = {str(r.get("ticket")): r for r in scoped
+            if r.get("kind") == "job" and not (r.get("extra") or {}).get("ending")}
 
     def _sum_by(key: str) -> dict:
         out: dict[str, float] = defaultdict(float)

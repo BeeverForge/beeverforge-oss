@@ -802,6 +802,9 @@ class HoldSyncInput(BaseModel):
     issue: str
     state: str = "on_hold"
     note: str = ""
+    #: The job's pull request, for the ending row `record_outcome` writes (#609). `""` for an input
+    #: recorded before this field, or a job that opened none.
+    pr_url: str = ""
     #: THE PARK THE WORKER ALREADY APPLIED, when the box handed it back (ADR-0055 D7, #414): the
     #: id of its transition in the card's record, so this reconcile is answered from that row and
     #: the card is not parked a second time. `""` — a park the workflow made itself (a crash, a
