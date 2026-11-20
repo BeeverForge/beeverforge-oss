@@ -46,7 +46,9 @@ reference frees it at once, and a full collection per module over a ~1 GB heap w
 each over ~960 modules. Within a module its tests still share one tree per content, which is where
 the repeated parses were (`test_schedules_are_reachable` asked eight times in one test). A module
 that asks again after another ran parses again; the parse of the package is 1.24 s and the
-modules of the unit selection that parse files at test time pay it in seconds, not minutes.
+modules of the unit selection that parse files at test time pay it again: in one process over
+that selection, `ast.parse` took 235 s against main's 166 s, and the run ended at 1,474 MB against
+main's 1,901 MB (2026-11-20, same box, back to back).
 
 A FACT, NOT THE TREE. A guard that needs one small answer from each of many files — the two in
 `test_ci_runs_every_test_exactly_once.py` that read every `tests/test_*.py` — asks `fact(path,
