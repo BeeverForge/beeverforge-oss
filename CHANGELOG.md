@@ -7,6 +7,14 @@ Every pull request carries the line its release's notes will read for it, as a f
 into the version's section here, and its GitHub release page carries the same notes
 ([docs/RELEASING.md](docs/RELEASING.md), "The release notes").
 
+## 0.1.3 (2026-11-20)
+
+### Fixes
+
+- **The board view reads a GitHub project board once, not twice.** Opening a board asked GitHub for the project's columns in one set of reads and for where each card sits in another, so every page of the board was paid for twice over. The column names now come in the same read that places the cards, so one view makes one read per hundred cards (#591).
+- **A Docker daemon slow to remove a box no longer crashes the job or loses its outcome.** When `docker rm -f` on a job's box did not finish within its bound, the job errored out with a traceback before any work if the box was a leftover from an interrupted attempt, and at the end of a run the same timeout replaced the run's outcome, so a hold or an open pull request surfaced as a failed job. The removal is now tried again once after a short wait; a leftover that still will not go parks the job with one sentence naming the box and the remedy, `docker rm -f <name>`, then resume, and any other step of starting the box that times out parks it the same way. A box left behind after a run is reported once, on the card and in the log, with the same command, and the run keeps the result it reached (#608).
+- **A merged job leaves its merge in the metrics.** When a job ends, its driver — the workflow and `beeverforge run`/`poll` alike — now writes one `job` row with the final state, the pull request and the platform stamp, marked `extra.ending: true` and written once, so a pull request merged by hand shows as a job that ended merged. And when the forge closed the issue before the workflow saw the merge, the card's door still records `merged` for that pull request, once, without rewriting the card. The metrics docs (`docs/reference/metrics.md`) say what an ending row is and that `card_transition` rows without `event` are effect outcomes (#609).
+
 ## 0.1.2 (2026-11-18)
 
 ### Fixes
