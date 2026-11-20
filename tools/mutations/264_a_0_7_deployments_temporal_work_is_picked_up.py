@@ -166,10 +166,12 @@ MUTATIONS = [
      "    prefixes = (prefix,)"),
     ("the floor counts BeeverForge's jobs only", ACTIVITIES,
      "    async for _ in client.list_workflows(\n"
-     "        'WorkflowType = \"JobWorkflow\" AND ExecutionStatus = \"Running\"'\n"
+     "        'WorkflowType IN (\"JobWorkflow\", \"BoxProveWorkflow\") AND ExecutionStatus = "
+     "\"Running\"'\n"
      "    ):\n        running += 1",
      "    async for _ in client.list_workflows(\n"
-     "        'WorkflowType = \"JobWorkflow\" AND ExecutionStatus = \"Running\"'\n"
+     "        'WorkflowType IN (\"JobWorkflow\", \"BoxProveWorkflow\") AND ExecutionStatus = "
+     "\"Running\"'\n"
      "        ' AND WorkflowId STARTS_WITH \"beeverforge-\"'\n"
      "    ):\n        running += 1"),
 

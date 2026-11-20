@@ -718,6 +718,18 @@ against moves — your `setup:` or `validate:` change, the harness toolbox chang
 changes **in a way your commands can feel**. `beeverforge box status myapp` says what changed, and
 the panel carries the same verdict beside every project.
 
+**An expired proof is proven again by the worker.** When the hold is an *expiry* — a proof that
+passed, against a world that has since moved — the worker starts one `box_prove` itself (the same
+row as above, so the same single flight and the same proof lock), once per hold reason, and only
+when the floor has a free job slot; it holds that slot while it runs, so a box sized for N lanes
+never runs a proof beside N jobs. When the proof passes, the next tick clears the hold, picks cards
+up, and tells the channel once that the box was proven again and why. When it fails, pickup stays
+held and the hold's sentence becomes the proof's own failure with its remedy; the worker does not
+prove that reason again, so run `beeverforge box prove myapp` once you have fixed it. A box that
+was *never* proven, or whose last proof *failed*, is never proven by the worker. To keep the proof
+by hand as before, set `BEEVERFORGE_BOX_REPROVE=off` (`0`, `false` and `no` say the same) on the
+worker; unset, it is on.
+
 > **Updating the platform does NOT expire your proof, and that is worth knowing before you update
 > often.** A local install builds its own box image, so every `up -d --build` gives it a new
 > content id — including builds that carry nothing but a newer version of BeeverForge. What your
