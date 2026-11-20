@@ -3093,6 +3093,14 @@ async def record_outcome(inp: HoldSyncInput) -> str:
         return record_ending(ProjectRegistry().get(inp.project), inp.issue, inp.state,
                              by="the workflow", note=inp.note or "")
 
+    def _the_row() -> bool:
+        # AND ITS ROW IN THE METRICS (#609): the attended driver writes it through the same function
+        from beeverforge.observability.job_record import record_job_ending
+
+        return record_job_ending(project=inp.project, issue=inp.issue, state=inp.state,
+                                 pr_url=inp.pr_url)
+
+    await asyncio.to_thread(_the_row)     # never raises: telemetry is additive
     try:
         recorded = await asyncio.to_thread(_write)
     except Exception as exc:  # noqa: BLE001 — the job ended; the record failing must not undo it

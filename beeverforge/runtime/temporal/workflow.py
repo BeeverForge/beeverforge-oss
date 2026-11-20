@@ -1652,11 +1652,12 @@ class JobWorkflow:
             await self._cleanup(params, shield=False)  # failed after retries → stop tasks
             await self._journal_outcome(params, JobState.FAILED.value, describe(exc, limit=200))
             raise
-        await self._journal_outcome(params, result.state.value, result.note or "")
+        await self._journal_outcome(params, result.state.value, result.note or "",
+                                    pr_url=result.pr_url or "")
         return result
 
     async def _journal_outcome(self, params: JobParams, state: str, note: str, *,
-                               shield: bool = False) -> None:
+                               shield: bool = False, pr_url: str = "") -> None:
         """Record how this job ENDED in the journal on disk — the record that outlives the engine.
 
         THE ONE EXIT, AND THAT IS THE WHOLE POINT (pilot, 2026-08-17). The journal is written by
@@ -1687,7 +1688,7 @@ class JobWorkflow:
         call = workflow.execute_activity(
             record_outcome,
             HoldSyncInput(project=params.project, issue=params.issue, state=state,
-                          note=(note or "")[:400]),
+                          note=(note or "")[:400], pr_url=pr_url),
             start_to_close_timeout=timedelta(minutes=2),
             retry_policy=_RETRY,
         )
