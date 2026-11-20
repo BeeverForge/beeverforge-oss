@@ -3894,30 +3894,46 @@ def _pickup_column(project) -> str:
     return got or CANONICAL_COLUMNS["todo"]
 
 
-@activity.defn
-async def available_slots() -> int:
+async def _free_slots(client) -> int:
     """Free slots on the floor = max_concurrent_jobs() minus the JobWorkflows currently RUNNING
-    (globally — the floor is a single shared agent token in v1). The poller starts at most this
-    many new tickets per tick, so a TO-DO batch is picked up ONE at a time in order, never all
-    at once. Excludes the deploy-watch children + the poller itself (WorkflowType filter): a
-    merged job that spawned a deploy-watch has ALREADY freed the floor (ADR-0005)."""
+    (globally — the floor is a single shared agent token in v1) and the box proofs: a proof pulls
+    an image and runs the client's whole suite, so it holds a slot while it runs (#614). Excludes
+    the deploy-watch children + the poller itself (WorkflowType filter): a merged job that
+    spawned a deploy-watch has ALREADY freed the floor (ADR-0005)."""
     from beeverforge.runtime.temporal import max_concurrent_jobs
 
-    # EVERY POLLER TICK runs this, and every tick used to open an engine client to count one
-    # list — see `engine_client`.
-    client = engine_client()
     running = 0
     async for _ in client.list_workflows(
-        'WorkflowType = "JobWorkflow" AND ExecutionStatus = "Running"'
+        'WorkflowType IN ("JobWorkflow", "BoxProveWorkflow") AND ExecutionStatus = "Running"'
     ):
         running += 1
     return max(0, max_concurrent_jobs() - running)
 
 
+async def _floor_free() -> int:
+    """The free slots on the floor, counted now through the worker's engine client."""
+    return await _free_slots(engine_client())
+
+
+@activity.defn
+async def available_slots() -> int:
+    """Free slots on the floor — the poller starts at most this many new tickets per tick, so a
+    TO-DO batch is picked up ONE at a time in order, never all at once. See `_free_slots`."""
+    # EVERY POLLER TICK runs this, and every tick used to open an engine client to count one
+    # list — see `engine_client`.
+    client = engine_client()
+    return await _free_slots(client)
+
+
 @activity.defn
 async def scan_todo(inp: ScanInput) -> list[str]:
     """Issue numbers currently in the board's pickup column (read-only)."""
-    from beeverforge.box_prove import announce_gate, clear_gate_announcement, gate_reason
+    from beeverforge.box_prove import (
+        announce_gate,
+        announce_reproven,
+        clear_gate_announcement,
+        gate_reason,
+    )
     from beeverforge.credentials import tracker_token_for
     from beeverforge.factory import bot_token_provider_for
 
@@ -3960,6 +3976,7 @@ async def scan_todo(inp: ScanInput) -> list[str]:
     default_held = await _gate()
     if default_held:
         announce_gate(inp.project, default_held, registry_name=inp.project)
+        await _prove_an_expired_box(inp.project, "", inp.project, default_held)
         # BOTH CONTRACTS, precisely: the original gate never spent board quota on a project
         # that cannot run anything, and the per-repo contract says a proven foreign repo must
         # not wait on the default's paperwork. A foreign card is only ever admitted on a proof
@@ -3974,6 +3991,7 @@ async def scan_todo(inp: ScanInput) -> list[str]:
         if not _bp.foreign_proofs_recorded(inp.project):
             return []
     else:
+        announce_reproven(inp.project, registry_name=inp.project)  # only if the worker proved it
         clear_gate_announcement(inp.project)  # so the NEXT breakage speaks
 
     tok = tracker_token_for(project)
@@ -4049,10 +4067,61 @@ async def scan_todo(inp: ScanInput) -> list[str]:
             # per-key marker so repos don't overwrite each other; the NOTIFIER is the
             # project's — a composite key is not a registry name
             announce_gate(key, held_by_repo[card_repo], registry_name=inp.project)
+            await _prove_an_expired_box(inp.project, card_repo, key, held_by_repo[card_repo])
             continue
+        announce_reproven(key, registry_name=inp.project)
         clear_gate_announcement(key)
         admitted.append(ref)
-    return admitted
+    return await _no_more_than_the_floor_has_free(admitted)
+
+
+async def _no_more_than_the_floor_has_free(admitted: list[str]) -> list[str]:
+    """The cards this scan admits, cut to the slots free NOW. The poller counted its slots before
+    it scanned, and a scan of another project may have started a box proof since (#614): a proof
+    holds a slot, and a box sized for N lanes never runs a proof beside N jobs. A floor that cannot
+    be counted leaves the poller's own count standing."""
+    if not admitted:
+        return admitted
+    try:
+        free = await _floor_free()
+    except Exception as exc:  # the poller's count stands; this only narrows it
+        activity.logger.info("the floor could not be counted after the box gate (%s)", exc)
+        return admitted
+    return admitted[:free]
+
+
+async def _prove_an_expired_box(project: str, repo: str, key: str, held: str) -> None:
+    """Start ONE box proof for an expired hold, on the worker, through the `box_prove` row (#614).
+
+    ONLY AN EXPIRY (`box_prove.Expired`): a box never proven, a proof that FAILED and a manifest
+    not yet merged are held for a person, and proving again would measure the same fault. ONCE PER
+    HOLD REASON, keyed as `announce_gate` keys it, so a failing proof is not a loop; the proof's
+    own lock and the row's single flight keep it to one at a time, and a proof already running is
+    not asked again. ONLY WITH A FREE SLOT: a proof pulls an image and runs the client's whole
+    suite, so it holds a slot while it runs (`_free_slots` counts it) and a tick with none waits.
+
+    NEVER RAISES — it runs on the poller's tick, and the hold it comes from already stands."""
+    from beeverforge import box_prove as bp
+
+    if not isinstance(held, bp.Expired) or not bp.reprove_enabled():
+        return
+    try:
+        if not bp.reprove_due(key, held) or bp.proof_running(key):
+            return
+        if await _floor_free() < 1:
+            return
+        from beeverforge.actions import SYSTEM, perform
+
+        outcome = await perform("box_prove", by=SYSTEM, project=project, repo=repo)
+        if not outcome.ok:
+            activity.logger.warning("the worker could not start the proof of %s's expired box "
+                                    "(%s) — retrying next tick", key, outcome.message)
+            return
+        bp.note_reprove_started(key, held)
+        activity.logger.info("BEEVERFORGE_BOX_REPROVE %s: %s — %s", key, held, outcome.message)
+    except Exception:  # the hold stands, and the next tick asks again
+        activity.logger.warning("the proof of %s's expired box could not be started", key,
+                                exc_info=True)
 
 
 def _taken_out_for_its_repository(project, tracker, board, ref: str) -> bool:

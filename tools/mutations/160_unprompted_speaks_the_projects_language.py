@@ -25,10 +25,10 @@ MUTATIONS = [
      'f"pre-flight sizing did not run ({reason}) — this ticket proceeds unsized")'),
 
     ("…and the channel half of the same gate", "beeverforge/box_prove.py",
-     '            message=tl_voice.say(tl_voice.NARRATION, "gate.pickup-held",\n'
+     '            message=tl_voice.say(tl_voice.NARRATION, phrase,\n'
      '                                 str(getattr(row, "language", "") or ""),\n'
-     '                                 project=project, reason=reason),',
-     '            message=f"tickets are not being picked up here — {reason}",'),
+     '                                 project=project, **fields),',
+     '            message=f"tickets are not being picked up here — {fields.get(\'reason\')}",'),
 
     ("the walk stops walking (a wrong root reports a clean package)", TEST,
      'for path in sorted((ROOT / "beeverforge").rglob("*.py")):',

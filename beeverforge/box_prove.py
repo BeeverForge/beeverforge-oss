@@ -1938,6 +1938,15 @@ def _toolchain_of(image: str) -> str:
     return (p.stdout or "").strip() if p.returncode == 0 else ""
 
 
+class Expired(str):
+    """A hold sentence that says a PASSING proof no longer describes the world (#614).
+
+    A `str` so every reader of a hold — the announcement, the panel, the log — takes it as the
+    sentence it is; a class so the worker can tell this hold from the others without parsing prose.
+    Only an expiry is something a proof can clear: a box never proven, a proof that FAILED and a
+    manifest not yet merged each need a person, and proving again would measure the same fault."""
+
+
 def _freshness_reason(proof: Proof, *, digest: str, variant: str, commands: str | None,
                       run_it: str, machine: str = "") -> str | None:
     """Whether the recorded proof still describes the world, and which fact moved if not.
@@ -1950,8 +1959,8 @@ def _freshness_reason(proof: Proof, *, digest: str, variant: str, commands: str 
     # as a rebuilt one. Empty on either side is "cannot say", which is not a verdict — every other
     # freshness check below still applies.
     if machine and proof.toolchain and machine != proof.toolchain:
-        return (f"the harness changed ({proof.toolchain} → {machine}), so the box is no longer "
-                f"the one that was proven — {run_it}")
+        return Expired(f"the harness changed ({proof.toolchain} → {machine}), so the box is no "
+                       f"longer the one that was proven — {run_it}")
     # THE TOOLBOX IS AN IMAGE-SIDE FACT, and a proof taken against no image never recorded one
     # (review of #105). Reading the worker's stamp against an empty field made a host proof report
     # a toolbox change on every tick — and `box prove`, the remedy in that very sentence, wrote the
@@ -1959,8 +1968,8 @@ def _freshness_reason(proof: Proof, *, digest: str, variant: str, commands: str 
     # module's own comments keep warning about. Reachable wherever a gating process has a populated
     # volume AND the declaration is set, which a compose worker that says so by hand is.
     if proof.image and variant and proof.toolbox != variant:
-        return (f"the harness toolbox changed ({proof.toolbox or 'none'} → {variant}), "
-                f"so the box is no longer the one that was proven — {run_it}")
+        return Expired(f"the harness toolbox changed ({proof.toolbox or 'none'} → {variant}), "
+                       f"so the box is no longer the one that was proven — {run_it}")
     if proof.image and not variant and proof.toolbox:
         # I CANNOT READ MY OWN TOOLBOX ≠ THE TOOLBOX CHANGED. The three-state rule this codebase
         # keeps paying for, one seam further in. The PANEL runs without the toolbox volume
@@ -1984,8 +1993,8 @@ def _freshness_reason(proof: Proof, *, digest: str, variant: str, commands: str 
                  "`setup:`/`validate:` from a measurement this process could not make",
                  proof.commands_hash)
     elif proof.commands_hash != commands:
-        return (f"this project's `setup:` or `validate:` changed since the box was proven — "
-                f"{run_it}")
+        return Expired(f"this project's `setup:` or `validate:` changed since the box was proven "
+                       f"— {run_it}")
     if proof.digest != digest:
         # A REBUILD IS NOT A CHANGE, and on the free deployment it is the common case. A compose
         # install BUILDS its box image, so it has no registry digest and this compares the content
@@ -2010,8 +2019,8 @@ def _freshness_reason(proof: Proof, *, digest: str, variant: str, commands: str 
             proof.digest = digest
             save(proof)
             return None
-        return (f"the image {proof.image} changed ({proof.digest[:19]}… → {digest[:19]}…) — "
-                f"{run_it}")
+        return Expired(f"the image {proof.image} changed ({proof.digest[:19]}… → "
+                       f"{digest[:19]}…) — {run_it}")
     return None
 
 
@@ -2060,6 +2069,29 @@ def foreign_proofs_recorded(project: str, *, root: Path | None = None) -> bool:
     except OSError as exc:
         log.warning("could not list the proof directory for %s (%s)", project, exc)
         return False
+
+
+def _the_failure_said(proof: Proof, run_it: str) -> str:
+    """The hold of a proof that FAILED, in the proof's own words: the first thing it found wrong,
+    with that finding's remedy (#614). The worker proves an expired box itself, so the person who
+    reads this did not run the proof and has nothing else to go on — "run it again" would send them
+    to measure what the worker just measured.
+
+    ONE LINE, REDACTED: a finding's message may carry the tail of the client's own output, and this
+    sentence goes to a channel."""
+    from beeverforge.runtime.boxed_job import redact
+
+    def line(text: str) -> str:
+        first = (text or "").strip().splitlines()
+        return redact(first[0].strip())[:200] if first else ""
+
+    failures = proof.failures()
+    if not failures:
+        return f"the last box proof FAILED — {run_it}"
+    first = failures[0]
+    what = f"{first.check}: {line(first.message)}" if line(first.message) else first.check
+    more = f" (and {len(failures) - 1} more)" if len(failures) > 1 else ""
+    return f"the last box proof FAILED — {what}{more} — {line(first.remedy) or run_it}"
 
 
 def gate_reason(project, *, sandbox: str, repo: str = "") -> str | None:
@@ -2115,7 +2147,7 @@ def gate_reason(project, *, sandbox: str, repo: str = "") -> str | None:
         subject = f"the box for {repo}" if repo and key != name else "the box"
         return f"{subject} has never been proven — {run_it}"
     if not proof.ok:
-        return f"the last box proof FAILED — {run_it}"
+        return _the_failure_said(proof, run_it)
 
     try:
         from beeverforge.loader import load_manifest
@@ -2194,6 +2226,37 @@ def _hold_key(reason: str) -> str:
     return _re.sub(r"\s+", " ", _re.sub(r"\([^)]*\)", "", reason)).strip()
 
 
+def _say_to_the_channel(project: str, registry_name: str, phrase: str, level: str,
+                        **fields: str) -> None:
+    """One gate sentence to the project's channel. Best-effort: a channel is an ADD-ON, so a push
+    that fails is logged and never holds the gate."""
+    try:
+        from beeverforge.factory import notifier_for_project
+        from beeverforge.registry import ProjectRegistry
+
+        # `notify`, NOT `send`. This read `.send(...)` from the day it shipped, and NO notifier
+        # has ever had that method — `Notifier` is a Protocol with exactly one member
+        # (`adapters/notify/base.py:17`). Every call raised `AttributeError` into the catch-all
+        # below and was logged at DEBUG, so the commit that introduced this gate claimed "the gate
+        # speaks" while the channel half had never once run: the 18th instance of this
+        # repository's signature defect, in the change whose entire point was that a wait must be
+        # a question rather than a state.
+        from beeverforge.techlead import voice as tl_voice
+
+        row = ProjectRegistry().get(registry_name or project)
+        notifier_for_project(row).notify(
+            message=tl_voice.say(tl_voice.NARRATION, phrase,
+                                 str(getattr(row, "language", "") or ""),
+                                 project=project, **fields),
+            level=level)
+    except Exception as exc:  # a channel is an ADD-ON; the log is the record
+        # WARNING, not DEBUG. A channel push is best-effort and must never hold the gate, but
+        # "best-effort" is the reason to log it, not the reason to hide it — DEBUG is what let a
+        # method that does not exist go unnoticed through two deployments.
+        log.warning("could not push the box gate for %s to a channel (%s) — the log line is "
+                    "the only record", project, str(exc)[:120])
+
+
 def announce_gate(project: str, reason: str, *, root: Path | None = None,
                   registry_name: str = "") -> bool:
     """Say why pickup is held, ONCE per reason. Returns whether it spoke.
@@ -2218,31 +2281,7 @@ def announce_gate(project: str, reason: str, *, root: Path | None = None,
         pass
 
     log.warning("%s: pickup is held — %s", project, reason)
-    try:
-        from beeverforge.factory import notifier_for_project
-        from beeverforge.registry import ProjectRegistry
-
-        # `notify`, NOT `send`. This read `.send(...)` from the day it shipped, and NO notifier
-        # has ever had that method — `Notifier` is a Protocol with exactly one member
-        # (`adapters/notify/base.py:17`). Every call raised `AttributeError` into the catch-all
-        # below and was logged at DEBUG, so the commit that introduced this gate claimed "the gate
-        # speaks" while the channel half had never once run: the 18th instance of this
-        # repository's signature defect, in the change whose entire point was that a wait must be
-        # a question rather than a state.
-        from beeverforge.techlead import voice as tl_voice
-
-        row = ProjectRegistry().get(registry_name or project)
-        notifier_for_project(row).notify(
-            message=tl_voice.say(tl_voice.NARRATION, "gate.pickup-held",
-                                 str(getattr(row, "language", "") or ""),
-                                 project=project, reason=reason),
-            level="warning")
-    except Exception as exc:  # noqa: BLE001 — a channel is an ADD-ON; the log is the record
-        # WARNING, not DEBUG. A channel push is best-effort and must never hold the gate, but
-        # "best-effort" is the reason to log it, not the reason to hide it — DEBUG is what let a
-        # method that does not exist go unnoticed through two deployments.
-        log.warning("could not push the box gate for %s to a channel (%s) — the log line above is "
-                    "the only record", project, str(exc)[:120])
+    _say_to_the_channel(project, registry_name, "gate.pickup-held", "warning", reason=reason)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # THE KEY, NOT THE SENTENCE — the same thing the read above compares. Writing the full
@@ -2260,6 +2299,80 @@ def clear_gate_announcement(project: str, *, root: Path | None = None) -> None:
     """Forget what was said, so the NEXT breakage speaks rather than staying quiet because
     something similar was announced once."""
     _announced_file(project, root).unlink(missing_ok=True)
+
+
+# ── the worker proves an expired box itself (#614) ────────────────────────────────────────────────
+
+#: The words that turn the worker's own re-proof off. Anything else, or nothing, leaves it on.
+_REPROVE_OFF = frozenset({"off", "0", "false", "no"})
+
+
+def reprove_enabled() -> bool:
+    """Whether the worker proves an EXPIRED box itself. On unless the deployment says
+    `BEEVERFORGE_BOX_REPROVE=off` (`0`, `false` and `no` say the same), and then a person proves by
+    hand with `beeverforge box prove`, as before."""
+    return (os.environ.get("BEEVERFORGE_BOX_REPROVE") or "").strip().lower() not in _REPROVE_OFF
+
+
+def proof_running(key: str) -> bool:
+    """Whether a proof of `key` is running on this machine right now: its lock is held.
+
+    A probe, not a claim: the lock is taken for no time and let go. Another holder is a proof (the
+    shell's, the worker's, onboarding's); the same thread holding it would not be, so this is asked
+    from the tick, which proves nothing itself. A lock that cannot be opened says no, as
+    `_hold_the_proof_of` runs unlocked then."""
+    lock = FileLock(proof_lock_path(key))
+    try:
+        lock.acquire(timeout=0)
+    except Waited:
+        return True
+    except OSError as exc:
+        log.warning("could not tell whether a proof of %s is running (%s)", key, exc)
+        return False
+    lock.release()
+    return False
+
+
+def _reproved_file(key: str, root: Path | None = None) -> Path:
+    return (root or _proof_dir()) / f"{key}.reprove"
+
+
+def reprove_due(key: str, reason: str, *, root: Path | None = None) -> bool:
+    """Whether the worker has not yet proved this hold: ONCE PER HOLD REASON, keyed as
+    `announce_gate` keys it (`_hold_key`), so a rebuild that moves only the digest in the sentence
+    is the same hold. A marker that cannot be read is not a start that happened — it is due."""
+    try:
+        return json.loads(_reproved_file(key, root).read_text()).get("hold") != _hold_key(reason)
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def note_reprove_started(key: str, reason: str, *, root: Path | None = None) -> None:
+    """Record that the worker started the proof for this hold, and why — what the channel is told
+    when the hold clears. Not fatal when it cannot be written, but said: without it the next tick
+    starts the proof again."""
+    path = _reproved_file(key, root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"hold": _hold_key(reason), "reason": reason}))
+    except OSError as exc:
+        log.warning("could not record that the proof of %s was started (%s) — the next tick "
+                    "will start it again", key, exc)
+
+
+def announce_reproven(key: str, *, root: Path | None = None, registry_name: str = "") -> bool:
+    """Tell the channel, once, that a box the worker proved again is open — and why it had to be.
+    Returns whether it spoke. Nothing to say when the worker started no proof for this key. The
+    marker goes either way, so a channel that is down is not retried for ever."""
+    path = _reproved_file(key, root)
+    try:
+        reason = str(json.loads(path.read_text()).get("reason") or "")
+    except (OSError, ValueError, AttributeError):
+        return False
+    log.warning("%s: the box was proven again — pickup resumes (it was held: %s)", key, reason)
+    _say_to_the_channel(key, registry_name, "gate.box-reproven", "info", reason=reason)
+    path.unlink(missing_ok=True)
+    return True
 
 
 # ── the box, as a HUMAN-READABLE verdict ──────────────────────────────────────────────────────

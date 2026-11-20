@@ -687,6 +687,11 @@ NARRATION: dict[str, dict[str, str]] = {
     "gate.pickup-held": {
         "en": "⏸️ *{project}* — tickets are not being picked up.\n{reason}",
         "pt-BR": "⏸️ *{project}* — os tickets não estão sendo pegos.\n{reason}"},
+    "gate.box-reproven": {
+        "en": "✅ *{project}* — the box was proven again and tickets are being picked up.\n"
+              "It had to be proven because: {reason}",
+        "pt-BR": "✅ *{project}* — o box foi provado de novo e os tickets voltaram a ser pegos.\n"
+                 "Precisou ser provado porque: {reason}"},
     # ── the promotion chain, on the ticket and in the channel ────────────────────────────────────
     #
     # THESE REACH THE TICKET, which is the one surface every project has whether or not a channel
