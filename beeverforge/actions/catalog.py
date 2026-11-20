@@ -7780,7 +7780,7 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
     from beeverforge import box_prove
 
     shell = box_prove.here()
-    if shell is not None and getattr(shell.project, "name", None) == project:
+    if shell is not None and (shell.name or getattr(shell.project, "name", None)) == project:
         run = await asyncio.to_thread(box_prove.prove_the_box, shell.project, repo=repo, ref=ref,
                                       image=image, sandbox=sandbox, record=shell.record)
         if run.busy:
@@ -7809,8 +7809,13 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
     # repository's proof and the default one never share a flight
     view, key = found, found.name
     if repo:
+        from beeverforge.actions import _REPO_RE
         from beeverforge.runtime.card_repo import _runner_view
 
+        if len(repo) > 160 or not _REPO_RE.match(repo):
+            return refused(INVALID, f"that is not a repository — owner/name, letters, digits, "
+                                    f"'.', '-' or '_', got {repo!r}. Nothing was started.",
+                           project=found.name, repo=repo)
         view, key = _runner_view(found, f"{repo}#0")
     # A BOX THE WORKER CANNOT RUN IS REFUSED HERE, as `_start` refuses it: an unknown box, or an
     # image the box cannot honour, would otherwise be answered `running` and fail on the worker
@@ -7830,7 +7835,7 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
     client, bad_engine = await _connected()
     if bad_engine:
         return bad_engine
-    handle = box_prove.workflow_id(key, ref)
+    handle = box_prove.workflow_id(key, ref, image, box_kind)
     try:
         await client.start_workflow(
             "BoxProveWorkflow",

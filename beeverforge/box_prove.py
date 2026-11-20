@@ -1295,6 +1295,8 @@ class Here:
 
     project: object
     record: Callable[[Proof], Path | None]
+    #: The name the command was given — the registry's key, which is not always `project.name`.
+    name: str = ""
 
 
 #: Set only by `beeverforge box prove`, around the row. WHERE A PROOF RUNS IS NOT A TRANSPORT'S
@@ -1305,9 +1307,11 @@ _HERE: ContextVar[Here | None] = ContextVar("box_prove_here", default=None)
 
 
 @contextmanager
-def proving_here(project, *, record: Callable[[Proof], Path | None]):
-    """Every `box_prove` asked in this context is proven in this process, of `project`."""
-    token = _HERE.set(Here(project=project, record=record))
+def proving_here(project, *, record: Callable[[Proof], Path | None], name: str = ""):
+    """Every `box_prove` asked in this context is proven in this process, of `project` — asked
+    under `name`, the registry key the command was given (the project's own name when omitted)."""
+    token = _HERE.set(Here(project=project, record=record,
+                           name=name or getattr(project, "name", "")))
     try:
         yield
     finally:
@@ -1330,10 +1334,13 @@ def _tell(kind: str, text: str) -> None:
         log.warning("a proof's progress could not be told (%s)", exc)
 
 
-def workflow_id(key: str, ref: str = "") -> str:
-    """The id one proof runs under on the worker: one flight per key and ref, so a second ask
-    while it runs joins it. HASHED, never truncated or spelled: a ref is a branch somebody typed."""
-    return "box-prove-" + hashlib.sha256(f"{key}\n{ref}".encode()).hexdigest()
+def workflow_id(key: str, ref: str = "", image: str = "", sandbox: str = "") -> str:
+    """The id one proof runs under on the worker: one flight per key, ref, image and box, so a
+    second ask for the same thing while it runs joins it — and an ask for another image or box
+    never joins a proof that measures something else. HASHED, never truncated or spelled: a ref is
+    a branch somebody typed."""
+    return "box-prove-" + hashlib.sha256(
+        f"{key}\n{ref}\n{image}\n{sandbox}".encode()).hexdigest()
 
 
 def document(proof: Proof) -> dict:

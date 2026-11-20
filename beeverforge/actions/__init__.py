@@ -552,6 +552,8 @@ _ISSUE_RE = re.compile(r"^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
 #: that out, not to add characters to a class and hope.
 _QUALIFIED_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
+#: The repository part of that pattern alone, for a repository named without a ticket.
+_REPO_RE = re.compile(_QUALIFIED_RE.pattern.split("#", 1)[0] + "$")
 _ISSUE_MAX = 64
 #: The qualified form needs room for `owner/name#` on top of the ref itself. A SEPARATE bound, so
 #: widening it here cannot quietly widen what a bare ref may be — the bound is what keeps a ref
