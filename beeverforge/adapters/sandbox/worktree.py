@@ -1178,9 +1178,10 @@ class WorktreeSandbox(SandboxAdapter):
         directory is removed only when `wt/.git` names THIS repository's `<common>/worktrees/` and
         the list, read, does not list `wt` (`_a_tree_this_repository_forgot`).
 
-        ANYTHING ELSE AT `wt` IS LEFT ALONE. The default root is `.beeverforge-worktrees` beside
-        the served checkouts, shared by every project the process serves, so `wt` can be another
-        repository's worktree of a branch with the same name, or a person's directory; `prepare`
+        ANYTHING ELSE AT `wt` IS LEFT ALONE. The default root is `.beeverforge-worktrees` in the
+        repository cache, beside the served checkouts and the same root a job's box gets, shared
+        by every project the process serves, so `wt` can be another repository's worktree of a
+        branch with the same name, or a person's directory; `prepare`
         refuses by name over it rather than this deleting it. A job's branch can meet that case;
         a proof's no longer does, since each key proves on a branch of its own (`box_probes`),
         and a second proof of one key, which would take the first one's live tree for its own

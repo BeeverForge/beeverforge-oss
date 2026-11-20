@@ -2,7 +2,8 @@
 
 `box_probes` prepared every proof's workspace on ONE branch, `beeverforge/box-prove`, and the
 worktree box names its directory after the branch under a root every project the process serves
-shares (`Path.cwd() / ".beeverforge-worktrees"`). So two proofs taken at once met at one path.
+shares (`.beeverforge-worktrees` in the repository cache, `BEEVERFORGE_REPO_CACHE`). So two proofs
+taken at once met at one path.
 Measured on git 2.43.0 with a real `WorktreeSandbox`, two keys and one root (2026-10-18, and again
 on 43b8ff7b, 2026-10-21):
 
@@ -37,6 +38,11 @@ def _project(key: str) -> SimpleNamespace:
 def _proofs_here(tmp_path: Path, monkeypatch) -> None:
     """Every proof's state under the test's own directory, never `/var/lib/beeverforge/proofs`."""
     monkeypatch.setattr(box_prove, "PROOF_DIR", tmp_path / "proofs")
+
+
+def _trees_here(tmp_path: Path, monkeypatch) -> None:
+    """The box's default root beside the test's own repository cache, never the shared one."""
+    monkeypatch.setenv("BEEVERFORGE_REPO_CACHE", str(tmp_path / "cache"))
 
 
 def _recording_box(monkeypatch, tmp_path: Path) -> list[str]:
@@ -145,7 +151,7 @@ def test_two_projects_on_one_repository_both_start_and_keep_their_trees(tmp_path
     """AC1 on the real worktree box. Before: B's `prepare` took A's tree for its own and removed
     it while A was proving in it (`A tree alive: False`, git 2.43.0, 2026-10-18)."""
     _proofs_here(tmp_path, monkeypatch)
-    monkeypatch.chdir(tmp_path)
+    _trees_here(tmp_path, monkeypatch)
     repo = _repository(tmp_path / "shared")
 
     with _prove("a", repo, sandbox="worktree") as a:
@@ -161,7 +167,7 @@ def test_two_projects_on_two_repositories_both_start(tmp_path, monkeypatch):
     """AC1 on the real worktree box, two repositories and the one root every project shares.
     Before: B did not start, refused over A's tree at the one path both proofs took."""
     _proofs_here(tmp_path, monkeypatch)
-    monkeypatch.chdir(tmp_path)
+    _trees_here(tmp_path, monkeypatch)
     repo_a = _repository(tmp_path / "acme")
     repo_b = _repository(tmp_path / "globex")
 

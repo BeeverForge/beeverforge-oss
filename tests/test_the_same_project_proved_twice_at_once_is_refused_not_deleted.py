@@ -178,9 +178,10 @@ def _another_process_holding(key: str, proofs: Path) -> subprocess.Popen:
 def test_a_second_proof_of_a_running_key_is_refused_and_the_first_tree_survives(
         tmp_path, monkeypatch):
     """AC2 on the real worktree box. Before: no refusal, and the second proof's `prepare` removed
-    the tree the first proof was running in."""
+    the tree the first proof was running in. The box's default root sits beside this test's own
+    repository cache, never the cache the suite shares."""
     _proofs_here(tmp_path, monkeypatch)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BEEVERFORGE_REPO_CACHE", str(tmp_path / "cache"))
     repo = _repository(tmp_path / "acme")
     marked: list[Path] = []
 
