@@ -8202,8 +8202,10 @@ async def _project_set_board_columns(*, project: str, by: Actor, columns: object
     if bad:
         return bad
     board, names, bad = await asyncio.to_thread(_the_board_of, found, nothing_changed=True)
-    if bad:
-        return bad
+    if bad or board is None:
+        # `board` is only ever None beside a refusal; the second test is for the type checker
+        return bad or refused(INVALID, f"{project} has no board configured. Nothing was changed.",
+                              project=project)
 
     def no(why: str) -> Outcome:
         return refused(INVALID, f"{why}. Nothing was changed. The board's columns are: "

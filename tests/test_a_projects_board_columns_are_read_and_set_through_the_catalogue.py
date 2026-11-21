@@ -125,13 +125,24 @@ def test_a_set_writes_the_tracker_options_and_answers_the_new_mapping(board):
     assert out.data["changed"] is True
 
 
-def test_a_set_is_idempotent_and_merges_what_is_held(board):
+def test_a_set_is_idempotent_and_merges_what_is_held(board, monkeypatch):
     assert _set(columns={"todo": "Ready"}).ok
     registry = board.registry.read_bytes()
 
     again = _set(columns={"todo": "Ready"})
     assert again.ok and again.data["changed"] is False
     assert board.registry.read_bytes() == registry
+
+    # the registry is not asked to write at all, not merely asked to write the same bytes
+    from beeverforge.registry import ProjectRegistry
+
+    writes: list[dict] = []
+    real = ProjectRegistry.set_tracker_options
+    monkeypatch.setattr(ProjectRegistry, "set_tracker_options",
+                        lambda self, name, options: (writes.append(options), real(self, name, options)))
+    assert _set(columns={"todo": "ready"}).data["changed"] is False
+    assert not writes, f"an unchanged mapping was written again: {writes}"
+    monkeypatch.setattr(ProjectRegistry, "set_tracker_options", real)
 
     assert _set(columns={"done": "Shipped"}).ok
     assert json.loads(_held()["columns"]) == {"todo": "Ready", "done": "Shipped"}
@@ -353,3 +364,69 @@ def test_a_word_that_is_not_stage_equals_column_is_refused_by_the_command(board)
     out = CliRunner().invoke(app, ["project", "set-board-columns", "acme", "todo"])
 
     assert out.exit_code != 0 and "stage=column" in out.output
+
+
+# ── the panel's strip: `paintBoardMap` is executed, not read ────────────────────────────────────
+
+def _paint_board_map(answer: str) -> str:
+    """What the page's own `paintBoardMap` draws into `#boardmap` when `act` answers `answer` (a JS
+    expression, or `throw` for a call that failed). The function is cut out of the page, whole, and
+    run under node over a stub `$`, the page's own `esc`, and an `act` that records its call."""
+    import pathlib
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not on PATH — the page's JavaScript cannot be executed here")
+    page = (pathlib.Path(__file__).resolve().parent.parent / "beeverforge" / "api"
+            / "panel.html").read_text(encoding="utf-8")
+    start = page.index("const paintBoardMap=async()=>{")
+    depth, end = 0, start
+    for end in range(page.index("{", start), len(page)):
+        depth += {"{": 1, "}": -1}.get(page[end], 0)
+        if depth == 0:
+            break
+    strip = page[start:end + 1]
+    esc = re.search(r"^const esc=.*$", page, re.M).group(0)
+    answer_js = ("(()=>{throw new Error('the board is down')})()" if answer == "throw"
+                 else answer)
+    script = "\n".join([
+        esc, "const name='acme';let asked=null;",
+        "const slot={innerHTML:''};const $=s=>s==='#boardmap'?slot:null;",
+        f"const act=async(n,p)=>{{asked=[n,p];return {answer_js}}};",
+        strip,
+        "paintBoardMap().then(()=>console.log(JSON.stringify({html:slot.innerHTML,asked})))"])
+    done = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr[-1200:]
+    return done.stdout
+
+
+def test_the_panel_strip_draws_every_stage_and_says_unmapped_for_one_with_no_column():
+    out = json.loads(_paint_board_map(
+        "{ok:true,data:{board:{kind:'github'},mapping:{todo:'Ready',done:null},"
+        "pickup:'Ready',pickup_on_board:true}}"))
+    assert out["asked"] == ["project_board_columns", {"project": "acme"}]
+    html = out["html"]
+    assert "<b>Ready</b>" in html and "todo" in html
+    assert "unmapped" in html and html.index("done") < html.index("unmapped")
+    assert "not a column of this board" not in html
+
+
+def test_the_panel_strip_flags_a_pickup_the_board_does_not_have_and_escapes_what_it_draws():
+    html = json.loads(_paint_board_map(
+        "{ok:true,data:{board:{kind:'github'},mapping:{todo:'<i>x</i>'},"
+        "pickup:'TO-DO',pickup_on_board:false}}"))["html"]
+    assert "not a column of this board" in html
+    assert "<i>" not in html and "&lt;i&gt;" in html
+
+
+def test_the_panel_strip_says_a_board_could_not_be_read_and_never_draws_an_empty_map():
+    refused = json.loads(_paint_board_map(
+        "{ok:false,message:'its columns are not known'}"))["html"]
+    assert "its columns are not known" in refused and "unmapped" not in refused
+    thrown = json.loads(_paint_board_map("throw"))["html"]
+    assert "the board is down" in thrown
+    nothing = json.loads(_paint_board_map("{ok:true,data:{board:null}}"))["html"]
+    assert "no board configured" in nothing
