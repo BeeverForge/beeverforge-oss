@@ -958,9 +958,32 @@ def _callers(name: str) -> set[str]:
 
 @pytest.mark.whole_tree
 def test_no_job_opens_a_proposal_only_a_person_does():
-    """Opening a proposal is `beeverforge preview propose` and `onboard --with-preview`. A job,
-    an activity, a workflow, the poller or the panel only ASK whether one is open."""
-    assert _callers("propose_preview") == {"beeverforge/cli.py"}
+    """Opening a proposal is always in a person's name: `beeverforge preview propose`, and the
+    `onboard` row's `with_preview` — from the shell, the panel or `act`. A job, a workflow or the
+    poller only ASK whether one is open; the one activity that opens any is `_do_onboard`, and
+    only with the opener made for the person whose onboarding it runs.
+
+    TWO CALL SITES, EACH A PERSON'S. `beeverforge/cli.py` is `preview propose`, typed by whoever
+    runs it. `beeverforge/actions/catalog.py` is the `onboard` row's opener (#237),
+    `previews_opened_as(by)`: it proposes in the name of the person who asked for that onboarding,
+    and opens nothing when nobody did. The onboarding's body (`onboarding/onboard.py`) is handed
+    the opener and never names the function."""
+    assert _callers("propose_preview") == {"beeverforge/cli.py", "beeverforge/actions/catalog.py"}
+    catalog_tree = parsed(ROOT / "beeverforge/actions/catalog.py")
+    proposers = {fn.name for fn in ast.walk(catalog_tree)
+                 if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
+                 and fn.name != "open_one"
+                 and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "propose_preview"
+                         for c in ast.walk(fn))}
+    assert proposers == {"previews_opened_as"}, proposers
+    # who may be handed the opener: the row a person runs, and the activity that runs that ask
+    assert _callers("previews_opened_as") == {"beeverforge/actions/catalog.py",
+                                              "beeverforge/runtime/temporal/activities.py"}
+    activities = parsed(ROOT / "beeverforge/runtime/temporal/activities.py")
+    handed = {fn.name for fn in ast.walk(activities) if isinstance(fn, ast.FunctionDef)
+              and any(isinstance(c, ast.Call) and "previews_opened_as" in (
+                  getattr(c.func, "id", ""), getattr(c.func, "attr", "")) for c in ast.walk(fn))}
+    assert handed == {"_do_onboard"}, handed
     assert _callers("_propose_hosted") | _callers("_propose_local") == {
         "beeverforge/onboarding/preview_propose.py"}
     for module in ("beeverforge/orchestrator", "beeverforge/runtime", "beeverforge/api"):

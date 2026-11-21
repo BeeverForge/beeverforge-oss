@@ -303,6 +303,27 @@ that cannot honour the project's `box.image`) is a 400, and nothing starts. That
 the registered ones. A proof of the same key already running on the host is a 409. The doctor's
 `box_proof` reads what the proof recorded. The row is the floor's, for an admin.
 
+`onboard` (`project`, [`sources`], [`with_preview`], [`sandbox`], [`skip_context`]) onboards a
+project's repositories, the registry's own and each of `sources` (a list, or comma-separated). Each
+one is read, its manifest proposed or proven as declared, proven in the box, its module map
+measured and its pull request opened. With `with_preview` its preview is proposed too, and then the
+context repository is backfilled, created through `product_init` when none is declared
+(`beeverforge onboard`). Through the API, and through `beeverforge act`, it runs on the worker and
+the answer comes back at once. `data.state` is `running`, `data.handle` names the run,
+`data.repositories` lists what it walks, and `data.joined` is `true` when the ask joined an
+onboarding of the same project already running. That command runs in place, and then
+`data.state` is `onboarded`. `data.repos` holds each `{repo, ok, pr, existed, proof, detail,
+questions, changed, steps}`, its `steps` each `{step, state, said}` for read, manifest, proof, map,
+pull_request (and preview), in the states of the rows of several steps below. `data.context` is
+the context repository's outcome, and `data.changed` is `false` when a second run found everything
+already there. Either way each step is journaled as it ends, at `/api/jobs/<project>/onboard/events`.
+`ok` is about the onboarding having run: the document's own `data.ok` says whether every
+repository finished. An unknown project is a 404 that names the registered ones. A source that is
+not a repository reference this project's forge can name is a 400 with `data.unreadable`, and so
+is a project that names no repository, and a box the worker cannot prove in (unknown, remote, or
+one that bounds nothing), with `data.sandbox`. Nothing starts. A joined ask's
+`data.repositories` is `null`: the run it joined walks the repositories it was started with. The row is the floor's, for an admin.
+
 **Rows of several steps.** `project_init` and `product_init` take several steps with the network
 between them, and say in `data.steps` what each came to: in order, each `{step, state, said}`, the
 state one of `done` (this call did it), `already` (it was there before), `skipped` (not this

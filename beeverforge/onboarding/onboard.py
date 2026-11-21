@@ -48,10 +48,13 @@ than re-pushed, "could not ask" never read as "there is none".
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,6 +62,7 @@ from beeverforge import gitpin, namespace
 from beeverforge.util import yaml_io
 
 if TYPE_CHECKING:
+    from beeverforge.onboarding.preview_propose import Outcome as PreviewOutcome
     from beeverforge.onboarding.spend import Spend
 
 log = logging.getLogger("beeverforge.onboarding.onboard")
@@ -394,6 +398,9 @@ class ContextOutcome:
     #: the wiring only a human can commit (each source repo's `docs_repo:` line)
     todo: list[str] = field(default_factory=list)
     detail: str = ""
+    #: whether this run pushed anything to the context repository — False when it found the
+    #: proposal already open, or nothing new to write (#237: a second run says it changed nothing)
+    changed: bool = False
 
 
 def onboard_product_context(project, *, sources: list[str],
@@ -524,7 +531,7 @@ def onboard_product_context(project, *, sources: list[str],
                 if rc != 0:
                     out.detail = f"git {gitpin.subcommand(args)} failed: {scrub(log_out)[-200:]}"
                     return out
-            out.ok = True
+            out.ok = out.changed = True
             out.detail = (f"{docs_repo} was born empty — the declaration and backfill are its "
                           f"first commit on {base}; review them there")
             return out
@@ -542,6 +549,7 @@ def onboard_product_context(project, *, sources: list[str],
             if rc != 0:
                 out.detail = f"git {gitpin.subcommand(args)} failed: {scrub(log_out)[-200:]}"
                 return out
+        out.changed = True  # pushed: the review request below is the ceremony, not the change
         out.pr = open_review_request(
             forge, repo=docs_repo, head=branch, base=base,
             title=f"BeeverForge: {getattr(project, 'name', 'product')}'s context — declaration "
@@ -1103,3 +1111,400 @@ def _backfill(project, docs_clone: Path, *, stream: StageFn | None,
     finally:
         for source in clones:
             _shutil.rmtree(source, ignore_errors=True)
+
+
+# ── a product's onboarding, asked: the `onboard` row's work (#237, ADR-0039) ────────────────────
+#
+# WHAT `beeverforge onboard` DID, IN ONE PLACE. The command walked the repositories, proposed each
+# preview, made the context repository through `product_init` and backfilled it — inside the CLI,
+# so nothing else could ask for an onboarding, and nothing but that terminal could say how far it
+# got. This is that body, called by the row for the shell's own `onboard` and by the worker's
+# activity for everybody else. It answers a document — every repository's steps, the context's
+# outcome, whether anything changed — and journals each step where the panel's events route reads
+# it (`/api/jobs/<project>/onboard/events`). The command renders the document.
+
+#: The journal an onboarding writes, `events_file(project, ONBOARDING)`, and its `ticket_id`.
+ONBOARDING = "onboard"
+
+#: One repository's steps, in the order they run: cloned and read, its manifest (inferred, or the
+#: one it declares), the proof in the box, the module map measured, the pull request. `PREVIEW`
+#: follows them with `with_preview`.
+READ, MANIFEST, PROOF, MAP, PULL_REQUEST, PREVIEW = (
+    "read", "manifest", "proof", "map", "pull_request", "preview")
+
+#: How an asked onboarding stands: `ONBOARDED` ran where it was asked and the answer is its
+#: document; `RUNNING` is the worker's, and the answer is its handle.
+ONBOARDED, RUNNING = "onboarded", "running"
+
+#: One onboarding on the worker: a proof per repository (each bounded by its own gates' limits)
+#: and the context's backfill, which may make agent passes. The flight is the workflow's, strictly
+#: longer.
+ONBOARD_CEILING = timedelta(hours=6)
+ONBOARD_HEARTBEAT = timedelta(minutes=2)
+ONBOARD_FLIGHT = ONBOARD_CEILING + timedelta(minutes=15)
+
+
+@dataclass(frozen=True)
+class Here:
+    """The shell's own `onboard`, running the onboarding in its process: who hears it while it
+    runs — `(kind, text)`, kind one of `said` (a line of the answer's own, before it), `start` and
+    `line` (each stage, and the box's own output)."""
+
+    listener: StageFn
+
+
+#: Set only by `beeverforge onboard`, around the row. WHERE AN ONBOARDING RUNS IS NOT A
+#: TRANSPORT'S NAME: `via == "cli"` is also `beeverforge act onboard` on an operator's laptop. A
+#: context variable, because a JSON caller cannot send one; `asyncio.to_thread` carries it over.
+_HERE: ContextVar[Here | None] = ContextVar("onboard_here", default=None)
+
+
+@contextmanager
+def in_this_shell(listener: StageFn):
+    """Every `onboard` asked in this context runs in this process, and `listener` hears it."""
+    token = _HERE.set(Here(listener=listener))
+    try:
+        yield
+    finally:
+        _HERE.reset(token)
+
+
+def here() -> Here | None:
+    """The shell onboarding in its own process, or None: the onboarding belongs on the worker."""
+    return _HERE.get()
+
+
+def _tell(kind: str, text: str) -> None:
+    """A line for the shell that is watching, if one is (`_say` keeps a failing one quiet)."""
+    shell = here()
+    _say(shell.listener if shell is not None else None, kind, text)
+
+
+def workflow_id(project_name: str) -> str:
+    """The id one onboarding runs under on the worker: one flight per project, so a second ask
+    while it runs joins it. HASHED, never spelled: a project's name is somebody's free text."""
+    return "onboard-" + hashlib.sha256(project_name.encode()).hexdigest()
+
+
+def repositories(project, sources: list[str]) -> list[str]:
+    """The repositories one onboarding walks: the registry's own and every source named, once each.
+
+    THE FORGE AXIS NAMES THE CODE, with the tracker as fallback — the same precedence `_ref_repo`
+    uses everywhere. Never BOTH: an ADO tracker.repo is the ADO *project* (work items), and a
+    GitHub deployment may track issues in a separate repository — sweeping the tracker axis in
+    onboarded a repository that holds no code. And no `"/" in r` filter: an ADO registry row
+    carries the BARE repository name, and the filter made the recommended path silently dead on
+    Azure DevOps (adversarial review, 2026-08-13)."""
+    forge, tracker = getattr(project, "forge", None), getattr(project, "tracker", None)
+    default_repo = (forge.repo if forge else None) or (tracker.repo if tracker else None) or ""
+    return sorted({r for r in [default_repo, *(sources or [])] if r})
+
+
+def through_product_init(by) -> Callable[[str], object]:
+    """How the run makes a context repository nobody declared: `product_init` with
+    `create_context`, performed as `by` — so a credential that may not change the installation is
+    refused there, by that row's own rule. Called on the run's own thread, never on a loop."""
+
+    def create(name: str):
+        import asyncio
+
+        from beeverforge import actions
+
+        return asyncio.run(actions.perform("product_init", by=by, project=name,
+                                           create_context=True))
+
+    return create
+
+
+class _Journal:
+    """The onboarding's events: every stage as it starts, and every step as it ends. A journal
+    that cannot be opened is logged, never the onboarding's failure — it is telemetry."""
+
+    def __init__(self, project, run: str) -> None:
+        self.run, self.sink = run, None
+        try:
+            from beeverforge.observability.registry import journal_for
+            from beeverforge.paths import events_file
+
+            self.sink = journal_for(events_file(project, ONBOARDING))
+        except Exception as exc:  # a status line is worth less than the onboarding it describes
+            log.warning("the onboarding journal of %s could not be opened (%s)",
+                        getattr(project, "name", "?"), exc)
+
+    def emit(self, kind: str, message: str, **data: object) -> None:
+        if self.sink is None:
+            return
+        from beeverforge.observability.events import JobEvent, now_iso
+
+        self.sink.emit(JobEvent(ts=now_iso(), job_id=self.run, ticket_id=ONBOARDING, kind=kind,
+                                message=message, data=dict(data)))
+
+    def step(self, subject: str, done: dict) -> None:
+        from beeverforge.actions.base import STEP_FAILED
+
+        kind = ("error" if done["state"] == STEP_FAILED
+                else "pr" if done["step"] in (PULL_REQUEST, PREVIEW) else "note")
+        self.emit(kind, f"{subject}: {done['step']} {done['state']} — {done['said']}",
+                  repo=subject, step=done["step"], state=done["state"])
+
+
+def steps_of(out) -> list[dict]:
+    """One repository's onboarding as its steps, each `{step, state, said}`, read off what
+    `onboard_source_repo` answered.
+
+    EVERY EXIT OF THAT FUNCTION IS ONE OF THESE SHAPES: stopped before anything was cloned (a
+    manifest path outside the repository, a clone that failed); cloned and stopped at a manifest
+    that does not load; or proven — `proof` is set whichever way the box went — then measured and
+    proposed. Read with defaults, because a caller may hand a lighter outcome than `RepoOutcome`."""
+    from beeverforge.actions.base import STEP_ALREADY, STEP_DONE, STEP_FAILED, STEP_SKIPPED, step
+
+    repo = str(getattr(out, "repo", "") or "")
+    detail = str(getattr(out, "detail", "") or "")
+    proof = str(getattr(out, "proof", "") or "")
+    ok = bool(getattr(out, "ok", False))
+    declared = bool(getattr(out, "manifest_already_there", False))
+    pr = str(getattr(out, "pr", "") or "")
+    not_reached = "not reached — an earlier step stopped this repository"
+    if not proof and not ok:
+        cloned = not (detail.startswith("could not clone") or "Nothing was cloned" in detail)
+        if not cloned:
+            return [step(READ, STEP_FAILED, detail),
+                    *(step(s, STEP_SKIPPED, not_reached)
+                      for s in (MANIFEST, PROOF, MAP, PULL_REQUEST))]
+        return [step(READ, STEP_DONE, f"{repo} cloned"), step(MANIFEST, STEP_FAILED, detail),
+                *(step(s, STEP_SKIPPED, not_reached) for s in (PROOF, MAP, PULL_REQUEST))]
+    questions = len(getattr(out, "questions", None) or [])
+    steps = [step(READ, STEP_DONE, f"{repo} cloned and read")]
+    # ALREADY IS A MANIFEST ON THE DEFAULT BRANCH, the one the clone read. One an earlier run
+    # proposed and nobody has merged is not there yet: said proposed, in the pull request found
+    # open, and never as this run's change
+    if declared:
+        steps.append(step(MANIFEST, STEP_ALREADY,
+                          "the repository already declares it — proven as-is"))
+    elif pr and getattr(out, "existed", False):
+        steps.append(step(MANIFEST, STEP_SKIPPED, f"proposed in {pr}, not merged yet — once it "
+                                                  f"merges the next run proves it as declared",
+                          proposed=pr))
+    else:
+        steps.append(step(MANIFEST, STEP_DONE, f"read from the repository — {questions} "
+                                               f"question(s) only a person can answer"))
+    if proof == "proven":
+        steps.append(step(PROOF, STEP_DONE, "proven in the box"))
+    elif proof.startswith("skipped"):
+        steps.append(step(PROOF, STEP_SKIPPED, proof))
+    else:
+        failures = list(getattr(out, "proof_failures", None) or [])
+        steps.append(step(PROOF, STEP_FAILED, "; ".join(failures) or proof or "not proven"))
+    modules = getattr(out, "modules", -1)
+    steps.append(step(MAP, STEP_DONE, f"{modules} module(s) — the context box publishes the map")
+                 if isinstance(modules, int) and modules >= 0 else
+                 step(MAP, STEP_SKIPPED, "the module map could not be measured"))
+    # ALREADY IS WHAT MAKES A SECOND RUN SAFE TO READ: the pull request it finds open, or nothing
+    # left to propose, is said as already there — never as a change this run made
+    if pr and getattr(out, "existed", False):
+        steps.append(step(PULL_REQUEST, STEP_ALREADY, f"already open — {pr}"))
+    elif pr:
+        steps.append(step(PULL_REQUEST, STEP_DONE, pr))
+    elif ok and declared:
+        steps.append(step(PULL_REQUEST, STEP_ALREADY, detail or "nothing to propose"))
+    elif ok:
+        steps.append(step(PULL_REQUEST, STEP_DONE, detail or "proposed"))
+    else:
+        steps.append(step(PULL_REQUEST, STEP_FAILED, detail or "the pull request did not open"))
+    return steps
+
+
+def _refused_by_the_provider(said: str) -> list[dict]:
+    """One repository a provider refused partway, as its steps: the refusal is the step that
+    failed, said in full, and the rest were not reached. Which step it struck is not known — the
+    forge is asked before the clone and again at the pull request — so it is said at the first."""
+    from beeverforge.actions.base import STEP_FAILED, STEP_SKIPPED, step
+
+    not_reached = "not reached — the provider refused this repository"
+    return [step(READ, STEP_FAILED, said),
+            *(step(s, STEP_SKIPPED, not_reached) for s in (MANIFEST, PROOF, MAP, PULL_REQUEST))]
+
+
+#: How the preview's proposal is opened for one repository, `(project, repo) -> Outcome`, or None
+#: when nobody asked for one. Handed in by the `onboard` row, in the name of the person who asked
+#: (`catalog.previews_opened_as`): opening a proposal is a person's act, so this body never names
+#: the function that opens one.
+PreviewOpener = Callable[[object, str], "PreviewOutcome"]
+
+
+def _preview_step(project, repo: str, outcome, open_preview: PreviewOpener | None) -> dict:
+    """`with_preview`: the preview's own pull request, through the same function `beeverforge
+    preview propose` uses (#265 slice 4). The block goes into the manifest ON THE BASE BRANCH, so
+    a repository whose manifest this run only proposed gets it once that merges — said, rather
+    than a second pull request that fights the first over one file."""
+    from beeverforge.actions.base import STEP_ALREADY, STEP_DONE, STEP_FAILED, STEP_SKIPPED, step
+
+    if not getattr(outcome, "manifest_already_there", False):
+        said = (f"proposed once the manifest merges — then `beeverforge preview propose "
+                f"{project.name} --source {repo} --yes`")
+        _tell("said", f"  · preview: {said}")
+        return step(PREVIEW, STEP_SKIPPED, said)
+    if open_preview is None:
+        said = (f"nobody asked for this onboarding in their name, so no proposal was opened — "
+                f"`beeverforge preview propose {project.name} --source {repo} --yes`")
+        _tell("said", f"  · preview: {said}")
+        return step(PREVIEW, STEP_SKIPPED, said)
+    proposed = open_preview(project, repo)
+    if not proposed.ok:
+        _tell("said", f"  ✗ preview: {proposed.detail}")
+        return step(PREVIEW, STEP_FAILED, proposed.detail)
+    if proposed.nothing:
+        _tell("said", f"  · preview: {proposed.detail}")
+        return step(PREVIEW, STEP_SKIPPED, proposed.detail)
+    where = proposed.url or proposed.detail
+    _tell("said", f"  ✓ preview: {where}" + (" (already open)" if proposed.existed else ""))
+    return step(PREVIEW, STEP_ALREADY if proposed.existed else STEP_DONE, where)
+
+
+def _repo_document(outcome, steps: list[dict]) -> dict:
+    from beeverforge.actions.base import STEP_DONE
+
+    return {"repo": str(getattr(outcome, "repo", "") or ""),
+            "ok": bool(getattr(outcome, "ok", False)),
+            "pr": str(getattr(outcome, "pr", "") or ""),
+            "existed": bool(getattr(outcome, "existed", False)),
+            "proof": str(getattr(outcome, "proof", "") or ""),
+            "detail": str(getattr(outcome, "detail", "") or ""),
+            "questions": list(getattr(outcome, "questions", None) or []),
+            "changed": any(s["state"] == STEP_DONE for s in steps
+                           if s["step"] in (PULL_REQUEST, PREVIEW)),
+            "steps": steps}
+
+
+def _a_context_repository_for(project, create_context: Callable[[str], object],
+                              stream: StageFn) -> tuple[object, bool, str]:
+    """`(project, created, "")` once the project names its context repository — re-read from the
+    registry when this made one — or `(project, False, why)` when it could not be made.
+
+    CREATING ONE CHANGES THE INSTALLATION, SO IT IS A ROW'S (#741): `product_init` creates the
+    repository in the client's organisation and records it, as `product init --create-context`
+    does. Without `write` it proposes nothing: the declaration this run proposes travels with the
+    backfill, in one review."""
+    from beeverforge.actions.base import STEP_DONE, STEP_FAILED
+    from beeverforge.registry import ProjectRegistry
+
+    if (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip():
+        return project, False, ""
+    _say(stream, "start", "context: no repository declared — creating one")
+    outcome = create_context(project.name)
+    data = getattr(outcome, "data", None) or {}
+    context = next((s for s in data.get("steps") or [] if s.get("step") == "context"), None)
+    if context is None or context.get("state") == STEP_FAILED:
+        return project, False, (context or {}).get("said") or str(getattr(outcome, "message", ""))
+    return ProjectRegistry().get(project.name), context.get("state") == STEP_DONE, ""
+
+
+def onboard_the_product(project, *, repos: list[str], with_preview: bool = False,
+                        sandbox: str = "container", skip_context: bool = False,
+                        create_context: Callable[[str], object],
+                        open_preview: PreviewOpener | None = None) -> dict:
+    """Onboard `project`: each of `repos` — clone, read, prove, map, pull request, and its
+    preview's proposal with `with_preview` — then, unless `skip_context`, the context repository,
+    made through `create_context` when nobody declared one. Each preview is opened through
+    `open_preview`, the asker's; without one it is said, never opened. Answers the run's document
+    and journals every step as it ends.
+
+    SAFE TO RUN AGAIN, BY WHAT IT CALLS: a manifest already declared is proven as-is and not
+    re-proposed, a pull request already open is found and not pushed over, a context already
+    proposed is found. This says so — each such step is `already`, and `changed` is false when no
+    step of this run changed anything."""
+    from beeverforge.actions.base import STEP_DONE, STEP_FAILED, step
+
+    journal = _Journal(project, workflow_id(project.name))
+    journal.emit("state", f"onboarding {', '.join(repos)}", repos=list(repos))
+
+    def heard(kind: str, text: str) -> None:
+        _tell(kind, text)
+        if kind == "start":
+            journal.emit("note", text)
+
+    documents = []
+    for repo in repos:
+        _tell("said", f"\n── {repo}")
+        try:
+            outcome = onboard_source_repo(project, repo, sandbox=sandbox, stream=heard)
+        except Exception as exc:
+            # A PROVIDER THAT ANSWERED NO IS THIS REPOSITORY'S FAILED STEP, in the sentence that
+            # names its remedy (`cli_refusals`, #111), and the others still run. Anything else is
+            # a defect and keeps its traceback — journaled first, so the panel reading the journal
+            # is told the onboarding stopped rather than watching it go quiet
+            from beeverforge.cli_refusals import as_a_sentence, looks_like_a_provider
+            from beeverforge.onboarding.propose_manifest import scrub
+
+            if not looks_like_a_provider(exc):
+                journal.emit("error", f"{repo}: the onboarding stopped — "
+                                      f"{type(exc).__name__}: {scrub(str(exc))[:300]}",
+                             repo=repo)
+                raise
+            outcome = RepoOutcome(repo=repo,
+                                  detail=scrub(as_a_sentence(exc, doing=f"onboard {repo}")))
+            steps = _refused_by_the_provider(outcome.detail)
+        else:
+            steps = steps_of(outcome)
+        mark = "✓" if outcome.ok else "✗"
+        _tell("said", f"{mark} {outcome.detail or outcome.pr or outcome.proof}")
+        if with_preview:
+            steps.append(_preview_step(project, repo, outcome, open_preview))
+        for done in steps:
+            journal.step(repo, done)
+        documents.append(_repo_document(outcome, steps))
+
+    context = None
+    if not skip_context:
+        _tell("said", "\n── the context repository")
+        project, created, not_made = _a_context_repository_for(project, create_context, heard)
+        if not_made:
+            made = ContextOutcome(detail=not_made)
+        else:
+            made = onboard_product_context(project, sources=repos, stream=heard)
+            made.created = created
+        mark = "✓" if made.ok else "✗"
+        _tell("said", f"{mark} {made.docs_repo or 'context'}{' (created)' if made.created else ''}"
+                      f" — {made.detail}")
+        if made.backfill:
+            _tell("said", f"  backfill: {made.backfill}")
+        elif made.ok:
+            _tell("said", "  backfill: not reached")
+        for t in made.todo:
+            _tell("said", f"  · still yours: {t}")
+        context = {"docs_repo": made.docs_repo, "created": bool(made.created), "ok": made.ok,
+                   "pr": made.pr, "backfill": made.backfill, "documents": list(made.documents),
+                   "todo": list(made.todo), "detail": made.detail,
+                   "changed": bool(made.created or made.changed)}
+        journal.step(made.docs_repo or "context",
+                     step("context", STEP_DONE if made.ok else STEP_FAILED, made.detail))
+
+    document = {
+        "project": project.name,
+        "ok": all(d["ok"] for d in documents) and (context is None or context["ok"]),
+        "changed": any(d["changed"] for d in documents) or bool(context and context["changed"]),
+        "proposed": any(d["ok"] and d["pr"] for d in documents)
+        or bool(context and context["ok"] and context["pr"]),
+        "repos": documents, "context": context}
+    document["detail"] = sentence(document)
+    journal.emit("state", document["detail"], ok=document["ok"], changed=document["changed"])
+    return document
+
+
+def sentence(document: dict) -> str:
+    """What one onboarding came to, in the sentence a person reads first."""
+    repos = document.get("repos") or []
+    context = document.get("context")
+    failed = [r["repo"] for r in repos if not r["ok"]]
+    if context is not None and not context["ok"]:
+        failed.append(context["docs_repo"] or "the context repository")
+    said = (f"onboarded {len(repos)} repositor{'y' if len(repos) == 1 else 'ies'} of "
+            f"{document.get('project', '')}")
+    if failed:
+        said += f" — {', '.join(failed)} did not finish, and each step says why"
+    if not document.get("changed"):
+        return (said + "; nothing changed — every repository and the context were already as "
+                       "an onboarding leaves them")
+    if document.get("proposed"):
+        return said + "; review and merge the pull request(s) it names"
+    return said

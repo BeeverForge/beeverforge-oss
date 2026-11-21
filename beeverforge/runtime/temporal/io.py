@@ -969,6 +969,24 @@ class BoxProveInput(BaseModel):
     sandbox: str = ""
 
 
+class OnboardInput(BaseModel):
+    """One project's onboarding asked through the `onboard` row, run on the worker (#237): the
+    repositories the row resolved and its own values, and WHO ASKED — the context step performs
+    `product_init` as them, so a credential that may not change the installation is refused there
+    on the worker exactly as it would be in the request."""
+
+    project: str
+    sources: list[str] = Field(default_factory=list)
+    with_preview: bool = False
+    sandbox: str = "container"
+    skip_context: bool = False
+    asked_by: str = ""
+    display: str = ""
+    via: str = ""
+    #: the asker's areas, or None for an unscoped caller — `Actor.scopes`' own distinction
+    scopes: list[str] | None = None
+
+
 class ReviewLoopInput(BaseModel):
     """A merged ticket whose independent review rejected it or raised something critical.
 
