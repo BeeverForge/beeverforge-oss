@@ -286,7 +286,7 @@ async def test_away_from_the_host_it_starts_the_proof_on_the_worker_and_answers_
     (started,) = engine.started
     assert started["name"] == "BoxProveWorkflow" and started["task_queue"] == TASK_QUEUE
     assert started["arg"].project == "demo"
-    assert started["id"] == bp.workflow_id("demo") == out.data["handle"]
+    assert started["id"] == bp.workflow_id("demo", "", "", "container") == out.data["handle"]
     assert started["execution_timeout"] == bp.PROOF_FLIGHT
     assert out.data["state"] == bp.RUNNING and out.data["proof"] is None
     assert demo.boxes == [], "the request proved the box itself"
@@ -298,7 +298,7 @@ async def test_a_shell_s_act_away_from_box_prove_proves_on_the_worker_too(demo, 
     and the doctor would hold the next pickup as if it never ran."""
     out = await actions.perform("box_prove", by=_shell(), project="demo")
 
-    assert out.ok and out.data["handle"] == bp.workflow_id("demo"), out.message
+    assert out.ok and out.data["handle"] == bp.workflow_id("demo", "", "", "container"), out.message
     assert len(engine.started) == 1 and demo.boxes == []
     assert bp.load("demo") is None, "a proof was recorded by the process that asked"
 
@@ -392,15 +392,21 @@ async def test_a_repository_s_proof_on_the_worker_is_its_own_flight(demo, engine
     other = await actions.perform("box_prove", by=_panel(), project="demo", repo="acme/web")
 
     assert default.ok and other.ok, (default.message, other.message)
-    assert other.data["key"] == key and other.data["handle"] == bp.workflow_id(key)
+    assert other.data["key"] == key
+    assert other.data["handle"] == bp.workflow_id(key, "", "", "container")
     assert other.data["handle"] != default.data["handle"] and other.data["joined"] is False
-    assert [s["id"] for s in engine.started] == [bp.workflow_id("demo"), bp.workflow_id(key)]
+    assert [s["id"] for s in engine.started] == [bp.workflow_id("demo", "", "", "container"),
+                                                 bp.workflow_id(key, "", "", "container")]
     assert engine.started[1]["arg"].repo == "acme/web"
 
 
 def test_a_ref_and_a_repository_are_their_own_proofs():
-    ids = {bp.workflow_id("demo"), bp.workflow_id("demo", "feat/x"),
-           bp.workflow_id("demo--org--web"), bp.workflow_id("demo", "feat/y")}
+    """Spelled as the row starts a flight: with the ask's image and the box it checked, which for
+    a plain ask is `container`. An id built with fewer arguments is one no flight runs under."""
+    ids = {bp.workflow_id("demo", "", "", "container"),
+           bp.workflow_id("demo", "feat/x", "", "container"),
+           bp.workflow_id("demo--org--web", "", "", "container"),
+           bp.workflow_id("demo", "feat/y", "", "container")}
 
     assert len(ids) == 4
 
@@ -853,7 +859,7 @@ def test_through_the_panel_s_route_it_answers_the_handle(demo, engine, monkeypat
     r = TestClient(app).post("/api/act/box_prove", json={"params": {"project": "demo"}})
 
     assert r.status_code == 200, r.text
-    assert r.json()["data"]["handle"] == bp.workflow_id("demo")
+    assert r.json()["data"]["handle"] == bp.workflow_id("demo", "", "", "container")
     assert len(engine.started) == 1
     assert "action=box_prove" in caplog.text, "the audit line was not written"
 
@@ -890,7 +896,8 @@ def test_through_the_shell_s_act_it_answers_the_handle(demo, engine, caplog):
 
     assert result.exit_code == 0, result.output
     body = json.loads(result.output)
-    assert body["data"]["handle"] == bp.workflow_id("demo") and body["data"]["proof"] is None
+    assert body["data"]["handle"] == bp.workflow_id("demo", "", "", "container")
+    assert body["data"]["proof"] is None
     assert len(engine.started) == 1 and demo.boxes == []
     assert "action=box_prove" in caplog.text, "the audit line was not written"
 
@@ -957,3 +964,90 @@ async def test_the_doctor_s_box_proof_reads_what_the_row_recorded(demo):
     found = check()
     assert found.check == "box_proof" and found.ok and "img:1" in found.message
     assert asyncio.iscoroutinefunction(catalog.CATALOG["box_prove"].run)
+
+
+# ── #577: the asks are checked ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def keyed(demo, tmp_path, monkeypatch):
+    """The registry key `shop` for a project whose own name is `demo`."""
+    reg = tmp_path / "keyed.yaml"
+    reg.write_text(json.dumps({"projects": {"shop": {
+        "name": "demo", "repo": "acme/demo",
+        "repo_path": "https://github.com/acme/demo.git"}}}))
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(reg))
+    return demo
+
+
+async def test_a_registry_key_that_differs_from_the_name_still_proves_in_place(keyed, engine):
+    from beeverforge.registry import ProjectRegistry
+
+    with bp.proving_here(ProjectRegistry().get("shop"), record=bp.save, name="shop"):
+        out = await actions.perform("box_prove", by=_shell(), project="shop")
+
+    assert out.ok and out.data["state"] == bp.PROVEN and out.data["handle"] is None, out.message
+    assert engine.started == [] and len(keyed.boxes) == 1
+
+
+def test_the_cli_refuses_a_running_answer_instead_of_rendering_a_verdict(keyed, monkeypatch):
+    from beeverforge import cli
+    from beeverforge.actions.base import done
+
+    monkeypatch.setattr(cli, "_perform", lambda *_a, **_k: done(
+        "the proof is running on the worker", state=bp.RUNNING, proof=None, key="demo",
+        recorded_at=None, handle="h", joined=False))
+
+    result = CliRunner().invoke(cli.app, ["box", "prove", "shop"])
+
+    assert result.exit_code == 1, result.output
+    assert "running on the worker" in result.output
+    assert "NOT PROVEN" not in result.output and "PROVEN —" not in result.output
+
+
+@pytest.mark.parametrize("bad", ["../x/y", "acme", "acme/web#3", "a/b/c", "acme/we b", "-a/b"])
+async def test_a_malformed_repo_is_refused_on_the_worker_before_anything_starts(demo, engine, bad):
+    out = await actions.perform("box_prove", by=_panel(), project="demo", repo=bad)
+
+    assert not out.ok and out.code == actions.INVALID, out.message
+    assert repr(bad) in out.message and engine.started == []
+
+
+async def test_a_second_ask_with_another_image_or_box_has_its_own_flight(demo, engine):
+    plain = await actions.perform("box_prove", by=_panel(), project="demo")
+    other_image = await actions.perform("box_prove", by=_panel(), project="demo", image="img:2")
+    again = await actions.perform("box_prove", by=_panel(), project="demo", image="img:2")
+
+    assert plain.ok and other_image.ok and again.ok
+    assert plain.data["handle"] != other_image.data["handle"]
+    assert other_image.data["joined"] is False
+    assert again.data["handle"] == other_image.data["handle"] and again.data["joined"] is True
+
+
+async def test_a_second_ask_in_another_box_has_its_own_flight(demo, engine, monkeypatch):
+    """A proof in the `worktree` box measures something the `container` one does not: joining the
+    running one would answer a box nobody proved."""
+    monkeypatch.setenv("BEEVERFORGE_OWN_WORK", "1")
+
+    plain = await actions.perform("box_prove", by=_panel(), project="demo")
+    other_box = await actions.perform("box_prove", by=_panel(), project="demo", sandbox="worktree")
+    again = await actions.perform("box_prove", by=_panel(), project="demo", sandbox="worktree")
+
+    assert plain.ok and other_box.ok and again.ok, (plain.message, other_box.message)
+    assert plain.data["handle"] != other_box.data["handle"]
+    assert other_box.data["joined"] is False
+    assert again.data["handle"] == other_box.data["handle"] and again.data["joined"] is True
+    assert [s["arg"].sandbox for s in engine.started] == ["container", "worktree"]
+
+
+async def test_a_repository_at_its_bound_starts_and_one_past_it_is_refused(demo, engine):
+    """The bound is the repository's own: a repository it lets through still makes a ticket the
+    qualified form accepts once `#` and a ref are put on it, which is how the row hands it on."""
+    at = "acme/" + "w" * (actions._REPO_MAX - len("acme/"))
+    assert actions._clean_ref(f"{at}#1") == (f"{at}#1", ""), "the bound outgrew the ticket form"
+
+    fits = await actions.perform("box_prove", by=_panel(), project="demo", repo=at)
+    past = await actions.perform("box_prove", by=_panel(), project="demo", repo=at + "w")
+
+    assert fits.ok and engine.started[0]["arg"].repo == at, fits.message
+    assert not past.ok and past.code == actions.INVALID, past.message
+    assert len(engine.started) == 1, "the repository past the bound was started"

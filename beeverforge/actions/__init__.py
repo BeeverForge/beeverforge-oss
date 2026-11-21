@@ -550,13 +550,20 @@ _ISSUE_RE = re.compile(r"^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
 #: a SECOND, fully-anchored pattern rather than by loosening the first: `/` and `#` reach a
 #: workflow id and a filename, and the way to allow exactly two segments and one hash is to spell
 #: that out, not to add characters to a class and hope.
-_QUALIFIED_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
+_REPO_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
+_QUALIFIED_RE = re.compile(rf"^{_REPO_PATTERN}#[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
+#: A repository named without a ticket (`box_prove --repo`). Built from the same part as the
+#: qualified form rather than cut out of its compiled text, so the two cannot drift apart.
+_REPO_RE = re.compile(rf"^{_REPO_PATTERN}$")
 _ISSUE_MAX = 64
 #: The qualified form needs room for `owner/name#` on top of the ref itself. A SEPARATE bound, so
 #: widening it here cannot quietly widen what a bare ref may be — the bound is what keeps a ref
 #: from becoming an unreasonable workflow id or filename, and each shape deserves its own.
 _QUALIFIED_MAX = 160
+#: A bare repository is handed on as `owner/name#0`, a qualified ref, so it is bounded by what
+#: that form leaves once the shortest `#ref` is on it: a repository accepted here is never one
+#: the qualified bound then refuses.
+_REPO_MAX = _QUALIFIED_MAX - len("#0")
 
 
 def _clean_ref(issue: str) -> tuple[str, str]:

@@ -1101,6 +1101,7 @@ def box_prove_cmd(
     from beeverforge.box_prove import (
         PROOF_DIR,
         PROVEN,
+        RUNNING,
         Finding,
         load,
         proving_here,
@@ -1137,7 +1138,7 @@ def box_prove_cmd(
     # THE `box_prove` ROW (#237): the row proves and records, in this shell's own process — this
     # command is the one caller that proves here, where its record is read — and what stays here
     # is how a terminal shows it, the box's live lines included
-    with watching(_stage), proving_here(project, record=_record):
+    with watching(_stage), proving_here(project, record=_record, name=name):
         outcome = _perform("box_prove", project=name, image=image or "",
                            sandbox=_box_kind(sandbox), repo=repo or "", ref=ref or "")
     if not outcome.ok:
@@ -1148,6 +1149,11 @@ def box_prove_cmd(
         typer.echo(outcome.message if bare else f"✗ {outcome.message}")
         raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)
     data = dict(outcome.data)
+    if data.get("state") == RUNNING:
+        # A STARTED PROOF HAS NO VERDICT: rendering it as one would print "NOT PROVEN" for a
+        # proof that has not ended. This command proves in its own process, so it never expects it
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(1)
     proof_key = str(data.get("key") or name)
     findings = [Finding.from_dict(f) for f in (data.get("proof") or {}).get("findings", [])]
     proven = data.get("state") == PROVEN
