@@ -7809,10 +7809,10 @@ async def _box_prove(*, project: str, by: Actor, repo: str = "", ref: str = "", 
     # repository's proof and the default one never share a flight
     view, key = found, found.name
     if repo:
-        from beeverforge.actions import _REPO_RE
+        from beeverforge.actions import _REPO_MAX, _REPO_RE
         from beeverforge.runtime.card_repo import _runner_view
 
-        if len(repo) > 160 or not _REPO_RE.match(repo):
+        if len(repo) > _REPO_MAX or not _REPO_RE.match(repo):
             return refused(INVALID, f"that is not a repository — owner/name, letters, digits, "
                                     f"'.', '-' or '_', got {repo!r}. Nothing was started.",
                            project=found.name, repo=repo)
