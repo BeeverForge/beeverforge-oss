@@ -473,7 +473,13 @@ def _why(exc: Exception) -> str:
 
 
 def _loggable(params: dict[str, object]) -> dict[str, object]:
-    return {k: ("***" if k in _SECRET else v) for k, v in params.items()}
+    out = {k: ("***" if k in _SECRET else v) for k, v in params.items()}
+    if "people" in out:
+        # THE COUNTS AND THE DIGEST, never the ids (#528): the line is the record of who asked
+        from beeverforge.product.people import loggable
+
+        out["people"] = loggable(out["people"])
+    return out
 
 
 def _check_params(found: ActionSpec, params: dict[str, object]) -> str:

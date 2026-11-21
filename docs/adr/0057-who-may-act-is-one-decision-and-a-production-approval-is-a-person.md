@@ -98,7 +98,11 @@ policy.may(subject: Subject, *, action: ActionSpec, project, on: Card | None = N
   comparing a card's requester itself.
 - **The policy reads grants; it does not store them.** `authz.py`'s rule stands: *who may act on a
   project is that project's business*. Grants live on the project in the registry, and
-  deployment-wide grants live with the deployment's identity configuration (D3).
+  deployment-wide grants live with the deployment's identity configuration (D3). **One row writes
+  the product's two lists, as a declared exception** (#528): `product_people_set` writes
+  `product.admins` and `product.engineers` for the installation's administrator, and no other row
+  does. It is `installation`, so a credential scoped to an area is refused, and a person is never
+  added by themselves; the policy still only reads what it left.
 - **Unchanged rules, now stated once:** an unknown scope or role is refused, never defaulted; an
   anonymous subject (`Subject.known` is false) holds exactly the role its credential's own row
   grants in D6 (the shared panel token `admin`, the shared board token `operator`, the shared

@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -7722,6 +7722,95 @@ async def _product_declare(*, project: str, docs_repo: str, by: Actor) -> Outcom
                 project=project, docs_repo=repo, reachable=False, why=why, cause=cause)
 
 
+def _people_refusal(project: str, exc: ValueError) -> Outcome:
+    return refused(NOT_FOUND, str(exc), project=project)
+
+
+def _people_said(admins: Sequence[str], engineers: Sequence[str]) -> dict:
+    """The two lists as the answer says them: one `{id, role}` list and its digest."""
+    from beeverforge.product import people as the_people
+
+    return dict(people=[*({"id": p, "role": "admin"} for p in admins),
+                        *({"id": p, "role": "engineer"} for p in engineers)],
+                digest=the_people.digest(admins, engineers))
+
+
+async def _product_people_list(*, project: str, by: Actor) -> Outcome:
+    """Who may approve or act on this product, as the registry holds it — `product.admins` and
+    `product.engineers` as one `{id, role}` list, with the digest `product_people_set` answers."""
+    from beeverforge.registry import ProjectRegistry
+
+    try:
+        admins, engineers = ProjectRegistry().people(project)
+    except KeyError:
+        return _no_such_project(project, so="nothing was read")
+    except ValueError as exc:
+        return _people_refusal(project, exc)
+    return done(f"{project}: {len(admins)} admins, {len(engineers)} engineers", project=project,
+                **_people_said(admins, engineers))
+
+
+def _people_moved(held: Sequence[str], new: Sequence[str]) -> dict:
+    return {"added": [p for p in new if p not in held],
+            "removed": [p for p in held if p not in new],
+            "unchanged": [p for p in new if p in held]}
+
+
+async def _product_people_set(*, project: str, by: Actor, people: object = None) -> Outcome:
+    """Set who may approve or act on this product: the whole list, in one registry write.
+
+    THE LIST IS THE STATE: a person left out is removed, an empty list empties both, and a call
+    that names nothing (`people` missing) is refused rather than read as "nobody". `product.admins`
+    is what `may_act` reads, so this row decides who may make the product role write — which is
+    why it is the installation's (a product credential, or a person on the list, cannot widen
+    their own access through it) and why no person may be ADDED by themselves: a grant whose
+    grantee is the granter is refused (ADR-0057). The shell outranks that, as it does every row.
+
+    DECIDED BEFORE ANYTHING IS WRITTEN: every entry is read first, and one that is not an
+    `{id, role}` of a known role, a second role for a person, or more than the bound refuses the
+    whole call, naming the entry. The rest of the `product:` entry is kept as the file has it.
+    The audit line is `perform`'s: the project, the counts and the digest, never an id."""
+    from beeverforge.product import people as the_people
+    from beeverforge.registry import ProjectRegistry
+
+    # AN UNREGISTERED NAME IS ASKED FIRST, as `project_update` does: a typo is the commonest cause
+    try:
+        ProjectRegistry().get(project)
+    except KeyError:
+        return _no_such_project(project, so="nothing was set")
+    if people is None:
+        return refused(INVALID, f"{project}'s people were not set — `people` is the whole list "
+                                f"of {{id, role}}; an empty list empties both", project=project)
+    admins, engineers, why = the_people.read(people)
+    if why:
+        return refused(INVALID, f"{project}'s people were not set — {why}. Nothing was changed",
+                       project=project)
+    moved: dict = {}
+
+    def change(held_admins: list[str], held_engineers: list[str]):
+        moved["admins"] = _people_moved(held_admins, admins)
+        moved["engineers"] = _people_moved(held_engineers, engineers)
+        joining = {*moved["admins"]["added"], *moved["engineers"]["added"]}
+        if by.via != "cli" and by.id and by.id in joining:
+            raise _Refusal(refused(
+                DENIED, f"{by.id} cannot add themselves to {project}'s people — a grant is not "
+                        f"made to the one who makes it. Nothing was changed", project=project))
+        return admins, engineers
+
+    try:
+        wrote = ProjectRegistry().set_people(project, change)
+    except KeyError:
+        return _no_such_project(project, so="nothing was set")
+    except ValueError as exc:
+        return _people_refusal(project, exc)
+    except _Refusal as exc:
+        return exc.outcome
+    said = _people_said(admins, engineers)
+    return done(f"{project}'s people: {len(admins)} admins, {len(engineers)} engineers"
+                + ("" if wrote else " — as it was; nothing was changed"),
+                project=project, changed=wrote, digest=said["digest"], **moved)
+
+
 async def _doctor(*, project: str, by: Actor) -> Outcome:
     """Every prerequisite of running a ticket on this project, checked — the
     `beeverforge.doctor/1` document as `data`, exactly as `beeverforge doctor --json` prints it.
@@ -10115,6 +10204,28 @@ CATALOG: dict[str, ActionSpec] = {
             installation=True,
             # A PRODUCT BEFORE ITS CODE DECLARES ITS CONTEXT TOO (#992): `product start` names this
             # row as the way to another context for one
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="product_people_set",
+            summary="set who may approve or act on a product: the whole list of people and their "
+                    "role (admin or engineer), in one write",
+            run=_product_people_set,
+            refuses=(INVALID, NOT_FOUND, DENIED),
+            required=("project", "people"),
+            installation=True,
+            # A PRODUCT BEFORE ITS CODE HAS PEOPLE TOO (#992): who may approve is the product's
+            needs_code=False,
+            params={"people": "the whole list, as `{id, role}` entries — the id the identity "
+                              "provider knows the person by, and `admin` or `engineer`; a person "
+                              "left out is removed, `[]` empties both lists"},
+        ),
+        ActionSpec(
+            name="product_people_list",
+            summary="read who may approve or act on a product, with the digest a set answers",
+            run=_product_people_list,
+            refuses=(NOT_FOUND,),
+            required=("project",),
             needs_code=False,
         ),
         ActionSpec(

@@ -4832,6 +4832,48 @@ def product_name(name: str,
     typer.echo(f"✓ {outcome.message}" if outcome.data["changed"] else outcome.message)
 
 
+product_people_app = typer.Typer(help="Who may approve or act on a product.")
+product_app.add_typer(product_people_app, name="people")
+
+
+@product_people_app.command("set")
+def product_people_set(
+    name: str,
+    admin: Annotated[list[str] | None, typer.Option(
+        "--admin", help="a person who may approve (repeatable)")] = None,
+    engineer: Annotated[list[str] | None, typer.Option(
+        "--engineer", help="a person who builds the product (repeatable)")] = None,
+) -> None:
+    """Set the WHOLE list of the product's people: a person left out is removed, and naming nobody
+    empties both lists. The ids are the ones the identity provider gives."""
+    # A MAPPING ONTO THE `product_people_set` ROW (#528): the row reads, decides and writes.
+    people = [{"id": who, "role": "admin"} for who in admin or []] \
+        + [{"id": who, "role": "engineer"} for who in engineer or []]
+    outcome = _perform("product_people_set", project=name, people=people)
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.code}: {outcome.message}")
+        raise typer.Exit(2)
+    typer.echo(f"✓ {outcome.message}" if outcome.data["changed"] else outcome.message)
+    for role in ("admins", "engineers"):
+        moved = outcome.data[role]
+        typer.echo(f"  {role}: +{len(moved['added'])} -{len(moved['removed'])} "
+                   f"={len(moved['unchanged'])}")
+    typer.echo(f"  digest {outcome.data['digest']}")
+
+
+@product_people_app.command("list")
+def product_people_list(name: str) -> None:
+    """Who may approve or act on the product, with the digest `set` answers."""
+    outcome = _perform("product_people_list", project=name)
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.code}: {outcome.message}")
+        raise typer.Exit(2)
+    typer.echo(outcome.message)
+    for person in outcome.data["people"]:
+        typer.echo(f"  {person['role']:<9} {person['id']}")
+    typer.echo(f"  digest {outcome.data['digest']}")
+
+
 @product_app.command("declare")
 def product_declare(name: str, docs_repo: str) -> None:
     """Declare this product's EXISTING context repository — the client already has one.
