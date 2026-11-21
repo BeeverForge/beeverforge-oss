@@ -303,6 +303,11 @@ OWNED = {
     "set_model": "project_set_model",        # which model a project's agent runs
     "set_language": "project_set_language",  # which language a project speaks first
     "set_preview": "project_set_preview",    # what the operator decides about its previews
+    # a project's board columns (#585): the write that maps a stage onto a column, and the read of
+    # the board that says what each stage is — a front end that did either would be a second
+    # opinion about which column dispatches work
+    "set_tracker_options": "project_set_board_columns",
+    "_board_columns_of": "project_board_columns",
     # `remove` CANNOT BE A MARKER — a front end's lists remove things all day, and a marker that
     # binds an identifier a front end legitimately needs forbids the wrong thing. What the row
     # owns besides the write is the answer to a name the registry does not hold, with its roster.

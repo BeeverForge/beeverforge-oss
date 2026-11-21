@@ -3983,6 +3983,7 @@ async function loadCockpit(name){
       <div class="gauge"><span class="lbl">token pool</span><b>${f.tokens?`<span class="dots">${dots}</span> ${esc(t.count)} <small>(${esc(t.source||"")})</small>`:unknown}</b></div>
       ${f.region?`<div class="gauge"><span class="lbl">region</span><b>${esc(f.region)}</b></div>`:""}
     </div>
+    <div class="rowg" id="boardmap"><div class="gauge"><span class="lbl bm">board columns</span><b>reading…</b></div></div>
     <div class="links">
       ${jump(L.board,"Board")}${jump(L.temporal,"Engine",f.engine_ui_hint)}
       ${L.cloudwatch
@@ -4051,8 +4052,10 @@ async function loadCockpit(name){
           <dd>the project's registry entry — <code>beeverforge project add …</code> chose it, and
           the <b>board</b> pill opens it. <b>this panel holds one itself</b>, which needs no
           account anywhere${hostedBoards?`; ${esc(hostedBoards)} ${hb.length>1?"are":"is"} supported the same
-          way and render${hb.length>1?"":"s"} on the same screen`:""}. The factory only ever reads TO-DO and writes back
-          state.</dd>
+          way and render${hb.length>1?"":"s"} on the same screen`:""}. The factory only ever reads
+          the column that dispatches work and writes back state. Which column is which stage:
+          <code>beeverforge project set-board-columns ${esc(name)} todo=&lt;column&gt; …</code>
+          (without a mapping it shows the one above).</dd>
         <dt>token pool</dt><dd>deployment-level, in <code>.env.compose</code> —
           how many harness credentials this installation can rotate through. <b>region</b> shows
           up beside it only once this deployment has a cloud; a local one has none.</dd>
@@ -4061,6 +4064,23 @@ async function loadCockpit(name){
         walked in <code>docs/ONBOARDING.md</code> §11, and every surface above (logs, secrets,
         boxes) with its free answer in §12.</p>
     </details>`;
+  // THE BOARD'S MAPPING, read through the catalogue's own row (#585) and drawn after the cockpit, so
+  // a board that answers slowly never holds the rest of the settings back. A stage no column is
+  // reads "unmapped" — what the doctor's `board_columns` says — and a board that could not be read
+  // says so, never an empty strip that reads as "nothing is mapped".
+  const paintBoardMap=async()=>{
+    const slot=$("#boardmap"); if(!slot)return;
+    let out; try{out=await act("project_board_columns",{project:name})}
+    catch(e){out={ok:false,message:String(e&&e.message||e)}}
+    const now=$("#boardmap"); if(!now)return;
+    if(!out.ok){now.innerHTML=`<div class="gauge"><span class="lbl bm">board columns</span><b>${esc(out.message||"could not be read")}</b></div>`;return}
+    const d=out.data||{};
+    if(!d.board){now.innerHTML=`<div class="gauge"><span class="lbl bm">board columns</span><b>no board configured</b></div>`;return}
+    const stage=([k,v])=>`<div class="gauge"><span class="lbl bm">${esc(k)}</span><b>${v?esc(v):'<span style="opacity:.55">unmapped</span>'}</b></div>`;
+    now.innerHTML=Object.entries(d.mapping||{}).map(stage).join("")
+      +`<div class="gauge"><span class="lbl bm">pickup</span><b>${esc(d.pickup)}${d.pickup_on_board?"":' <small style="opacity:.7">(not a column of this board)</small>'}</b></div>`;
+  };
+  paintBoardMap();
 }
 // RECENT RUNS IS HISTORY, AND HISTORY BELONGS TO THE DURABLE RECORD (#131). This list was built
 // from the engine alone, and the engine forgets: the pilot opened his floor ~26h after shipping

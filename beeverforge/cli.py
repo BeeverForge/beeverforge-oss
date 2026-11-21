@@ -15,6 +15,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from dotenv import load_dotenv
@@ -343,6 +344,41 @@ def project_set_preview(
     if outcome.data["dropped"]:
         typer.echo(f"  ! refused (a credential of the factory's own, or not a name): "
                    f"{', '.join(outcome.data['dropped'])}")
+
+
+@project_app.command("set-board-columns")
+def project_set_board_columns(
+    name: str,
+    mapping: Annotated[list[str] | None, typer.Argument(
+        help="stage=column, one per stage — todo=Ready in_progress=Doing done=Shipped")] = None,
+    pickup: str | None = typer.Option(
+        None, "--pickup", help="the column that dispatches work (it is the `todo` column)"),
+) -> None:
+    """Which column of this project's board is each stage — todo, in_progress, in_review, done and
+    the rest the core defines — and which column dispatches work. Merged into what the project
+    holds; a column the board does not have, a stage the core does not define and two stages on
+    one column are refused, naming the board's columns, and nothing is changed.
+
+    With no mapping it shows the board as it is read now, which stages no column is, and what
+    dispatches. The next doctor and the poller's next pass read the change; nothing restarts."""
+    # A MAPPING ONTO THE `project_set_board_columns` AND `project_board_columns` ROWS (#585): the
+    # rows validate against the board and write; what stays here is how a terminal shows them.
+    if mapping or pickup:
+        outcome = _perform("project_set_board_columns", project=name, columns=list(mapping or []),
+                           pickup=pickup or "")
+    else:
+        outcome = _perform("project_board_columns", project=name)
+    if not outcome.ok:
+        _refuse_the_row(outcome, name)
+    data = outcome.data
+    if data.get("board") is None and "mapping" in data and not data["mapping"]:
+        typer.echo(f"{name} has no board configured — its tickets are named directly")
+        return
+    typer.echo(f"✓ {outcome.message}" if mapping or pickup else outcome.message.split(";")[0])
+    for stage, column in data["mapping"].items():
+        typer.echo(f"  {stage:<13} {column if column else 'unmapped'}")
+    typer.echo(f"  {'pickup':<13} {data['pickup']}"
+               + ("" if data["pickup_on_board"] else "  (not a column of this board)"))
 
 
 @project_app.command("show")

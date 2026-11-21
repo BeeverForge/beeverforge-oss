@@ -279,10 +279,18 @@ saying so.
 | `project_add` | `project`, `repo_path`, [`provider`], [`repo`], [`board_owner`], [`board_number`], [`organization`], [`ado_project`], [`repository`], [`work_item_type`], [`token_env`], [`model`], [`language`] | registers a project with every axis its address and options say; a name already registered as asked changes nothing (`data.changed` is `false`), and one registered differently is refused with a 409 naming what differs (`beeverforge project add`, and `POST /api/projects`) |
 | `project_init` | `project`, [`repo_path`], [`repo`], [`board_owner`], [`language`], [`provider`] | makes a project ready to move a ticket — registers it from `repo_path` if it is not registered, creates its board (or adds the columns a board it has lacks, where the board's row can), seeds its context repository where this installation owns it, scaffolds its manifest — each step only if it is missing; `data.steps` says what each came to, and a step that failed makes it a 500 that names what was done before it (`beeverforge project init`) |
 | `project_remove` | `project` | unregisters a project; nothing else about it is touched (`beeverforge project remove`) |
+| `project_set_board_columns` | `project`, [`columns`], [`pickup`] | maps stages onto the board's columns, written to the tracker option the board reads (`columns`, `status_map` on Jira) and `pickup_status`, merged into what is held and idempotent (`data.changed` is `false` when it already was so); `columns` is a mapping or `todo=Ready,done=Shipped`, and the answer is the new `data.mapping` and `data.pickup`. A column the board does not have, a stage the core does not define, two stages on one column and a `pickup` that is not the `todo` column are a 400 that says `Nothing was changed` and names the board's columns; the doctor's `board_columns` and `board_stages` and the poller read the change on their next pass, with no restart (`beeverforge project set-board-columns`) |
 | `project_set_model` | `project`, `model`, [`role`] | the model the coding agent runs, passed to the harness verbatim, for every role or one (`beeverforge project set-model`) |
 | `project_set_language` | `project`, `language` | the language a project speaks first; a reply follows whoever asked (`beeverforge project set-language`) |
 | `project_set_preview` | `project`, [`required`], [`hours`], [`auto_start`], [`env`], [`build_arg`], [`network`], [`cpus`], [`memory`], [`clear_env`] | the operator's preview policy, merged into what is held; `data.preview` is the policy saved and `data.dropped` the names a preview may never receive (`beeverforge project set-preview`) |
 <!-- installation:end -->
+
+`project_board_columns` (`project`) reads and changes nothing, and is the administrator's like the rows above (a credential scoped to the product is refused it):
+
+| action | takes | what it answers |
+|---|---|---|
+| `project_board_columns` | `project` | reads the project's board: `data.board` (its `kind` and `address`, `null` for a project with no board), `data.columns` as the board reports them, `data.mapping` from each stage the core defines to its column (`null` for a stage no column is, which is what the doctor's `board_columns` reports as unmapped), and `data.pickup`, the column that dispatches work, with `data.pickup_on_board`; a board that cannot be read is a 503, never a board with no columns (`beeverforge project set-board-columns <name>`) |
+
 
 `[name]` is optional. Beside them, `doctor` (`project`) changes nothing and answers any floor
 credential: its `data` is the `beeverforge.doctor/1` document `beeverforge doctor --json` prints,
