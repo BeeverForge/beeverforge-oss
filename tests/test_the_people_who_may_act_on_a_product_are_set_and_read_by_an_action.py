@@ -367,6 +367,7 @@ def test_the_guard_finds_a_row_that_writes_the_lists_some_other_way():
     assert _functions_that_write_the_lists(fixture) == {"_sneaky", "_also"}
 
 
+@pytest.mark.whole_tree
 def test_only_this_row_writes_the_product_lists():
     for path in sorted((ROOT / "beeverforge").rglob("*.py")):
         if path.name == "registry.py":
