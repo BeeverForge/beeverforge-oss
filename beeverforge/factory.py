@@ -662,6 +662,9 @@ def build_promotion_runner(project, issue: str):
     tracker_found = axis_answer_for(project, "tracker")
     forge_tok, tracker_tok = forge_found.value, tracker_found.value
     repo_path = resolve_repo_path(project, token=forge_tok or app_tok)
+    forge_provider = (stored_token_provider(project, "forge", forge_found)
+                      if forge_tok
+                      else deployment_forge_provider(project))
     return PromotionRunner(
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here). The re-minting
@@ -673,11 +676,11 @@ def build_promotion_runner(project, issue: str):
                                               if tracker_tok
                                               else deployment_tracker_provider(project))),
         # …and here, for the same reason (#236): see `build_runner`
-        forge=build_forge(project, token=forge_tok,
-                          token_provider=(stored_token_provider(project, "forge", forge_found)
-                                          if forge_tok
-                                          else deployment_forge_provider(project))),
-        observer=build_observer(project, token=forge_tok or app_tok),
+        forge=build_forge(project, token=forge_tok, token_provider=forge_provider),
+        # THE OBSERVER READS THE FORGE'S TOKEN THE WAY THE FORGE DOES (#589): it was handed the
+        # string read at composition, so a promotion that outlived it observed under an expired one
+        observer=build_observer(project, token=forge_tok or app_tok,
+                                token_provider=forge_provider),
         manifest=load_manifest(project, repo_root=repo_path),
         events=journal_for(events_file(project, issue)),
         # AND WHICH LANGUAGE IT SAYS ALL OF THAT IN (#160). Every sentence the promotion runner

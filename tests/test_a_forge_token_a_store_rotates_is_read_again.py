@@ -697,3 +697,69 @@ def test_no_token_value_reaches_a_log(tmp_path, secrets, clock, caplog, gh_calls
 
     said = "\n".join(r.getMessage() for r in caplog.records)
     assert FIRST not in said and SECOND not in said
+
+
+# ── 6. the promotion runner's environment observer (#589) ───────────────────────────────────────
+
+def _observed_with(runner, gh_calls) -> str | None:
+    """The `GH_TOKEN` the observer's next read carries; `gh` is never run."""
+    runner.observer._api("repos/acme/widgets/deployments")
+    return gh_calls[-1]
+
+
+@pytest.fixture
+def observer_gh_calls(monkeypatch):
+    from beeverforge.adapters.environment import github_actions
+
+    seen: list[str | None] = []
+
+    def run(argv, *a, env=None, **kw):
+        seen.append((env or {}).get("GH_TOKEN"))
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+    monkeypatch.setattr(github_actions.subprocess, "run", run)
+    return seen
+
+
+def test_an_observer_whose_promotion_outlives_the_first_tokens_lifetime_reads_under_a_fresh_one(
+        tmp_path, secrets, clock, observer_gh_calls):
+    secrets(BOT, FIRST)
+    runner = factory.build_promotion_runner(_project(tmp_path), "#1")
+    assert _observed_with(runner, observer_gh_calls) == FIRST
+    secrets(BOT, SECOND)
+    clock.at(80)
+
+    assert _observed_with(runner, observer_gh_calls) == SECOND
+
+
+def test_the_observer_of_a_PAT_or_the_environment_is_handed_its_token_once(
+        tmp_path, secrets, clock, monkeypatch):
+    project = _project(tmp_path)
+    secrets(BOT, PAT)
+    runner = factory.build_promotion_runner(project, "#1")
+    assert runner.observer._token_provider is None and runner.observer._static_token == PAT
+
+    monkeypatch.delenv(STORE_VAR)
+    monkeypatch.setenv(BOT, FIRST)
+    runner = factory.build_promotion_runner(project, "#1")
+    assert runner.observer._token_provider is None and runner.observer._static_token == FIRST
+
+
+def test_a_refusal_met_by_the_observers_re_read_is_said_by_name_and_no_login_answers_it(
+        tmp_path, addon_store, clock, monkeypatch, observer_gh_calls):
+    held, _ = addon_store
+    held[BOT] = FIRST
+    runner = factory.build_promotion_runner(_project(tmp_path), "#1")
+    _observed_with(runner, observer_gh_calls)
+
+    def refuse(self, name):
+        raise CredentialRefused(f"the rotating store seals {name}")
+
+    monkeypatch.setattr(RotatingStore, "resolve", refuse)
+    clock.at(70)
+    before = len(observer_gh_calls)
+
+    with pytest.raises(LoginRefused) as refused:
+        runner.observer._api("repos/acme/widgets/deployments")
+    assert f"{KIND}:{BOT}" in str(refused.value) and FIRST not in str(refused.value)
+    assert len(observer_gh_calls) == before, "`gh` ran after the credential was refused"
