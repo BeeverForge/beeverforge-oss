@@ -153,6 +153,8 @@ nothing; `env apply <path-or-name> --yes` writes it into that checkout (`--accep
 clone the repository and propose the manifest as a pull request instead — the whole session is
 walked in [ONBOARDING §3](../ONBOARDING.md).
 
+**The product's people** — `product people set <name> <person:role>… [--file <path>] [--yes]` (the role is `admin` or `engineer`; a file holds one `person:role` per line) shows what it would add and remove and writes only with `--yes`; it sets the whole list of who may approve (`admin`) or act (`engineer`) on the product in one registry write: a person left out is removed, naming nobody is refused and never empties the lists, and the rest of the product's entry stays. A call that matches what is held answers unchanged without rewriting the file; a malformed entry or a second role for one person is refused (exit 2) and nothing is written; a project with no `product:` section is refused naming `product declare`. `product people list <name>` reads the list with its digest. They are the `product_people_set` and `product_people_list` actions.
+
 **The context repository** — `product declare <name> <repo>` names one the client ALREADY has
 (GitHub `owner/repo`; Azure `repo`, or `Project/repo` across projects) and reads it back with
 both credentials that will open it. `product init <name> --create-context --write` creates one

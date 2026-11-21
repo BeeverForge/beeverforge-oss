@@ -298,6 +298,9 @@ OWNED = {
     # is what every one of these verbs did before, from the command line alone:
     "withdraw": "people_revoke",             # taking a person off the deployment
     "hold_poller": "poller_pause/poller_resume",  # the deployment-wide hold on pickup
+    # who may approve or act on a product (#528): the one write of `product.admins`, and its read
+    "set_people": "product_people_set",
+    "_people_said": "product_people_list/product_people_set",
     "set_agent_name": "product_name",        # what the product role is called
     "set_docs_repo": "product_declare",      # where the product's requirements live
     "set_model": "project_set_model",        # which model a project's agent runs

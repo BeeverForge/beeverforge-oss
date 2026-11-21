@@ -35,6 +35,7 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -303,6 +304,10 @@ def _refused_as_registered(others: list[dict], project: Project) -> None:
         raise ValueError(f"project {project.name!r} would share its short name "
                          f"{slug(project.name)!r} with {twin!r} — previews, their hosts "
                          "and their cookies are named by it; choose another name")
+
+
+#: What `set_people` is given: the held (admins, engineers) in, the pair to hold out.
+_PeopleChange = Callable[[list[str], list[str]], tuple[list[str], list[str]]]
 
 
 class ProjectRegistry:
@@ -790,6 +795,46 @@ class ProjectRegistry:
             product["agent_name"] = agent_name
             raw[name]["product"] = product
             self._save_raw(raw)
+
+    def people(self, name: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """`(product.admins, product.engineers)` as the file holds them. RAISES `KeyError` for a
+        name not held and `ValueError` for a project with no `product:` section."""
+        raw = self._load_raw()
+        if name not in raw:
+            raise KeyError(name)
+        product = raw[name].get("product")
+        if not isinstance(product, dict):
+            raise ValueError(f"{name} has no product module — declare its context repository "
+                             f"first (`beeverforge product declare`)")
+        return (tuple(str(x) for x in product.get("admins") or ()),
+                tuple(str(x) for x in product.get("engineers") or ()))
+
+    def set_people(self, name: str, change: _PeopleChange) -> bool:
+        """Replace the product's two lists of people in ONE write — `change(admins, engineers)`
+        answers the pair to hold, read from the entry as it is UNDER THE LOCK, so two calls each
+        leave one whole pair and never a mix. True when the file was written, False — and not
+        rewritten — when the pair is the one held. The rest of the entry is kept as it is.
+
+        RAISES `KeyError` for a name not held and `ValueError` for a project with no `product:`
+        section; `change` may raise its own refusal, and then nothing is written."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            if not isinstance(raw[name].get("product"), dict):
+                raise ValueError(f"{name} has no product module — declare its context "
+                                 f"repository first (`beeverforge product declare`)")
+            product = dict(raw[name]["product"])
+            have = ([str(x) for x in product.get("admins") or ()],
+                    [str(x) for x in product.get("engineers") or ()])
+            admins, engineers = change(*have)
+            if (sorted(set(admins)), sorted(set(engineers))) == \
+                    (sorted(set(have[0])), sorted(set(have[1]))):  # an order is not a change
+                return False
+            product["admins"], product["engineers"] = list(admins), list(engineers)
+            raw[name]["product"] = product
+            self._save_raw(raw)
+            return True
 
     def set_language(self, name: str, language: str) -> None:
         """Which language this project's UNPROMPTED messages are written in (#124).
