@@ -298,6 +298,14 @@ factory still works, you just name tickets directly. On **Azure DevOps**, regist
 Boards ships with the project, so there is no board to create:
 [docs/setup/azure-devops.md](setup/azure-devops.md) §5 is that step.)
 
+A repository that moved, a different board or a different CI is not a new registration:
+`project add` refuses a name that is registered differently, and removing then adding drops the
+project's model, language, preview policy and attached board. `beeverforge project update <name>`
+changes only where the repository, tracker or CI is — `--repo-path`, `--board-owner`/`--board-number`,
+`--provider`, `--ci` — in one write, keeps everything else, and says `changed: false` when it was
+already so. It refuses what `project add` would refuse for the same input. It writes the registry
+only; it does not move the repository, its cards or its CI definition.
+
 **The board's columns are the platform's vocabulary**: seven on GitHub Projects
 (`Backlog · TO-DO · In progress · In review · Needs Review · Needs Action · Done` — created for
 you, in that order, by the command above; *Needs Review* is optional on a board you built

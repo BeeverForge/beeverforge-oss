@@ -193,6 +193,7 @@
  "tests/test_a_refusal_names_who_can.py": 0.1,
  "tests/test_a_refused_credential_opens_no_door.py": 17.9,
  "tests/test_a_refused_gate_key_is_said_as_itself.py": 0.1,
+ "tests/test_a_registered_projects_repository_tracker_and_ci_are_changed_by_one_action.py": 2.0,
  "tests/test_a_registry_that_spans_organisations_fails_the_doctor.py": 0.1,
  "tests/test_a_rejected_review_can_be_asked_again.py": 0.4,
  "tests/test_a_relative_gitdir_under_a_symlinked_cache_root_holds_the_job.py": 0.2,

@@ -8368,7 +8368,7 @@ async def _project_add(*, project: str, repo_path: str, by: Actor, provider: obj
     answer (`changed: false`), so a script that adds and then initialises can be run twice; one
     registered differently is refused, naming what differs, and nothing is written. Adding again is
     not how a project is changed — its own rows are (`project_set_model`, `project_set_language`),
-    and `project_remove` first is how it is replaced."""
+    and `project_update` changes where its repository, tracker or CI is."""
     from pydantic import ValidationError
 
     from beeverforge import doors
@@ -8421,9 +8421,10 @@ async def _project_add(*, project: str, repo_path: str, by: Actor, provider: obj
         differs = _differs(held, asked)
         if differs:
             return refused(CONFLICT, f"{name} is already registered, with a different "
-                                     f"{', '.join(differs)} — nothing was changed. A project is "
-                                     f"changed by its own rows (project_set_model, "
-                                     f"project_set_language), or removed first and added again",
+                                     f"{', '.join(differs)} — nothing was changed. Where its "
+                                     f"repository, tracker or CI is changes with project_update; "
+                                     f"its model and language by their own rows "
+                                     f"(project_set_model, project_set_language)",
                            project=name, differs=differs)
         return done(f"{name} is already registered as asked — nothing was changed", project=name,
                     changed=False, registered=held.model_dump(mode="json", exclude_none=True))
@@ -8436,6 +8437,129 @@ async def _project_add(*, project: str, repo_path: str, by: Actor, provider: obj
         return refused(CONFLICT, f"{name} was not registered — {exc}", project=name)
     return done(f"registered project {name!r}", project=name, changed=True,
                 registered=asked.model_dump(mode="json", exclude_none=True))
+
+
+class _Refusal(Exception):
+    """A refusal `project_update` decided inside the registry's lock, carried out of it."""
+
+    def __init__(self, outcome: Outcome) -> None:
+        super().__init__(outcome.message)
+        self.outcome = outcome
+
+
+def _axes_updated(held, *, name: str, repo_path: str, provider: str, repo: str, board_owner: str,
+                  board_number: str, organization: str, ado_project: str, repository: str,
+                  work_item_type: str, token_env: str, ci: str) -> dict:
+    """The `Project` fields `project_update` writes over `held`: `{field: value}`, or `_Refusal`.
+
+    THE QUESTIONS ARE `project_add`'s, ASKED OF THE SAME FUNCTIONS (`doors.foreign_host`,
+    `doors.axes_for`): whose host the address is, the kind on every axis, whether the coordinates
+    were given. What is not said is what is HELD — the kind and repository of the tracker when the
+    address is not moved, and every option the axis already has (the attached board, a credential
+    variable) when its kind stays — so an update changes what it names and nothing else."""
+    from beeverforge import doors
+    from beeverforge.contracts.project import ProviderRef
+
+    moved = bool(repo_path)
+    where = repo_path or held.repo_path
+    fields: dict = {}
+    if moved:
+        fields["repo_path"] = where
+    axes: dict = {}
+    if moved or provider or repo or board_owner or board_number or organization or ado_project \
+            or repository or work_item_type or token_env:
+        chosen = provider or ("" if moved else held.tracker.kind)
+        try:
+            foreign = doors.foreign_host(where, provider=chosen)
+        except ValueError as exc:
+            raise _Refusal(refused(INVALID, str(exc), project=name)) from exc
+        if foreign:
+            raise _Refusal(refused(INVALID, doors.foreign_refusal(foreign), project=name,
+                                   foreign=foreign))
+        # THE HELD REPOSITORY STANDS IN for one not given, except where it is not the code's name:
+        # on Azure DevOps the tracker's is the project inside the organisation
+        seed = "" if moved or held.tracker.kind == "azure_devops" else held.tracker.repo or ""
+        try:
+            axes = doors.axes_for(
+                name, where, provider=chosen, repo=repo or seed, organization=organization,
+                ado_project=ado_project, repository=repository, work_item_type=work_item_type,
+                token_env=token_env, board_owner=board_owner, board_number=board_number)
+        except doors.MissingCoordinates as exc:
+            missing = [flag.lstrip("-").replace("-", "_") for flag in exc.missing]
+            them = "it" if len(missing) == 1 else "them"
+            raise _Refusal(refused(
+                INVALID, f"{name} was not updated: {', '.join(missing)} could not be read from "
+                         f"{where!r}, and a project of this kind needs {them} — pass {them}",
+                project=name, missing=missing)) from exc
+    if ci:
+        axes["ci"] = ProviderRef(kind=ci.lower(), repo=None, options={})
+    for axis, new in axes.items():
+        have = getattr(held, axis, None)
+        if have is not None and have.kind == new.kind:
+            new = ProviderRef(kind=new.kind, repo=new.repo or have.repo,
+                              options={**have.options, **new.options})
+        elif axis == "ci" and new.repo is None:
+            new = ProviderRef(kind=new.kind, repo=held.tracker.repo, options={})
+        fields[axis] = new
+    return fields
+
+
+async def _project_update(*, project: str, by: Actor, repo_path: object = "",
+                          provider: object = "", repo: object = "", board_owner: object = "",
+                          board_number: object = "", organization: object = "",
+                          ado_project: object = "", repository: object = "",
+                          work_item_type: object = "", token_env: object = "",
+                          ci: object = "") -> Outcome:
+    """Change where a registered project's repository, tracker or CI is — one write, and only the
+    axes named.
+
+    `project_add` REFUSES A NAME THAT IS REGISTERED DIFFERENTLY, and `project_remove` then
+    `project_add` drops the entry's model, language, preview policy, `enabled` and attached board.
+    This keeps them: it reads the entry under the registry's lock, writes the repository and the
+    axes the address and options say, and leaves the rest as the file has it.
+
+    EVERY REFUSAL `project_add` MAKES FOR THE SAME INPUT IS MADE HERE, by the same functions (the
+    host, the coordinates, the credential variable's name, one GitHub organisation per
+    installation, one preview slug), and each leaves the entry as it was. A call that matches what
+    is held answers `changed: false` and does not rewrite the file. THE NAME IS NOT CHANGED, and
+    neither is where the code lives — this says only what the registry says."""
+    from pydantic import ValidationError
+
+    from beeverforge.registry import ProjectRegistry
+
+    given = dict(repo_path=_given(repo_path), provider=_given(provider), repo=_given(repo),
+                 board_owner=_given(board_owner), board_number=_given(board_number),
+                 organization=_given(organization), ado_project=_given(ado_project),
+                 repository=_given(repository), work_item_type=_given(work_item_type),
+                 token_env=_given(token_env), ci=_given(ci))
+    # AN UNREGISTERED NAME IS ASKED FIRST: a typo is the commonest cause, and "say what to change"
+    # to a name nobody holds would send the person to the wrong problem
+    try:
+        ProjectRegistry().get(project)
+    except KeyError:
+        return _no_such_project(project, so="nothing was updated")
+    if not any(given.values()):
+        return refused(INVALID, f"{project} was not updated — say what to change: "
+                                f"{', '.join(given)}", project=project)
+    try:
+        fields = list(ProjectRegistry().set_axes(
+            project, lambda held: _axes_updated(held, name=project, **given)))
+    except KeyError:
+        return _no_such_project(project, so="nothing was updated")
+    except _Refusal as exc:
+        return exc.outcome
+    except ValidationError as exc:
+        return refused(INVALID, f"{project} was not updated — "
+                                f"{' '.join(str(exc).split())[:300]}", project=project)
+    except ValueError as exc:
+        return refused(CONFLICT, f"{project} was not updated — {exc}", project=project)
+    if not fields:
+        return done(f"{project} is already as asked — nothing was changed", project=project,
+                    changed=False, fields=[])
+    # THE AUDIT RECORD IS `perform`'s, ONE PER CALL: who, and the parameters given (a credential
+    # parameter masked there) — this row adds no second line
+    return done(f"updated {project!r}: {', '.join(fields)}", project=project, changed=True,
+                fields=fields)
 
 
 # ── making a registered project ready: a row of several steps (#741) ────────────────────────────
@@ -10137,6 +10261,41 @@ CATALOG: dict[str, ActionSpec] = {
                          "empty leaves the harness's default",
                 "language": "a language tag the project speaks first in, e.g. `en` or "
                             "`pt-BR`; empty is English",
+            },
+        ),
+        ActionSpec(
+            name="project_update",
+            summary="change where a registered project's repository, tracker or CI is — only "
+                    "the axes named, in one write, the rest of its entry kept",
+            run=_project_update,
+            refuses=(INVALID, NOT_FOUND, CONFLICT),
+            required=("project",),
+            optional=("repo_path", "provider", "repo", "board_owner", "board_number",
+                      "organization", "ado_project", "repository", "work_item_type", "token_env",
+                      "ci"),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS UPDATED TOO (#992): this is the registry's row for it
+            needs_code=False,
+            params={
+                "project": "the registered project to change",
+                "repo_path": "where the code is now: a path on the machine the factory runs on, "
+                             "or a clone URL; the axes its host says are written with it",
+                "provider": "the kind of the tracker, when the address cannot say it",
+                "repo": "the repository as its forge names it, e.g. `owner/name`",
+                "board_owner": "who owns the board the cards are on, given with `board_number`",
+                "board_number": "the board's number, given with `board_owner`",
+                "organization": "the organisation the project lives in, where its kind has one "
+                                "and the address does not carry it",
+                "ado_project": "the project inside that organisation, where the address does "
+                               "not carry it",
+                "repository": "the repository inside that project, where the address does not "
+                              "carry it",
+                "work_item_type": "the kind of card the factory writes on a board that has "
+                                  "several, spelled as the board spells it",
+                "token_env": "the NAME of the environment variable holding this project's "
+                             "credential — never the credential itself",
+                "ci": "the kind of CI that reports on its pull requests, e.g. `github_actions`, "
+                      "or `none`",
             },
         ),
         ActionSpec(

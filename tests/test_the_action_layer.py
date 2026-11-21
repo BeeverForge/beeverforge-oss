@@ -316,6 +316,9 @@ OWNED = {
     # needs (ADR-0049 D2, `doors.axes_for` since #992): a front end that wrote them itself would
     # be the fourth copy of the rule the three registering doors used to each carry
     "axes_for": "project_add",
+    # changing them for a project already registered (#527): the same questions asked of the same
+    # functions, and written under the registry's lock with the rest of the entry kept
+    "set_axes": "project_update",
     # pointing the registry at a board this platform created — the one write `project init` made
     # beside registering, and a second door that made it would be a board nobody's row decided on
     "attach_board": "project_init",
