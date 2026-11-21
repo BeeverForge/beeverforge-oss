@@ -549,10 +549,13 @@ def project_update(
     board_owner: str = typer.Option(None, help="The board's owner, for a tracker that has one"),
     board_number: str = typer.Option(None, help="The board's number, for a tracker that has one"),
     organization: str = typer.Option(None, help="The tracker's organisation, when it has one"),
-    ado_project: str = typer.Option(None, "--ado-project", help="The tracker's project, when it has one"),
-    repository: str = typer.Option(None, help="The repository's name in the tracker, when it has one"),
+    ado_project: str = typer.Option(None, "--ado-project",
+                                    help="The tracker's project, when it has one"),
+    repository: str = typer.Option(None, help="The repository's name in the tracker, "
+                                              "when it has one"),
     work_item_type: str = typer.Option(None, "--work-item-type",
-                                       help="The kind of work item the factory writes, when the tracker has kinds"),
+                                       help="The kind of work item the factory writes, "
+                                            "when the tracker has kinds"),
     token_env: str = typer.Option(None, help="Name of the env var holding THIS project's "
                                              "credential"),
     ci: str = typer.Option(None, help="The kind of CI, e.g. github_actions, or none"),
