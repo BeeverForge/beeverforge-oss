@@ -42,13 +42,16 @@ def moved(held: Sequence[str], new: Sequence[str]) -> dict[str, list[str]]:
 
 def _unfit(who: object) -> str:
     """Why an id cannot be a person's, or "" — an id is stored AS GIVEN, so what cannot be said
-    plainly in a log line or a file (an empty one, a long one, a control character) is refused."""
+    plainly in a log line or a file (an empty one, a long one, a control character) is refused,
+    and so is whitespace: an id is never trimmed, so a padded one is one authz never matches."""
     if not isinstance(who, str) or not who.strip():
         return "has no person"
     if len(who) > ID_BOUND:
         return f"has a person longer than {ID_BOUND} characters"
     if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in who):
         return "has a person with a control character in it"
+    if any(c.isspace() for c in who):
+        return "has a person with whitespace in it; give the id exactly as the provider has it"
     return ""
 
 
