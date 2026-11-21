@@ -108,8 +108,15 @@ def test_an_empty_list_empties_both_and_a_missing_one_is_refused(registry):
 
 def test_the_bound_is_a_thousand_and_ids_are_stored_as_given(registry):
     assert the_people.BOUND == 1000
-    assert _set([{"person": " ana ", "role": "admin"}]).ok
-    assert _product(registry)["admins"] == [" ana "]  # no strip: the id is the provider's own
+    assert _set([{"person": "Ana.Souza@Example", "role": "admin"}]).ok
+    # no case-folding: the id is the provider's own, compared byte for byte by authz
+    assert _product(registry)["admins"] == ["Ana.Souza@Example"]
+    # an id with whitespace in or around it is no one authz will ever match: refused, not trimmed
+    for padded in (" ana ", "ana ", "a b", "a\u3000b"):
+        before = _bytes(registry)
+        out = _set([{"person": padded, "role": "admin"}])
+        assert out.code == "invalid" and "entry 1" in out.message and "whitespace" in out.message
+        assert _bytes(registry) == before
 
 
 def test_a_project_with_no_product_section_is_refused_naming_the_declaration(registry):
