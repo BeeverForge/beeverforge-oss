@@ -4839,25 +4839,63 @@ product_app.add_typer(product_people_app, name="people")
 @product_people_app.command("set")
 def product_people_set(
     name: str,
-    admin: Annotated[list[str] | None, typer.Option(
-        "--admin", help="a person who may approve (repeatable)")] = None,
-    engineer: Annotated[list[str] | None, typer.Option(
-        "--engineer", help="a person who builds the product (repeatable)")] = None,
+    people: Annotated[list[str] | None, typer.Argument(
+        help="who, as person:role — the role is admin or engineer")] = None,
+    file: Annotated[Path | None, typer.Option(
+        "--file", help="a file with one person:role per line")] = None,
+    yes: Annotated[bool, typer.Option(
+        "--yes", help="write it; without it the change is only shown")] = False,
 ) -> None:
-    """Set the WHOLE list of the product's people: a person left out is removed, and naming nobody
-    empties both lists. The ids are the ones the identity provider gives."""
+    """Set the WHOLE list of the product's people: a person left out is removed.
+
+    Shows what would change and writes only with --yes. Naming nobody is refused — it never
+    empties the lists (the `product_people_set` action does, with `[]`). The ids are the ones the
+    identity provider gives."""
     # A MAPPING ONTO THE `product_people_set` ROW (#528): the row reads, decides and writes.
-    people = [{"id": who, "role": "admin"} for who in admin or []] \
-        + [{"id": who, "role": "engineer"} for who in engineer or []]
-    outcome = _perform("product_people_set", project=name, people=people)
+    given = list(people or [])
+    if file is not None:
+        try:
+            given += [line for line in file.read_text(encoding="utf-8").splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")]
+        except (UnicodeDecodeError, OSError) as exc:
+            typer.echo(f"✗ {file} could not be read: {exc}")
+            raise typer.Exit(2) from exc
+    if not given:
+        typer.echo("✗ nobody was named — give person:role arguments or --file; nothing was changed")
+        raise typer.Exit(2)
+    entries = []
+    for text in given:
+        who, _, role = text.rpartition(":")
+        if not who:
+            typer.echo(f"✗ {text!r} is not person:role; nothing was changed")
+            raise typer.Exit(2)
+        entries.append({"person": who, "role": role})
+    held = _perform("product_people_list", project=name)
+    if not held.ok:
+        typer.echo(f"✗ {held.code}: {held.message}")
+        raise typer.Exit(2)
+    if not yes:
+        from beeverforge.product import people as the_people
+
+        admins, engineers, why = the_people.read(entries)
+        if why:
+            typer.echo(f"✗ invalid: {why}. Nothing was changed")
+            raise typer.Exit(2)
+        for role, new in zip(("admin", "engineer"), (admins, engineers), strict=True):
+            now = [p["person"] for p in held.data["people"] if p["role"] == role]
+            said = the_people.moved(now, new)
+            typer.echo(f"  {role}: +{said['added']} -{said['removed']} ={len(said['unchanged'])}")
+        typer.echo("nothing was written — run it again with --yes to write it")
+        return
+    outcome = _perform("product_people_set", project=name, people=entries)
     if not outcome.ok:
         typer.echo(f"✗ {outcome.code}: {outcome.message}")
         raise typer.Exit(2)
     typer.echo(f"✓ {outcome.message}" if outcome.data["changed"] else outcome.message)
     for role in ("admins", "engineers"):
-        moved = outcome.data[role]
-        typer.echo(f"  {role}: +{len(moved['added'])} -{len(moved['removed'])} "
-                   f"={len(moved['unchanged'])}")
+        said = outcome.data[role]
+        typer.echo(f"  {role}: +{len(said['added'])} -{len(said['removed'])} "
+                   f"={len(said['unchanged'])}")
     typer.echo(f"  digest {outcome.data['digest']}")
 
 
@@ -4870,7 +4908,7 @@ def product_people_list(name: str) -> None:
         raise typer.Exit(2)
     typer.echo(outcome.message)
     for person in outcome.data["people"]:
-        typer.echo(f"  {person['role']:<9} {person['id']}")
+        typer.echo(f"  {person['role']:<9} {person['person']}")
     typer.echo(f"  digest {outcome.data['digest']}")
 
 

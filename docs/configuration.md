@@ -797,9 +797,9 @@ product:
   enabled: true                                       # optional (the incident switch)
 ```
 
-`beeverforge product people set <name> --admin ana --engineer caio` (the `product_people_set` action; `product people list` and
+`beeverforge product people set <name> ana:admin caio:engineer --yes` (without `--yes` it only shows the change) (the `product_people_set` action; `product people list` and
 `product_people_list` read it back) writes `admins` and `engineers` as one list in one registry write: a person left out is
-removed, and a person who is added by the one asking is refused. It is the installation's — a scoped credential is denied.
+removed, and a person who is added by the one asking is refused. It is the installation's — a scoped credential, or anyone asking from a room, is denied.
 
 `admins` are **people of the platform** — the ids the deployment's identity provider knows them
 by (the `BEEVERFORGE_PRODUCT_TOKENS` identities on the panel, an invitation, an SSO login) — never

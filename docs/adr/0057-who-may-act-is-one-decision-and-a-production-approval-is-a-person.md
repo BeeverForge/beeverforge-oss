@@ -101,8 +101,9 @@ policy.may(subject: Subject, *, action: ActionSpec, project, on: Card | None = N
   deployment-wide grants live with the deployment's identity configuration (D3). **One row writes
   the product's two lists, as a declared exception** (#528): `product_people_set` writes
   `product.admins` and `product.engineers` for the installation's administrator, and no other row
-  does. It is `installation`, so a credential scoped to an area is refused, and a person is never
-  added by themselves; the policy still only reads what it left.
+  does. It is `installation`, so a credential scoped to an area is refused, so is anyone asking from a
+  room (only the panel, the shell and the factory itself may grant), and a person is never added by
+  themselves; the policy still only reads what it left.
 - **Unchanged rules, now stated once:** an unknown scope or role is refused, never defaulted; an
   anonymous subject (`Subject.known` is false) holds exactly the role its credential's own row
   grants in D6 (the shared panel token `admin`, the shared board token `operator`, the shared

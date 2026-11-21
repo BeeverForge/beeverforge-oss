@@ -7730,14 +7730,14 @@ def _people_said(admins: Sequence[str], engineers: Sequence[str]) -> dict:
     """The two lists as the answer says them: one `{id, role}` list and its digest."""
     from beeverforge.product import people as the_people
 
-    return dict(people=[*({"id": p, "role": "admin"} for p in admins),
-                        *({"id": p, "role": "engineer"} for p in engineers)],
+    return dict(people=[*({"person": p, "role": "admin"} for p in sorted(admins)),
+                        *({"person": p, "role": "engineer"} for p in sorted(engineers))],
                 digest=the_people.digest(admins, engineers))
 
 
 async def _product_people_list(*, project: str, by: Actor) -> Outcome:
     """Who may approve or act on this product, as the registry holds it — `product.admins` and
-    `product.engineers` as one `{id, role}` list, with the digest `product_people_set` answers."""
+    `product.engineers` as one `{person, role}` list, with the digest a set answers."""
     from beeverforge.registry import ProjectRegistry
 
     try:
@@ -7750,10 +7750,9 @@ async def _product_people_list(*, project: str, by: Actor) -> Outcome:
                 **_people_said(admins, engineers))
 
 
-def _people_moved(held: Sequence[str], new: Sequence[str]) -> dict:
-    return {"added": [p for p in new if p not in held],
-            "removed": [p for p in held if p not in new],
-            "unchanged": [p for p in new if p in held]}
+#: the doors a grant of access may come through: the panel's own credential, a shell on the host,
+#: and the factory itself
+_INSTALLATION_DOORS = frozenset({"panel", "cli", "internal"})
 
 
 async def _product_people_set(*, project: str, by: Actor, people: object = None) -> Outcome:
@@ -7763,16 +7762,23 @@ async def _product_people_set(*, project: str, by: Actor, people: object = None)
     that names nothing (`people` missing) is refused rather than read as "nobody". `product.admins`
     is what `may_act` reads, so this row decides who may make the product role write — which is
     why it is the installation's (a product credential, or a person on the list, cannot widen
-    their own access through it) and why no person may be ADDED by themselves: a grant whose
-    grantee is the granter is refused (ADR-0057). The shell outranks that, as it does every row.
+    their own access through it) and why it is refused to anyone asking from a room: only the
+    panel, the shell and the factory itself (`_INSTALLATION_DOORS`) may make a grant, and no
+    person may be ADDED by themselves (ADR-0057).
 
     DECIDED BEFORE ANYTHING IS WRITTEN: every entry is read first, and one that is not an
-    `{id, role}` of a known role, a second role for a person, or more than the bound refuses the
+    `{person, role}` of a known role, a second role for a person, or more than the bound refuses the
     whole call, naming the entry. The rest of the `product:` entry is kept as the file has it.
-    The audit line is `perform`'s: the project, the counts and the digest, never an id."""
+    The audit line is `perform`'s: the project, the counts, the digest and the person ids
+    changed, never a credential."""
     from beeverforge.product import people as the_people
     from beeverforge.registry import ProjectRegistry
 
+    # A ROOM IS NOT THE INSTALLATION: an unscoped admin of a chat room passes the generic check
+    # (`scopes is None`), so who asks is decided here, by the door, before anything is read
+    if by.via not in _INSTALLATION_DOORS:
+        return refused(DENIED, f"{project}'s people are set from the panel or the shell, not "
+                               f"from {by.via or 'a room'}. Nothing was changed", project=project)
     # AN UNREGISTERED NAME IS ASKED FIRST, as `project_update` does: a typo is the commonest cause
     try:
         ProjectRegistry().get(project)
@@ -7789,8 +7795,8 @@ async def _product_people_set(*, project: str, by: Actor, people: object = None)
 
     def change(held_admins: list[str],
                held_engineers: list[str]) -> tuple[list[str], list[str]]:
-        moved["admins"] = _people_moved(held_admins, admins)
-        moved["engineers"] = _people_moved(held_engineers, engineers)
+        moved["admins"] = the_people.moved(held_admins, admins)
+        moved["engineers"] = the_people.moved(held_engineers, engineers)
         joining = {*moved["admins"]["added"], *moved["engineers"]["added"]}
         if by.via != "cli" and by.id and by.id in joining:
             raise _Refusal(refused(
@@ -10217,7 +10223,7 @@ CATALOG: dict[str, ActionSpec] = {
             installation=True,
             # A PRODUCT BEFORE ITS CODE HAS PEOPLE TOO (#992): who may approve is the product's
             needs_code=False,
-            params={"people": "the whole list, as `{id, role}` entries — the id the identity "
+            params={"people": "the whole list, as `{person, role}` entries — the id the identity "
                               "provider knows the person by, and `admin` or `engineer`; a person "
                               "left out is removed, `[]` empties both lists"},
         ),

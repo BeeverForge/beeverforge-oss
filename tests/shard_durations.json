@@ -731,6 +731,7 @@
  "tests/test_the_panel_speaks_one_language.py": 0.1,
  "tests/test_the_panel_touches_no_cloud_locally.py": 0.7,
  "tests/test_the_panels_board_shows_the_delivered_cards.py": 6.9,
+ "tests/test_the_people_who_may_act_on_a_product_are_set_and_read_by_an_action.py": 7.4,
  "tests/test_the_platform_reads_a_repository_and_proposes.py": 0.4,
  "tests/test_the_poller_has_a_lever.py": 0.1,
  "tests/test_the_preview_axis.py": 0.1,

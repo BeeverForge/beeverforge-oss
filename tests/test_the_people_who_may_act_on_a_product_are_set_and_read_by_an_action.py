@@ -22,8 +22,8 @@ from beeverforge.product import people as the_people
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLATION = actions.Actor(id="rob", via="panel", admin=True)
-FULL = [{"id": "ana", "role": "admin"}, {"id": "bia", "role": "admin"},
-        {"id": "caio", "role": "engineer"}]
+FULL = [{"person": "ana", "role": "admin"}, {"person": "bia", "role": "admin"},
+        {"person": "caio", "role": "engineer"}]
 
 
 def _set(people=FULL, by=INSTALLATION, project="acme"):
@@ -106,6 +106,12 @@ def test_an_empty_list_empties_both_and_a_missing_one_is_refused(registry):
 
 # ── refusals write nothing ──────────────────────────────────────────────────────────────────────
 
+def test_the_bound_is_a_thousand_and_ids_are_stored_as_given(registry):
+    assert the_people.BOUND == 1000
+    assert _set([{"person": " ana ", "role": "admin"}]).ok
+    assert _product(registry)["admins"] == [" ana "]  # no strip: the id is the provider's own
+
+
 def test_a_project_with_no_product_section_is_refused_naming_the_declaration(registry):
     before = _bytes(registry)
     out = _set(project="bare")
@@ -121,11 +127,15 @@ def test_an_unregistered_project_is_refused_naming_the_roster(registry):
 
 
 @pytest.mark.parametrize("people, names", [
-    ([{"id": "", "role": "admin"}], "entry 1"),
-    ([{"id": "ok", "role": "admin"}, {"id": "   ", "role": "admin"}], "entry 2"),
-    ([{"id": "x", "role": "owner"}], "entry 1"),
-    ([{"id": "x", "role": "admin"}, {"id": "x", "role": "engineer"}], "entry 2"),
-    ([{"id": f"p{i}", "role": "admin"} for i in range(the_people.BOUND + 1)], "at most"),
+    ([{"person": "", "role": "admin"}], "entry 1"),
+    ([{"person": "ok", "role": "admin"}, {"person": "   ", "role": "admin"}], "entry 2"),
+    ([{"person": "x" * (the_people.ID_BOUND + 1), "role": "admin"}], "entry 1"),
+    ([{"person": "a\nb", "role": "admin"}], "entry 1"),
+    ([{"person": "a\x00b", "role": "admin"}], "entry 1"),
+    ([{"id": "ana", "role": "admin"}], "entry 1"),
+    ([{"person": "x", "role": "owner"}], "entry 1"),
+    ([{"person": "x", "role": "admin"}, {"person": "x", "role": "engineer"}], "entry 2"),
+    ([{"person": f"p{i}", "role": "admin"} for i in range(the_people.BOUND + 1)], "at most"),
     (["ana"], "entry 1"),
     ("ana", "list"),
 ])
@@ -151,20 +161,22 @@ def test_the_same_list_answers_unchanged_and_does_not_rewrite(registry, monkeypa
 
 
 def test_the_answer_names_what_was_added_removed_and_kept(registry):
-    out = _set([{"id": "ana", "role": "admin"}, {"id": "old", "role": "admin"},
-                {"id": "caio", "role": "engineer"}])
+    out = _set([{"person": "ana", "role": "admin"}, {"person": "old", "role": "admin"},
+                {"person": "caio", "role": "engineer"}])
     assert out.data["admins"] == {"added": ["ana"], "removed": [], "unchanged": ["old"]}
     assert out.data["engineers"] == {"added": ["caio"], "removed": ["gone"], "unchanged": []}
 
 
-def test_one_audit_record_with_counts_and_digest_and_no_ids(registry, caplog):
+def test_one_audit_record_with_counts_and_digest_and_the_ids_changed(registry, caplog):
     with caplog.at_level(logging.INFO):
         out = _set()
     mine = [r for r in caplog.records if "product_people_set" in r.getMessage()]
     assert len(mine) == 1
     line = mine[0].getMessage()
     assert "acme" in line and "2 admins, 1 engineers" in line and out.data["digest"] in line
-    assert "ana" not in line.replace("acme", "")
+    for changed in ("ana", "bia", "caio", "old", "gone"):  # added and removed: who was changed
+        assert changed in line
+    assert "token" not in line.lower()
 
 
 # ── two writers ─────────────────────────────────────────────────────────────────────────────────
@@ -172,8 +184,8 @@ def test_one_audit_record_with_counts_and_digest_and_no_ids(registry, caplog):
 def test_two_concurrent_sets_leave_one_list_whole(registry):
     from beeverforge.registry import ProjectRegistry
 
-    one = [{"id": "a1", "role": "admin"}, {"id": "a2", "role": "engineer"}]
-    two = [{"id": "b1", "role": "admin"}, {"id": "b2", "role": "engineer"}]
+    one = [{"person": "a1", "role": "admin"}, {"person": "a2", "role": "engineer"}]
+    two = [{"person": "b1", "role": "admin"}, {"person": "b2", "role": "engineer"}]
     go, first_in, seen = threading.Event(), threading.Event(), []
     real = ProjectRegistry._load_raw
 
@@ -208,6 +220,7 @@ def test_two_concurrent_sets_leave_one_list_whole(registry):
     actions.Actor(id="ana", via="panel", admin=True),  # unscoped, adding themselves
     actions.Actor(id="ana", via="slack", admin=True),  # a person asking from the product's room
     actions.Actor(id="caio", via="slack", admin=False, scopes=frozenset({"product"})),
+    actions.Actor(id="ana", via="slack", admin=True),  # unscoped, from the room, adding ANOTHER
 ])
 def test_a_credential_that_is_not_the_installations_is_denied(registry, by):
     before = _bytes(registry)
@@ -215,9 +228,17 @@ def test_a_credential_that_is_not_the_installations_is_denied(registry, by):
     assert out.code == "denied" and _bytes(registry) == before
 
 
+@pytest.mark.parametrize("via", ["slack", "teams", "product", "web", ""])
+def test_nobody_asking_from_a_room_adds_another_person(registry, via):
+    by = actions.Actor(id="ana", via=via, admin=True)
+    before = _bytes(registry)
+    out = _set([{"person": "mallory", "role": "admin"}], by=by)
+    assert out.code == "denied" and _bytes(registry) == before
+
+
 def test_a_person_may_leave_themselves_on_the_list_but_not_join_it(registry):
     me = actions.Actor(id="old", via="panel", admin=True)
-    assert _set([{"id": "old", "role": "admin"}], by=me).ok
+    assert _set([{"person": "old", "role": "admin"}], by=me).ok
 
 
 # ── the read ────────────────────────────────────────────────────────────────────────────────────
@@ -226,8 +247,15 @@ def test_the_list_answers_what_was_set_with_the_same_digest(registry):
     out = _set()
     read = _list()
     assert read.ok and read.data["digest"] == out.data["digest"]
-    assert read.data["people"] == [{"id": "ana", "role": "admin"}, {"id": "bia", "role": "admin"},
-                                   {"id": "caio", "role": "engineer"}]
+    assert read.data["people"] == [{"person": "ana", "role": "admin"}, {"person": "bia", "role": "admin"},
+                                   {"person": "caio", "role": "engineer"}]
+
+
+def test_the_list_answers_sorted_by_role_then_person(registry):
+    _set([{"person": "zed", "role": "admin"}, {"person": "bob", "role": "engineer"},
+          {"person": "amy", "role": "admin"}, {"person": "al", "role": "engineer"}])
+    assert [(p["role"], p["person"]) for p in _list().data["people"]] == [
+        ("admin", "amy"), ("admin", "zed"), ("engineer", "al"), ("engineer", "bob")]
 
 
 def test_the_list_of_a_product_nobody_is_on_is_empty(registry):
@@ -248,18 +276,56 @@ def test_the_rows_are_documented():
     assert list((ROOT / "changes").glob("528.*.md"))
 
 
-def test_the_command_sets_and_lists(registry):
+def test_the_command_shows_the_change_and_writes_only_with_yes(registry):
     from beeverforge.cli import app
 
     runner = CliRunner()
-    out = runner.invoke(app, ["product", "people", "set", "acme", "--admin", "ana",
-                              "--admin", "bia", "--engineer", "caio"])
-    assert out.exit_code == 0, out.output
+    before = _bytes(registry)
+    shown = runner.invoke(app, ["product", "people", "set", "acme", "ana:admin", "bia:admin",
+                                "caio:engineer"])
+    assert shown.exit_code == 0, shown.output
+    assert "ana" in shown.output and "--yes" in shown.output and _bytes(registry) == before
+    done = runner.invoke(app, ["product", "people", "set", "acme", "ana:admin", "bia:admin",
+                               "caio:engineer", "--yes"])
+    assert done.exit_code == 0, done.output
     assert _product(registry)["admins"] == ["ana", "bia"]
+    assert _product(registry)["engineers"] == ["caio"]
     listed = runner.invoke(app, ["product", "people", "list", "acme"])
     assert listed.exit_code == 0 and "ana" in listed.output and "caio" in listed.output
-    refused = runner.invoke(app, ["product", "people", "set", "bare", "--admin", "ana"])
-    assert refused.exit_code != 0
+
+
+def test_the_command_reads_a_file_of_person_role_lines(registry, tmp_path):
+    from beeverforge.cli import app
+
+    given = tmp_path / "people.txt"
+    given.write_text("ana:admin\n\ncaio:engineer\n")
+    out = CliRunner().invoke(app, ["product", "people", "set", "acme", "--file", str(given),
+                                   "--yes"])
+    assert out.exit_code == 0, out.output
+    assert _product(registry)["admins"] == ["ana"] and _product(registry)["engineers"] == ["caio"]
+
+
+def test_the_command_with_nothing_given_is_refused_and_empties_nothing(registry, tmp_path):
+    from beeverforge.cli import app
+
+    empty = tmp_path / "none.txt"
+    empty.write_text("\n")
+    runner = CliRunner()
+    before = _bytes(registry)
+    for args in (["acme", "--yes"], ["acme", "--file", str(empty), "--yes"]):
+        out = runner.invoke(app, ["product", "people", "set", *args])
+        assert out.exit_code != 0 and _bytes(registry) == before
+
+
+def test_the_command_refuses_a_malformed_argument_and_an_unregistered_product(registry):
+    from beeverforge.cli import app
+
+    runner = CliRunner()
+    before = _bytes(registry)
+    for args in (["acme", "ana", "--yes"], ["acme", "ana:owner", "--yes"],
+                 ["bare", "ana:admin", "--yes"]):
+        out = runner.invoke(app, ["product", "people", "set", *args])
+        assert out.exit_code != 0 and _bytes(registry) == before
 
 
 # ── the amended decision ────────────────────────────────────────────────────────────────────────
@@ -302,8 +368,11 @@ def test_the_guard_finds_a_row_that_writes_the_lists_some_other_way():
 
 
 def test_only_this_row_writes_the_product_lists():
-    for path in sorted((ROOT / "beeverforge/actions").glob("*.py")):
+    for path in sorted((ROOT / "beeverforge").rglob("*.py")):
+        if path.name == "registry.py":
+            continue  # the registry owns `set_people`, the one writer the row calls
         writers = _functions_that_write_the_lists(path.read_text())
-        assert writers <= {"_product_people_set"}, (path.name, writers)
+        assert writers <= ({"_product_people_set"} if path.name == "catalog.py" else set()), (
+            str(path.relative_to(ROOT)), writers)
     catalog = (ROOT / "beeverforge/actions/catalog.py").read_text()
     assert _functions_that_write_the_lists(catalog) == {"_product_people_set"}

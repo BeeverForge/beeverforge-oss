@@ -432,7 +432,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
         label = str(getattr(by, "label", "") or "")
         log.info("action=%s by=%s%s ok=%s code=%s params=%s", key, by,
                  f" label={label!r}" if label else "", outcome.ok, outcome.code or "-",
-                 _loggable(key, params))
+                 _loggable(key, params, outcome))
         return outcome
     except asyncio.CancelledError:
         raise  # a cancellation is the caller's, never an outcome
@@ -473,13 +473,17 @@ def _why(exc: Exception) -> str:
     return first_message(exc)
 
 
-def _loggable(key: str, params: dict[str, object]) -> dict[str, object]:
+def _loggable(key: str, params: dict[str, object],
+              outcome: Outcome | None = None) -> dict[str, object]:
     out = {k: ("***" if k in _SECRET else v) for k, v in params.items()}
     if key == "product_people_set" and "people" in out:
-        # THE COUNTS AND THE DIGEST, never the ids (#528): the line is the record of who asked
+        # THE COUNTS, THE DIGEST AND THE PEOPLE CHANGED (#528): the line is the record of who was
+        # added and removed; the list as a whole is not repeated, and no credential is in it
         from beeverforge.product.people import loggable
 
-        out["people"] = loggable(out["people"])
+        said = outcome.data if outcome is not None and outcome.ok else {}
+        out["people"] = loggable(out["people"], {r: said[r] for r in ("admins", "engineers")
+                                                 if r in said})
     return out
 
 
