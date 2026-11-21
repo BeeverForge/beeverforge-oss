@@ -180,6 +180,18 @@ def test_every_refusal_project_add_makes_is_made_and_the_entry_is_unchanged(regi
     assert registry.read_bytes() == before
 
 
+@pytest.mark.parametrize("token_env", ["ACME_TOKEN", "bad name", "-x", "GITHUB_TOKEN"])
+def test_a_token_env_is_judged_as_project_add_judges_it(registry, token_env):
+    """`project_add` has no refusal of its own for this name today, so the two are held to the same
+    answer — whatever it is — rather than to a refusal that exists in neither."""
+    params = {"repo_path": "https://github.com/acme/other.git", "token_env": token_env}
+    asked_of_add = _add(name="fresh", **params)
+
+    out = _update(**params)
+
+    assert (out.ok, out.code) == (asked_of_add.ok, asked_of_add.code), (out, asked_of_add)
+
+
 def test_a_slug_another_project_has_is_refused_as_project_add_refuses_it(registry):
     import yaml
 
@@ -211,6 +223,19 @@ def test_an_unregistered_name_is_refused_with_the_roster_and_nothing_is_written(
     assert not path.exists() or "acme" not in path.read_text()
 
 
+def test_the_registry_refuses_an_unheld_name_itself_when_it_is_removed_after_the_ask(registry):
+    """The action asks first, so the lock's own refusal is only reached by a name removed in
+    between: the registry is asked directly, and holds no entry of that name afterwards."""
+    from beeverforge.registry import ProjectRegistry
+
+    before = registry.read_bytes()
+
+    with pytest.raises(KeyError):
+        ProjectRegistry().set_axes("ghost", lambda held: {"repo_path": "https://github.com/a/b"})
+
+    assert registry.read_bytes() == before
+
+
 # ── a call that matches what is held ────────────────────────────────────────────────────────────
 
 def test_a_call_that_matches_what_is_held_answers_unchanged_and_does_not_write(registry,
@@ -231,23 +256,17 @@ def test_a_call_that_matches_what_is_held_answers_unchanged_and_does_not_write(r
 
 # ── the answer and the audit record ─────────────────────────────────────────────────────────────
 
-def test_the_answer_names_the_fields_and_the_audit_record_holds_no_credential(registry, caplog):
+def test_the_answer_names_the_fields_and_the_audit_record_is_one_with_no_credential(registry,
+                                                                                    caplog):
     with caplog.at_level(logging.INFO):
         out = _update(board_owner="acme", board_number="9", token_env="ACME_TOKEN")
 
     assert out.ok and out.data["fields"] == ["tracker"], out
-    lines = [r.getMessage() for r in caplog.records if "project_update" in r.getMessage()
-             and "changed" in r.getMessage()]
+    lines = [r.getMessage() for r in caplog.records if "project_update" in r.getMessage()]
     assert len(lines) == 1, lines
-    assert "tracker" in lines[0] and "rob" in lines[0]
+    assert "by=" in lines[0] and "rob" in lines[0] and "ok=True" in lines[0]
+    assert "board_owner" in lines[0] and "board_number" in lines[0]
     assert "ghp_" not in lines[0]
-
-
-def test_an_update_that_changed_nothing_leaves_no_changed_record(registry, caplog):
-    with caplog.at_level(logging.INFO):
-        _update(repo_path=HELD_URL)
-
-    assert not [r for r in caplog.records if "fields=" in r.getMessage()]
 
 
 # ── two calls at once ───────────────────────────────────────────────────────────────────────────

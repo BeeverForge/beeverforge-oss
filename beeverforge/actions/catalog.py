@@ -8556,9 +8556,8 @@ async def _project_update(*, project: str, by: Actor, repo_path: object = "",
     if not fields:
         return done(f"{project} is already as asked — nothing was changed", project=project,
                     changed=False, fields=[])
-    # THE AUDIT RECORD: who, and which fields — names only, never a value, since an option may
-    # name a credential
-    log.info("project_update %s changed fields=%s by=%s", project, ",".join(fields), by)
+    # THE AUDIT RECORD IS `perform`'s, ONE PER CALL: who, and the parameters given (a credential
+    # parameter masked there) — this row adds no second line
     return done(f"updated {project!r}: {', '.join(fields)}", project=project, changed=True,
                 fields=fields)
 
