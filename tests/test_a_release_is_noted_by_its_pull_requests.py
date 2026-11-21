@@ -251,13 +251,13 @@ def test_a_final_version_is_declared_only_with_its_notes(tree):
     (tree / "CHANGELOG.md").write_text(PREAMBLE + "\n## 0.7.0 (2026-10-21)\n\n### Fixes\n\n- x (#1).\n")
     assert _check(tree, version_pr, labels=(LABEL,)).returncode == 0
 
-    _fragment(tree, "540.fix.md", "Left out of the notes.")
+    _fragment(tree, "9540.fix.md", "Left out of the notes.")
     leftover = _check(tree, version_pr, labels=(LABEL,))
-    assert leftover.returncode == 1 and "changes/540.fix.md" in leftover.stderr, leftover.stderr
+    assert leftover.returncode == 1 and "changes/9540.fix.md" in leftover.stderr, leftover.stderr
 
     # AFTER THE FINAL, a backport for the next patch brings its fragment to a branch that still
     # declares the final: that is the next notes' first line, not a forgotten one
-    backport = _check(tree, [("A", "changes/540.fix.md"), ("M", "beeverforge/cli.py")])
+    backport = _check(tree, [("A", "changes/9540.fix.md"), ("M", "beeverforge/cli.py")])
     assert backport.returncode == 0, backport.stderr
 
 
@@ -267,8 +267,8 @@ def test_a_final_version_is_declared_only_with_its_notes(tree):
 def test_the_assembly_writes_the_version_on_top_and_removes_what_it_used(tree):
     older = "## 0.6.0 (2026-10-14)\n\n### Fixes\n\n- An older line (#1).\n"
     (tree / "CHANGELOG.md").write_text(PREAMBLE + "\n" + older)
-    _fragment(tree, "540.fix.md", "A defect that no longer happens.")
-    _fragment(tree, "541.highlight.md", "**The headline.**")
+    _fragment(tree, "9540.fix.md", "A defect that no longer happens.")
+    _fragment(tree, "9541.highlight.md", "**The headline.**")
 
     done = _run(tree, "assemble", "0.7.0", "--date", "2026-10-21")
 
@@ -278,7 +278,7 @@ def test_the_assembly_writes_the_version_on_top_and_removes_what_it_used(tree):
     assert written.index("## 0.7.0 (2026-10-21)") < written.index("## 0.6.0 (2026-10-14)"), written
     assert written.endswith(older), "the older version's notes were changed"
     assert not list((tree / "changes").iterdir()), "the fragments it used are still there"
-    assert "- A defect that no longer happens (#540)." in written
+    assert "- A defect that no longer happens (#9540)." in written
 
     # WHAT IT PRINTS IS WHAT THE PAGE CARRIES: the version pull request's body is the page's notes
     page = _run(tree, "page", "v0.7.0")
@@ -322,36 +322,36 @@ def test_each_line_closes_with_its_reference_and_keeps_its_sub_items(tree):
 ])
 def test_the_assembly_refuses_what_it_should_not_write(tree, version, why):
     (tree / "CHANGELOG.md").write_text(PREAMBLE + "\n## 0.6.0 (2026-10-14)\n\n- x (#1).\n")
-    _fragment(tree, "540.fix.md", "A line.")
+    _fragment(tree, "9540.fix.md", "A line.")
     before = (tree / "CHANGELOG.md").read_text()
 
     done = _run(tree, "assemble", version)
 
     assert done.returncode != 0 and why in done.stderr, done.stderr
     assert (tree / "CHANGELOG.md").read_text() == before
-    assert (tree / "changes" / "540.fix.md").exists()
+    assert (tree / "changes" / "9540.fix.md").exists()
 
 
 def test_the_assembly_refuses_a_version_with_no_line_or_a_broken_one(tree):
     assert "no fragment" in _run(tree, "assemble", "0.7.0").stderr
 
-    _fragment(tree, "540.fix.md", "A good line.")
-    _fragment(tree, "541.fixes.md", "A misnamed one.")
+    _fragment(tree, "9540.fix.md", "A good line.")
+    _fragment(tree, "9541.fixes.md", "A misnamed one.")
     done = _run(tree, "assemble", "0.7.0")
 
-    assert done.returncode == 1 and "changes/541.fixes.md" in done.stderr, done.stderr
+    assert done.returncode == 1 and "changes/9541.fixes.md" in done.stderr, done.stderr
     assert (tree / "CHANGELOG.md").read_text() == PREAMBLE, "it wrote half the notes"
-    assert (tree / "changes" / "540.fix.md").exists()
+    assert (tree / "changes" / "9540.fix.md").exists()
 
 
 def test_the_preview_writes_nothing(tree):
-    _fragment(tree, "540.fix.md", "A line.")
+    _fragment(tree, "9540.fix.md", "A line.")
 
     done = _run(tree, "preview", "0.7.0")
 
     assert done.returncode == 0 and done.stdout.startswith("## 0.7.0 (unreleased)\n"), done.stdout
     assert (tree / "CHANGELOG.md").read_text() == PREAMBLE
-    assert (tree / "changes" / "540.fix.md").exists()
+    assert (tree / "changes" / "9540.fix.md").exists()
 
 
 # ── the release page ────────────────────────────────────────────────────────────────────────────
