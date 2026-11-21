@@ -46,6 +46,7 @@ def _github_actions(project, **kw):
     return GitHubActionsObserver(
         (project.forge.repo if getattr(project, "forge", None) else None) or "",
         token=kw.get("token"),
+        token_provider=kw.get("token_provider"),
         # the FORGE's refusal, whose CI this is: handed no token after one, the observer runs no
         # `gh` on the machine's own login (#742), as the forge's own row does
         refused="" if kw.get("token") else github_refusal(project, "forge"),
@@ -94,7 +95,7 @@ def _azure_pipelines(project, **kw):
 _azure_pipelines.display_name = "Azure Pipelines"
 
 
-def _none(project, *, token=None):
+def _none(project, *, token=None, token_provider=None):
     """Nothing watches this project's code, and that is an answer rather than a gap (ADR-0049 D1).
 
     ANY FORGE MAY NAME IT through `forge.options.ci`: a GitHub repository with no workflows is
@@ -181,7 +182,7 @@ def reads_deploys(project) -> bool:
     return declared is not False
 
 
-def build_observer(project, *, token=None):
+def build_observer(project, *, token=None, token_provider=None):
     """The project's CI observer. Raises on an unknown kind — a deployment whose pipelines are
     never observed would report every release as "still verifying", for ever.
 
@@ -190,7 +191,7 @@ def build_observer(project, *, token=None):
     kind = observer_kind(project)
     builder = OBSERVERS.get(kind)
     if builder is not None:
-        return builder(project, token=token)
+        return builder(project, token=token, token_provider=token_provider)
     added = plugins.builder(AXIS, kind, builtin=OBSERVERS)
     if added is not None:
         return added(project, token=None)

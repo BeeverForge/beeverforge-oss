@@ -49,14 +49,19 @@ MUTATIONS = [
      "                                              else deployment_tracker_provider(project))),\n"
      "        # A TOKEN A ROTATING"),
 
+    ("the promotion runner's observer keeps the token it was composed with (#589)", FACTORY,
+     "        observer=build_observer(project, token=forge_tok or app_tok,\n"
+     "                                token_provider=forge_provider),",
+     "        observer=build_observer(project, token=forge_tok or app_tok),"),
+
+    ("the observer ignores the provider it is handed (#589)",
+     "beeverforge/adapters/environment/registry.py",
+     '        token_provider=kw.get("token_provider"),\n        # the FORGE\'s',
+     '        # the FORGE\'s'),
+
     ("the promotion runner's forge keeps the token it was composed with", FACTORY,
-     "        # …and here, for the same reason (#236): see `build_runner`\n"
-     "        forge=build_forge(project, token=forge_tok,\n"
-     "                          token_provider=(stored_token_provider(project, \"forge\", "
-     "forge_found)\n",
-     "        # …and here, for the same reason (#236): see `build_runner`\n"
-     "        forge=build_forge(project, token=forge_tok,\n"
-     "                          token_provider=(None\n"),
+     "        forge=build_forge(project, token=forge_tok, token_provider=forge_provider),\n",
+     "        forge=build_forge(project, token=forge_tok, token_provider=None),\n"),
 
     # ── when it is read ────────────────────────────────────────────────────────────────────────
     ("the re-read comes five minutes before the lifetime ends, not every five minutes", CRED,

@@ -17,9 +17,13 @@ _CONCLUSION: dict[str, Status] = {
 
 
 class GitHubActionsObserver(EnvironmentObserver):
-    def __init__(self, repo: str, *, token: str | None = None, refused: str = "") -> None:
+    def __init__(self, repo: str, *, token: str | None = None, refused: str = "",
+                 token_provider=None) -> None:
         self.repo = repo  # "owner/name"
         self._static_token = token
+        #: read at every `gh` call, as the forge's is (#236): a promotion outlives the token the
+        #: observer was composed with, and a token a store rotates is read again, not kept (#589)
+        self._token_provider = token_provider
         #: why the credential store refused the credential this observer was meant to use (#742) —
         #: then it runs nothing on the machine's own login, as the forge it watches
         self.refused = refused
