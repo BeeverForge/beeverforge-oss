@@ -30,6 +30,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from beeverforge import gitpin, namespace
 from beeverforge.actions.base import (
@@ -53,6 +54,10 @@ from beeverforge.actions.base import (
     refused,
 )
 from beeverforge.actions.base import step as _step
+
+if TYPE_CHECKING:
+    from beeverforge.adapters.board.base import BoardAdapter
+    from beeverforge.contracts.project import Project
 
 log = logging.getLogger("beeverforge.actions")
 
@@ -8031,7 +8036,7 @@ async def _project_set_preview(*, project: str, by: Actor, required: object = No
 # are the same line, read and written through the board's own row: the option THIS board reads
 # (`columns`, or `status_map` on Jira), and `pickup_status` for the column that dispatches work.
 
-def _board_columns_of(proj) -> tuple[object, list[str] | None]:
+def _board_columns_of(proj: Project) -> tuple[BoardAdapter | None, list[str] | None]:
     """`(board, its column names)` — the board the project's row builds, and what it reports.
     `(None, None)` when the project has no board; `(board, None)` when it could not be read,
     which is not a board without columns."""
@@ -8045,7 +8050,7 @@ def _board_columns_of(proj) -> tuple[object, list[str] | None]:
     return board, board.column_names()
 
 
-def _board_mapping(board, names: list[str]) -> dict[str, str | None]:
+def _board_mapping(board: BoardAdapter, names: list[str]) -> dict[str, str | None]:
     """Each stage the core defines, and the column of this board that is it — `None` for a stage
     no column is, which is what the doctor's `board_columns` reports as missing."""
     from beeverforge.adapters.board.base import stage_column
@@ -8055,7 +8060,8 @@ def _board_mapping(board, names: list[str]) -> dict[str, str | None]:
             for key in BOARD_ORDER}
 
 
-def _the_board_of(proj, *, nothing_changed: bool) -> tuple[object, list[str], Outcome | None]:
+def _the_board_of(proj: Project, *, nothing_changed: bool,
+                  ) -> tuple[BoardAdapter | None, list[str], Outcome | None]:
     """`(board, names, None)`, or `(None, [], why)` — the refusal for a project with no board and
     for a board that could not be read. A board that cannot say which columns it has is UNAVAILABLE,
     never "has none": the caller would map a stage to a column it could not check."""
@@ -8266,7 +8272,9 @@ async def _project_set_board_columns(*, project: str, by: Actor, columns: object
     trial.tracker.options = {**options, **write}
     after = build_board(
         trial, token_provider=lambda: tracker_token_for(trial) or deployment_tracker_token(trial))
-    seen = _board_mapping(after, names) if after is not None else {}
+    if after is None:
+        return no("this board cannot be built from the options it would hold")
+    seen = _board_mapping(after, names)
     unread = [s for s, c in chosen.items() if (seen.get(s) or "").casefold() != c.casefold()]
     if unread or (queue_now and str(after.pickup_column()).casefold() != queue_now.casefold()):
         return no(f"this board does not read `{option}`/`pickup_status` for "
