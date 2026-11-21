@@ -643,6 +643,26 @@ class ProjectRegistry:
             raw[name]["tracker"] = tracker
             self._save_raw(raw)
 
+    def set_tracker_options(self, name: str, options: dict[str, str]) -> None:
+        """Write `options` over a registered project's tracker options — the board's column
+        mapping is the caller (`project_set_board_columns`, #585).
+
+        Layered onto what is held, under the same lock as every other mutation and for
+        `attach_board`'s reason: an option this call does not name — the board's coordinates, a
+        credential variable — is not this call's to lose. The values are written as given, strings
+        as `ProviderRef.options` is; the project is validated whole before the file is."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            tracker = raw[name].setdefault("tracker", {}) or {}
+            held = dict(tracker.get("options") or {})
+            held.update({str(k): str(v) for k, v in options.items()})
+            tracker["options"] = held
+            raw[name]["tracker"] = tracker
+            Project(**raw[name])
+            self._save_raw(raw)
+
     def set_model(self, name: str, model: str, *, role: str | None = None) -> None:
         """Which model the harness runs for this project — the CLI's way in (funnel review 2).
 

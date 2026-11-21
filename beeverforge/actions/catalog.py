@@ -8024,6 +8024,273 @@ async def _project_set_preview(*, project: str, by: Actor, required: object = No
     return done(said, project=project, preview=saved.model_dump(mode="json"), dropped=dropped)
 
 
+# ── a project's board columns: read and set (#585) ─────────────────────────────────────────────
+#
+# THE MAPPING FROM A STAGE TO A COLUMN WAS A LINE OF YAML, written by hand inside the worker image
+# from the sentence the doctor's `board_columns` and `board_stages` findings print. These two rows
+# are the same line, read and written through the board's own row: the option THIS board reads
+# (`columns`, or `status_map` on Jira), and `pickup_status` for the column that dispatches work.
+
+def _board_columns_of(proj) -> tuple[object, list[str] | None]:
+    """`(board, its column names)` — the board the project's row builds, and what it reports.
+    `(None, None)` when the project has no board; `(board, None)` when it could not be read,
+    which is not a board without columns."""
+    from beeverforge.adapters.board.factory import build_board
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+    board = build_board(
+        proj, token_provider=lambda: tracker_token_for(proj) or deployment_tracker_token(proj))
+    if board is None:
+        return None, None
+    return board, board.column_names()
+
+
+def _board_mapping(board, names: list[str]) -> dict[str, str | None]:
+    """Each stage the core defines, and the column of this board that is it — `None` for a stage
+    no column is, which is what the doctor's `board_columns` reports as missing."""
+    from beeverforge.adapters.board.base import stage_column
+    from beeverforge.adapters.board.columns import BOARD_ORDER
+
+    return {key: stage_column(board, key, existing=True, names=names) or None
+            for key in BOARD_ORDER}
+
+
+def _the_board_of(proj, *, nothing_changed: bool) -> tuple[object, list[str], Outcome | None]:
+    """`(board, names, None)`, or `(None, [], why)` — the refusal for a project with no board and
+    for a board that could not be read. A board that cannot say which columns it has is UNAVAILABLE,
+    never "has none": the caller would map a stage to a column it could not check."""
+    tail = " Nothing was changed." if nothing_changed else ""
+    try:
+        board, names = _board_columns_of(proj)
+    except ValueError as exc:
+        return None, [], refused(INVALID, f"{proj.name}'s board cannot be built: {exc}.{tail}",
+                                 project=proj.name)
+    if board is None:
+        return None, [], refused(INVALID, f"{proj.name} has no board configured, so there are no "
+                                          f"columns to map.{tail}", project=proj.name)
+    if names is None:
+        return None, [], refused(
+            UNAVAILABLE, f"{proj.name}'s board could not be read, so its columns are not known "
+                         f"and a mapping cannot be checked against them.{tail} Run "
+                         f"`beeverforge doctor {proj.name}` for what stopped the read.",
+            project=proj.name)
+    return board, names, None
+
+
+def _columns_asked(columns: object) -> dict[str, str]:
+    """`{stage: column}` from what a caller handed: a mapping, a list of `stage=column`, or the
+    words of a front end — a JSON object or `stage=column` pairs, comma-separated. A stage is
+    named by the core's key, in any case and with `-` or a space for `_` (`in progress`)."""
+    import json
+
+    if columns in (None, "", [], (), {}):
+        return {}
+    if isinstance(columns, Mapping):
+        pairs = [(k, v) for k, v in columns.items()]
+    else:
+        items = columns if isinstance(columns, list | tuple) else None
+        if items is None:
+            text = str(columns).strip()
+            if text.startswith("{"):
+                try:
+                    obj = json.loads(text)
+                except ValueError:
+                    raise ValueError(f"{text!r} is not a JSON object of stage: column") from None
+                if not isinstance(obj, dict):
+                    raise ValueError(f"{text!r} is not a JSON object of stage: column")
+                return _columns_asked(obj)
+            items = text.split(",")
+        pairs = []
+        for item in (str(i).strip() for i in items):
+            if not item:
+                continue
+            stage, eq, column = item.partition("=")
+            if not eq:
+                raise ValueError(f"{item!r} is not stage=column")
+            pairs.append((stage, column))
+    return {re.sub(r"[\s-]+", "_", str(stage).strip().lower()): str(column).strip()
+            for stage, column in pairs}
+
+
+def _said_mapping(mapping: dict[str, str | None]) -> str:
+    mapped = [f"{k}→{v}" for k, v in mapping.items() if v]
+    unmapped = [k for k, v in mapping.items() if not v]
+    return (f"mapped: {', '.join(mapped) or 'none'}"
+            + (f"; unmapped: {', '.join(unmapped)}" if unmapped else ""))
+
+
+async def _project_board_columns(*, project: str, by: Actor) -> Outcome:
+    """A project's board as the platform reads it: its kind and address, the columns the board
+    reports, the stage each of them is, and the column that dispatches work.
+
+    A STAGE NO COLUMN IS, IS `None` — what the doctor's `board_columns` and `board_stages`
+    findings call unmapped. `pickup_on_board` says whether the column that dispatches is one the
+    board has: `pickup` alone would read as healthy when it names the platform's own `TO-DO` on a
+    board that renamed it. A project with no board answers `board: null`, which is a legitimate
+    setup; a board that could not be read is UNAVAILABLE, never a board with no columns."""
+    import asyncio
+
+    from beeverforge.adapters.board.base import stage_option
+    from beeverforge.adapters.board.columns import BOARD_ORDER
+    from beeverforge.doctor import _board_coordinates
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    try:
+        board, names = await asyncio.to_thread(_board_columns_of, found)
+    except ValueError as exc:
+        return refused(INVALID, f"{project}'s board cannot be built: {exc}", project=project)
+    if board is None:
+        return done(f"{project} has no board configured — its tickets are named directly",
+                    project=project, board=None, columns=[], mapping={}, pickup=None,
+                    pickup_on_board=False, stages=list(BOARD_ORDER))
+    if names is None:
+        return refused(UNAVAILABLE, f"{project}'s board could not be read, so its columns are "
+                                    f"not known. Run `beeverforge doctor {project}` for what "
+                                    f"stopped the read.", project=project)
+    mapping = _board_mapping(board, names)
+    pickup = str(board.pickup_column() or "")
+    address = _board_coordinates(found)
+    kind = (found.tracker.kind or "").strip().lower()
+    return done(f"{project}: {kind} board {address} has {len(names)} columns "
+                f"({', '.join(names)}); {_said_mapping(mapping)}; work is picked up from "
+                f"{pickup!r}" + ("" if pickup in names else ", which the board does not have"),
+                project=project, board={"kind": kind, "address": address}, columns=names,
+                mapping=mapping, pickup=pickup, pickup_on_board=pickup in names,
+                option=stage_option(board), stages=list(BOARD_ORDER))
+
+
+async def _project_set_board_columns(*, project: str, by: Actor, columns: object = None,
+                                     pickup: object = None) -> Outcome:
+    """Map the core's stages onto a project's board columns and name the column that dispatches
+    work — written to the tracker options the way `project_set_preview` writes its field, merged
+    into what is held, and answering the new mapping.
+
+    DECIDED BEFORE ANYTHING IS WRITTEN, AND EVERY REFUSAL IS `INVALID` WITH "Nothing was changed"
+    AND THE BOARD'S ACTUAL COLUMNS: a column the board does not have (matched without case, and
+    written as the board spells it), a stage the core does not define, two stages on one column
+    (a column reads back as one stage), a `pickup` that is not the `todo` column asked beside it.
+
+    THE BOARD ITSELF IS ASKED WHETHER IT WILL READ WHAT IS ABOUT TO BE WRITTEN: the project's
+    options are merged on a copy, the board the registry's row builds from the copy is read, and
+    what it answers for each stage asked is compared with the ask. A board that ignores the option
+    (the local one reads its own rows) is refused, not reported as changed — the same board the
+    poller, the doctor and the card's door build, from the same options, on their next pass and
+    with no restart.
+
+    THE QUEUE IS THE `todo` COLUMN, and `pickup_status` is the poller's own name for it, which
+    wins where both are held. So a `todo` set while a `pickup_status` is held moves it too, and a
+    `pickup` set beside a held `todo` mapping moves that, or the one written last would be silently
+    the other's loser."""
+    import asyncio
+    import json
+
+    from beeverforge.adapters.board.base import stage_option
+    from beeverforge.adapters.board.columns import BOARD_ORDER
+    from beeverforge.adapters.board.factory import build_board
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+    from beeverforge.registry import ProjectRegistry
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    board, names, bad = await asyncio.to_thread(_the_board_of, found, nothing_changed=True)
+    if bad:
+        return bad
+
+    def no(why: str) -> Outcome:
+        return refused(INVALID, f"{why}. Nothing was changed. The board's columns are: "
+                                f"{', '.join(names) or 'none'}.", project=project, columns=names,
+                       stages=list(BOARD_ORDER))
+
+    def on_the_board(column: str) -> str:
+        return next((n for n in names if n.casefold() == column.strip().casefold()), "")
+
+    try:
+        asked = _columns_asked(columns)
+    except ValueError as exc:
+        return no(str(exc))
+    wanted_pickup = str(pickup or "").strip()
+    if not asked and not wanted_pickup:
+        return no("say a stage and its column (`todo=Ready`), a pickup column, or both")
+    chosen: dict[str, str] = {}
+    for stage, column in asked.items():
+        if stage not in BOARD_ORDER:
+            return no(f"{stage!r} is not a stage the core defines (the stages are "
+                      f"{', '.join(BOARD_ORDER)})")
+        spelled = on_the_board(column)
+        if not spelled:
+            return no(f"the board has no column {column!r} to map {stage!r} to")
+        chosen[stage] = spelled
+    if wanted_pickup and not (queue := on_the_board(wanted_pickup)):
+        return no(f"the board has no column {wanted_pickup!r} to pick work up from")
+    if wanted_pickup:
+        if "todo" in chosen and chosen["todo"].casefold() != queue.casefold():
+            return no(f"`todo` is {chosen['todo']!r} and the pickup is {queue!r}, and the queue is "
+                      f"one column")
+        wanted_pickup = queue
+
+    option = stage_option(board)
+    if not option:
+        return no(f"this board declares its columns nowhere, so {', '.join(chosen)} cannot be "
+                  f"mapped")
+    options = dict(found.tracker.options or {})
+    try:
+        held = json.loads(options.get(option) or "{}")
+        if not isinstance(held, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        return no(f"the project's tracker option `{option}` is not a JSON object of stage: "
+                  f"column, so it cannot be merged into and would be lost")
+    held = {str(k): str(v) for k, v in held.items()}
+    merged = {**held, **chosen}
+    for stage, column in chosen.items():
+        other = next((o for o, c in merged.items()
+                      if o != stage and c.strip().casefold() == column.casefold()), "")
+        if other:
+            return no(f"{stage!r} and {other!r} cannot both be the column {column!r}: a column is "
+                      f"one stage")
+
+    # THE QUEUE, ONE COLUMN UNDER TWO NAMES (see the docstring)
+    queue_now = wanted_pickup or chosen.get("todo", "")
+    write = {option: json.dumps(merged, ensure_ascii=False)}
+    if queue_now and (wanted_pickup or options.get("pickup_status")):
+        write["pickup_status"] = queue_now
+    if wanted_pickup and "todo" in held and "todo" not in chosen:
+        merged["todo"] = chosen["todo"] = wanted_pickup
+        write[option] = json.dumps(merged, ensure_ascii=False)
+
+    # ASK THE BOARD IT WILL BE BUILT AS, from a copy: what it answers is the new mapping.
+    trial = found.model_copy(deep=True)
+    trial.tracker.options = {**options, **write}
+    after = build_board(
+        trial, token_provider=lambda: tracker_token_for(trial) or deployment_tracker_token(trial))
+    seen = _board_mapping(after, names) if after is not None else {}
+    unread = [s for s, c in chosen.items() if (seen.get(s) or "").casefold() != c.casefold()]
+    if unread or (queue_now and str(after.pickup_column()).casefold() != queue_now.casefold()):
+        return no(f"this board does not read `{option}`/`pickup_status` for "
+                  f"{', '.join(unread) or 'its pickup column'}, so it would go on reading the old "
+                  f"mapping")
+
+    changed = any(options.get(k) != v for k, v in write.items())
+    if changed:
+        try:
+            ProjectRegistry().set_tracker_options(project, write)
+        except KeyError:
+            return _no_such_project(project)
+        except ValueError as exc:
+            why = " ".join(str(exc).split())[:300]
+            return refused(INVALID, f"the mapping was not saved — {why}. Nothing was changed.",
+                           project=project)
+    pick = str(after.pickup_column() or "")
+    return done(f"{project}: {_said_mapping(seen)}; work is picked up from {pick!r}"
+                + (" — takes effect on the next pass, no restart needed (the registry is read "
+                   "per run)" if changed else " — already so, nothing was changed"),
+                project=project, changed=changed, mapping=seen, pickup=pick,
+                pickup_on_board=pick in names, columns=names, option=option)
+
+
 # ── registering a project, and making it ready to move a ticket (#741) ──────────────────────────
 #
 # THREE DOORS WROTE A PROJECT, AND NONE WAS A ROW. `beeverforge project add` and `project init`
@@ -9781,6 +10048,39 @@ CATALOG: dict[str, ActionSpec] = {
                 "cpus": "the CPU limit of each service, e.g. `2`",
                 "memory": "the memory limit of each service, e.g. `2g`",
                 "clear_env": "`true` to drop every run-time name before adding these",
+            },
+        ),
+        ActionSpec(
+            name="project_board_columns",
+            summary="read a project's board: its kind and address, the columns the board "
+                    "reports, the stage each is, and the column that dispatches work",
+            run=_project_board_columns,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            # NOT AN INSTALLATION ROW: it writes nothing (that flag is for a row that does), but
+            # it is the administrator's like the rest, `needs_admin` by default
+            # A PROJECT BEFORE ITS CODE IS READ TOO (#992): the board is the registry's row, and
+            # reads nothing of the code
+            needs_code=False,
+        ),
+        ActionSpec(
+            name="project_set_board_columns",
+            summary="map a project's stages onto its board's columns and name the column that "
+                    "dispatches work, written to the tracker options the way the board reads them",
+            run=_project_set_board_columns,
+            refuses=(INVALID, NOT_FOUND, UNAVAILABLE),
+            required=("project",),
+            optional=("columns", "pickup"),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS SET TOO (#992): see `project_set_preview`
+            needs_code=False,
+            params={
+                "columns": "stage to column, merged into what is held: a mapping, or "
+                           "`todo=Ready,done=Shipped`; a stage is one the core defines "
+                           "(backlog, todo, in_progress, in_review, needs_review, needs_action, "
+                           "done) and a column is one the board has",
+                "pickup": "the column that dispatches work, one the board has; it is the `todo` "
+                          "column, and the two cannot differ",
             },
         ),
         ActionSpec(
