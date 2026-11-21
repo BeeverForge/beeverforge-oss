@@ -345,7 +345,8 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
         # outright. Asking `admin` first would let that credential through on every row it happens
         # to satisfy.
         if not by.may_enter(found.scope):
-            log.warning("DENIED_SCOPE %s (%s) by %s (%s)", key, found.scope, by, _loggable(params))
+            log.warning("DENIED_SCOPE %s (%s) by %s (%s)", key, found.scope, by,
+                        _loggable(key, params))
             # AN INSTALLATION ROW NAMES THE ADMINISTRATOR, NOT THE AREA (#741): a row that changes
             # the installation is refused to a credential of ANY area, so sending a product
             # credential to "somebody whose credential covers the floor" is the wrong remedy — a
@@ -368,7 +369,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
         # panel's own token and its per-person rows, an invitation to neither area, and a shell on
         # the host.
         if found.installation and by.scopes is not None:
-            log.warning("DENIED_INSTALLATION %s by %s (%s)", key, by, _loggable(params))
+            log.warning("DENIED_INSTALLATION %s by %s (%s)", key, by, _loggable(key, params))
             return refused(
                 DENIED,
                 f"{key} changes this installation, which is the administrator's; this credential "
@@ -378,7 +379,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
             )
 
         if found.needs_admin and not by.admin:
-            log.warning("DENIED %s by %s (%s)", key, by, _loggable(params))
+            log.warning("DENIED %s by %s (%s)", key, by, _loggable(key, params))
             return refused(
                 DENIED,
                 f"{by} is not allowed to {key} — ask somebody listed as an admin for this project.",
@@ -392,7 +393,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
         if waits_for_code(found):
             waiting = _waiting_for_its_code(params.get("project"), key)
             if waiting:
-                log.info("NO_CODE_YET %s by %s (%s)", key, by, _loggable(params))
+                log.info("NO_CODE_YET %s by %s (%s)", key, by, _loggable(key, params))
                 return refused(CONFLICT, waiting, reason=NO_CODE_YET)
 
         from beeverforge.runtime.temporal.vocabulary import EngineUnreachable
@@ -431,7 +432,7 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
         label = str(getattr(by, "label", "") or "")
         log.info("action=%s by=%s%s ok=%s code=%s params=%s", key, by,
                  f" label={label!r}" if label else "", outcome.ok, outcome.code or "-",
-                 _loggable(params))
+                 _loggable(key, params))
         return outcome
     except asyncio.CancelledError:
         raise  # a cancellation is the caller's, never an outcome
@@ -472,9 +473,9 @@ def _why(exc: Exception) -> str:
     return first_message(exc)
 
 
-def _loggable(params: dict[str, object]) -> dict[str, object]:
+def _loggable(key: str, params: dict[str, object]) -> dict[str, object]:
     out = {k: ("***" if k in _SECRET else v) for k, v in params.items()}
-    if "people" in out:
+    if key == "product_people_set" and "people" in out:
         # THE COUNTS AND THE DIGEST, never the ids (#528): the line is the record of who asked
         from beeverforge.product.people import loggable
 

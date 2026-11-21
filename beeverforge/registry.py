@@ -35,6 +35,7 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -303,6 +304,10 @@ def _refused_as_registered(others: list[dict], project: Project) -> None:
         raise ValueError(f"project {project.name!r} would share its short name "
                          f"{slug(project.name)!r} with {twin!r} — previews, their hosts "
                          "and their cookies are named by it; choose another name")
+
+
+#: What `set_people` is given: the held (admins, engineers) in, the pair to hold out.
+_PeopleChange = Callable[[list[str], list[str]], tuple[list[str], list[str]]]
 
 
 class ProjectRegistry:
@@ -804,7 +809,7 @@ class ProjectRegistry:
         return (tuple(str(x) for x in product.get("admins") or ()),
                 tuple(str(x) for x in product.get("engineers") or ()))
 
-    def set_people(self, name: str, change) -> bool:
+    def set_people(self, name: str, change: _PeopleChange) -> bool:
         """Replace the product's two lists of people in ONE write — `change(admins, engineers)`
         answers the pair to hold, read from the entry as it is UNDER THE LOCK, so two calls each
         leave one whole pair and never a mix. True when the file was written, False — and not

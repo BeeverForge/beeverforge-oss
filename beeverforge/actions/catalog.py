@@ -7787,7 +7787,8 @@ async def _product_people_set(*, project: str, by: Actor, people: object = None)
                        project=project)
     moved: dict = {}
 
-    def change(held_admins: list[str], held_engineers: list[str]):
+    def change(held_admins: list[str],
+               held_engineers: list[str]) -> tuple[list[str], list[str]]:
         moved["admins"] = _people_moved(held_admins, admins)
         moved["engineers"] = _people_moved(held_engineers, engineers)
         joining = {*moved["admins"]["added"], *moved["engineers"]["added"]}

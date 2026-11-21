@@ -206,6 +206,8 @@ def test_two_concurrent_sets_leave_one_list_whole(registry):
     actions.Actor(id="x", via="panel", admin=True, scopes=frozenset({"product"})),
     actions.Actor(id="ana", via="product", admin=True, scopes=frozenset({"product"})),
     actions.Actor(id="ana", via="panel", admin=True),  # unscoped, adding themselves
+    actions.Actor(id="ana", via="slack", admin=True),  # a person asking from the product's room
+    actions.Actor(id="caio", via="slack", admin=False, scopes=frozenset({"product"})),
 ])
 def test_a_credential_that_is_not_the_installations_is_denied(registry, by):
     before = _bytes(registry)
@@ -267,9 +269,41 @@ def test_adr_0057_names_this_row_as_the_declared_exception_to_the_grants_rule():
     assert "product_people_set" in text
 
 
-def test_only_this_row_writes_the_product_lists():
-    from beeverforge.registry import ProjectRegistry
+def _functions_that_write_the_lists(source: str) -> set[str]:
+    """Names of the top-level functions in `source` that set the product's lists: a `.set_people(` call, or
+    an assignment to an `admins` / `engineers` key or attribute."""
+    import ast
 
-    assert hasattr(ProjectRegistry, "set_people")
-    src = (ROOT / "beeverforge/actions/catalog.py").read_text()
-    assert src.count(".set_people(") == 1
+    found: set[str] = set()
+    for fn in ast.parse(source).body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "set_people":
+                found.add(fn.name)
+            targets = node.targets if isinstance(node, ast.Assign) else []
+            for t in targets:
+                for leaf in ast.walk(t):
+                    if (isinstance(leaf, ast.Constant) and leaf.value in ("admins", "engineers")) \
+                            or getattr(leaf, "attr", "") in ("admins", "engineers"):
+                        found.add(fn.name)
+    return found
+
+
+def test_the_guard_finds_a_row_that_writes_the_lists_some_other_way():
+    fixture = (
+        "async def _sneaky(*, project, by):\n"
+        "    raw['p']['product']['admins'] = ['me']\n"
+        "async def _also(*, project, by):\n"
+        "    ProjectRegistry().set_people(project, None)\n"
+        "async def _innocent(*, project, by):\n"
+        "    return admins\n")
+    assert _functions_that_write_the_lists(fixture) == {"_sneaky", "_also"}
+
+
+def test_only_this_row_writes_the_product_lists():
+    for path in sorted((ROOT / "beeverforge/actions").glob("*.py")):
+        writers = _functions_that_write_the_lists(path.read_text())
+        assert writers <= {"_product_people_set"}, (path.name, writers)
+    catalog = (ROOT / "beeverforge/actions/catalog.py").read_text()
+    assert _functions_that_write_the_lists(catalog) == {"_product_people_set"}
