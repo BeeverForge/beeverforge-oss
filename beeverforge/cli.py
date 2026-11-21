@@ -539,6 +539,42 @@ def project_forget(
         raise typer.Exit(1)
 
 
+@project_app.command("update")
+def project_update(
+    name: str,
+    repo_path: str = typer.Option(None, "--repo-path", help="Where the code is now: a local path "
+                                                            "or clone URL"),
+    provider: str = typer.Option(None, help="The tracker's kind, when the address cannot say it"),
+    repo: str = typer.Option(None, help="Repo/board ref, e.g. owner/name"),
+    board_owner: str = typer.Option(None, help="Board owner (GitHub Projects org/user)"),
+    board_number: str = typer.Option(None, help="Board number (GitHub Projects v2)"),
+    organization: str = typer.Option(None, help="Azure DevOps organisation"),
+    ado_project: str = typer.Option(None, "--ado-project", help="Azure DevOps project"),
+    repository: str = typer.Option(None, help="Azure Repos repository name"),
+    work_item_type: str = typer.Option(None, "--work-item-type",
+                                       help="Azure Boards work item type the factory writes"),
+    token_env: str = typer.Option(None, help="Name of the env var holding THIS project's "
+                                             "credential"),
+    ci: str = typer.Option(None, help="The kind of CI, e.g. github_actions, or none"),
+) -> None:
+    """Change where a registered project's repository, tracker or CI is. Only what you name is
+    changed — its model, language, previews, `enabled` and attached board stay. The same refusals
+    as `project add` apply, and nothing is written when one does or when nothing differs."""
+    # A MAPPING ONTO THE `project_update` ROW (#527): the row decides and writes.
+    outcome = _perform("project_update", project=name, repo_path=repo_path or "",
+                       provider=provider or "", repo=repo or "", board_owner=board_owner or "",
+                       board_number=board_number or "", organization=organization or "",
+                       ado_project=ado_project or "", repository=repository or "",
+                       work_item_type=work_item_type or "", token_env=token_env or "",
+                       ci=ci or "")
+    if not outcome.ok:
+        _refuse_the_row(outcome, name)
+    if outcome.data["changed"]:
+        typer.echo(f"✓ {outcome.message}")
+    else:
+        typer.echo(f"· {outcome.message}")
+
+
 @project_app.command("remove")
 def project_remove(name: str) -> None:
     """Unregister a project. A name that is not registered is refused, with the roster."""

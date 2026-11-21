@@ -271,6 +271,40 @@ def installation_scope_line(by_owner: dict[str, list[str]],
             f"(`beeverforge project remove <name>`)")
 
 
+def _refused_as_registered(others: list[dict], project: Project) -> None:
+    """Raise `ValueError` when `project` would not be a registry `others` can hold with it — two
+    GitHub organisations in one installation, two names one preview slug. ONE FUNCTION for `add`
+    and `update`, so a door that registers a project and a door that changes one cannot disagree
+    about what is refused. `others` are the entries of every OTHER project, as the file holds
+    them."""
+    # REFUSED HERE BECAUSE HERE IS WHERE THE MISTAKE IS MADE (#64). A human is in front of
+    # this — `beeverforge project add` or the panel's POST /api/projects, which already renders a
+    # ValueError as a 409 carrying the message — so the cost of refusing is one sentence at the
+    # moment it can still be acted on, rather than a 404 on a repo they can see in their browser,
+    # three layers away, minutes later.
+    #
+    # ASKED OF THE WHOLE REGISTRY AS IT WOULD BE, through the SAME function `list` warns with — one
+    # rule, one implementation. An earlier version compared the incoming project's orgs against
+    # the incumbents' and missed the case a test caught: a SINGLE project whose repo is in one org
+    # and whose board is in another spans two installations by itself, and no between-project
+    # comparison can see that.
+    would_be = [Project(**other) for other in others] + [project]
+    spanning = spanning_installations(would_be)
+    if spanning:
+        raise ValueError(spanning_message(spanning))
+    # ONE SLUG, ONE PROJECT (ADR-0050 D7). A preview's compose project, host names and cookie are
+    # built from the project's slug; two projects whose names slug alike (`Acme` and `acme`) would
+    # alias each other's previews on one daemon. Refused here, where a person is naming the
+    # project; `doctor` lists any that predate this.
+    from beeverforge.preview import slug
+
+    twin = next((o.name for o in would_be[:-1] if slug(o.name) == slug(project.name)), None)
+    if twin is not None:
+        raise ValueError(f"project {project.name!r} would share its short name "
+                         f"{slug(project.name)!r} with {twin!r} — previews, their hosts "
+                         "and their cookies are named by it; choose another name")
+
+
 class ProjectRegistry:
     def __init__(self, path: Path | str | None = None) -> None:
         # env override lets the panel/tests point at an isolated registry
@@ -545,37 +579,39 @@ class ProjectRegistry:
                     "repository — register it with its code (`beeverforge project add <name> "
                     "<repository>`) or start its product before the code with its context "
                     "repository (`beeverforge product start <name> <context-repository>`)")
-            # REFUSED HERE BECAUSE HERE IS WHERE THE MISTAKE IS MADE (#64). A human is in front of
-            # this — `beeverforge project add` or the panel's POST /api/projects, which already
-            # renders a
-            # ValueError as a 409 carrying the message — so the cost of refusing is one sentence
-            # at the moment it can still be acted on, rather than a 404 on a repo they can see in
-            # their browser, three layers away, minutes later.
-            #
-            # ASKED OF THE WHOLE REGISTRY AS IT WOULD BE, through the SAME function `list` warns
-            # with — one rule, one implementation. An earlier version compared the incoming
-            # project's orgs against the incumbents' and missed the case a test caught: a SINGLE
-            # project whose repo is in one org and whose board is in another spans two
-            # installations by itself, and no between-project comparison can see that.
-            would_be = [Project(**other) for other in raw.values()] + [project]
-            spanning = spanning_installations(would_be)
-            if spanning:
-                raise ValueError(spanning_message(spanning))
-            # ONE SLUG, ONE PROJECT (ADR-0050 D7). A preview's compose project, host names and
-            # cookie are built from the project's slug; two projects whose names slug alike
-            # (`Acme` and `acme`) would alias each other's previews on one daemon. Refused here,
-            # where a person is naming the project; `doctor` lists any that predate this.
-            from beeverforge.preview import slug
-
-            twin = next((o.name for o in would_be[:-1] if slug(o.name) == slug(project.name)),
-                        None)
-            if twin is not None:
-                raise ValueError(f"project {project.name!r} would share its short name "
-                                 f"{slug(project.name)!r} with {twin!r} — previews, their hosts "
-                                 "and their cookies are named by it; choose another name")
+            _refused_as_registered(list(raw.values()), project)
             raw[project.name] = project.model_dump(mode="json")
             self._save_raw(raw)
             self._warn_foreign_pointers(project)
+
+    def set_axes(self, name: str, change) -> tuple[str, ...]:
+        """Change a registered project's repository and its axes — `change(held)` answers the
+        `Project` fields to write (`repo_path`, `tracker`, `forge`, `ci`), read from the entry as
+        it is UNDER THE LOCK, so two calls on one project each build on the other's write. Returns
+        the fields that differ, and writes nothing — not even the same bytes again — when none do.
+
+        Everything else in the entry is kept as the file has it. RAISES `KeyError` for a name not
+        held, and `ValueError` for what `add` refuses for the same project (`change` may raise it
+        too, for what it cannot build); the registry is asked as it would be, minus this entry."""
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            held = Project(**raw[name])
+            fields = change(held)
+            wanted = {k: (v.model_dump(mode="json") if hasattr(v, "model_dump") else v)
+                      for k, v in fields.items()}
+            have = held.model_dump(mode="json")
+            differing = [k for k, v in wanted.items() if have.get(k) != v]
+            if not differing:
+                return ()
+            entry = {**raw[name], **{k: wanted[k] for k in differing}}
+            project = Project(**entry)
+            _refused_as_registered([o for key, o in raw.items() if key != name], project)
+            raw[name] = entry
+            self._save_raw(raw)
+            self._warn_foreign_pointers(project)
+            return tuple(differing)
 
     def _warn_foreign_pointers(self, project: Project) -> None:
         """The two pointers that may legitimately live in another org — warned, never refused.
