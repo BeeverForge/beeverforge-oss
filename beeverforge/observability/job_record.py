@@ -166,6 +166,9 @@ def platform_stamp() -> dict[str, str]:
 #: poll`, a one-machine deployment's scheduler (#551). The workflow signs `the workflow`.
 BY_THE_ATTENDED_DRIVER = "the attended driver"
 
+#: Who signs an ending the attention list settles for a job whose workflow ended without one (#652).
+BY_THE_PLATFORM = "the attention list"
+
 
 def record_ending(project, issue: str, state: str, *, by: str, note: str = "") -> str:
     """Append a job's ENDING to its card's journal — a `state` line that carries `by` — and return

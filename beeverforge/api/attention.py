@@ -18,6 +18,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+from beeverforge.contracts.project import Project
+
 log = logging.getLogger("beeverforge.panel")
 
 #: The inner budget for one project's tracker read; the engine read has its own, in the route.
@@ -40,6 +42,7 @@ def settle(
     closed_refs: Callable[[str, list[str], float], set[str] | None],
     bounded: Callable[[Callable[[], object], float], object] = run_bounded,
     timeout: float = TRACKER_TIMEOUT_S,
+    ending: Callable[[dict], object] | None = None,
 ) -> list[dict]:
     """`jobs` without those whose workflow is not running and whose ticket is closed.
 
@@ -48,7 +51,8 @@ def settle(
     when unreadable. Only the candidates are ever asked about (a job whose workflow runs is listed
     without a question), once per project, through `bounded` (injected so no test waits on a
     clock). The tracker is handed a budget strictly inside `timeout`, so its own call ends before
-    the wait on it does."""
+    the wait on it does. `ending(job)`, when given, is called for each job dropped because its
+    ticket is closed, so how it ended is written down (#652); it never raises into the list."""
     if running is None:
         return [{**j, "note": "could not tell whether its workflow still runs"} for j in jobs]
     live = {(str(j.get("project")), str(j.get("issue"))) for j in jobs} & running
@@ -82,4 +86,67 @@ def settle(
                                         "(the bound ran out or its read failed)"})
         elif issue not in verdict:
             kept.append(job)
+        elif ending is not None:
+            try:
+                ending(job)
+            except Exception as exc:  # the list is answered whatever the ending did
+                log.info("attention: ending of %s#%s failed: %r", project, issue, exc)
     return kept
+
+
+def _already_ended(project: Project, issue: str, state: str) -> bool:
+    """Whether the journal's LAST state line is this ending already (a pass that raced, or a stale
+    list); an unreadable journal is not an ending."""
+    import json
+
+    from beeverforge.paths import events_file
+
+    try:
+        lines = events_file(project, issue).read_text().splitlines()
+    except OSError:
+        return False
+    for raw in reversed(lines):
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if event.get("kind") == "state":
+            return event.get("message") == state and "by" in (event.get("data") or {})
+    return False
+
+
+def end_closed(job: dict, *, project: Project, pr_status: Callable[[str, str], str]) -> str | None:
+    """Write how a held job whose ticket is closed ENDED (#652); the state written, else `None`.
+
+    `project` is the registered project the job belongs to. `pr_status(project, pr_url)` is the
+    forge's word: `merged`, `closed` or `open`, and it RAISES
+    when it cannot say. A merged pull request journals ONE `merged` ending naming it, and the
+    ending row throughput counts; a pull request closed without a merge journals `closed` and no
+    row. UNKNOWN WRITES NOTHING: a failed read, an open pull request, or a job with no pull request
+    to ask about is retried by the next pass. The row is written first and keyed, and the journal
+    line second, so a pass that stops between them is finished by the next; once the line is
+    written the job is no longer held, so a second pass finds nothing to end."""
+    from beeverforge.observability.job_record import (
+        BY_THE_PLATFORM,
+        record_ending,
+        record_job_ending,
+    )
+
+    name, issue, pr = str(job.get("project")), str(job.get("issue")), job.get("pr_url")
+    if not pr:
+        return None
+    try:
+        status = pr_status(name, str(pr))
+    except Exception as exc:  # unknown is not absence: nothing is written
+        log.info("attention: pull request of %s#%s unreadable: %r", name, issue, exc)
+        return None
+    if status in ("merged", "closed") and _already_ended(project, issue, status):
+        return None
+    if status == "merged":
+        record_job_ending(project=name, issue=issue, state="merged", pr_url=str(pr))
+        return record_ending(project, issue, "merged", by=BY_THE_PLATFORM,
+                             note=f"its ticket was closed by the merged pull request {pr}")
+    if status == "closed":
+        return record_ending(project, issue, "closed", by=BY_THE_PLATFORM,
+                             note=f"its ticket was closed and pull request {pr} was not merged")
+    return None

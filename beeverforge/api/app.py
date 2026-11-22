@@ -1723,7 +1723,9 @@ async def attention() -> list[dict]:
     running = await _running_workflows()
     return await asyncio.to_thread(
         settling.settle, held, running=running, closed_refs=_closed_refs_of,
-        timeout=settling.TRACKER_TIMEOUT_S)
+        timeout=settling.TRACKER_TIMEOUT_S,
+        ending=lambda job: settling.end_closed(
+            job, project=_project_or_404(str(job.get("project"))), pr_status=_pr_status_of))
 
 
 #: How many running workflows one read of the engine holds. A page this full may have left some out,
@@ -1747,6 +1749,16 @@ async def _running_workflows() -> set[tuple[str, str]] | None:
         return None
     return {(str(r.get("project")), str(r.get("issue")))
             for r in rows if r.get("status") == "running"}
+
+
+def _pr_status_of(project: str, pr_url: str) -> str:
+    """`merged` | `closed` | `open` for `pr_url` on `project`'s forge; RAISES when it cannot say."""
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+
+    proj = _project_or_404(project)
+    forge = build_forge(proj, token=forge_token_for(proj) or deployment_forge_token(proj))
+    return forge.pr_status(pr=pr_url)
 
 
 def _closed_refs_of(project: str, refs: list[str], timeout: float) -> set[str] | None:
