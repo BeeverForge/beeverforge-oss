@@ -23,9 +23,10 @@ TEST = ONE_CLIENT
 CONNECTION = "beeverforge/runtime/temporal/connection.py"
 
 MUTATIONS = [
+    # re-pinned 2026-11-22 (#657): the held client is looked up once, and a rotated key handed to it
     ("a client is made for every caller", CONNECTION,
-     "            if held is not None:\n                return held",
-     "            if False:\n                return held", ONE_CLIENT),
+     "            held = _HELD.get(key)\n            if held is None:\n                refusal",
+     "            held = None\n            if held is None:\n                refusal", ONE_CLIENT),
     ("the core does not forward through the log", CONNECTION,
      "        forwarding=LogForwardingConfig(logger=logging.getLogger(CORE_LOGGER))))",
      "        forwarding=None))", ONE_CLIENT),
@@ -35,7 +36,9 @@ MUTATIONS = [
      '                **({"runtime": runtime} if runtime is not None else {}), **_auth())',
      "                **_auth())", ONE_CLIENT),
     ("a changed target is served the old target's client", CONNECTION,
-     "    return address(), namespace(), digest", '    return address(), "default", digest',
+     # re-pinned 2026-11-22 (#657): the key is answered beside the stored key
+     "    return (address(), namespace(), digest), api_key",
+     '    return (address(), "default", digest), api_key',
      ONE_CLIENT),
     # The stand-in is on the path the case reads: a connect that no longer asks the probe before
     # it builds a runtime is red here, by the probe's own count, not only in the `refusing` case.

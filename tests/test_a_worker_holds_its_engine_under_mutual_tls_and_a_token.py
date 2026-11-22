@@ -160,9 +160,11 @@ class Engine:
 
     def token(self, *permissions: str, lives: float = 600.0) -> str:
         """A JWT the server's default claim mapper reads; `lives` below zero is already expired."""
-        expires = int(time.time() + lives)
+        now = int(time.time())
+        expires = int(now + lives)
+        # ISSUED BEFORE IT EXPIRES AND NEVER IN THE FUTURE, which the server refuses as well.
         return jwt.encode({"sub": "worker-657", "permissions": list(permissions),
-                           "iat": expires - 600, "exp": expires},
+                           "iat": min(now, expires) - 60, "exp": expires},
                           self.signing_key, algorithm="ES256", headers={"kid": KID})
 
     def tls(self, *, certificate: bool = True) -> TLSConfig:
@@ -381,7 +383,9 @@ async def test_a_token_WITHOUT_a_certificate_is_refused_at_the_handshake(deploye
     assert not isinstance(refused.value, RPCError), (
         f"a token without a certificate reached the server's API ({refused.value!r}) — the "
         f"handshake should have refused it before any authorizer")
-    assert "connect" in str(refused.value).lower(), refused.value
+    # THE SERVER'S OWN ALERT, measured on 1.25.2: "received fatal alert: CertificateRequired" —
+    # the TLS layer refused the connection, not a trust failure on the client's side.
+    assert "CertificateRequired" in str(refused.value), refused.value
 
 
 async def test_a_token_ROTATED_IN_PLACE_keeps_the_worker_polling(deployed, engine):

@@ -8,6 +8,12 @@ The SAME code runs everywhere (ADR-0001 D-16); only the connection target change
             TEMPORAL_API_KEY=<key>                                 (API-key auth + TLS)
       or    TEMPORAL_TLS_CERT=/path/client.pem
             TEMPORAL_TLS_KEY=/path/client.key                      (classic mTLS)
+    self-hosted, mutual TLS AND a JWT authorizer: all three above together — the certificate is
+            presented and the key is sent as the bearer token (#657)
+    any:    TEMPORAL_TLS_SERVER_CA_CERT=/path/engine-ca.pem        (the engine's CA, for this
+                                                                    connection alone)
+            TEMPORAL_API_KEY_REFRESH_SECONDS=60                    (how often a stored key is
+                                                                    read again)
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import contextlib
 import gc
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -34,6 +41,8 @@ from beeverforge.listeners import ENGINE
 from beeverforge.observability import logs
 from beeverforge.runtime.temporal.deadlines import read_deadline, unreachable_window
 from beeverforge.runtime.temporal.vocabulary import EngineUnreachable
+
+log = logging.getLogger(__name__)
 
 #: The one local target, spelled once. Named so a deployment can DECLARE it — which is the whole
 #: difference between "I meant the dev server" and "nobody told me anything" (#163). ASKED OF THE
@@ -89,28 +98,39 @@ def _auth() -> dict:
     #
     # AND A REFUSED ONE ENDS THE CHAIN (review of #822): a refused API key is not answered by the
     # client certificate, nor by connecting with nothing — the connect attempt fails with the
-    # store's sentence, which `view.connect()` reports to every caller queued behind it.
+    # store's sentence, which `view.connect()` reports to every caller queued behind it. A refused
+    # certificate key ends it the same way, with an API key beside it or not.
+    #
+    # BOTH AT ONCE (#657). A self-hosted server with mutual TLS AND a JWT authorizer asks for the
+    # client certificate at the handshake and for the token on every call. The key used to replace
+    # the certificate, so that server refused the connection at the handshake; now a deployment
+    # that sets both presents both, and one that sets either alone gets exactly what it got before.
+    #
+    # THE ENGINE'S OWN CA (#657): `TEMPORAL_TLS_SERVER_CA_CERT` is this connection's root and no
+    # other's, so pinning the engine's CA does not change what the rest of the process trusts.
     from beeverforge.adapters.credential_store.registry import lookup
 
     api_key = lookup("TEMPORAL_API_KEY")
     if api_key.refused:
         raise RuntimeError(f"the engine credential TEMPORAL_API_KEY is refused by the credential "
                            f"store — {api_key.refused}; nothing is used in its place")
-    if api_key.value:  # Temporal Cloud API-key auth (TLS required)
-        return {"api_key": api_key.value, "tls": True}
     client_key = lookup("TEMPORAL_TLS_KEY")
     if client_key.refused:
         raise RuntimeError(f"the engine credential TEMPORAL_TLS_KEY is refused by the credential "
                            f"store — {client_key.refused}; nothing is used in its place")
     cert, key = os.environ.get("TEMPORAL_TLS_CERT"), client_key.value
-    if cert and key:  # classic mTLS client cert
-        return {
-            "tls": TLSConfig(
-                client_cert=Path(cert).read_bytes(),
-                client_private_key=Path(key).read_bytes(),
-            )
-        }
-    return {}  # plain dev-server
+    server_ca = os.environ.get("TEMPORAL_TLS_SERVER_CA_CERT")
+    tls: dict[str, bytes] = {}
+    if cert and key:  # a client certificate: classic mTLS, or mTLS beside the key
+        tls["client_cert"] = Path(cert).read_bytes()
+        tls["client_private_key"] = Path(key).read_bytes()
+    if server_ca:
+        tls["server_root_ca_cert"] = Path(server_ca).read_bytes()
+    auth: dict = {"tls": TLSConfig(**tls)} if tls else {}
+    if api_key.value:  # API-key auth, which needs TLS: the system's roots when nothing else says
+        auth["api_key"] = api_key.value
+        auth.setdefault("tls", True)
+    return auth  # nothing set: a plain dev server
 
 
 #: How much of the auth digest travels in a pool key. Twelve hex characters is 48 bits — far more
@@ -148,8 +168,9 @@ def fingerprint() -> tuple[str, str, str]:
     `view.connect()`, which reuses one client per target (GitHub issue #134): the
     panel opened a fresh gRPC client on every `/api/floor` request, and the reporter measured 20 →
     32 open connections over six requests on 2026-09-15. "Same target" has to include the AUTH
-    material, because a redeployment that swaps an API key while keeping the address must not be
-    served by a client holding the old credential.
+    material, because a redeployment that changes how it authenticates while keeping the address
+    must not be served by a client opened the old way. An API key whose VALUE changes is not that:
+    the held client is handed the new key in place (#657, `_target`).
 
     THE SECRET NEVER ENTERS THE KEY — a truncated SHA-256 goes in instead. A pool key reaches a log
     line, a `repr` and a test failure message, and this repository already carries guards against
@@ -176,17 +197,33 @@ def fingerprint() -> tuple[str, str, str]:
     failure-sharing path reports it once to every caller queued behind it, rather than from a key
     computation that has no sentence to say about it.
     """
+    return _target()[0]
+
+
+def _target() -> tuple[tuple[str, str, str], str | None]:
+    """`(fingerprint(), the API key stored now)` — one read of the store for both, so `connect()`
+    can hand a rotated key to the client it holds without asking the store twice.
+
+    WHETHER A KEY IS SET IS IN THE DIGEST; ITS VALUE IS NOT (#657). A key that appears or goes away
+    changes how the connection authenticates, and is a new client. A key whose value changes is
+    the same target: the client this process holds is handed the new one in place (`connect`,
+    `refresh_api_key`), because the worker holds the client it was born with and would never be
+    given a new one. The server CA's contents are in it, as the certificate's are, for the reason
+    `fingerprint` gives for those."""
     from beeverforge.adapters.credential_store.registry import stored
 
     cert = os.environ.get("TEMPORAL_TLS_CERT") or ""
     key = stored("TEMPORAL_TLS_KEY") or ""
+    server_ca = os.environ.get("TEMPORAL_TLS_SERVER_CA_CERT") or ""
+    api_key = stored("TEMPORAL_API_KEY")
     material = "\x00".join((
-        "api_key", stored("TEMPORAL_API_KEY") or "",
+        "api_key", "set" if api_key else "",
         "tls_cert", cert, _contents(cert),
         "tls_key", key, _contents(key),
+        "server_ca", server_ca, _contents(server_ca),
     ))
     digest = hashlib.sha256(material.encode()).hexdigest()[:_DIGEST_CHARS]
-    return address(), namespace(), digest
+    return (address(), namespace(), digest), api_key
 
 
 #: The logger the engine client's core writes through when the deployment asked for JSON lines.
@@ -348,20 +385,28 @@ async def connect(*, within: float | None = None) -> Client:
         up to `RESTS_AT_MOST_S`; a client that lands ends it. A cancelled attempt is still
         nobody's failure, and leaves no rest."""
     while True:
-        key = fingerprint()  # raises for an engine nobody declared, before anything is built
+        # raises for an engine nobody declared, before anything is built
+        key, stored_key = _target()
         with _HOLDING:
             held = _HELD.get(key)
-            if held is not None:
-                return held
-            refusal = _resting(key)
-            if refusal is not None:
-                raise refusal
-            flight = _IN_FLIGHT.get(key)
-            mine = flight is None
-            if flight is None:
-                flight = _IN_FLIGHT[key] = concurrent.futures.Future()
-                # RUNNING, so a waiter that is cancelled cannot cancel the attempt under the others.
-                flight.set_running_or_notify_cancel()
+            if held is None:
+                refusal = _resting(key)
+                if refusal is not None:
+                    raise refusal
+                flight = _IN_FLIGHT.get(key)
+                mine = flight is None
+                if flight is None:
+                    flight = _IN_FLIGHT[key] = concurrent.futures.Future()
+                    # RUNNING, so a waiter that is cancelled cannot cancel the attempt under the
+                    # others.
+                    flight.set_running_or_notify_cancel()
+        if held is not None:
+            # A KEY THAT CHANGED WHERE IT IS STORED is handed to the client already held — read in
+            # the same breath as the target above, so the store is asked once (#657): no second
+            # client, and no reconnect.
+            if stored_key and getattr(held, "api_key", None) != stored_key:
+                _present(held, stored_key)
+            return held
         if mine:
             return await _connect_for(key, flight, read_deadline() if within is None else within)
         try:
@@ -432,6 +477,18 @@ async def _connect_for(key: tuple[str, str, str], flight: concurrent.futures.Fut
         _HELD[key] = client
         failed_before = bool(_RESTING)
         _RESTING.clear()
+        # ITS KEY IS READ AGAIN WHILE IT IS HELD (#657), by one refresher per held client, ended
+        # with it: a refresher for a client let go of would keep that client, and its connection,
+        # alive for the life of the process.
+        ended = list(_REFRESHING.values())
+        _REFRESHING.clear()
+        refresher = None
+        if getattr(client, "api_key", None):
+            refresher = _REFRESHING[key] = _KeyRefresh(client, every=api_key_refresh_every())
+    for old in ended:
+        old.stop()
+    if refresher is not None:
+        refresher.start()
     flight.set_result(client)
     if let_go or failed_before:
         # A TARGET THAT CHANGED lets its old client go — collected at once, so its connection
@@ -453,6 +510,102 @@ def forget() -> None:
         _HELD.clear()
         _IN_FLIGHT.clear()
         _RESTING.clear()
+        ended = list(_REFRESHING.values())
+        _REFRESHING.clear()
+    for refresher in ended:
+        refresher.stop()
+
+
+#: How often, in seconds, the API key of the client this process holds is read again from where it
+#: is stored. A deployment whose key is a short-lived token sets it below the token's lifetime.
+API_KEY_REFRESH_VAR = "TEMPORAL_API_KEY_REFRESH_SECONDS"
+_API_KEY_REFRESH_S = 60.0
+
+
+def api_key_refresh_every() -> float:
+    """The refresh interval: `TEMPORAL_API_KEY_REFRESH_SECONDS`, read per call; unset, or not a
+    finite number of seconds above zero, `_API_KEY_REFRESH_S`."""
+    try:
+        wanted = float(os.environ.get("TEMPORAL_API_KEY_REFRESH_SECONDS", "") or _API_KEY_REFRESH_S)
+    except ValueError:
+        return _API_KEY_REFRESH_S
+    return wanted if math.isfinite(wanted) and wanted > 0 else _API_KEY_REFRESH_S
+
+
+def _present(client: Client, api_key: str) -> None:
+    """Hand `client` the key `api_key` through temporalio's `Client.api_key` setter: the calls it
+    makes from now on carry it, on the connection it already has. Said by name, never by value."""
+    client.api_key = api_key
+    log.info("the engine credential TEMPORAL_API_KEY changed where it is stored; the engine "
+             "client presents the new one from its next call, without reconnecting")
+
+
+def refresh_api_key(client: Client) -> bool:
+    """Read `TEMPORAL_API_KEY` again and hand it to `client` when it changed. True when it did.
+
+    THE KEY WAS READ ONCE, AT CONNECT (#657), and a worker holds the client it was born with for
+    its whole life, so a short-lived token made the worker fail when it expired, until somebody
+    restarted it. Read here through the credential store as `_auth()` reads it — a file rewritten
+    in place, a store that answers a fresh token — and handed to the client the process already
+    holds, so neither the connection nor the worker on it is restarted.
+
+    A READ THAT FAILS KEEPS THE KEY THE CLIENT HAS. A refusal, or a store that answers nothing, is
+    said once per read, by name, and the client goes on presenting what it holds: replacing a key
+    with nothing would end the worker's polls at once, where the key it holds may still be good.
+    When that key does expire, the server refuses the calls, which say so themselves. The store's
+    own sentence is asked for quietly, because this one is the one that says what happens."""
+    from beeverforge.adapters.credential_store.registry import lookup
+
+    found = lookup("TEMPORAL_API_KEY", quiet=True)
+    if not found.value:
+        log.warning("the engine credential TEMPORAL_API_KEY %s when it was read again; the engine "
+                    "client keeps presenting the key it holds, and the store is asked again in "
+                    "%gs", f"was refused ({found.refused})" if found.refused
+                    else "answered nothing", api_key_refresh_every())
+        return False
+    if found.value == getattr(client, "api_key", None):
+        return False
+    _present(client, found.value)
+    return True
+
+
+class _KeyRefresh:
+    """Reads the held client's API key again every `every` seconds, on a thread of its own, until
+    it is stopped. `wait` is how it waits — the stop event's own `wait` unless a test hands one in;
+    it answers True when the refresher is to end.
+
+    A THREAD, NOT A TASK: the client this process holds answers from any loop (`connect`), and the
+    loops that use it come and go; the worker's lives as long as the worker, the panel's as long as
+    a request. A thread waiting on an event costs nothing between reads and ends the moment it is
+    stopped."""
+
+    def __init__(self, client: Client, *, every: float, wait=None) -> None:
+        self.client = client
+        self.every = every
+        self._ended = threading.Event()
+        self._wait = wait if wait is not None else self._ended.wait
+        self.thread = threading.Thread(target=self.run, name="engine-api-key-refresh",
+                                       daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self._ended.set()
+
+    def run(self) -> None:
+        while not self._wait(self.every):
+            try:
+                refresh_api_key(self.client)
+            except Exception as exc:  # noqa: BLE001 — one failed read must not end the refresher
+                log.warning("reading the engine credential TEMPORAL_API_KEY again failed (%s); "
+                            "the engine client keeps presenting the key it holds, and it is read "
+                            "again in %gs", type(exc).__name__, self.every)
+
+
+#: The refresher of the client `_HELD` holds, by the same key, and ONE ENTRY IN TOTAL, as `_HELD`
+#: is: a client let go of has its refresher stopped with it.
+_REFRESHING: dict[tuple[str, str, str], _KeyRefresh] = {}
 
 
 class EngineNotListening(RuntimeError):

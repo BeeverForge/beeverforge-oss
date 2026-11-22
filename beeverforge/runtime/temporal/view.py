@@ -961,10 +961,12 @@ async def connect() -> Client:
 
     AND THE POOL HOLDS AT MOST ONE ENTRY, TOTAL — not one per key. `fingerprint()` reads
     process-wide environment and the TLS files it names, so a process has exactly one engine target
-    at a time; a target that CHANGES (a moved address, a rotated API key, a cert rewritten in
-    place) yields a different key, and keeping the old entry beside the new one would retain its
-    client for the life of the process. That is #134's leak again, on a deployment's clock instead
-    of a request's — and it would arrive by exactly the path the cert-content digest opens. So a
+    at a time; a target that CHANGES (a moved address, an API key that appears or goes away, a
+    cert rewritten in place) yields a different key — a key whose value rotates does not, and is
+    handed to the one client in place (#657) — and keeping the old entry beside the new one would
+    retain its client for the life of the process. That is #134's leak again, on a deployment's
+    clock instead of a request's — and it would arrive by exactly the path the cert-content digest
+    opens. So a
     new entry EMPTIES the pool rather than joining it. Nothing is evicted from under a coroutine:
     a holder mid-`async with` keeps its own reference.
 
@@ -1017,7 +1019,7 @@ async def connect() -> Client:
         entry = None
     if entry is None:
         # EMPTIED, NOT ADDED TO — this is the "at most one entry, total" line. A stale entry under
-        # a DIFFERENT key (a moved address, a rotated key, a cert rewritten in place) would
+        # a DIFFERENT key (a moved address, a key set or unset, a cert rewritten in place) would
         # otherwise sit beside the live one for ever, holding its client: #134's leak again, on
         # the slow clock of a deployment's re-keying. Dropping it from the dict is enough and is
         # all that is safe — a coroutine mid-`async with` on it holds its own reference and
