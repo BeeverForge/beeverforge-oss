@@ -1273,6 +1273,7 @@ const ACTS={
   decide:        d=>decide(d.p,d.i,d.k),
   mergeGate:     d=>mergeGate(d.p,d.i,d.k),
   actJob:        d=>actJob(d.p,d.i,d.k),
+  dismissJob:    d=>dismissJob(d.p,d.i),
   // `resume` WITH a choice — the decision options on a parked job's action strip.
   actJobChoice:  d=>actJob(d.p,d.i,"resume",d.k),
   answerQuestion:d=>answerQuestion(d.p,d.tok,d.k),
@@ -1875,8 +1876,11 @@ function inboxOptions(it){
   if(it.kind=="approval")return`<button class="btn sm" data-act="openPromote" data-p="${esc(p)}" data-i="${esc(i)}">Review &amp; promote</button>`;
   if(it.kind=="rate_limit")return`<button class="btn sm" data-act="actJob" data-p="${esc(p)}" data-i="${esc(i)}" data-k="resume">Retry now</button> `+
     `<button class="btn sm ghost" data-act="actJob" data-p="${esc(p)}" data-i="${esc(i)}" data-k="skip">Skip</button>`;
+  // DISMISS (#653) — a held job whose workflow has ended and needs nobody. The core refuses it
+  // while the workflow still runs (`skip` is that one's), so the button is only a question.
+  const dismiss=it.state=="on_hold"?` <button class="btn sm plain" title="close this held job — its workflow has ended and nothing is left to do; the card is not moved" data-act="dismissJob" data-p="${esc(p)}" data-i="${esc(i)}" data-k="dismiss">Dismiss</button>`:"";
   return(it.options||[]).map(o=>
-    `<button class="btn sm${o.key=="resume"?"":" ghost"}" data-act="actJob" data-p="${esc(p)}" data-i="${esc(i)}" data-k="${esc(o.key)}">${esc(o.label)}</button>`).join(" ");
+    `<button class="btn sm${o.key=="resume"?"":" ghost"}" data-act="actJob" data-p="${esc(p)}" data-i="${esc(i)}" data-k="${esc(o.key)}">${esc(o.label)}</button>`).join(" ")+dismiss;
 }
 // WHAT THIS PLATFORM'S OWN REVIEWER FOUND, beside the buttons that act on it (#149). It was
 // computed at the REVIEW station and shown nowhere near the gate, so a pull request the review
@@ -5125,6 +5129,16 @@ async function mergeGate(project,issue,answer,instruction){
   setTimeout(loadEngine,800);setTimeout(loadInbox,800);
 }
 
+async function dismissJob(project,issue){
+  try{
+    const r=await mfetch(`/api/act/dismiss`,
+      {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({params:{project,issue}})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok)toast("Dismissed",(d&&d.message)||`#${issue} dismissed`,"ok");
+    else toast("Could not dismiss",(d&&d.detail)||"the job did not accept that","err");
+  }catch(e){toast("Error","could not dismiss the job","err")}
+  setTimeout(loadEngine,800);setTimeout(loadInbox,800);
+}
 async function actJob(project,issue,action,choice){
   if(action=="skip" && !confirm(`Skip #${issue}? This frees the floor and leaves the ticket for its owner (Backlog).`))return;
   const fc=$("#floorCtl");if(fc)fc.innerHTML='<span class="pill b-run"><span class="spin"></span> '+esc(choice?("choice "+choice):action)+'…</span>';

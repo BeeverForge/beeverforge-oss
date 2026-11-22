@@ -202,6 +202,7 @@ FRONT_ENDS = ("beeverforge/api/app.py", "beeverforge/runtime/slack/bot.py", "bee
 #: logic and appears nowhere else in a front end.
 OWNED = {
     "act_job": "resume/skip",                # the durable signal to a parked job
+    "_already_ended": "dismiss",             # a held job closed by a person: the `dismissed` line (#653)
     "create_ticket": "card_create",          # opening a card on the client's board
     # queueing — the gesture that authorises spending. #414 moved the move itself (`set_column`)
     # into the card's door, whose guard fails on it anywhere outside; what this row owns is the

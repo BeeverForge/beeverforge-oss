@@ -192,6 +192,67 @@ async def _skip(*, project: str, issue: str, by: Actor) -> Outcome:
     return _refusal_of(moved) or _after_the_door(moved, said["it"])
 
 
+# ── dismiss — a held job whose workflow has ended (#653) ─────────────────────────────────────────
+
+async def _running(client, project: str, issue: str) -> bool:
+    """Whether the engine holds a RUNNING workflow for this job. A workflow it does not know is not
+    running; any other failure is the engine's and is raised as it came, never read as "ended"."""
+    from temporalio.client import WorkflowExecutionStatus
+
+    from beeverforge.runtime.temporal import view as tv
+
+    try:
+        described = await tv.job_handle(client, project, issue).describe()
+    except Exception as exc:  # noqa: BLE001
+        if _looks_missing(exc):
+            return False
+        raise
+    return described.status == WorkflowExecutionStatus.RUNNING
+
+
+async def _dismiss(*, project: str, issue: str, by: Actor, why: str = "") -> Outcome:
+    """Close a held job whose workflow has ended: ONE `dismissed` state line with who and why, and
+    nothing else. The card is not moved — `skip` would send a closed ticket back to the backlog.
+
+    A workflow that still runs is `skip`'s to answer, so it is refused naming it; a job nobody ran
+    for this issue is NOT_FOUND. Repeating it writes nothing more (the journal's last word is
+    already `dismissed`)."""
+    from beeverforge.api.attention import _already_ended
+    from beeverforge.observability.job_record import record_ending
+    from beeverforge.paths import events_file
+    from beeverforge.util.filelock import Waited, lock_beside
+
+    if not re.fullmatch(r"\d+", issue or "", re.ASCII):
+        return refused(INVALID, f"{issue!r} is not an issue number — digits only.")
+    found, bad = _project(project)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    if await _running(client, found.name, issue):
+        return refused(
+            CONFLICT,
+            f"#{issue}'s workflow still runs — dismissing is for a job that has ended. "
+            f"Use `skip` to stop it.")
+    journal = events_file(found, issue)
+    if not journal.exists():
+        return refused(NOT_FOUND, f"no job has ever run for #{issue} on {found.name} — check the "
+                                  f"ticket reference.")
+    note = (why or "").strip()
+    try:
+        with lock_beside(journal).held(timeout=2.0):
+            if _already_ended(found, issue, "dismissed"):
+                return done(f"#{issue} was already dismissed.", project=found.name, issue=issue,
+                            written=False)
+            record_ending(found, issue, "dismissed", by=str(by), note=note)
+    except Waited:
+        return refused(UNAVAILABLE, f"#{issue}'s journal is being written by somebody else — "
+                                    f"try again in a moment.")
+    return done(f"#{issue} dismissed — {by} closed it; the card was not moved.",
+                project=found.name, issue=issue, written=True, why=note or None)
+
+
 # ── the card's door, from a row (ADR-0055) ───────────────────────────────────────────────────────
 
 async def _through_the_door(proj, issue: str, event, *, by: Actor, why: str = "",
@@ -9324,6 +9385,19 @@ CATALOG: dict[str, ActionSpec] = {
             choose_when="for a parked job a re-run cannot advance, and for an ORPHANED one "
                         "(ticket closed, workflow still holding the line). The ticket is left for "
                         "its owner rather than thrown away",
+        ),
+        ActionSpec(
+            name="dismiss",
+            summary="close a held job whose workflow has ended, leaving its card where it is",
+            run=_dismiss,
+            refuses=(NOT_FOUND, CONFLICT, INVALID, UNAVAILABLE),
+            required=("project", "issue"),
+            optional=("why",),
+            params={"why": "one sentence saying why it needs nobody — it is stored with the "
+                           "dismissal and shown"},
+            choose_when="for a held job whose workflow already ended and which needs nobody "
+                        "(shipped by hand, rebuilt elsewhere). A workflow that still runs is "
+                        "`skip`'s",
         ),
         ActionSpec(
             name="ack",
