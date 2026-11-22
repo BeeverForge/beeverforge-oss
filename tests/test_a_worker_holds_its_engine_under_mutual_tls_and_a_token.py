@@ -75,6 +75,8 @@ KID = "bf-657"
 READY_WITHIN_S = 180.0
 #: Each workflow's bound, once the server is ready.
 JOB_WITHIN_S = 60.0
+#: How long one image may take to pull, where this machine does not hold it yet.
+PULL_WITHIN_S = 600.0
 
 
 def _docker() -> bool:
@@ -198,8 +200,33 @@ def _serve_jwks(host: str, document: bytes) -> _JwksServer:
     return server
 
 
+def _cannot(reason: str) -> None:
+    """Skip with `reason` — or fail with it where `TEST_REQUIRE_DOCKER` says this must run."""
+    if os.environ.get("TEST_REQUIRE_DOCKER"):
+        pytest.fail(reason)
+    pytest.skip(reason)
+
+
+def _pulled(image: str) -> None:
+    """`image` on this machine, pulled in a step of its own and bounded by `PULL_WITHIN_S`, so a
+    slow registry is said as itself and never as an engine that did not start."""
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True,
+                      timeout=60).returncode == 0:
+        return
+    try:
+        done = subprocess.run(["docker", "pull", image], capture_output=True, text=True,
+                              timeout=PULL_WITHIN_S)
+    except subprocess.TimeoutExpired:
+        _cannot(f"pulling {image} took longer than {PULL_WITHIN_S:g}s")
+    if done.returncode != 0:
+        _cannot(f"{image} could not be pulled: {done.stderr.strip()[-300:]}")
+
+
 def _docker_run(*args: str) -> str:
-    done = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=120)
+    try:
+        done = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"docker {' '.join(args[:2])} did not answer in 120s") from None
     if done.returncode != 0:
         raise AssertionError(f"docker {' '.join(args[:2])} failed: {done.stderr.strip()}")
     return done.stdout.strip()
@@ -263,6 +290,8 @@ def engine(tmp_path_factory):
     jwk = json.loads(jwt.algorithms.ECAlgorithm.to_jwk(signing.public_key()))
     jwks = json.dumps({"keys": [{**jwk, "kid": KID, "alg": "ES256", "use": "sig"}]}).encode()
 
+    for image in (DATABASE, IMAGE):
+        _pulled(image)
     tag = uuid.uuid4().hex[:8]
     network, database, temporal = f"bf657-{tag}", f"bf657-db-{tag}", f"bf657-engine-{tag}"
     started: list[str] = []
@@ -271,7 +300,14 @@ def engine(tmp_path_factory):
     try:
         gateway = _docker_run("network", "inspect", network, "-f",
                               "{{(index .IPAM.Config 0).Gateway}}")
-        jwks_server = _serve_jwks(gateway, jwks)
+        try:
+            jwks_server = _serve_jwks(gateway, jwks)
+        except OSError as exc:
+            # DOCKER DESKTOP AND A ROOTLESS DAEMON keep the network's gateway inside their own
+            # VM or namespace: this process cannot listen there, and the engine could not reach a
+            # key served anywhere else it can see.
+            _cannot(f"the JWKS server cannot listen on the Docker network's gateway {gateway} "
+                    f"({exc.strerror or exc}) — a daemon whose networks this host does not hold")
         jwks_url = f"http://{gateway}:{jwks_server.server_address[1]}/jwks.json"
         _docker_run("run", "-d", "--rm", "--name", database, "--network", network,
                     "-e", "POSTGRES_USER=temporal", "-e", "POSTGRES_PASSWORD=temporal", DATABASE)

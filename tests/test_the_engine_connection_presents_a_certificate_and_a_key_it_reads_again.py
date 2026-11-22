@@ -395,3 +395,130 @@ def test_the_refresher_thread_is_named_for_what_it_does(engine):
     refresher = connection._KeyRefresh(_Client(1, FIRST), every=1.0,
                                        wait=threading.Event().wait)
     assert "engine-api-key" in refresher.thread.name
+
+
+# ── 5. a key that stays gone is let go of, after a bounded grace (review of the #657 branch) ───
+
+class _Clock:
+    """`connection._now`, moved by the test."""
+
+    def __init__(self) -> None:
+        self.at = 1000.0
+
+    def __call__(self) -> float:
+        return self.at
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    moved = _Clock()
+    monkeypatch.setattr(connection, "_now", moved)
+    monkeypatch.setenv("BEEVERFORGE_STORED_TOKEN_TTL", "100")
+    return moved
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_key_GONE_from_its_store_is_kept_for_the_grace_then_dropped(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    """A static key never expires on the server, so keeping a removed key for ever is keeping a
+    revoked credential for ever. It is kept for `BEEVERFORGE_STORED_TOKEN_TTL` after its last good
+    read, then the client presents NO key — it fails closed — and says so by name."""
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    with caplog.at_level(logging.DEBUG):
+        connection.refresh_api_key(client)          # the last good read, at 1000
+        held.unlink()
+        for at in (1050.0, 1070.0, 1099.0):         # inside the grace
+            clock.at = at
+            connection.refresh_api_key(client)
+        inside = _warnings(caplog)
+        assert client.api_key == FIRST and client.set_to == [], client.set_to
+        for at in (1101.0, 1200.0, 1300.0):         # past it
+            clock.at = at
+            connection.refresh_api_key(client)
+
+    assert client.set_to == [None], (
+        f"past the grace the client was handed {client.set_to!r}: a key nobody stores any more "
+        f"was still presented")
+    assert len(inside) == 1, f"one state, {len(inside)} warnings: {inside}"
+    assert "no longer held" in inside[0] and "BEEVERFORGE_STORED_TOKEN_TTL" in inside[0], inside
+    said = _warnings(caplog)
+    assert len(said) == 2, f"two states, {len(said)} warnings: {said}"
+    assert "TEMPORAL_API_KEY" in said[1] and "no key" in said[1], said[1]
+    assert FIRST not in caplog.text
+
+
+def test_a_REFUSED_reread_is_said_as_a_refusal_not_as_a_key_nobody_holds(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    connection.refresh_api_key(client)
+    held.chmod(0o666)
+
+    with caplog.at_level(logging.DEBUG):
+        for at in (1010.0, 1020.0, 1030.0, 1040.0):
+            clock.at = at
+            connection.refresh_api_key(client)
+
+    said = _warnings(caplog)
+    assert len(said) == 1, f"a refusal that persists was said {len(said)} times: {said}"
+    assert "refused" in said[0] and "no longer held" not in said[0], said[0]
+    assert client.api_key == FIRST
+
+
+def test_a_key_that_COMES_BACK_is_presented_and_the_grace_starts_again(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    connection.refresh_api_key(client)
+    held.unlink()
+    clock.at = 1200.0
+    connection.refresh_api_key(client)                  # past the grace: dropped
+    held.write_text(SECOND)
+    held.chmod(0o600)
+    clock.at = 1210.0
+
+    assert connection.refresh_api_key(client) is True
+    assert client.api_key == SECOND and client.set_to == [None, SECOND], client.set_to
+
+    held.unlink()
+    clock.at = 1300.0                                   # 90 s after the good read: kept
+    connection.refresh_api_key(client)
+    assert client.api_key == SECOND, "the grace did not start again from the last good read"
+
+
+# ── 6. connect() and the refresher never set a stale key over a newer one ──────────────────────
+
+async def test_a_STALE_reread_does_not_overwrite_a_key_connect_handed_over_since(
+        engine, monkeypatch):
+    """The refresher reads the old key, connect() reads and hands over the new one, then the
+    refresher's read lands. The read that STARTED later wins, whatever order they end in."""
+    from beeverforge.adapters.credential_store import registry
+    from beeverforge.adapters.credential_store.registry import Answer
+
+    monkeypatch.setenv("TEMPORAL_API_KEY", FIRST)
+    client = await connection.connect()
+    entered, release = threading.Event(), threading.Event()
+
+    def stale(name, *, quiet=False):
+        entered.set()
+        assert release.wait(5), "the test never released the stale read"
+        return Answer(reference=f"env:{name}", value=FIRST)
+
+    monkeypatch.setattr(registry, "lookup", stale)
+    reader = threading.Thread(target=connection.refresh_api_key, args=(client,))
+    reader.start()
+    assert entered.wait(5)
+    monkeypatch.setenv("TEMPORAL_API_KEY", SECOND)
+    assert await connection.connect() is client
+    assert client.api_key == SECOND
+    release.set()
+    reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert client.api_key == SECOND, (
+        f"the refresher's stale read overwrote the newer key: the client was handed "
+        f"{client.set_to!r}")
