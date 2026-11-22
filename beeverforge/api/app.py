@@ -4471,9 +4471,12 @@ def factory(project: str) -> dict:
     # a project we may describe as armed.
     pickup: bool | None = None
     single_agent, review_mode = True, ""
+    box_image = ""
     try:
         proj = ProjectRegistry().get(project)
         pickup = bool(getattr(proj, "enabled", True))
+        box = getattr(proj, "box", None)
+        box_image = (getattr(box, "image", None) if box else None) or ""
         # ASKED OF THE BOARD, NOT SPELLED HERE (#162). This built
         # `https://github.com/{orgs|users}/{owner}/projects/{n}` by hand, from GitHub Projects v2
         # vocabulary, on the reference surface of a product sold as vendor-agnostic — so an Azure
@@ -4531,6 +4534,8 @@ def factory(project: str) -> dict:
         "single_agent": single_agent,
         "review_mode": review_mode,
         "models": models,  # per-role, resolved through the registry (env → project → default)
+        # what `project set-box-image` wrote; empty = the deployment's default is in force (#569)
+        "box_image": box_image,
         "region": region,
         # THE BOARDS THIS DEPLOYMENT CAN BUILD ON SOMEBODY'S SERVICE, EACH BY ITS ROW'S OWN NAME.
         # The cockpit's how-to spelled three vendors in the page — so an installed add-on's board

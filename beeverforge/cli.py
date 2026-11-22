@@ -294,6 +294,19 @@ def project_set_language(
     typer.echo("  A reply still follows whoever asked: someone who writes in English gets English.")
 
 
+@project_app.command("set-box-image")
+def project_set_box_image(
+    name: str,
+    image: str = typer.Argument(..., help="An image reference — ghcr.io/acme/box:1.2. Empty ('') "
+                                          "clears it back to the deployment's default"),
+) -> None:
+    """Which image this project's box runs — a registry value, changed here instead of by editing
+    YAML inside the worker. The image is checked the way `box prove` checks it before it starts,
+    and a changed one marks the box's proof stale, so the next job or `box prove` proves it."""
+    # A MAPPING ONTO THE `project_set_box_image` ROW (#569): the row validates, writes and marks.
+    _says_the_row(_perform("project_set_box_image", project=name, image=image), name)
+
+
 @project_app.command("set-preview")
 def project_set_preview(
     name: str,

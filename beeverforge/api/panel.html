@@ -4006,6 +4006,10 @@ async function loadCockpit(name){
           for one. It is passed to the harness verbatim (each CLI names models its own way,
           including a Bedrock inference-profile ARN). <b>agent default</b> above means nobody has
           chosen: the harness's own default is in force.</dd>
+        <dt>box image</dt><dd>${f.box_image?`now <code>${esc(f.box_image)}</code>`:"now the deployment's default"}:
+          <code>beeverforge project set-box-image ${esc(name)} &lt;image&gt;</code>
+          — an empty image goes back to the deployment's default. Changing it marks the box's
+          proof stale, so the next job or <code>box prove</code> proves it in the new image.</dd>
         <dt>the agents themselves — prompts, guidelines, TDD</dt>
           <dd>the role prompts are files:
           <code>beeverforge/org_defaults/roles/{executor,planner,sizer,techlead,coordinator,recovery,product}.md</code>.

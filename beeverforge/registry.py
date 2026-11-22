@@ -863,6 +863,29 @@ class ProjectRegistry:
             raw[name]["language"] = wanted
             self._save_raw(raw)
 
+    def set_box_image(self, name: str, image: str) -> bool:
+        """Write this project's `box.image`; an empty `image` clears it back to the deployment's
+        default (#569). True when the file was written, False — and not rewritten — when the
+        image is the one held. The rest of the entry, `box:` included, is kept as it is.
+
+        RAISES `KeyError` for a name not held. What an image may be is `factory.image_refused`'s,
+        asked by the row before this."""
+        wanted = (image or "").strip()
+        with self._locked():
+            raw = self._load_raw()
+            if name not in raw:
+                raise KeyError(name)
+            box = dict(raw[name].get("box") or {})
+            if (box.get("image") or "") == wanted:
+                return False
+            if wanted:
+                box["image"] = wanted
+            else:
+                box.pop("image", None)
+            raw[name]["box"] = box
+            self._save_raw(raw)
+            return True
+
     def set_preview(self, name: str, policy: dict) -> None:
         """Replace one project's preview policy (`Project.preview`). The value is validated as a
         `PreviewPolicy` before it is written, so what lands in the file is what the model reads —
