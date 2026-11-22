@@ -1711,7 +1711,13 @@ async def attention() -> list[dict]:
     on-hold / needs-refinement / paused / awaiting-approval job across projects.
 
     A job whose workflow is not running and whose ticket is closed has nothing left for a person
-    (#651); it is read once per project, bounded, and a read that fails keeps the entry listed."""
+    (#651); it is read once per project, bounded, and a read that fails keeps the entry listed.
+
+    THIS READ WRITES (#652): a job it drops because its ticket is closed gets its ending recorded
+    — one `merged` event and ending row when the ticket's pull request merged, `closed` otherwise —
+    so GET /api/attention is how those endings reach the metrics. The forge reads of the whole pass
+    share one deadline inside this route's bound; a job it cuts off writes nothing and stays
+    listed with a note."""
     # The engine's list, read where it costs no `temporalio` (#178): this route reads the JOURNAL
     # (`list_jobs()` here is this module's own), so it answers on an install without the extra.
     from beeverforge.api import attention as settling
@@ -1723,7 +1729,10 @@ async def attention() -> list[dict]:
     running = await _running_workflows()
     return await asyncio.to_thread(
         settling.settle, held, running=running, closed_refs=_closed_refs_of,
-        timeout=settling.TRACKER_TIMEOUT_S)
+        timeout=settling.TRACKER_TIMEOUT_S,
+        ending=lambda job, within: settling.end_closed(
+            job, project=_project_or_404(str(job.get("project"))), pr_status=_pr_status_of,
+            timeout=min(within, settling.PR_STATUS_TIMEOUT_S)))
 
 
 #: How many running workflows one read of the engine holds. A page this full may have left some out,
@@ -1747,6 +1756,16 @@ async def _running_workflows() -> set[tuple[str, str]] | None:
         return None
     return {(str(r.get("project")), str(r.get("issue")))
             for r in rows if r.get("status") == "running"}
+
+
+def _pr_status_of(project: str, pr_url: str) -> str:
+    """`merged` | `closed` | `open` for `pr_url` on `project`'s forge; RAISES when it cannot say."""
+    from beeverforge.adapters.forge.registry import build_forge
+    from beeverforge.credentials import deployment_forge_token, forge_token_for
+
+    proj = _project_or_404(project)
+    forge = build_forge(proj, token=forge_token_for(proj) or deployment_forge_token(proj))
+    return forge.pr_status(pr=pr_url)
 
 
 def _closed_refs_of(project: str, refs: list[str], timeout: float) -> set[str] | None:

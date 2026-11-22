@@ -579,7 +579,7 @@
     "/api/v1/attention": {
       "get": {
         "summary": "Attention",
-        "description": "Jobs that need a human — the operator's inbox (A5). One place to see every\non-hold / needs-refinement / paused / awaiting-approval job across projects.\n\nA job whose workflow is not running and whose ticket is closed has nothing left for a person\n(#651); it is read once per project, bounded, and a read that fails keeps the entry listed.",
+        "description": "Jobs that need a human — the operator's inbox (A5). One place to see every\non-hold / needs-refinement / paused / awaiting-approval job across projects.\n\nA job whose workflow is not running and whose ticket is closed has nothing left for a person\n(#651); it is read once per project, bounded, and a read that fails keeps the entry listed.\n\nTHIS READ WRITES (#652): a job it drops because its ticket is closed gets its ending recorded\n— one `merged` event and ending row when the ticket's pull request merged, `closed` otherwise —\nso GET /api/attention is how those endings reach the metrics. The forge reads of the whole pass\nshare one deadline inside this route's bound; a job it cuts off writes nothing and stays\nlisted with a note.",
         "operationId": "attention_api_v1_attention_get",
         "responses": {
           "200": {
@@ -598,7 +598,7 @@
     "/api/attention": {
       "get": {
         "summary": "Attention",
-        "description": "Jobs that need a human — the operator's inbox (A5). One place to see every\non-hold / needs-refinement / paused / awaiting-approval job across projects.\n\nA job whose workflow is not running and whose ticket is closed has nothing left for a person\n(#651); it is read once per project, bounded, and a read that fails keeps the entry listed.",
+        "description": "Jobs that need a human — the operator's inbox (A5). One place to see every\non-hold / needs-refinement / paused / awaiting-approval job across projects.\n\nA job whose workflow is not running and whose ticket is closed has nothing left for a person\n(#651); it is read once per project, bounded, and a read that fails keeps the entry listed.\n\nTHIS READ WRITES (#652): a job it drops because its ticket is closed gets its ending recorded\n— one `merged` event and ending row when the ticket's pull request merged, `closed` otherwise —\nso GET /api/attention is how those endings reach the metrics. The forge reads of the whole pass\nshare one deadline inside this route's bound; a job it cuts off writes nothing and stays\nlisted with a note.",
         "operationId": "attention_api_attention_get",
         "responses": {
           "200": {
