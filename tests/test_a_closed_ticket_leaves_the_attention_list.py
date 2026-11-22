@@ -60,3 +60,46 @@ def test_failed_or_unreadable_read_keeps_entry_with_reason():
 def test_unknown_engine_keeps_entries_with_reason():
     out = settle(HELD, running=None, closed_refs=Tracker({"1"}), bounded=_direct)
     assert len(out) == 2 and "workflow" in out[0]["note"]
+
+
+def test_run_bounded_times_out_without_waiting_on_the_worker():
+    import threading
+
+    import pytest
+
+    from beeverforge.api.attention import run_bounded
+
+    gate = threading.Event()
+    try:
+        with pytest.raises(TimeoutError):
+            run_bounded(gate.wait, 0.01)
+    finally:
+        gate.set()
+    assert run_bounded(lambda: 7, 5) == 7
+
+
+def _route(monkeypatch, *, running, closed):
+    import asyncio
+
+    from beeverforge.api import app
+
+    tracker = Tracker(closed)
+
+    async def _running():
+        return running
+
+    monkeypatch.setattr(app, "list_jobs", lambda: HELD + [
+        {"project": "acme", "issue": "3", "state": "running"}])
+    monkeypatch.setattr(app, "_running_workflows", _running)
+    monkeypatch.setattr(app, "_closed_refs_of", tracker)
+    return asyncio.run(app.attention()), tracker
+
+
+def test_route_drops_closed_held_job_and_reads_tracker_once(monkeypatch):
+    out, tracker = _route(monkeypatch, running=set(), closed={"1"})
+    assert [j["issue"] for j in out] == ["2"] and tracker.calls == 1
+
+
+def test_route_lists_everything_when_engine_unreadable(monkeypatch):
+    out, tracker = _route(monkeypatch, running=None, closed={"1", "2"})
+    assert len(out) == 2 and tracker.calls == 0

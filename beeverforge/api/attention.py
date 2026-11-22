@@ -59,16 +59,16 @@ def settle(
         project = key[0]
         if project not in closed:
             try:
-                answer = bounded(partial(closed_refs, project), timeout)
-                closed[project] = (answer if isinstance(answer, set)
+                read = bounded(partial(closed_refs, project), timeout)
+                closed[project] = (read if isinstance(read, set)
                                    else "the tracker could not be read")
             except Exception as exc:  # a failed read is listed with its reason
                 log.info("attention: tracker read for %s failed: %r", project, exc)
                 closed[project] = ("the tracker read timed out" if isinstance(exc, TimeoutError)
                                    else f"the tracker could not be read ({type(exc).__name__})")
-        answer = closed[project]
-        if isinstance(answer, str):
-            kept.append({**job, "note": answer})
-        elif key[1] not in answer:
+        verdict = closed[project]
+        if isinstance(verdict, str):
+            kept.append({**job, "note": verdict})
+        elif key[1] not in verdict:
             kept.append(job)
     return kept
