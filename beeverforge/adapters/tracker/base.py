@@ -857,6 +857,27 @@ def summary_of(tracker, ref: str) -> TicketSummary | None:
     return found if isinstance(found, TicketSummary) else None
 
 
+def closed_among(tracker, refs: list[str], timeout: float) -> set[str] | None:
+    """Which of `refs` are closed, from ONE read of just those tickets' state and within `timeout`
+    seconds; `None` when this row has no such read or it could not be made (#651).
+
+    OFF THE PORT, like `summary_of`. A row without `closed_among` is UNKNOWN, never "all open" and
+    never a whole-board read to find out: the caller keeps the entry and says why. NEVER RAISES."""
+    read = getattr(tracker, "closed_among", None)
+    if not callable(read):
+        return None
+    try:
+        found = read(refs, timeout)
+    except Exception:  # noqa: BLE001 — "could not read" is an answer: nothing is called closed
+        import logging
+
+        logging.getLogger("beeverforge.tracker").info(
+            "the tracker raised reading the state of %d tickets — read as unreadable", len(refs),
+            exc_info=True)
+        return None
+    return found if isinstance(found, set) else None
+
+
 def remove_ticket(tracker, ref: str, reason: str, *, by: str, note: str) -> bool:
     """Remove `ref` the way THIS row removes a card — `True` — or, on a row with no removal of its
     own, close it as NOT delivered with `note` on it — `False`, so the caller can say which.

@@ -37,38 +37,44 @@ def settle(
     jobs: list[dict],
     *,
     running: set[tuple[str, str]] | None,
-    closed_refs: Callable[[str], set[str] | None],
+    closed_refs: Callable[[str, list[str], float], set[str] | None],
     bounded: Callable[[Callable[[], object], float], object] = run_bounded,
     timeout: float = TRACKER_TIMEOUT_S,
 ) -> list[dict]:
     """`jobs` without those whose workflow is not running and whose ticket is closed.
 
     `running` is the `(project, issue)` of every live workflow, or `None` when the engine could not
-    be asked. `closed_refs(project)` answers the refs of that project's closed tickets, `None` when
-    unreadable; it is called at most once per project, through `bounded` (injected so no test waits
-    on a clock)."""
+    be asked. `closed_refs(project, refs, timeout)` answers which of THOSE refs are closed, `None`
+    when unreadable. Only the candidates are ever asked about (a job whose workflow runs is listed
+    without a question), once per project, through `bounded` (injected so no test waits on a
+    clock). The tracker is handed a budget strictly inside `timeout`, so its own call ends before
+    the wait on it does."""
     if running is None:
         return [{**j, "note": "could not tell whether its workflow still runs"} for j in jobs]
+    live = {(str(j.get("project")), str(j.get("issue"))) for j in jobs} & running
+    candidates: dict[str, list[str]] = {}
+    for job in jobs:
+        project, issue = str(job.get("project")), str(job.get("issue"))
+        if (project, issue) not in live:
+            candidates.setdefault(project, []).append(issue)
+    inner = max(timeout / 2, timeout - 1.0)
     closed: dict[str, set[str] | str] = {}
+    for project, refs in candidates.items():
+        try:
+            read = bounded(partial(closed_refs, project, refs, inner), timeout)
+            closed[project] = read if isinstance(read, set) else "the tracker could not be read"
+        except Exception as exc:  # a failed read is listed with its reason
+            log.info("attention: tracker read for %s failed: %r", project, exc)
+            closed[project] = ("the tracker read timed out" if isinstance(exc, TimeoutError)
+                               else f"the tracker could not be read ({type(exc).__name__})")
     kept: list[dict] = []
     for job in jobs:
-        key = (str(job.get("project")), str(job.get("issue")))
-        if key in running:
+        project, issue = str(job.get("project")), str(job.get("issue"))
+        verdict = closed.get(project)
+        if (project, issue) in live or verdict is None:
             kept.append(job)
-            continue
-        project = key[0]
-        if project not in closed:
-            try:
-                read = bounded(partial(closed_refs, project), timeout)
-                closed[project] = (read if isinstance(read, set)
-                                   else "the tracker could not be read")
-            except Exception as exc:  # a failed read is listed with its reason
-                log.info("attention: tracker read for %s failed: %r", project, exc)
-                closed[project] = ("the tracker read timed out" if isinstance(exc, TimeoutError)
-                                   else f"the tracker could not be read ({type(exc).__name__})")
-        verdict = closed[project]
-        if isinstance(verdict, str):
+        elif isinstance(verdict, str):
             kept.append({**job, "note": verdict})
-        elif key[1] not in verdict:
+        elif issue not in verdict:
             kept.append(job)
     return kept

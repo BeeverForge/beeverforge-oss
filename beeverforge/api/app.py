@@ -1722,7 +1722,13 @@ async def attention() -> list[dict]:
         return held
     running = await _running_workflows()
     return await asyncio.to_thread(
-        settling.settle, held, running=running, closed_refs=_closed_refs_of)
+        settling.settle, held, running=running, closed_refs=_closed_refs_of,
+        timeout=settling.TRACKER_TIMEOUT_S)
+
+
+#: How many running workflows one read of the engine holds. A page this full may have left some out,
+#: and a workflow left out would read as "not running" — so a full page is UNKNOWN, not complete.
+_RUNNING_PAGE = 200
 
 
 async def _running_workflows() -> set[tuple[str, str]] | None:
@@ -1730,23 +1736,32 @@ async def _running_workflows() -> set[tuple[str, str]] | None:
     try:
         tv, _addr, ns = _temporal()
         client = await asyncio.wait_for(tv.connect(), timeout=5)
-        rows = await asyncio.wait_for(tv.list_jobs(client, ns), timeout=5)
+        rows = await asyncio.wait_for(
+            tv.list_jobs(client, ns, limit=_RUNNING_PAGE, query='ExecutionStatus = "Running"'),
+            timeout=5)
     except Exception as exc:  # unknown is said on each entry, not hidden
         logging.getLogger("beeverforge.panel").info("attention: engine unreadable: %r", exc)
+        return None
+    if len(rows) >= _RUNNING_PAGE:
+        logging.getLogger("beeverforge.panel").info("attention: a full page of running workflows")
         return None
     return {(str(r.get("project")), str(r.get("issue")))
             for r in rows if r.get("status") == "running"}
 
 
-def _closed_refs_of(project: str) -> set[str] | None:
-    """The refs of a project's closed tickets in ONE bulk read; `None` when unreadable."""
+def _closed_refs_of(project: str, refs: list[str], timeout: float) -> set[str] | None:
+    """Which of `refs` are closed in `project`'s tracker — ONE batched read of those tickets' state
+    (no bodies), ended within `timeout`; `None` when unreadable or the project is not registered."""
+    from beeverforge.adapters.tracker.base import closed_among
     from beeverforge.adapters.tracker.registry import build_tracker
     from beeverforge.credentials import deployment_tracker_token, tracker_token_for
 
-    proj = _project_or_404(project)
+    try:
+        proj = _project_or_404(project)
+    except HTTPException:
+        return None
     token = tracker_token_for(proj) or deployment_tracker_token(proj)
-    tickets = build_tracker(proj, token=token).list_tickets(state="closed")
-    return None if tickets is None else {str(t.ref) for t in tickets}
+    return closed_among(build_tracker(proj, token=token), refs, timeout)
 
 
 def _verdict_of(read: dict, job: dict) -> dict:
