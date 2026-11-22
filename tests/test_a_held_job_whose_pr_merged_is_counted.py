@@ -1,5 +1,6 @@
 """#652 — a held job whose ticket is closed ends as `merged` (counted) or `closed` (not)."""
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -41,7 +42,8 @@ def forge(answer):
 def _pass(answer):
     return settle([JOB], running=set(), closed_refs=lambda *_: {"7"},
                   bounded=lambda fn, _t: fn(),
-                  ending=lambda job: end_closed(job, project=ACME, pr_status=forge(answer)))
+                  ending=lambda job, within: end_closed(job, project=ACME, pr_status=forge(answer),
+                                                        timeout=within))
 
 
 def test_merged_leaves_one_event_naming_the_pr_and_one_row():
@@ -72,14 +74,77 @@ def test_an_unreadable_or_open_pr_writes_nothing(answer):
     assert _journal() == [] and _rows() == []
 
 
-def test_a_job_without_a_pr_writes_nothing():
-    assert end_closed({**JOB, "pr_url": None}, project=ACME, pr_status=forge("merged")) is None
-    assert _journal() == [] and _rows() == []
+def test_a_job_without_a_pr_whose_ticket_is_closed_ends_closed_and_counts_nothing():
+    job = {**JOB, "pr_url": None}
+    asked = []
+
+    def status(project, pr):
+        asked.append(pr)
+        return "merged"
+
+    assert end_closed(job, project=ACME, pr_status=status) == "closed"
+    assert end_closed(job, project=ACME, pr_status=status) is None
+    assert [e["message"] for e in _journal()] == ["closed"] and _rows() == [] and asked == []
+
+
+def test_a_merge_already_journalled_earlier_is_not_journalled_again():
+    _pass("merged")
+    from beeverforge.observability.job_record import record_ending
+    record_ending(ACME, "7", "on_hold", by="the workflow", note="re-held after a resume")
+    end_closed(JOB, project=ACME, pr_status=forge("merged"))
+    assert len([e for e in _journal() if e["message"] == "merged"]) == 1
+    assert len(_rows()) == 1
+
+
+def test_a_merge_for_another_pull_request_is_still_journalled():
+    _pass("merged")
+    other = {**JOB, "pr_url": "https://forge.example/acme/pull/10"}
+    assert end_closed(other, project=ACME, pr_status=forge("merged")) == "merged"
+    assert len([e for e in _journal() if e["message"] == "merged"]) == 2
+
+
+def test_two_threads_ending_one_job_leave_one_merged_line(monkeypatch):
+    from beeverforge.api import attention
+
+    meet = threading.Barrier(2)
+    real = attention._already_ended
+
+    def checked_then_meet(*args):
+        seen = real(*args)
+        try:
+            meet.wait(timeout=0.2)  # both past the check before either appends — if allowed
+        except threading.BrokenBarrierError:
+            pass
+        return seen
+
+    monkeypatch.setattr(attention, "_already_ended", checked_then_meet)
+    threads = [threading.Thread(target=end_closed, args=(JOB,),
+                                kwargs={"project": ACME, "pr_status": forge("merged")})
+               for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len([e for e in _journal() if e["message"] == "merged"]) == 1
+    assert len(_rows()) == 1
+
+
+def test_the_whole_pass_shares_one_deadline_and_cut_off_jobs_stay_listed_with_a_note():
+    jobs = [{**JOB, "issue": str(n)} for n in (7, 8, 9)]
+    now = [0.0]
+    seen = []
+
+    def ending(job, within):
+        seen.append((job["issue"], within))
+        now[0] += 6.0  # each read spends 6 s of the 10 s the pass has
+
+    out = settle(jobs, running=set(), closed_refs=lambda *_: {"7", "8", "9"},
+                 bounded=lambda fn, _t: fn(), timeout=10.0, clock=lambda: now[0], ending=ending)
+    assert seen == [("7", 10.0), ("8", 4.0)]
+    assert [j["issue"] for j in out] == ["9"] and "time" in out[0]["note"]
 
 
 def test_a_failing_ending_never_fails_the_list():
     out = settle([JOB], running=set(), closed_refs=lambda *_: {"7"}, bounded=lambda fn, _t: fn(),
-                 ending=lambda job: 1 / 0)
+                 ending=lambda job, within: 1 / 0)
     assert out == []
 
 
