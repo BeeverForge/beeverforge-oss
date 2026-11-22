@@ -155,9 +155,10 @@ MUTATIONS = [
     # the role reads); the withholding this row cut is gone, and
     # 336b_everybody_reads_everything.py guards the rule that replaced it.
 
+    # re-pinned 2026-11-22: the knowledge source's gaps (ADR-0052 D15) joined the list before it
     ("the manifest does not say what the view left out", MODULE,
-     "                                 gaps=[*gaps, *found_gaps, *_the_view_s_gap(self)])",
-     "                                 gaps=[*gaps, *found_gaps])"),
+     "                                 gaps=[*gaps, *found_gaps, *known_gaps, *_the_view_s_gap(self)])",
+     "                                 gaps=[*gaps, *found_gaps, *known_gaps])"),
 
     ("the index sends a direct distillate to every conversation", SEARCH,
      "               \"(items.kind != 'distillate' OR items.private = 0 OR "

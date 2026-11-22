@@ -42,9 +42,9 @@ is history. The state of the tree is measured, not remembered, and it is this:
   by name.
 - **Every registry consults the loader.** The axes that consult the loader today: `board`,
   `board_setup`, `box`, `box_runner`, `channel`, `ci`, `credential`, `credential_store`,
-  `embed`, `event`, `extract`, `forge`, `harness`, `identity`, `metrics`, `notifier`,
-  `preview`, `role`, `session_store`, `token_pool` and `tracker` — spelled exactly so in the
-  entry-point name.
+  `embed`, `event`, `extract`, `forge`, `harness`, `identity`, `knowledge_source`, `metrics`,
+  `notifier`, `preview`, `role`, `session_store`, `token_pool` and `tracker` — spelled exactly so
+  in the entry-point name.
   `beeverforge/plugins.py::AXES` is the published list;
   `tests/test_a_stranger_can_add_an_adapter.py` DERIVES the registries from
   the tree (every module that asks the loader) and holds the set they ask for equal to it, and
@@ -155,6 +155,17 @@ argument and reads its own settings; one that raises — a vault whose address w
 a store that cannot be built: a reference to it is refused by name, and a reader that walks every
 installed store, as the product's facts and the certify pack do to withhold what they hold, passes
 it over (`tests/test_a_store_that_cannot_be_built_takes_no_reader_down.py`).*
+
+*Since 2026-11-22 a source of knowledge beside the product's own repositories is an axis too, as
+ADR-0052 D15 decided — `knowledge_source.<kind>` returns a `KnowledgeSource` with one method,
+`ask(question)`, which answers the message with each sentence's citations or raises `NotAsked`
+with one sentence saying why. It is born with two: `none`, the default, under which the core is
+what it was before the axis existed
+(`tests/test_the_product_role_reads_beeverforge_knowledge_when_switched_on.py` holds the facts
+pack to it byte for byte), and `beeverforge-knowledge`, a client of BeeverForge Knowledge, an
+optional separate service, over HTTP. What a row answers reaches the product role as one file of
+its facts (ADR-0041), never as a tool it calls; a row that cannot be asked is one line in the
+facts' README, and the answer goes on.*
 
 **The code is small; the commitment is not.** Adopting in-process as *the* extension model
 closes the door on providers written in C# or Go, and on plugging one in without a

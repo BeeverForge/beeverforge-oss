@@ -93,6 +93,10 @@ AXES: tuple[str, ...] = (
     # an add-on reads is a `credential_store.<kind>` row, and every credential the core reads asks
     # it (`adapters/credential_store/registry.py`).
     "credential_store",
+    # ADR-0052 D15: any source of knowledge beside the product's repositories and its context
+    # repository is an add-on — `none` ships, and so does the client of BeeverForge Knowledge, an
+    # optional separate service (`adapters/knowledge_source/registry.py`). Off unless named.
+    "knowledge_source",
 )
 
 #: WHERE THE PLATFORM'S OWN ROWS SHIP, by entry-point name, so a refusal can say which package to

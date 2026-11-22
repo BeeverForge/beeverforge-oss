@@ -177,6 +177,7 @@ that matters:
 | `board_setup` | `builder()` | a `BoardCreator` |
 | `role` | `builder()` | a `RoleSpec` (a value, not a client) |
 | `preview` | `builder()` | a `(PreviewTraits, factory)` row; `factory(**kw)` → a `PreviewRuntime` (§3b) |
+| `knowledge_source` | `builder(project=None)` | a `KnowledgeSource`: `ask(question)` → an `Answered` (each sentence with the labels it cites, and the documents they name), or `NotAsked` with one sentence saying why |
 
 The safe shape is **accept what your axis passes, then `**_kw`** — a keyword the core grows
 later then arrives as ignorable instead of as a `TypeError` on a live path.

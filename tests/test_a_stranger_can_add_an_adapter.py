@@ -373,6 +373,10 @@ PROBES = {
     # #742: a stranger's credential store — a vault of its own, named `acme:<name>`.
     "credential_store": lambda p: __import__("beeverforge.adapters.credential_store.registry",
                                              fromlist=["x"]).build_store("acme"),
+    # ADR-0052 D15: a stranger's source of knowledge beside the product's own repositories.
+    "knowledge_source": lambda p: __import__("beeverforge.adapters.knowledge_source.registry",
+                                             fromlist=["x"]).build_knowledge_source("acme",
+                                                                                    project=p),
 }
 
 

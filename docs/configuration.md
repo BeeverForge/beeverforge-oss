@@ -952,6 +952,30 @@ answers by exact words, metadata and date, and every search says so.
 | `BEEVERFORGE_EMBED_MODEL_SHA256` | *(unset)* | the SHA-256 of `model.safetensors` of a model the platform does not pin, to accept it; an unpinned model is refused otherwise |
 | `BEEVERFORGE_PRODUCT_RETRIEVAL` | *(on)* | `off` turns the retrieval step off — no search before the answer and no `[[BUSCA]]` — so the evaluation battery can measure the answer with it and without it; the front end's search of a product (`/api/v1/product/{project}/search`) then searches nothing and says so in `degraded` |
 
+### A knowledge source beside the product's own (optional, off by default)
+
+Any source of knowledge beside the product's repositories and its context repository is an add-on
+row on the `knowledge_source` axis (ADR-0052 D15). The core ships two rows: `none`, what a
+deployment that says nothing gets — the role reads exactly what it read before the axis existed,
+and nothing is asked of anybody — and `beeverforge-knowledge`, which asks BeeverForge Knowledge, an
+optional separate service, over HTTP. With it on, before each answer the message is asked of the
+service as the role its administrator registered (a service principal and its token), and what it
+answered — each sentence with the labels of the documents it rests on, and each document's title,
+address, identity, version and classification — is `found/knowledge.md` in the role's facts. A
+service that refuses, is rate-limited, has no model, errs, is too slow or cannot be reached is one
+line in the facts' README, and the answer goes on without it. The token is read through the
+credential store when the service is asked, is sent only to the address below and never in clear
+across a network, is never written to a log or a file, and is stripped from what a workload in a
+worktree box can read.
+
+| variable | default | what it sets |
+|---|---|---|
+| `BEEVERFORGE_KNOWLEDGE_SOURCE` | `none` | the row: `none` (off), `beeverforge-knowledge`, or a kind an add-on registers (`knowledge_source.<kind>`) |
+| `BEEVERFORGE_KNOWLEDGE_URL` | *(unset)* | where the service is, `https://…`; plain `http://` only to this machine's loopback |
+| `BEEVERFORGE_KNOWLEDGE_TOKEN` | *(unset)* | the bearer token of the role the service's administrator registered; a credential, read through the credential store (`BEEVERFORGE_CREDENTIAL_STORE`) |
+| `BEEVERFORGE_KNOWLEDGE_PRODUCT` | *(unset)* | the product to ask within, by its name or its id at the service; unset, the role's own scope alone decides what is read |
+| `BEEVERFORGE_KNOWLEDGE_TIMEOUT_SECONDS` | `30` | how long one question may take, from above 0 to 300 seconds; a `429` whose `Retry-After` is at most 5 seconds is waited for and asked once more, never again |
+
 ### Harness
 
 `product` is a fourth axis, beside executor/reviewer/techlead:

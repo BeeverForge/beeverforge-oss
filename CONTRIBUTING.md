@@ -211,7 +211,8 @@ Every axis is an adapter behind a registry, and an add-on plugs in through the
 table at lookup time, a built-in row wins a collision, and an unknown kind still refuses by
 name. The axis names an entry point may use are `beeverforge/plugins.py::AXES` (board,
 board_setup, box, box_runner, channel, ci, credential, credential_store, embed, event, extract,
-forge, harness, identity, metrics, notifier, preview, role, session_store, token_pool, tracker), and
+forge, harness, identity, knowledge_source, metrics, notifier, preview, role, session_store,
+token_pool, tracker), and
 `tests/test_a_stranger_can_add_an_adapter.py` holds that list equal to what the registries ask
 for — see [docs/core/07-extensibility.md](docs/core/07-extensibility.md), including §10's
 ledger of what is core and what is vendor-owned. The core ships GitHub, Azure DevOps and Jira;

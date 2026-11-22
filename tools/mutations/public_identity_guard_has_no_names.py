@@ -223,8 +223,10 @@ MUTATIONS = [
     # loader for is written into it.
     # re-pinned 2026-10-18 (#742): `credential_store` joined the sentence and it reflowed
     ("the document claims an axis the registries do not ask the loader for", DOC,
-     "  `preview`, `role`, `session_store`, `token_pool` and `tracker` — spelled",
-     "  `preview`, `role`, `sandbox`, `session_store`, `token_pool` and `tracker` — spelled",
+     # re-pinned 2026-11-22: `knowledge_source` (ADR-0052 D15) moved the sentence's line breaks
+     "  `notifier`, `preview`, `role`, `session_store`, `token_pool` and `tracker` — spelled",
+     "  `notifier`, `preview`, `role`, `sandbox`, `session_store`, `token_pool` and `tracker` — "
+     "spelled",
      DOCGUARD),
 
     ("the doctrine exclusion grows to swallow the extensibility document", DOCGUARD,

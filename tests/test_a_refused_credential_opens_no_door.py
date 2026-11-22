@@ -668,6 +668,30 @@ def _preview_key(b: Bench, name: str) -> None:
         preview.mint("acme", "1", expires=4_102_444_800)
 
 
+def _knowledge_source(b: Bench, name: str) -> None:
+    """The token BeeverForge Knowledge is asked with (ADR-0052 D15): refused, the service is asked
+    nothing — the variable of the same name is never sent in its place."""
+    import httpx
+
+    from beeverforge.adapters.knowledge_source.base import NotAsked
+    from beeverforge.adapters.knowledge_source.service import KnowledgeService
+
+    b.monkeypatch.setenv(name, FALLBACK)
+    sent: list[httpx.Request] = []
+    row = KnowledgeService(url="https://knowledge.example",
+                           transport=httpx.MockTransport(lambda r: sent.append(r) or
+                                                         httpx.Response(200, json={})))
+    with pytest.raises(NotAsked, match=name):
+        row.ask("What holds today?")
+    assert sent == [], "a refused token's variable was sent in its place"
+
+
+def _knowledge_names() -> tuple[str, ...]:
+    from beeverforge.adapters.knowledge_source.service import TOKEN_ENV
+
+    return (TOKEN_ENV,)
+
+
 def _engine(b: Bench, name: str) -> None:
     from beeverforge.runtime.temporal import connection
 
@@ -1211,6 +1235,8 @@ CONSUMERS = {
                                         _merge_gate),
     "another pass, at either gate": Consumer("beeverforge/product/adjust.py", _gate_names,
                                              _another_pass),
+    "the knowledge source's token": Consumer("beeverforge/adapters/knowledge_source/service.py",
+                                             _knowledge_names, _knowledge_source),
     "certify's panel control": Consumer("beeverforge/certify/controls.py",
                                         lambda: __import__("beeverforge.certify.controls",
                                                            fromlist=["x"])._PANEL_TOKENS,
