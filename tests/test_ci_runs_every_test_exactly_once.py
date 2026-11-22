@@ -360,6 +360,23 @@ def test_the_group_suffix_is_cut_only_where_it_trails_the_last_bracket(nodeid, r
     assert _without_the_group(nodeid) == recorded
 
 
+@pytest.mark.parametrize("nodeid, recorded", [
+    ("a.py::t@docker", "a.py::t"),
+    ("a.py::t[a@b]@together", "a.py::t[a@b]"),
+])
+def test_the_recorder_writes_a_grouped_report_without_its_suffix(tmp_path, nodeid, recorded):
+    """Drives the recorder itself with a fake report: no xdist, no subprocess, so it holds on a
+    pytest that gives no suffix too."""
+    from types import SimpleNamespace
+
+    from tests.conftest import _RecordIds
+
+    path = tmp_path / "ran.txt"
+    _RecordIds(str(path)).pytest_runtest_logreport(SimpleNamespace(when="setup", nodeid=nodeid))
+
+    assert path.read_text(encoding="utf-8").splitlines() == [recorded]
+
+
 def test_ids_written_inside_the_tree_are_refused(probe):
     """A test that scans the tree read the ids file while the run was writing it, and failed on a
     test id that named a maintainer: in one CI slice and not the next.
