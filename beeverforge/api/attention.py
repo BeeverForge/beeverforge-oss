@@ -118,7 +118,8 @@ def _names(data: dict, pr: str) -> bool:
         return data["pr_url"] == pr
     if not pr:
         return False
-    return re.search(rf"(?<![\w/:.-]){re.escape(pr)}(?![\w/-])", str(data.get("reason") or "")) is not None
+    named = rf"(?<![\w/:.-]){re.escape(pr)}(?![\w/-])"
+    return re.search(named, str(data.get("reason") or "")) is not None
 
 
 def _already_ended(project: Project, issue: str, state: str, pr: str = "") -> bool:

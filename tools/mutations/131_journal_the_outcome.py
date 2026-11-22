@@ -29,8 +29,8 @@ MUTATIONS = [
     # `job_record.record_ending`, which the attended driver and a stop write through too
     ("the reason is dropped and only the bare state survives",
      "beeverforge/observability/job_record.py",
-     '        data={"reason": (note or "").strip() or None, "by": by}))\n',
-     '        data={}))\n'),
+     '        data={"reason": (note or "").strip() or None, "by": by,\n',
+     '        data={"by": by,\n'),
 
     ("a journal that will not write takes the job down with it",
      "beeverforge/runtime/temporal/activities.py",
