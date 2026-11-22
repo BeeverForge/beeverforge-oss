@@ -48,9 +48,9 @@ MUTATIONS = [
 
     ("the attention route reads the engine's list through the engine's module again", APP,
      "    from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES\n\n"
-     '    return [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]',
+     '    held = [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]',
      "    from beeverforge.runtime.temporal.view import ATTENTION_STATES\n\n"
-     '    return [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]'),
+     '    held = [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]'),
 
     ("the vocabulary module reaches for the engine's client itself", VOCABULARY,
      "", "\nimport temporalio  # noqa: F401, E402\n"),
