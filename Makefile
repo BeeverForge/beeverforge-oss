@@ -65,7 +65,9 @@ test: ## run the test suite
 # TEST_SHARDS slices. Every job writes the node ids it started to TEST_IDS, the lint job writes
 # the whole collection, and `test-ran-once` fails on a test that is missing, doubled or unknown —
 # so a test added tomorrow cannot fall between two jobs. The same targets run here, one at a time
-# or a slice at a time: `make test-unit TEST_SHARD=2 TEST_SHARDS=3`.
+# or a slice at a time: `make test-unit TEST_SHARD=2 TEST_SHARDS=3`. TEST_JUNIT, when set, is where
+# the unit run writes its JUnit report: the shard-table refresh rebuilds `tests/shard_durations.json`
+# from CI's four.
 INTEGRATION_TESTS := owns_its_engine or slow
 ALONE_TESTS := alone
 # OUTSIDE THE TREE: a test that scans the tree would read the ids while they are written.
@@ -86,7 +88,7 @@ test-collect: ## write the node id of every test the suite collects to TEST_IDS
 	@tail -1 $(TEST_IDS_DIR)/collect.log
 
 test-unit: ## the tests that start no engine and need no Docker, in parallel (TEST_SHARD/TEST_SHARDS: one slice)
-	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15 $(if $(TEST_SHARDS),--shard=$(TEST_SHARD)/$(TEST_SHARDS)) $(if $(TEST_IDS),--record-ids=$(TEST_IDS))
+	python -m pytest -q -n auto -m "not ($(INTEGRATION_TESTS) or $(ALONE_TESTS))" --durations=15 $(if $(TEST_SHARDS),--shard=$(TEST_SHARD)/$(TEST_SHARDS)) $(if $(TEST_IDS),--record-ids=$(TEST_IDS)) $(if $(TEST_JUNIT),--junitxml=$(TEST_JUNIT))
 
 # `--dist loadgroup`: the tests on the real Docker daemon share compose projects, so they carry
 # `xdist_group("docker")` and run on one worker, one after another; the rest spread as before.

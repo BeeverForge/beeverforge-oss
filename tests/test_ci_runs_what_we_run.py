@@ -22,6 +22,7 @@ fails loudly when collection does.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import os
 import re
 import shlex
@@ -31,6 +32,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+
+from tests.the_tree_read_once import parsed
 
 ROOT = Path(__file__).resolve().parent.parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
@@ -464,3 +467,120 @@ def test_the_roots_follow_the_tree_and_the_line_reader_can_SEE_a_target():
     assert ("addons" in roots) == (ROOT / "addons").is_dir()
     assert _ruff_targets("ruff check beeverforge/ tests/ --fix addons") == {"beeverforge", "tests",
                                                                             "addons"}
+
+
+# ── the shard table's refresh ───────────────────────────────────────────────────────────────────
+#
+# #649: the table was built once and never rebuilt, and a per-change check on its staleness failed
+# whichever change added the file that crossed 10%. The share moved to the refresh workflow, which
+# rebuilds the table from CI's four unit reports. So its command must stay the builder's own, with
+# the share, and read exactly the reports CI's unit jobs write. Read from the parsed YAML, never by
+# matching text: a comment that quotes the command must not pass for the command.
+
+REFRESH = ROOT / ".github" / "workflows" / "refresh-shard-durations.yml"
+BUILDER = ROOT / "tests" / "shard_durations.py"
+
+
+def _workflow(path: Path) -> dict:
+    import yaml
+
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if True in loaded:  # YAML 1.1 reads the bare key `on` as true
+        loaded["on"] = loaded.pop(True)
+    return loaded
+
+
+def _steps(workflow: dict) -> list[tuple[str, dict]]:
+    return [(name, step) for name, job in workflow["jobs"].items() for step in job.get("steps", [])]
+
+
+def _documented_refresh() -> list[str]:
+    """The refresh command `tests/shard_durations.py` documents, up to its first placeholder."""
+    doc = ast.get_docstring(parsed(BUILDER)) or ""
+    lines = [line.strip() for line in doc.splitlines()
+             if line.strip().startswith("python -m tests.shard_durations --max-unlisted")]
+    assert len(lines) == 1, f"{BUILDER.name} documents the refresh command {len(lines)} times"
+    words = shlex.split(lines[0])
+    return words[:next(i for i, word in enumerate(words) if word.startswith("<"))]
+
+
+def test_the_refresh_runs_the_builders_command_on_the_four_reports_ci_writes():
+    import yaml
+
+    documented = _documented_refresh()
+    assert documented == ["python", "-m", "tests.shard_durations", "--max-unlisted", "0.1"], documented
+    workflow = _workflow(REFRESH)
+    lines = [line.strip() for _job, step in _steps(workflow)
+             for line in step.get("run", "").splitlines()
+             if re.match(r"\s*(\S+/)?python\S*\s+-m\s+tests\.shard_durations\b", line)]
+    assert len(lines) == 1, lines
+    words = shlex.split(lines[0])
+    assert words[:len(documented)] == documented, (words, documented)
+
+    unit = yaml.safe_load(CI.read_text(encoding="utf-8"))["jobs"]["unit"]
+    env = next(step["env"] for step in unit["steps"] if step.get("run") == "make test-unit")
+    shards = range(1, int(env["TEST_SHARDS"]) + 1)
+    assert list(shards) == unit["strategy"]["matrix"]["shard"]
+    wanted = [Path(env["TEST_JUNIT"]).name.replace("${{ matrix.shard }}", str(n)) for n in shards]
+    reports = words[len(documented):]
+    assert [Path(report).name for report in reports] == wanted, (reports, wanted)
+    folder = {str(Path(report).parent) for report in reports}
+    assert len(folder) == 1, folder
+
+    # the reports are the newest attempt of each unit artifact of the run, picked by the proof's rule
+    upload = next(step for step in unit["steps"]
+                  if str(step.get("uses", "")).startswith("actions/upload-artifact@"))
+    names = [upload["with"]["name"].replace("${{ matrix.shard }}", str(n)) for n in shards]
+    downloads = [step for _job, step in _steps(workflow)
+                 if str(step.get("uses", "")).startswith("actions/download-artifact@")
+                 and step["with"].get("run-id")]
+    assert len(downloads) == 1, downloads
+    pattern = downloads[0]["with"]["pattern"]
+    assert all(fnmatch.fnmatch(name.replace("${{ github.run_attempt }}", "1"), pattern)
+               for name in names), (pattern, names)
+    assert not fnmatch.fnmatch("test-ids-integration-attempt-1", pattern), pattern
+    picks = [line for _job, step in _steps(workflow) for line in step.get("run", "").splitlines()
+             if "--newest-attempts" in line]
+    assert len(picks) == 1, picks
+    pick = shlex.split(picks[0])
+    assert pick[:3] == ["python", "scripts/every_test_ran_once.py", "--newest-attempts"], pick
+    assert pick[4] == folder.pop(), (pick, reports)
+
+
+def test_the_refresh_runs_weekly_and_on_demand_and_only_its_pull_request_job_may_write():
+    workflow = _workflow(REFRESH)
+
+    assert set(workflow["on"]) == {"workflow_dispatch", "schedule"}, workflow["on"]
+    assert [entry.get("cron") for entry in workflow["on"]["schedule"]], workflow["on"]["schedule"]
+    assert workflow["permissions"] == {"contents": "read"}, workflow["permissions"]
+    openers = {job for job, step in _steps(workflow) if "gh pr create" in step.get("run", "")}
+    assert len(openers) == 1, openers
+    for name, job in workflow["jobs"].items():
+        granted = job.get("permissions")
+        assert isinstance(granted, dict), f"{name} inherits instead of naming its permissions"
+        if name in openers:
+            assert granted == {"contents": "write", "pull-requests": "write"}, (name, granted)
+        else:
+            assert set(granted.items()) <= {("contents", "read"), ("actions", "read")}, (name, granted)
+    for job, step in _steps(workflow):
+        assert "${{" not in step.get("run", ""), (
+            f"{job} interpolates an expression into a shell; hand it over in `env:`", step)
+    text = REFRESH.read_text(encoding="utf-8")
+    assert "pull_request_target" not in workflow["on"] and "secrets." not in text
+
+
+def test_the_refresh_opens_a_pull_request_only_when_the_table_changed():
+    workflow = _workflow(REFRESH)
+    (opener,) = {job for job, step in _steps(workflow) if "gh pr create" in step.get("run", "")}
+    job = workflow["jobs"][opener]
+    (rebuild,) = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
+
+    assert job.get("if") == f"needs.{rebuild}.outputs.changed == 'true'", job.get("if")
+    output = workflow["jobs"][rebuild]["outputs"]["changed"]
+    step_id = re.fullmatch(r"\$\{\{ steps\.([\w-]+)\.outputs\.changed \}\}", output)
+    assert step_id, output
+    diff = next(step for step in workflow["jobs"][rebuild]["steps"] if step.get("id") == step_id[1])
+    assert "git diff --quiet -- tests/shard_durations.json" in diff["run"], diff
+    # and the job that opens it asks again, against main as it is by then
+    opens = next(step["run"] for step in job["steps"] if "gh pr create" in step.get("run", ""))
+    assert opens.index("git diff --quiet -- tests/shard_durations.json") < opens.index("gh pr create")

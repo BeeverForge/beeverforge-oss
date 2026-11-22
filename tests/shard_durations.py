@@ -2,6 +2,11 @@
 
     python -m tests.shard_durations <junit.xml> [<junit.xml> ...] [--out PATH]
 
+`.github/workflows/refresh-shard-durations.yml` runs it weekly, on the four unit reports of the
+latest green `main` run, and opens a pull request when the table changed:
+
+    python -m tests.shard_durations --max-unlisted 0.1 <junit.xml> [<junit.xml> ...]
+
 WHAT THE TABLE IS FOR. `--shard=I/N` (`tests/conftest.py`) gives each CI unit job whole test files,
 and balances them by this table: longest first, each to the least-loaded shard. A shard skips
 every file another shard owns before it imports it, so each job collects only its part (#356).
@@ -28,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tomllib
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -57,12 +63,23 @@ def table_from(reports: list[Path], root: Path) -> dict[str, float]:
     return {path: max(round(total, 1), FLOOR) for path, total in sorted(seconds.items())}
 
 
+def test_files(root: Path) -> set[str]:
+    """The test files under `root`'s pytest `testpaths`, as the table keys them."""
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    patterns = config["tool"]["pytest"]["ini_options"]["testpaths"]
+    return {p.relative_to(root).as_posix() for pattern in patterns for top in root.glob(pattern)
+            if top.is_dir() for glob in ("test_*.py", "*_test.py") for p in top.rglob(glob)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m tests.shard_durations",
                                      description="Rebuild the shard duration table from JUnit.")
     parser.add_argument("reports", nargs="+", type=Path, help="JUnit XML of a full unit run")
     parser.add_argument("--out", type=Path, default=TABLE, help=f"where to write (default {TABLE})")
     parser.add_argument("--root", type=Path, default=ROOT, help=argparse.SUPPRESS)
+    parser.add_argument("--max-unlisted", type=float, metavar="SHARE",
+                        help="exit 1, naming them, when more than this share of the tree's test "
+                             "files is not in the rebuilt table")
     args = parser.parse_args(argv)
     table = table_from(args.reports, args.root)
     if not table:
@@ -72,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     args.out.write_text(json.dumps(table, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     print(f"{args.out}: {len(table)} files, {sum(table.values()):.1f} s")
+    if args.max_unlisted is not None:
+        files = test_files(args.root)
+        missing = sorted(files - table.keys())
+        if len(missing) > args.max_unlisted * len(files):
+            print(f"{len(missing)} of {len(files)} test files are not in the rebuilt table, more than "
+                  f"{args.max_unlisted:.0%}:\n  " + "\n  ".join(missing), file=sys.stderr)
+            return 1
     return 0
 
 

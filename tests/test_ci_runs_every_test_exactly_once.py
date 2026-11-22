@@ -257,7 +257,9 @@ def test_the_longest_file_goes_to_the_least_loaded_shard_ties_by_path():
 @pytest.mark.whole_tree
 def test_every_file_of_the_tree_lands_in_one_shard_for_any_n():
     """Every test file of every test root, a file added tomorrow that the table does not list,
-    and a listed file that is gone: each in exactly one shard of 1..N, with the committed table."""
+    and a listed file that is gone: each in exactly one shard of 1..N, with the committed table.
+    How many files the table lists is not asked here: a stale table costs balance, not correctness,
+    so the refresh workflow holds that share (`--max-unlisted`), not each change."""
     from tests.conftest import SHARD_TABLE, _shard_of, _shard_owners, _shard_table
 
     table = _shard_table(SHARD_TABLE)
@@ -271,9 +273,6 @@ def test_every_file_of_the_tree_lands_in_one_shard_for_any_n():
         owners = _shard_owners({**table, "tests/test_gone_since.py": 9.9}, count)
         for key in keys:
             assert _shard_of(key, owners, count) in range(1, count + 1), (key, count)
-    assert sum(key not in table for key in files) < len(files) / 10, (
-        f"{SHARD_TABLE} lists too few of the tree's test files to balance them; rebuild it with "
-        f"`python -m tests.shard_durations <junit.xml>`")
 
 
 @pytest.mark.skipif(importlib.util.find_spec("xdist") is None, reason="pytest-xdist not installed")
@@ -383,6 +382,36 @@ def test_the_table_is_rebuilt_from_a_junit_report(tmp_path):
     assert out.read_text(encoding="utf-8") == json.dumps(
         {"tests/test_a.py": 1.3, "tests/test_b.py": 2.1, "tests/test_c.py": 0.1},
         indent=1, sort_keys=True) + "\n"
+
+
+def test_the_refresh_fails_when_too_many_files_are_unlisted_and_names_them(tmp_path, capsys):
+    """After its own rebuild the refresh counts the tree's test files the table does not list: over
+    the given share it exits 1 naming them, at or under it exits 0. The table is written either way."""
+    from tests.shard_durations import main
+
+    root = tmp_path / "root"
+    (root / "tests").mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8")
+    for name in ("test_a.py", "test_b.py", "test_c.py", "test_d.py", "a_test.py"):
+        (root / "tests" / name).write_text("", encoding="utf-8")
+    report = tmp_path / "run.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest">'
+        '<testcase classname="tests.test_a" name="t" time="1"/>'
+        '<testcase classname="tests.test_b" name="t" time="1"/>'
+        '</testsuite></testsuites>', encoding="utf-8")
+    out = tmp_path / "table.json"
+    args = [str(report), "--out", str(out), "--root", str(root)]
+
+    assert main([*args, "--max-unlisted", "0.6"]) == 0
+    assert main([*args, "--max-unlisted", "0.5"]) == 1
+    said = capsys.readouterr().err
+    for name in ("tests/test_c.py", "tests/test_d.py", "tests/a_test.py"):
+        assert name in said, said
+    assert "tests/test_a.py" not in said, said
+    assert json.loads(out.read_text(encoding="utf-8")) == {"tests/test_a.py": 1.0,
+                                                           "tests/test_b.py": 1.0}
 
 
 # ── 2. the proof ────────────────────────────────────────────────────────────────────────────────
@@ -531,9 +560,34 @@ def test_the_unit_slices_are_the_matrixs_and_each_job_records_what_it_ran():
                             _env_of(jobs[name], command)["TEST_IDS"])
 
 
-def _make_n(target: str) -> str:
-    return subprocess.run(["make", "-n", target], cwd=ROOT, capture_output=True, text=True,
-                          timeout=60).stdout
+def test_the_unit_run_writes_a_junit_report_when_asked_and_not_otherwise():
+    """The shard-table refresh reads CI's four unit reports (`TEST_JUNIT`, beside the test ids).
+    Each case builds its own environment: CI's unit job sets `TEST_JUNIT` for this very process."""
+    unset = {key: value for key, value in os.environ.items() if key != "TEST_JUNIT"}
+    assert "--junitxml=/tmp/unit-1.xml" in _make_n(
+        "test-unit", env={**unset, "TEST_JUNIT": "/tmp/unit-1.xml"})
+    assert "--junitxml" not in _make_n("test-unit", env=unset)
+
+
+def test_each_unit_job_writes_its_junit_report_into_the_artifact_it_uploads():
+    """CI's side of the hook: each unit shard sets `TEST_JUNIT` to a file of its own inside the
+    directory it uploads with its test ids, so the report travels in that artifact, kept as long."""
+    unit = _jobs()["unit"]
+    junit = _env_of(unit, "make test-unit").get("TEST_JUNIT", "")
+    uploads = [step for step in unit["steps"]
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+
+    assert junit.endswith(".xml") and "${{ matrix.shard }}" in junit, junit
+    assert not Path(junit).name.startswith("ran-"), "the proof would read the report as test ids"
+    assert len(uploads) == 1, uploads
+    folder = uploads[0]["with"]["path"].rstrip("/")
+    assert str(Path(junit).parent) == folder, (junit, folder)
+    assert uploads[0].get("if") == "always()", uploads[0]
+
+
+def _make_n(target: str, env: dict[str, str] | None = None) -> str:
+    return subprocess.run(["make", "-n", *target.split()], cwd=ROOT, capture_output=True, text=True,
+                          timeout=60, env=env).stdout
 
 
 def test_the_unit_integration_and_alone_runs_split_the_suite_without_overlap():
