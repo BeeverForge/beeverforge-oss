@@ -556,6 +556,8 @@ class _Presented:
     good_at: float
     settled: int = 0
     said: tuple[str, str] | None = None
+    #: the grace of the lapse in progress, read once when it began (`_settle`); None between
+    grace: float | None = None
 
 
 #: The one client's `_Presented`, ONE ENTRY IN TOTAL, as `_HELD` is: a client seen for the first
@@ -598,6 +600,8 @@ def _settle(client: Client, read: int, value: str | None, refused: str = "") -> 
     within a bounded time, rather than for as long as the process lives (a key that is not a
     token never expires on the server). It fails closed: the server then refuses the calls.
 
+    THE GRACE IS READ ONCE, when the lapse begins, and kept until a read answers a key again.
+
     SAID ONCE PER CHANGE OF STATE, by name, never by value: a refusal (the store will not hand it
     over, perhaps for a moment) apart from a key nobody holds any more, and each apart from the
     key being let go of. A refusal that persists is one line, not one per interval."""
@@ -611,6 +615,7 @@ def _settle(client: Client, read: int, value: str | None, refused: str = "") -> 
         now = _now()
         if value:
             state.good_at = now
+            state.grace = None
             if state.said is not None:
                 log.info("the engine credential TEMPORAL_API_KEY is answered by its store again")
                 state.said = None
@@ -621,7 +626,11 @@ def _settle(client: Client, read: int, value: str | None, refused: str = "") -> 
                      "engine client presents the new one from its next call, without "
                      "reconnecting")
             return True
-        ttl = _stored_token_ttl()
+        # READ ONCE PER LAPSE (re-review of #657): asked at every read, an unreadable setting was
+        # said at every interval for as long as the store stayed silent.
+        if state.grace is None:
+            state.grace = _stored_token_ttl()
+        ttl = state.grace
         why = "refused" if refused else "gone"
         if now - state.good_at < ttl:
             phase = "kept"
