@@ -300,7 +300,7 @@ def test_under_xdist_each_started_test_is_written_once(probe):
     under `--dist loadgroup`, as CI's integration job runs, xdist suffixes a grouped test's id
     with `@<group>`, which the collection does not carry."""
     path = probe.out / "ran-xdist.txt"
-    done = probe("-n", "2", "--dist", "loadgroup", f"--record-ids={path}")
+    done = probe("-n", "2", "--dist", "loadgroup", "-vv", f"--record-ids={path}")
     assert done.returncode == 0, done.stdout[-1500:]
     alone = probe.out / "ran-alone.txt"
     assert probe(f"--record-ids={alone}").returncode == 0
@@ -308,6 +308,73 @@ def test_under_xdist_each_started_test_is_written_once(probe):
     assert sorted(_ids(path)) == sorted(_ids(alone)), "xdist and one process ran different tests"
     assert any("test_grouped[a@b]" in nodeid for nodeid in _ids(path)), "the grouped test ran nowhere"
     assert len(_ids(path)) == len(set(_ids(path))), "a test was written twice under xdist"
+    if "]@together" not in done.stdout:
+        pytest.skip("the installed pytest and pytest-xdist put no `@<group>` suffix on a grouped "
+                    "test's id, so the suffix rule was not exercised by this run; "
+                    "`test_the_group_suffix_is_cut_only_where_it_trails_the_last_bracket` pins it")
+
+
+GROUPED_WORKERS = textwrap.dedent("""\
+    import os
+
+    import pytest
+
+
+    @pytest.mark.xdist_group("together")
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_grouped(n):
+        with open(os.environ["PROBE_WORKERS"], "a", encoding="utf-8") as log:
+            log.write(os.environ["PYTEST_XDIST_WORKER"] + "\\n")
+""")
+
+
+@pytest.mark.skipif(importlib.util.find_spec("xdist") is None, reason="pytest-xdist not installed")
+def test_two_tests_of_one_xdist_group_run_on_one_worker(tmp_path_factory):
+    """`--dist loadgroup` is what keeps the real-daemon tests off each other's compose projects.
+    pytest 9.2.0 stopped handing xdist the group, and the tests spread over both workers."""
+    where = tmp_path_factory.mktemp("group-workers")
+    assert ROOT not in where.resolve().parents, "the probe is inside the tree under test"
+    (where / "test_grouped.py").write_text(GROUPED_WORKERS, encoding="utf-8")
+    workers = tmp_path_factory.mktemp("group-workers-out") / "workers.txt"
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", str(where), "-c", str(ROOT / "pyproject.toml"), "-q",
+         "-p", "no:cacheprovider", "-p", "no:randomly", "--no-header", f"--rootdir={where}",
+         "-n", "2", "--dist", "loadgroup"],
+        capture_output=True, text=True, cwd=str(ROOT), timeout=300,
+        env={**os.environ, "PROBE_WORKERS": str(workers)})
+    assert done.returncode == 0, done.stdout[-1500:]
+
+    assert len(_ids(workers)) == 2, _ids(workers)
+    assert len(set(_ids(workers))) == 1, f"one group ran on {sorted(set(_ids(workers)))}"
+
+
+@pytest.mark.parametrize("nodeid, recorded", [
+    ("a.py::t@docker", "a.py::t"),
+    ("a.py::t[a@b]@together", "a.py::t[a@b]"),
+    ("a.py::t[a@b]", "a.py::t[a@b]"),
+    ("a.py::t", "a.py::t"),
+])
+def test_the_group_suffix_is_cut_only_where_it_trails_the_last_bracket(nodeid, recorded):
+    from tests.conftest import _without_the_group
+
+    assert _without_the_group(nodeid) == recorded
+
+
+@pytest.mark.parametrize("nodeid, recorded", [
+    ("a.py::t@docker", "a.py::t"),
+    ("a.py::t[a@b]@together", "a.py::t[a@b]"),
+])
+def test_the_recorder_writes_a_grouped_report_without_its_suffix(tmp_path, nodeid, recorded):
+    """Drives the recorder itself with a fake report: no xdist, no subprocess, so it holds on a
+    pytest that gives no suffix too."""
+    from types import SimpleNamespace
+
+    from tests.conftest import _RecordIds
+
+    path = tmp_path / "ran.txt"
+    _RecordIds(str(path)).pytest_runtest_logreport(SimpleNamespace(when="setup", nodeid=nodeid))
+
+    assert path.read_text(encoding="utf-8").splitlines() == [recorded]
 
 
 def test_ids_written_inside_the_tree_are_refused(probe):

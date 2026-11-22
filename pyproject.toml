@@ -109,7 +109,8 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "bandit>=1.7",
-    "pytest>=8.2",
+    # Bounded below 9.2 like constraints.txt, which has the cause and the remedy.
+    "pytest>=8.2,<9.2",
     "pytest-asyncio>=0.23",
     "types-pyyaml",
     # `dev` means "able to run the SUITE" — THIS tree's suite. No vendor SDK here (2026-08-26):

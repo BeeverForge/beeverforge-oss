@@ -5,3 +5,10 @@
 # `make install`, then `python -m beeverforge.api.openapi`.
 fastapi==0.143.3
 pydantic==2.14.1
+
+# pytest 9.2 no longer hands pytest-xdist a test's `xdist_group`, so `--dist loadgroup` spreads a
+# group over every worker (the real-daemon tests then share compose projects) and ids carry no
+# `@<group>` suffix. Cause: pytest 9.2.0 with pytest-xdist 3.8.0. Remedy: lift this pin once a
+# pytest-xdist release groups correctly on 9.2; `test_two_tests_of_one_xdist_group_run_on_one_worker`
+# goes green on it.
+pytest<9.2

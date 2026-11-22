@@ -127,7 +127,7 @@ get faster on its own buys an empty directory.
 
 Host tools (the orchestrator shells out to these):
 
-- **Python ≥ 3.12** (the platform itself; `pip install -e '.[dev]'`).
+- **Python ≥ 3.12** (the platform itself; `make install`).
 - **git** — worktrees, clones, push.
 - **Docker** — only for `--sandbox container` (the production path).
 - **`gh`** — the GitHub CLI, authenticated (`gh auth login` or `GH_TOKEN`). This is
