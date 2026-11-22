@@ -566,6 +566,22 @@ def test_the_unit_run_writes_a_junit_report_when_asked_and_not_otherwise():
     assert "--junitxml" not in _make_n("test-unit")
 
 
+def test_each_unit_job_writes_its_junit_report_into_the_artifact_it_uploads():
+    """CI's side of the hook: each unit shard sets `TEST_JUNIT` to a file of its own inside the
+    directory it uploads with its test ids, so the report travels in that artifact, kept as long."""
+    unit = _jobs()["unit"]
+    junit = _env_of(unit, "make test-unit").get("TEST_JUNIT", "")
+    uploads = [step for step in unit["steps"]
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+
+    assert junit.endswith(".xml") and "${{ matrix.shard }}" in junit, junit
+    assert not Path(junit).name.startswith("ran-"), "the proof would read the report as test ids"
+    assert len(uploads) == 1, uploads
+    folder = uploads[0]["with"]["path"].rstrip("/")
+    assert str(Path(junit).parent) == folder, (junit, folder)
+    assert uploads[0].get("if") == "always()", uploads[0]
+
+
 def _make_n(target: str) -> str:
     return subprocess.run(["make", "-n", *target.split()], cwd=ROOT, capture_output=True, text=True,
                           timeout=60).stdout
