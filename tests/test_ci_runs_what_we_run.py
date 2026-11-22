@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.the_tree_read_once import parsed
+
 ROOT = Path(__file__).resolve().parent.parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -494,7 +496,7 @@ def _steps(workflow: dict) -> list[tuple[str, dict]]:
 
 def _documented_refresh() -> list[str]:
     """The refresh command `tests/shard_durations.py` documents, up to its first placeholder."""
-    doc = ast.get_docstring(ast.parse(BUILDER.read_text(encoding="utf-8"))) or ""
+    doc = ast.get_docstring(parsed(BUILDER)) or ""
     lines = [line.strip() for line in doc.splitlines()
              if line.strip().startswith("python -m tests.shard_durations --max-unlisted")]
     assert len(lines) == 1, f"{BUILDER.name} documents the refresh command {len(lines)} times"

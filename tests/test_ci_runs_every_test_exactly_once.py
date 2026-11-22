@@ -561,9 +561,12 @@ def test_the_unit_slices_are_the_matrixs_and_each_job_records_what_it_ran():
 
 
 def test_the_unit_run_writes_a_junit_report_when_asked_and_not_otherwise():
-    """The shard-table refresh reads CI's four unit reports (`TEST_JUNIT`, beside the test ids)."""
-    assert "--junitxml=/tmp/unit-1.xml" in _make_n("test-unit TEST_JUNIT=/tmp/unit-1.xml")
-    assert "--junitxml" not in _make_n("test-unit")
+    """The shard-table refresh reads CI's four unit reports (`TEST_JUNIT`, beside the test ids).
+    Each case builds its own environment: CI's unit job sets `TEST_JUNIT` for this very process."""
+    unset = {key: value for key, value in os.environ.items() if key != "TEST_JUNIT"}
+    assert "--junitxml=/tmp/unit-1.xml" in _make_n(
+        "test-unit", env={**unset, "TEST_JUNIT": "/tmp/unit-1.xml"})
+    assert "--junitxml" not in _make_n("test-unit", env=unset)
 
 
 def test_each_unit_job_writes_its_junit_report_into_the_artifact_it_uploads():
@@ -582,9 +585,9 @@ def test_each_unit_job_writes_its_junit_report_into_the_artifact_it_uploads():
     assert uploads[0].get("if") == "always()", uploads[0]
 
 
-def _make_n(target: str) -> str:
+def _make_n(target: str, env: dict[str, str] | None = None) -> str:
     return subprocess.run(["make", "-n", *target.split()], cwd=ROOT, capture_output=True, text=True,
-                          timeout=60).stdout
+                          timeout=60, env=env).stdout
 
 
 def test_the_unit_integration_and_alone_runs_split_the_suite_without_overlap():
