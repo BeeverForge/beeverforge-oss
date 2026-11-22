@@ -113,9 +113,9 @@ MUTATIONS = [
     # `temporalio`, instead of from `view`, which does. The cut is the same one.
     ("the web layer keeps its own set of attention states again", APP,
      "    from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES\n\n"
-     '    return [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]',
+     '    held = [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]',
      '    _ATTENTION = {"on_hold", "needs_refinement", "paused", "blocked", "failed"}\n'
-     '    return [j for j in list_jobs() if j.get("state") in _ATTENTION]'),
+     '    held = [j for j in list_jobs() if j.get("state") in _ATTENTION]'),
 
     ("the wire shape is generated, so a private field widens somebody else's payload", LADDER,
      '        return {"scope": self.scope, "word": self.word,',

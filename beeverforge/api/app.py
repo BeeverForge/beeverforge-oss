@@ -1706,14 +1706,62 @@ class JournalUnreadable(RuntimeError):
 
 
 @_read("/api/attention", read_models.JournalJobs)
-def attention() -> list[dict]:
+async def attention() -> list[dict]:
     """Jobs that need a human — the operator's inbox (A5). One place to see every
-    on-hold / needs-refinement / paused / awaiting-approval job across projects."""
+    on-hold / needs-refinement / paused / awaiting-approval job across projects.
+
+    A job whose workflow is not running and whose ticket is closed has nothing left for a person
+    (#651); it is read once per project, bounded, and a read that fails keeps the entry listed."""
     # The engine's list, read where it costs no `temporalio` (#178): this route reads the JOURNAL
     # (`list_jobs()` here is this module's own), so it answers on an install without the extra.
+    from beeverforge.api import attention as settling
     from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES
 
-    return [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]
+    held = [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]
+    if not held:
+        return held
+    running = await _running_workflows()
+    return await asyncio.to_thread(
+        settling.settle, held, running=running, closed_refs=_closed_refs_of,
+        timeout=settling.TRACKER_TIMEOUT_S)
+
+
+#: How many running workflows one read of the engine holds. A page this full may have left some out,
+#: and a workflow left out would read as "not running" — so a full page is UNKNOWN, not complete.
+_RUNNING_PAGE = 200
+
+
+async def _running_workflows() -> set[tuple[str, str]] | None:
+    """`(project, issue)` of every live workflow, `None` when the engine could not be asked."""
+    try:
+        tv, _addr, ns = _temporal()
+        client = await asyncio.wait_for(tv.connect(), timeout=5)
+        rows = await asyncio.wait_for(
+            tv.list_jobs(client, ns, limit=_RUNNING_PAGE, query='ExecutionStatus = "Running"'),
+            timeout=5)
+    except Exception as exc:  # unknown is said on each entry, not hidden
+        logging.getLogger("beeverforge.panel").info("attention: engine unreadable: %r", exc)
+        return None
+    if len(rows) >= _RUNNING_PAGE:
+        logging.getLogger("beeverforge.panel").info("attention: a full page of running workflows")
+        return None
+    return {(str(r.get("project")), str(r.get("issue")))
+            for r in rows if r.get("status") == "running"}
+
+
+def _closed_refs_of(project: str, refs: list[str], timeout: float) -> set[str] | None:
+    """Which of `refs` are closed in `project`'s tracker — ONE batched read of those tickets' state
+    (no bodies), ended within `timeout`; `None` when unreadable or the project is not registered."""
+    from beeverforge.adapters.tracker.base import closed_among
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+    try:
+        proj = _project_or_404(project)
+    except HTTPException:
+        return None
+    token = tracker_token_for(proj) or deployment_tracker_token(proj)
+    return closed_among(build_tracker(proj, token=token), refs, timeout)
 
 
 def _verdict_of(read: dict, job: dict) -> dict:

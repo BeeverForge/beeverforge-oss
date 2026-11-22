@@ -125,7 +125,7 @@ class GitHubIssuesTracker(TrackerAdapter):
 
     _RATE_MARKERS = ("rate limit", "abuse detection", "submitted too quickly", "retry your request")
 
-    def _gh(self, args: list[str], timeout: int = 60, *,
+    def _gh(self, args: list[str], timeout: float = 60, *,
             stdin: str | None = None) -> subprocess.CompletedProcess[str]:
         # A LONG TEXT GOES ON STDIN (`stdin=`, with `--body-file -`), never as one argv element:
         # Linux refuses an element of 131,072 bytes or more (MAX_ARG_STRLEN, the terminating NUL
@@ -466,6 +466,34 @@ class GitHubIssuesTracker(TrackerAdapter):
             # a 200 without the field is a shape this adapter does not know — never an open card
             return None
         return _summary(row, ref=qualify_ref(repo, row.get("number") or num, self.repo))
+
+    def closed_among(self, refs: list[str], timeout: float) -> set[str] | None:
+        """Which of `refs` (plain issue numbers of THIS repository) are closed — one GraphQL call
+        asking for the `state` of each and nothing else, no bodies — or `None` when it could not be
+        read (#651). A ref that is not a plain number (a qualified one, anything else) is not asked
+        and so is not called closed. `timeout` bounds the call itself."""
+        numbers = [r for r in dict.fromkeys(str(r) for r in refs) if r.isascii() and r.isdigit()]
+        if not numbers:
+            return set()
+        owner, _, name = self.repo.partition("/")
+        fields = " ".join(f"i{n}: issue(number: {int(n)}) {{ state }}" for n in numbers)
+        query = ("query($owner: String!, $name: String!) "
+                 f"{{ repository(owner: $owner, name: $name) {{ {fields} }} }}")
+        p = self._gh(["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+                      "-f", f"name={name}"], timeout=timeout)
+        if p.returncode != 0:
+            log.warning("could not read the state of %d tickets of %s (%s)", len(numbers),
+                        self.repo, (p.stderr or "")[-200:])
+            return None
+        try:
+            found = ((json.loads(p.stdout or "{}") or {}).get("data") or {}).get("repository")
+        except ValueError:
+            log.warning("gh answered unparseable JSON reading ticket states of %s", self.repo)
+            return None
+        if not isinstance(found, dict):
+            return None
+        return {n for n in numbers
+                if str((found.get(f"i{int(n)}") or {}).get("state", "")).upper() == "CLOSED"}
 
     def ticket_url(self, ref: str) -> str:
         """The web URL for this issue, honouring the ref's own repository (C-18) and the host.
