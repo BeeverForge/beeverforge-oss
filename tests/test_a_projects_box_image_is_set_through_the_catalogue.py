@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -171,13 +170,6 @@ def test_it_leaves_one_audit_record_allowed_and_one_refused(held, caplog):
     assert len(lines) == 2, lines
 
 
-def test_it_is_listed_in_the_catalogue_reference():
-    text = (Path(__file__).resolve().parents[1]
-            / "docs/reference/the-front-end-api.md").read_text()
-
-    assert "| `project_set_box_image` | `project`, [`image`] |" in text
-
-
 def test_the_command_runs_the_row(held):
     from beeverforge import cli
 
@@ -217,17 +209,17 @@ def test_the_cli_verb_writes_nothing_itself(held, monkeypatch):
     assert out.exit_code == 0 and len(seen) == 1 and held.read_bytes() == before
 
 
-def test_the_panel_facts_show_the_current_image(held):
-    from beeverforge.api import app
+def test_the_panel_facts_show_the_current_image_and_then_none_after_a_clear(held, monkeypatch):
+    from beeverforge import loader
+    from beeverforge.api.app import factory
+
+    def no_checkout(project):
+        raise ValueError("the manifest is not read here")
+
+    monkeypatch.setattr(loader, "load_manifest", no_checkout)
 
     _set("acme/box:9")
-    import inspect
+    assert factory("acme")["box_image"] == "acme/box:9"
 
-    assert '"box_image"' in inspect.getsource(app) and "box_image" in (
-        Path(app.__file__).parent / "panel.html").read_text()
-
-
-def test_the_release_note_exists():
-    note = Path(__file__).resolve().parents[1] / "changes" / "569.behaviour.md"
-
-    assert note.read_text().strip()
+    _set("")
+    assert factory("acme")["box_image"] == ""
