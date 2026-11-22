@@ -115,17 +115,30 @@ def _already_ended(project: Project, issue: str, state: str) -> bool:
     return False
 
 
-def end_closed(job: dict, *, project: Project, pr_status: Callable[[str, str], str]) -> str | None:
+#: The budget for one forge read of a pull request's state; a slower forge is unknown.
+PR_STATUS_TIMEOUT_S = 5.0
+
+
+def end_closed(
+    job: dict,
+    *,
+    project: Project,
+    pr_status: Callable[[str, str], str],
+    bounded: Callable[[Callable[[], object], float], object] = run_bounded,
+    timeout: float = PR_STATUS_TIMEOUT_S,
+) -> str | None:
     """Write how a held job whose ticket is closed ENDED (#652); the state written, else `None`.
 
     `project` is the registered project the job belongs to. `pr_status(project, pr_url)` is the
     forge's word: `merged`, `closed` or `open`, and it RAISES
     when it cannot say. A merged pull request journals ONE `merged` ending naming it, and the
     ending row throughput counts; a pull request closed without a merge journals `closed` and no
-    row. UNKNOWN WRITES NOTHING: a failed read, an open pull request, or a job with no pull request
-    to ask about is retried by the next pass. The row is written first and keyed, and the journal
-    line second, so a pass that stops between them is finished by the next; once the line is
-    written the job is no longer held, so a second pass finds nothing to end."""
+    row. UNKNOWN WRITES NOTHING: a failed or timed-out read (bounded by `timeout`), an open pull
+    request, or a job with no pull request to ask about (it stays listed, by design: there is
+    nothing to tell a merge from a plain close) is retried by the next pass.
+    The row is written first and keyed, and the journal line second, so a pass that stops
+    between them is finished by the next; once the line is written the job is no longer held, so a
+    second pass finds nothing to end."""
     from beeverforge.observability.job_record import (
         BY_THE_PLATFORM,
         record_ending,
@@ -136,7 +149,7 @@ def end_closed(job: dict, *, project: Project, pr_status: Callable[[str, str], s
     if not pr:
         return None
     try:
-        status = pr_status(name, str(pr))
+        status = bounded(partial(pr_status, name, str(pr)), timeout)
     except Exception as exc:  # unknown is not absence: nothing is written
         log.info("attention: pull request of %s#%s unreadable: %r", name, issue, exc)
         return None

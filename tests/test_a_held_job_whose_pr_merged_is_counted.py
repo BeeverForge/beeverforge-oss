@@ -81,3 +81,29 @@ def test_a_failing_ending_never_fails_the_list():
     out = settle([JOB], running=set(), closed_refs=lambda *_: {"7"}, bounded=lambda fn, _t: fn(),
                  ending=lambda job: 1 / 0)
     assert out == []
+
+
+def test_a_forge_that_does_not_answer_in_time_writes_nothing():
+    def too_slow(fn, timeout):
+        raise TimeoutError
+
+    assert end_closed(JOB, project=ACME, pr_status=forge("merged"), bounded=too_slow) is None
+    assert _journal() == [] and _rows() == []
+
+
+def test_the_real_forge_wiring_asks_the_forge_for_the_pr(monkeypatch):
+    from beeverforge.api import app
+
+    asked = {}
+
+    class Forge:
+        def pr_status(self, *, pr, repo=""):
+            asked["pr"] = pr
+            return "merged"
+
+    monkeypatch.setattr(app, "_project_or_404", lambda name: ACME)
+    monkeypatch.setattr("beeverforge.adapters.forge.registry.build_forge",
+                        lambda proj, token=None: Forge())
+    monkeypatch.setattr("beeverforge.credentials.forge_token_for", lambda proj: "t")
+    assert app._pr_status_of("acme", PR) == "merged"
+    assert asked == {"pr": PR}
