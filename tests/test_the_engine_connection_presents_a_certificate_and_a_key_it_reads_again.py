@@ -522,3 +522,24 @@ async def test_a_STALE_reread_does_not_overwrite_a_key_connect_handed_over_since
     assert client.api_key == SECOND, (
         f"the refresher's stale read overwrote the newer key: the client was handed "
         f"{client.set_to!r}")
+
+
+def test_an_INVALID_grace_is_said_once_per_lapse_not_at_every_read(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    """The grace is read once when a lapse begins and kept for it: an unreadable
+    `BEEVERFORGE_STORED_TOKEN_TTL` is said once, not at every interval (re-review of #657)."""
+    monkeypatch.setenv("BEEVERFORGE_STORED_TOKEN_TTL", "soon")
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    connection.refresh_api_key(client)
+    held.unlink()
+
+    with caplog.at_level(logging.DEBUG):
+        for at in (1010.0, 1020.0, 1030.0, 5000.0, 5010.0):   # inside the hour, then past it
+            clock.at = at
+            connection.refresh_api_key(client)
+
+    about_the_grace = [m for m in _warnings(caplog) if "is not a number of seconds" in m]
+    assert len(about_the_grace) == 1, (
+        f"the unreadable grace was said {len(about_the_grace)} times in one lapse")
+    assert client.set_to == [None], "the hour the unreadable setting falls back to was not used"

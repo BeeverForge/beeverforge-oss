@@ -210,8 +210,12 @@ def _cannot(reason: str) -> None:
 def _pulled(image: str) -> None:
     """`image` on this machine, pulled in a step of its own and bounded by `PULL_WITHIN_S`, so a
     slow registry is said as itself and never as an engine that did not start."""
-    if subprocess.run(["docker", "image", "inspect", image], capture_output=True,
-                      timeout=60).returncode == 0:
+    try:
+        held = subprocess.run(["docker", "image", "inspect", image], capture_output=True,
+                              timeout=60).returncode == 0
+    except subprocess.TimeoutExpired:
+        _cannot(f"the Docker daemon did not say within 60s whether it holds {image}")
+    if held:
         return
     try:
         done = subprocess.run(["docker", "pull", image], capture_output=True, text=True,
@@ -410,6 +414,11 @@ async def test_a_certificate_WITHOUT_a_token_is_refused_by_the_authorizer(deploy
 
 
 async def test_a_token_WITHOUT_a_certificate_is_refused_at_the_handshake(deployed, monkeypatch):
+    """The same address, the same CA and the same token answer WITH the certificate, first — so
+    what fails after is the server's demand for one, and nothing else about the connection."""
+    client = await connection.connect(within=20)
+    await client.workflow_service.describe_namespace(DescribeNamespaceRequest(namespace=NAMESPACE))
+    connection.forget()
     monkeypatch.delenv("TEMPORAL_TLS_CERT")
     monkeypatch.delenv("TEMPORAL_TLS_KEY")
 
@@ -425,9 +434,37 @@ async def test_a_token_WITHOUT_a_certificate_is_refused_at_the_handshake(deploye
     # ("hyper::Error(Canceled, \"connection closed\")") — 1 run in 3 under load.
     said = str(refused.value)
     assert "Transport" in said, said
-    assert "InvalidCertificate" not in said and "UnknownIssuer" not in said, (
-        f"the client refused the server's certificate, so the server's demand for one was never "
-        f"tested: {said}")
+    for elsewhere in ("InvalidCertificate", "UnknownIssuer", "Connection refused", "dns",
+                      "resolve", "No such host"):
+        assert elsewhere not in said, (
+            f"the connection failed for a reason other than the missing certificate "
+            f"({elsewhere!r}): {said}")
+
+
+async def test_a_key_GONE_past_its_grace_is_dropped_and_the_server_refuses_the_held_client(
+        deployed, monkeypatch):
+    """Fail closed against the real SDK: past `BEEVERFORGE_STORED_TOKEN_TTL` the held client is
+    handed `api_key = None` (temporalio's setter takes `str | None`), and the server refuses what
+    it calls next — the call that answered a moment before."""
+    monkeypatch.setenv("BEEVERFORGE_STORED_TOKEN_TTL", "100")
+    now = [1000.0]
+    monkeypatch.setattr(connection, "_now", lambda: now[0])
+    client = await connection.connect(within=20)
+    ask = DescribeNamespaceRequest(namespace=NAMESPACE)
+    await client.workflow_service.describe_namespace(ask)
+
+    deployed.unlink()
+    now[0] = 1050.0
+    assert connection.refresh_api_key(client) is False
+    assert client.api_key, "the key was dropped inside its grace"
+    await client.workflow_service.describe_namespace(ask)
+    now[0] = 1101.0
+    connection.refresh_api_key(client)
+
+    assert client.api_key is None
+    with pytest.raises(RPCError) as refused:
+        await client.workflow_service.describe_namespace(ask)
+    assert refused.value.status == RPCStatusCode.PERMISSION_DENIED, refused.value
 
 
 async def test_a_token_ROTATED_IN_PLACE_keeps_the_worker_polling(deployed, engine):
