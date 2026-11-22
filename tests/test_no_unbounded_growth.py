@@ -238,6 +238,9 @@ _CACHES = {
     # #657 — the refresher of the one client `_HELD` holds
     ("beeverforge/runtime/temporal/connection.py", "_REFRESHING"):
         "one entry in total, beside `_HELD`'s: a client that lands, or `forget`, empties it first",
+    ("beeverforge/runtime/temporal/connection.py", "_PRESENTED"):
+        "one entry in total, under one fixed key: the client `_HELD` holds, replaced when another "
+        "is seen",
     ("beeverforge/runtime/temporal/view.py", "_CLIENTS"):
         "exactly one entry — the engine target this process is configured for right now, emptied "
         "and re-filled when that target changes; the environment, not traffic",

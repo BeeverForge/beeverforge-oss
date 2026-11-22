@@ -11,7 +11,8 @@ The SAME code runs everywhere (ADR-0001 D-16); only the connection target change
     self-hosted, mutual TLS AND a JWT authorizer: all three above together — the certificate is
             presented and the key is sent as the bearer token (#657)
     any:    TEMPORAL_TLS_SERVER_CA_CERT=/path/engine-ca.pem        (the engine's CA, for this
-                                                                    connection alone)
+                                                                    connection alone; a path,
+                                                                    never a secret reference)
             TEMPORAL_AUTH_REFRESH_SECONDS=60                       (how often a stored key is
                                                                     read again)
 """
@@ -23,11 +24,13 @@ import concurrent.futures
 import contextlib
 import gc
 import hashlib
+import itertools
 import logging
 import math
 import os
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -385,6 +388,7 @@ async def connect(*, within: float | None = None) -> Client:
         up to `RESTS_AT_MOST_S`; a client that lands ends it. A cancelled attempt is still
         nobody's failure, and leaves no rest."""
     while True:
+        read = next(_READS)  # numbered before the store is asked (`_settle`)
         # raises for an engine nobody declared, before anything is built
         key, stored_key = _target()
         with _HOLDING:
@@ -404,8 +408,8 @@ async def connect(*, within: float | None = None) -> Client:
             # A KEY THAT CHANGED WHERE IT IS STORED is handed to the client already held — read in
             # the same breath as the target above, so the store is asked once (#657): no second
             # client, and no reconnect.
-            if stored_key and getattr(held, "api_key", None) != stored_key:
-                _present(held, stored_key)
+            if stored_key:
+                _settle(held, read, stored_key)
             return held
         if mine:
             return await _connect_for(key, flight, read_deadline() if within is None else within)
@@ -487,6 +491,7 @@ async def _connect_for(key: tuple[str, str, str], flight: concurrent.futures.Fut
             refresher = _REFRESHING[key] = _KeyRefresh(client, every=api_key_refresh_every())
     for old in ended:
         old.stop()
+    _landed(client)
     if refresher is not None:
         refresher.start()
     flight.set_result(client)
@@ -514,10 +519,14 @@ def forget() -> None:
         _REFRESHING.clear()
     for refresher in ended:
         refresher.stop()
+    with _PRESENTING:
+        _PRESENTED.clear()
 
 
 #: How often, in seconds, the API key of the client this process holds is read again from where it
 #: is stored. A deployment whose key is a short-lived token sets it below the token's lifetime.
+#: READ WHEN THE CLIENT IS MADE (`_connect_for`): a changed interval applies to the next client,
+#: not to the refresher already running.
 AUTH_REFRESH_VAR = "TEMPORAL_AUTH_REFRESH_SECONDS"
 _API_KEY_REFRESH_S = 60.0
 
@@ -532,12 +541,110 @@ def api_key_refresh_every() -> float:
     return wanted if math.isfinite(wanted) and wanted > 0 else _API_KEY_REFRESH_S
 
 
-def _present(client: Client, api_key: str) -> None:
-    """Hand `client` the key `api_key` through temporalio's `Client.api_key` setter: the calls it
-    makes from now on carry it, on the connection it already has. Said by name, never by value."""
-    client.api_key = api_key
-    log.info("the engine credential TEMPORAL_API_KEY changed where it is stored; the engine "
-             "client presents the new one from its next call, without reconnecting")
+def _now() -> float:
+    """What the engine key's grace is measured by: a seam of its own, so a test moves a clock
+    instead of waiting the grace out."""
+    return time.monotonic()
+
+
+@dataclass
+class _Presented:
+    """What this process knows about the key the client it holds presents: which client, when its
+    store last answered a key, the newest read settled so far, and the failure last said."""
+
+    client: int
+    good_at: float
+    settled: int = 0
+    said: tuple[str, str] | None = None
+
+
+#: The one client's `_Presented`, ONE ENTRY IN TOTAL, as `_HELD` is: a client seen for the first
+#: time replaces it.
+_PRESENTED: dict[str, _Presented] = {}
+#: Held while a read is settled: the compare and the set of `Client.api_key` are one step.
+_PRESENTING = threading.Lock()
+#: Every read of the key takes a number BEFORE it asks the store, so the read that STARTED later
+#: wins however the two end (`_settle`).
+_READS = itertools.count(1)
+
+
+def _state(client: Client) -> _Presented:
+    """`client`'s `_Presented`, made now for a client not seen before. Under `_PRESENTING`."""
+    state = _PRESENTED.get("held")
+    if state is None or state.client != id(client):
+        state = _PRESENTED["held"] = _Presented(client=id(client), good_at=_now())
+    return state
+
+
+def _landed(client: Client) -> None:
+    """A client was just made with the key `_auth()` read: its grace runs from now."""
+    with _PRESENTING:
+        _PRESENTED["held"] = _Presented(client=id(client), good_at=_now())
+
+
+def _settle(client: Client, read: int, value: str | None, refused: str = "") -> bool:
+    """Settle what read number `read` of `TEMPORAL_API_KEY` answered — `value`, or why there was
+    none — against `client`. True when the client was handed a new key.
+
+    THE NEWEST READ WINS (review of the #657 branch). `connect()` and the refresher read the store
+    on their own threads, and a read that started first can end last: without the number, the
+    refresher's read of the old key landed after `connect()` had handed over the new one, and put
+    the old one back. A read older than one already settled changes nothing and says nothing.
+
+    A READ THAT ANSWERS NO KEY keeps the one the client holds for `BEEVERFORGE_STORED_TOKEN_TTL`
+    after the last read that answered one — the grace a stored forge token is given, for the same
+    reason: a store that is briefly unreachable must not end the worker's polls. Past it the
+    client presents NO key, so a key removed or revoked where it is stored stops being presented
+    within a bounded time, rather than for as long as the process lives (a key that is not a
+    token never expires on the server). It fails closed: the server then refuses the calls.
+
+    SAID ONCE PER CHANGE OF STATE, by name, never by value: a refusal (the store will not hand it
+    over, perhaps for a moment) apart from a key nobody holds any more, and each apart from the
+    key being let go of. A refusal that persists is one line, not one per interval."""
+    from beeverforge.credentials import STORED_TOKEN_TTL_VAR, _stored_token_ttl
+
+    with _PRESENTING:
+        state = _state(client)
+        if read < state.settled:
+            return False
+        state.settled = read
+        now = _now()
+        if value:
+            state.good_at = now
+            if state.said is not None:
+                log.info("the engine credential TEMPORAL_API_KEY is answered by its store again")
+                state.said = None
+            if getattr(client, "api_key", None) == value:
+                return False
+            client.api_key = value
+            log.info("the engine credential TEMPORAL_API_KEY changed where it is stored; the "
+                     "engine client presents the new one from its next call, without "
+                     "reconnecting")
+            return True
+        ttl = _stored_token_ttl()
+        why = "refused" if refused else "gone"
+        if now - state.good_at < ttl:
+            phase = "kept"
+        else:
+            phase = "dropped"
+            if getattr(client, "api_key", None) is not None:
+                client.api_key = None
+        if state.said == (why, phase):
+            return False
+        state.said = (why, phase)
+        what = (f"is refused by its store ({refused})" if refused
+                else "is no longer held by its store (it answered nothing)")
+        if phase == "kept":
+            log.warning("the engine credential TEMPORAL_API_KEY %s; the engine client keeps "
+                        "presenting the key it holds until %s (%gs) has passed since the store "
+                        "last answered one, %gs from now", what, STORED_TOKEN_TTL_VAR, ttl,
+                        max(0.0, state.good_at + ttl - now))
+        else:
+            log.warning("the engine credential TEMPORAL_API_KEY %s, and %s (%gs) has passed since "
+                        "the store last answered one; the engine client presents no key from now "
+                        "on, and the engine refuses what needs one", what, STORED_TOKEN_TTL_VAR,
+                        ttl)
+        return False
 
 
 def refresh_api_key(client: Client) -> bool:
@@ -547,26 +654,14 @@ def refresh_api_key(client: Client) -> bool:
     its whole life, so a short-lived token made the worker fail when it expired, until somebody
     restarted it. Read here through the credential store as `_auth()` reads it — a file rewritten
     in place, a store that answers a fresh token — and handed to the client the process already
-    holds, so neither the connection nor the worker on it is restarted.
-
-    A READ THAT FAILS KEEPS THE KEY THE CLIENT HAS. A refusal, or a store that answers nothing, is
-    said once per read, by name, and the client goes on presenting what it holds: replacing a key
-    with nothing would end the worker's polls at once, where the key it holds may still be good.
-    When that key does expire, the server refuses the calls, which say so themselves. The store's
-    own sentence is asked for quietly, because this one is the one that says what happens."""
+    holds, so neither the connection nor the worker on it is restarted. A read that answers no key
+    is settled by `_settle`: a bounded grace, then no key. The store's own sentence is asked for
+    quietly, because `_settle`'s is the one that says what happens."""
     from beeverforge.adapters.credential_store.registry import lookup
 
+    read = next(_READS)
     found = lookup("TEMPORAL_API_KEY", quiet=True)
-    if not found.value:
-        log.warning("the engine credential TEMPORAL_API_KEY %s when it was read again; the engine "
-                    "client keeps presenting the key it holds, and the store is asked again in "
-                    "%gs", f"was refused ({found.refused})" if found.refused
-                    else "answered nothing", api_key_refresh_every())
-        return False
-    if found.value == getattr(client, "api_key", None):
-        return False
-    _present(client, found.value)
-    return True
+    return _settle(client, read, found.value, found.refused)
 
 
 class _KeyRefresh:

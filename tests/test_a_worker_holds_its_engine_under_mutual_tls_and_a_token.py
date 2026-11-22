@@ -419,9 +419,15 @@ async def test_a_token_WITHOUT_a_certificate_is_refused_at_the_handshake(deploye
     assert not isinstance(refused.value, RPCError), (
         f"a token without a certificate reached the server's API ({refused.value!r}) — the "
         f"handshake should have refused it before any authorizer")
-    # THE SERVER'S OWN ALERT, measured on 1.25.2: "received fatal alert: CertificateRequired" —
-    # the TLS layer refused the connection, not a trust failure on the client's side.
-    assert "CertificateRequired" in str(refused.value), refused.value
+    # THE TRANSPORT ENDED IT, not the API and not the client's own trust. Measured on 1.25.2, two
+    # ways, by which side of TLS 1.3's late client-certificate check the client reads first: the
+    # server's alert ("received fatal alert: CertificateRequired"), or the connection it closed
+    # ("hyper::Error(Canceled, \"connection closed\")") — 1 run in 3 under load.
+    said = str(refused.value)
+    assert "Transport" in said, said
+    assert "InvalidCertificate" not in said and "UnknownIssuer" not in said, (
+        f"the client refused the server's certificate, so the server's demand for one was never "
+        f"tested: {said}")
 
 
 async def test_a_token_ROTATED_IN_PLACE_keeps_the_worker_polling(deployed, engine):
