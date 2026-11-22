@@ -4470,11 +4470,13 @@ def factory(project: str) -> dict:
     # which the panel renders as its own sentence — a project whose pickup we cannot check is not
     # a project we may describe as armed.
     pickup: bool | None = None
-    single_agent, review_mode, box_image = True, "", ""
+    single_agent, review_mode = True, ""
+    box_image = ""
     try:
         proj = ProjectRegistry().get(project)
-        box_image = (proj.box.image if proj.box else None) or ""
         pickup = bool(getattr(proj, "enabled", True))
+        box = getattr(proj, "box", None)
+        box_image = (getattr(box, "image", None) if box else None) or ""
         # ASKED OF THE BOARD, NOT SPELLED HERE (#162). This built
         # `https://github.com/{orgs|users}/{owner}/projects/{n}` by hand, from GitHub Projects v2
         # vocabulary, on the reference surface of a product sold as vendor-agnostic — so an Azure
