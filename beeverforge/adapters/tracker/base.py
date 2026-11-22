@@ -857,25 +857,61 @@ def summary_of(tracker, ref: str) -> TicketSummary | None:
     return found if isinstance(found, TicketSummary) else None
 
 
-def closed_among(tracker, refs: list[str], timeout: float) -> set[str] | None:
-    """Which of `refs` are closed, from ONE read of just those tickets' state and within `timeout`
-    seconds; `None` when this row has no such read or it could not be made (#651).
+class ClosedRead(set):
+    """The refs found closed, and `unread`: the refs asked about that got no answer (the bound ran
+    out before them, or their own read failed). A `set`, so a caller that only wants the closed
+    ones reads it as one; `unread` is what a caller that must say why an entry stays reads."""
 
-    OFF THE PORT, like `summary_of`. A row without `closed_among` is UNKNOWN, never "all open" and
-    never a whole-board read to find out: the caller keeps the entry and says why. NEVER RAISES."""
+    def __init__(self, closed=(), *, unread=()):
+        super().__init__(closed)
+        self.unread = set(unread)
+
+
+def closed_among(tracker, refs: list[str], timeout: float, *, clock=None) -> set[str] | None:
+    """Which of `refs` are closed, within `timeout` seconds; `None` when this row cannot say (#651).
+
+    A row with its own `closed_among` answers it in ONE read of just those tickets' state. A row
+    without one (Jira, Azure DevOps, the local board) is asked `get_ticket` per ref, and only for
+    the refs given, until `timeout` runs out: a ref the bound cuts off, or whose read fails, is in
+    the answer's `unread` and is never called closed. A row with neither read is UNKNOWN, never
+    "all open" and never a whole-board read to find out: the caller keeps the entry and says why.
+
+    OFF THE PORT, like `summary_of`. `clock` is injected so no test waits on real time.
+    NEVER RAISES."""
+    import logging
+
+    log = logging.getLogger("beeverforge.tracker")
     read = getattr(tracker, "closed_among", None)
-    if not callable(read):
+    if callable(read):
+        try:
+            found = read(refs, timeout)
+        except Exception:  # noqa: BLE001 — "could not read" is an answer: nothing is called closed
+            log.info("the tracker raised reading the state of %d tickets — read as unreadable",
+                     len(refs), exc_info=True)
+            return None
+        return found if isinstance(found, set) else None
+    get = getattr(tracker, "get_ticket", None)
+    if not callable(get):
         return None
-    try:
-        found = read(refs, timeout)
-    except Exception:  # noqa: BLE001 — "could not read" is an answer: nothing is called closed
-        import logging
+    import time
 
-        logging.getLogger("beeverforge.tracker").info(
-            "the tracker raised reading the state of %d tickets — read as unreadable", len(refs),
-            exc_info=True)
-        return None
-    return found if isinstance(found, set) else None
+    now = clock or time.monotonic
+    started = now()
+    closed: set[str] = set()
+    unread: set[str] = set()
+    for ref in dict.fromkeys(str(r) for r in refs):
+        if now() - started >= timeout:
+            unread.add(ref)
+            continue
+        try:
+            state = getattr(get(ref), "state", None)
+        except Exception:  # noqa: BLE001 — an unreadable ticket is unread, never closed
+            log.info("the tracker raised reading %s — it stays listed", ref, exc_info=True)
+            unread.add(ref)
+            continue
+        if state == "closed":
+            closed.add(ref)
+    return ClosedRead(closed, unread=unread)
 
 
 def remove_ticket(tracker, ref: str, reason: str, *, by: str, note: str) -> bool:

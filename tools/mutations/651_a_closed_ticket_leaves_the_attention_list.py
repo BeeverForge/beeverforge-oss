@@ -9,12 +9,20 @@ Each cut breaks one claim of `tests/test_a_closed_ticket_leaves_the_attention_li
   2. the tracker is asked once per job instead of once per project;
   3. a failed tracker read is taken for "closed", so the entry vanishes instead of being listed;
   4. an engine that could not be asked (`running=None`) is read as "nothing runs";
-  5. the `isinstance(read, set)` guard goes, so an unreadable answer is trusted as a closed set.
+  5. the `isinstance(read, set)` guard goes, so an unreadable answer is trusted as a closed set;
+  6. the tracker's inner budget is the whole wait, not strictly inside it;
+  7. the GitHub call is made without its `timeout=`, so it runs on the default 60 s;
+  8. `_closed_refs_of` hands the tracker a fixed 60 instead of the bound it was given;
+  9. the GitHub read calls every ticket closed, whatever its state;
+ 10. the engine is asked for every workflow, not only the running ones;
+ 11. a tracker with no `closed_among` is read as "nothing closed" instead of per-candidate.
 """
 
 TEST = "tests/test_a_closed_ticket_leaves_the_attention_list.py"
 ATTENTION = "beeverforge/api/attention.py"
 APP = "beeverforge/api/app.py"
+BASE = "beeverforge/adapters/tracker/base.py"
+GITHUB = "beeverforge/adapters/tracker/github.py"
 
 MUTATIONS = [
     ("the running-workflow check is dropped", ATTENTION,
@@ -71,4 +79,37 @@ MUTATIONS = [
      "            pass\n"
      "        candidates.setdefault(project, []).append(issue)\n",
      TEST + "::test_tracker_is_asked_only_for_the_candidates"),
+
+    ("the inner budget is the whole wait", ATTENTION,
+     "    inner = max(timeout / 2, timeout - 1.0)\n",
+     "    inner = timeout\n",
+     TEST + "::test_the_bound_goes_down_to_the_tracker_and_is_strictly_inside_it"),
+
+    ("the GitHub call is made without its timeout", GITHUB,
+     "\"-f\", f\"name={name}\"], timeout=timeout)\n",
+     "\"-f\", f\"name={name}\"])\n",
+     TEST + "::test_github_reads_the_state_of_the_asked_refs_in_one_call"),
+
+    ("a fixed 60 replaces the bound handed to the tracker", APP,
+     "    return closed_among(build_tracker(proj, token=token), refs, timeout)\n",
+     "    return closed_among(build_tracker(proj, token=token), refs, 60)\n",
+     TEST + "::test_closed_refs_asks_the_tracker_for_those_refs_under_the_bound"),
+
+    ("the CLOSED filter is dropped", GITHUB,
+     "        return {n for n in numbers\n"
+     "                if str((found.get(f\"i{int(n)}\") or {}).get(\"state\", \"\")).upper()"
+     " == \"CLOSED\"}\n",
+     "        return set(numbers)\n",
+     TEST + "::test_github_reads_the_state_of_the_asked_refs_in_one_call"),
+
+    ("the Running query is dropped", APP,
+     "query='ExecutionStatus = \"Running\"'),",
+     "query=''),",
+     TEST + "::test_running_workflows_asks_the_engine_for_the_running_ones_only"),
+
+    ("a tracker with no closed_among is read as nothing closed", BASE,
+     "    get = getattr(tracker, \"get_ticket\", None)\n",
+     "    return set()\n"
+     "    get = getattr(tracker, \"get_ticket\", None)\n",
+     TEST + "::test_a_tracker_with_no_batched_read_is_asked_per_candidate_only"),
 ]

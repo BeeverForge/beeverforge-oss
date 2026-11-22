@@ -303,3 +303,79 @@ def test_github_says_none_when_the_read_fails_or_is_garbled(monkeypatch):
     assert _github(monkeypatch, returncode=1)[0].closed_among(["1"], 7.0) is None
     assert _github(monkeypatch, stdout="not json")[0].closed_among(["1"], 7.0) is None
     assert _github(monkeypatch, stdout='{"data":null}')[0].closed_among(["1"], 7.0) is None
+
+
+# ── a tracker with no batched read: one get_ticket per candidate, inside the same bound ─────────
+
+class PlainTracker:
+    """A non-GitHub row: it has `get_ticket` and nothing else of ours."""
+
+    def __init__(self, states, *, error_on=()):
+        self.states, self.error_on, self.asked = states, set(error_on), []
+
+    def get_ticket(self, ref):
+        from types import SimpleNamespace
+
+        self.asked.append(ref)
+        if ref in self.error_on:
+            raise RuntimeError("tracker down")
+        return SimpleNamespace(state=self.states.get(ref))
+
+
+class Clock:
+    """Each look at the clock moves it on by `step`, so no test waits on real time."""
+
+    def __init__(self, step=0.0):
+        self.now, self.step = 0.0, step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def test_a_tracker_with_no_batched_read_is_asked_per_candidate_only():
+    from beeverforge.adapters.tracker.base import closed_among
+
+    tracker = PlainTracker({"1": "closed", "2": "open"})
+    got = closed_among(tracker, ["1", "2"], 7.0, clock=Clock())
+    assert got == {"1"} and tracker.asked == ["1", "2"]
+    assert got.unread == set()
+
+
+def test_a_candidate_the_bound_cuts_off_is_unread_not_open():
+    from beeverforge.adapters.tracker.base import closed_among
+
+    tracker = PlainTracker({"1": "closed", "2": "closed", "3": "closed"})
+    got = closed_among(tracker, ["1", "2", "3"], 2.5, clock=Clock(step=1.0))
+    assert tracker.asked == ["1", "2"]
+    assert got == {"1", "2"} and got.unread == {"3"}
+
+
+def test_a_ticket_that_cannot_be_read_is_not_closed_and_not_asked_twice():
+    from beeverforge.adapters.tracker.base import closed_among
+
+    tracker = PlainTracker({"2": "closed"}, error_on={"1"})
+    got = closed_among(tracker, ["1", "2"], 7.0, clock=Clock())
+    assert got == {"2"} and got.unread == {"1"}
+
+
+def test_a_tracker_with_neither_read_is_unknown():
+    from beeverforge.adapters.tracker.base import closed_among
+
+    assert closed_among(object(), ["1"], 7.0, clock=Clock()) is None
+
+
+def test_settle_lists_an_unread_candidate_with_a_note_that_the_bound_ran_out():
+    from beeverforge.adapters.tracker.base import ClosedRead
+
+    def read(_project, _refs, _timeout):
+        return ClosedRead({"1"}, unread={"2"})
+
+    out = settle(HELD, running=set(), closed_refs=read, bounded=_direct)
+    assert [j["issue"] for j in out] == ["2"] and "ran out" in out[0]["note"]
+
+
+def test_route_helper_with_a_non_github_tracker_drops_closed_and_keeps_open(monkeypatch):
+    tracker = PlainTracker({"1": "closed", "2": "open"})
+    got, _built = _closed_refs(monkeypatch, tracker)
+    assert got == {"1"} and tracker.asked == ["1", "2"]

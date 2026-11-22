@@ -59,10 +59,12 @@ def settle(
             candidates.setdefault(project, []).append(issue)
     inner = max(timeout / 2, timeout - 1.0)
     closed: dict[str, set[str] | str] = {}
+    unread: dict[str, set[str]] = {}
     for project, refs in candidates.items():
         try:
             read = bounded(partial(closed_refs, project, refs, inner), timeout)
             closed[project] = read if isinstance(read, set) else "the tracker could not be read"
+            unread[project] = set(getattr(read, "unread", ()))
         except Exception as exc:  # a failed read is listed with its reason
             log.info("attention: tracker read for %s failed: %r", project, exc)
             closed[project] = ("the tracker read timed out" if isinstance(exc, TimeoutError)
@@ -75,6 +77,9 @@ def settle(
             kept.append(job)
         elif isinstance(verdict, str):
             kept.append({**job, "note": verdict})
+        elif issue in unread.get(project, ()):
+            kept.append({**job, "note": "the tracker did not answer for this ticket "
+                                        "(the bound ran out or its read failed)"})
         elif issue not in verdict:
             kept.append(job)
     return kept
