@@ -2699,6 +2699,26 @@ def preview_login(
                f"preview")
 
 
+# ── a held job, closed from a shell (#653) ───────────────────────────────────────────────────────
+
+job_app = typer.Typer(help="A job the factory ran.")
+app.add_typer(job_app, name="job")
+
+
+@job_app.command("dismiss")
+def job_dismiss(name: str = typer.Argument(..., help="the registered project"),
+                issue: str = typer.Argument(..., help="the card's number"),
+                why: str = typer.Option("", "--why", help="why it needs nobody (kept with it)")
+                ) -> None:
+    """Close a held job whose workflow has ended — `dismiss`, the panel's attention-row button.
+    The card is not moved; a workflow that still runs is `skip`'s."""
+    params = {"project": name, "issue": issue, **({"why": why} if why else {})}
+    outcome = _perform("dismiss", **params)
+    typer.echo(("✓ " if outcome.ok else f"✗ {outcome.code}: ") + outcome.message)
+    if not outcome.ok:
+        raise typer.Exit(1)
+
+
 # ── a preview on demand: the panel's buttons, from a shell (ADR-0050 D6) ─────────────────────────
 #
 # `start`, `stop` and `restart` ARE THE CATALOG'S ROWS (`preview_start`/`_stop`/`_rebuild`), run as

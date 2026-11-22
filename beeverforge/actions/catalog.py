@@ -192,6 +192,107 @@ async def _skip(*, project: str, issue: str, by: Actor) -> Outcome:
     return _refusal_of(moved) or _after_the_door(moved, said["it"])
 
 
+# ── dismiss — a held job whose workflow has ended (#653) ─────────────────────────────────────────
+
+async def _running(client, project: str, issue: str) -> bool:
+    """Whether the engine holds a RUNNING workflow for this job. A workflow it does not know is not
+    running — decided by the RPC status code NOT_FOUND, never by the error's text, and not when
+    that NOT_FOUND is about the NAMESPACE (the engine is then not the one we meant to ask). Any
+    other failure is the engine's and is raised as it came, never read as "ended"."""
+    from temporalio.api.errordetails.v1 import NamespaceNotFoundFailure
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from beeverforge.runtime.temporal import view as tv
+
+    try:
+        described = await tv.job_handle(client, project, issue).describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND and not any(
+                d.Is(NamespaceNotFoundFailure.DESCRIPTOR) for d in exc.grpc_status.details):
+            return False
+        raise
+    return described.status == WorkflowExecutionStatus.RUNNING
+
+
+def _last_state(project, issue: str) -> str:
+    """The message of the journal's last `state` line ("" when none, or unreadable)."""
+    import json
+
+    from beeverforge.paths import events_file
+
+    try:
+        lines = events_file(project, issue).read_text().splitlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if event.get("kind") == "state":
+            return str(event.get("message") or "")
+    return ""
+
+
+async def _dismiss(*, project: str, issue: str, by: Actor, why: str = "") -> Outcome:
+    """Close a held job whose workflow has ended: ONE `dismissed` state line with who and why, and
+    nothing else. The card is not moved — `skip` would send a closed ticket back to the backlog.
+
+    A workflow that still runs is `skip`'s to answer, so it is refused naming it; a job nobody ran
+    for this issue is NOT_FOUND. Repeating it writes nothing more (the journal's last word is
+    already `dismissed`)."""
+    from temporalio.service import RPCError
+
+    from beeverforge.api.attention import _already_ended
+    from beeverforge.observability.job_record import record_ending
+    from beeverforge.paths import events_file
+    from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES
+    from beeverforge.util.causes import first_message
+    from beeverforge.util.filelock import Waited, lock_beside
+
+    if not re.fullmatch(r"\d+", issue or "", re.ASCII):
+        return refused(INVALID, f"{issue!r} is not an issue number — digits only.")
+    found, bad = _project(project)
+    if bad:
+        return bad
+    client, bad = await _connected()
+    if bad:
+        return bad
+    try:
+        runs = await _running(client, found.name, issue)
+    except RPCError as exc:  # an engine that cannot say is unknown, not "ended"
+        log.warning("dismiss #%s: the engine could not say whether it runs: %r", issue, exc)
+        return refused(UNAVAILABLE, f"could not ask the engine whether #{issue}'s workflow "
+                                    f"still runs ({first_message(exc, limit=100)}) — nothing "
+                                    f"was written.")
+    if runs:
+        return refused(
+            CONFLICT,
+            f"#{issue}'s workflow still runs — dismissing is for a job that has ended. "
+            f"Use `skip` to stop it.")
+    journal = events_file(found, issue)
+    if not journal.exists():
+        return refused(NOT_FOUND, f"no job has ever run for #{issue} on {found.name} — check the "
+                                  f"ticket reference.")
+    note = (why or "").strip()
+    try:
+        with lock_beside(journal).held(timeout=2.0):
+            if _already_ended(found, issue, "dismissed"):
+                return done(f"#{issue} was already dismissed.", project=found.name, issue=issue,
+                            written=False)
+            last = _last_state(found, issue)
+            if last not in ATTENTION_STATES:
+                return refused(CONFLICT, f"#{issue} is {last or 'not held'}, not held — only a "
+                                         f"held job can be dismissed, and nothing was written.")
+            record_ending(found, issue, "dismissed", by=str(by), note=note)
+    except Waited:
+        return refused(UNAVAILABLE, f"#{issue}'s journal is being written by somebody else — "
+                                    f"try again in a moment.")
+    return done(f"#{issue} dismissed — {by} closed it; the card was not moved.",
+                project=found.name, issue=issue, written=True, why=note or None)
+
+
 # ── the card's door, from a row (ADR-0055) ───────────────────────────────────────────────────────
 
 async def _through_the_door(proj, issue: str, event, *, by: Actor, why: str = "",
@@ -9324,6 +9425,19 @@ CATALOG: dict[str, ActionSpec] = {
             choose_when="for a parked job a re-run cannot advance, and for an ORPHANED one "
                         "(ticket closed, workflow still holding the line). The ticket is left for "
                         "its owner rather than thrown away",
+        ),
+        ActionSpec(
+            name="dismiss",
+            summary="close a held job whose workflow has ended, leaving its card where it is",
+            run=_dismiss,
+            refuses=(NOT_FOUND, CONFLICT, INVALID, UNAVAILABLE),
+            required=("project", "issue"),
+            optional=("why",),
+            params={"why": "one sentence saying why it needs nobody — it is stored with the "
+                           "dismissal and shown"},
+            choose_when="for a held job whose workflow already ended and which needs nobody "
+                        "(shipped by hand, rebuilt elsewhere). A workflow that still runs is "
+                        "`skip`'s",
         ),
         ActionSpec(
             name="ack",
