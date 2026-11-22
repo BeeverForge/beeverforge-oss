@@ -13,7 +13,11 @@ The claims, each a row:
   2. the proof fails on a test missing, doubled or unknown, and on an empty collection;
   3. CI wires it: the `test` job needs every job and runs the proof, the slices are the matrix's,
      the three runs' markers split the suite without overlap, and the guard on CI's pytest follows
-     the Makefile;
+     the Makefile; each unit job writes its JUnit report into the artifact it uploads, and the
+     shard table's refresh workflow runs the builder's documented command, share included, on the
+     four reports CI writes (the newest attempt of each), weekly and on demand, with only its
+     pull-request job allowed to write, no expression in a shell, and a pull request only when
+     the table changed;
   4. a test that asserts its own CPU time is marked `alone` and runs with no xdist neighbours;
   5. the real-daemon tests are in the `docker` group, and the integration run distributes by it.
 """
@@ -25,6 +29,11 @@ CI = ".github/workflows/ci.yml"
 GUARD = "tests/test_ci_runs_what_we_run.py"
 TREE = "tests/test_every_shard_of_the_tree_is_part_of_its_collection.py"
 REFRESH = "tests/shard_durations.py"
+WORKFLOW = ".github/workflows/refresh-shard-durations.yml"
+COMMAND = f"{GUARD}::test_the_refresh_runs_the_builders_command_on_the_four_reports_ci_writes"
+PRIVILEGE = (f"{GUARD}::"
+             "test_the_refresh_runs_weekly_and_on_demand_and_only_its_pull_request_job_may_write")
+CHANGED = f"{GUARD}::test_the_refresh_opens_a_pull_request_only_when_the_table_changed"
 
 MUTATIONS = [
     # 1. the slices, and what a run records
@@ -117,6 +126,57 @@ MUTATIONS = [
     ("CI never runs the alone tests", CI,
      "      - run: make test-alone\n        env:\n"
      "          TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/ran-alone.txt\n", ""),
+    ("a unit job writes no JUnit report", CI,
+     "          TEST_JUNIT: ${{ runner.temp }}/beeverforge-test-ids/junit-unit-"
+     "${{ matrix.shard }}.xml\n", ""),
+    ("the JUnit report is written outside the directory the job uploads", CI,
+     "          TEST_JUNIT: ${{ runner.temp }}/beeverforge-test-ids/junit-unit-",
+     "          TEST_JUNIT: ${{ runner.temp }}/junit-unit-"),
+    ("every unit shard writes one report name", CI,
+     "junit-unit-${{ matrix.shard }}.xml", "junit-unit.xml"),
+    # the shard table's refresh (#649)
+    ("the refresh drops the share of unlisted files", WORKFLOW,
+     "      - run: python -m tests.shard_durations --max-unlisted 0.1 ",
+     "      - run: python -m tests.shard_durations ", COMMAND),
+    ("the refresh holds a looser share than the builder documents", WORKFLOW,
+     '--max-unlisted 0.1 "$RUNNER_TEMP', '--max-unlisted 0.5 "$RUNNER_TEMP', COMMAND),
+    ("the builder documents another share", REFRESH,
+     "    python -m tests.shard_durations --max-unlisted 0.1 <junit.xml>",
+     "    python -m tests.shard_durations --max-unlisted 0.5 <junit.xml>", COMMAND),
+    ("the refresh reads three of the four reports", WORKFLOW,
+     ' "$RUNNER_TEMP/unit-reports/junit-unit-4.xml"', "", COMMAND),
+    ("the refresh reads every attempt of a re-run shard, not the newest", WORKFLOW,
+     '      - run: python scripts/every_test_ran_once.py --newest-attempts'
+     ' "$RUNNER_TEMP/unit-artifacts"'
+     ' "$RUNNER_TEMP/unit-reports"',
+     '      - run: mkdir -p "$RUNNER_TEMP/unit-reports" && cp "$RUNNER_TEMP"/unit-artifacts/*/*.xml'
+     ' "$RUNNER_TEMP/unit-reports"', COMMAND),
+    ("the refresh downloads the integration artifact too", WORKFLOW,
+     "          pattern: test-ids-unit-*", "          pattern: test-ids-*", COMMAND),
+    ("the refresh runs only on demand", WORKFLOW,
+     '  schedule:\n    - cron: "23 4 * * 1"\n', "", PRIVILEGE),
+    ("a pull_request_target run of the refresh is allowed", WORKFLOW,
+     "  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request_target:\n", PRIVILEGE),
+    ("every job of the refresh may write by default", WORKFLOW,
+     "permissions:\n  contents: read\n\nconcurrency",
+     "permissions:\n  contents: write\n\nconcurrency", PRIVILEGE),
+    ("the job that runs the tree's code may write", WORKFLOW,
+     "      contents: read\n      actions: read\n", "      contents: write\n      actions: read\n",
+     PRIVILEGE),
+    ("the pull-request job may also write actions", WORKFLOW,
+     "      pull-requests: write\n", "      pull-requests: write\n      actions: write\n",
+     PRIVILEGE),
+    ("the refresh interpolates an expression into a shell", WORKFLOW,
+     'branch="refresh-shard-durations/$GITHUB_RUN_ID"',
+     'branch="refresh-shard-durations/${{ github.ref_name }}"', PRIVILEGE),
+    ("the refresh opens a pull request when nothing changed", WORKFLOW,
+     "    if: needs.rebuild.outputs.changed == 'true'\n", "", CHANGED),
+    ("the rebuild says changed whatever the diff", WORKFLOW,
+     'if git diff --quiet -- tests/shard_durations.json; then\n            echo "the table',
+     'if false; then\n            echo "the table', CHANGED),
+    ("the pull-request job does not ask main again", WORKFLOW,
+     'if git diff --quiet -- tests/shard_durations.json; then\n            echo "main already',
+     'if false; then\n            echo "main already', CHANGED),
     # 4. a test that asserts its own CPU time runs alone
     ("the map's timing test loses its mark", "tests/test_knowledge_derived_not_cached.py",
      "@pytest.mark.alone\ndef test_generating_is_fast_enough_to_do_every_time(capsys):",

@@ -1,0 +1,126 @@
+# Rebuild tests/shard_durations.json, the measured seconds of each test file that balances CI's
+# four unit shards, from the JUnit reports of the latest green `main` run (#649).
+#
+# The table was built once and never rebuilt, and a per-change check on its staleness failed
+# whichever change added the test file that crossed 10%. A stale table costs only balance
+# (tests/shard_durations.py), so no change is failed for it any more: this workflow keeps it
+# current, and it is the one that fails, naming the files, when more than 10% of the tree's test
+# files are still unlisted after its own rebuild. `tests/test_ci_runs_what_we_run.py` holds its
+# command to the one the builder documents, and its reports to the ones ci.yml's unit jobs write.
+#
+# LEAST PRIVILEGE. The job that runs the tree's code reads only: the repository, and the actions
+# artifacts of the CI run it rebuilds from. Only the job that opens the pull request may write,
+# and it runs no code from the tree. No secret but GITHUB_TOKEN; no expression is interpolated
+# into a shell, every value reaches one through `env:`.
+#
+# A PULL REQUEST OPENED WITH GITHUB_TOKEN STARTS NO WORKFLOW, so `ci` does not run on it by itself:
+# a maintainer closes and reopens it (or pushes to it) to get its checks. The repository setting
+# "Allow GitHub Actions to create and approve pull requests" must be on for `gh pr create`.
+name: refresh-shard-durations
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-shard-durations
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - id: run
+        name: the latest green ci run on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          found=$(gh run list -R "$REPO" --workflow ci.yml --branch main --event push \
+            --status success --limit 1 --json databaseId,headSha \
+            --jq '.[0] | "\(.databaseId) \(.headSha)"')
+          read -r id sha <<< "$found"
+          if [[ ! "$id" =~ ^[0-9]+$ || ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "no green ci run on main to rebuild the table from" >&2
+            exit 1
+          fi
+          echo "ci run $id at $sha"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      # the tree the reports were measured on, so the share of unlisted files is that tree's
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.run.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: test-ids-unit-*
+          run-id: ${{ steps.run.outputs.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/unit-artifacts
+      # a re-run shard leaves its earlier attempt's artifact beside the newest: keep the newest (#417)
+      - run: python scripts/every_test_ran_once.py --newest-attempts "$RUNNER_TEMP/unit-artifacts" "$RUNNER_TEMP/unit-reports"
+      # the builder's own command (tests/shard_durations.py), on the four shards' reports
+      - run: python -m tests.shard_durations --max-unlisted 0.1 "$RUNNER_TEMP/unit-reports/junit-unit-1.xml" "$RUNNER_TEMP/unit-reports/junit-unit-2.xml" "$RUNNER_TEMP/unit-reports/junit-unit-3.xml" "$RUNNER_TEMP/unit-reports/junit-unit-4.xml"
+      - id: diff
+        run: |
+          if git diff --quiet -- tests/shard_durations.json; then
+            echo "the table is current: no pull request"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --stat -- tests/shard_durations.json
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: steps.diff.outputs.changed == 'true'
+        with:
+          name: shard-durations
+          path: tests/shard_durations.json
+          if-no-files-found: error
+
+  pull-request:
+    needs: rebuild
+    if: needs.rebuild.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/download-artifact@v4
+        with:
+          name: shard-durations
+          path: ${{ runner.temp }}/shard-durations
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/shard-durations/shard_durations.json" tests/shard_durations.json
+          if git diff --quiet -- tests/shard_durations.json; then
+            echo "main already holds this table: no pull request"
+            exit 0
+          fi
+          branch="refresh-shard-durations/$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -q -m "Refresh the shard duration table from the latest green main run" \
+            -- tests/shard_durations.json
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --label no-release-note \
+            --title "Refresh the shard duration table from the latest green main run" \
+            --body "Rebuilt by refresh-shard-durations.yml (run $GITHUB_RUN_ID) with \`python -m tests.shard_durations --max-unlisted 0.1\` on the four unit JUnit reports of the latest green \`main\` run. Opened with GITHUB_TOKEN, so \`ci\` does not start by itself: close and reopen this pull request to run its checks."

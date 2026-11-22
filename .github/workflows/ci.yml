@@ -58,6 +58,9 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}
           TEST_SHARDS: 4
           TEST_IDS: ${{ runner.temp }}/beeverforge-test-ids/ran-unit-${{ matrix.shard }}.txt
+          # the shard's JUnit report, uploaded with its ids: refresh-shard-durations.yml rebuilds
+          # tests/shard_durations.json from the four of the latest green main run (#649)
+          TEST_JUNIT: ${{ runner.temp }}/beeverforge-test-ids/junit-unit-${{ matrix.shard }}.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

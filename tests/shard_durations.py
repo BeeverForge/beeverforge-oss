@@ -2,6 +2,11 @@
 
     python -m tests.shard_durations <junit.xml> [<junit.xml> ...] [--out PATH]
 
+`.github/workflows/refresh-shard-durations.yml` runs it weekly, on the four unit reports of the
+latest green `main` run, and opens a pull request when the table changed:
+
+    python -m tests.shard_durations --max-unlisted 0.1 <junit.xml> [<junit.xml> ...]
+
 WHAT THE TABLE IS FOR. `--shard=I/N` (`tests/conftest.py`) gives each CI unit job whole test files,
 and balances them by this table: longest first, each to the least-loaded shard. A shard skips
 every file another shard owns before it imports it, so each job collects only its part (#356).

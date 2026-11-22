@@ -508,8 +508,9 @@ def test_the_refresh_runs_the_builders_command_on_the_four_reports_ci_writes():
     documented = _documented_refresh()
     assert documented == ["python", "-m", "tests.shard_durations", "--max-unlisted", "0.1"], documented
     workflow = _workflow(REFRESH)
-    lines = [line for _job, step in _steps(workflow) for line in step.get("run", "").splitlines()
-             if "tests.shard_durations" in line]
+    lines = [line.strip() for _job, step in _steps(workflow)
+             for line in step.get("run", "").splitlines()
+             if re.match(r"\s*(\S+/)?python\S*\s+-m\s+tests\.shard_durations\b", line)]
     assert len(lines) == 1, lines
     words = shlex.split(lines[0])
     assert words[:len(documented)] == documented, (words, documented)
