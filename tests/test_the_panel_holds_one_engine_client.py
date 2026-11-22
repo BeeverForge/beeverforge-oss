@@ -203,19 +203,32 @@ async def test_a_MOVED_engine_gets_a_new_client(engine, monkeypatch):
     assert first is not second
 
 
-async def test_a_CHANGED_CREDENTIAL_gets_a_new_client_at_the_same_address(engine, monkeypatch):
+async def test_a_KEY_THAT_APPEARS_gets_a_new_client_at_the_same_address(engine, monkeypatch):
     """The half that makes the auth digest in the key a guard rather than a decoration: a
-    redeployment that rotates the API key while keeping the address must not be served by a client
-    still holding the old credential."""
+    redeployment that starts presenting an API key while keeping the address must not be served by
+    a client opened without one."""
+    first = await tv.connect()
+    monkeypatch.setenv("TEMPORAL_API_KEY", "key-after-the-redeployment")
+    second = await tv.connect()
+
+    assert engine.calls == 2, (
+        f"a key appeared and the pool opened {engine.calls} clients — the address never "
+        f"changed, so only the auth material in the key can tell these apart")
+    assert first is not second
+
+
+async def test_a_ROTATED_KEY_keeps_the_client_it_is_handed_to(engine, monkeypatch):
+    """A key whose VALUE changes is the same target (#657): the process's one client is handed the
+    new key in place (`connection.refresh_api_key`, held in
+    `test_the_engine_connection_presents_a_certificate_and_a_key_it_reads_again.py`), so the pool
+    keeps it rather than opening a client the worker beside it would never be given."""
     monkeypatch.setenv("TEMPORAL_API_KEY", "key-before-the-rotation")
     first = await tv.connect()
     monkeypatch.setenv("TEMPORAL_API_KEY", "key-after-the-rotation")
     second = await tv.connect()
 
-    assert engine.calls == 2, (
-        f"the credential rotated and the pool opened {engine.calls} clients — the address never "
-        f"changed, so only the auth material in the key can tell these apart")
-    assert first is not second
+    assert engine.calls == 1, f"a rotated key opened {engine.calls} clients"
+    assert first is second
 
 
 # ── 8. and the secret does not travel in it ─────────────────────────────────────────────────────

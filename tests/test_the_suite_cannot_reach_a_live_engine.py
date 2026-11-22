@@ -148,12 +148,16 @@ def test_a_file_that_lifts_the_barrier_really_starts_its_OWN_engine(path):
     else carrying this marker is a file that opted out of the guard without earning it — which is
     how a documented exception becomes a pass.
 
-    `WorkflowEnvironment` is the only thing in this stack that starts one: it picks a free port,
-    owns the server's whole life, and tears it down with the fixture.
+    `WorkflowEnvironment` starts one: it picks a free port, owns the server's whole life, and tears
+    it down with the fixture. The other is a real server image started for the module in a
+    container that removes itself (`docker run --rm` of `temporalio/auto-setup`, #657), on a port
+    Docker picks — the one way to test what the ephemeral server cannot be configured with, such
+    as mutual TLS beside an authorizer.
     """
     src = path.read_text()
+    in_a_container = "temporalio/auto-setup" in src and '"--rm"' in src
 
-    assert "WorkflowEnvironment" in src, (
+    assert "WorkflowEnvironment" in src or in_a_container, (
         f"{path.name} lifts the live-engine barrier and never starts an ephemeral server — it is "
         f"opting out of the guard rather than earning the exception")
     assert "localhost:7233" not in src and "TEMPORAL_ADDRESS" not in src, (
