@@ -23,7 +23,7 @@ WHAT IS HELD HERE, through `_auth()`, `fingerprint()` and the real `connection.c
   · the pool key changes with the CA's contents and with whether a key is set, never with the
     key's value, and carries neither;
   · a key that changed where it is stored is handed to the client the process already holds — on
-    the next `connect()`, and by the refresher every `TEMPORAL_API_KEY_REFRESH_SECONDS` for a
+    the next `connect()`, and by the refresher every `TEMPORAL_AUTH_REFRESH_SECONDS` for a
     holder that never asks again (the worker) — through the client's `api_key` setter, without a
     second `Client.connect`;
   · a re-read that is refused or answers nothing keeps the key the client has, said once by name;
@@ -80,7 +80,7 @@ def engine(monkeypatch):
     was handed and answering a `_Client`."""
     monkeypatch.setenv("TEMPORAL_ADDRESS", "engine.example:7233")
     for name in ("TEMPORAL_ENDPOINT", "TEMPORAL_API_KEY", "TEMPORAL_TLS_CERT", "TEMPORAL_TLS_KEY",
-                 "TEMPORAL_TLS_SERVER_CA_CERT", "TEMPORAL_API_KEY_REFRESH_SECONDS",
+                 "TEMPORAL_TLS_SERVER_CA_CERT", "TEMPORAL_AUTH_REFRESH_SECONDS",
                  "BEEVERFORGE_LOG_FORMAT", STORE_VAR, DIR_VAR):
         monkeypatch.delenv(name, raising=False)
     made: list[dict] = []
@@ -315,7 +315,7 @@ def test_a_reread_that_fails_KEEPS_the_key_and_says_so_by_name(
 async def test_a_held_client_with_a_key_has_ONE_refresher_and_it_ends_with_the_client(
         engine, monkeypatch, tmp_path):
     monkeypatch.setenv("TEMPORAL_API_KEY", FIRST)
-    monkeypatch.setenv("TEMPORAL_API_KEY_REFRESH_SECONDS", "3600")
+    monkeypatch.setenv("TEMPORAL_AUTH_REFRESH_SECONDS", "3600")
 
     client = await connection.connect()
     await connection.connect()
@@ -351,11 +351,11 @@ async def test_forget_stops_the_refresher(engine, monkeypatch):
 ])
 def test_the_refresh_interval_is_a_setting(monkeypatch, declared, every):
     if declared is None:
-        monkeypatch.delenv(connection.API_KEY_REFRESH_VAR, raising=False)
+        monkeypatch.delenv(connection.AUTH_REFRESH_VAR, raising=False)
     else:
-        monkeypatch.setenv(connection.API_KEY_REFRESH_VAR, declared)
+        monkeypatch.setenv(connection.AUTH_REFRESH_VAR, declared)
 
-    assert connection.API_KEY_REFRESH_VAR == "TEMPORAL_API_KEY_REFRESH_SECONDS"
+    assert connection.AUTH_REFRESH_VAR == "TEMPORAL_AUTH_REFRESH_SECONDS"
     assert connection.api_key_refresh_every() == every
 
 

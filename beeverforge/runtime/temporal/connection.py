@@ -12,7 +12,7 @@ The SAME code runs everywhere (ADR-0001 D-16); only the connection target change
             presented and the key is sent as the bearer token (#657)
     any:    TEMPORAL_TLS_SERVER_CA_CERT=/path/engine-ca.pem        (the engine's CA, for this
                                                                     connection alone)
-            TEMPORAL_API_KEY_REFRESH_SECONDS=60                    (how often a stored key is
+            TEMPORAL_AUTH_REFRESH_SECONDS=60                       (how often a stored key is
                                                                     read again)
 """
 
@@ -518,15 +518,15 @@ def forget() -> None:
 
 #: How often, in seconds, the API key of the client this process holds is read again from where it
 #: is stored. A deployment whose key is a short-lived token sets it below the token's lifetime.
-API_KEY_REFRESH_VAR = "TEMPORAL_API_KEY_REFRESH_SECONDS"
+AUTH_REFRESH_VAR = "TEMPORAL_AUTH_REFRESH_SECONDS"
 _API_KEY_REFRESH_S = 60.0
 
 
 def api_key_refresh_every() -> float:
-    """The refresh interval: `TEMPORAL_API_KEY_REFRESH_SECONDS`, read per call; unset, or not a
+    """The refresh interval: `TEMPORAL_AUTH_REFRESH_SECONDS`, read per call; unset, or not a
     finite number of seconds above zero, `_API_KEY_REFRESH_S`."""
     try:
-        wanted = float(os.environ.get("TEMPORAL_API_KEY_REFRESH_SECONDS", "") or _API_KEY_REFRESH_S)
+        wanted = float(os.environ.get("TEMPORAL_AUTH_REFRESH_SECONDS", "") or _API_KEY_REFRESH_S)
     except ValueError:
         return _API_KEY_REFRESH_S
     return wanted if math.isfinite(wanted) and wanted > 0 else _API_KEY_REFRESH_S

@@ -322,7 +322,7 @@ def deployed(engine, monkeypatch, tmp_path):
     """This engine's settings as a deployment sets them: the certificate and its key, the server
     CA, and the API key as a file in the `file` credential store. Answers the key's file."""
     for name in ("TEMPORAL_ENDPOINT", "TEMPORAL_API_KEY", "BEEVERFORGE_LOG_FORMAT",
-                 "TEMPORAL_API_KEY_REFRESH_SECONDS"):
+                 "TEMPORAL_AUTH_REFRESH_SECONDS"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(connection, "address", lambda: engine.address)
     monkeypatch.setenv("TEMPORAL_NAMESPACE", NAMESPACE)
