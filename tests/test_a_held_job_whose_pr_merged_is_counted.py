@@ -103,6 +103,40 @@ def test_a_merge_for_another_pull_request_is_still_journalled():
     assert len([e for e in _journal() if e["message"] == "merged"]) == 2
 
 
+@pytest.mark.parametrize("journalled, held", [("12", "1"), ("1", "12")])
+def test_a_pull_request_that_is_a_prefix_of_another_is_not_the_same_merge(journalled, held):
+    base = "https://forge.example/acme/pull/"
+    end_closed({**JOB, "pr_url": base + journalled}, project=ACME, pr_status=forge("merged"))
+    assert end_closed({**JOB, "pr_url": base + held}, project=ACME,
+                      pr_status=forge("merged")) == "merged"
+    assert len([e for e in _journal() if e["message"] == "merged"]) == 2
+    assert {r["pr_url"] for r in _rows()} == {base + journalled, base + held}
+
+
+def test_the_merged_event_carries_the_pr_url_as_its_own_field():
+    _pass("merged")
+    (event,) = [e for e in _journal() if e["message"] == "merged"]
+    assert event["data"]["pr_url"] == PR
+
+
+def _legacy_merged(pr):
+    from beeverforge.observability.job_record import record_ending
+    record_ending(ACME, "7", "merged", by="the platform",
+                  note=f"its ticket was closed by the merged pull request {pr}")
+
+
+def test_a_legacy_merged_line_without_the_field_is_matched_on_the_whole_url():
+    base = "https://forge.example/acme/pull/"
+    _legacy_merged(base + "12")
+    assert end_closed({**JOB, "pr_url": base + "1"}, project=ACME,
+                      pr_status=forge("merged")) == "merged"
+    assert end_closed({**JOB, "pr_url": base + "12"}, project=ACME,
+                      pr_status=forge("merged")) is None
+    _legacy_merged(base + "7.")  # punctuation after the URL still ends it
+    assert end_closed({**JOB, "pr_url": base + "7"}, project=ACME,
+                      pr_status=forge("merged")) is None
+
+
 def test_two_threads_ending_one_job_leave_one_merged_line(monkeypatch):
     from beeverforge.api import attention
 

@@ -106,6 +106,21 @@ def settle(
     return kept
 
 
+def _names(data: dict, pr: str) -> bool:
+    """Whether a `merged` line's data names the pull request `pr`.
+
+    The `pr_url` field is compared for EQUALITY. A line from before the field existed is matched on
+    the whole URL as a token in its `reason`: followed by the end, a space or punctuation, never by
+    more of a number (`/pull/1` is not in `/pull/12`) and never preceded by more of a URL."""
+    import re
+
+    if "pr_url" in data:
+        return data["pr_url"] == pr
+    if not pr:
+        return False
+    return re.search(rf"(?<![\w/:.-]){re.escape(pr)}(?![\w/-])", str(data.get("reason") or "")) is not None
+
+
 def _already_ended(project: Project, issue: str, state: str, pr: str = "") -> bool:
     """Whether this ending is in the journal already (a pass that raced, or a stale list).
 
@@ -130,8 +145,7 @@ def _already_ended(project: Project, issue: str, state: str, pr: str = "") -> bo
             continue
         data = event.get("data") or {}
         if state == "merged":
-            if (event.get("message") == "merged" and "by" in data
-                    and pr in str(data.get("reason") or "")):
+            if event.get("message") == "merged" and "by" in data and _names(data, pr):
                 return True
             continue
         return event.get("message") == state and "by" in data
@@ -191,7 +205,7 @@ def end_closed(
                 return None
             if status == "merged":
                 record_job_ending(project=name, issue=issue, state="merged", pr_url=pr)
-                return record_ending(project, issue, "merged", by=BY_THE_PLATFORM,
+                return record_ending(project, issue, "merged", by=BY_THE_PLATFORM, pr_url=pr,
                                      note=f"its ticket was closed by the merged pull request {pr}")
             note = (f"its ticket was closed and pull request {pr} was not merged" if pr
                     else "its ticket was closed and it has no pull request")

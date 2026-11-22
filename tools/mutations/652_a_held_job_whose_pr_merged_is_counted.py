@@ -13,7 +13,8 @@ Each cut breaks one claim of `tests/test_a_held_job_whose_pr_merged_is_counted.p
   6. a closed-without-a-merge ticket writes the merged row too;
   7. the shared deadline is never checked, so a slow pass records every job;
   8. each ending is given the whole budget instead of what is left of it;
-  9. a job with no pull request is left listed instead of ending as closed.
+  9. a job with no pull request is left listed instead of ending as closed;
+ 10. the pull request is matched as a substring of the journalled reason, not by its own field.
 """
 
 TEST = "tests/test_a_held_job_whose_pr_merged_is_counted.py"
@@ -31,8 +32,8 @@ MUTATIONS = [
      TEST + "::test_a_merge_already_journalled_earlier_is_not_journalled_again"),
 
     ("the merged guard ignores which pull request", ATTENTION,
-     "and pr in str(data.get(\"reason\") or \"\")):",
-     "):",
+     "and \"by\" in data and _names(data, pr):",
+     "and \"by\" in data:",
      TEST + "::test_a_merge_for_another_pull_request_is_still_journalled"),
 
     ("a failed forge read is taken for merged", ATTENTION,
@@ -66,4 +67,9 @@ MUTATIONS = [
      "    status = \"closed\"\n    if pr:\n",
      "    status = \"open\"\n    if pr:\n",
      TEST + "::test_a_job_without_a_pr_whose_ticket_is_closed_ends_closed_and_counts_nothing"),
+
+    ("the pull request is matched by substring", ATTENTION,
+     "    if \"pr_url\" in data:\n        return data[\"pr_url\"] == pr\n",
+     "    return pr in str(data.get(\"reason\") or \"\")\n",
+     TEST + "::test_a_pull_request_that_is_a_prefix_of_another_is_not_the_same_merge"),
 ]

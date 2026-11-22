@@ -170,7 +170,8 @@ BY_THE_ATTENDED_DRIVER = "the attended driver"
 BY_THE_PLATFORM = "the attention list"
 
 
-def record_ending(project, issue: str, state: str, *, by: str, note: str = "") -> str:
+def record_ending(project, issue: str, state: str, *, by: str, note: str = "",
+                  pr_url: str = "") -> str:
     """Append a job's ENDING to its card's journal — a `state` line that carries `by` — and return
     the state written. RAISES what the journal raises: each caller decides what a failure means.
 
@@ -183,12 +184,14 @@ def record_ending(project, issue: str, state: str, *, by: str, note: str = "") -
     second one cannot grow a second shape of the line.
 
     APPENDS, NEVER REWRITES: the box's own `state` lines say how far the job got, and carry a
-    `reason`, never a `by` (`machine._set_state`); this adds what it became."""
+    `reason`, never a `by` (`machine._set_state`); this adds what it became. A `pr_url` is written
+    as its own field, so a reader compares it for equality instead of searching the `reason`."""
     from beeverforge.observability.events import JobEvent, now_iso
     from beeverforge.observability.registry import journal_for
     from beeverforge.paths import events_file
 
     journal_for(events_file(project, issue)).emit(JobEvent(
         ts=now_iso(), job_id=f"#{issue}", ticket_id=f"#{issue}", kind="state", message=state,
-        data={"reason": (note or "").strip() or None, "by": by}))
+        data={"reason": (note or "").strip() or None, "by": by,
+              **({"pr_url": pr_url} if pr_url else {})}))
     return state
