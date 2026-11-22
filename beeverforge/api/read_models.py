@@ -137,6 +137,8 @@ class JournalJob(ReadModel):
     events: int | None = None
     pr_url: str | None = None
     cost_usd: Number | None = None
+    #: On `/api/attention` only: why the entry could not be checked against its ticket (#651).
+    note: str | None = None
 
 
 class JournalJobs(RootModel[list[JournalJob]]):

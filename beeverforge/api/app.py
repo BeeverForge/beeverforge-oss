@@ -1706,14 +1706,47 @@ class JournalUnreadable(RuntimeError):
 
 
 @_read("/api/attention", read_models.JournalJobs)
-def attention() -> list[dict]:
+async def attention() -> list[dict]:
     """Jobs that need a human — the operator's inbox (A5). One place to see every
-    on-hold / needs-refinement / paused / awaiting-approval job across projects."""
+    on-hold / needs-refinement / paused / awaiting-approval job across projects.
+
+    A job whose workflow is not running and whose ticket is closed has nothing left for a person
+    (#651); it is read once per project, bounded, and a read that fails keeps the entry listed."""
     # The engine's list, read where it costs no `temporalio` (#178): this route reads the JOURNAL
     # (`list_jobs()` here is this module's own), so it answers on an install without the extra.
+    from beeverforge.api import attention as settling
     from beeverforge.runtime.temporal.vocabulary import ATTENTION_STATES
 
-    return [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]
+    held = [j for j in list_jobs() if j.get("state") in ATTENTION_STATES]
+    if not held:
+        return held
+    running = await _running_workflows()
+    return await asyncio.to_thread(
+        settling.settle, held, running=running, closed_refs=_closed_refs_of)
+
+
+async def _running_workflows() -> set[tuple[str, str]] | None:
+    """`(project, issue)` of every live workflow, `None` when the engine could not be asked."""
+    try:
+        tv, _addr, ns = _temporal()
+        client = await asyncio.wait_for(tv.connect(), timeout=5)
+        rows = await asyncio.wait_for(tv.list_jobs(client, ns), timeout=5)
+    except Exception as exc:  # unknown is said on each entry, not hidden
+        logging.getLogger("beeverforge.panel").info("attention: engine unreadable: %r", exc)
+        return None
+    return {(str(r.get("project")), str(r.get("issue")))
+            for r in rows if r.get("status") == "running"}
+
+
+def _closed_refs_of(project: str) -> set[str] | None:
+    """The refs of a project's closed tickets in ONE bulk read; `None` when unreadable."""
+    from beeverforge.adapters.tracker.registry import build_tracker
+    from beeverforge.credentials import deployment_tracker_token, tracker_token_for
+
+    proj = _project_or_404(project)
+    token = tracker_token_for(proj) or deployment_tracker_token(proj)
+    tickets = build_tracker(proj, token=token).list_tickets(state="closed")
+    return None if tickets is None else {str(t.ref) for t in tickets}
 
 
 def _verdict_of(read: dict, job: dict) -> dict:
