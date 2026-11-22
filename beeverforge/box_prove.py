@@ -266,6 +266,10 @@ class Proof:
     #: (proven with zero findings recorded).
     findings: list[Finding] | None = field(default_factory=list)
     at: str = ""
+    #: WHY THIS PROOF NO LONGER DESCRIBES THE BOX, said by whoever changed it (#569): the project's
+    #: `box.image` was set to another. Empty = nothing says so. A new proof is a new record, so it
+    #: clears itself.
+    stale: str = ""
 
     def failures(self) -> list[Finding]:
         """What makes this proof not ok — and therefore what holds a pickup.
@@ -1210,7 +1214,7 @@ def save(proof: Proof, *, root: Path | None = None) -> Path | None:
             "project": proof.project, "image": proof.image, "ok": proof.ok,
             "digest": proof.digest, "toolbox": proof.toolbox,
             "commands_hash": proof.commands_hash, "at": proof.at,
-            "toolchain": proof.toolchain,
+            "toolchain": proof.toolchain, "stale": proof.stale,
         }
         if proof.findings is not None:
             doc["findings"] = [f.to_dict() for f in proof.findings]
@@ -1248,7 +1252,31 @@ def load(project: str, *, root: Path | None = None) -> Proof | None:
                  ok=bool(data.get("ok")), digest=data.get("digest", ""),
                  toolbox=data.get("toolbox", ""),
                  commands_hash=data.get("commands_hash", ""), at=data.get("at", ""),
-                 toolchain=data.get("toolchain", ""), findings=findings)
+                 toolchain=data.get("toolchain", ""), findings=findings,
+                 stale=str(data.get("stale", "") or ""))
+
+
+def mark_stale(project: str, why: str, *, root: Path | None = None) -> int:
+    """Say, on every recorded proof of `project` (its own and each foreign repository's), that it
+    no longer describes the box — so the gate holds with `why` and the worker proves again (#569).
+
+    NEVER RAISES, and counts the proofs it marked: the image is already written when this runs, and
+    an unwritable proofs directory must not turn a saved setting into a refusal. `save` says why a
+    proof could not be written."""
+    folder = root or _proof_dir()
+    try:
+        names = [project] + sorted(p.stem for p in folder.glob(f"{project}--*.json"))
+    except OSError as exc:
+        log.warning("could not list the proofs of %s to mark them stale (%s)", project, exc)
+        return 0
+    marked = 0
+    for name in names:
+        proof = load(name, root=root)
+        if proof is None or proof.stale == why:
+            continue
+        proof.stale = why
+        marked += 1 if save(proof, root=root) else 0
+    return marked
 
 
 # ── one project's proof, asked: the `box_prove` row's work (#237, ADR-0039) ─────────────────────
@@ -2155,6 +2183,8 @@ def gate_reason(project, *, sandbox: str, repo: str = "") -> str | None:
         return f"{subject} has never been proven — {run_it}"
     if not proof.ok:
         return _the_failure_said(proof, run_it)
+    if proof.stale:
+        return Expired(f"{proof.stale} — {run_it}")
 
     try:
         from beeverforge.loader import load_manifest

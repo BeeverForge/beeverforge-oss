@@ -8039,6 +8039,56 @@ async def _project_set_language(*, project: str, language: str, by: Actor) -> Ou
                 language=chosen)
 
 
+async def _project_set_box_image(*, project: str, by: Actor, image: str = "") -> Outcome:
+    """Which image this project's box runs — `box.image`, written the way `project_set_preview`
+    writes its field. An empty `image` clears it back to the deployment's default.
+
+    REFUSES WHAT `box prove` REFUSES BEFORE IT STARTS (#539): the same `resolve_box_image`, asked
+    of the box this deployment runs, says an image its sandbox kind cannot honour; and a reference
+    that does not parse is refused with it. Every refusal is `INVALID` with "Nothing was changed".
+
+    AN IMAGE THAT CHANGED MARKS EVERY RECORDED PROOF OF THE PROJECT STALE, so the gate holds with
+    the reason and the next job or `box prove` proves the box in the new image. The same image set
+    again is no change: nothing is written and no proof is marked."""
+    from beeverforge import box_prove
+    from beeverforge.contracts.project import BoxConfig
+    from beeverforge.factory import image_refused, resolve_box_image
+    from beeverforge.registry import ProjectRegistry
+    from beeverforge.runtime.temporal.io import default_sandbox
+
+    found, bad = _project(project)
+    if bad:
+        return bad
+    wanted = str(image or "").strip()
+    why = image_refused(wanted) if wanted else ""
+    if not why and wanted:
+        box = (found.box or BoxConfig()).model_copy(update={"image": wanted})
+        try:
+            resolve_box_image(found.model_copy(update={"box": box}), sandbox=default_sandbox())
+        except ValueError as exc:
+            why = str(exc)
+    if why:
+        return refused(INVALID, f"the image was not changed — {' '.join(why.split())[:400]}. "
+                                f"Nothing was changed.", project=found.name, image=wanted)
+    try:
+        changed = ProjectRegistry().set_box_image(found.name, wanted)
+    except KeyError:
+        return _no_such_project(project)
+    marked = 0
+    if changed:
+        previous = (found.box.image if found.box else None) or "the deployment's default"
+        now = wanted or "the deployment's default"
+        marked = box_prove.mark_stale(found.name,
+                                      f"the box image was changed ({previous} → {now})")
+    said = (f"{found.name}: box image {wanted!r}" if wanted else
+            f"{found.name}: box image cleared — the deployment's default applies")
+    said += (" — unchanged" if not changed else
+             f" — the box's proof is stale, so the next job or `box prove {found.name}` proves "
+             f"it in the new image" if marked else
+             " — takes effect on the next job (no proof was recorded to go stale)")
+    return done(said, project=found.name, image=wanted, changed=changed, stale=marked)
+
+
 def _either(value: object) -> bool | None:
     """A yes or a no a caller handed in any spelling — `None` when it handed neither, which a
     policy reads as "keep what is there". Consent is `_said_yes`'s; this adds the no."""
@@ -10278,6 +10328,23 @@ CATALOG: dict[str, ActionSpec] = {
             needs_code=False,
             params={"language": "a language tag, e.g. `en` or `pt-BR` — any tag the project's "
                                 "agents understand"},
+        ),
+        ActionSpec(
+            name="project_set_box_image",
+            summary="say which image a project's box runs; empty goes back to the deployment's "
+                    "default, and a changed image marks the box proof stale",
+            run=_project_set_box_image,
+            refuses=(INVALID, NOT_FOUND),
+            required=("project",),
+            # OPTIONAL BECAUSE EMPTY IS AN ANSWER: a required parameter that is empty is "missing"
+            # to the catalogue, and clearing the image is what an empty one asks for
+            optional=("image",),
+            installation=True,
+            # A PROJECT BEFORE ITS CODE IS SET TOO (#992): this is the registry's row for it, and
+            # reads nothing of the code
+            needs_code=False,
+            params={"image": "an image reference, e.g. `ghcr.io/acme/box:1.2`; empty clears it "
+                             "back to the deployment's default"},
         ),
         ActionSpec(
             name="project_set_preview",

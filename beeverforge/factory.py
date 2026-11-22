@@ -345,6 +345,21 @@ def _authenticated(project, url: str, token: str | None) -> str:
         return url
 
 
+_IMAGE_REFERENCE = re.compile(
+    r"(?:[A-Za-z0-9.-]+:[0-9]+/)?[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[0-9a-f]{64})?")
+
+
+def image_refused(image: str) -> str:
+    """Why `image` is not an image reference, or "" when it is (#569): `[host[:port]/]name[/name]
+    [:tag][@sha256:digest]`. A value `docker run` would read as a flag or split on a space is
+    refused here, where the setting is written."""
+    if not _IMAGE_REFERENCE.fullmatch(image or ""):
+        return (f"{image!r} is not an image reference — name[:tag] or "
+                f"host/name[:tag][@sha256:...], with no spaces")
+    return ""
+
+
 def resolve_box_image(project=None, *, explicit: str | None = None,
                       sandbox: str | None = None) -> str:
     """WHICH IMAGE the box runs — decided here and nowhere else (ADR-0037 D4).

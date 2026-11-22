@@ -4470,9 +4470,10 @@ def factory(project: str) -> dict:
     # which the panel renders as its own sentence — a project whose pickup we cannot check is not
     # a project we may describe as armed.
     pickup: bool | None = None
-    single_agent, review_mode = True, ""
+    single_agent, review_mode, box_image = True, "", ""
     try:
         proj = ProjectRegistry().get(project)
+        box_image = (proj.box.image if proj.box else None) or ""
         pickup = bool(getattr(proj, "enabled", True))
         # ASKED OF THE BOARD, NOT SPELLED HERE (#162). This built
         # `https://github.com/{orgs|users}/{owner}/projects/{n}` by hand, from GitHub Projects v2
@@ -4531,6 +4532,8 @@ def factory(project: str) -> dict:
         "single_agent": single_agent,
         "review_mode": review_mode,
         "models": models,  # per-role, resolved through the registry (env → project → default)
+        # what `project set-box-image` wrote; empty = the deployment's default is in force (#569)
+        "box_image": box_image,
         "region": region,
         # THE BOARDS THIS DEPLOYMENT CAN BUILD ON SOMEBODY'S SERVICE, EACH BY ITS ROW'S OWN NAME.
         # The cockpit's how-to spelled three vendors in the page — so an installed add-on's board
