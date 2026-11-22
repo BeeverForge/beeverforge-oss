@@ -198,12 +198,13 @@ async def _running(client, project: str, issue: str) -> bool:
     """Whether the engine holds a RUNNING workflow for this job. A workflow it does not know is not
     running; any other failure is the engine's and is raised as it came, never read as "ended"."""
     from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError
 
     from beeverforge.runtime.temporal import view as tv
 
     try:
         described = await tv.job_handle(client, project, issue).describe()
-    except Exception as exc:  # noqa: BLE001
+    except RPCError as exc:
         if _looks_missing(exc):
             return False
         raise

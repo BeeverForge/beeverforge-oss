@@ -121,3 +121,38 @@ def test_the_panel_attention_row_offers_it_escaped():
 
     html = (Path(catalog.__file__).parents[1] / "api" / "panel.html").read_text()
     assert 'data-k="dismiss"' in html and "act/dismiss" in html
+
+
+class _Handle:
+    def __init__(self, result):
+        self.result = result
+
+    async def describe(self):
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return SimpleNamespace(status=self.result)
+
+
+async def _ask_running(monkeypatch, result):
+    from beeverforge.runtime.temporal import view as tv
+
+    monkeypatch.setattr(tv, "job_handle", lambda client, project, issue: _Handle(result))
+    # the autouse fixture replaces `_running`; call the real one
+    return await _real_running(object(), "acme", "7")
+
+
+_real_running = catalog._running
+
+
+@pytest.mark.asyncio
+async def test_running_reads_the_engines_status_and_a_missing_workflow_is_not_running(monkeypatch):
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError, RPCStatusCode
+
+    assert await _ask_running(monkeypatch, WorkflowExecutionStatus.RUNNING) is True
+    assert await _ask_running(monkeypatch, WorkflowExecutionStatus.COMPLETED) is False
+    missing = RPCError("workflow not found", RPCStatusCode.NOT_FOUND, b"")
+    assert await _ask_running(monkeypatch, missing) is False
+    other = RPCError("deadline exceeded", RPCStatusCode.DEADLINE_EXCEEDED, b"")
+    with pytest.raises(RPCError):
+        await _ask_running(monkeypatch, other)
