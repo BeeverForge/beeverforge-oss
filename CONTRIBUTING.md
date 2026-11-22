@@ -80,11 +80,12 @@ tells you to rather than guessing.
 shard never imports a file another shard owns. The files are balanced by
 `tests/shard_durations.json`, the measured seconds of each test file. A file the table does not
 list still runs in exactly one shard, picked by its path, so a stale table only costs balance.
-Refresh it after you add or move heavy test files, or when CI's four unit job times drift apart.
-Write the JUnit report outside the tree, then rebuild the table from it:
-
-    python -m pytest -q -n auto -p no:randomly -m "not (owns_its_engine or slow or alone)" --junitxml=/tmp/unit.xml
-    python -m tests.shard_durations /tmp/unit.xml
+A workflow, `refresh-shard-durations.yml`, rebuilds it: weekly, and on demand from the Actions tab
+(`workflow_dispatch`). It reads the four unit JUnit reports of the latest green `main` run, runs
+`python -m tests.shard_durations --max-unlisted 0.1` on them, and opens a pull request when the
+table changed (none when it did not). It fails, naming the files, when more than 10% of the test
+files are still unlisted after its own rebuild. So do not refresh the table by hand in a change
+that adds a test file; the workflow does it.
 
 **What green looks like.** pytest's last line reads `N passed, M skipped` and some warnings — no
 `failed`, no `error` — and `make test` exits 0. Skips are normal and each says why: in this public

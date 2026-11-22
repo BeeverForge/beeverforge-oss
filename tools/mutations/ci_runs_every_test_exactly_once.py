@@ -8,7 +8,8 @@ The claims, each a row:
      on the probe and on the real tree, a file the duration table does not list included; a
      shard never imports or skips by key a file it does not own, and the table's refresh credits
      every test to its file; an xdist run writes each test it started once, a skipped one
-     included;
+     included; the refresh fails, naming the files, when too large a share of the tree is unlisted
+     after its own rebuild, and the unit run writes a JUnit report when `TEST_JUNIT` is set;
   2. the proof fails on a test missing, doubled or unknown, and on an empty collection;
   3. CI wires it: the `test` job needs every job and runs the proof, the slices are the matrix's,
      the three runs' markers split the suite without overlap, and the guard on CI's pytest follows
@@ -64,6 +65,14 @@ MUTATIONS = [
      TREE),
     ("the refresh credits a class's tests to no file", REFRESH,
      "    for end in range(len(parts), 0, -1):", "    for end in [len(parts)]:"),
+    ("the refresh never fails on unlisted files", REFRESH,
+     "        if len(missing) > args.max_unlisted * len(files):", "        if False:"),
+    ("the refresh names no unlisted file", REFRESH,
+     '"\\n  ".join(missing), file=sys.stderr)', '"", file=sys.stderr)'),
+    ("the refresh counts a listed file as unlisted", REFRESH,
+     "        missing = sorted(files - table.keys())", "        missing = sorted(files)"),
+    ("the unit run never writes a JUnit report", "Makefile",
+     " $(if $(TEST_JUNIT),--junitxml=$(TEST_JUNIT))", ""),
     ("an xdist worker records too, so every test is written twice", CONF,
      '    if record and not hasattr(config, "workerinput"):', "    if record:"),
     ("a test is recorded when it is called, so a skipped one is missing", CONF,
