@@ -84,10 +84,10 @@ async def test_an_issue_nothing_ran_for_is_not_found():
     assert _journal("99") == []
 
 
-@pytest.mark.parametrize("bad", ["../7", "CONT-7", "7a", "7\n"])
+@pytest.mark.parametrize("bad", ["../7", "CONT-7", "7a", "7 8"])
 async def test_the_issue_must_be_digits(bad):
     out = await _dismiss(bad)
-    assert not out.ok and out.code in (actions.INVALID, actions.NOT_FOUND)
+    assert not out.ok and out.code == actions.INVALID
     assert not [e for e in _journal() if e["message"] == "dismissed"]
 
 
@@ -116,11 +116,46 @@ def test_the_cli_invokes_the_action(monkeypatch):
     assert asked == [("dismiss", {"project": "acme", "issue": "7", "why": "shipped"}, "cli")]
 
 
-def test_the_panel_attention_row_offers_it_escaped():
+def _dismiss_row_markup() -> str:
     from pathlib import Path
 
     html = (Path(catalog.__file__).parents[1] / "api" / "panel.html").read_text()
-    assert 'data-k="dismiss"' in html and "act/dismiss" in html
+    (line,) = [x for x in html.splitlines() if x.lstrip().startswith("const dismiss=")]
+    return line
+
+
+def test_the_panel_attention_row_offers_it():
+    html_line = _dismiss_row_markup()
+    assert 'data-k="dismiss"' in html_line and 'data-act="dismissJob"' in html_line
+
+
+def test_every_value_the_dismiss_row_interpolates_goes_through_esc():
+    import re
+
+    line = _dismiss_row_markup()
+    template = line[line.index("`"):line.rindex("`") + 1]
+    holes = re.findall(r"\$\{(.*?)\}", template)
+    assert holes, "the row interpolates nothing — the test would prove nothing"
+    assert all(re.fullmatch(r"esc\([A-Za-z_.]+\)", h) for h in holes), holes
+
+
+@pytest.mark.parametrize("state", ["merged", "done", "failed_and_ended"])
+async def test_a_job_that_is_not_held_is_refused_and_unchanged(state):
+    if state == "failed_and_ended":
+        state = "closed"
+    record_ending(ACME, "7", state, by="the workflow", note="")
+    before = events_file(ACME, "7").read_text()
+    out = await _dismiss()
+    assert out.code == actions.CONFLICT and state in out.message
+    assert events_file(ACME, "7").read_text() == before
+
+
+async def test_a_dismissed_job_is_a_successful_no_op():
+    _hold()
+    await _dismiss()
+    before = events_file(ACME, "7").read_text()
+    out = await _dismiss()
+    assert out.ok and events_file(ACME, "7").read_text() == before
 
 
 class _Handle:
@@ -156,3 +191,65 @@ async def test_running_reads_the_engines_status_and_a_missing_workflow_is_not_ru
     other = RPCError("deadline exceeded", RPCStatusCode.DEADLINE_EXCEEDED, b"")
     with pytest.raises(RPCError):
         await _ask_running(monkeypatch, other)
+
+
+async def test_only_the_status_code_says_no_such_workflow_never_the_text(monkeypatch):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    text_only = RPCError("workflow not found", RPCStatusCode.UNAVAILABLE, b"")
+    with pytest.raises(RPCError):
+        await _ask_running(monkeypatch, text_only)
+    code_only = RPCError("no such execution", RPCStatusCode.NOT_FOUND, b"")
+    assert await _ask_running(monkeypatch, code_only) is False
+
+
+async def test_a_missing_namespace_is_not_a_missing_workflow(monkeypatch):
+    from temporalio.api.common.v1 import GrpcStatus
+    from temporalio.api.errordetails.v1 import NamespaceNotFoundFailure
+    from temporalio.service import RPCError, RPCStatusCode
+
+    status = GrpcStatus()
+    status.details.add().Pack(NamespaceNotFoundFailure(namespace="nope"))
+    gone = RPCError("namespace nope is not found", RPCStatusCode.NOT_FOUND,
+                    status.SerializeToString())
+    with pytest.raises(RPCError):
+        await _ask_running(monkeypatch, gone)
+
+
+async def test_an_engine_error_refuses_and_writes_nothing(monkeypatch):
+    from temporalio.service import RPCError, RPCStatusCode
+
+    async def broken(client, project, issue):
+        raise RPCError("deadline exceeded", RPCStatusCode.DEADLINE_EXCEEDED, b"")
+
+    monkeypatch.setattr(catalog, "_running", broken)
+    _hold()
+    before = events_file(ACME, "7").read_text()
+    out = await _dismiss()
+    assert not out.ok and out.code == actions.UNAVAILABLE
+    assert events_file(ACME, "7").read_text() == before
+
+
+async def test_the_journal_is_checked_and_written_only_while_the_lock_is_held(monkeypatch):
+    from beeverforge.api import attention
+    from beeverforge.observability import job_record
+    from beeverforge.util.filelock import lock_beside
+
+    lock = lock_beside(events_file(ACME, "7"))
+    held_at = {}
+    real_check, real_write = attention._already_ended, job_record.record_ending
+
+    def check(*a, **k):
+        held_at["check"] = lock.held_here()
+        return real_check(*a, **k)
+
+    def write(*a, **k):
+        held_at["write"] = lock.held_here()
+        return real_write(*a, **k)
+
+    monkeypatch.setattr(attention, "_already_ended", check)
+    monkeypatch.setattr(job_record, "record_ending", write)
+    _hold()
+    held_at.clear()
+    assert (await _dismiss()).ok
+    assert held_at == {"check": True, "write": True}
