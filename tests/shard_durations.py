@@ -3,7 +3,8 @@
     python -m tests.shard_durations <junit.xml> [<junit.xml> ...] [--out PATH]
 
 `.github/workflows/refresh-shard-durations.yml` runs it weekly, on the four unit reports of the
-latest green `main` run, and opens a pull request when the table changed:
+latest green `main` run, and pushes a branch for a maintainer to open as a pull request when the
+table changed:
 
     python -m tests.shard_durations --max-unlisted 0.1 <junit.xml> [<junit.xml> ...]
 

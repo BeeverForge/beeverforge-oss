@@ -16,7 +16,7 @@ The claims, each a row:
      the Makefile; each unit job writes its JUnit report into the artifact it uploads, and the
      shard table's refresh workflow runs the builder's documented command, share included, on the
      four reports CI writes (the newest attempt of each), weekly and on demand, with only its
-     pull-request job allowed to write, no expression in a shell, and a pull request only when
+     hand-off job allowed to write, no expression in a shell, and a branch handed off only when
      the table changed;
   4. a test that asserts its own CPU time is marked `alone` and runs with no xdist neighbours;
   5. the real-daemon tests are in the `docker` group, and the integration run distributes by it.
@@ -32,8 +32,8 @@ REFRESH = "tests/shard_durations.py"
 WORKFLOW = ".github/workflows/refresh-shard-durations.yml"
 COMMAND = f"{GUARD}::test_the_refresh_runs_the_builders_command_on_the_four_reports_ci_writes"
 PRIVILEGE = (f"{GUARD}::"
-             "test_the_refresh_runs_weekly_and_on_demand_and_only_its_pull_request_job_may_write")
-CHANGED = f"{GUARD}::test_the_refresh_opens_a_pull_request_only_when_the_table_changed"
+             "test_the_refresh_runs_weekly_and_on_demand_and_only_its_hand_off_job_may_write")
+CHANGED = f"{GUARD}::test_the_refresh_hands_off_only_when_the_table_changed"
 
 MUTATIONS = [
     # 1. the slices, and what a run records
@@ -163,18 +163,20 @@ MUTATIONS = [
     ("the job that runs the tree's code may write", WORKFLOW,
      "      contents: read\n      actions: read\n", "      contents: write\n      actions: read\n",
      PRIVILEGE),
-    ("the pull-request job may also write actions", WORKFLOW,
-     "      pull-requests: write\n", "      pull-requests: write\n      actions: write\n",
+    # RE-PINNED 2026-11-23 (#656): the pull-request job became the hand-off job, which writes
+    # contents only; tools/mutations/656_the_shard_refresh_hands_off.py holds the rest of it.
+    ("the hand-off job may also write actions", WORKFLOW,
+     "      contents: write\n", "      contents: write\n      actions: write\n",
      PRIVILEGE),
     ("the refresh interpolates an expression into a shell", WORKFLOW,
      'branch="refresh-shard-durations/$GITHUB_RUN_ID"',
      'branch="refresh-shard-durations/${{ github.ref_name }}"', PRIVILEGE),
-    ("the refresh opens a pull request when nothing changed", WORKFLOW,
+    ("the refresh hands off a branch when nothing changed", WORKFLOW,
      "    if: needs.rebuild.outputs.changed == 'true'\n", "", CHANGED),
     ("the rebuild says changed whatever the diff", WORKFLOW,
      'if git diff --quiet -- tests/shard_durations.json; then\n            echo "the table',
      'if false; then\n            echo "the table', CHANGED),
-    ("the pull-request job does not ask main again", WORKFLOW,
+    ("the hand-off job does not ask main again", WORKFLOW,
      'if git diff --quiet -- tests/shard_durations.json; then\n            echo "main already',
      'if false; then\n            echo "main already', CHANGED),
     # 4. a test that asserts its own CPU time runs alone
