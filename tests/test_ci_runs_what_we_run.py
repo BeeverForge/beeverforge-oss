@@ -547,19 +547,51 @@ def test_the_refresh_runs_the_builders_command_on_the_four_reports_ci_writes():
     assert pick[4] == folder.pop(), (pick, reports)
 
 
-def test_the_refresh_runs_weekly_and_on_demand_and_only_its_pull_request_job_may_write():
+# #656: the last job opened the pull request itself, with `gh pr create` and GITHUB_TOKEN. That
+# needs the repository setting "Allow GitHub Actions to create and approve pull requests", which is
+# off here and is one switch for creating AND approving: with it on, any workflow step holding
+# `pull-requests: write` could approve a pull request, and main's one required approval would count
+# it. A pull request GITHUB_TOKEN opens starts no workflow either, so it got no `ci` run. So the job
+# pushes a branch with `contents: write` only and hands a maintainer the link that opens the pull
+# request; the person's pull request is the person's event, and `ci` runs on it.
+
+#: a command that opens, approves or merges a pull request on GitHub, by its CLI or its API
+_PULL_REQUEST_BY_WORKFLOW = re.compile(
+    r"\bgh\s+pr\s+(create|merge|review)\b|\bgh\s+api\b.*\bpulls\b")
+#: an action that does the same from a `uses:`
+_PULL_REQUEST_ACTION = re.compile(r"pull-request|approve|merge", re.IGNORECASE)
+#: a command that runs code: an interpreter, a build tool, or a script by its path
+_RUNS_CODE = re.compile(
+    r"(^|[;&|(]\s*)(python\S*|pip\S*|pytest|make|npm|npx|node|uv|bash|sh|source|\.)\s|(^|\s)\./")
+
+
+def _shell_lines(step: dict) -> list[str]:
+    """The commands of a step's `run:`, comment lines left out: a comment is not a command."""
+    return [line.strip() for line in step.get("run", "").splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def _hand_off(workflow: dict) -> tuple[str, dict, dict]:
+    """The one job that pushes, and its one step that does."""
+    pushes = [(name, step) for name, step in _steps(workflow)
+              if any(line.startswith("git push") for line in _shell_lines(step))]
+    assert len(pushes) == 1, f"the refresh should push from exactly one step: {pushes}"
+    name, step = pushes[0]
+    return name, workflow["jobs"][name], step
+
+
+def test_the_refresh_runs_weekly_and_on_demand_and_only_its_hand_off_job_may_write():
     workflow = _workflow(REFRESH)
 
     assert set(workflow["on"]) == {"workflow_dispatch", "schedule"}, workflow["on"]
     assert [entry.get("cron") for entry in workflow["on"]["schedule"]], workflow["on"]["schedule"]
     assert workflow["permissions"] == {"contents": "read"}, workflow["permissions"]
-    openers = {job for job, step in _steps(workflow) if "gh pr create" in step.get("run", "")}
-    assert len(openers) == 1, openers
+    hand_off, _job, _step = _hand_off(workflow)
     for name, job in workflow["jobs"].items():
         granted = job.get("permissions")
         assert isinstance(granted, dict), f"{name} inherits instead of naming its permissions"
-        if name in openers:
-            assert granted == {"contents": "write", "pull-requests": "write"}, (name, granted)
+        if name == hand_off:
+            assert granted == {"contents": "write"}, (name, granted)
         else:
             assert set(granted.items()) <= {("contents", "read"), ("actions", "read")}, (name, granted)
     for job, step in _steps(workflow):
@@ -569,10 +601,25 @@ def test_the_refresh_runs_weekly_and_on_demand_and_only_its_pull_request_job_may
     assert "pull_request_target" not in workflow["on"] and "secrets." not in text
 
 
-def test_the_refresh_opens_a_pull_request_only_when_the_table_changed():
+def test_no_step_of_the_refresh_opens_approves_or_merges_a_pull_request():
     workflow = _workflow(REFRESH)
-    (opener,) = {job for job, step in _steps(workflow) if "gh pr create" in step.get("run", "")}
-    job = workflow["jobs"][opener]
+
+    for name, scope in [("the workflow", workflow), *workflow["jobs"].items()]:
+        granted = scope.get("permissions") or {}
+        assert not isinstance(granted, str) or "write" not in granted, (name, granted)
+        assert isinstance(granted, str) or granted.get("pull-requests") != "write", (
+            f"{name} may write pull requests; the hand-off needs `contents: write` only", granted)
+    for job, step in _steps(workflow):
+        for line in _shell_lines(step):
+            assert not _PULL_REQUEST_BY_WORKFLOW.search(line), (
+                f"{job} opens, approves or merges a pull request; push a branch and link its form",
+                line)
+        assert not _PULL_REQUEST_ACTION.search(str(step.get("uses", ""))), (job, step["uses"])
+
+
+def test_the_refresh_hands_off_only_when_the_table_changed():
+    workflow = _workflow(REFRESH)
+    hand_off, job, push = _hand_off(workflow)
     (rebuild,) = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
 
     assert job.get("if") == f"needs.{rebuild}.outputs.changed == 'true'", job.get("if")
@@ -581,6 +628,110 @@ def test_the_refresh_opens_a_pull_request_only_when_the_table_changed():
     assert step_id, output
     diff = next(step for step in workflow["jobs"][rebuild]["steps"] if step.get("id") == step_id[1])
     assert "git diff --quiet -- tests/shard_durations.json" in diff["run"], diff
-    # and the job that opens it asks again, against main as it is by then
-    opens = next(step["run"] for step in job["steps"] if "gh pr create" in step.get("run", ""))
-    assert opens.index("git diff --quiet -- tests/shard_durations.json") < opens.index("gh pr create")
+    # and the job that pushes asks again, against main as it is by then
+    lines = _shell_lines(push)
+    asks = next(i for i, line in enumerate(lines)
+                if "git diff --quiet -- tests/shard_durations.json" in line)
+    pushes = next(i for i, line in enumerate(lines) if line.startswith("git push"))
+    assert asks < pushes, (hand_off, lines)
+
+
+def test_the_hand_off_runs_no_code_from_the_tree():
+    _name, job, _step = _hand_off(_workflow(REFRESH))
+
+    uses = [str(step["uses"]).split("@")[0] for step in job["steps"] if "uses" in step]
+    assert set(uses) <= {"actions/checkout", "actions/download-artifact"}, uses
+    checkout = next(step for step in job["steps"]
+                    if str(step.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"]["ref"] == "main", checkout
+    for step in job["steps"]:
+        for line in _shell_lines(step):
+            assert not _RUNS_CODE.search(line), f"the hand-off runs code: {line}"
+
+
+#: the expressions a hand-off step may read through `env:`, and what the run below hands each
+_CONTEXT = {"${{ github.repository }}": "example-owner/example-repo"}
+_MAIN_TABLE = '{\n  "tests/test_a.py": 1.0\n}\n'
+_REBUILT_TABLE = '{\n  "tests/test_a.py": 2.5,\n  "tests/test_b.py": 0.5\n}\n'
+_RUN_ID = "4242"
+
+
+def _run_hand_off(tmp_path: Path, rebuilt: str) -> tuple[subprocess.CompletedProcess[str], Path, str]:
+    """The hand-off step's own shell, run as the runner runs it, in a clone of a `main` that holds
+    `_MAIN_TABLE`, with `rebuilt` as the artifact the rebuild job uploaded. Returns the run, the
+    bare remote it pushes to, and what it wrote to the step summary."""
+    _name, job, step = _hand_off(_workflow(REFRESH))
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GITHUB_RUN_ID": _RUN_ID, "RUNNER_TEMP": str(runner),
+           "GITHUB_STEP_SUMMARY": str(runner / "summary.md"),
+           "GITHUB_OUTPUT": str(runner / "output"),
+           "GITHUB_REPOSITORY": _CONTEXT["${{ github.repository }}"]}
+    for key, value in (step.get("env") or {}).items():
+        assert value in _CONTEXT, f"the hand-off reads {key}={value}, which this test does not hand"
+        env[key] = _CONTEXT[value]
+
+    def git(*argv: str, cwd: Path) -> str:
+        return subprocess.run(["git", *argv], cwd=cwd, env=env, check=True, capture_output=True,
+                              text=True).stdout
+
+    remote, tree = tmp_path / "origin.git", tmp_path / "tree"
+    git("init", "-q", "--bare", "-b", "main", str(remote), cwd=tmp_path)
+    git("init", "-q", "-b", "main", str(tree), cwd=tmp_path)
+    (tree / "tests").mkdir()
+    (tree / "tests" / "shard_durations.json").write_text(_MAIN_TABLE, encoding="utf-8")
+    git("add", "-A", cwd=tree)
+    git("-c", "user.name=main", "-c", "user.email=main@example.invalid", "commit", "-q", "-m",
+        "main", cwd=tree)
+    git("remote", "add", "origin", str(remote), cwd=tree)
+    git("push", "-q", "origin", "main", cwd=tree)
+
+    download = next(step for step in job["steps"]
+                    if str(step.get("uses", "")).startswith("actions/download-artifact@"))
+    folder = Path(download["with"]["path"].replace("${{ runner.temp }}", str(runner)))
+    folder.mkdir(parents=True)
+    (folder / "shard_durations.json").write_text(rebuilt, encoding="utf-8")
+
+    script = runner / "step.sh"
+    script.write_text(step["run"], encoding="utf-8")
+    ran = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                         cwd=tree, env=env, capture_output=True, text=True)
+    summary = runner / "summary.md"
+    return ran, remote, summary.read_text(encoding="utf-8") if summary.exists() else ""
+
+
+def _in_remote(remote: Path, *argv: str) -> str:
+    return subprocess.run(["git", "--git-dir", str(remote), *argv], capture_output=True, text=True,
+                          check=True).stdout
+
+
+def _branches(remote: Path) -> list[str]:
+    return _in_remote(remote, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+
+
+def test_the_hand_off_pushes_the_branch_and_links_the_form_that_opens_its_pull_request(tmp_path):
+    ran, remote, summary = _run_hand_off(tmp_path, _REBUILT_TABLE)
+    branch = f"refresh-shard-durations/{_RUN_ID}"
+
+    # green: a changed table is the outcome the run exists for, not a failure
+    assert ran.returncode == 0, (ran.stdout, ran.stderr)
+    assert _branches(remote) == ["main", branch], _branches(remote)
+    assert _in_remote(remote, "show", f"{branch}:tests/shard_durations.json") == _REBUILT_TABLE
+    touched = _in_remote(remote, "diff", "--name-only", "main", branch).split()
+    assert touched == ["tests/shard_durations.json"], touched
+    link = (f"https://github.com/{_CONTEXT['${{ github.repository }}']}"
+            f"/compare/main...{branch}?expand=1")
+    assert link in summary, summary
+    assert "no-release-note" in summary, summary
+    warnings = [line for line in ran.stdout.splitlines() if line.startswith("::warning")]
+    assert len(warnings) == 1 and branch in warnings[0], ran.stdout
+
+
+def test_the_hand_off_pushes_nothing_when_main_already_holds_the_table(tmp_path):
+    ran, remote, summary = _run_hand_off(tmp_path, _MAIN_TABLE)
+
+    assert ran.returncode == 0, (ran.stdout, ran.stderr)
+    assert _branches(remote) == ["main"], _branches(remote)
+    assert "/compare/" not in summary, summary
+    assert "::warning" not in ran.stdout, ran.stdout
