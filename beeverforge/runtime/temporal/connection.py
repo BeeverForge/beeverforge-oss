@@ -59,11 +59,19 @@ _ADDRESS_VARS = ENGINE.reach_vars
 
 
 class EngineNotDeclared(RuntimeError):
-    """Nobody said where the durable engine is.
+    """Nobody said where the durable engine is — or a setting the engine connection is told to use
+    names a file that cannot be read.
 
     ITS OWN TYPE, because every caller of `address()` already has an except-branch that degrades
     honestly, and this must land there rather than in a generic handler that reports "the engine
     did not answer" — which is the sentence a silent localhost produced for a year.
+
+    AND THE CONNECTION'S CONFIGURATION REFUSAL (review of CORE!664): every entry point that dials
+    the engine at birth — the worker, the starter, the schedules — turns this type into its one
+    sentence and an exit code, so a TLS file that is missing or unreadable is said there as what
+    it is, naming its setting, rather than as a bare `FileNotFoundError` traceback. `address()`
+    never raises it for that, so the callers that ask `address()` alone still read it as an engine
+    nobody declared.
     """
 
 
@@ -111,6 +119,12 @@ def _auth() -> dict:
     #
     # THE ENGINE'S OWN CA (#657): `TEMPORAL_TLS_SERVER_CA_CERT` is this connection's root and no
     # other's, so pinning the engine's CA does not change what the rest of the process trusts.
+    # AND IT IS THE ONLY ROOT (review of CORE!664, read in the source of temporalio 1.36.1): the
+    # client core hands it to tonic as `ca_certificate` and calls `with_native_roots()` only when
+    # none is set (sdk-core `crates/client/src/lib.rs` 678-684), and tonic 0.14.9 adds the system's
+    # roots to a connector only when that was called (`transport/channel/service/tls.rs` 107-130);
+    # the build carries no webpki roots. Held against a real server, with the system's roots made
+    # to trust the engine: tests/test_a_worker_holds_its_engine_under_mutual_tls_and_a_token.py.
     from beeverforge.adapters.credential_store.registry import lookup
 
     api_key = lookup("TEMPORAL_API_KEY")
@@ -125,15 +139,35 @@ def _auth() -> dict:
     server_ca = os.environ.get("TEMPORAL_TLS_SERVER_CA_CERT")
     tls: dict[str, bytes] = {}
     if cert and key:  # a client certificate: classic mTLS, or mTLS beside the key
-        tls["client_cert"] = Path(cert).read_bytes()
-        tls["client_private_key"] = Path(key).read_bytes()
+        tls["client_cert"] = _tls_file("TEMPORAL_TLS_CERT", cert, "the client certificate")
+        tls["client_private_key"] = _tls_file("TEMPORAL_TLS_KEY", key,
+                                              "the client certificate's private key")
     if server_ca:
-        tls["server_root_ca_cert"] = Path(server_ca).read_bytes()
+        tls["server_root_ca_cert"] = _tls_file(
+            "TEMPORAL_TLS_SERVER_CA_CERT", server_ca,
+            "the CA the engine's server certificate is checked against")
     auth: dict = {"tls": TLSConfig(**tls)} if tls else {}
     if api_key.value:  # API-key auth, which needs TLS: the system's roots when nothing else says
         auth["api_key"] = api_key.value
         auth.setdefault("tls", True)
     return auth  # nothing set: a plain dev server
+
+
+def _tls_file(setting: str, path: str, what: str) -> bytes:
+    """The bytes of the TLS file `setting` names — or `EngineNotDeclared`, in one sentence.
+
+    FAILURES SPEAK BY NAME (review of CORE!664): `read_bytes()` raised the bare
+    `FileNotFoundError` or `PermissionError`, which names a path but neither the setting that put
+    it there nor what to do. The sentence names the setting, the path, the cause and the remedy,
+    and never the file's bytes: the OS's own words for why it cannot be read, and nothing it read.
+    Raised `from None`, so a log does not print the bare error beneath it as a traceback."""
+    try:
+        return Path(path).read_bytes()
+    except OSError as exc:
+        raise EngineNotDeclared(
+            f"the engine setting {setting} names {path} as {what}, and it cannot be read "
+            f"({exc.strerror or type(exc).__name__}): point {setting} at a PEM file this "
+            f"process's user can read, or unset it") from None
 
 
 #: How much of the auth digest travels in a pool key. Twelve hex characters is 48 bits — far more
@@ -584,27 +618,37 @@ def _landed(client: Client) -> None:
         _PRESENTED["held"] = _Presented(client=id(client), good_at=_now())
 
 
-def _settle(client: Client, read: int, value: str | None, refused: str = "") -> bool:
+def _settle(client: Client, read: int, value: str | None, refused: str = "",
+            failed: bool = False) -> bool:
     """Settle what read number `read` of `TEMPORAL_API_KEY` answered — `value`, or why there was
-    none — against `client`. True when the client was handed a new key.
+    none, `failed` when the store raised rather than answering — against `client`. True when the
+    client was handed a new key.
 
     THE NEWEST READ WINS (review of the #657 branch). `connect()` and the refresher read the store
     on their own threads, and a read that started first can end last: without the number, the
     refresher's read of the old key landed after `connect()` had handed over the new one, and put
     the old one back. A read older than one already settled changes nothing and says nothing.
 
-    A READ THAT ANSWERS NO KEY keeps the one the client holds for `BEEVERFORGE_STORED_TOKEN_TTL`
-    after the last read that answered one — the grace a stored forge token is given, for the same
-    reason: a store that is briefly unreachable must not end the worker's polls. Past it the
-    client presents NO key, so a key removed or revoked where it is stored stops being presented
-    within a bounded time, rather than for as long as the process lives (a key that is not a
-    token never expires on the server). It fails closed: the server then refuses the calls.
+    A READ THE STORE REFUSES DROPS THE KEY AT ONCE (review of CORE!664): the client presents no
+    key from that read on. The store said no on purpose — a file anyone may rewrite, a reference
+    it will not follow — and a new `connect()` with that refusal fails at once (`_auth()`, review
+    of #822), so the client already held must not go on presenting what a new one would never be
+    made with. It is the same answer, asked of the same store, a moment later.
 
-    THE GRACE IS READ ONCE, when the lapse begins, and kept until a read answers a key again.
+    A READ THAT ANSWERS NOTHING — the key gone from the store, or the store failing (unreachable, a
+    timeout: `Answer.failed`) — keeps the key the client holds for `BEEVERFORGE_STORED_TOKEN_TTL`
+    after the last read that answered one: the grace a stored forge token is given, for the same
+    reason, a store that is briefly away must not end the worker's polls. Past it the client
+    presents NO key, so a key removed or revoked where it is stored stops being presented within a
+    bounded time, rather than for as long as the process lives (a key that is not a token never
+    expires on the server). Both fail closed: the server then refuses the calls.
 
-    SAID ONCE PER CHANGE OF STATE, by name, never by value: a refusal (the store will not hand it
-    over, perhaps for a moment) apart from a key nobody holds any more, and each apart from the
-    key being let go of. A refusal that persists is one line, not one per interval."""
+    THE GRACE IS READ ONCE, when the lapse begins, and kept until a read answers a key again. A key
+    already let go of is not kept by a later silence inside it.
+
+    SAID ONCE PER CHANGE OF STATE, by name, never by value: a refusal, a store that did not answer
+    and a key nobody holds any more, each apart from the others and from the key being let go
+    of. A state that persists is one line, not one per interval."""
     from beeverforge.credentials import STORED_TOKEN_TTL_VAR, _stored_token_ttl
 
     with _PRESENTING:
@@ -626,28 +670,38 @@ def _settle(client: Client, read: int, value: str | None, refused: str = "") -> 
                      "engine client presents the new one from its next call, without "
                      "reconnecting")
             return True
-        # READ ONCE PER LAPSE (re-review of #657): asked at every read, an unreadable setting was
-        # said at every interval for as long as the store stayed silent.
-        if state.grace is None:
-            state.grace = _stored_token_ttl()
-        ttl = state.grace
-        why = "refused" if refused else "gone"
-        if now - state.good_at < ttl:
-            phase = "kept"
+        holding = getattr(client, "api_key", None) is not None
+        if refused and not failed:
+            # A REFUSAL IS FINAL, from this read: no grace is asked for (review of CORE!664).
+            why, phase, ttl = "refused", "dropped", 0.0
         else:
-            phase = "dropped"
-            if getattr(client, "api_key", None) is not None:
-                client.api_key = None
+            # READ ONCE PER LAPSE (re-review of #657): asked at every read, an unreadable setting
+            # was said at every interval for as long as the store stayed silent.
+            if state.grace is None:
+                state.grace = _stored_token_ttl()
+            ttl = state.grace
+            why = "failed" if refused else "gone"
+            phase = "kept" if holding and now - state.good_at < ttl else "dropped"
+        if phase == "dropped" and holding:
+            client.api_key = None
         if state.said == (why, phase):
             return False
         state.said = (why, phase)
-        what = (f"is refused by its store ({refused})" if refused
-                else "is no longer held by its store (it answered nothing)")
+        what = {"refused": f"is refused by its store ({refused})",
+                "failed": f"was not read: its store did not answer ({refused})",
+                "gone": "is no longer held by its store (it answered nothing)"}[why]
         if phase == "kept":
             log.warning("the engine credential TEMPORAL_API_KEY %s; the engine client keeps "
                         "presenting the key it holds until %s (%gs) has passed since the store "
                         "last answered one, %gs from now", what, STORED_TOKEN_TTL_VAR, ttl,
                         max(0.0, state.good_at + ttl - now))
+        elif not holding:
+            log.warning("the engine credential TEMPORAL_API_KEY %s; the engine client still "
+                        "presents no key, until its store answers one again", what)
+        elif why == "refused":
+            log.warning("the engine credential TEMPORAL_API_KEY %s; the engine client presents no "
+                        "key from now on, as a new connection would not be made with it, and the "
+                        "engine refuses what needs one", what)
         else:
             log.warning("the engine credential TEMPORAL_API_KEY %s, and %s (%gs) has passed since "
                         "the store last answered one; the engine client presents no key from now "
@@ -664,13 +718,14 @@ def refresh_api_key(client: Client) -> bool:
     restarted it. Read here through the credential store as `_auth()` reads it — a file rewritten
     in place, a store that answers a fresh token — and handed to the client the process already
     holds, so neither the connection nor the worker on it is restarted. A read that answers no key
-    is settled by `_settle`: a bounded grace, then no key. The store's own sentence is asked for
-    quietly, because `_settle`'s is the one that says what happens."""
+    is settled by `_settle`: a refusal drops the key at once; a store that answered nothing gets a
+    bounded grace, then no key. The store's own sentence is asked for quietly, because `_settle`'s
+    is the one that says what happens."""
     from beeverforge.adapters.credential_store.registry import lookup
 
     read = next(_READS)
     found = lookup("TEMPORAL_API_KEY", quiet=True)
-    return _settle(client, read, found.value, found.refused)
+    return _settle(client, read, found.value, found.refused, found.failed)
 
 
 class _KeyRefresh:
