@@ -43,9 +43,9 @@ release manager's explicit **go**. Every result is written in the release's **tr
 
 | role | who, today | what they decide or do |
 |---|---|---|
-| release manager | @robertocsp | the cut date, what goes in, every tag, the go/no-go for each release |
+| release manager | @hcristia | the cut date, what goes in, every tag, the go/no-go for each release |
 | reviewer | @hermesfelipe | reviews every pull request, the version and backport pull requests included |
-| deputy release manager | @hermesfelipe | takes the role when the release manager cannot: the `v*` ruleset lists both, so a release never waits on one person |
+| deputy release manager | @guilhermelfranco | takes the role when the release manager cannot: the `v*` ruleset lists both, so a release never waits on one person |
 | release agent | `release-manager` | audits, prepares the pull requests, runs the rehearsals, previews and assembles the notes. It never tags, publishes, merges or changes a setting without the release manager's explicit go |
 
 ## Running it with the agent
