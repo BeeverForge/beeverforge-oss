@@ -1143,6 +1143,13 @@ class _ConflictSandbox(WorktreeSandbox):
         return "conflict"
 
 
+class _RebaseFailsSandbox(WorktreeSandbox):
+    """Reports a rebase that failed for a reason that is not a conflict (#276)."""
+
+    def rebase_onto_base(self, *, workspace, base, remote_url=None) -> str:
+        raise RuntimeError("rebase failed: Unable to create index.lock: File exists.")
+
+
 def _sizing_ticket_id(tid: str) -> Ticket:
     return Ticket(
         id=tid, title="add feature", objective="add a feature", repo="o/app",
@@ -1190,6 +1197,21 @@ def test_auto_merge_holds_on_conflict(repo: Path, tmp_path: Path):
     assert "conflicts with main" in result.note
     assert not runner.forge.merged
     assert runner.forge.opened is not None  # PR stays open for the human
+
+
+def test_auto_merge_holds_on_a_rebase_that_failed_for_its_cause(repo: Path, tmp_path: Path):
+    # not a conflict → the hold says what git said, not "conflicts with main" (#276).
+    tracker = FakeTracker(_sizing_ticket_id("#34"))
+    manifest = Manifest(merge_policy="auto", validate={"test": "true", "security": "true"})
+    sandbox = _RebaseFailsSandbox(root=tmp_path / "wt")
+    runner = _runner(repo, tracker, manifest, tmp_path, sandbox=sandbox)
+
+    result = runner.run("#34")
+
+    assert result.state is JobState.ON_HOLD
+    assert "could not rebase: rebase failed: Unable to create index.lock" in result.note
+    assert "conflicts with" not in result.note
+    assert not runner.forge.merged
 
 
 def test_auto_merge_holds_when_merge_fails(repo: Path, tmp_path: Path):

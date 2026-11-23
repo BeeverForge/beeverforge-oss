@@ -4186,9 +4186,13 @@ class JobRunner:
         result and re-push before merging — so nothing lands stale (a textual merge that
         breaks against newer code never sneaks in). A textual conflict, a post-rebase
         validation failure, or an unmergeable PR holds for a human — it never crashes."""
-        status = self.sandbox.rebase_onto_base(
-            workspace=ws, base=base, remote_url=self.forge.push_remote()
-        )
+        try:
+            status = self.sandbox.rebase_onto_base(
+                workspace=ws, base=base, remote_url=self.forge.push_remote()
+            )
+        except RuntimeError as exc:  # git's own sentence, redacted by the box (#276)
+            return self._hold(ticket, owner, f"could not rebase: {exc}", JobState.ON_HOLD,
+                              branch=branch, pr_url=pr)
         if status == "conflict":
             return self._hold(
                 ticket, owner,
