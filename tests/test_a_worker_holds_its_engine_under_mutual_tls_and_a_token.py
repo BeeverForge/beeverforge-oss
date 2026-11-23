@@ -19,7 +19,11 @@ its key, the server CA, and the API key as a file in the `file` credential store
   3. the token without the certificate is refused at the handshake, before any authorizer;
   4. a token rotated in place reaches the held client without a reconnect, and the worker on it
      keeps polling: an already-expired token is refused by the server once it is presented, and the
-     fresh one after it runs the next workflow on the same worker.
+     fresh one after it runs the next workflow on the same worker;
+  5. the pinned CA REPLACES the system's roots for this connection, never adds to them: with the
+     system's roots made to trust the engine (`SSL_CERT_FILE`, which the client core's native
+     roots read), the engine is answered without a pinned CA and refused under a pinned CA that
+     did not sign it (review of CORE!664).
 
 BOUNDED: the only real waits are the readiness poll (at most `READY_WITHIN_S`) and each workflow's
 bound. The engine's address is the port Docker published for this module's container, handed to
@@ -487,3 +491,40 @@ async def test_a_token_ROTATED_IN_PLACE_keeps_the_worker_polling(deployed, engin
         assert await _a_job(client, queue) == "polled", "the worker stopped polling"
 
     assert await connection.connect(within=20) is client, "the rotation made a new client"
+
+
+async def test_the_pinned_CA_REPLACES_the_system_roots_and_never_adds_to_them(
+        deployed, engine, monkeypatch, tmp_path):
+    """The point of pinning is that nothing else is trusted for this connection. So the system's
+    roots are made to trust this engine — `SSL_CERT_FILE`, which `rustls-native-certs` reads in
+    place of the platform store — and the same connection is made twice:
+
+      · NO pinned CA: answered, which shows the system's roots are the ones in use, and that they
+        do trust this server;
+      · a pinned CA that did NOT sign the server: refused at the handshake as an unknown issuer.
+        Had the pinned CA been added to the system's roots, the second would have been answered
+        as the first was.
+    """
+    pem = serialization.Encoding.PEM
+    monkeypatch.setenv("SSL_CERT_FILE", engine.ca)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.delenv("TEMPORAL_TLS_SERVER_CA_CERT")
+    ask = DescribeNamespaceRequest(namespace=NAMESPACE)
+
+    client = await connection.connect(within=20)
+    await client.workflow_service.describe_namespace(ask)
+    connection.forget()
+    stranger = _certificate("another-ca-657", _key(), ca=True)
+    monkeypatch.setenv("TEMPORAL_TLS_SERVER_CA_CERT",
+                       _write(tmp_path / "another-ca.pem", stranger.public_bytes(pem)))
+
+    with pytest.raises(RuntimeError) as refused:
+        pinned = await connection.connect(within=20)
+        await pinned.workflow_service.describe_namespace(ask)
+
+    said = str(refused.value)
+    assert not isinstance(refused.value, RPCError), (
+        f"a server certificate the pinned CA did not sign reached the server's API ({said}): the "
+        f"system's roots were trusted beside the pinned CA")
+    assert "UnknownIssuer" in said, (
+        f"the connection failed, but not because the pinned CA did not sign the server: {said}")

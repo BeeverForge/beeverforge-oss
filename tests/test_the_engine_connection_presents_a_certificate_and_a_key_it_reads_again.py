@@ -26,7 +26,10 @@ WHAT IS HELD HERE, through `_auth()`, `fingerprint()` and the real `connection.c
     the next `connect()`, and by the refresher every `TEMPORAL_AUTH_REFRESH_SECONDS` for a
     holder that never asks again (the worker) — through the client's `api_key` setter, without a
     second `Client.connect`;
-  · a re-read that is refused or answers nothing keeps the key the client has, said once by name;
+  · a re-read whose store answers nothing — the key gone, the store failing — keeps the key the
+    client has for a bounded grace; a re-read the store REFUSES drops it at once, as a new
+    `connect()` would not be made with it; each said once by name;
+  · a TLS file that cannot be read is refused in one sentence naming its setting, never its bytes;
   · no key value reaches a log line.
 
 No test here waits on real time: the refresher's wait is handed in. The same properties against a
@@ -291,13 +294,24 @@ def test_the_refresher_hands_a_rotated_key_to_a_holder_that_never_asks_again(
     assert client.api_key == SECOND
 
 
-@pytest.mark.parametrize("how", ["refused", "gone"])
-def test_a_reread_that_fails_KEEPS_the_key_and_says_so_by_name(
+def _store_fails(monkeypatch) -> None:
+    """The `file` store raising what an unreachable store raises: it answered nothing, and it
+    refused nothing."""
+    from beeverforge.adapters.credential_store.file import FileStore
+
+    def silent(self, name):
+        raise TimeoutError("the store did not answer in time")
+
+    monkeypatch.setattr(FileStore, "resolve", silent)
+
+
+@pytest.mark.parametrize("how", ["store-failed", "gone"])
+def test_a_reread_that_ANSWERS_NOTHING_keeps_the_key_and_says_so_by_name(
         engine, monkeypatch, tmp_path, caplog, how):
     held = _stored_key(monkeypatch, tmp_path, FIRST)
     client = _Client(1, FIRST)
-    if how == "refused":
-        held.chmod(0o666)   # anyone may write it: the file store refuses it
+    if how == "store-failed":
+        _store_fails(monkeypatch)
     else:
         held.unlink()
 
@@ -306,7 +320,8 @@ def test_a_reread_that_fails_KEEPS_the_key_and_says_so_by_name(
 
     assert presented is False
     assert client.set_to == [] and client.api_key == FIRST, (
-        "a re-read that failed replaced the key the client holds — a refusal is not a new key")
+        "a re-read that answered nothing replaced the key the client holds — silence is not a "
+        "new key")
     said = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(said) == 1 and "TEMPORAL_API_KEY" in said[0], said
     assert FIRST not in caplog.text
@@ -451,22 +466,104 @@ def test_a_key_GONE_from_its_store_is_kept_for_the_grace_then_dropped(
     assert FIRST not in caplog.text
 
 
-def test_a_REFUSED_reread_is_said_as_a_refusal_not_as_a_key_nobody_holds(
+def test_a_REFUSED_reread_DROPS_the_key_at_once_as_a_new_connect_would(
         engine, monkeypatch, tmp_path, caplog, clock):
+    """The store said no on purpose — a file anyone may rewrite — which is not a store that went
+    quiet. A new `connect()` with that refusal fails at once (`_auth()`, review of #822), so the
+    held client must not go on presenting the key for the grace either (review of CORE!664)."""
     held = _stored_key(monkeypatch, tmp_path, FIRST)
     client = _Client(1, FIRST)
-    connection.refresh_api_key(client)
+    connection.refresh_api_key(client)                  # the last good read, at 1000
     held.chmod(0o666)
 
     with caplog.at_level(logging.DEBUG):
-        for at in (1010.0, 1020.0, 1030.0, 1040.0):
+        clock.at = 1010.0                               # well inside the grace
+        connection.refresh_api_key(client)
+        first = list(client.set_to)
+        for at in (1020.0, 1030.0, 1040.0):
             clock.at = at
             connection.refresh_api_key(client)
 
+    assert first == [None], (
+        f"the first refused read handed the client {first!r}: a key the store refuses was still "
+        f"presented inside BEEVERFORGE_STORED_TOKEN_TTL")
+    assert client.set_to == [None] and client.api_key is None, client.set_to
     said = _warnings(caplog)
     assert len(said) == 1, f"a refusal that persists was said {len(said)} times: {said}"
-    assert "refused" in said[0] and "no longer held" not in said[0], said[0]
-    assert client.api_key == FIRST
+    assert "refused" in said[0] and "no key" in said[0], said[0]
+    assert "no longer held" not in said[0] and "keeps presenting" not in said[0], said[0]
+    with pytest.raises(RuntimeError, match="TEMPORAL_API_KEY"):
+        connection._auth()                              # and a new connect() is refused alike
+    assert FIRST not in caplog.text
+
+
+def test_a_store_that_FAILS_keeps_the_key_for_the_grace_and_is_not_said_as_a_refusal(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    """An unreachable store, a timeout: the store answered nothing, and the grace is for exactly
+    that — a store briefly away must not end the worker's polls."""
+    _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    connection.refresh_api_key(client)                  # the last good read, at 1000
+    _store_fails(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        for at in (1010.0, 1050.0, 1099.0):             # inside the grace
+            clock.at = at
+            connection.refresh_api_key(client)
+        assert client.set_to == [] and client.api_key == FIRST, (
+            f"a store that failed was read as a refusal: the client was handed {client.set_to!r}")
+        clock.at = 1101.0                               # past it
+        connection.refresh_api_key(client)
+
+    assert client.set_to == [None], client.set_to
+    said = _warnings(caplog)
+    assert len(said) == 2, f"two states, {len(said)} warnings: {said}"
+    assert "did not answer" in said[0] and "refused" not in said[0], said[0]
+    assert "BEEVERFORGE_STORED_TOKEN_TTL" in said[0] and "no key" in said[1], said
+
+
+def test_a_refusal_INSIDE_a_lapse_drops_the_key_the_grace_was_keeping(
+        engine, monkeypatch, tmp_path, caplog, clock):
+    """A store that went quiet and then says no: the refusal is final from the read that says it,
+    and a later silence does not claim to keep a key the client no longer has."""
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    client = _Client(1, FIRST)
+    connection.refresh_api_key(client)
+    held.unlink()
+
+    with caplog.at_level(logging.DEBUG):
+        clock.at = 1010.0
+        connection.refresh_api_key(client)              # gone: kept
+        held.write_text(FIRST)
+        held.chmod(0o666)
+        clock.at = 1020.0
+        connection.refresh_api_key(client)              # refused: dropped at once
+        held.unlink()
+        clock.at = 1030.0
+        connection.refresh_api_key(client)              # gone again, inside the old grace
+
+    assert client.set_to == [None] and client.api_key is None, client.set_to
+    said = _warnings(caplog)
+    assert "keeps presenting" not in said[-1], (
+        f"after the refusal dropped the key, a later read said it was kept: {said[-1]}")
+
+
+@pytest.mark.parametrize("how", ["refused", "failed"])
+def test_the_store_tells_a_REFUSAL_from_a_store_that_FAILED(engine, monkeypatch, tmp_path, how):
+    """The registry answers both as `refused` — a refused credential is never used in place of
+    another — and says which it was, so the re-read can give the grace to silence alone."""
+    from beeverforge.adapters.credential_store.registry import lookup
+
+    held = _stored_key(monkeypatch, tmp_path, FIRST)
+    if how == "refused":
+        held.chmod(0o666)
+    else:
+        _store_fails(monkeypatch)
+
+    found = lookup("TEMPORAL_API_KEY", quiet=True)
+
+    assert found.refused and found.value is None, found
+    assert found.failed is (how == "failed"), found
 
 
 def test_a_key_that_COMES_BACK_is_presented_and_the_grace_starts_again(
@@ -543,3 +640,54 @@ def test_an_INVALID_grace_is_said_once_per_lapse_not_at_every_read(
     assert len(about_the_grace) == 1, (
         f"the unreadable grace was said {len(about_the_grace)} times in one lapse")
     assert client.set_to == [None], "the hour the unreadable setting falls back to was not used"
+
+
+# ── 7. a TLS file that cannot be read is said by name (review of CORE!664) ─────────────────────
+
+_CONTENTS = {"cert": b"CLIENT-CERT-CONTENT", "key": b"CLIENT-KEY-CONTENT", "ca": b"ENGINE-CA-CONTENT"}
+_SETTINGS = {"TEMPORAL_TLS_CERT": "cert", "TEMPORAL_TLS_KEY": "key",
+             "TEMPORAL_TLS_SERVER_CA_CERT": "ca"}
+
+
+def _every_tls_setting(monkeypatch, tmp_path, broken_setting: str, how: str) -> str:
+    """All three TLS files readable and an API key set, then `broken_setting` pointed at a path
+    that cannot be read. Answers that path."""
+    files = _files(tmp_path, **_CONTENTS)
+    monkeypatch.setenv("TEMPORAL_API_KEY", FIRST)
+    for setting, name in _SETTINGS.items():
+        monkeypatch.setenv(setting, files[name])
+    if how == "missing":
+        broken = tmp_path / "nowhere" / "engine.pem"
+    else:   # a directory: unreadable as a file for every user, root included
+        broken = tmp_path / "a-directory.pem"
+        broken.mkdir()
+    monkeypatch.setenv(broken_setting, str(broken))
+    return str(broken)
+
+
+@pytest.mark.parametrize("how", ["missing", "a-directory"])
+@pytest.mark.parametrize("setting", list(_SETTINGS))
+def test_an_UNREADABLE_tls_file_is_refused_in_one_sentence_naming_its_setting(
+        engine, monkeypatch, tmp_path, setting, how):
+    broken = _every_tls_setting(monkeypatch, tmp_path, setting, how)
+
+    with pytest.raises(connection.EngineNotDeclared) as refused:
+        connection._auth()
+
+    said = str(refused.value)
+    assert setting in said, f"the refusal does not name the setting {setting}: {said}"
+    assert broken in said, f"the refusal does not name the path: {said}"
+    assert "\n" not in said and "Traceback" not in said, said
+    for content in (*_CONTENTS.values(), FIRST.encode()):
+        assert content.decode() not in said, f"the refusal carries a file's content: {said}"
+    assert refused.value.__cause__ is None and refused.value.__suppress_context__, (
+        "the bare OSError is chained beneath the sentence, so a log prints it as a traceback")
+
+
+async def test_an_UNREADABLE_server_CA_reaches_the_caller_of_connect_as_the_sentence(
+        engine, monkeypatch, tmp_path):
+    _every_tls_setting(monkeypatch, tmp_path, "TEMPORAL_TLS_SERVER_CA_CERT", "missing")
+
+    with pytest.raises(connection.EngineNotDeclared, match="TEMPORAL_TLS_SERVER_CA_CERT"):
+        await connection.connect()
+    assert engine == [], "a connection was attempted without the CA the deployment pinned"
