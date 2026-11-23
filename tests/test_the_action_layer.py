@@ -411,6 +411,11 @@ OWNED = {
     # a mapping onto this row, and a front end that called it would be a second place deciding
     # what a proof records.
     "prove_the_box": "box_prove",
+    # A project's repositories onboarded (#237). The marker is the onboarding's whole body — each
+    # repository read, proposed, proven, mapped and pulled, the previews, the context made through
+    # `product_init` and backfilled: `onboard` is a mapping onto this row, and a front end that
+    # called it would be a second place deciding what an onboarding proposes.
+    "onboard_the_product": "onboard",
 }
 
 

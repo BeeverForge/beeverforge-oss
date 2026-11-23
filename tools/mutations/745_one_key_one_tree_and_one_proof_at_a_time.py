@@ -160,7 +160,10 @@ MUTATIONS = [
     ("`box prove --ref` answers a busy key with exit 0, so a pre-merge check reads a refused "
      "proof as a pass",
      CLI,
+     # two lines, since `onboard` exits the same way (#237): this is `box prove`'s
+     '        typer.echo(outcome.message if bare else f"✗ {outcome.message}")\n'
      "        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)\n",
+     '        typer.echo(outcome.message if bare else f"✗ {outcome.message}")\n'
      "        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 0)\n", DOORS),
 
     # ── 4. the key is free again however the proof ends ────────────────────────────────────────

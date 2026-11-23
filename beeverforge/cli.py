@@ -1907,52 +1907,6 @@ def _handover_lines(name: str, *, proposed: bool) -> list[str]:
             f"when a ticket can run."]
 
 
-def _onboard_preview(project, repo: str, outcome) -> None:
-    """`onboard --with-preview`: the preview's own pull request, through the same function
-    `beeverforge preview propose` uses (#265 slice 4). The block goes into the manifest ON THE
-    BASE BRANCH, so a repository whose manifest this run only proposed gets it once that merges —
-    said, rather than a second pull request that fights the first over one file."""
-    from beeverforge.onboarding.preview_propose import propose_preview
-
-    if not outcome.manifest_already_there:
-        typer.echo(f"  · preview: proposed once the manifest merges — then `beeverforge preview "
-                   f"propose {project.name} --source {repo} --yes`")
-        return
-    said = propose_preview(project, repo=repo)
-    if not said.ok:
-        typer.echo(f"  ✗ preview: {said.detail}")
-    elif said.nothing:
-        typer.echo(f"  · preview: {said.detail}")
-    else:
-        typer.echo(f"  ✓ preview: {said.url or said.detail}"
-                   + (" (already open)" if said.existed else ""))
-
-
-def _a_context_repository_for(name: str, project, *, stage) -> tuple[object, bool, str]:
-    """`(project, created, "")` once the project names its context repository — re-read from the
-    registry when this made one — or `(project, False, why)` when it could not be made.
-
-    CREATING ONE CHANGES THE INSTALLATION, SO IT IS A ROW'S (#741). `onboard` created the
-    repository and recorded it in the registry from the command line's own code, through the
-    onboarding module: the one verb still writing the installation outside a row once `product
-    init` became `product_init`. That row creates the repository in the client's organisation and
-    records it, as `product init --create-context` does. Without `write` it proposes nothing: the
-    declaration this verb proposes travels with the backfill, in one review. Its declaration step
-    reads the repository just made to show a plan nobody prints here — one clone of an empty
-    repository, the price of not keeping a second way to make one."""
-    from beeverforge.actions import STEP_DONE, STEP_FAILED
-
-    if (getattr(getattr(project, "product", None), "docs_repo", "") or "").strip():
-        return project, False, ""
-    stage("start", "context: no repository declared — creating one")
-    outcome = _perform("product_init", project=name, create_context=True)
-    context = next((step for step in outcome.data.get("steps") or []
-                    if step["step"] == "context"), None)
-    if context is None or context["state"] == STEP_FAILED:
-        return project, False, context["said"] if context else outcome.message
-    return _get_project(name), context["state"] == STEP_DONE, ""
-
-
 @app.command("onboard")
 @speaks_plainly("onboard that repository")
 def onboard_cmd(
@@ -1982,17 +1936,11 @@ def onboard_cmd(
     A product that spans repositories (front + back) names them with --source; each gets its
     own manifest, its own proof and its own pull request, which is exactly how the runtime
     treats them (a card runs against ITS repository's box)."""
-    from beeverforge.onboarding.onboard import onboard_source_repo
+    from beeverforge.actions.base import INVALID, NOT_FOUND
+    from beeverforge.onboarding import onboard
 
     project = _get_project(name)
-    # THE FORGE AXIS NAMES THE CODE, with the tracker as fallback — the same precedence
-    # _ref_repo uses everywhere. Never BOTH: an ADO tracker.repo is the ADO *project* (work
-    # items), and a GitHub deployment may track issues in a separate repository — sweeping the
-    # tracker axis in onboarded a repository that holds no code. And no `"/" in r` filter: an
-    # ADO registry row carries the BARE repository name, and the filter made the recommended
-    # path silently dead on Azure DevOps (adversarial review, 2026-08-13).
-    default_repo = (project.forge.repo if project.forge else None) or project.tracker.repo or ""
-    repos = sorted({r for r in [default_repo, *(source or [])] if r})
+    repos = onboard.repositories(project, list(source or []))
     if not repos:
         typer.echo(f"✗ {name} names no repository in its registry entry and no --source was "
                    f"given — there is nothing to onboard")
@@ -2002,72 +1950,52 @@ def onboard_cmd(
         raise typer.Exit(2)
 
     def _stage(kind: str, text: str) -> None:
-        if kind == "start":
+        if kind == "said":
+            typer.echo(text)
+        elif kind == "start":
             typer.echo(f"  … {text}", err=True)
         elif kind == "line":
             typer.echo(f"      {text.rstrip()}", err=True)
 
-    outcomes = []
-    for repo in repos:
-        typer.echo(f"\n── {repo}")
-        outcome = onboard_source_repo(project, repo, sandbox=sandbox, stream=_stage)
-        outcomes.append(outcome)
-        mark = "✓" if outcome.ok else "✗"
-        typer.echo(f"{mark} {outcome.detail or outcome.pr or outcome.proof}")
-        if with_preview:
-            _onboard_preview(project, repo, outcome)
-
-    context_outcome = None
-    if not skip_context:
-        from beeverforge.onboarding.onboard import ContextOutcome, onboard_product_context
-
-        typer.echo("\n── the context repository")
-        project, created, not_made = _a_context_repository_for(name, project, stage=_stage)
-        if not_made:
-            context_outcome = ContextOutcome(detail=not_made)
-        else:
-            context_outcome = onboard_product_context(project, sources=repos, stream=_stage)
-            context_outcome.created = created
-        mark = "✓" if context_outcome.ok else "✗"
-        made = " (created)" if context_outcome.created else ""
-        typer.echo(f"{mark} {context_outcome.docs_repo or 'context'}{made} — "
-                   f"{context_outcome.detail}")
-        if context_outcome.backfill:
-            typer.echo(f"  backfill: {context_outcome.backfill}")
-        elif context_outcome.ok:
-            typer.echo("  backfill: not reached")
-        for t in context_outcome.todo:
-            typer.echo(f"  · still yours: {t}")
+    # THE `onboard` ROW (#237): the row walks every repository and the context, in this shell's own
+    # process, and tells this terminal each line as it goes; what stays here is the summary of the
+    # document it answers, and the handover
+    with onboard.in_this_shell(_stage):
+        outcome = _perform("onboard", project=name, sources=list(source or []), sandbox=sandbox,
+                           with_preview=with_preview, skip_context=skip_context)
+    if not outcome.ok:
+        typer.echo(f"✗ {outcome.message}")
+        raise typer.Exit(2 if outcome.code in (INVALID, NOT_FOUND) else 1)
+    outcomes = outcome.data.get("repos") or []
+    context_outcome = outcome.data.get("context")
 
     typer.echo("\n── the product, repository by repository")
     failed = False
     for o in outcomes:
-        if o.ok and o.pr:
-            line = f"  ✓ {o.repo:<30} proof: {o.proof:<8} → {o.pr}"
-        elif o.ok:
+        if o["ok"] and o["pr"]:
+            line = f"  ✓ {o['repo']:<30} proof: {o['proof']:<8} → {o['pr']}"
+        elif o["ok"]:
             # THE DETAIL, not a summary of it: ok-without-a-URL covers both "nothing new to
             # propose" and "pushed but the review request did not open — open it by hand",
             # and collapsing the second into the first told the operator a repository was
             # done when a step of it still needs a hand (adversarial review, 2026-08-13)
-            line = f"  · {o.repo:<30} proof: {o.proof:<8} {o.detail}"
+            line = f"  · {o['repo']:<30} proof: {o['proof']:<8} {o['detail']}"
         else:
-            line = f"  ✗ {o.repo:<30} {o.detail}"
+            line = f"  ✗ {o['repo']:<30} {o['detail']}"
             failed = True
         typer.echo(line)
-        for q in o.questions[:4]:
+        for q in o["questions"][:4]:
             typer.echo(f"        ? {q}")
     if context_outcome is not None:
-        if context_outcome.ok and context_outcome.pr:
-            typer.echo(f"  ✓ {context_outcome.docs_repo:<30} context → {context_outcome.pr}")
-        elif context_outcome.ok:
-            typer.echo(f"  · {context_outcome.docs_repo:<30} {context_outcome.detail}")
+        docs_repo = context_outcome["docs_repo"]
+        if context_outcome["ok"] and context_outcome["pr"]:
+            typer.echo(f"  ✓ {docs_repo:<30} context → {context_outcome['pr']}")
+        elif context_outcome["ok"]:
+            typer.echo(f"  · {docs_repo:<30} {context_outcome['detail']}")
         else:
-            typer.echo(f"  ✗ {context_outcome.docs_repo or 'context':<30} "
-                       f"{context_outcome.detail}")
+            typer.echo(f"  ✗ {docs_repo or 'context':<30} {context_outcome['detail']}")
             failed = True
-    proposed = any(o.ok and o.pr for o in outcomes) or bool(
-        context_outcome is not None and context_outcome.ok and context_outcome.pr)
-    for line in _handover_lines(name, proposed=proposed):
+    for line in _handover_lines(name, proposed=bool(outcome.data.get("proposed"))):
         typer.echo(line)
     if failed:
         raise typer.Exit(1)
