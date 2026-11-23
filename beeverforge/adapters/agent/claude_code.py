@@ -24,8 +24,9 @@ import os
 import re
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 from beeverforge.adapters.agent.base import (
     CONTINUE_INSTRUCTION,
@@ -1224,6 +1225,7 @@ def _parse_stream(
     those, so the trace shows real actions only (they once read as "the planner edited")."""
     granted = set(allowed_tools or [])
     final: dict | None = None
+    results: list[dict] = []  # every result event: turns and tokens are summed over them (#644)
     actions: list[str] = []
     session_id = ""  # C2: the Claude session to `--resume` if this invocation pauses
     for line in out.splitlines():
@@ -1240,6 +1242,7 @@ def _parse_stream(
             session_id = evt["session_id"]  # present on init/result/assistant events; last wins
         if evt.get("type") == "result":
             final = evt
+            results.append(evt)
         elif evt.get("type") == "assistant":
             content = evt.get("message", {}).get("content", [])
             if isinstance(content, list):
@@ -1300,7 +1303,6 @@ def _parse_stream(
         )
     reason, retry = _detect_pause(result_text) if is_err else (None, None)
     ok = rc == 0 and not final.get("is_error", False) and reason is None
-    usage = final.get("usage") or {}
     return AgentRunResult(
         ok=ok,
         summary=_summarize(final, ok, reason),
@@ -1308,14 +1310,23 @@ def _parse_stream(
         actions=actions,
         pause_reason=reason,
         retry_at=retry,
-        num_turns=final.get("num_turns"),  # the effort currency (ADR-0013 D4)
+        # the effort currency (ADR-0013 D4)
+        num_turns=_summed(results, lambda e: e.get("num_turns")),
         # token usage for the cost dashboard — input includes cache reads/writes when the CLI
         # reports them; absent on older CLIs → None (the dashboard just shows cost then).
-        input_tokens=usage.get("input_tokens"),
-        output_tokens=usage.get("output_tokens"),
+        input_tokens=_summed(results, lambda e: (e.get("usage") or {}).get("input_tokens")),
+        output_tokens=_summed(results, lambda e: (e.get("usage") or {}).get("output_tokens")),
         raw_output=out,
         resume_handle=session_id,  # C2: raw session id; _invoke wraps it into the full handle
     )
+
+
+def _summed(results: list[dict], read: Callable[[dict], Any]) -> int | None:
+    """The sum of one count over every result event of a run: each event counts only its own leg
+    (`total_cost_usd` alone is cumulative, so the cost is read from the last event). `None` when
+    no event reports it — unknown stays unknown, never 0."""
+    counts = [v for v in map(read, results) if isinstance(v, int) and not isinstance(v, bool)]
+    return sum(counts) if counts else None
 
 
 def _summarize(final: dict, ok: bool, reason: str | None) -> str:
