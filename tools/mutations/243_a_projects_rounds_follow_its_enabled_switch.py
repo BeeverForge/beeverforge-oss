@@ -19,8 +19,8 @@ MUTATIONS = [
      "            pass\n"),
 
     ("an engine that cannot be reached raises and undoes the switch's answer", CATALOG,
-     "    except Exception as exc:  # noqa: BLE001 — the registry write stands; the boot",
-     "    except KeyError as exc:  # noqa: BLE001 — the registry write stands; the boot"),
+     "    except Exception as exc:  # the registry write stands; the boot",
+     "    except KeyError as exc:  # the registry write stands; the boot"),
 
     ("the watch is left out of a project's rounds", SCHED,
      "            (WATCH_SCHEDULE_PREFIX, OKF_SCHEDULE_PREFIX, CARD_QUESTION_SCHEDULE_PREFIX)]",

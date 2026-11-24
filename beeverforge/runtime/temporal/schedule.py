@@ -429,14 +429,14 @@ async def retire_disabled_rounds() -> list[str]:
 
     try:
         disabled = [p.name for p in ProjectRegistry().list() if not p.enabled]
-    except Exception as exc:  # noqa: BLE001 — an unreadable registry must not retire anything
+    except Exception as exc:  # an unreadable registry must not retire anything
         log.warning("could not read the registry; retiring no disabled project's rounds (%s)", exc)
         return []
     out: list[str] = []
     for name in disabled:
         try:
             retired = await retire_project_rounds(name)
-        except Exception as exc:  # noqa: BLE001 — one project's failure must not keep the rest
+        except Exception as exc:  # one project's failure must not keep the rest
             log.warning("could not retire the rounds of disabled project %s (%s)", name, exc)
             continue
         out += [f"retired {sid} (project {name!r} is disabled)" for sid in retired]

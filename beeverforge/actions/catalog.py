@@ -879,7 +879,7 @@ async def _enable(*, project: str, by: Actor, enabled: bool = True) -> Outcome:
             await schedule.schedule_project_rounds(found.name)
         else:
             await schedule.retire_project_rounds(found.name)
-    except Exception as exc:  # noqa: BLE001 — the registry write stands; the boot reconciles
+    except Exception as exc:  # the registry write stands; the boot reconciles
         log.warning("could not %s %s's rounds (%s)", "schedule" if enabled else "retire",
                     found.name, exc)
         tail += (f" Its tech-lead, knowledge and card-question rounds could not be "
