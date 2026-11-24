@@ -42,6 +42,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -49,6 +50,7 @@ from pathlib import Path
 
 from beeverforge import gitpin
 from beeverforge.adapters.sandbox.base import (
+    DaemonTimedOut,
     OutputBuffer,
     SandboxAdapter,
     Workspace,
@@ -114,9 +116,50 @@ def _container_name(project: str | None, safe_branch: str) -> str:
     return "-".join(parts)
 
 
-def _host(cmd: list[str], timeout: int = 120, env: dict[str, str] | None = None) -> tuple[int, str]:
+#: How long a host command may take before `_host` gives up on it (`subprocess.TimeoutExpired`).
+_HOST_TIMEOUT = 120
+
+
+def _host(cmd: list[str], timeout: int = _HOST_TIMEOUT,
+          env: dict[str, str] | None = None) -> tuple[int, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+#: The wait before the one retry of a `docker rm -f` the daemon did not finish within
+#: `_HOST_TIMEOUT` (#608). Measured on a deployment: the daemon was slow to remove a box whose
+#: processes the OOM killer had just killed, and finished on its own minutes later. One short
+#: retry covers a daemon that was busy for a moment; a longer one would only hold the job while a
+#: person could already be told the one command that frees it.
+REMOVE_RETRY_WAIT = 10.0
+
+
+def remove_the_box(cname: str, *, sleep: Callable[[float], None],
+                   at_start: bool) -> tuple[int, str]:
+    """`docker rm -f <cname>`, tried again once after `REMOVE_RETRY_WAIT` when the daemon does not
+    finish it within the bound, and refused with one sentence (`DaemonTimedOut`) when it does not
+    finish the second time either.
+
+    `sleep` is the clock the wait is read from, so a test waits on none. `at_start` says which
+    removal this is: the leftover of an interrupted attempt, which keeps this job from starting,
+    or the job's own box after its run, which keeps nothing from finishing but is left on the
+    host. Either way the remedy is the same command, by name."""
+    argv = ["docker", "rm", "-f", cname]
+    try:
+        return _host(argv)
+    except subprocess.TimeoutExpired:
+        log.warning("the Docker daemon did not remove the box %s within %d s; trying once more in "
+                    "%g s", cname, _HOST_TIMEOUT, REMOVE_RETRY_WAIT)
+    sleep(REMOVE_RETRY_WAIT)
+    try:
+        return _host(argv)
+    except subprocess.TimeoutExpired:
+        then = ("so this job could not start; run `docker rm -f {name}`, then resume" if at_start
+                else "after its run, so it is still on the host; run `docker rm -f {name}` to "
+                     "remove it")
+        raise DaemonTimedOut(
+            f"the Docker daemon did not remove the {'leftover ' * at_start}box {cname!r} within "
+            f"{_HOST_TIMEOUT} s, twice, {then.format(name=cname)}.", name=cname) from None
 
 
 #: The link-local address a cloud machine's instance metadata — and the tokens of the identity its
@@ -440,6 +483,12 @@ class ContainerSandbox(SandboxAdapter):
         self._output = OutputBuffer()
         #: A job's stop (#44), set by `JobRunner.hears` on a job's box only; see `run`.
         self.stop: Stop | None = None
+        #: The clock the wait before a `docker rm -f` retry is read from (`remove_the_box`), so a
+        #: test hands the box its own and waits on none.
+        self.sleep: Callable[[float], None] = time.sleep
+        #: The clone `_start` made for a box that is not up yet, which `prepare` removes when the
+        #: start times out: `_start` records the handle only once the box is up.
+        self._starting: Path | None = None
 
 
     def guidelines_path(self, host_dir: Path) -> str | None:
@@ -570,6 +619,36 @@ class ContainerSandbox(SandboxAdapter):
         self, *, repo_path: Path, base_branch: str, branch: str, checkout_existing: bool = False,
         remote_url: str | None = None,
     ) -> Workspace:
+        """`_start`, with every host command of the start that does not finish within its bound
+        refused in one sentence (`DaemonTimedOut`) rather than raised as `TimeoutExpired` (#608).
+
+        THE WHOLE START, NOT ONLY THE REMOVAL: the probe, the pull, the clone's git, `docker run`
+        and the `docker exec` after it all go through `_host`, and a daemon slow enough to miss
+        one bound is slow for the next. The leftover's removal is the one step retried
+        (`remove_the_box`), because it is the one measured to finish on its own a moment later."""
+        safe = branch.replace("/", "-")
+        cname = _container_name(self.project, safe)
+        self._starting = None
+        try:
+            return self._start(repo_path=repo_path, base_branch=base_branch, branch=branch,
+                               checkout_existing=checkout_existing, remote_url=remote_url)
+        except (subprocess.TimeoutExpired, DaemonTimedOut) as exc:
+            if self._starting is not None:
+                shutil.rmtree(self._starting, ignore_errors=True)
+            if isinstance(exc, DaemonTimedOut):
+                raise
+            step = " ".join(exc.cmd[:2]) if exc.cmd[0] == "docker" else str(exc.cmd[0])
+            raise DaemonTimedOut(
+                f"the box {cname!r} could not be started: `{step}` did not finish within "
+                f"{exc.timeout:g} s, so no work began; check that the Docker daemon answers "
+                "(`docker info`), then resume.", name=cname) from None
+        finally:
+            self._starting = None
+
+    def _start(
+        self, *, repo_path: Path, base_branch: str, branch: str, checkout_existing: bool,
+        remote_url: str | None,
+    ) -> Workspace:
         """See `_materialize_workspace` for the git steps — factored out so the branch topology
         is testable without a docker daemon."""
         safe = branch.replace("/", "-")
@@ -590,6 +669,7 @@ class ContainerSandbox(SandboxAdapter):
         if work_dir:
             Path(work_dir).mkdir(parents=True, exist_ok=True)
         host_clone = Path(tempfile.mkdtemp(prefix=f"beeverforge-{safe}-", dir=work_dir or None))
+        self._starting = host_clone
         if work_dir:
             # THE BOX MAY NOT BE THE CORE'S UID (#519). `mkdtemp` makes 0700, and a shared work dir
             # is how a deployment lets a daemon that runs as ANOTHER uid in — a rootless daemon,
@@ -628,7 +708,7 @@ class ContainerSandbox(SandboxAdapter):
         if probe_rc == 0:
             logs.announce(log, f"BEEVERFORGE: removing the leftover box {cname!r} from an "
                                f"interrupted attempt before starting fresh", logging.WARNING)
-            rm_rc, rm_out = _host(["docker", "rm", "-f", cname])
+            rm_rc, rm_out = remove_the_box(cname, sleep=self.sleep, at_start=True)
             if rm_rc != 0:
                 # An unremovable corpse still refuses below with the daemon's own words — this
                 # only adds WHY to the trail instead of letting the collision masquerade as new.
@@ -1083,8 +1163,14 @@ class ContainerSandbox(SandboxAdapter):
         return "rebased"
 
     def cleanup(self, *, workspace: Workspace) -> None:
-        if self._container:
-            _host(["docker", "rm", "-f", self._container])
-        if self._host_clone and self._host_clone.exists():
-            shutil.rmtree(self._host_clone, ignore_errors=True)
-        self._container, self._host_clone = None, None
+        """Remove the box and its clone. RAISES `DaemonTimedOut` when the daemon did not remove the
+        container, twice (#608), and only after the clone and the handles are gone too: the
+        caller reports the box left on the host, and nothing else of this job is kept for it."""
+        name, self._container = self._container, None
+        try:
+            if name:
+                remove_the_box(name, sleep=self.sleep, at_start=False)
+        finally:
+            if self._host_clone and self._host_clone.exists():
+                shutil.rmtree(self._host_clone, ignore_errors=True)
+            self._host_clone = None
