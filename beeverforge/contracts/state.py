@@ -55,6 +55,17 @@ class JobState(StrEnum):
 
     FAILED = "failed"
 
+    #: THE SIZER SPLIT THE CARD: its parts were filed and the parent closed as NOT delivered, so the
+    #: job ended without shipping anything (#669). It ended `done` before, and `done` is past the
+    #: merge: throughput and autonomy counted the parent as a merge, and each part again when it
+    #: merged.
+    #:
+    #: A STATE OF ITS OWN, DECLARED AFTER `DONE`, so `PAST_THE_MERGE` — read off the enum's order
+    #: from `MERGED` to `DONE` — still means "merged or later" and every reader of it excludes a
+    #: split by the one definition they share. `DONE` with a marker would need each reader to
+    #: remember the exclusion. Never move it between `MERGED` and `DONE`.
+    SPLIT = "split"
+
 
 #: THE STATES PAST THE MERGE, read off the machine's own order: every state from `MERGED` to
 #: `DONE`, as ADR-0001 D-12 lays them out. A job that ENDED in one of them landed its change. It

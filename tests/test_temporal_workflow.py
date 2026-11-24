@@ -575,7 +575,7 @@ async def test_preflight_split_creates_children_and_frees_the_floor(env: Workflo
     async with worker:
         h = await _start(env.client, JobParams(project="p", issue="37", promote=False))
         result = await h.result()
-    assert result.state == JobState.DONE
+    assert result.state == JobState.SPLIT
     assert "split into" in (result.note or "")
     assert len(_SPLIT_CALLS) == 1 and len(_SPLIT_CALLS[0].children) == 2
     assert ran == []  # the expensive path never launched
