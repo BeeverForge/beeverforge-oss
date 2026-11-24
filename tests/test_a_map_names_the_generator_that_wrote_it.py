@@ -22,6 +22,27 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _release(version: str) -> tuple[int, int, int]:
+    major, minor, patch = (int(piece) for piece in version.split(".")[:3])
+    return major, minor, patch
+
+
+def _dotted(release: tuple[int, int, int]) -> str:
+    return ".".join(str(piece) for piece in release)
+
+
+def _older(release: tuple[int, int, int]) -> str | None:
+    """A release below this one, or None when it is 0.0.0 and nothing is."""
+    major, minor, patch = release
+    if patch:
+        return _dotted((major, minor, patch - 1))
+    if minor:
+        return _dotted((major, minor - 1, 0))
+    if major:
+        return _dotted((major - 1, 0, 0))
+    return None
+
+
 def _with_version(bundle, version: str):
     manifest = bundle.manifest.model_copy(update={"generator_version": version})
     return bundle.model_copy(update={"manifest": manifest})
@@ -46,7 +67,9 @@ def test_a_fresh_bundle_is_not_stale(repo):
 
 
 def test_a_bundle_from_an_older_generator_is_stale(repo):
-    assert is_stale(_with_version(build_bundle(repo), "0.1.3"), repo) is True
+    older = _older(_release(beeverforge.__version__))
+    assert older is not None
+    assert is_stale(_with_version(build_bundle(repo), older), repo) is True
 
 
 def test_a_bundle_with_no_recorded_version_is_stale_and_still_read(repo, tmp_path):
@@ -62,9 +85,26 @@ def test_a_bundle_with_no_recorded_version_is_stale_and_still_read(repo, tmp_pat
     assert is_stale(read, repo) is True
 
 
-@pytest.mark.parametrize("version", [beeverforge.__version__, "0.2.0", "0.2.1", "1.0", "10.0.0"])
-def test_the_same_or_a_newer_generator_is_not_stale(repo, version):
-    assert is_stale(_with_version(build_bundle(repo), version), repo) is False
+@pytest.fixture(params=["as-built", "0.3.0.dev0", "1.0.0"])
+def running(request, monkeypatch) -> str:
+    """The running generator's version: the real one, then two a bump could land on."""
+    if request.param != "as-built":
+        monkeypatch.setattr(beeverforge, "__version__", request.param)
+    return beeverforge.__version__
+
+
+def test_the_same_or_a_newer_generator_is_not_stale(repo, running):
+    major, minor, patch = _release(running)
+    for version in (running, _dotted((major, minor, patch + 1)),
+                    _dotted((major, minor + 1, 0)), _dotted((major + 1, 0, 0))):
+        assert is_stale(_with_version(build_bundle(repo), version), repo) is False, version
+
+
+def test_an_older_generator_is_stale_whatever_the_running_one(repo, running):
+    older = _older(_release(running))
+    if older is None:
+        pytest.skip("no release is older than 0.0.0")
+    assert is_stale(_with_version(build_bundle(repo), older), repo) is True
 
 
 def test_an_unparseable_version_is_stale(repo):
@@ -73,7 +113,9 @@ def test_an_unparseable_version_is_stale(repo):
 
 def test_a_refresh_rebuilds_a_map_from_an_older_generator_over_unchanged_sources(repo, tmp_path):
     dest = tmp_path / "out"
-    write_bundle_dir(_with_version(build_bundle(repo), "0.1.3"), dest, force=True)
+    older = _older(_release(beeverforge.__version__))
+    assert older is not None
+    write_bundle_dir(_with_version(build_bundle(repo), older), dest, force=True)
     assert write_bundle_dir(build_bundle(repo), dest) == dest
     read = read_bundle_dir(dest)
     assert read is not None
