@@ -25,7 +25,7 @@ import hashlib
 import logging
 from pathlib import Path
 
-from beeverforge import __version__
+import beeverforge
 from beeverforge.knowledge.contracts import BundleManifest, KnowledgeBundle
 from beeverforge.knowledge.generator import canonical_source_files
 
@@ -46,7 +46,7 @@ def _release(version: str) -> tuple[int, ...] | None:
 def generator_is_older(manifest: BundleManifest) -> bool:
     """True when the manifest names no generator, an unreadable one, or a release older than the
     one running. The same or a newer release is not older. Padding makes (0, 2) equal (0, 2, 0)."""
-    written, running = _release(manifest.generator_version), _release(__version__)
+    written, running = _release(manifest.generator_version), _release(beeverforge.__version__)
     if written is None or running is None:
         return True
     width = max(len(written), len(running))
