@@ -42,6 +42,7 @@ implemented by none of them.**
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import re
@@ -449,6 +450,18 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
 #: which is precisely the path a wrong password takes.
 _SECRET = frozenset({"password", "token", "secret", "key"})
 
+#: Parameters that carry a PERSON'S WORDS (#205). The audit record keeps how much was said and a
+#: digest that proves which words, never the words: a message refused at the gate, or accepted, is
+#: not something a log line a deployment ships off the host should hold.
+_FREE_TEXT = frozenset({"message", "body", "comment", "answer", "answers", "instruction", "note",
+                        "question", "text", "criteria", "title", "ask", "query", "reason", "why"})
+
+
+def _words(value: object) -> dict[str, object]:
+    """The audit record's view of free text: its length and its digest, from one computation."""
+    text = value if isinstance(value, str) else repr(value)
+    return {"chars": len(text), "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
 
 def _why(exc: Exception) -> str:
     """What the refusal says an action died of — the install, when the install is what is missing.
@@ -475,7 +488,8 @@ def _why(exc: Exception) -> str:
 
 def _loggable(key: str, params: dict[str, object],
               outcome: Outcome | None = None) -> dict[str, object]:
-    out = {k: ("***" if k in _SECRET else v) for k, v in params.items()}
+    out = {k: ("***" if k in _SECRET else _words(v) if k in _FREE_TEXT and v else v)
+           for k, v in params.items()}
     if key == "product_people_set" and "people" in out:
         # THE COUNTS, THE DIGEST AND THE PEOPLE CHANGED (#528): the line is the record of who was
         # added and removed; the list as a whole is not repeated, and no credential is in it
