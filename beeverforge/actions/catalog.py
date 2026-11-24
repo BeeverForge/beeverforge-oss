@@ -870,6 +870,21 @@ async def _enable(*, project: str, by: Actor, enabled: bool = True) -> Outcome:
     state = "enabled" if enabled else "disabled"
     tail = ("new tickets in TO-DO will be picked up." if enabled
             else "nothing new will be picked up; jobs already running are unaffected.")
+    # The project's rounds follow the switch at once, not at the next worker boot. The switch is
+    # already made: an engine that cannot be reached is said, and the boot reconcile converges.
+    from beeverforge.runtime.temporal import schedule
+
+    try:
+        if enabled:
+            await schedule.schedule_project_rounds(found.name)
+        else:
+            await schedule.retire_project_rounds(found.name)
+    except Exception as exc:  # the registry write stands; the boot reconciles
+        log.warning("could not %s %s's rounds (%s)", "schedule" if enabled else "retire",
+                    found.name, exc)
+        tail += (f" Its tech-lead, knowledge and card-question rounds could not be "
+                 f"{'scheduled' if enabled else 'retired'} now (the engine said: {exc}); the "
+                 f"next worker boot does it.")
     return done(f"{found.name} is {state} — {tail} ({by})",
                 project=found.name, enabled=bool(enabled))
 
