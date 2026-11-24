@@ -1566,10 +1566,24 @@ class WorktreeSandbox(SandboxAdapter):
         rc, _ = _run(["git", "-C", wp, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"])
         if rc == 0:
             return "up_to_date"
-        rc, out = _run(["git", "-C", wp, "rebase", "FETCH_HEAD"])
+        # AS THE JOB'S BOT (#276): a rebase replays commits as their committer, and a host with no
+        # git identity refused it — which this reported as a conflict.
+        from beeverforge.credentials import bot_identity
+        bot = bot_identity()
+        as_the_bot = {**os.environ,
+                      "GIT_AUTHOR_NAME": bot.name, "GIT_AUTHOR_EMAIL": bot.email,
+                      "GIT_COMMITTER_NAME": bot.name, "GIT_COMMITTER_EMAIL": bot.email}
+        rc, out = _run(["git", "-C", wp, "rebase", "FETCH_HEAD"], env=as_the_bot)
         if rc != 0:
+            # A CONFLICT IS AN UNMERGED PATH, NOT A NONZERO EXIT (#276): a held `index.lock` or a
+            # full disk fails the same way, and a person asked to resolve a conflict that is not
+            # there finds nothing to resolve. The cause is read before the abort clears it.
+            unmerged_rc, unmerged = _run(
+                ["git", "-C", wp, "diff", "--name-only", "--diff-filter=U"])
             _run(["git", "-C", wp, "rebase", "--abort"])
-            return "conflict"
+            if unmerged_rc == 0 and unmerged.strip():
+                return "conflict"
+            raise RuntimeError(f"rebase failed: {_redact(out)}")
         return "rebased"
 
     def cleanup(self, *, workspace: Workspace) -> None:
