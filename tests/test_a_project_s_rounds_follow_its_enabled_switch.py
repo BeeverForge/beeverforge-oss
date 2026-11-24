@@ -113,6 +113,17 @@ def test_enabling_a_disabled_project_creates_its_three_rounds_at_once(engine):
     assert engine.existing == _rounds(PROJECT)
 
 
+def test_rounds_that_already_exist_are_updated_not_recreated(engine):
+    from beeverforge.runtime.temporal import schedule
+
+    engine.existing |= _rounds(PROJECT)
+    made = _run(schedule.schedule_project_rounds(PROJECT))
+    assert sorted(e for e in engine.events if e[0] == "update") == sorted(
+        ("update", sid) for sid in _rounds(PROJECT))
+    assert not [e for e in engine.events if e[0] == "create"]
+    assert sorted(made) == sorted(f"updated {sid}" for sid in _rounds(PROJECT))
+
+
 def test_enabling_one_project_schedules_nothing_for_another(engine, tmp_path, monkeypatch):
     _register(tmp_path, monkeypatch, enabled=False, name="other")
     _enable(True)
@@ -120,8 +131,9 @@ def test_enabling_one_project_schedules_nothing_for_another(engine, tmp_path, mo
 
 
 def test_disabling_a_project_deletes_its_three_rounds(engine):
-    _enable(True)
-    engine.existing.add("beeverforge-poller")
+    # seeded straight into the engine: going through the enable path would make this pass on
+    # code that has no disable path at all
+    engine.existing |= _rounds(PROJECT) | {"beeverforge-poller"}
     outcome = _enable(False)
     assert outcome.ok, outcome.message
     assert engine.existing == {"beeverforge-poller"}

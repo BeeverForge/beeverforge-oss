@@ -31,6 +31,20 @@ MUTATIONS = [
      "                raise\n            continue\n",
      "            raise\n"),
 
+    ("a round that already exists is left as it was instead of updated", SCHED,
+     "            made.append(f\"created {sid}\")\n"
+     "        except ScheduleAlreadyRunningError:\n"
+     "            handle = client.get_schedule_handle(sid)\n"
+     "            await handle.update(lambda _, sch=schedule: ScheduleUpdate(schedule=sch))\n"
+     "            made.append(f\"updated {sid}\")\n"
+     "    return made\n\n\n"
+     "async def retire_project_rounds",
+     "            made.append(f\"created {sid}\")\n"
+     "        except ScheduleAlreadyRunningError:\n"
+     "            pass\n"
+     "    return made\n\n\n"
+     "async def retire_project_rounds"),
+
     ("the boot stops retiring a disabled project's rounds", SCHED,
      "    out += await retire_disabled_rounds()\n",
      ""),
