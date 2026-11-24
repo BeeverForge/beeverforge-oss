@@ -28,6 +28,7 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import ssl
 import stat
 import subprocess
@@ -121,6 +122,17 @@ class Bed:
             if root.is_dir() else {}
 
 
+def _stamped(src: Path, dest: Path) -> Path:
+    """A copy of the context fixture whose maps name the running generator, so their freshness
+    never depends on the release number the fixture was written under."""
+    import beeverforge
+    shutil.copytree(src, dest)
+    for manifest in dest.glob(".okf/repos/*/manifest.yaml"):
+        with manifest.open("a") as out:
+            out.write(f"generator_version: {beeverforge.__version__}\n")
+    return dest
+
+
 @pytest.fixture()
 def bed(tmp_path, monkeypatch, git_bed) -> Bed:
     cache = tmp_path / "cache"
@@ -136,7 +148,8 @@ def bed(tmp_path, monkeypatch, git_bed) -> Bed:
     made = tmp_path / "repositories"
     repos = {name: a_served_tree(git_bed, FIXTURE / rel, made / name)
              for name, rel in REPOS.items()}
-    context = a_served_tree(git_bed, FIXTURE / "context", made / "harbourline-context")
+    context = a_served_tree(git_bed, _stamped(FIXTURE / "context", tmp_path / "stamped"),
+                            made / "harbourline-context")
     urls = {name: f"file://{path}" for name, path in repos.items()}
     asked: list[str] = []
 
@@ -814,6 +827,22 @@ def test_the_module_maps_are_named_only_after_they_were_checked(bed):
         assert (f"`{repo}`: `docs/.okf/repos/{repo}/modules.yaml` — checked, it matches "
                 f"`src/{repo}/`") in prompt, repo
     assert f"`harbourline-tracking`: {mount.NO_MAP}" in prompt
+
+
+@pytest.fixture()
+def a_later_release(monkeypatch):
+    import beeverforge
+    monkeypatch.setattr(beeverforge, "__version__", "99.0.0")
+
+
+def test_the_fixture_maps_are_current_whatever_the_release_number(a_later_release, bed):
+    """The fixture manifests carry no release of their own: the bed stamps the running one, so a
+    version bump never turns every harbourline map stale (#680)."""
+    harness = _Recording()
+    bed.module(agent=harness).answer("which module computes the chargeable weight?")
+    prompt = harness.prompts[0]
+
+    assert "`docs/.okf/repos/harbourline/modules.yaml` — checked" in prompt
 
 
 def test_a_map_the_code_moved_past_is_not_given(bed):
