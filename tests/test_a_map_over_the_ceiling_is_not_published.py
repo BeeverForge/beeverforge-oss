@@ -48,8 +48,22 @@ def test_a_refresh_over_the_ceiling_publishes_nothing_and_logs_one_line(
     monkeypatch.setattr(knowledge, "build_bundle", lambda *a, **k: _with_a_module_of_many_symbols(
         real_build_bundle(*a, **k), 2_000))
 
+    # the concept renewal (#543) must still run when the map is refused: an early return inside
+    # the refusal would stop it and still leave the map unchanged
+    import beeverforge.onboarding.renew as renew
+    renewals: list[object] = []
+    real_renew = renew.renew_concepts
+
+    def spy(*a, **k):
+        renewals.append(a)
+        return real_renew(*a, **k)
+
+    monkeypatch.setattr(renew, "renew_concepts", spy)
+
     with caplog.at_level(logging.DEBUG):
         outcome = acts._do_refresh_knowledge(inp)
+
+    assert len(renewals) == 1
 
     assert outcome == "unchanged"
     assert _branch_commits(context, "main") == published

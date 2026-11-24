@@ -3,7 +3,8 @@
 THE CLAIMS:
 
   1. A document over `yaml_io.MAX_BYTES` is refused, and the refresh treats the map as unchanged.
-  2. The refusal is logged once, naming the document, its size, the ceiling and the largest module.
+  2. The concept renewal still runs when the map is refused.
+  3. The refusal is logged once, naming the document, its size, the ceiling and the largest module.
 """
 
 TEST = "tests/test_a_map_over_the_ceiling_is_not_published.py"
@@ -19,6 +20,10 @@ MUTATIONS = [
     ("the refresh lets the refusal escape as a failed round",
      ACTIVITIES, "        except BundleOverCeiling as exc:",
      "        except KeyboardInterrupt as exc:"),
+
+    ("the refusal returns from the refresh and the concept renewal never runs",
+     ACTIVITIES, "            map_changed = False\n",
+     '            return "unchanged"\n'),
 
     ("the refresh counts the refused map as changed",
      ACTIVITIES, "            map_changed = False\n", "            map_changed = True\n"),
