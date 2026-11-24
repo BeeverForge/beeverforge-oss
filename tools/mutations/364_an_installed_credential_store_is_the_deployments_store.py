@@ -55,7 +55,8 @@ MUTATIONS = [
 
     # 6. the reference
     ("the reference drops the TLS key from what a worker asks for at start", DOCS,
-     ", and `TEMPORAL_TLS_KEY` when no API key answers;",
+     # re-pinned 2026-11-22 (#657): the TLS key is asked beside the API key as well
+     ", and `TEMPORAL_TLS_KEY` beside it or in its place;",
      ";"),
     ("the reference names `GH_TOKEN` as the forge's credential again", DOCS,
      "the forge's `BEEVERFORGE_FORGE_TOKEN` / `BEEVERFORGE_BOT_TOKEN`",

@@ -176,8 +176,9 @@ async def _client():
     other's any more; the refusal while a read is remembered as silent is why this stays apart.)
 
     KEPT ONLY WHILE IT IS STILL THE RIGHT ONE, by the pool's own two tests. `fingerprint()` is how
-    this tree says "the same engine, as the same caller", so a rotated key or a certificate
-    rewritten in place is approved with a new client, never the old credential. And the loop: the
+    this tree says "the same engine, as the same caller", so a key that appears or goes away, or a
+    certificate rewritten in place, is approved with a new client, never the old credential; a key
+    whose value rotates is handed to the client already held (#657). And the loop: the
     entry's lock belongs to the loop that made it, and the standing loop is replaced if it ever
     ends, so a new loop makes a new entry — around the same client since #681, because a client
     answers from any loop (temporalio 1.29 and later). A client per ROTATION, not per approval.

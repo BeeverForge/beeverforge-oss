@@ -150,6 +150,12 @@ class Answer:
     #: why the store will not hand over what it holds, in its own sentence; `""` when it did not
     #: refuse. Holding nothing is not a refusal.
     refused: str = ""
+    #: True when `refused` is a store that FAILED — it raised rather than answering: unreachable,
+    #: a timeout, a defect — and not one that said no on purpose (`CredentialRefused`). Both are
+    #: refusals to every reader that uses the credential, since nothing is used in its place; a
+    #: re-read of a credential already held may tell them apart, because a store that went quiet
+    #: has said nothing about the credential (review of CORE!664).
+    failed: bool = False
 
 
 #: Nothing answered and nothing refused.
@@ -191,7 +197,8 @@ def _ask(kind: str, name: str, *, quiet: bool = False) -> Answer:
                 "and nothing is used in its place", kind, name, type(exc).__name__, exc,
                 exc_info=not quiet)
         return Answer(reference=reference,
-                      refused=f"the {kind} store failed reading `{name}` ({type(exc).__name__})")
+                      refused=f"the {kind} store failed reading `{name}` ({type(exc).__name__})",
+                      failed=True)
     return Answer(reference=reference, value=value) if value else NOTHING
 
 

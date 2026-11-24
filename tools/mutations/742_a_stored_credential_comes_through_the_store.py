@@ -69,8 +69,9 @@ MUTATIONS = [
     # re-pinned 2026-10-19 (#822): the key is looked up as an `Answer`
     ("the engine's API key is read from its variable again",
      "beeverforge/runtime/temporal/connection.py",
-     '        return {"api_key": api_key.value, "tls": True}',
-     '        return {"api_key": os.environ.get("TEMPORAL_API_KEY"), "tls": True}', SWEEP),
+     # re-pinned 2026-11-22 (#657): the key is added beside whatever TLS the connection has
+     '        auth["api_key"] = api_key.value',
+     '        auth["api_key"] = os.environ.get("TEMPORAL_API_KEY")', SWEEP),
     ("the sweep's exemption swallows the whole package", SWEEP,
      'STORE = PACKAGE / "adapters" / "credential_store"',
      "STORE = PACKAGE", SWEEP),

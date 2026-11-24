@@ -104,8 +104,9 @@ MUTATIONS = [
     ("the raw TEMPORAL_API_KEY goes into the key instead of a digest, so the deployment's "
      "credential travels in every repr and log line the pool reaches",
      CONN,
-     "    return address(), namespace(), digest",
-     '    return address(), namespace(), os.environ.get("TEMPORAL_API_KEY") or ""'),
+     # re-pinned 2026-11-22 (#657): the key is answered beside the key value it was read with
+     "    return (address(), namespace(), digest), api_key",
+     '    return (address(), namespace(), os.environ.get("TEMPORAL_API_KEY") or ""), api_key'),
 
     ("the key digests the TLS PATHS instead of the files' contents, so a cert rewritten in place "
      "at an unchanged path is served by a client holding the superseded one",

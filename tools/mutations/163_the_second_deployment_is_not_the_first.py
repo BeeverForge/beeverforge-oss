@@ -15,7 +15,8 @@ PANEL = "tests/test_the_panel_touches_no_cloud_locally.py"
 MUTATIONS = [
     # ── the engine ───────────────────────────────────────────────────────────────────────────────
     ("the undeclared engine silently becomes a local one again", CONN,
-     '    raise EngineNotDeclared(', '    return LOCAL_DEV_ADDRESS\n    raise EngineNotDeclared(',
+     '        return found\n    raise EngineNotDeclared(',
+     '        return found\n    return LOCAL_DEV_ADDRESS\n    raise EngineNotDeclared(',
      BARRIER),
 
     ("…and the panel re-derives the same question with its own default", VIEW,

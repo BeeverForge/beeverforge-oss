@@ -481,8 +481,9 @@ MUTATIONS = [
     ("a runtime that cannot be built wedges every later connect", CONNECTION,
      "    runtime = None\n    try:\n", "    runtime = core_runtime()\n    try:\n", LOGS),
     ("every caller makes an attempt of its own", CONNECTION,
-     "            mine = flight is None\n            if flight is None:",
-     "            mine = True\n            if True:", LOGS),
+     # re-pinned 2026-11-22 (#657): one level deeper, under "nothing is held"
+     "                mine = flight is None\n                if flight is None:",
+     "                mine = True\n                if True:", LOGS),
     ("a failure is not shared: those behind it try again", CONNECTION,
      "        flight.set_exception(failure if isinstance(failure, Exception) else _Abandoned())",
      "        flight.set_exception(_Abandoned())", LOGS),
@@ -508,8 +509,9 @@ MUTATIONS = [
     ("a failed attempt leaves no rest, so every read builds a runtime again (3cd816ac)",
      CONNECTION, "                _rest_after(key, failure)\n", "                pass\n", LOGS),
     ("a target that rests is attempted anyway (3cd816ac)", CONNECTION,
-     "            if refusal is not None:\n                raise refusal\n",
-     "            if False:\n                raise refusal\n", LOGS),
+     # re-pinned 2026-11-22 (#657): one level deeper, under "nothing is held"
+     "                if refusal is not None:\n                    raise refusal\n",
+     "                if False:\n                    raise refusal\n", LOGS),
     ("the rest never grows (3cd816ac)", CONNECTION,
      "    wait = first if before is None else min(2 * before.wait, max(RESTS_AT_MOST_S, first))",
      "    wait = first", LOGS),
