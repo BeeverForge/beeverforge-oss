@@ -2880,7 +2880,7 @@ class JobWorkflow:
     async def _preflight(self, params: JobParams) -> RunResult | None:
         """ADR-0013 D2/D3 — size the ticket on the worker BEFORE any Fargate. Returns:
         None → fit/degraded/error: run the job exactly as before;
-        DONE  → the ticket was SPLIT (children created, parent closed): complete, free floor;
+        SPLIT → the ticket was SPLIT (children created, parent closed): complete, free floor;
         NEEDS_REFINEMENT → unclear: a preformed result the caller parks (Resume re-runs after
         the human clarifies — preflight runs again then, judging the improved text)."""
         try:
@@ -2909,7 +2909,7 @@ class JobWorkflow:
                     start_to_close_timeout=timedelta(minutes=5),
                     retry_policy=RetryPolicy(maximum_attempts=2),  # idempotent (search-first)
                 )
-                return RunResult(ticket_id=params.issue, state=JobState.DONE, note=note)
+                return RunResult(ticket_id=params.issue, state=JobState.SPLIT, note=note)
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning("#%s: the automatic split failed (%s) — parking with the "
                                         "proposal for a person to split by hand", params.issue, exc)
@@ -3139,7 +3139,7 @@ class JobWorkflow:
                 elif result is None and pre_pending:
                     pre_pending = False
                     result = await self._preflight(params)
-                    if result is not None and result.state == JobState.DONE:
+                    if result is not None and result.state == JobState.SPLIT:
                         return result  # split completed — children exist, the parent is closed
                     if result is not None and result.state == JobState.SKIPPED:
                         # ADR-0048 §5: the question is on the card and the card is parked in
