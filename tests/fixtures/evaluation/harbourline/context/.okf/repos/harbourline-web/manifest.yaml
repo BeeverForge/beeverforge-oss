@@ -10,6 +10,7 @@ checksums:
 files_read: 2
 files_unread: 6
 generated_at: '2026-09-24T00:00:00Z'
+generator_version: 0.2.0.dev0
 source_commit: fixture
 unread_extensions:
 - files: 2
