@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from beeverforge import __version__
 from beeverforge.knowledge.contracts import (
     BUNDLE_VERSION,
     BundleManifest,
@@ -35,6 +36,7 @@ from beeverforge.knowledge.generator import (
     canonical_source_files,
     survey_extensions,
 )
+from beeverforge.knowledge.staleness import generator_is_older
 from beeverforge.util import yaml_io
 
 _log = logging.getLogger("beeverforge.knowledge.bundle")
@@ -80,6 +82,7 @@ def build_bundle(repo_path: Path, *, commit: str = "", generated_at: str = "") -
     survey = survey_extensions(repo_path)
     manifest = BundleManifest(
         bundle_version=BUNDLE_VERSION,
+        generator_version=__version__,
         generated_at=generated_at,
         source_commit=commit,
         checksums=compute_checksums(repo_path),
@@ -186,7 +189,8 @@ def write_bundle_dir(bundle: KnowledgeBundle, dest: Path, *, force: bool = False
     dest = Path(dest)
     if not force:
         existing = read_bundle_dir(dest)
-        if existing is not None and derived_key(existing) == derived_key(bundle):
+        if (existing is not None and not generator_is_older(existing.manifest)
+                and derived_key(existing) == derived_key(bundle)):
             _log.info("knowledge: sources unchanged — bundle left as-is (nothing to commit)")
             return None
     modules_text = _within_ceiling(

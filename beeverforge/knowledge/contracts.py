@@ -116,6 +116,10 @@ class BundleManifest(BaseModel):
     model_config = _MODEL
 
     bundle_version: str = BUNDLE_VERSION
+    # The release of the generator that wrote this map. `bundle_version` is the SCHEMA and does not
+    # move when the generator's output does, so without this a map from an older release looked
+    # current for ever. "" = not recorded (written before this field): treated as older.
+    generator_version: str = ""
     generated_at: str = ""  # ISO-8601, passed in by the caller (never read the clock here)
     source_commit: str = ""
     checksums: list[SourceChecksum] = Field(default_factory=list)

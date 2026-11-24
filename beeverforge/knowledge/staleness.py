@@ -25,10 +25,35 @@ import hashlib
 import logging
 from pathlib import Path
 
-from beeverforge.knowledge.contracts import KnowledgeBundle
+from beeverforge import __version__
+from beeverforge.knowledge.contracts import BundleManifest, KnowledgeBundle
 from beeverforge.knowledge.generator import canonical_source_files
 
 _log = logging.getLogger("beeverforge.knowledge.staleness")
+
+
+def _release(version: str) -> tuple[int, ...] | None:
+    """The numeric release of a version string ("0.2.0.dev0" -> (0, 2, 0)), or None when it has
+    none. Pre/dev suffixes are ignored: a development build of a release is that release."""
+    parts: list[int] = []
+    for piece in version.strip().split("."):
+        if not piece.isdecimal():
+            break
+        parts.append(int(piece))
+    return tuple(parts) or None
+
+
+def generator_is_older(manifest: BundleManifest) -> bool:
+    """True when the manifest names no generator, an unreadable one, or a release older than the
+    one running. The same or a newer release is not older. Padding makes (0, 2) equal (0, 2, 0)."""
+    written, running = _release(manifest.generator_version), _release(__version__)
+    if written is None or running is None:
+        return True
+    width = max(len(written), len(running))
+    def pad(r: tuple[int, ...]) -> tuple[int, ...]:
+        return r + (0,) * (width - len(r))
+
+    return pad(written) < pad(running)
 
 
 def is_stale(bundle: KnowledgeBundle, repo_path: Path) -> bool:
@@ -43,6 +68,8 @@ def is_stale(bundle: KnowledgeBundle, repo_path: Path) -> bool:
     persisted bundle as stale and the map would never be served once. `source_commit` is
     provenance ("which commit was this derived from"), not the freshness test; the checksums
     are the freshness test, and they are exact."""
+    if generator_is_older(bundle.manifest):
+        return True
     repo = Path(repo_path).expanduser().resolve()
     try:
         tracked = {c.file: c.sha256 for c in bundle.manifest.checksums}
