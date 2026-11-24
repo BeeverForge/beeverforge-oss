@@ -52,6 +52,9 @@ from beeverforge.lifecycle.table import (
 #: `delivered` card is closed on every row since #413 (the local row's Done closes it as well).
 _NOT_OPEN = frozenset({State.CLOSED, State.REMOVED, State.DELIVERED})
 
+#: The states a card is in when the forge closed it before the workflow saw its pull request merge.
+_CLOSED_BEFORE_THE_MERGE_WAS_SEEN = frozenset({State.CLOSED, State.DELIVERED})
+
 log = logging.getLogger("beeverforge.lifecycle.card")
 
 #: How many times a writer that lost the race for a card's next number reads and decides again.
@@ -176,6 +179,16 @@ def transition(project, card: str, event: CardEvent, *, by: str, why: str = "",
         elif event in READ_FROM_THE_RECORD:
             seen = replace(seen, state=_merged_or_staged(seen.state, history))
         refusal = allowed(seen.state, event, open_card=seen.open)
+        late = (refusal is not None and event is CardEvent.MERGED
+                and seen.state in _CLOSED_BEFORE_THE_MERGE_WAS_SEEN
+                and "stages_follow" in (facts or {}) and bool((facts or {}).get("pr_url")))
+        if late:
+            # THE FORGE CLOSED THE ISSUE BEFORE THE WORKFLOW SAW THE MERGE (#609): a pull request
+            # merged by hand closes the card it says it fixes. The job's telling — the one hand of
+            # `merged` keyed by its pull request — is still recorded, once, and what the forge
+            # already wrote to the card is not written again. The box's and the settle's `merged`
+            # are not this and stay refused
+            refusal = None
         if refusal is not None and acted and seen.state is after(event, {**(facts or {}),
                                                                         "before": ""}):
             # THE ENGINE ACTED, AND THE JOB'S OWN ENDING GOT THERE FIRST: a person's skip signals
@@ -212,6 +225,8 @@ def transition(project, card: str, event: CardEvent, *, by: str, why: str = "",
         known["before"] = seen.state.value if seen.state else ""
         if observed:
             known["observed"] = True
+        if late:
+            known["late"] = True
         known.setdefault("title", seen.title)
         known.setdefault("opened_by", seen.opened_by)
         # WHERE THE REQUESTER ASKED, READ BEFORE ANYTHING IS APPLIED: the card's delivery loop

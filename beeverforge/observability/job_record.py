@@ -96,6 +96,56 @@ def record_job(*, project: str, issue: str, ts: str, state: str = "", title: str
         log.info("job telemetry for %s#%s was not recorded (%s)", project, issue, str(exc)[:160])
 
 
+#: The outcomes that PARK a job rather than end it: it can resume, and will end again.
+PARKED = frozenset({"on_hold", "paused"})
+
+
+def record_job_ending(*, project: str, issue: str, state: str, pr_url: str = "") -> bool:
+    """A job's ENDING as ONE `job` row — its final state, its pull request and its platform stamp,
+    marked `extra.ending` so a consumer picks it without guessing from timestamps (#609). Returns
+    whether a row was written NOW.
+
+    WHY A ROW OF ITS OWN. The attempt's row is written when an attempt ends, and a job that ends at
+    a merge somebody else made — a person on the forge, an operator's merge action — has no attempt
+    ending there: the row it wrote said `awaiting_merge` or nothing, and no row of the metrics said
+    the job ended merged. Both drivers write the ending, from the one place each knows the job is
+    over (the workflow's `record_outcome`, the attended driver's `_drive_one`), through here, so a
+    second one cannot grow a second shape of it. The per-attempt rows are unchanged.
+
+    ONCE PER JOB, STATE AND PULL REQUEST: the row is keyed by them, so a replayed activity or a
+    second driver writes nothing again, while a job that ends `merged` and later `done` says both.
+    A store that cannot write by key is written as an ordinary row, and a second one is possible.
+
+    ONLY AN OUTCOME THAT ENDS THE JOB IS AN ENDING. A job that parks (`on_hold`: an impediment, an
+    operator's cancel, a terminated workflow; `paused`: a usage limit) can be resumed and will end
+    again, so a row for the park would count a job that has not ended and a second one when it
+    does. Those write nothing (`PARKED`); the journal's own line still records the park. `failed`
+    is an ending: the job stopped, and a retry that ends differently writes its own row.
+
+    BEST-EFFORT, like every write on this axis: it never raises and never changes the job."""
+    import hashlib
+    from datetime import UTC, datetime
+
+    from beeverforge.observability.metrics import KeyedSink, MetricRecord
+    from beeverforge.observability.registry import deployment_metrics_sink
+
+    if state in PARKED:
+        return False
+    try:
+        sink = deployment_metrics_sink()
+        row = MetricRecord(
+            project=project, ticket=issue, ts=datetime.now(UTC).isoformat(), kind="job",
+            role="_job_", state=state, pr_url=pr_url or "",
+            extra={"platform": platform_stamp(), "ending": True})
+        if not isinstance(sink, KeyedSink):
+            return bool(sink.record(row))
+        seal = hashlib.sha256(f"{state}\n{pr_url or ''}".encode()).hexdigest()[:20]
+        return sink.record_if_absent(row, key=f"job#{issue}#ending#{seal}")
+    except Exception as exc:
+        log.info("the ending of %s#%s was not recorded (%s)", project, issue, str(exc)[:160])
+        return False
+
+
 def platform_stamp() -> dict[str, str]:
     """WHICH PLATFORM RAN THE ATTEMPT: the package's version and the image's build code (`""`
     outside a built image), on every `job` row (#356).
