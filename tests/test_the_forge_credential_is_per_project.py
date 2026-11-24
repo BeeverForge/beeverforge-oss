@@ -145,7 +145,9 @@ def test_a_forge_credential_is_resolved_PER_PROJECT(path, func_name):
     assert func is not None, f"{func_name} vanished from {path} — this guard now guards nothing"
 
     called = _calls_named(func)
-    assert "forge_token_for" in called, (
+    # `axis_answer_for(project, "forge")` is the same per-project resolution, answering the store's
+    # reference beside the value, which the runners hand on rather than read twice (#236)
+    assert called & {"forge_token_for", "axis_answer_for"}, (
         f"{path}::{func_name} does not ask which project's forge it is resolving for"
     )
     assert "forge_token" not in called, (
