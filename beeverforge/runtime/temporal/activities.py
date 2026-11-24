@@ -5253,7 +5253,12 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
     from beeverforge.adapters.forge.registry import clone_url_for
     from beeverforge.credentials import deployment_forge_token, forge_token_for
     from beeverforge.knowledge import build_bundle, write_bundle
-    from beeverforge.knowledge.bundle import BUNDLE_DIRNAME, MANIFEST_FILE, MODULES_FILE
+    from beeverforge.knowledge.bundle import (
+        BUNDLE_DIRNAME,
+        MANIFEST_FILE,
+        MODULES_FILE,
+        BundleOverCeiling,
+    )
     from beeverforge.knowledge.pipeline import (
         discard_fetched_bundle,
         fetch_published_bundle,
@@ -5344,7 +5349,13 @@ def _do_refresh_knowledge(inp: KnowledgeRefreshInput) -> str:
         commit = head.stdout.strip() if head.returncode == 0 else ""
         now = datetime.now(UTC).isoformat()
         bundle = build_bundle(Path(repo_path), commit=commit, generated_at=now)
-        map_changed = write_bundle(bundle, Path(repo_path)) is not None
+        try:
+            map_changed = write_bundle(bundle, Path(repo_path)) is not None
+        except BundleOverCeiling as exc:
+            # A map its own readers would refuse is not published: the one before it stays live,
+            # so this round counts it as unchanged (#543), said once, where the size is known.
+            activity.logger.warning("knowledge refresh for %s: %s", inp.project, exc)
+            map_changed = False
         # THE CONCEPTS MOVE WITH THE CODE (ADR-0045; `onboarding/renew.py`). The map above is
         # regenerated for free; a concept that the checker shows no longer matches this checkout is
         # re-authored here, under the project's budget, with the backfill's own harness — and the

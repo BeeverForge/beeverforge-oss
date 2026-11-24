@@ -149,14 +149,25 @@ class BundleOverCeiling(ValueError):
     ignored, a map that exists and is never used (#541)."""
 
 
-def _within_ceiling(path: Path, text: str) -> str:
+def _largest_module(bundle: KnowledgeBundle) -> str:
+    """The module whose own entry serializes largest — what to look at when the map is too big."""
+    sized = [(len(_dump(m.model_dump(mode="json")).encode("utf-8")), m.name)
+             for m in bundle.module_map.modules]
+    if not sized:
+        return "(none)"
+    size, name = max(sized)
+    return f"{name} ({size:,} bytes)"
+
+
+def _within_ceiling(path: Path, text: str, bundle: KnowledgeBundle) -> str:
     """`text`, or `BundleOverCeiling` naming `path` when its reader would refuse it."""
     size = len(text.encode("utf-8"))
     if size > yaml_io.MAX_BYTES:
         raise BundleOverCeiling(
             f"the knowledge bundle {path} would be {size:,} bytes, over the "
             f"{yaml_io.MAX_BYTES:,}-byte ceiling a YAML file is read to, so it was not written: "
-            "read back, it would be refused and the map ignored")
+            f"read back, it would be refused and the map ignored; largest module: "
+            f"{_largest_module(bundle)}")
     return text
 
 
@@ -194,9 +205,11 @@ def write_bundle_dir(bundle: KnowledgeBundle, dest: Path, *, force: bool = False
             _log.info("knowledge: sources unchanged — bundle left as-is (nothing to commit)")
             return None
     modules_text = _within_ceiling(
-        dest / MODULES_FILE, _GENERATED_BANNER + _dump(bundle.module_map.model_dump(mode="json")))
+        dest / MODULES_FILE, _GENERATED_BANNER + _dump(bundle.module_map.model_dump(mode="json")),
+        bundle)
     manifest_text = _within_ceiling(
-        dest / MANIFEST_FILE, _GENERATED_BANNER + _dump(bundle.manifest.model_dump(mode="json")))
+        dest / MANIFEST_FILE, _GENERATED_BANNER + _dump(bundle.manifest.model_dump(mode="json")),
+        bundle)
     dest.mkdir(parents=True, exist_ok=True)
     # REPLACED, NEVER TRUNCATED. A RepoCache snapshot is built with `copy_function=os.link`, so
     # every file shares its inode with the hidden master (and with any snapshot a concurrent
