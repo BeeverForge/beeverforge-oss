@@ -203,6 +203,7 @@ async def ensure_all() -> list[str]:
     # schedules raised out of this function, and 0.7's poller is then the only one there is.
     out += await retire_former_schedules()
     out += await retire_orphan_schedules()
+    out += await retire_disabled_rounds()
     return out
 
 
@@ -367,6 +368,79 @@ async def retire_orphan_schedules() -> list[str]:
             except Exception as exc:  # noqa: BLE001 — a failed delete is a log line, not an outage
                 log.warning("could not retire the orphan schedule %s (%s)", sid, exc)
     return retired
+
+
+def _round_ids(project_name: str) -> list[str]:
+    """The three schedules that are a project's rounds: the tech-lead's watch, the knowledge
+    refresh and the card-question sweep. The product sweep is not one: it follows the product
+    module, not the project's pickup switch."""
+    return [f"{prefix}-{project_name}" for prefix in
+            (WATCH_SCHEDULE_PREFIX, OKF_SCHEDULE_PREFIX, CARD_QUESTION_SCHEDULE_PREFIX)]
+
+
+async def schedule_project_rounds(project_name: str) -> list[str]:
+    """Create or update the three rounds of ONE project, now. Idempotent.
+
+    THE SWITCH MUST NOT WAIT FOR A DEPLOY. `ensure_all` reconciles at worker boot, so a project
+    enabled afterwards had no rounds until the worker next restarted. Scoped to the one project:
+    enabling `a` never touches `b`'s schedules."""
+    client = await connect()
+    made: list[str] = []
+    for sid, schedule in zip(_round_ids(project_name), (
+            _watch_schedule(project_name, WATCH_EVERY_HOURS),
+            _okf_schedule(project_name, OKF_EVERY_HOURS),
+            _card_question_schedule(project_name, CARD_QUESTION_EVERY_HOURS)), strict=True):
+        try:
+            await client.create_schedule(sid, schedule)
+            made.append(f"created {sid}")
+        except ScheduleAlreadyRunningError:
+            handle = client.get_schedule_handle(sid)
+            await handle.update(lambda _, sch=schedule: ScheduleUpdate(schedule=sch))
+            made.append(f"updated {sid}")
+    return made
+
+
+async def retire_project_rounds(project_name: str) -> list[str]:
+    """Delete the three rounds of ONE project; the rounds stop. Idempotent: a schedule already
+    gone is the state this wants. Any other failure raises, for the caller to say."""
+    from temporalio.service import RPCError, RPCStatusCode
+
+    client = await connect()
+    retired: list[str] = []
+    for sid in _round_ids(project_name):
+        try:
+            await client.get_schedule_handle(sid).delete()
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                raise
+            continue
+        retired.append(sid)
+    return retired
+
+
+async def retire_disabled_rounds() -> list[str]:
+    """Delete the rounds of every REGISTERED project that is disabled — the boot's half of the
+    switch, converging the other way like `retire_orphan_schedules` does for unregistered ones.
+
+    A project disabled while the engine was down, or by hand-editing the registry, still has its
+    three schedules, firing hourly onto a floor that is deliberately off. NEVER RAISES: an
+    unreadable registry retires nothing, and one project's failed delete is a log line."""
+    from beeverforge.registry import ProjectRegistry
+
+    try:
+        disabled = [p.name for p in ProjectRegistry().list() if not p.enabled]
+    except Exception as exc:  # noqa: BLE001 — an unreadable registry must not retire anything
+        log.warning("could not read the registry; retiring no disabled project's rounds (%s)", exc)
+        return []
+    out: list[str] = []
+    for name in disabled:
+        try:
+            retired = await retire_project_rounds(name)
+        except Exception as exc:  # noqa: BLE001 — one project's failure must not keep the rest
+            log.warning("could not retire the rounds of disabled project %s (%s)", name, exc)
+            continue
+        out += [f"retired {sid} (project {name!r} is disabled)" for sid in retired]
+    return out
 
 
 async def main() -> None:
