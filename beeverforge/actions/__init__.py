@@ -450,11 +450,24 @@ async def perform(name: str, *, by: Actor, **params: object) -> Outcome:
 #: which is precisely the path a wrong password takes.
 _SECRET = frozenset({"password", "token", "secret", "key"})
 
-#: Parameters that carry a PERSON'S WORDS (#205). The audit record keeps how much was said and a
-#: digest that proves which words, never the words: a message refused at the gate, or accepted, is
-#: not something a log line a deployment ships off the host should hold.
-_FREE_TEXT = frozenset({"message", "body", "comment", "answer", "answers", "instruction", "note",
-                        "question", "text", "criteria", "title", "ask", "query", "reason", "why"})
+#: What a log line holds of a person's words (#205): how much was said and a digest that proves
+#: which words, never the words. A message refused at the gate, or accepted, is not something a log
+#: line a deployment ships off the host should hold.
+#: The ONLY parameters whose value a log line prints as given (#205): ids, numbers, enums, booleans,
+#: and project, issue, repository and board names. The list fails closed: a parameter that is not
+#: here is digested whatever it is called, so a new parameter that takes a person's words is never
+#: logged whole by omission. `tests/test_a_refused_message_reaches_no_log_line.py` walks the catalog
+#: and fails on a string parameter that is neither listed here nor digested.
+_SAFE = frozenset({
+    "accept", "ado_project", "agent_name", "approver", "auto_start", "before", "board",
+    "board_number", "board_owner", "capability", "card", "choice", "ci", "column", "cpus",
+    "docs_repo", "durable", "enabled", "force", "head", "hours", "image", "in_favour_of", "issue",
+    "language", "limit", "memory", "message_id", "model", "network", "number", "numbers",
+    "organization", "origin", "path", "people", "pickup", "pr", "product", "project", "promote",
+    "provider", "ref", "repo", "repo_path", "repository", "required", "role", "room", "sandbox",
+    "session", "severity", "source", "target", "thread", "token_env", "unit", "version", "wait",
+    "work_item_type", "write", "yes",
+})
 
 
 def _words(value: object) -> dict[str, object]:
@@ -486,9 +499,14 @@ def _why(exc: Exception) -> str:
     return first_message(exc)
 
 
+def _says(value: object) -> bool:
+    """Whether a value can hold a person's words: any non-empty string, list or object."""
+    return isinstance(value, (str, list, tuple, dict)) and bool(value)
+
+
 def _loggable(key: str, params: dict[str, object],
               outcome: Outcome | None = None) -> dict[str, object]:
-    out = {k: ("***" if k in _SECRET else _words(v) if k in _FREE_TEXT and v else v)
+    out = {k: ("***" if k in _SECRET else v if k in _SAFE or not _says(v) else _words(v))
            for k, v in params.items()}
     if key == "product_people_set" and "people" in out:
         # THE COUNTS, THE DIGEST AND THE PEOPLE CHANGED (#528): the line is the record of who was

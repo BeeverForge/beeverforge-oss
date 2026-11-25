@@ -79,3 +79,27 @@ async def test_the_info_line_keeps_the_action_the_caller_and_the_kept_parameters
     assert "Ana (via slack)" in line
     assert "'project': 'demo'" in line and "'thread': 't1'" in line
     assert WORDS not in caplog.text and "salary" not in caplog.text
+
+
+#: The catalogue parameters that took a person's words and were missing from the hand-kept list.
+UNLISTED = ("restated", "violates", "requirement", "decision", "term", "context", "display")
+
+
+@pytest.mark.parametrize("name", UNLISTED)
+def test_a_parameter_that_takes_words_is_digested_not_printed(name):
+    out = actions._loggable("any", {name: WORDS})
+
+    assert WORDS not in str(out)
+    assert out[name]["chars"] == len(WORDS)
+
+
+def test_every_string_parameter_in_the_catalogue_is_safe_or_digested():
+    names = {p for spec in catalog.CATALOG.values() for p in spec.parameters}
+    for name in sorted(names - actions._SECRET):
+        out = actions._loggable("any", {name: WORDS})[name]
+        if name in actions._SAFE:
+            assert out == WORDS, name
+        else:
+            assert out == {"chars": len(WORDS),
+                           "sha256": hashlib.sha256(WORDS.encode()).hexdigest()}, name
+    assert not set(UNLISTED) & actions._SAFE
