@@ -489,6 +489,11 @@ own container:
 docker compose --env-file .env.compose up -d --build
 ```
 
+The worker and the panel run as root there, so where a local-forge project's repository belongs to
+another user, the box's clone, the repository cache, the job's push and the local forge's git run
+as that owner inside it, and a repository that cannot be reached that way is refused with the
+cause and the remedy.
+
 Where the durable engine already runs somewhere else (a hosted Temporal namespace, or one your
 platform team operates), the published `beeverforge-worker` image runs the worker **and** the
 panel in one long-lived container. The image's entry point is `tini -s --`, so the command is

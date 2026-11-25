@@ -19,11 +19,12 @@ AUTHORING = "beeverforge/product/authoring.py"
 MUTATIONS = [
     # 1. the clones a path reaches
     ("TODAY'S DEFECT: the cache clones a path file by file", CACHE,
-     '            rc, out = _git(gitpin.pinned(["clone", "--no-local",\n',
-     '            rc, out = _git(gitpin.pinned(["clone",\n'),
+     # RE-PINNED 2026-11-25, with the row below: a repository on this machine is served as its owner
+     '                rc, out = _git(gitpin.pinned(["clone", "--no-local", *read,\n',
+     '                rc, out = _git(gitpin.pinned(["clone", *read,\n'),
     ("the box clones the cache file by file again, without hardlinks", BOX,
-     '["clone", "--no-local", "--", str(repo_path), str(host_clone)]',
-     '["clone", "--local", "--no-hardlinks", "--", str(repo_path), str(host_clone)]'),
+     '["clone", "--no-local", *_quietly(served), "--", str(repo_path),\n',
+     '["clone", "--local", "--no-hardlinks", *_quietly(served), "--", str(repo_path),\n'),
 
     # 2. every clone, and the guard
     ("a clone that writes a requirement copies the objects directory", AUTHORING,
