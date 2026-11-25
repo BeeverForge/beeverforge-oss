@@ -53,7 +53,7 @@ import time
 import uuid
 from pathlib import Path
 
-from beeverforge import gitpin
+from beeverforge import gitowner, gitpin
 from beeverforge.adapters import gitworktrees
 from beeverforge.util.filelock import FileLock
 
@@ -233,10 +233,21 @@ def remote_default_branch(clone_url: str) -> str:
     `""` ON ANY TROUBLE, and the caller falls back to what it already has: an unreachable remote
     must not be the reason a working checkout is thrown away.
     """
-    rc, out = _git(gitpin.pinned(["ls-remote", "--symref", "--", clone_url, "HEAD"]))
+    rc, out = _the_remotes_head(clone_url)
     if rc != 0:
         return ""
     return _symref_branch(out)
+
+
+def _the_remotes_head(clone_url: str) -> tuple[int, str]:
+    """`ls-remote`'s answer. A refusal is one more trouble here: the clone that follows says it."""
+    try:
+        with gitowner.upload_pack(clone_url) as served:
+            rc, out = _git(gitpin.pinned(["ls-remote", "--symref", *served, "--", clone_url,
+                                          "HEAD"]))
+    except gitowner.Refused as exc:
+        return 128, str(exc)
+    return rc, out
 
 
 def _symref_branch(out: str) -> str:
@@ -277,6 +288,12 @@ def _one_reason(exc: OSError) -> str:
     return str(getattr(exc, "strerror", None) or exc)[:200]
 
 
+def _why(exc: Exception) -> str:
+    """Why a sync failed, for a log line. A refusal whole: its remedy names a path, at its end."""
+    said = _scrub(str(exc))
+    return said if isinstance(exc, gitowner.Refused) else said[:160]
+
+
 class RepoCache:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root) if root else default_root()
@@ -312,8 +329,7 @@ class RepoCache:
                     # could fill and then could not empty (#369).
                     self._purge_displaced()
         except Exception as exc:  # noqa: BLE001 — cache trouble must never block the pipeline
-            log.warning("BEEVERFORGE_CACHE: sync failed for %s (%s)",
-                        project, _scrub(str(exc))[:160])
+            log.warning("BEEVERFORGE_CACHE: sync failed for %s (%s)", project, _why(exc))
             return None
 
     def _sync(self, project: str, clone_url: str, base_branch: str) -> Path | None:
@@ -329,18 +345,20 @@ class RepoCache:
         if not (wanted and (master / ".git").exists()
                 and self._reset(master, wanted, clone_url)):
             # missing or corrupt → drop and reclone (the degrade ladder's middle rung).
-            # Only the hidden master is dropped; the served tree stays whole throughout.
-            shutil.rmtree(master, ignore_errors=True)
-            master.parent.mkdir(parents=True, exist_ok=True)
-            # THE CALLER'S OWN ANSWER DECIDES HERE, not `wanted`: `wanted` may have been inferred
-            # from the checkout this line has just deleted, and cloning
-            # `--branch <name-from-a-tree-we-judged-unusable>` fails on a name nobody asked for.
-            # An empty ask lets git pick, which is what it means. `--no-local`, like every clone
-            # the platform runs (#594): a path is read through the pack protocol, never copied
-            # file by file while the source's own maintenance repacks it.
-            rc, out = _git(gitpin.pinned(["clone", "--no-local",
-                                          *(["--branch", base_branch] if base_branch else []),
-                                          "--", clone_url, str(master)]))
+            # Only the hidden master is dropped; the served tree stays whole throughout. A source
+            # that cannot be read as its owner is refused first, with the master still there.
+            with gitowner.upload_pack(clone_url) as read:
+                shutil.rmtree(master, ignore_errors=True)
+                master.parent.mkdir(parents=True, exist_ok=True)
+                # THE CALLER'S OWN ANSWER DECIDES HERE, not `wanted`: `wanted` may have been
+                # inferred from the checkout this line has just deleted, and cloning
+                # `--branch <name-from-a-tree-we-judged-unusable>` fails on a name nobody asked
+                # for. An empty ask lets git pick, which is what it means. `--no-local`, like every
+                # clone the platform runs (#594): a path is read through the pack protocol, never
+                # copied file by file while the source's own maintenance repacks it.
+                rc, out = _git(gitpin.pinned(["clone", "--no-local", *read,
+                                              *(["--branch", base_branch] if base_branch else []),
+                                              "--", clone_url, str(master)]))
             if rc != 0:
                 # GIT'S WHOLE SENTENCE (#592): the last 160 characters cut inside the object's path,
                 # and the words before it, what git was doing when the file was not there, were
@@ -513,15 +531,16 @@ class RepoCache:
         refspec keeps `origin/<base>` meaning what it always did — without it the fetch would only
         move FETCH_HEAD and the reset below would silently use a stale ref."""
         spec = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
-        fetch = (gitpin.pinned(["fetch", "--", clone_url, spec]) if clone_url
-                 else gitpin.pinned(["fetch", "--", "origin", base_branch]))
-        for args in (fetch,
-                     ["checkout", "-f", base_branch],
-                     ["reset", "--hard", f"origin/{base_branch}"],
-                     ["clean", "-fdx"]):
-            rc, _ = _git(args, cwd=path)
-            if rc != 0:
-                return False
+        with gitowner.upload_pack(clone_url) as served:
+            fetch = (gitpin.pinned(["fetch", *served, "--", clone_url, spec]) if clone_url
+                     else gitpin.pinned(["fetch", "--", "origin", base_branch]))
+            for args in (fetch,
+                         ["checkout", "-f", base_branch],
+                         ["reset", "--hard", f"origin/{base_branch}"],
+                         ["clean", "-fdx"]):
+                rc, _ = _git(args, cwd=path)
+                if rc != 0:
+                    return False
         # a checkout cloned before this was fixed still holds a token in .git/config
         _scrub_remote(path, clone_url)
         return True

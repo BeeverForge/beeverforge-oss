@@ -50,7 +50,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from beeverforge import namespace
+from beeverforge import gitowner, namespace
 from beeverforge.adapters.sandbox.stopping import Stop
 from beeverforge.adapters.sandbox.timeouts import TIMEOUT_MARKER, timed_out
 from beeverforge.observability.job_record import record_one_pass
@@ -404,6 +404,9 @@ class Probes:
     #: gates through `run_in_box`/`run_streaming` with the box's default. A separate entry rather
     #: than a widened `run_in_box`, so every single-argument test double stays valid.
     run_gate: Callable[[str, int, Callable[[str], None] | None], tuple[int, str]] | None = None
+    #: What the box's start raised, whole, or None when it started: a repository that cannot be
+    #: reached as its owner is reported by its own cause and remedy.
+    box_start_exception: Callable[[], Exception | None] = lambda: None
 
 
 def component_gates(manifest) -> dict[str, str]:
@@ -589,6 +592,19 @@ def _variant_remedy(variant: str, image: tuple[str, str, str]) -> str:
         f"the toolbox was built on {have_os} and the box runs {want_os}. Build the worker image "
         f"on {want_os} — a toolbox assembled on a developer's machine cannot be mounted into a "
         "Linux container"
+    )
+
+
+def _box_did_not_start(p: Probes, out: str) -> Finding:
+    refused = p.box_start_exception()
+    if isinstance(refused, gitowner.Refused):
+        return Finding("box", False, refused.reason,
+                       refused.remedy or "the words above are the whole reason; no remedy is known")
+    return Finding(
+        "box", False, _tail(out) or "the box did not start",
+        "this is the container itself, before any of your commands ran — a name collision "
+        "with a leftover container, an image that cannot keep alive, or a daemon that refused "
+        "the run. `docker ps -a` and remove anything named beeverforge-<project>-*",
     )
 
 
@@ -787,12 +803,7 @@ def prove(project: str, image: str, p: Probes, *,
     # run reported itself as a failing `setup:`, with a remedy about private package feeds.
     rc, out = p.run_in_box("true")
     if rc != 0:
-        proof.findings.append(Finding(
-            "box", False, _tail(out) or "the box did not start",
-            "this is the container itself, before any of your commands ran — a name collision "
-            "with a leftover container, an image that cannot keep alive, or a daemon that refused "
-            "the run. `docker ps -a` and remove anything named beeverforge-<project>-*",
-        ))
+        proof.findings.append(_box_did_not_start(p, out))
         return proof
     proof.findings.append(Finding("box", True, "the box starts and runs commands"))
 
@@ -1593,7 +1604,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
         # (adversarial review, 2026-08-13). `key=None` keeps the default slot, byte for byte.
         repo = repo_path if repo_path is not None else resolve_repo_path(project, cache_key=key)
         manifest = manifest if manifest is not None else load_manifest(project, repo_root=repo)
-        start_error = ""
+        start_error, start_exception = "", None
         # THE REGISTRY'S `box:` KNOBS ARE FORWARDED, from the one function `build_runner` uses
         # (`factory.box_knobs`, #191). This call once passed none of them, so the proof box had the
         # default network, no cache volume, no `box.env` (measured by the onboard fact-finding pass,
@@ -1809,7 +1820,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
                 repo_path=repo, base_branch=manifest.base_branch,
                 branch=f"{namespace.BRANCH_PREFIX}/box-prove-{_prove_slug(subject)}")
         except Exception as exc:  # noqa: BLE001 — an unstartable box IS the finding, not a crash
-            start_error = str(exc)[:300]
+            start_error, start_exception = str(exc)[:300], exc
             log.info("the box could not be started for the proof (%s)", start_error)
 
         # A COMMAND ALREADY RUNNING WHEN THE ENGINE GAVE UP is ended by the box's own stop, then
@@ -1873,6 +1884,7 @@ def box_probes(project, image: str, *, repo_path: Path | None = None, manifest=N
             # for `prove`, and read as the harness refusing by `box answer`.
             box_start_error=lambda: (start_error or "unknown reason") if workspace is None else "",
             inlined_documents=_inlined_documents,
+            box_start_exception=lambda: start_exception,
         )
     finally:
         finished.set()

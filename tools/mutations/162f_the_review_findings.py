@@ -50,21 +50,23 @@ MUTATIONS = [
      "        wanted = base_branch or remote_default_branch(clone_url)"),
 
     ("…and the reverse: an unreachable remote throws away a working checkout", CACHE,
-     '    rc, out = _git(gitpin.pinned(["ls-remote", "--symref", "--", clone_url, "HEAD"]))\n'
+     # RE-PINNED 2026-11-25: the probe is made in a `with`, so what follows it is the anchor
      '    if rc != 0:\n'
-     '        return ""',
-     '    rc, out = _git(gitpin.pinned(["ls-remote", "--symref", "--", clone_url, "HEAD"]))\n'
+     '        return ""\n'
+     '    return _symref_branch(out)',
      '    if rc != 0:\n'
-     '        raise RuntimeError("unreachable")'),
+     '        raise RuntimeError("unreachable")\n'
+     '    return _symref_branch(out)'),
 
     # RE-PINNED 2026-10-10 (#594): every clone passes `--no-local`
     ("the reclone reuses a name inferred from the tree it has just deleted", CACHE,
-     '            rc, out = _git(gitpin.pinned(["clone", "--no-local",\n'
-     '                                          *(["--branch", base_branch] if base_branch else []),\n'
-     '                                          "--", clone_url, str(master)]))',
-     '            rc, out = _git(gitpin.pinned(["clone", "--no-local",\n'
-     '                                          *(["--branch", wanted] if wanted else []),\n'
-     '                                          "--", clone_url, str(master)]))'),
+     # RE-PINNED 2026-11-25: a repository on this machine is served as its owner
+     '                rc, out = _git(gitpin.pinned(["clone", "--no-local", *read,\n'
+     '                                              *(["--branch", base_branch] if base_branch else []),\n'
+     '                                              "--", clone_url, str(master)]))',
+     '                rc, out = _git(gitpin.pinned(["clone", "--no-local", *read,\n'
+     '                                              *(["--branch", wanted] if wanted else []),\n'
+     '                                              "--", clone_url, str(master)]))'),
 
     ("the symref answer is parsed as the whole line", CACHE,
      '            return line.split("refs/heads/", 1)[1].split()[0].strip()',

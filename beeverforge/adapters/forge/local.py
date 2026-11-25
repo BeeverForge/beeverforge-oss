@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from beeverforge import gitpin
+from beeverforge import gitowner, gitpin
 from beeverforge.adapters import gitworktrees
 from beeverforge.adapters.board_db import connect, next_pr, now_iso
 
@@ -77,8 +77,7 @@ class LocalForge:
     # ---- git, in one place ----------------------------------------------------------------
 
     def _git(self, *args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", cwd or self.repo_path, *args],
-                              capture_output=True, text=True, timeout=_TIMEOUT, check=False)
+        return _run_in(cwd or self.repo_path, args)
 
     def _out(self, *args: str, cwd: str | None = None) -> str:
         p = self._git(*args, cwd=cwd)
@@ -330,6 +329,7 @@ class LocalForge:
         key = self._repo_key(repo)
         where = self.clone_url(key)
         when = now_iso()
+        gitowner.owner_of(where)  # refused here, before a row that would hold empty shas
         with connect(self._db, write=True) as conn:
             live = conn.execute(
                 "SELECT number FROM pull_requests WHERE project = ? AND repo = ? AND head = ? "
@@ -532,7 +532,8 @@ class LocalForge:
                 return "unknown"
             base, head, where = row["base"], row["head"], self._where(row)
             if not self._sha(head, where):
-                return self._refuse(pr, f"the branch {head} is gone from this repository")
+                return self._refuse(pr, self._why_no_head(
+                    pr, where, f"the branch {head} is gone from this repository"))
             # THE ORDER IS THE ANSWER, and two of these were in the wrong place until a test
             # reached them. A repository with a merge in progress cannot be rebased either, so
             # `dirty` has to be decided BEFORE `behind` — otherwise the loop would spend its
@@ -664,6 +665,20 @@ class LocalForge:
                              (sentence, now_iso(), self.project, number))
         return "dirty"
 
+    def _why_no_head(self, pr: str, where: str, gone: str) -> str:
+        """Why a head's commit could not be read. `gone`, the sentence saying the branch is, unless
+        git runs there as the repository's owner and cannot be run at all: then what it, or the
+        refusal, said, recorded on the pull request. A repository nobody could read must not be
+        reported as a branch somebody deleted."""
+        if not gitowner.is_switched(where):
+            return gone
+        asked = self._git("rev-parse", "--git-dir", cwd=where)
+        if asked.returncode == 0:
+            return gone
+        said = self._sentence(asked)
+        self._refuse(pr, said)
+        return said
+
     def update_branch(self, *, pr: str) -> bool:
         """Rebase the head onto the base, in a scratch tree, and move the head's ref. False when
         it could not, with nothing moved.
@@ -737,7 +752,8 @@ class LocalForge:
         patch = self._patch_id(base, head, where)
         head_sha = self._sha(head, where)
         if not head_sha:
-            raise RuntimeError(f"the branch {head} is gone from this repository — nothing to merge")
+            raise RuntimeError(self._why_no_head(
+                pr, where, f"the branch {head} is gone from this repository — nothing to merge"))
 
         if blocked := self._blocked(base, where):
             self._refuse(pr, blocked)
@@ -836,6 +852,7 @@ class LocalForge:
 
         started = self._sha(head, where)
         scratch = tempfile.mkdtemp(prefix="beeverforge-rebase-")
+        gitowner.hand_to_the_owner_of(where, scratch)
         tree = str(Path(scratch) / "tree")
         try:
             added = self._git("worktree", "add", "--detach", tree, started, cwd=where)
@@ -864,6 +881,19 @@ class LocalForge:
         finally:
             self._git("worktree", "remove", "--force", tree, cwd=where)
             shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _run_in(repository: str, args: tuple[str, ...]) -> subprocess.CompletedProcess:
+    """Git in `repository`, as its owner when this process is root and another user owns it
+    (`gitowner`). A repository that cannot be reached that way answers as git's own failure does,
+    so every caller keeps its contract."""
+    try:
+        with gitowner.running_as_owner(repository) as (where, how):
+            return subprocess.run(["git", "-C", where, *args], capture_output=True, text=True,
+                                  timeout=_TIMEOUT, check=False, **how)
+    except gitowner.Refused as exc:
+        log.warning("git was not run in %s: %s", repository, exc)
+        return subprocess.CompletedProcess(args, 128, "", str(exc))
 
 
 def _same(a: str, b: str) -> bool:
