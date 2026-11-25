@@ -61,8 +61,10 @@ MUTATIONS = [
      "", SLICE),
 
     ("a branch that is gone merges as if it were there", FORGE,
-     '        if not head_sha:\n            raise RuntimeError(f"the branch {head} is gone from '
-     'this repository — nothing to merge")',
+     # RE-PINNED 2026-11-25: the sentence goes through `_why_no_head`
+     '        if not head_sha:\n            raise RuntimeError(self._why_no_head(\n'
+     '                pr, where, f"the branch {head} is gone from this repository — nothing to '
+     'merge"))',
      "        if not head_sha:\n            pass", SLICE),
 
     ("the merge stops being idempotent, so a retried activity fails on work already done", FORGE,

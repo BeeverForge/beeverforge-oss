@@ -264,8 +264,9 @@ MUTATIONS = [
     # RE-PINNED 2026-11-09 (#450): the push and the keep run in `host_push` since #386
     ("the kept branch is pushed with force, so a branch already at its name is replaced",
      HOST_PUSH,
-     '"push", "--no-verify", "--",\n                                   target, f"{tip}:refs/heads/{kept}"]',
-     '"push", "--force", "--no-verify", "--",\n                                   target, f"{tip}:refs/heads/{kept}"]'),
+     # RE-PINNED 2026-11-25: a repository on this machine is received as its owner
+     '"push", "--no-verify", *received,\n                                   "--", target, f"{tip}:refs/heads/{kept}"]',
+     '"push", "--force", "--no-verify", *received,\n                                   "--", target, f"{tip}:refs/heads/{kept}"]'),
 
     # re-pinned with the line above it: the pause's refusal says itself on the card too
     ("the card is not told where the forge's commits went",

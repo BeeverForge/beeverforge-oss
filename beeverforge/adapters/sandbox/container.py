@@ -44,11 +44,11 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
-from beeverforge import gitpin
+from beeverforge import gitowner, gitpin
 from beeverforge.adapters.sandbox.base import (
     DaemonTimedOut,
     OutputBuffer,
@@ -124,6 +124,38 @@ def _host(cmd: list[str], timeout: int = _HOST_TIMEOUT,
           env: dict[str, str] | None = None) -> tuple[int, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def _must(args: list[str], what: str, served: Sequence[str] = ()) -> None:
+    """Run a git step of the workspace, or raise saying which failed. `served` is the option that
+    made a local repository's owner serve it (`gitowner`), empty when nobody did."""
+    rc, out = _host(args)
+    if rc != 0:
+        raise _unread(out, served, f"{what} failed ({rc})")
+
+
+def _unread(out: str, served: Sequence[str], what: str, said: str = "") -> RuntimeError:
+    """The failure of a read. Served by the owner, git's own words lead, uncut, and what was being
+    done follows, or leads where git left no words; otherwise `said`, or `what` and the first of
+    git's words."""
+    words = _redact(out).strip()
+    if served and not words:
+        return gitowner.Refused(what, "git said nothing more")
+    if served:
+        return gitowner.Refused(words, detail=what)
+    return RuntimeError(said or f"{what}: {words[:300]}")
+
+
+def _served_by_its_owner(remote_url: str | None,
+                         repo_path: Path) -> AbstractContextManager[list[str]]:
+    """`gitowner.upload_pack` for a fetch from the forge, or from the clone's `origin`: that is a
+    name, and the directory it names is `repo_path`."""
+    return gitowner.upload_pack(remote_url or repo_path)
+
+
+def _quietly(served: Sequence[str]) -> list[str]:
+    """The clone's `served` option, and no progress line before what git says of a failure."""
+    return ["--quiet", *served] if served else []
 
 
 #: The wait before the one retry of a `docker rm -f` the daemon did not finish within
@@ -277,15 +309,12 @@ def _materialize_workspace(*, repo_path: Path, host_clone: Path, base_branch: st
     directory. Found by running `beeverforge box prove` inside the compose worker.
 
     Module-level, docker-free, so the branch topology is testable against real git repos."""
-    def _must(args: list[str], what: str) -> None:
-        rc, out = _host(args)
-        if rc != 0:
-            raise RuntimeError(f"{what} failed ({rc}): {_redact(out).strip()[:300]}")
-
     # A clone has its own refs, so a branch a person has out in a working tree of `repo_path` does
     # not stop it: unlike the worktree box, this one never raises `BranchHeldElsewhere` (#623).
-    _must(gitpin.argv(["clone", "--no-local", "--", str(repo_path), str(host_clone)]),
-          f"cloning {repo_path} into the box's workspace")
+    with gitowner.upload_pack(repo_path) as served:
+        _must(gitpin.argv(["clone", "--no-local", *_quietly(served), "--", str(repo_path),
+                           str(host_clone)]),
+              f"cloning {repo_path} into the box's workspace", served)
     if checkout_existing:
         # FETCH THE PR BRANCH FROM THE FORGE, NOT FROM THE CACHE. This clone's `origin` is the
         # worker's cache DIRECTORY (cloned by path above), which only ever holds the base branch its
@@ -305,9 +334,10 @@ def _materialize_workspace(*, repo_path: Path, host_clone: Path, base_branch: st
         source = remote_url or "origin"
         # A failed fetch here would leave the clone on the BASE branch, so a CI repair would run
         # against code that does not contain the change it is repairing — hence `_must`.
-        _must(gitpin.argv(["-C", str(host_clone), "fetch", "--", source,
-                           f"+{branch}:refs/remotes/origin/{branch}"]),
-              f"fetching the existing branch {branch!r}")
+        with _served_by_its_owner(remote_url, repo_path) as served:
+            _must(gitpin.argv(["-C", str(host_clone), "fetch", *served, "--", source,
+                               f"+{branch}:refs/remotes/origin/{branch}"]),
+                  f"fetching the existing branch {branch!r}", served)
         _must(["git", "-C", str(host_clone), "checkout", "-B", branch, f"origin/{branch}"],
               f"checking out {branch!r}")
         # A REOPENED PULL REQUEST IS MEASURED FROM WHERE IT LEFT THE BASE, as the worktree box
@@ -383,13 +413,14 @@ def _read_the_forges_base(host_clone: Path, base_branch: str, remote_url: str) -
     costs nothing the job could have kept, and it refuses before an agent has spent anything."""
     from beeverforge.adapters.sandbox.worktree import _remote_has_no_such_branch, no_such_base
 
-    rc, out = _host(gitpin.argv(["-C", str(host_clone), "fetch", "--", remote_url,
-                                 f"refs/heads/{base_branch}"]))
+    with gitowner.upload_pack(remote_url) as served:
+        rc, out = _host(gitpin.argv(["-C", str(host_clone), "fetch", *served, "--", remote_url,
+                                     f"refs/heads/{base_branch}"]))
     if rc != 0:
         if _remote_has_no_such_branch(out):
             raise RuntimeError(no_such_base(base_branch, "the forge"))
-        raise RuntimeError(f"could not read {base_branch!r} from the forge, the base this job "
-                           f"starts from and is measured against: {_redact(out).strip()[:300]}")
+        raise _unread(out, served, f"could not read {base_branch!r} from the forge, the base this "
+                                   "job starts from and is measured against")
 
 
 #: Said after a refused `docker run` whose daemon had no init to give the box (#532): Docker ships
@@ -1150,9 +1181,11 @@ class ContainerSandbox(SandboxAdapter):
             if rc != 0:
                 raise RuntimeError(f"could not resolve origin remote: {url}")
             target = url.strip()
-        rc, out = _host(gitpin.argv(["-C", hc, "fetch", "--", target, base]))
+        with gitowner.upload_pack(target) as served:
+            rc, out = _host(gitpin.argv(["-C", hc, "fetch", *served, "--", target, base]))
         if rc != 0:
-            raise RuntimeError(f"fetch failed: {_redact(out)}")
+            raise _unread(out, served, f"fetching {base!r} to rebase onto it failed ({rc})",
+                          f"fetch failed: {_redact(out)}")
         rc, _ = _host(["git", "-C", hc, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"])
         if rc == 0:
             return "up_to_date"

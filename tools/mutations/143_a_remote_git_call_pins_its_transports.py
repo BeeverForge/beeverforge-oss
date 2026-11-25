@@ -41,8 +41,10 @@ MUTATIONS = [
 
     # 2. the core's calls
     ("the cache's remote probe reads the machine's transports again", CACHE,
-     '    rc, out = _git(gitpin.pinned(["ls-remote", "--symref", "--", clone_url, "HEAD"]))',
-     '    rc, out = _git(["ls-remote", "--symref", "--", clone_url, "HEAD"])'),
+     # RE-PINNED 2026-11-25: a repository on this machine is served as its owner
+     '            rc, out = _git(gitpin.pinned(["ls-remote", "--symref", *served, "--", clone_url,\n'
+     '                                          "HEAD"]))',
+     '            rc, out = _git(["ls-remote", "--symref", *served, "--", clone_url, "HEAD"])'),
     ("the preview's head read reads the machine's transports again", DEMAND,
      '        done = subprocess.run(gitpin.argv(["ls-remote", "--heads", "--", remote,\n'
      '                                           f"refs/heads/{branch}"]),',
