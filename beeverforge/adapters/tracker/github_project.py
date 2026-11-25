@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
 from beeverforge.adapters.github_cli import LoginRefused, credential_of, nothing_named, refused
+from beeverforge.adapters.rate_limit import rate_limited
 from beeverforge.adapters.tracker.base import Budget, BudgetUnreadable
 from beeverforge.contracts import JobState
 from beeverforge.contracts.refs import qualify_ref, ref_number, split_repo_ref
@@ -136,7 +137,8 @@ def _run_gh(args: list[str], token: str | None):
 def _gh_json(args: list[str], token: str | None = None) -> dict:
     p = _run_gh(args, token)
     if p.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args)} failed: {p.stderr}")
+        message = f"gh {' '.join(args)} failed: {p.stderr}"
+        raise rate_limited(p, message) or RuntimeError(message)
     return json.loads(p.stdout)
 
 
