@@ -90,7 +90,11 @@ interesting surface is well-defined:
   already read. With the local
   forge the push's target is a
   repository on this machine, whose receiving side runs under that repository's own config and
-  hooks; that is tracked with the other host-side git calls in #400.
+  hooks; that is tracked with the other host-side git calls in #400. When the worker is root and
+  the repository belongs to another user, that side (and the side that serves the keep's fetch)
+  runs as that owner, in a short environment without the worker's credentials, and the push is
+  refused where the owner cannot be used (two owners, a directory the owner cannot enter, a git
+  directory of group 0, no `setpriv`). Otherwise it runs as the worker, as before.
 
   The **worker image run as one container** (`beeverforge worker --with-panel`) starts the panel
   from the worker's own environment, so the panel's HTTP process holds the worker's credentials —

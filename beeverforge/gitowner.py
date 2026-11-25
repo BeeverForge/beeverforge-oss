@@ -9,7 +9,8 @@ clone, a push and a merge, the person could not edit a merged file, delete the j
 were root's, and all of that worked.
 
 So, when the process is root and another user owns the repository, the git that reads or writes
-inside it runs as that user. Not root, or root's own repository: every call is what it was.
+inside it runs as that user, with the git directory's group, and is refused where that is root's.
+Not root, or root's own repository: every call is what it was.
 
 TWO FORMS, BECAUSE GIT IS STARTED TWO WAYS. `running_as_owner` is for a git this process starts.
 `upload_pack` and `receive_pack` are for the side git starts itself, in the repository a clone, a
@@ -45,7 +46,7 @@ _GITDIR_MOST = 8192
 
 
 class Owner(NamedTuple):
-    """The user git runs as, and the group: the git directory's."""
+    """The user git runs as, and the group: the git directory's, never root's."""
 
     uid: int
     gid: int
@@ -70,7 +71,8 @@ class Refused(RuntimeError):
 
 def owner_of(path: object) -> Owner | None:
     """Who git runs as in the repository at `path`, or None for "as today". Raises `Refused` when
-    its work tree and git directory have two owners, or its owner cannot enter it."""
+    its work tree and git directory have two owners, its git directory's group is root's, or its
+    owner cannot enter it."""
     if os.geteuid() != 0 or not path:
         return None
     try:
@@ -85,6 +87,8 @@ def owner_of(path: object) -> Owner | None:
         raise _two_owners(tree, git_dir, of_tree, of_git)
     if of_git.uid == 0:
         return None
+    if of_git.gid == 0:
+        raise _roots_group(git_dir, of_tree)
     _refuse_where_shut(of_git, tree, git_dir)
     return of_git
 
@@ -125,14 +129,33 @@ def _ownership(path: Path) -> tuple[int, int]:
 
 
 def _two_owners(tree: Path, git_dir: Path, of_tree: Owner, of_git: Owner) -> Refused:
-    """The command names the owner that is not root, and the path the other one has."""
+    """The command names the owner that is not root, and the path the other one has: both paths,
+    where the git directory that is kept has root's group."""
     keep, change = (of_tree, git_dir) if of_tree.uid else (of_git, tree)
+    group, whose = _a_group(keep)
+    paths = shlex.join(map(str, dict.fromkeys((change, change if keep.gid else git_dir))))
     return Refused(
         f"the repository has two owners: work tree uid {of_tree.uid}, git directory uid "
         f"{of_git.uid}",
-        f"give both one owner (`chown -R {keep.uid}:{keep.gid} {shlex.quote(str(change))}`): the "
+        f"give both one owner (`chown -R {keep.uid}:{group} {paths}`): the "
         f"work tree is {tree} (uid {of_tree.uid}) and the git directory is {git_dir} (uid "
-        f"{of_git.uid})")
+        f"{of_git.uid}){whose}")
+
+
+def _roots_group(git_dir: Path, of_tree: Owner) -> Refused:
+    group, whose = _a_group(of_tree)
+    return Refused(
+        f"the repository's owner is uid {of_tree.uid}, and its git directory has group 0, root's",
+        "git and the repository's hooks would run with that group: give the git directory another "
+        f"(`chgrp -R {group} {shlex.quote(str(git_dir))}`){whose}")
+
+
+def _a_group(owner: Owner) -> tuple[str, str]:
+    """The group a remedy names, never root's and never invented, and what it says of it."""
+    if owner.gid:
+        return str(owner.gid), ""
+    return "<group>", (f"; `<group>` is a group of uid {owner.uid}'s, not root's, for example what "
+                       "`id -g` prints for that user")
 
 
 # ── whether the owner can get there ─────────────────────────────────────────────────────────────

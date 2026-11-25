@@ -12,6 +12,8 @@ These need root, and are skipped with a reason otherwise. They start no containe
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -186,6 +188,25 @@ def test_each_refusal_comes_before_anything_is_written(scene, monkeypatch, caplo
     said = f"{refused.value}{caplog.text}"
     assert reason in said and remedy in said, said
     assert made._tree(scene.repo) == before
+
+
+def test_a_git_directory_of_roots_group_is_refused_until_its_remedy_is_followed(scene):
+    head = scene.the_job_commits()
+    git_dir = scene.repo / ".git"
+    for path in (git_dir, *git_dir.rglob("*")):
+        os.chown(path, UID, 0, follow_symlinks=False)
+    before = made._tree(scene.repo)
+
+    with pytest.raises(RuntimeError) as refused:
+        made._push(scene, str(scene.repo))
+    assert made._tree(scene.repo) == before
+
+    command = re.search(r"`(chgrp [^`]*)`", str(refused.value)).group(1)
+    assert shlex.split(command) == ["chgrp", "-R", str(GID), str(git_dir)]
+    subprocess.run(shlex.split(command), check=True)
+    assert made._push(scene, str(scene.repo)) == head
+    assert _roots(scene.repo) == []
+    assert [p for p in (git_dir, *git_dir.rglob("*")) if p.lstat().st_gid == 0] == []
 
 
 def test_a_directory_is_tried_as_the_user_itself(scene):

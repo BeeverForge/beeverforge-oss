@@ -603,7 +603,7 @@ def _box_did_not_start(p: Probes, out: str) -> Finding:
     refused = p.box_start_exception()
     if isinstance(refused, gitowner.Refused):
         return Finding("box", False, refused.reason,
-                       refused.remedy or "git's own words above are the whole reason")
+                       refused.remedy or "the words above are the whole reason; no remedy is known")
     return Finding(
         "box", False, _tail(out) or "the box did not start",
         "this is the container itself, before any of your commands ran — a name collision "

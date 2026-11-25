@@ -5,7 +5,7 @@ Run:  .venv/bin/python tools/mutate.py tools/mutations/688_git_runs_as_the_repos
 
 The claims, each with its rows:
 
-  1. who git runs as: root only, the repository's owner, two owners refused;
+  1. who git runs as: root only, the repository's owner, two owners and root's group refused;
   2. a directory the owner cannot enter is refused, by its bits and then one attempt as the user;
   3. the short environment, the empty `HOME`, and the process arguments;
   4. the command git starts for the other side, quoted, and only for a path on this machine;
@@ -60,6 +60,36 @@ MUTATIONS = [
     ("a refusal loses its parts when pickled", OWNER,
      "        return (Refused, (self.reason, self.remedy, self.detail))",
      "        return (Refused, (str(self),))"),
+    ("a git directory of group 0 is accepted", OWNER,
+     "    if of_git.gid == 0:\n        raise", "    if False:\n        raise",
+     TEST + "::test_a_git_directory_of_roots_group_is_refused"),
+    ("root's own repository is refused for its group", OWNER,
+     "    if of_git.uid == 0:\n        return None\n"
+     "    if of_git.gid == 0:\n        raise _roots_group(git_dir, of_tree)\n",
+     "    if of_git.gid == 0:\n        raise _roots_group(git_dir, of_tree)\n"
+     "    if of_git.uid == 0:\n        return None\n",
+     TEST + "::test_no_other_group_0_is_refused"),
+    ("the group is checked after an attempt made with it", OWNER,
+     "    if of_git.gid == 0:\n        raise _roots_group(git_dir, of_tree)\n"
+     "    _refuse_where_shut(of_git, tree, git_dir)\n",
+     "    _refuse_where_shut(of_git, tree, git_dir)\n"
+     "    if of_git.gid == 0:\n        raise _roots_group(git_dir, of_tree)\n",
+     TEST + "::test_a_git_directory_of_roots_group_is_refused"),
+    ("the work tree's group decides", OWNER,
+     "    if of_git.gid == 0:", "    if of_tree.gid == 0:",
+     TEST + "::test_no_other_group_0_is_refused"),
+    ("the chgrp remedy names group 0", OWNER,
+     "    group, whose = _a_group(of_tree)", '    group, whose = str(of_tree.gid), ""',
+     TEST + "::test_a_git_directory_of_roots_group_is_refused"),
+    ("the chgrp remedy's path is unquoted", OWNER,
+     "(`chgrp -R {group} {shlex.quote(str(git_dir))}`)", "(`chgrp -R {group} {git_dir}`)",
+     TEST + "::test_a_git_directory_of_roots_group_is_refused"),
+    ("the two owners' remedy names group 0", OWNER,
+     "    group, whose = _a_group(keep)", '    group, whose = str(keep.gid), ""',
+     TEST + "::test_the_two_owners_remedy_never_names_group_0"),
+    ("the two owners' remedy leaves a git directory of group 0 as it is", OWNER,
+     "(change, change if keep.gid else git_dir)", "(change, change)",
+     TEST + "::test_the_two_owners_remedy_never_names_group_0"),
 
     # 2. entering
     ("nobody asks whether the owner can get there", OWNER,
@@ -235,7 +265,7 @@ MUTATIONS = [
     ("a refused repository is reported as a leftover container", PROVE,
      "    if isinstance(refused, gitowner.Refused):", "    if False:"),
     ("git's own words are given no remedy at all", PROVE,
-     ' or "git\'s own words above are the whole reason")', ")"),
+     ' or "the words above are the whole reason; no remedy is known")', ")"),
     ("the refusal never reaches the proof", PROVE,
      "            box_start_exception=lambda: start_exception,\n", ""),
     ("the reason comes after the remedy, so a cut loses it", OWNER,

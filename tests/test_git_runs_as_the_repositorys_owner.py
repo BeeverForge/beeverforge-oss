@@ -158,6 +158,71 @@ def test_two_owners_are_refused_and_never_guessed(monkeypatch, shapes, tree_owne
     assert str(exc) == f"{exc.reason} — {exc.remedy}"
 
 
+@pytest.fixture
+def plain(tmp_path):
+    """All that is looked at to find a repository, at a path a shell would split."""
+    tree = tmp_path / "a b's"
+    (tree / ".git").mkdir(parents=True)
+    return tree
+
+
+#: What a remedy says of a group it does not know.
+A_GROUP = (f"; `<group>` is a group of uid {UID}'s, not root's, for example what `id -g` prints "
+           "for that user")
+
+
+@pytest.mark.parametrize(("tree_owner", "git_owner", "changed"), [
+    ((UID, 0), (77, 78), [".git"]), ((UID, 0), (0, 0), [".git"]), ((0, 0), (UID, 0), ["", ".git"]),
+])
+def test_the_two_owners_remedy_never_names_group_0(monkeypatch, plain, tree_owner, git_owner,
+                                                   changed):
+    """Followed, it would lead straight to the refusal of a git directory of group 0. So would the
+    work tree alone, where that is the git directory's group already."""
+    from beeverforge import gitowner
+
+    _owned_by(monkeypatch, {plain: tree_owner, plain / ".git": git_owner})
+
+    with pytest.raises(gitowner.Refused) as refused:
+        gitowner.owner_of(plain)
+
+    paths = " ".join(shlex.quote(str(plain / name)) for name in changed)
+    assert f"`chown -R {UID}:<group> {paths}`" in refused.value.remedy
+    assert refused.value.remedy.endswith(A_GROUP)
+
+
+@pytest.mark.parametrize(("trees_group", "command"), [(GID, f"chgrp -R {GID}"),
+                                                      (0, "chgrp -R <group>")])
+def test_a_git_directory_of_roots_group_is_refused(monkeypatch, plain, trees_group, command):
+    """Git, and the repository's hooks, would run with root's group. Nothing is tried as the owner
+    first: that attempt would have the group too."""
+    from beeverforge import gitowner
+
+    _owned_by(monkeypatch, {plain: (UID, trees_group), plain / ".git": (UID, 0)},
+              enters=lambda *a: pytest.fail("the owner's attempt was made with root's group"))
+
+    with pytest.raises(gitowner.Refused) as refused:
+        gitowner.owner_of(plain)
+
+    exc = refused.value
+    assert exc.reason == (f"the repository's owner is uid {UID}, and its git directory has group "
+                          "0, root's")
+    assert f"`{command} {shlex.quote(str(plain / '.git'))}`" in exc.remedy
+    assert exc.remedy.endswith(A_GROUP) is ("<group>" in exc.remedy) is (trees_group == 0)
+
+
+@pytest.mark.parametrize(("tree_owner", "git_owner", "runs_as"), [
+    ((0, GID), (0, 0), None), ((UID, 0), (UID, GID), (UID, GID)),
+], ids=["root's own", "the work tree's"])
+def test_no_other_group_0_is_refused(monkeypatch, plain, tree_owner, git_owner, runs_as):
+    """Root's own repository is not switched, whatever its group, and a work tree's group is not
+    the one git runs with."""
+    from beeverforge import gitowner
+
+    _owned_by(monkeypatch, {plain: tree_owner, plain / ".git": git_owner})
+
+    assert gitowner.owner_of(plain) == runs_as
+
+
 # ── whether the owner can get there ─────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("who", ["a parent", "the work tree", "an outside git directory"])
@@ -956,13 +1021,20 @@ def _a_repository_its_owner_cannot_enter(scene, monkeypatch) -> tuple[str, str]:
             f"chmod o+x {scene.repo.parent}")
 
 
+def _a_git_directory_of_roots_group(scene, monkeypatch) -> tuple[str, str]:
+    _root_and_the_owner(scene, monkeypatch, git_dirs=(UID, 0))
+    return (f"the repository's owner is uid {UID}, and its git directory has group 0, root's",
+            f"chgrp -R {GID} {scene.repo / '.git'}")
+
+
 def _a_missing_setpriv(scene, monkeypatch) -> tuple[str, str]:
     _root_and_the_owner(scene, monkeypatch, setpriv=False)
     return (f"git cannot run as the repository's owner, uid {UID}: `setpriv` is missing",
             "util-linux's `setpriv`")
 
 
-CAUSES = (_a_repository_with_two_owners, _a_repository_its_owner_cannot_enter, _a_missing_setpriv)
+CAUSES = (_a_repository_with_two_owners, _a_git_directory_of_roots_group,
+          _a_repository_its_owner_cannot_enter, _a_missing_setpriv)
 every_cause = pytest.mark.parametrize("cause", CAUSES, ids=lambda f: f.__name__.strip("_"))
 
 
@@ -971,10 +1043,13 @@ def _tree(where: Path) -> list:
 
 
 #: The local forge's git is started by Python, which needs no `setpriv`, so it is no cause there.
+#: Root's group is refused where two owners are, so a read, a write and the forge show it.
 REFUSALS = [(place, cause) for cause in CAUSES
             for place in (_the_boxs_clone, _the_existing_branch, _the_jobs_push, _the_keep,
                           _the_caches_clone, "the forge")
-            if (place, cause) != ("the forge", _a_missing_setpriv)]
+            if (place, cause) != ("the forge", _a_missing_setpriv)
+            and (cause is not _a_git_directory_of_roots_group
+                 or place in (_the_boxs_clone, _the_jobs_push, "the forge"))]
 
 
 @pytest.mark.parametrize(("place", "cause"), REFUSALS,
@@ -1091,8 +1166,8 @@ def test_the_proofs_box_line_is_the_refusal_and_its_remedy(monkeypatch, tmp_path
     with _a_box_that_raises(monkeypatch, tmp_path, gits) as probes:
         line = _the_box_line(probes)
     assert line.message == words
-    assert "git's own words" in line.remedy
-    assert "leftover" not in line.remedy and "docker" not in line.remedy
+    # True of words that are not git's, too: an `OSError` while the switch was started.
+    assert line.remedy == "the words above are the whole reason; no remedy is known"
 
 
 def test_an_ordinary_start_error_reads_as_it_did(monkeypatch, tmp_path):
@@ -1131,6 +1206,10 @@ def test_the_longest_reason_fits_before_any_path(monkeypatch, shapes):
     most = 2 ** 32 - 2
     said = []
     _owned_by(monkeypatch, {tree: (most, GID), git_dir: (most - 1, GID)})
+    with pytest.raises(gitowner.Refused) as refused:
+        gitowner.owner_of(path)
+    said.append(refused.value.reason)
+    _owned_by(monkeypatch, {tree: (most, 0), git_dir: (most, 0)})
     with pytest.raises(gitowner.Refused) as refused:
         gitowner.owner_of(path)
     said.append(refused.value.reason)
