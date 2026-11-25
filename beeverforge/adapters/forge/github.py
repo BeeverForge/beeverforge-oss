@@ -10,7 +10,9 @@ import logging
 import os
 import re
 import subprocess
+import time
 import urllib.parse
+from collections.abc import Callable
 
 from beeverforge.adapters.forge.base import (
     BranchProtection,
@@ -32,6 +34,7 @@ from beeverforge.adapters.github_cli import (
     nothing_named,
     refused,
 )
+from beeverforge.adapters.rate_limit import rate_limited, redact
 
 log = logging.getLogger("beeverforge.forge.github")
 
@@ -104,9 +107,7 @@ _ACTIONS_RUN = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+
 _RUNS_READ = 2
 
 
-def _redact(text: str) -> str:
-    """Strip any token embedded in an authenticated URL before it reaches a log/error."""
-    return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text or "")
+_redact = redact
 
 
 # ---- merge gates: one wording for GitHub's two mechanisms (#184, #206) --------------------------
@@ -289,6 +290,14 @@ class GitHubForge(ForgeAdapter):
         except OSError as exc:
             return argv_too_long(args, exc, log)
 
+    #: The clock a rate limit's reset is read against (#698); a test injects its own.
+    clock: Callable[[], float] = time.time
+
+    def _failure(self, p: subprocess.CompletedProcess[str], message: str) -> RuntimeError:
+        """The error a failed `gh` call raises: `RateLimited`, with its reset, when the limit
+        is what refused it (#698); otherwise the generic `message`, as before."""
+        return rate_limited(p, message, clock=self.clock) or RuntimeError(message)
+
     def _write(self, args: list[str], *, body: str,
                title: str | None = None) -> subprocess.CompletedProcess[str]:
         """The one way a pull-request text reaches `gh`: `args`, then `--title` when there is one,
@@ -373,11 +382,22 @@ class GitHubForge(ForgeAdapter):
         product's claim that a provider is configuration stops being true at the first timeout.
         """
         try:
-            return self._gh(args)
+            answered = self._gh(args)
         except (subprocess.SubprocessError, OSError) as exc:
             # `gh` never answered, so there is nothing to parse and nothing to conclude.
             log.warning("gh could not be run to %s: %s", what, _redact(str(exc))[:200])
             return None
+        # A SPENT RATE LIMIT IS NEITHER "UNREADABLE" NOR "NOT THERE" (#698): it is raised as
+        # itself, with its reset, so a caller that can wait does, and one that cannot is not
+        # told a branch is absent or a pull request was never opened.
+        self._raise_if_limited(answered)
+        return answered
+
+    def _raise_if_limited(self, p: subprocess.CompletedProcess[str]) -> None:
+        """Raise `RateLimited` when `p` is the forge refusing for its rate limit; else nothing."""
+        limited = rate_limited(p, clock=self.clock)
+        if limited is not None:
+            raise limited
 
     def list_branches(self, repo: str = "", *, prefix: str = "") -> list[str] | None:
         """Bare branch names, filtered server-side by `prefix`. `[]` = none; `None` = unreadable.
@@ -545,7 +565,7 @@ class GitHubForge(ForgeAdapter):
                 recovered = None
             if recovered:
                 return recovered
-            raise RuntimeError(f"gh pr create failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr create failed: {_redact(p.stderr)}")
         return p.stdout.strip()
 
     def _bring_up_to_date(self, pr: str, *, repo: str, title: str, body: str) -> bool:
@@ -586,7 +606,7 @@ class GitHubForge(ForgeAdapter):
         # a FAILED lookup is "unknown", not "no PR" — raise so callers don't blindly
         # create a duplicate on a transient error (idempotency, engineering.md #3).
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr list failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr list failed: {_redact(p.stderr)}")
         return p.stdout.strip() or None
 
     def review_pr(self, *, pr: str, event: ReviewEvent, body: str) -> None:
@@ -606,7 +626,7 @@ class GitHubForge(ForgeAdapter):
         if p.returncode != 0:
             p = self._gh(["pr", "merge", pr, "--repo", target, "--squash"])
             if p.returncode != 0:
-                raise RuntimeError(f"gh pr merge failed: {_redact(p.stderr)}")
+                raise self._failure(p, f"gh pr merge failed: {_redact(p.stderr)}")
 
     def force_merge(self, *, pr: str) -> None:
         """Merge NOW, bypassing the up-to-date / required-check gate — the executable option a
@@ -614,7 +634,7 @@ class GitHubForge(ForgeAdapter):
         decision). Uses admin override; raises if even that is refused (then it stays parked)."""
         p = self._gh(["pr", "merge", pr, "--repo", self.repo, "--squash", "--admin"])
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr merge --admin failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr merge --admin failed: {_redact(p.stderr)}")
 
     def close_pr(self, *, pr: str, reason: str = "") -> None:
         """`gh pr close` — closes without merging and LEAVES THE BRANCH. Deliberately no
@@ -624,7 +644,7 @@ class GitHubForge(ForgeAdapter):
             argv += ["--comment", reason.strip()[:500]]
         p = self._gh(argv)
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr close failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr close failed: {_redact(p.stderr)}")
 
     def pr_merged(self, *, pr: str) -> bool:
         """Whether the PR (URL or number) has actually been merged — the workflow's
@@ -633,7 +653,7 @@ class GitHubForge(ForgeAdapter):
 
         p = self._gh(["pr", "view", pr, "--repo", self.repo, "--json", "mergedAt"])
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr view failed: {_redact(p.stderr)}")
         try:
             return bool(_json.loads(p.stdout or "{}").get("mergedAt"))
         except ValueError as exc:
@@ -655,7 +675,7 @@ class GitHubForge(ForgeAdapter):
         p = self._gh(["pr", "view", pr, "--repo", self._repo_or_self(repo),
                       "--json", "state,mergedAt"])
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr view failed: {_redact(p.stderr)}")
         try:
             data = _json.loads(p.stdout or "{}")
         except ValueError as exc:
@@ -989,7 +1009,7 @@ class GitHubForge(ForgeAdapter):
             stderr = (p.stderr or "").lower()
             if "no checks" in stderr or "no required checks" in stderr:
                 return []
-            raise RuntimeError(f"gh pr checks failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr checks failed: {_redact(p.stderr)}")
         try:
             checks = _json.loads(p.stdout)
         except ValueError as exc:
@@ -1277,7 +1297,7 @@ class GitHubForge(ForgeAdapter):
 
         p = self._gh(["pr", "view", pr, "--repo", self.repo, "--json", "mergeCommit"])
         if p.returncode != 0:
-            raise RuntimeError(f"gh pr view failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh pr view failed: {_redact(p.stderr)}")
         try:
             mc = _json.loads(p.stdout or "{}").get("mergeCommit") or {}
         except ValueError as exc:
@@ -1294,7 +1314,7 @@ class GitHubForge(ForgeAdapter):
             "--json", "databaseId,headSha,status,conclusion,url",
         ])
         if p.returncode != 0:
-            raise RuntimeError(f"gh run list failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh run list failed: {_redact(p.stderr)}")
         try:
             runs = _json.loads(p.stdout or "[]")
         except ValueError as exc:
@@ -1313,7 +1333,7 @@ class GitHubForge(ForgeAdapter):
         """Trigger a `workflow_dispatch` GitHub Actions workflow (on-demand e2e, ADR-0008)."""
         p = self._gh(["workflow", "run", workflow, "--repo", self.repo, "--ref", ref])
         if p.returncode != 0:
-            raise RuntimeError(f"gh workflow run {workflow} failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh workflow run {workflow} failed: {_redact(p.stderr)}")
 
     def latest_run(self, *, workflow: str) -> dict | None:
         """The most recent run of `workflow` as {id, status, conclusion, url, created_at} —
@@ -1325,7 +1345,7 @@ class GitHubForge(ForgeAdapter):
             "--json", "databaseId,status,conclusion,url,createdAt",
         ])
         if p.returncode != 0:
-            raise RuntimeError(f"gh run list failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"gh run list failed: {_redact(p.stderr)}")
         try:
             rows = _json.loads(p.stdout or "[]")
         except ValueError:
@@ -1373,13 +1393,14 @@ class GitHubForge(ForgeAdapter):
         if made.returncode != 0:
             err = (made.stderr or made.stdout or "").strip()
             if "not accessible by integration" not in err.lower():
-                raise RuntimeError(f"could not create {full}: {err[:300]}")
+                raise self._failure(made, f"could not create {full}: {_redact(err[:300])}")
             # `gh repo create` is a GraphQL mutation GitHub refuses to EVERY App installation
             # token, and the raw refusal reads like a platform bug when it is a credential
             # class (pilot, 2026-08-13). What exists instead depends on who the owner is, so
             # the owner is asked first — the probe-then-decide the board setup already earned
             # on a live personal account.
             kind = self._gh(["api", f"users/{owner}", "--jq", ".type"])
+            self._raise_if_limited(kind)
             owner_type = (kind.stdout or "").strip() if kind.returncode == 0 else ""
             if owner_type == "Organization":
                 rest = self._gh(["api", "--method", "POST", f"orgs/{owner}/repos",
@@ -1387,6 +1408,7 @@ class GitHubForge(ForgeAdapter):
                                  "-F", f"private={'true' if private else 'false'}",
                                  *(["-f", f"description={description}"] if description else [])])
                 if rest.returncode != 0:
+                    self._raise_if_limited(rest)
                     raise RuntimeError(
                         f"the GitHub App cannot create {full}: its Repository → Administration "
                         f"permission is not Read and write. Grant it on the App's settings "
@@ -1457,6 +1479,8 @@ class GitHubForge(ForgeAdapter):
 
     def latest_tag(self) -> str | None:
         p = self._gh(["api", f"repos/{self.repo}/tags?per_page=1", "--jq", ".[0].name"])
+        # A spent limit is not "no tag yet" (#698): raise it so the caller waits for the reset.
+        self._raise_if_limited(p)
         name = p.stdout.strip()
         return name or None
 
@@ -1473,7 +1497,7 @@ class GitHubForge(ForgeAdapter):
         if p.returncode != 0:
             if self._tag_exists(tag):  # created concurrently between our check and POST
                 return
-            raise RuntimeError(f"create tag {tag} failed: {_redact(p.stderr)}")
+            raise self._failure(p, f"create tag {tag} failed: {_redact(p.stderr)}")
 
     def _tag_exists(self, tag: str) -> bool:
         return self._gh(["api", f"repos/{self.repo}/git/ref/tags/{tag}"]).returncode == 0
@@ -1482,5 +1506,5 @@ class GitHubForge(ForgeAdapter):
         p = self._gh(["api", f"repos/{self.repo}/commits/{ref}", "--jq", ".sha"])
         sha = p.stdout.strip()
         if not sha:
-            raise RuntimeError(f"could not resolve sha for {ref!r}: {_redact(p.stderr)}")
+            raise self._failure(p, f"could not resolve sha for {ref!r}: {_redact(p.stderr)}")
         return sha

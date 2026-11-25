@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Callable
 
 from beeverforge.adapters.github_cli import (
     BODY_LIMIT,
@@ -23,6 +24,7 @@ from beeverforge.adapters.github_cli import (
     nothing_named,
     refused,
 )
+from beeverforge.adapters.rate_limit import RateLimited, rate_limited
 from beeverforge.adapters.tracker.base import (
     Budget,
     TicketComment,
@@ -170,6 +172,14 @@ class GitHubIssuesTracker(TrackerAdapter):
             return argv_too_long(args, exc, log)
         return p
 
+    #: The clock a rate limit's reset is read against (#698); a test injects its own.
+    clock: Callable[[], float] = time.time
+
+    def _failure(self, p: subprocess.CompletedProcess[str], message: str) -> RuntimeError:
+        """The error a failed `gh` call raises: `RateLimited`, with its reset, when the limit
+        is what refused it (#698); otherwise the generic `message`, as before."""
+        return rate_limited(p, message, clock=self.clock) or RuntimeError(message)
+
     def _write(self, args: list[str], timeout: int = 60, *,
                stdin: str | None = None) -> subprocess.CompletedProcess[str]:
         """Run a mutating `gh` call and RAISE when the forge refused it.
@@ -185,9 +195,9 @@ class GitHubIssuesTracker(TrackerAdapter):
         """
         p = self._gh(args, timeout=timeout, stdin=stdin)
         if p.returncode != 0:
-            raise RuntimeError(
-                f"gh {' '.join(args[:2])} failed ({p.returncode}): "
-                f"{(p.stderr or p.stdout or '')[-300:]}")
+            raise self._failure(
+                p, f"gh {' '.join(args[:2])} failed ({p.returncode}): "
+                   f"{(p.stderr or p.stdout or '')[-300:]}")
         return p
 
     def _locate(self, ref: str) -> tuple[str, str]:
@@ -211,7 +221,7 @@ class GitHubIssuesTracker(TrackerAdapter):
              "--json", "number,title,body,labels,author,state,stateReason"]
         )
         if p.returncode != 0:
-            raise RuntimeError(f"gh issue view failed: {p.stderr}")
+            raise self._failure(p, f"gh issue view failed: {p.stderr}")
         data = json.loads(p.stdout)
         ticket = parse_ticket_body(
             id=f"#{data['number']}", title=data["title"],
@@ -565,7 +575,7 @@ class GitHubIssuesTracker(TrackerAdapter):
         p = self._gh(["issue", "view", num, "--repo", repo, "--json", "assignees"])
         if p.returncode != 0:
             # "nobody is assigned" is an ANSWER, and it decides who a parked ticket goes back to.
-            raise RuntimeError(f"gh issue view (assignees) failed: {(p.stderr or '')[-200:]}")
+            raise self._failure(p, f"gh issue view (assignees) failed: {(p.stderr or '')[-200:]}")
         return [a["login"] for a in json.loads(p.stdout).get("assignees", [])]
 
     def set_assignees(self, ref: str, logins: list[str]) -> None:
@@ -615,7 +625,7 @@ class GitHubIssuesTracker(TrackerAdapter):
         p = self._gh(["issue", "create", "--repo", target,
                       "--title", title, "--body-file", "-"], stdin=body)
         if p.returncode != 0:
-            raise RuntimeError(f"gh issue create failed: {p.stderr[:300]}")
+            raise self._failure(p, f"gh issue create failed: {p.stderr[:300]}")
         url = (p.stdout or "").strip().splitlines()[-1].strip()
         num = url.rstrip("/").rsplit("/", 1)[-1]
         if self.board is not None:
@@ -639,7 +649,7 @@ class GitHubIssuesTracker(TrackerAdapter):
             # so conflating them files the duplicate it exists to prevent. GitHub's search carries
             # a far lower limit than issue creation, so it failing while `create` still works is
             # the ordinary case, not the exotic one.
-            raise RuntimeError(f"gh issue list (search) failed: {(p.stderr or '')[-200:]}")
+            raise self._failure(p, f"gh issue list (search) failed: {(p.stderr or '')[-200:]}")
         for it in json.loads(p.stdout or "[]"):
             if (it.get("title") or "").strip() == title.strip():
                 return f"#{it['number']}"
@@ -662,7 +672,7 @@ class GitHubIssuesTracker(TrackerAdapter):
             # The only write here that replaces rather than appends: reporting it as landed when it
             # did not is how a card keeps criteria written against a retired requirement while
             # everybody is told it was realigned.
-            raise RuntimeError(f"gh issue edit (body) failed: {(p.stderr or '')[-300:]}")
+            raise self._failure(p, f"gh issue edit (body) failed: {(p.stderr or '')[-300:]}")
 
     def close_ticket(self, ref: str, reason: str, *, delivered: bool = True) -> None:
         # `--reason` AND `--comment` ARE DIFFERENT FIELDS, and only the comment was ever set. The
@@ -694,6 +704,8 @@ class GitHubIssuesTracker(TrackerAdapter):
         issue then carries a reason for a close that did not happen."""
         try:
             self._close_bare(repo, num, delivered=delivered)
+        except RateLimited:
+            raise  # its type and its reset are what a caller waits on (#698)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"the close reason was posted as a comment but the issue is still open ({exc}); "

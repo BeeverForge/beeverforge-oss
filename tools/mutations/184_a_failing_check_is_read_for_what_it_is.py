@@ -112,7 +112,7 @@ MUTATIONS = [
      "        except RuntimeError as exc:\n            # Every run read below"),
 
     ("GitHub: an unreadable answer reads as `no checks`", GITHUB,
-     '            raise RuntimeError(f"gh pr checks failed: {_redact(p.stderr)}")\n',
+     '            raise self._failure(p, f"gh pr checks failed: {_redact(p.stderr)}")\n',
      "            return []\n"),
 
     # ── claim 3: a row that never heard of this ───────────────────────────────────────────────
