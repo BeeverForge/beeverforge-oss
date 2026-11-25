@@ -123,3 +123,23 @@ def test_the_forges_other_failure_stays_generic(monkeypatch):
     with pytest.raises(RuntimeError) as err:
         forge.close_pr(pr="1")
     assert not isinstance(err.value, RateLimited)
+
+
+def test_free_text_on_stdout_that_says_rate_limit_is_not_a_refusal():
+    assert rate_limited(_p("boom", "PR title: fix the rate limit docs"), clock=lambda: NOW) is None
+
+
+def test_a_graphql_body_on_stdout_is_a_refusal():
+    body = '{"errors":[{"type":"RATE_LIMITED"}]}'
+    assert isinstance(rate_limited(_p("", body), clock=lambda: NOW), RateLimited)
+
+
+def test_a_board_read_that_hits_the_limit_is_not_wrapped_as_unreadable(monkeypatch):
+    from beeverforge.adapters.tracker import github_project as gp
+
+    monkeypatch.setattr(gp, "_run_gh", lambda args, token=None: _p(_EXCEEDED))
+    board = gp.GitHubProjectBoard.__new__(gp.GitHubProjectBoard)
+    board.owner, board.number = "o", 1
+    monkeypatch.setattr(gp.GitHubProjectBoard, "token", None)
+    with pytest.raises(RateLimited):
+        board._board_items_via_graphql("organization")

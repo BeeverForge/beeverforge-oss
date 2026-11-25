@@ -13,6 +13,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Callable
 
 from beeverforge.adapters.github_cli import (
     BODY_LIMIT,
@@ -172,7 +173,7 @@ class GitHubIssuesTracker(TrackerAdapter):
         return p
 
     #: The clock a rate limit's reset is read against (#698); a test injects its own.
-    clock = staticmethod(time.time)
+    clock: Callable[[], float] = time.time
 
     def _failure(self, p: subprocess.CompletedProcess[str], message: str) -> RuntimeError:
         """The error a failed `gh` call raises: `RateLimited`, with its reset, when the limit

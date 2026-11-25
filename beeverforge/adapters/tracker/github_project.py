@@ -15,7 +15,7 @@ from collections.abc import Callable
 
 from beeverforge.adapters.board.columns import CANONICAL_COLUMNS
 from beeverforge.adapters.github_cli import LoginRefused, credential_of, nothing_named, refused
-from beeverforge.adapters.rate_limit import rate_limited
+from beeverforge.adapters.rate_limit import RateLimited, rate_limited
 from beeverforge.adapters.tracker.base import Budget, BudgetUnreadable
 from beeverforge.contracts import JobState
 from beeverforge.contracts.refs import qualify_ref, ref_number, split_repo_ref
@@ -382,9 +382,9 @@ class GitHubProjectBoard:
             # `gh api graphql` exits non-zero whenever the response carries GraphQL errors, so
             # the code is a reliable verdict — no payload to parse for a mutation whose result
             # this caller does not use.
-            raise RuntimeError(
-                f"adding {issue_url} to the board {self.owner}/{self.number} failed: "
-                f"{(p.stderr or '').strip()[:300]}")
+            message = (f"adding {issue_url} to the board {self.owner}/{self.number} failed: "
+                       f"{(p.stderr or '').strip()[:300]}")
+            raise rate_limited(p, message) or RuntimeError(message)
 
     def _content_id(self, issue_url: str) -> str:
         """The issue's own node id — what `addProjectV2ItemById` takes, since a URL is not an id.
@@ -488,6 +488,8 @@ class GitHubProjectBoard:
                 args += ["-f", f"cursor={cursor}"]
             try:
                 data = _gh_json(args, self.token)
+            except RateLimited:
+                raise  # a spent budget is neither "wrong root" nor "unreadable"
             except RuntimeError as exc:
                 # `gh api graphql` exits non-zero whenever the response carries GraphQL errors,
                 # and a project that is not under THIS root arrives exactly that way

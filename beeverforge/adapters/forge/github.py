@@ -12,6 +12,7 @@ import re
 import subprocess
 import time
 import urllib.parse
+from collections.abc import Callable
 
 from beeverforge.adapters.forge.base import (
     BranchProtection,
@@ -33,7 +34,7 @@ from beeverforge.adapters.github_cli import (
     nothing_named,
     refused,
 )
-from beeverforge.adapters.rate_limit import rate_limited
+from beeverforge.adapters.rate_limit import rate_limited, redact
 
 log = logging.getLogger("beeverforge.forge.github")
 
@@ -106,9 +107,7 @@ _ACTIONS_RUN = re.compile(r"^https://github\.com/([^/]+/[^/]+)/actions/runs/(\d+
 _RUNS_READ = 2
 
 
-def _redact(text: str) -> str:
-    """Strip any token embedded in an authenticated URL before it reaches a log/error."""
-    return re.sub(r"(https://)[^@/\s]+@", r"\1***@", text or "")
+_redact = redact
 
 
 # ---- merge gates: one wording for GitHub's two mechanisms (#184, #206) --------------------------
@@ -292,7 +291,7 @@ class GitHubForge(ForgeAdapter):
             return argv_too_long(args, exc, log)
 
     #: The clock a rate limit's reset is read against (#698); a test injects its own.
-    clock = staticmethod(time.time)
+    clock: Callable[[], float] = time.time
 
     def _failure(self, p: subprocess.CompletedProcess[str], message: str) -> RuntimeError:
         """The error a failed `gh` call raises: `RateLimited`, with its reset, when the limit
@@ -1383,7 +1382,7 @@ class GitHubForge(ForgeAdapter):
         if made.returncode != 0:
             err = (made.stderr or made.stdout or "").strip()
             if "not accessible by integration" not in err.lower():
-                raise RuntimeError(f"could not create {full}: {err[:300]}")
+                raise self._failure(made, f"could not create {full}: {_redact(err[:300])}")
             # `gh repo create` is a GraphQL mutation GitHub refuses to EVERY App installation
             # token, and the raw refusal reads like a platform bug when it is a credential
             # class (pilot, 2026-08-13). What exists instead depends on who the owner is, so
@@ -1492,5 +1491,5 @@ class GitHubForge(ForgeAdapter):
         p = self._gh(["api", f"repos/{self.repo}/commits/{ref}", "--jq", ".sha"])
         sha = p.stdout.strip()
         if not sha:
-            raise RuntimeError(f"could not resolve sha for {ref!r}: {_redact(p.stderr)}")
+            raise self._failure(p, f"could not resolve sha for {ref!r}: {_redact(p.stderr)}")
         return sha
