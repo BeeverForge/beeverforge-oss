@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,11 +232,14 @@ def test_the_mode_bits_are_read_before_anybody_is_asked(monkeypatch, tmp_path, m
         door.chmod(0o700)
 
 
-def test_an_attempt_that_could_not_be_made_refuses_nothing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trouble", [
+    PermissionError(1, "Operation not permitted"), subprocess.TimeoutExpired(["test"], 60),
+], ids=["it cannot start", "it never ends"])
+def test_an_attempt_that_could_not_be_made_refuses_nothing(monkeypatch, tmp_path, trouble):
     from beeverforge import gitowner
 
     def cannot(*a, **k):
-        raise PermissionError(1, "Operation not permitted")
+        raise trouble
 
     monkeypatch.setattr(gitowner, "_bits_let_in", lambda owner, d: False)
     monkeypatch.setattr(subprocess, "run", cannot)
@@ -756,7 +760,8 @@ def test_every_changed_call_succeeds_with_git_run_as_the_owner(scene, monkeypatc
 
 @every_call
 def test_no_changed_call_starts_git_in_the_repository_as_root(scene, monkeypatch, call):
-    """Nothing root started wrote there, so nothing there is root's."""
+    """Who each git in the repository is started as. Whose its files then are, and that the owner
+    goes on working there, only real ownership shows: the file that needs root."""
     _root_and_the_owner(scene, monkeypatch)
 
     call(scene)
@@ -1179,6 +1184,23 @@ def test_gits_own_refusal_of_a_switched_read_leads_uncut_and_redacted(scene, mon
     assert exc.reason.startswith("fatal: https://***@example.invalid refused "), exc.reason
     assert "at the end" in exc.reason and "secret" not in str(exc)
     assert exc.remedy == "" and exc.detail.startswith(doing.format(repo=scene.repo))
+
+
+def test_a_switched_read_that_said_nothing_says_what_failed(monkeypatch, tmp_path):
+    """A clone a signal ended leaves no words of git's to lead with, nor to send anybody to."""
+    from beeverforge import gitowner
+    from beeverforge.adapters.sandbox import container
+
+    monkeypatch.setattr(gitowner, "upload_pack", lambda _t: nullcontext(["--upload-pack=x"]))
+    monkeypatch.setattr(container, "_host", lambda *a, **k: (-9, " \n"))
+    with pytest.raises(gitowner.Refused) as refused:
+        _the_boxs_clone(SimpleNamespace(repo=tmp_path / "repo", ws=tmp_path / "ws"))
+
+    what = f"cloning {tmp_path / 'repo'} into the box's workspace failed (-9)"
+    assert str(refused.value) == f"{what} — git said nothing more"
+    with _a_box_that_raises(monkeypatch, tmp_path, refused.value) as probes:
+        line = _the_box_line(probes)
+    assert (line.message, line.remedy) == (what, "git said nothing more")
 
 
 def test_an_existing_branch_the_owner_could_not_serve_leads_with_gits_words(scene, monkeypatch):

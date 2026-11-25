@@ -167,12 +167,12 @@ def _bits_let_in(owner: Owner, directory: Path) -> bool:
 
 def _tried_and_entered(owner: Owner, directory: Path) -> bool:
     """A COMMAND RUN AS THE USER, never `cwd=`: the process changes directory before it changes
-    user, so `cwd=` would be tried as root. An attempt that could not be made denies nothing; what
-    git says next stands."""
+    user, so `cwd=` would be tried as root. An attempt that could not be made, or did not end,
+    denies nothing; what git says next stands."""
     try:
         tried = subprocess.run(["test", "-x", str(directory)], capture_output=True, check=False,
                                timeout=_ENTER_TIMEOUT, **_as(owner, _kept_from_the_worker()))
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return True
     return tried.returncode == 0
 

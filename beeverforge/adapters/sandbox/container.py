@@ -136,8 +136,11 @@ def _must(args: list[str], what: str, served: Sequence[str] = ()) -> None:
 
 def _unread(out: str, served: Sequence[str], what: str, said: str = "") -> RuntimeError:
     """The failure of a read. Served by the owner, git's own words lead, uncut, and what was being
-    done follows; otherwise `said`, or `what` and the first of git's words."""
+    done follows, or leads where git left no words; otherwise `said`, or `what` and the first of
+    git's words."""
     words = _redact(out).strip()
+    if served and not words:
+        return gitowner.Refused(what, "git said nothing more")
     if served:
         return gitowner.Refused(words, detail=what)
     return RuntimeError(said or f"{what}: {words[:300]}")
