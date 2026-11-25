@@ -196,7 +196,7 @@ jobs:
               ;;
           esac
           # Indented Markdown code blocks render the report as inert text.
-          report="$(jq -er 'gsub("[\\u0000-\\u0008\\u000b-\\u001f]"; "") | split("\\n") | map("    " + .) | join("\\n")' <<< "$REPORT_JSON")"
+          report="$(jq -er 'gsub("[\u0000-\u0008\u000b-\u001f]"; "") | split("\n") | map("    " + .) | join("\n")' <<< "$REPORT_JSON")"
           printf '%s\n## Opus semantic review — %s\n\nCommit: `%s` · [Actions run](%s/%s/actions/runs/%s)\n\n%s\n' \
             "$REVIEW_MARKER" "$status" "$HEAD_SHA" "$GITHUB_SERVER_URL" \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$report" > "$RUNNER_TEMP/review.md"
