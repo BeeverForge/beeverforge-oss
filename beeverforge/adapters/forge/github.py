@@ -382,11 +382,22 @@ class GitHubForge(ForgeAdapter):
         product's claim that a provider is configuration stops being true at the first timeout.
         """
         try:
-            return self._gh(args)
+            answered = self._gh(args)
         except (subprocess.SubprocessError, OSError) as exc:
             # `gh` never answered, so there is nothing to parse and nothing to conclude.
             log.warning("gh could not be run to %s: %s", what, _redact(str(exc))[:200])
             return None
+        # A SPENT RATE LIMIT IS NEITHER "UNREADABLE" NOR "NOT THERE" (#698): it is raised as
+        # itself, with its reset, so a caller that can wait does, and one that cannot is not
+        # told a branch is absent or a pull request was never opened.
+        self._raise_if_limited(answered)
+        return answered
+
+    def _raise_if_limited(self, p: subprocess.CompletedProcess[str]) -> None:
+        """Raise `RateLimited` when `p` is the forge refusing for its rate limit; else nothing."""
+        limited = rate_limited(p, clock=self.clock)
+        if limited is not None:
+            raise limited
 
     def list_branches(self, repo: str = "", *, prefix: str = "") -> list[str] | None:
         """Bare branch names, filtered server-side by `prefix`. `[]` = none; `None` = unreadable.
@@ -1389,6 +1400,7 @@ class GitHubForge(ForgeAdapter):
             # the owner is asked first — the probe-then-decide the board setup already earned
             # on a live personal account.
             kind = self._gh(["api", f"users/{owner}", "--jq", ".type"])
+            self._raise_if_limited(kind)
             owner_type = (kind.stdout or "").strip() if kind.returncode == 0 else ""
             if owner_type == "Organization":
                 rest = self._gh(["api", "--method", "POST", f"orgs/{owner}/repos",
@@ -1396,6 +1408,7 @@ class GitHubForge(ForgeAdapter):
                                  "-F", f"private={'true' if private else 'false'}",
                                  *(["-f", f"description={description}"] if description else [])])
                 if rest.returncode != 0:
+                    self._raise_if_limited(rest)
                     raise RuntimeError(
                         f"the GitHub App cannot create {full}: its Repository → Administration "
                         f"permission is not Read and write. Grant it on the App's settings "

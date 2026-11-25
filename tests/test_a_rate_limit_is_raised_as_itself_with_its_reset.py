@@ -143,3 +143,64 @@ def test_a_board_read_that_hits_the_limit_is_not_wrapped_as_unreadable(monkeypat
     monkeypatch.setattr(gp.GitHubProjectBoard, "token", None)
     with pytest.raises(RateLimited):
         board._board_items_via_graphql("organization")
+
+
+def test_a_close_that_hits_the_limit_after_its_reason_keeps_its_type_and_reset(monkeypatch):
+    tracker = _tracker()
+    limited = RateLimited("spent", reset_at=NOW + 99)
+
+    def _write(args, *a, **kw):
+        if args[:2] == ["issue", "close"]:
+            raise limited
+        return _p(code=0)
+
+    monkeypatch.setattr(tracker, "_write", _write)
+    monkeypatch.setattr(tracker, "_post_reason", lambda *a, **kw: True)
+    monkeypatch.setattr(tracker, "_locate", lambda ref: ("o/r", "7"))
+    with pytest.raises(RateLimited) as err:
+        tracker.close_ticket("#7", "done")
+    assert err.value.reset_at == NOW + 99
+
+
+def _forge_paths():
+    """Every forge read that used to fold a rate limit into None / False / a generic error."""
+    return {
+        "list_branches": lambda f: f.list_branches("o/r", prefix="req/"),
+        "delete_branch": lambda f: f.delete_branch("req/1"),
+        "pr_for_head": lambda f: f.pr_for_head("req/1"),
+        "merge_gates": lambda f: f.merge_gates(base="main"),
+        "credential_permissions": lambda f: f.credential_permissions(),
+        "review_comments": lambda f: f.review_comments(pr="https://github.com/o/r/pull/3"),
+        "published_releases": lambda f: f.published_releases("https://github.com/o/r"),
+        "workflow_states": lambda f: f.disabled_ci_paths(),
+        "ensure_repo": lambda f: f.create_repository(name="o/new"),
+    }
+
+
+@pytest.mark.parametrize("path", sorted(_forge_paths()))
+def test_every_forge_read_and_the_repo_creation_raise_rate_limited(monkeypatch, path):
+    forge = GitHubForge("o/r")
+    forge.clock = lambda: NOW
+    monkeypatch.setattr(subprocess, "run", _Runner(_p(_EXCEEDED + "\nRetry-After: 20")))
+    with pytest.raises(RateLimited) as err:
+        _forge_paths()[path](forge)
+    assert err.value.reset_at == NOW + 20
+
+
+def test_a_repo_creation_refused_for_its_limit_after_the_app_refusal_is_rate_limited(monkeypatch):
+    forge = GitHubForge("o/r")
+    forge.clock = lambda: NOW
+    refusals = iter([_p("", "", 1), _p("Resource not accessible by integration"),
+                     _p("", "Organization", 0), _p(_EXCEEDED)])
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: next(refusals))
+    with pytest.raises(RateLimited):
+        forge.create_repository(name="o/new")
+
+
+def test_an_owner_probe_that_hits_the_limit_is_not_read_as_a_personal_account(monkeypatch):
+    forge = GitHubForge("o/r")
+    forge.clock = lambda: NOW
+    answers = iter([_p("", "", 1), _p("Resource not accessible by integration"), _p(_EXCEEDED)])
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: next(answers))
+    with pytest.raises(RateLimited):
+        forge.create_repository(name="o/new")

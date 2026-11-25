@@ -24,7 +24,7 @@ from beeverforge.adapters.github_cli import (
     nothing_named,
     refused,
 )
-from beeverforge.adapters.rate_limit import rate_limited
+from beeverforge.adapters.rate_limit import RateLimited, rate_limited
 from beeverforge.adapters.tracker.base import (
     Budget,
     TicketComment,
@@ -704,6 +704,8 @@ class GitHubIssuesTracker(TrackerAdapter):
         issue then carries a reason for a close that did not happen."""
         try:
             self._close_bare(repo, num, delivered=delivered)
+        except RateLimited:
+            raise  # its type and its reset are what a caller waits on (#698)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"the close reason was posted as a comment but the issue is still open ({exc}); "
