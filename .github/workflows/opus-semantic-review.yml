@@ -33,7 +33,7 @@ jobs:
     steps:
       # The workflow comes from the base branch. The PR checkout is input data only.
       - name: Read the PR tree
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: source
@@ -45,6 +45,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir context
+          # Remove links before giving the model filesystem access to PR content.
+          find source -type l -delete
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
             --json title,body,headRefOid,closingIssuesReferences > context/pr.json
           if [[ "$(jq -r .headRefOid context/pr.json)" != "$HEAD_SHA" ]]; then
@@ -66,18 +68,38 @@ jobs:
             if [[ "$url" == "https://github.com/$GITHUB_REPOSITORY/issues/"* ]]; then
               number="$(jq -r .number <<< "$issue")"
               gh issue view "$number" --repo "$GITHUB_REPOSITORY" --json title,body,comments \
+                | jq '.comments |= map(select(.authorAssociation | IN("OWNER", "MEMBER", "COLLABORATOR")))' \
                 > "context/issue-$number.json"
             fi
           done
 
-      - name: Install Claude Code
-        run: npm install --global @anthropic-ai/claude-code@2.1.332
+      - name: Install verified Claude Code
+        shell: bash
+        run: |
+          version=2.1.332
+          platform=linux-x64
+          fingerprint=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+          release="https://downloads.claude.ai/claude-code-releases/$version"
+          cd "$(mktemp -d)"
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          curl -fsSL https://downloads.claude.ai/keys/claude-code.asc | gpg --batch --import
+          curl -fsSLO "$release/manifest.json"
+          curl -fsSLO "$release/manifest.json.sig"
+          gpg --batch --status-fd 1 --verify manifest.json.sig manifest.json > signature-status
+          awk -v key="$fingerprint" '$2 == "VALIDSIG" && $NF == key { valid=1 } END { exit !valid }' signature-status
+          curl -fsSL "$release/$platform/claude" -o claude
+          checksum="$(jq -er --arg platform "$platform" '.platforms[$platform].checksum | select(test("^[0-9a-f]{64}$"))' manifest.json)"
+          printf '%s  claude\n' "$checksum" | sha256sum --check --status
+          install -m 0755 claude "$RUNNER_TEMP/claude"
+          "$RUNNER_TEMP/claude" --help | grep -- '--restricted'
 
       - name: Review with Opus
         id: opus
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          DISABLE_AUTOUPDATER: "1"
         run: |
           if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
             echo "::error::Configure the repository secret CLAUDE_CODE_OAUTH_TOKEN."
@@ -85,10 +107,10 @@ jobs:
           fi
 
           schema='{"type":"object","additionalProperties":false,"required":["verdict","report"],"properties":{"verdict":{"type":"string","enum":["pass","changes_requested","inconclusive"]},"report":{"type":"string","minLength":1,"maxLength":10000}}}'
-          claude -p --restricted --model opus --tools "Read,Glob,Grep" \
-            --disallowedTools 'mcp__*' --max-turns 40 \
-            --output-format json --json-schema "$schema" \
-            > "$RUNNER_TEMP/opus-review.json" <<'PROMPT'
+          if ! "$RUNNER_TEMP/claude" -p --restricted --model opus --tools "Read,Glob,Grep" \
+            --disallowedTools 'mcp__*' 'Read(//proc/**)' 'Read(//sys/**)' 'Read(//dev/**)' 'Read(~/**)' \
+            --max-turns 40 --output-format json --json-schema "$schema" \
+            > "$RUNNER_TEMP/opus-review.json" 2> "$RUNNER_TEMP/opus-review.stderr" <<'PROMPT'
           Review this pull request independently against what was requested and how the project works.
 
           Read context/pr.json, context/pr.diff, every linked issue file under context/,
@@ -110,6 +132,27 @@ jobs:
           Use inconclusive when the linked issue is unavailable or the evidence is
           insufficient to validate the intended behavior. Report in concise Markdown.
           PROMPT
+          then
+            echo "::error::Claude Code could not finish the review. Check the subscription and Opus access."
+            exit 1
+          fi
+
+          # Keep raw model output in this job. Fail closed before exporting any credential.
+          python3 - "$RUNNER_TEMP/opus-review.json" <<'PYTHON'
+          import json
+          import os
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as file:
+              response = json.load(file)
+          report = (response.get("structured_output") or {}).get("report", "")
+          if isinstance(report, str) and (
+              os.environ["CLAUDE_CODE_OAUTH_TOKEN"] in report
+              or re.search(r"sk-ant-[A-Za-z0-9_-]+", report, re.IGNORECASE)
+          ):
+              raise SystemExit("Review output contains credential-like material. Publishing refused.")
+          PYTHON
 
           jq -e '
             .is_error == false
@@ -152,7 +195,8 @@ jobs:
               REPORT_JSON='"The review did not complete. See the Actions run for details."'
               ;;
           esac
-          report="$(jq -er 'gsub("<"; "&lt;") | gsub("@"; "＠")' <<< "$REPORT_JSON")"
+          # Indented Markdown code blocks render the report as inert text.
+          report="$(jq -er 'gsub("[\\u0000-\\u0008\\u000b-\\u001f]"; "") | split("\\n") | map("    " + .) | join("\\n")' <<< "$REPORT_JSON")"
           printf '%s\n## Opus semantic review — %s\n\nCommit: `%s` · [Actions run](%s/%s/actions/runs/%s)\n\n%s\n' \
             "$REVIEW_MARKER" "$status" "$HEAD_SHA" "$GITHUB_SERVER_URL" \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$report" > "$RUNNER_TEMP/review.md"
