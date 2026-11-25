@@ -1479,6 +1479,8 @@ class GitHubForge(ForgeAdapter):
 
     def latest_tag(self) -> str | None:
         p = self._gh(["api", f"repos/{self.repo}/tags?per_page=1", "--jq", ".[0].name"])
+        # A spent limit is not "no tag yet" (#698): raise it so the caller waits for the reset.
+        self._raise_if_limited(p)
         name = p.stdout.strip()
         return name or None
 

@@ -173,6 +173,7 @@ def _forge_paths():
         "review_comments": lambda f: f.review_comments(pr="https://github.com/o/r/pull/3"),
         "published_releases": lambda f: f.published_releases("https://github.com/o/r"),
         "workflow_states": lambda f: f.disabled_ci_paths(),
+        "latest_tag": lambda f: f.latest_tag(),
         "ensure_repo": lambda f: f.create_repository(name="o/new"),
     }
 

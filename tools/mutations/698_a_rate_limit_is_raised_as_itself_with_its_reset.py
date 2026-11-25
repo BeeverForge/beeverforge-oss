@@ -33,6 +33,11 @@ MUTATIONS = [
      "        self._raise_if_limited(answered)\n        return answered\n",
      "        return answered\n"),
 
+    ("the latest tag reads a spent limit as no tag at all "
+     "(test_every_forge_read_and_the_repo_creation_raise_rate_limited)", FORGE,
+     "        self._raise_if_limited(p)\n        name = p.stdout.strip()\n",
+     "        name = p.stdout.strip()\n"),
+
     ("repo creation reads a limited owner probe as a personal account "
      "(test_an_owner_probe_that_hits_the_limit_is_not_read_as_a_personal_account)", FORGE,
      "            self._raise_if_limited(kind)\n", ""),
