@@ -607,16 +607,22 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
     # mints GitHub tokens, and only the shipped Azure and Jira rows knew to refuse it (measured
     # 2026-08-24). Each axis now asks the credential registry for ITS vendor's provider, which
     # is the App minter for the reference vendor and None for a vendor that declares none.
+    # THE JOB'S WRITES SURVIVE THE FORGE'S RATE LIMIT (#699): queued and applied after its reset
+    from beeverforge.adapters.tracker.deferred import DeferringTracker
+
+    queue_file = project_log_dir(project) / "queued-tracker-effects.json"
     return JobRunner(
         project=project,  # ADR-0027: the gate needs to know whose board this is
         change=change,  # #448 slice 4: which change of the card — it names the branch
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here)
-        tracker=build_tracker(project, token=tracker_tok,
-                              token_provider=(stored_token_provider(project, "tracker",
-                                                                    tracker_found)
-                                              if tracker_tok
-                                              else deployment_tracker_provider(project))),
+        tracker=DeferringTracker(
+            build_tracker(project, token=tracker_tok,
+                          token_provider=(stored_token_provider(project, "tracker",
+                                                                tracker_found)
+                                          if tracker_tok
+                                          else deployment_tracker_provider(project))),
+            path=queue_file),
         # A TOKEN A ROTATING STORE ANSWERED IS READ AGAIN BEFORE IT EXPIRES (#236): with a stored
         # token this passed no provider, so the forge pushed for the whole job with the string
         # read here, and a job longer than the hour an installation token lives pushed with an
