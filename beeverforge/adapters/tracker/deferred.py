@@ -103,7 +103,7 @@ class DeferringTracker:
                     self._queue.insert(0, entry)
                     self._save()
                     return
-                except Exception as exc:  # noqa: BLE001 — a retry that cannot succeed is dropped
+                except Exception as exc:  # a retry that cannot succeed is dropped, logged
                     log.error("BEEVERFORGE_QUEUED_EFFECT_DROPPED entry=%s %s %s (%s) — it failed "
                               "for a reason other than the rate limit, so it is not retried",
                               entry["id"], entry["kind"], entry["ref"],
