@@ -119,11 +119,12 @@ def _draining_queued_effects(run):
     Applied to `JobRunner.run` after the class, so `run` stays the body that reads the floor."""
     @functools.wraps(run)
     def wrapper(self, *args, **kwargs):
+        ticket_ref = str(args[0] if args else kwargs.get("ticket_ref", ""))
         self._drain_queued_effects()
         try:
             return run(self, *args, **kwargs)
         finally:
-            self._drain_queued_effects()
+            self._drain_queued_effects(ticket_ref, ended=True)
     return wrapper
 
 
@@ -1947,15 +1948,29 @@ class JobRunner:
             environments=list(self.manifest.environments.keys()),
             post_merge_deploy=self.manifest.post_merge_deploy))
 
-    def _drain_queued_effects(self) -> None:
+    def _drain_queued_effects(self, ticket_ref: str = "", *, ended: bool = False) -> None:
         """Apply the tracker writes a rate limit deferred, once their reset has passed (#699).
 
-        Called when a job starts and when it ends, so a finished job's queue is drained by the
-        next job of the project; best-effort, the delivery never waits on bookkeeping."""
+        Called when a job starts and when it ends (the worker's hourly round drains the rest);
+        best-effort, the delivery never waits on bookkeeping.
+
+        A STOPPED JOB APPLIES NOTHING (`_unless_stopped`, review of #708): its entries stay in the
+        file, and the stop's own move on the card's record supersedes its marks at the next drain.
+        AT THE JOB'S END ITS OWN PROGRESS MARKS ARE DROPPED: the outcome it hands back to the
+        card's door (ADR-0055 D7) is the card's newest state, and a mark applied after it would
+        move the card backwards (D5) — a delivered card marked `validating` again."""
         flush = getattr(self.tracker, "flush", None)
         if not callable(flush):
             return
         try:
+            self._unless_stopped("drain the queued tracker effects")
+        except JobStopped:
+            return
+        try:
+            supersede = getattr(self.tracker, "supersede", None)
+            if ended and ticket_ref and callable(supersede):
+                supersede(ticket_ref, ("state",),
+                          "the job ended, and the outcome it hands back is the card's newest state")
             flush()
         except Exception as exc:
             log.warning("could not drain the queued tracker effects (%s)", str(exc)[:160])

@@ -592,21 +592,21 @@ def test_every_comment_the_worker_posts_goes_through_the_queue():
 def test_a_tickets_later_entry_never_overtakes_one_still_waiting():
     forge, clock, t = _tracker()
     t.comment("#1", "first")
+    t.comment("#1", "second")  # joins behind, due at the same reset
     clock.now = RESET
+    real = forge.comment
 
     def again(ref, body):
         raise RateLimited("spent", reset_at=RESET + 500)
 
-    real = forge.comment
     forge.comment = again
-    t.flush()  # "first" goes back, due at RESET + 500
+    t.flush()  # "first" meets the limit again and goes back, due at RESET + 500; "second" is not
+    assert [e["reset_at"] for e in t.pending] == [RESET + 500, RESET]
     forge.comment = real
-    forge.limited = True
-    t.comment("#1", "second")  # joins behind "first"
     forge.limited = False
     clock.now = RESET + 1
     t.flush()
-    assert forge.applied == []
+    assert forge.applied == []  # "second" is due, and still waits behind "first"
     clock.now = RESET + 500
     t.flush()
     assert [c[2] for c in forge.applied] == ["first", "second"]

@@ -1010,6 +1010,17 @@ def _tracker_for(project):
                          token_provider=None if tok else bot_token_provider_for(project, "tracker"))
 
 
+def _queued(project, tracker):
+    """`tracker`, its writes queued past the forge's rate limit and applied after the reset
+    (#699): for what the worker says on a card once and nothing else retries — the sizing and
+    pre-flight verdicts, the gather's comments, the chase, the preview, the coordinator's advice
+    and the diagnosis. Not for the card's door, whose failed effects its own record converges
+    (ADR-0055 D5): one effect with two retry paths would be applied twice."""
+    from beeverforge.factory import deferring_tracker
+
+    return deferring_tracker(project, tracker)
+
+
 def _sizer_result_text(res) -> str:
     """The sizer's FULL final message — the sizer writes its analysis FIRST and the JSON verdict
     LAST, so the 1000-char cap chops the verdict off (live bug: #37's 3509-char response). One
@@ -1144,7 +1155,7 @@ def _do_preflight(inp: PreflightInput) -> PreflightVerdict:
                                            f"{inp.project}#{inp.issue} — {reason}",
                           logging.WARNING)
             try:
-                tracker.comment(
+                _queued(project, tracker).comment(
                     f"#{inp.issue.lstrip('#')}",
                     tl_voice.say(tl_voice.NARRATION, "preflight.unsized", _lang, why=reason))
             except Exception:  # noqa: BLE001 — surfacing is best-effort, never blocks
@@ -1284,13 +1295,15 @@ def _do_preflight(inp: PreflightInput) -> PreflightVerdict:
         if verdict.verdict == "unclear":
             qs = ("\n".join(f"- {q}" for q in verdict.questions)
                   or tl_voice.say(tl_voice.NARRATION, "preflight.no-questions", _lang))
-            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.unclear",
-                                                    _lang, questions=qs))
+            _queued(project, tracker).comment(
+                ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.unclear", _lang,
+                                        questions=qs))
         elif verdict.verdict == "split":
             kids = "\n".join(f"- **{c.get('title', '?')}** — {c.get('objective', '')}"
                              for c in verdict.children)
-            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.too-large",
-                                                    _lang, why=verdict.reasons, children=kids))
+            _queued(project, tracker).comment(
+                ticket.id, tl_voice.say(tl_voice.NARRATION, "preflight.too-large", _lang,
+                                        why=verdict.reasons, children=kids))
     except Exception:  # noqa: BLE001 — commentary is cosmetic
         activity.logger.warning("could not comment the sizing verdict on #%s", inp.issue)
     return verdict
@@ -1972,8 +1985,9 @@ def _do_gather(inp: GatherInput) -> GatherVerdict:  # noqa: C901 — one activit
                                      "%s per card", inp.issue, len(still) - g.QUESTIONS_PER_CARD,
                                      g.QUESTIONS_PER_CARD)
         if facts:
-            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.established", lang,
-                                                    facts="\n".join(facts)))
+            _queued(project, tracker).comment(
+                ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.established", lang,
+                                        facts="\n".join(facts)))
         counts = {"authored": authored, "established": established, "asked": len(questions)}
         if not questions:
             return proceed(f"established before starting: {authored} concept(s) authored, "
@@ -1999,8 +2013,9 @@ def _do_gather(inp: GatherInput) -> GatherVerdict:  # noqa: C901 — one activit
             qs_text += "\n" + "\n".join(f"- {' '.join(gp.detail.split())[:400]}" for gp in open_qs)
         requester = tracker_requester_of(ticket)
         if not requester:
-            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.unaddressed",
-                                                    lang, questions=qs_text))
+            _queued(project, tracker).comment(
+                ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.unaddressed", lang,
+                                        questions=qs_text))
             return proceed("questions recorded on the card; it names nobody this tracker can "
                            "notify, so the work proceeds", **counts)
         qhash = g.question_hash([p for p, _ in questions])
@@ -2047,7 +2062,8 @@ def _do_gather(inp: GatherInput) -> GatherVerdict:  # noqa: C901 — one activit
             return proceed("the question could not be posted — the work proceeds",
                            degraded=f"gather: {said[:160]}", **counts)
         if parked.startswith("failed"):
-            tracker.comment(ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.not-parked", lang))
+            _queued(project, tracker).comment(
+                ticket.id, tl_voice.say(tl_voice.NARRATION, "gather.not-parked", lang))
             return proceed("the park did not land on this tracker — the questions are on the card "
                            "and the work proceeds", degraded=f"park: {parked[:160]}", **counts)
         _pf_emit(journal_for(None, live=True), inp.project, inp.issue, "note",
@@ -2210,7 +2226,7 @@ def _do_card_question_sweep(project_name: str) -> str:  # noqa: C901 — one rou
                 due = chase_due([loop], hours_open={(loop.kind, loop.subject, loop.about): age_h},
                                 after_hours=CARD_QUESTION_CHASE_AFTER_HOURS, ts=now)
                 if due:
-                    tracker.comment(ref, tl_voice.say(
+                    _queued(project, tracker).comment(ref, tl_voice.say(
                         tl_voice.NARRATION, "gather.chase", lang,
                         mention=_mention_for(tracker, ctx.get("requester", ""))))
                     rows += due
@@ -2558,8 +2574,8 @@ def _the_preview_is_up(project_name: str, token: str) -> list[str]:
         link = live.route(project_name, card)
         if one_repo:
             try:
-                _tracker_for(project).comment(card, live.comment(found, link=link,
-                                                                 language=language))
+                _queued(project, _tracker_for(project)).comment(
+                    card, live.comment(found, link=link, language=language))
                 told.append(card)
             except Exception as exc:  # noqa: BLE001 — the card misses a comment, said
                 activity.logger.warning("BEEVERFORGE_TICKET_COMMENT_LOST %s#%s — the preview is "
@@ -4299,7 +4315,8 @@ def _do_coordinate(item: CoordinatorItem) -> dict:
                                        f"{item.project}#{item.issue}", logging.WARNING)
         return {}
     try:  # post the humanized take on the ticket (durable, channel-agnostic)
-        tracker = _tracker_for(ProjectRegistry().get(item.project))
+        project = ProjectRegistry().get(item.project)
+        tracker = _queued(project, _tracker_for(project))
         rec = next((o for o in item.options
                     if str(o.get("key", "")).lower() == advice.recommend.lower()), None)
         reclabel = rec.get("label") if rec else advice.recommend
@@ -4358,7 +4375,7 @@ def _do_diagnose(inp: HoldSyncInput) -> bool:
 
     posted = False
     try:  # durable record on the ticket
-        tracker.comment(ref, handoff_to_markdown(ho, raw_note=inp.note))
+        _queued(project, tracker).comment(ref, handoff_to_markdown(ho, raw_note=inp.note))
         posted = True
     except Exception as exc:  # noqa: BLE001 — the channel below may still carry it
         activity.logger.warning("the diagnosis never reached ticket %s (%s)", ref, str(exc)[:120])
@@ -6939,6 +6956,18 @@ def _converge_card_transitions(project) -> None:
         activity.logger.info("card change observed: %s", line)
     for line in converge(project):
         activity.logger.info("card transition converged: %s", line)
+    # THE TRACKER WRITES A RATE LIMIT QUEUED (#699, review of #708): a project with no next job
+    # applied its queue never; the hourly round applies it within the hour after the reset
+    from beeverforge.factory import drain_queued_effects
+
+    try:
+        applied = drain_queued_effects(project, tracker_for=_tracker_for)
+    except Exception as exc:  # noqa: BLE001 — the round's other steps are not its price
+        activity.logger.warning("the queued tracker effects could not be drained (%s)",
+                                str(exc)[:160])
+        return
+    if applied:
+        activity.logger.info("queued tracker effects applied after the reset: %d", applied)
 
 
 @activity.defn
