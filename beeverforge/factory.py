@@ -564,7 +564,9 @@ def _card_of(project, scope: str, ref: str) -> str:
         from beeverforge.registry import ProjectRegistry
 
         product = ProjectRegistry().get(project.name) or project
-    except Exception:  # noqa: BLE001 — a view of an unregistered project is its own product
+    except Exception as exc:  # noqa: BLE001 — a view of an unregistered project is its own product
+        log.debug("the product of %s is not registered (%s) — the view stands for it",
+                  project.name, exc)
         product = project
     if not scope or _is_default_repo(product, scope):
         return bare

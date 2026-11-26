@@ -47,14 +47,18 @@ MUTATIONS = [
      "                timeout=_SAID_UP_WITHIN)\n",
      "            pass\n"),
     ("the card is not told", ACT,
-     "                _tracker_for(project).comment(card, live.comment(found, link=link,",
-     "                (lambda *a: None)(card, live.comment(found, link=link,"),
+     "                _queued(project, _tracker_for(project)).comment(\n"
+     "                    card, live.comment(found, link=link, language=language))",
+     "                (lambda *a: None)(\n"
+     "                    card, live.comment(found, link=link, language=language))"),
     ("the product role is not told", ACT,
      "            events.preview_up(project, card=card, url=link,",
      "            (lambda *a, **k: None)(project, card=card, url=link,"),
     ("a requirement's cards are commented on by number across repositories", ACT,
-     "        if one_repo:\n            try:\n                _tracker_for(project)",
-     "        if True:\n            try:\n                _tracker_for(project)"),
+     "        if one_repo:\n            try:\n"
+     "                _queued(project, _tracker_for(project))",
+     "        if True:\n            try:\n"
+     "                _queued(project, _tracker_for(project))"),
     ("the link carries the preview's own keyed host", LIVE,
      "    path = ROUTE.format(project=quote(str(project), safe=\"\"), card=quote(str(card), safe=\"\"))",
      "    path = f\"/{project}/{card}?t=key\""),
