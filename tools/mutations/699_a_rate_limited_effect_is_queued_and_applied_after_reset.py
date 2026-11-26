@@ -41,6 +41,6 @@ MUTATIONS = [
 
     ("a job does not drain the queue when it starts "
      "(test_a_later_runner_drains_what_a_finished_job_left_when_it_starts)", MACHINE,
-     "        self._drain_queued_effects()\n        try:\n            return self._run_ticket(",
-     "        try:\n            return self._run_ticket("),
+     "        self._drain_queued_effects()\n        try:\n            return run(self, *args, **kwargs)",
+     "        try:\n            return run(self, *args, **kwargs)"),
 ]
