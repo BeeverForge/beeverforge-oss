@@ -983,9 +983,8 @@ def _what_it_was(scene, call) -> None:
                                "XDG_CONFIG_HOME", "GIT_SSH_COMMAND"}, changed
             assert done.how["env"]["WORKER_SECRET"] == "planted"
     if call in CACHE:
-        for done in mine:
-            assert done.how["env"] == {**os.environ, "GIT_TERMINAL_PROMPT": "0",
-                                       "GCM_INTERACTIVE": "never"}
+        # On this branch the cache's git is given no environment of its own: the process's.
+        assert {done.how["env"] for done in mine} == {None}
 
 
 @every_call
