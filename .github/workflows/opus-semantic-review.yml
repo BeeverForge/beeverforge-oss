@@ -30,6 +30,13 @@ on:
         description: Which try of filling a gap this is (the workflow's own)
         type: number
         default: 1
+      # What the workflow passes when it starts the review of another pull request of the same
+      # head: nobody asked by hand, so a refusal is a notice; but it always reviews, because
+      # that pull request has a base and a scope of its own.
+      started_by_workflow:
+        description: Started by the workflow for another pull request of the same head
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -67,7 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ASKED: ${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          BY_HAND: ${{ github.event_name == 'workflow_dispatch' && !inputs.only_if_missing }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' && !inputs.only_if_missing && !inputs.started_by_workflow }}
         run: |
           # Not reviewed, said by name: an error when a person asked, a notice otherwise.
           skip() {
@@ -100,9 +107,10 @@ jobs:
               [[ -n "$other" && "$other" != "$pr" ]] || continue
               # A START THAT FAILS IS SAID, AND COSTS THIS PULL REQUEST NOTHING: its own review
               # goes on, and the other is one run by hand away.
-              # `only_if_missing`: nobody asked for this run, so a refusal in it is a notice.
+              # NOT `only_if_missing`: the two share a commit, so the first to publish gives
+              # it a status, and the other would then skip a review of its own base and scope.
               if gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" \
-                  -f pr="$other" -f only_if_missing=true; then
+                  -f pr="$other" -f started_by_workflow=true; then
                 echo "::notice::#$other has the same head: a review of its own was started."
               else
                 echo "::warning::#$other has the same head and its review could not be started: run it by hand (gh workflow run opus-semantic-review.yml -f pr=$other)."

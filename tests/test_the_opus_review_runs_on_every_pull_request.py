@@ -192,8 +192,8 @@ def test_every_pull_request_of_one_head_gets_a_review(runner):
     assert runner.outputs["pr"] == "10" and runner.outputs["eligible"] == "true"
     started = [call for call in runner.calls if call[:2] == ["workflow", "run"]]
     assert started == [["workflow", "run", "opus-semantic-review.yml", "--repo", REPO,
-                        "-f", "pr=11", "-f", "only_if_missing=true"]], \
-        "started as the workflow's own run: nobody asked, so a refusal there is a notice (#726)"
+                        "-f", "pr=11", "-f", "started_by_workflow=true"]], \
+        "the workflow's own run: a refusal there is a notice, and it always reviews (#726)"
     listed = [call for call in runner.calls if call[-1].endswith(f"/commits/{HEAD}/pulls")]
     assert len(listed) == 1, "the head's pull requests are asked for once"
 
@@ -474,6 +474,10 @@ def test_only_a_person_asking_by_number_reviews_a_head_that_has_its_review():
     need = next(step for step in _workflow()["jobs"]["review"]["steps"] if step.get("id") == "need")
     asked = need["env"]["ONLY_IF_MISSING"]
     assert asked == "${{ github.event_name != 'workflow_dispatch' || inputs.only_if_missing }}"
+    # …and the run started for ANOTHER pull request of the same head is not one of the skipped:
+    # the two share a commit, so the first to publish would otherwise stand in for the other,
+    # whose base and scope are its own
+    assert "started_by_workflow" not in asked
 
 
 def test_a_review_that_was_not_needed_does_nothing_and_publishes_nothing():
@@ -483,7 +487,8 @@ def test_a_review_that_was_not_needed_does_nothing_and_publishes_nothing():
     assert [step.get("if") for step in steps[1:]] == ["steps.need.outputs.needed == 'true'"] * 4
     assert "needs.review.outputs.needed != 'false'" in jobs["publish"]["if"]
     target = json.dumps(jobs["target"])
-    assert "github.event_name == 'workflow_dispatch' && !inputs.only_if_missing" in target, \
+    assert ("github.event_name == 'workflow_dispatch' && !inputs.only_if_missing "
+            "&& !inputs.started_by_workflow") in target, \
         "a run the workflow started is not somebody asking: its refusal is a notice"
 
 
