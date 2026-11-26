@@ -9,6 +9,7 @@ and repair were layered on in this file.) The orchestrator itself stays determin
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -110,6 +111,20 @@ _VALIDATION_TIMEOUT = 1800
 _E2E_POLL = 15  # seconds between polls of the dispatched e2e run (ADR-0008)
 _E2E_TIMEOUT = 1500  # give up watching the e2e run after ~25min (a stuck run reports, not hangs)
 _E2E_MAX_ERRORS = 5  # consecutive poll failures before we stop and report the REAL error
+
+
+def _draining_queued_effects(run):
+    """Drain the tracker writes a rate limit deferred around a job (#699).
+
+    Applied to `JobRunner.run` after the class, so `run` stays the body that reads the floor."""
+    @functools.wraps(run)
+    def wrapper(self, *args, **kwargs):
+        self._drain_queued_effects()
+        try:
+            return run(self, *args, **kwargs)
+        finally:
+            self._drain_queued_effects()
+    return wrapper
 
 
 def _all_passed(validations: list[ValidationResult]) -> bool:
@@ -1946,18 +1961,6 @@ class JobRunner:
             log.warning("could not drain the queued tracker effects (%s)", str(exc)[:160])
 
     def run(
-        self, ticket_ref: str, resume_handle: str | None = None, spent_turns: int = 0,
-        decision: str = "", another_pass: str = "",
-    ) -> RunResult:
-        """Drive one ticket to a PR, draining the effects a rate limit deferred around it."""
-        self._drain_queued_effects()
-        try:
-            return self._run_ticket(ticket_ref, resume_handle, spent_turns, decision,
-                                    another_pass)
-        finally:
-            self._drain_queued_effects()
-
-    def _run_ticket(
         self, ticket_ref: str, resume_handle: str | None = None, spent_turns: int = 0,
         decision: str = "", another_pass: str = "",
     ) -> RunResult:
@@ -5267,4 +5270,10 @@ class JobRunner:
 # read each method as it is written.
 for _entry in ("run", "repair_ci", "review_pr"):
     setattr(JobRunner, _entry, hands_back(getattr(JobRunner, _entry)))
+del _entry
+
+# THE QUEUED TRACKER EFFECTS ARE DRAINED AROUND A JOB (#699), applied here and not in a wrapper
+# method so `JobRunner.run` stays the body the floor tests read.
+for _entry in ("run",):
+    setattr(JobRunner, _entry, _draining_queued_effects(getattr(JobRunner, _entry)))
 del _entry
