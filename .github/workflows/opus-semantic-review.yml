@@ -3,26 +3,66 @@ name: Opus semantic review
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
+  # ANY OPEN PULL REQUEST, WHATEVER ITS BASE. `pull_request_target` reads this file from the base
+  # branch, so a pull request into a release branch that does not carry it yet, or one opened
+  # before it existed, starts no review on its own. Run from `main`, this reviews it by number.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of the open pull request to review
+        required: true
+        type: number
 
 permissions: {}
 
 concurrency:
-  group: opus-semantic-review-${{ github.event.pull_request.number }}
+  group: opus-semantic-review-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: true
 
 env:
-  PR_NUMBER: ${{ github.event.pull_request.number }}
-  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   REVIEW_MARKER: "<!-- beeverforge-opus-semantic-review -->"
+  # The factory's GitHub App files the issues its pull requests close. A login ending in `[bot]`
+  # can only be that app's, so its issues and comments are scope, as a maintainer's are.
+  FACTORY_APP: "beeverforge-oss[bot]"
 
 jobs:
+  # The pull request to review, read from the API for both triggers: its number, its head, and
+  # whether this review runs on it (open, not a draft, a branch of this repository).
+  target:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      pr: ${{ steps.pr.outputs.pr }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      eligible: ${{ steps.pr.outputs.eligible }}
+    steps:
+      - name: Resolve the pull request
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" > "$RUNNER_TEMP/pr.json"
+          eligible=false
+          if jq -e --arg repo "$GITHUB_REPOSITORY" '
+              .state == "open" and (.draft | not) and .head.repo.full_name == $repo
+              and .user.login != "dependabot[bot]"' "$RUNNER_TEMP/pr.json" > /dev/null; then
+            eligible=true
+          fi
+          jq -r '"pr=\(.number)", "head_sha=\(.head.sha)"' "$RUNNER_TEMP/pr.json" >> "$GITHUB_OUTPUT"
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+          echo "Pull request #$PR: eligible=$eligible"
+
   review:
-    if: >-
-      !github.event.pull_request.draft &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: target
+    if: needs.target.outputs.eligible == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      PR_NUMBER: ${{ needs.target.outputs.pr }}
+      HEAD_SHA: ${{ needs.target.outputs.head_sha }}
     permissions:
       contents: read
       issues: read
@@ -31,11 +71,12 @@ jobs:
       verdict: ${{ steps.opus.outputs.verdict }}
       report: ${{ steps.opus.outputs.report }}
     steps:
-      # The workflow comes from the base branch. The PR checkout is input data only.
+      # The workflow comes from the base branch, or from the ref it was run from by hand. The PR
+      # checkout is input data only.
       - name: Read the PR tree
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.target.outputs.head_sha }}
           path: source
           persist-credentials: false
 
@@ -68,14 +109,16 @@ jobs:
             if [[ "$url" == "https://github.com/$GITHUB_REPOSITORY/issues/"* ]]; then
               number="$(jq -r .number <<< "$issue")"
               endpoint="repos/$GITHUB_REPOSITORY/issues/$number"
-              gh api "$endpoint" | jq '
-                if (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR")) then
+              gh api "$endpoint" | jq --arg factory "$FACTORY_APP" '
+                if (.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+                  or (.user.type == "Bot" and .user.login == $factory) then
                   {number, trusted_author: true, title, body}
                 else
                   {number, trusted_author: false, note: "A maintainer comment must confirm scope."}
                 end' > "context/issue-$number.json"
-              gh api --paginate "$endpoint/comments" | jq -s '
-                [.[][] | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+              gh api --paginate "$endpoint/comments" | jq -s --arg factory "$FACTORY_APP" '
+                [.[][] | select((.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+                  or (.user.type == "Bot" and .user.login == $factory))
                 | {body}]' > "context/issue-$number-comments.json"
             fi
           done
@@ -309,9 +352,12 @@ jobs:
 
   publish:
     name: Semantic review
-    needs: review
+    needs: [target, review]
     if: ${{ !cancelled() && needs.review.result != 'skipped' }}
     runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ needs.target.outputs.pr }}
+      HEAD_SHA: ${{ needs.target.outputs.head_sha }}
     permissions:
       pull-requests: write
       statuses: write
