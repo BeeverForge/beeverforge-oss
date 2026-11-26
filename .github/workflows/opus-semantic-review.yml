@@ -74,15 +74,15 @@ jobs:
             # EVERY OPEN PULL REQUEST THIS HEAD HAS, not only the first: one branch can be open
             # into `main` and into a release branch. This run reviews one; each other gets a run
             # of its own, by number, as a person would start it.
-            heads="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
-              | jq -r --arg sha "$RUN_HEAD_SHA" \
-                '.[] | select(.state == "open" and .head.sha == $sha) | .number')"
-            # …of the ones this review runs on: a draft or a fork would only be refused there.
-            reviewed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
-              | jq -r --arg sha "$RUN_HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" \
-                '.[] | select(.state == "open" and .head.sha == $sha and (.draft | not)
-                  and .head.repo.full_name == $repo and .user.login != "dependabot[bot]")
-                 | .number')"
+            # ASKED ONCE, read twice: two answers could disagree about which pull requests exist.
+            gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" > "$RUNNER_TEMP/heads.json"
+            heads="$(jq -r --arg sha "$RUN_HEAD_SHA" \
+              '.[] | select(.state == "open" and .head.sha == $sha) | .number' "$RUNNER_TEMP/heads.json")"
+            # …and the ones this review runs on: a draft or a fork would only be refused there.
+            reviewed="$(jq -r --arg sha "$RUN_HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" \
+              '.[] | select(.state == "open" and .head.sha == $sha and (.draft | not)
+                and .head.repo.full_name == $repo and .user.login != "dependabot[bot]")
+               | .number' "$RUNNER_TEMP/heads.json")"
             if [[ -z "$pr" ]]; then
               pr="$(head -n 1 <<< "$heads")"
             fi

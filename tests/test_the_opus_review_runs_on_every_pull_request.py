@@ -193,6 +193,8 @@ def test_every_pull_request_of_one_head_gets_a_review(runner):
     started = [call for call in runner.calls if call[:2] == ["workflow", "run"]]
     assert started == [["workflow", "run", "opus-semantic-review.yml", "--repo", REPO,
                         "-f", "pr=11"]]
+    listed = [call for call in runner.calls if call[-1].endswith(f"/commits/{HEAD}/pulls")]
+    assert len(listed) == 1, "the head's pull requests are asked for once"
 
 
 def test_another_pull_request_that_would_only_be_refused_is_not_started(runner):
