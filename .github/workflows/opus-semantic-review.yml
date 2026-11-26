@@ -20,6 +20,16 @@ on:
         description: Number of the open pull request to review
         required: true
         type: number
+      # What the workflow itself passes when it starts a run to fill a gap (`ensure`): review
+      # only if the pull request's head still has no status, and count the tries.
+      only_if_missing:
+        description: Review only if the head has no opus/semantic-review status yet
+        type: boolean
+        default: false
+      attempt:
+        description: Which try of filling a gap this is (the workflow's own)
+        type: number
+        default: 1
 
 permissions: {}
 
@@ -57,7 +67,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ASKED: ${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          BY_HAND: ${{ github.event_name == 'workflow_dispatch' }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' && !inputs.only_if_missing }}
         run: |
           # Not reviewed, said by name: an error when a person asked, a notice otherwise.
           skip() {
@@ -136,13 +146,41 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
+      statuses: read
     outputs:
+      needed: ${{ steps.need.outputs.needed }}
       verdict: ${{ steps.opus.outputs.verdict }}
       report: ${{ steps.opus.outputs.report }}
     steps:
+      # ASKED HERE, AFTER THE WAIT IN THE GROUP, because the answer changes while waiting. A run
+      # started to fill a gap reviews only a head that is still the pull request's and still has
+      # no status; otherwise it does nothing, and `ensure` looks again when it ends.
+      - name: Is this review still needed
+        id: need
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_IF_MISSING: ${{ inputs.only_if_missing || false }}
+        run: |
+          needed=true
+          if [[ "$ONLY_IF_MISSING" == true ]]; then
+            current="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
+            statuses="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/statuses" \
+              | jq '[.[] | select(.context == "opus/semantic-review")] | length')"
+            if [[ "$current" != "$HEAD_SHA" ]]; then
+              needed=false
+              echo "::notice::Not reviewed: #$PR_NUMBER has moved past ${HEAD_SHA:0:12}."
+            elif (( statuses > 0 )); then
+              needed=false
+              echo "::notice::Not reviewed again: ${HEAD_SHA:0:12} already has its review."
+            fi
+          fi
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
       # The workflow comes from `main` (or, for a draft made ready, the base branch). The PR
       # checkout is input data only.
       - name: Read the PR tree
+        if: steps.need.outputs.needed == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.target.outputs.head_sha }}
@@ -150,6 +188,7 @@ jobs:
           persist-credentials: false
 
       - name: Collect PR, issue and prior review context
+        if: steps.need.outputs.needed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,6 +270,7 @@ jobs:
           done <<< "$closing"
 
       - name: Install verified Claude Code
+        if: steps.need.outputs.needed == 'true'
         shell: bash
         run: |
           version=2.1.332
@@ -255,6 +295,7 @@ jobs:
       # ends as a failure and `publish` says "Review unavailable". Stopped by the job's limit it
       # would end as cancelled, which is what a replaced review is, and nothing would be said.
       - name: Review with Opus
+        if: steps.need.outputs.needed == 'true'
         id: opus
         timeout-minutes: 15
         shell: bash
@@ -464,8 +505,9 @@ jobs:
   publish:
     name: Semantic review
     needs: [target, review]
-    # A review that was replaced publishes nothing: the one that replaced it will.
-    if: ${{ !cancelled() && needs.review.result != 'skipped' && needs.review.result != 'cancelled' }}
+    # A review that was replaced publishes nothing, and neither does one that found it was not
+    # needed. `ensure` checks afterwards that the pull request's head has a status all the same.
+    if: ${{ !cancelled() && needs.review.result != 'skipped' && needs.review.result != 'cancelled' && needs.review.outputs.needed != 'false' }}
     runs-on: ubuntu-latest
     env:
       PR_NUMBER: ${{ needs.target.outputs.pr }}
@@ -519,3 +561,50 @@ jobs:
             -f state="$state" -f context="opus/semantic-review" -f description="$status" \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           [[ "$state" == "success" ]]
+
+  # NO PULL REQUEST IS LEFT WITHOUT A STATUS. The status is required for merging, and several
+  # things end a run without one: a waiting review replaced by another that entered the group
+  # later (jobs enter in the order they start, not the order of the pushes), a review whose head
+  # the pull request left while it ran. Whatever happened above, this asks one question at the
+  # end: does the pull request's head, as it is NOW, have its status? If not, it starts one more
+  # run for it, which reviews only if that is still true when its turn comes. Bounded: a gap that
+  # three tries do not fill is said, not chased.
+  ensure:
+    name: Every head has a status
+    needs: [target, review, publish]
+    if: ${{ always() && needs.target.outputs.eligible == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ needs.target.outputs.pr }}
+    permissions:
+      actions: write
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Start a review where the head has none
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ inputs.attempt || 1 }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/now.json"
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" '
+              .state == "open" and (.draft | not) and .head.repo.full_name == $repo' \
+              "$RUNNER_TEMP/now.json" > /dev/null; then
+            echo "#$PR_NUMBER is no longer one this review runs on."
+            exit 0
+          fi
+          head="$(jq -r .head.sha "$RUNNER_TEMP/now.json")"
+          statuses="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/statuses" \
+            | jq '[.[] | select(.context == "opus/semantic-review")] | length')"
+          if (( statuses > 0 )); then
+            echo "${head:0:12} has its review."
+            exit 0
+          fi
+          if ! [[ "$ATTEMPT" =~ ^[0-9]+$ ]] || (( ATTEMPT >= 3 )); then
+            echo "::error::#$PR_NUMBER at ${head:0:12} has no opus/semantic-review status after $ATTEMPT tries. Start one by hand: gh workflow run opus-semantic-review.yml -f pr=$PR_NUMBER"
+            exit 1
+          fi
+          gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" \
+            -f pr="$PR_NUMBER" -f only_if_missing=true -f attempt="$(( ATTEMPT + 1 ))"
+          echo "::notice::#$PR_NUMBER at ${head:0:12} had no status: a review was started for it (try $(( ATTEMPT + 1 )))."

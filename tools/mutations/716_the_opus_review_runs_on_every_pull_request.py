@@ -10,7 +10,8 @@ merge gate. The claims, each a group of rows:
   1. every pull request is reviewed, into any branch, and what is not reviewed is named;
   2. one review per pull request, and a replaced one publishes nothing;
   3. scope is set by whoever can write to the repository, and by the factory's own issue;
-  4. only a pass is green, and what is published is the head that was reviewed, as plain text.
+  4. only a pass is green, and what is published is the head that was reviewed, as plain text;
+  5. no pull request is left without a status, and filling a gap is bounded.
 """
 
 TEST = "tests/test_the_opus_review_runs_on_every_pull_request.py"
@@ -59,9 +60,10 @@ MUTATIONS = [
     ("a model call that hangs is stopped by the job's limit and nothing is said", REVIEW,
      "        timeout-minutes: 15\n", ""),
     ("a replaced review publishes `Review unavailable`", REVIEW,
-     " && needs.review.result != 'cancelled' }}", " }}"),
+     " && needs.review.result != 'cancelled' && needs.review.outputs.needed",
+     " && needs.review.outputs.needed"),
     ("the job that resolves the number can start no run", REVIEW,
-     "      actions: write\n", ""),
+     "      actions: write\n      contents: read\n", "      contents: read\n"),
 
     # 3. whose words are the scope
     ("#719'S DEFECT: the issue's author is judged by author_association", REVIEW,
@@ -94,4 +96,37 @@ MUTATIONS = [
      '            echo "A newer commit is available."\n'),
     ("the model's words are published as Markdown", REVIEW,
      'map("    " + .)', "map(.)"),
+
+    # 5. no pull request is left without a status
+    ("the last job starts nothing for a head with no status", REVIEW,
+     '          gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" \\\n'
+     '            -f pr="$PR_NUMBER" -f only_if_missing=true',
+     '          : gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" \\\n'
+     '            -f pr="$PR_NUMBER" -f only_if_missing=true'),
+    ("any status at all counts as the review's", REVIEW,
+     """          statuses="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/statuses" \\
+            | jq '[.[] | select(.context == "opus/semantic-review")] | length')\"""",
+     """          statuses="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/statuses" \\
+            | jq 'length')\""""),
+    ("a gap is chased for ever", REVIEW,
+     "(( ATTEMPT >= 3 ))", "(( ATTEMPT >= 300 ))"),
+    ("a closed pull request is chased", REVIEW,
+     """              .state == "open" and (.draft | not) and .head.repo.full_name == $repo' \\
+              "$RUNNER_TEMP/now.json\"""",
+     """              true' \\
+              "$RUNNER_TEMP/now.json\""""),
+    ("the last job is skipped when the review was cancelled", REVIEW,
+     "    if: ${{ always() && needs.target.outputs.eligible == 'true' }}\n",
+     "    if: ${{ needs.target.outputs.eligible == 'true' }}\n"),
+    ("a run started to fill a gap reviews a head that already has its review", REVIEW,
+     "            elif (( statuses > 0 )); then\n              needed=false\n",
+     "            elif (( statuses > 0 )); then\n              needed=true\n"),
+    ("a run started to fill a gap reviews a head the pull request has left", REVIEW,
+     '            if [[ "$current" != "$HEAD_SHA" ]]; then\n              needed=false\n',
+     '            if [[ "$current" != "$HEAD_SHA" ]]; then\n              needed=true\n'),
+    ("a review that was not needed publishes `Review unavailable`", REVIEW,
+     " && needs.review.outputs.needed != 'false' }}", " }}"),
+    ("a refusal in a run the workflow started is an error, as if somebody had asked", REVIEW,
+     "github.event_name == 'workflow_dispatch' && !inputs.only_if_missing }}",
+     "github.event_name == 'workflow_dispatch' }}"),
 ]

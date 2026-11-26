@@ -297,12 +297,118 @@ def test_no_job_holds_more_than_it_needs():
     assert workflow["permissions"] == {}
     jobs = workflow["jobs"]
     assert jobs["review"]["permissions"] == {"contents": "read", "issues": "read",
-                                             "pull-requests": "read"}
+                                             "pull-requests": "read", "statuses": "read"}
+    assert jobs["ensure"]["permissions"] == {"actions": "write", "pull-requests": "read",
+                                             "statuses": "read"}
     assert jobs["publish"]["permissions"] == {"pull-requests": "write", "statuses": "write"}
     assert jobs["target"]["permissions"] == {"actions": "write", "contents": "read",
                                              "pull-requests": "read"}
     holders = [name for name, job in jobs.items() if "CLAUDE_CODE_OAUTH_TOKEN" in json.dumps(job)]
     assert holders == ["review"], "only the job that can write nothing holds the Claude credential"
+
+
+# ── no pull request is left without a status ───────────────────────────────────────────────────
+
+def _status(context: str = "opus/semantic-review") -> dict:
+    return {"context": context, "state": "failure"}
+
+
+def _started(runner: Runner) -> list[list[str]]:
+    return [call for call in runner.calls if call[:2] == ["workflow", "run"]]
+
+
+def test_at_the_end_of_every_run_a_head_with_no_status_gets_a_review(runner):
+    """The status is required for merging, and a run can end without one: a waiting review
+    replaced by one that entered the group later, a head the pull request left meanwhile. So the
+    last job asks about the head AS IT IS NOW, whatever this run was reviewing."""
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": [_status("ci/lint")]}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1")
+
+    assert ran.returncode == 0, ran.stderr
+    assert _started(runner) == [["workflow", "run", "opus-semantic-review.yml", "--repo", REPO,
+                                 "-f", "pr=9", "-f", "only_if_missing=true", "-f", "attempt=2"]]
+    assert "::notice::#9 at aaaaaaaaaaaa had no status" in ran.stdout
+
+
+def test_a_head_that_has_its_status_starts_nothing(runner):
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": [_status()]}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1")
+
+    assert ran.returncode == 0 and _started(runner) == []
+
+
+@pytest.mark.parametrize("pull", [_pull(9, state="closed"), _pull(9, draft=True),
+                                  _pull(9, repo="stranger/forge")],
+                         ids=["closed", "draft", "fork"])
+def test_a_pull_request_no_longer_reviewed_is_not_chased(runner, pull):
+    runner.answers = {f"repos/{REPO}/pulls/9": pull,
+                      f"repos/{REPO}/commits/{HEAD}/statuses": []}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1")
+
+    assert ran.returncode == 0 and _started(runner) == []
+
+
+@pytest.mark.parametrize("attempt", ["3", "7", "not a number"])
+def test_a_gap_three_tries_do_not_fill_is_said_and_not_chased(runner, attempt):
+    """A status that cannot be posted at all would otherwise start runs for ever."""
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": []}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT=attempt)
+
+    assert ran.returncode == 1 and _started(runner) == []
+    assert "::error::#9 at aaaaaaaaaaaa has no opus/semantic-review status" in ran.stdout
+    assert "gh workflow run opus-semantic-review.yml -f pr=9" in ran.stdout
+
+
+def test_the_last_job_runs_whatever_happened_to_the_review():
+    jobs = _workflow()["jobs"]
+    assert jobs["ensure"]["needs"] == ["target", "review", "publish"]
+    condition = jobs["ensure"]["if"]
+    assert "always()" in condition and "needs.target.outputs.eligible == 'true'" in condition
+
+
+@pytest.mark.parametrize("current, statuses, needed", [
+    (HEAD, [], "true"),
+    (HEAD, [_status("ci/lint")], "true"),
+    (HEAD, [_status()], "false"),
+    (OLDER, [], "false"),
+], ids=["no status yet", "another check's status", "already reviewed", "the head has moved"])
+def test_a_run_started_to_fill_a_gap_reviews_only_if_the_gap_is_still_there(
+        runner, current, statuses, needed):
+    """Asked after the wait in the group: by then the review it was started for may have
+    published, and a second Opus call would buy nothing."""
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=current),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": statuses}
+
+    ran = runner.run(_step("review", "Is this review still needed"), PR_NUMBER="9",
+                     HEAD_SHA=HEAD, ONLY_IF_MISSING="true")
+
+    assert ran.returncode == 0, ran.stderr
+    assert runner.outputs == {"needed": needed}
+
+
+def test_any_other_run_reviews_without_asking(runner):
+    ran = runner.run(_step("review", "Is this review still needed"), PR_NUMBER="9",
+                     HEAD_SHA=HEAD, ONLY_IF_MISSING="false")
+
+    assert ran.returncode == 0 and runner.outputs == {"needed": "true"} and runner.calls == []
+
+
+def test_a_review_that_was_not_needed_does_nothing_and_publishes_nothing():
+    jobs = _workflow()["jobs"]
+    steps = jobs["review"]["steps"]
+    assert steps[0]["id"] == "need"
+    assert [step.get("if") for step in steps[1:]] == ["steps.need.outputs.needed == 'true'"] * 4
+    assert "needs.review.outputs.needed != 'false'" in jobs["publish"]["if"]
+    target = json.dumps(jobs["target"])
+    assert "github.event_name == 'workflow_dispatch' && !inputs.only_if_missing" in target, \
+        "a run the workflow started is not somebody asking: its refusal is a notice"
 
 
 # ── whose words are the scope ───────────────────────────────────────────────────────────────────
