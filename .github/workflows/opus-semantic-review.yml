@@ -77,14 +77,25 @@ jobs:
             heads="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
               | jq -r --arg sha "$RUN_HEAD_SHA" \
                 '.[] | select(.state == "open" and .head.sha == $sha) | .number')"
+            # …of the ones this review runs on: a draft or a fork would only be refused there.
+            reviewed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
+              | jq -r --arg sha "$RUN_HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" \
+                '.[] | select(.state == "open" and .head.sha == $sha and (.draft | not)
+                  and .head.repo.full_name == $repo and .user.login != "dependabot[bot]")
+                 | .number')"
             if [[ -z "$pr" ]]; then
               pr="$(head -n 1 <<< "$heads")"
             fi
             while IFS= read -r other; do
               [[ -n "$other" && "$other" != "$pr" ]] || continue
-              gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" -f pr="$other"
-              echo "::notice::#$other has the same head: a review of its own was started."
-            done <<< "$heads"
+              # A START THAT FAILS IS SAID, AND COSTS THIS PULL REQUEST NOTHING: its own review
+              # goes on, and the other is one run by hand away.
+              if gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" -f pr="$other"; then
+                echo "::notice::#$other has the same head: a review of its own was started."
+              else
+                echo "::warning::#$other has the same head and its review could not be started: run it by hand (gh workflow run opus-semantic-review.yml -f pr=$other)."
+              fi
+            done <<< "$reviewed"
           fi
           [[ "$pr" =~ ^[1-9][0-9]*$ ]] || skip "no open pull request number in '${pr:-nothing}'"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" > "$RUNNER_TEMP/pr.json"
@@ -103,13 +114,19 @@ jobs:
   review:
     needs: target
     if: needs.target.outputs.eligible == 'true'
-    # ONE REVIEW PER PULL REQUEST, KEYED BY ITS NUMBER, whatever started the run: a newer push, or
-    # a run by hand, replaces the review that is running. On this job and not on the workflow,
-    # where the number is not known yet, and where a `ci` re-run (which reviews nothing) would
-    # cancel a review it does not replace.
+    # ONE REVIEW AT A TIME PER PULL REQUEST, KEYED BY ITS NUMBER, whatever started the run. On
+    # this job and not on the workflow, where the number is not known yet and where a `ci` re-run
+    # (which reviews nothing) would cancel a review it does not replace.
+    #
+    # THE NEXT ONE WAITS, IT DOES NOT CANCEL. Jobs enter the group in the order they start, not
+    # the order of the pushes: with cancelling, the review of an older head that started late
+    # could cancel the newer head's, then fail on "the PR changed", and the pull request would
+    # have no status at all. Waiting is safe in both orders: a review of a head the pull request
+    # has left fails fast in `Collect`, and the one waiting behind it then runs. Only a review
+    # still WAITING is replaced by a newer one, and it publishes nothing (`publish`).
     concurrency:
       group: opus-semantic-review-pr-${{ needs.target.outputs.pr }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -234,8 +251,12 @@ jobs:
           install -m 0755 claude "$RUNNER_TEMP/claude"
           "$RUNNER_TEMP/claude" --help | grep -- '--restricted'
 
+      # THE STEP'S OWN LIMIT, UNDER THE JOB'S: a model call that hangs fails the step, so the job
+      # ends as a failure and `publish` says "Review unavailable". Stopped by the job's limit it
+      # would end as cancelled, which is what a replaced review is, and nothing would be said.
       - name: Review with Opus
         id: opus
+        timeout-minutes: 15
         shell: bash
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

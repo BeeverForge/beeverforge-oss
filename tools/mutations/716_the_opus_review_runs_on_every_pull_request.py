@@ -41,14 +41,23 @@ MUTATIONS = [
     ("anything typed is sent to the API as a number", REVIEW,
      '[[ "$pr" =~ ^[1-9][0-9]*$ ]] || skip', '[[ -n "$pr" ]] || skip'),
     ("the second pull request of one head gets no review", REVIEW,
-     '              gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" '
-     '-f pr="$other"\n',
-     ""),
+     '              if gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" '
+     '-f pr="$other"; then\n',
+     "              if true; then\n"),
+    ("a draft with the same head is started, to be refused in red", REVIEW,
+     '            done <<< "$reviewed"\n', '            done <<< "$heads"\n'),
+    ("a start that fails for another stops this one's review", REVIEW,
+     "              else\n                echo \"::warning::#$other has the same head",
+     "              else\n                exit 1; echo \"::warning::#$other has the same head"),
 
     # 2. one review per pull request
     ("the review is keyed by something other than the number", REVIEW,
      "      group: opus-semantic-review-pr-${{ needs.target.outputs.pr }}\n",
      "      group: opus-semantic-review-${{ github.run_id }}\n"),
+    ("the next review cancels the one running, whichever head is newer", REVIEW,
+     "      cancel-in-progress: false\n", "      cancel-in-progress: true\n"),
+    ("a model call that hangs is stopped by the job's limit and nothing is said", REVIEW,
+     "        timeout-minutes: 15\n", ""),
     ("a replaced review publishes `Review unavailable`", REVIEW,
      " && needs.review.result != 'cancelled' }}", " }}"),
     ("the job that resolves the number can start no run", REVIEW,

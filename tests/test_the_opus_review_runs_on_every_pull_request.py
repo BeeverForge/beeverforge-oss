@@ -47,7 +47,7 @@ args = sys.argv[1:]
 with open(os.path.join(here, "calls.jsonl"), "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\\n")
 if args[:1] != ["api"]:
-    sys.exit(0)
+    sys.exit(1 if os.environ.get("NO_RUN_CAN_BE_STARTED") else 0)
 rest, method, jq, path = args[1:], "GET", None, None
 while rest:
     word = rest.pop(0)
@@ -195,6 +195,33 @@ def test_every_pull_request_of_one_head_gets_a_review(runner):
                         "-f", "pr=11"]]
 
 
+def test_another_pull_request_that_would_only_be_refused_is_not_started(runner):
+    """Started by number, a draft or a fork is refused as an ERROR (somebody asked): red runs
+    for pull requests nobody asked about."""
+    runner.answers = {f"repos/{REPO}/commits/{HEAD}/pulls":
+                          [_pull(10), _pull(11, draft=True), _pull(12, repo="stranger/forge"),
+                           _pull(13, author="dependabot[bot]")],
+                      f"repos/{REPO}/pulls/10": _pull(10)}
+
+    ran = runner.run(_step("target", "Resolve"), ASKED="10", RUN_HEAD_SHA=HEAD, BY_HAND="false")
+
+    assert ran.returncode == 0 and runner.outputs["eligible"] == "true"
+    assert [call for call in runner.calls if call[:2] == ["workflow", "run"]] == []
+
+
+def test_a_review_that_cannot_be_started_for_another_costs_this_one_nothing(runner):
+    runner.answers = {f"repos/{REPO}/commits/{HEAD}/pulls": [_pull(10), _pull(11)],
+                      f"repos/{REPO}/pulls/10": _pull(10)}
+
+    ran = runner.run(_step("target", "Resolve"), ASKED="10", RUN_HEAD_SHA=HEAD, BY_HAND="false",
+                     NO_RUN_CAN_BE_STARTED="1")
+
+    assert ran.returncode == 0, ran.stderr
+    assert runner.outputs == {"pr": "10", "head_sha": HEAD, "eligible": "true"}
+    assert "::warning::#11 has the same head and its review could not be started" in ran.stdout
+    assert "-f pr=11" in ran.stdout, "the warning carries the command that starts it"
+
+
 @pytest.mark.parametrize("pull, why", [
     (_pull(5, state="closed"), "#5 is closed"),
     (_pull(5, draft=True), "#5 is a draft"),
@@ -235,19 +262,32 @@ def test_what_is_not_a_pull_request_number_asks_the_api_nothing(runner, asked):
 
 # ── one review per pull request ─────────────────────────────────────────────────────────────────
 
-def test_a_review_is_replaced_only_by_a_review_of_the_same_pull_request():
+def test_one_review_at_a_time_per_pull_request_and_the_next_one_waits():
     """Keyed by the number on the REVIEW job. On the workflow, the number is not known yet, a run
     by hand and an event's run had two keys, and a `ci` re-run cancelled a review it did not
-    replace (#714's review, findings B and 3)."""
+    replace (#714's review, findings B and 3).
+
+    AND IT WAITS RATHER THAN CANCELS (#723's review): jobs enter the group in the order they
+    start, so with cancelling the review of an older head could cancel the newer head's and leave
+    the pull request with no status."""
     workflow = _workflow()
     assert "concurrency" not in workflow
     assert workflow["jobs"]["review"]["concurrency"] == {
         "group": "opus-semantic-review-pr-${{ needs.target.outputs.pr }}",
-        "cancel-in-progress": True}
+        "cancel-in-progress": False}
     assert "concurrency" not in workflow["jobs"]["target"]
     publish = workflow["jobs"]["publish"]["if"]
     assert "needs.review.result != 'cancelled'" in publish, "a replaced review publishes nothing"
     assert "needs.review.result != 'skipped'" in publish
+
+
+def test_a_model_call_that_hangs_ends_as_a_failure_that_is_published():
+    """`publish` says nothing for a CANCELLED review, which is what a replaced one is. A job
+    stopped by its own time limit ends cancelled too, so the model's step carries a shorter limit
+    of its own: the step fails, the job fails, and "Review unavailable" is published."""
+    review = _workflow()["jobs"]["review"]
+    opus = next(step for step in review["steps"] if step.get("id") == "opus")
+    assert opus["timeout-minutes"] < review["timeout-minutes"]
 
 
 def test_no_job_holds_more_than_it_needs():
