@@ -182,6 +182,40 @@ def test_other_failures_still_raise_and_reads_pass_through():
     assert t.assignees("#1") == ["someone"]
 
 
+def test_a_write_for_a_ticket_with_entries_waiting_joins_behind_them():
+    forge, clock, t = _tracker()
+    t.comment("#1", "first")
+    forge.limited = False  # the forge would take a write now, but "first" waits for its reset
+    clock.now = RESET - 1
+    t.comment("#1", "second")
+    t.comment("#2", "other ticket")
+    assert forge.applied == [("comment", "#2", "other ticket")]
+    clock.now = RESET
+    t.flush()
+    assert [c[2] for c in forge.applied] == ["other ticket", "first", "second"]
+
+
+def test_an_entry_that_fails_for_another_reason_is_dropped_and_the_next_applied(caplog):
+    forge, clock, t = _tracker()
+    t.comment("#1", "broken")
+    t.comment("#1", "fine")
+    forge.limited = False
+    real = forge.comment
+
+    def comment(ref, body):
+        if body == "broken":
+            raise RuntimeError("422 unprocessable")
+        real(ref, body)
+
+    forge.comment = comment
+    clock.now = RESET
+    with caplog.at_level(logging.ERROR):
+        t.flush()
+    assert forge.applied == [("comment", "#1", "fine")]
+    assert t.pending == []
+    assert any("BEEVERFORGE_QUEUED_EFFECT_DROPPED" in r.getMessage() for r in caplog.records)
+
+
 # -- review of #708: one file shared by several trackers --
 
 def test_two_trackers_on_one_path_lose_no_entry(tmp_path):
