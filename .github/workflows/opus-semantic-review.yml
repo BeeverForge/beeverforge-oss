@@ -169,17 +169,23 @@ jobs:
             [[ "$known" == true ]]
           }
 
+          # READ INTO A VARIABLE FIRST: a `jq` that fails inside `< <(…)` is not seen by the
+          # shell, and the loop would quietly review against no issue at all.
+          closing="$(jq -c '.closingIssuesReferences[]' context/pr.json)"
           while IFS= read -r issue; do
+            [[ -n "$issue" ]] || continue
             url="$(jq -r .url <<< "$issue")"
             if [[ "$url" == "https://github.com/$GITHUB_REPOSITORY/issues/"* ]]; then
               number="$(jq -r .number <<< "$issue")"
               endpoint="repos/$GITHUB_REPOSITORY/issues/$number"
               gh api "$endpoint" > "$RUNNER_TEMP/issue.json"
               gh api --paginate "$endpoint/comments" | jq -s 'add // []' > "$RUNNER_TEMP/comments.json"
+              people="$(jq -rs '.[0].user, .[1][].user | select(.type == "User") | .login' \
+                "$RUNNER_TEMP/issue.json" "$RUNNER_TEMP/comments.json" | sort -u)"
               while IFS= read -r login; do
+                [[ -n "$login" ]] || continue
                 can_write "$login" || true
-              done < <(jq -rs '.[0].user, .[1][].user | select(.type == "User") | .login' \
-                         "$RUNNER_TEMP/issue.json" "$RUNNER_TEMP/comments.json" | sort -u)
+              done <<< "$people"
               trusted="$(jq -c 'map(select(.writes) | .login)' <<< "$writers")"
               jq --arg factory "$FACTORY_APP" --argjson trusted "$trusted" '
                 if (.user.type == "User" and (.user.login | IN($trusted[])))
@@ -192,7 +198,7 @@ jobs:
                 [.[] | select(.user.type == "User" and (.user.login | IN($trusted[]))) | {body}]' \
                 "$RUNNER_TEMP/comments.json" > "context/issue-$number-comments.json"
             fi
-          done < <(jq -c '.closingIssuesReferences[]' context/pr.json)
+          done <<< "$closing"
 
       - name: Install verified Claude Code
         shell: bash
