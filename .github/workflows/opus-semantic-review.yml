@@ -151,12 +151,18 @@ jobs:
           writers='[]'
           can_write() {
             local login="$1" known permission
-            known="$(jq -r --arg login "$login" 'map(select(.login == $login))[0].writes // empty' <<< "$writers")"
+            # `false` is an answer too: read as text, or `//` would take it for no answer.
+            known="$(jq -r --arg login "$login" 'map(select(.login == $login))[0].writes | select(. != null) | tostring' <<< "$writers")"
             if [[ -z "$known" ]]; then
-              permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$login/permission" --jq .permission 2> /dev/null || true)"
               known=false
-              if [[ "$permission" == admin || "$permission" == write ]]; then
-                known=true
+              if permission="$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$login/permission" --jq .permission 2> "$RUNNER_TEMP/permission.err")"; then
+                if [[ "$permission" == admin || "$permission" == write ]]; then
+                  known=true
+                fi
+              else
+                # NOT ASKED IS NOT "NO". The person is read as an outsider either way, but the run
+                # says the question failed, so an inconclusive verdict is not a mystery.
+                echo "::warning::Could not ask whether $login can write to this repository ($(head -c 200 "$RUNNER_TEMP/permission.err" | tr '\n' ' ')); what they filed does not count as scope in this run."
               fi
               writers="$(jq -c --arg login "$login" --argjson writes "$known" '. + [{login: $login, writes: $writes}]' <<< "$writers")"
             fi
