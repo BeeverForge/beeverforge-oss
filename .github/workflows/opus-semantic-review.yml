@@ -1,11 +1,17 @@
 name: Opus semantic review
 
 on:
+  # EVERY PULL REQUEST, WHATEVER ITS BASE. `pull_request_target` reads this file from the pull
+  # request's base branch, so a pull request into a release branch started no review. `ci` runs
+  # on every pull request into any branch, and a `workflow_run` workflow is always read from
+  # `main`: so each pull request is reviewed when it opens, reopens and on every push.
+  workflow_run:
+    workflows: [ci]
+    types: [requested]
+  # A draft made ready starts no `ci` run (pull requests into `main`, where this file is).
   pull_request_target:
-    types: [opened, reopened, ready_for_review, synchronize]
-  # ANY OPEN PULL REQUEST, WHATEVER ITS BASE. `pull_request_target` reads this file from the base
-  # branch, so a pull request into a release branch that does not carry it yet, or one opened
-  # before it existed, starts no review on its own. Run from `main`, this reviews it by number.
+    types: [ready_for_review]
+  # By hand, any open pull request by number: one opened before this file, or a second look.
   workflow_dispatch:
     inputs:
       pr:
@@ -16,21 +22,29 @@ on:
 permissions: {}
 
 concurrency:
-  group: opus-semantic-review-${{ github.event.pull_request.number || inputs.pr }}
+  group: opus-semantic-review-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || inputs.pr }}
   cancel-in-progress: true
 
 env:
   REVIEW_MARKER: "<!-- beeverforge-opus-semantic-review -->"
   # The factory's GitHub App files the issues its pull requests close. A login ending in `[bot]`
-  # can only be that app's, so its issues and comments are scope, as a maintainer's are.
+  # can only be that app's, so the issue it filed is scope, as a maintainer's is. Its comments
+  # are not: they narrate the job and can quote anyone.
   FACTORY_APP: "beeverforge-oss[bot]"
 
 jobs:
-  # The pull request to review, read from the API for both triggers: its number, its head, and
-  # whether this review runs on it (open, not a draft, a branch of this repository).
+  # The pull request to review, read from the API whatever started the run: its number, its head,
+  # and whether this review runs on it (open, not a draft, a branch of this repository, and for a
+  # `ci` run the head that run is for). `ci`'s pushes to `main` and its re-runs are not reviews.
   target:
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.run_attempt == 1 &&
+        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       pr: ${{ steps.pr.outputs.pr }}
@@ -42,18 +56,39 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number || inputs.pr }}
+          ASKED: ${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" > "$RUNNER_TEMP/pr.json"
-          eligible=false
-          if jq -e --arg repo "$GITHUB_REPOSITORY" '
-              .state == "open" and (.draft | not) and .head.repo.full_name == $repo
-              and .user.login != "dependabot[bot]"' "$RUNNER_TEMP/pr.json" > /dev/null; then
-            eligible=true
+          # Not reviewed, said by name: an error when a person asked, a notice otherwise.
+          skip() {
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            if [[ "$BY_HAND" == true ]]; then
+              echo "::error::Not reviewed: $1"
+              exit 1
+            fi
+            echo "::notice::Not reviewed: $1"
+            exit 0
+          }
+          pr="$ASKED"
+          if [[ -z "$pr" && -n "$RUN_HEAD_SHA" ]]; then
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
+              | jq -r --arg sha "$RUN_HEAD_SHA" \
+                '[.[] | select(.state == "open" and .head.sha == $sha)][0].number // empty')"
           fi
+          [[ "$pr" =~ ^[1-9][0-9]*$ ]] || skip "no open pull request number in '${pr:-nothing}'"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" > "$RUNNER_TEMP/pr.json"
+          why="$(jq -r --arg repo "$GITHUB_REPOSITORY" --arg sha "$RUN_HEAD_SHA" '
+            if .state != "open" then "#\(.number) is \(.state)"
+            elif .draft then "#\(.number) is a draft"
+            elif .head.repo.full_name != $repo then "#\(.number) comes from another repository"
+            elif .user.login == "dependabot[bot]" then "#\(.number) is from dependabot"
+            elif $sha != "" and .head.sha != $sha then "#\(.number) has moved past \($sha[0:12])"
+            else "" end' "$RUNNER_TEMP/pr.json")"
+          [[ -z "$why" ]] || skip "$why"
           jq -r '"pr=\(.number)", "head_sha=\(.head.sha)"' "$RUNNER_TEMP/pr.json" >> "$GITHUB_OUTPUT"
-          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
-          echo "Pull request #$PR: eligible=$eligible"
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+          echo "Reviewing #$pr into $(jq -r .base.ref "$RUNNER_TEMP/pr.json") at $(jq -r .head.sha "$RUNNER_TEMP/pr.json")"
 
   review:
     needs: target
@@ -71,7 +106,7 @@ jobs:
       verdict: ${{ steps.opus.outputs.verdict }}
       report: ${{ steps.opus.outputs.report }}
     steps:
-      # The workflow comes from the base branch, or from the ref it was run from by hand. The PR
+      # The workflow comes from `main` (or, for a draft made ready, the base branch). The PR
       # checkout is input data only.
       - name: Read the PR tree
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,9 +151,8 @@ jobs:
                 else
                   {number, trusted_author: false, note: "A maintainer comment must confirm scope."}
                 end' > "context/issue-$number.json"
-              gh api --paginate "$endpoint/comments" | jq -s --arg factory "$FACTORY_APP" '
-                [.[][] | select((.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
-                  or (.user.type == "Bot" and .user.login == $factory))
+              gh api --paginate "$endpoint/comments" | jq -s '
+                [.[][] | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
                 | {body}]' > "context/issue-$number-comments.json"
             fi
           done
