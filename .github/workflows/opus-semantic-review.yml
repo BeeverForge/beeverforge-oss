@@ -568,7 +568,14 @@ jobs:
   # the pull request left while it ran. Whatever happened above, this asks one question at the
   # end: does the pull request's head, as it is NOW, have its status? If not, it starts one more
   # run for it, which reviews only if that is still true when its turn comes. Bounded: a gap that
-  # three tries do not fill is said, not chased.
+  # five tries do not fill is said, not chased.
+  #
+  # A REVIEW THAT WAS REPLACED WHILE WAITING STARTS NOTHING: the run that replaced it is in the
+  # group and answers for the head when it ends. If the replaced one started a run too, that run
+  # would enter the group and replace the review that is waiting, whose own last job would start
+  # another, and so on: with two pushes during one review, four runs and a false alarm (#723's
+  # review). So exactly one run answers at a time, the last to enter the group, and it cannot
+  # itself be deferring: it was not replaced.
   ensure:
     name: Every head has a status
     needs: [target, review, publish]
@@ -586,7 +593,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ATTEMPT: ${{ inputs.attempt || 1 }}
+          REVIEW_RESULT: ${{ needs.review.result }}
         run: |
+          if [[ "$REVIEW_RESULT" == cancelled ]]; then
+            echo "::notice::This review of #$PR_NUMBER was replaced while it waited: the run that replaced it answers for the head."
+            exit 0
+          fi
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/now.json"
           if ! jq -e --arg repo "$GITHUB_REPOSITORY" '
               .state == "open" and (.draft | not) and .head.repo.full_name == $repo' \
@@ -601,7 +613,7 @@ jobs:
             echo "${head:0:12} has its review."
             exit 0
           fi
-          if ! [[ "$ATTEMPT" =~ ^[0-9]+$ ]] || (( ATTEMPT >= 3 )); then
+          if ! [[ "$ATTEMPT" =~ ^[0-9]+$ ]] || (( ATTEMPT >= 5 )); then
             echo "::error::#$PR_NUMBER at ${head:0:12} has no opus/semantic-review status after $ATTEMPT tries. Start one by hand: gh workflow run opus-semantic-review.yml -f pr=$PR_NUMBER"
             exit 1
           fi

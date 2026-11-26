@@ -324,12 +324,50 @@ def test_at_the_end_of_every_run_a_head_with_no_status_gets_a_review(runner):
     runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
                       f"repos/{REPO}/commits/{HEAD}/statuses": [_status("ci/lint")]}
 
-    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1")
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
+                     REVIEW_RESULT="failure")
 
     assert ran.returncode == 0, ran.stderr
     assert _started(runner) == [["workflow", "run", "opus-semantic-review.yml", "--repo", REPO,
                                  "-f", "pr=9", "-f", "only_if_missing=true", "-f", "attempt=2"]]
     assert "::notice::#9 at aaaaaaaaaaaa had no status" in ran.stdout
+
+
+def test_a_review_replaced_while_it_waited_leaves_the_head_to_the_run_that_replaced_it(runner):
+    """A run it started would enter the group and replace the review that is waiting there, whose
+    own last job would start another: two pushes during one review made four runs and a false
+    "no status after 3 tries" (#723's review). The replaced run asks the API nothing at all."""
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": []}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
+                     REVIEW_RESULT="cancelled")
+
+    assert ran.returncode == 0 and runner.calls == []
+    assert "the run that replaced it answers for the head" in ran.stdout
+
+
+def _two_pushes_during_one_review() -> list[str]:
+    """Which runs start a run, in #723's scenario, by the workflow's own last step: R0 reviews H0;
+    H1 waits and is replaced by H2; R0 ends, H2 runs and publishes; every run's last job then
+    asks. Each entry is (name, the review's result, whether the head has its status by then)."""
+    return [("H1, replaced while waiting", "cancelled", False),
+            ("R0, whose head the pull request left", "failure", False),
+            ("H2, which published", "success", True)]
+
+
+def test_two_pushes_during_one_review_start_one_extra_run_and_no_alarm(runner):
+    started, alarms = [], []
+    for name, result, has_status in _two_pushes_during_one_review():
+        runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                          f"repos/{REPO}/commits/{HEAD}/statuses": [_status()] * has_status}
+        ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
+                         REVIEW_RESULT=result)
+        assert ran.returncode == 0, name
+        started += [name] * len(_started(runner))
+        alarms += [name] * ran.stdout.count("::error::")
+
+    assert started == ["R0, whose head the pull request left"] and alarms == []
 
 
 def test_a_head_that_has_its_status_starts_nothing(runner):
@@ -353,8 +391,8 @@ def test_a_pull_request_no_longer_reviewed_is_not_chased(runner, pull):
     assert ran.returncode == 0 and _started(runner) == []
 
 
-@pytest.mark.parametrize("attempt", ["3", "7", "not a number"])
-def test_a_gap_three_tries_do_not_fill_is_said_and_not_chased(runner, attempt):
+@pytest.mark.parametrize("attempt", ["5", "7", "not a number"])
+def test_a_gap_five_tries_do_not_fill_is_said_and_not_chased(runner, attempt):
     """A status that cannot be posted at all would otherwise start runs for ever."""
     runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
                       f"repos/{REPO}/commits/{HEAD}/statuses": []}

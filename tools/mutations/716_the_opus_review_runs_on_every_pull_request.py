@@ -109,7 +109,10 @@ MUTATIONS = [
      """          statuses="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/statuses" \\
             | jq 'length')\""""),
     ("a gap is chased for ever", REVIEW,
-     "(( ATTEMPT >= 3 ))", "(( ATTEMPT >= 300 ))"),
+     "(( ATTEMPT >= 5 ))", "(( ATTEMPT >= 500 ))"),
+    ("a review replaced while it waited starts a run that replaces the one waiting", REVIEW,
+     '          if [[ "$REVIEW_RESULT" == cancelled ]]; then\n',
+     '          if [[ "$REVIEW_RESULT" == never ]]; then\n'),
     ("a closed pull request is chased", REVIEW,
      """              .state == "open" and (.draft | not) and .head.repo.full_name == $repo' \\
               "$RUNNER_TEMP/now.json\"""",
