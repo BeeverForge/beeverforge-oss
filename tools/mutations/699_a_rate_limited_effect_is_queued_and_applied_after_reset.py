@@ -23,13 +23,13 @@ MUTATIONS = [
      "another applied (test_an_entry_a_live_tracker_applied_is_not_applied_again_by_another)",
      DEFERRED,
      "                    fcntl.flock(fd, fcntl.LOCK_EX)\n"
-     "                    self._queue = self._load()\n",
+     "                    self._reload()\n",
      "                    fcntl.flock(fd, fcntl.LOCK_EX)\n"),
 
     ("no file lock is taken, so the file is not the one truth "
      "(test_two_trackers_on_one_path_lose_no_entry)", DEFERRED,
      "                if fd is not None:\n                    fcntl.flock(fd, fcntl.LOCK_EX)\n"
-     "                    self._queue = self._load()\n",
+     "                    self._reload()\n",
      "                self._queue = self._queue\n"),
 
     ("build_runner hands the runner a bare tracker, so nothing is queued "

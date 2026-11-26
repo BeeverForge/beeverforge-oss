@@ -567,8 +567,9 @@ def _home_repo(project) -> str:
         log.debug("the product of %s is not registered (%s) — its tracker names its repository",
                   project.name, exc)
     if product is not None:
-        return str((product.forge.repo if product.forge else None)
-                   or getattr(product.tracker, "repo", "") or "")
+        forge = getattr(product, "forge", None)
+        return str(getattr(forge, "repo", None)
+                   or getattr(getattr(product, "tracker", None), "repo", "") or "")
     return str(getattr(getattr(project, "tracker", None), "repo", "") or "")
 
 
