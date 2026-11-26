@@ -30,6 +30,13 @@ on:
         description: Which try of filling a gap this is (the workflow's own)
         type: number
         default: 1
+      # What the workflow passes when it starts the review of another pull request of the same
+      # head: nobody asked by hand, so a refusal is a notice; but it always reviews, because
+      # that pull request has a base and a scope of its own.
+      started_by_workflow:
+        description: Started by the workflow for another pull request of the same head
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -67,7 +74,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ASKED: ${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.pull_requests[0].number }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          BY_HAND: ${{ github.event_name == 'workflow_dispatch' && !inputs.only_if_missing }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' && !inputs.only_if_missing && !inputs.started_by_workflow }}
         run: |
           # Not reviewed, said by name: an error when a person asked, a notice otherwise.
           skip() {
@@ -100,7 +107,10 @@ jobs:
               [[ -n "$other" && "$other" != "$pr" ]] || continue
               # A START THAT FAILS IS SAID, AND COSTS THIS PULL REQUEST NOTHING: its own review
               # goes on, and the other is one run by hand away.
-              if gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" -f pr="$other"; then
+              # NOT `only_if_missing`: the two share a commit, so the first to publish gives
+              # it a status, and the other would then skip a review of its own base and scope.
+              if gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" \
+                  -f pr="$other" -f started_by_workflow=true; then
                 echo "::notice::#$other has the same head: a review of its own was started."
               else
                 echo "::warning::#$other has the same head and its review could not be started: run it by hand (gh workflow run opus-semantic-review.yml -f pr=$other)."
@@ -153,14 +163,16 @@ jobs:
       report: ${{ steps.opus.outputs.report }}
     steps:
       # ASKED HERE, AFTER THE WAIT IN THE GROUP, because the answer changes while waiting. A run
-      # started to fill a gap reviews only a head that is still the pull request's and still has
-      # no status; otherwise it does nothing, and `ensure` looks again when it ends.
+      # nobody asked for by number (an event's, or one the workflow started) reviews only a head
+      # that is still the pull request's and still has no status; otherwise it does nothing, and
+      # `ensure` looks again when it ends. So one head is reviewed once, however many runs reach
+      # it. A RUN A PERSON STARTS BY NUMBER ALWAYS REVIEWS: that is how a second look is asked for.
       - name: Is this review still needed
         id: need
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ONLY_IF_MISSING: ${{ inputs.only_if_missing || false }}
+          ONLY_IF_MISSING: ${{ github.event_name != 'workflow_dispatch' || inputs.only_if_missing }}
         run: |
           needed=true
           if [[ "$ONLY_IF_MISSING" == true ]]; then
@@ -596,8 +608,16 @@ jobs:
           REVIEW_RESULT: ${{ needs.review.result }}
         run: |
           if [[ "$REVIEW_RESULT" == cancelled ]]; then
-            echo "::notice::This review of #$PR_NUMBER was replaced while it waited: the run that replaced it answers for the head."
-            exit 0
+            # REPLACED WHILE IT WAITED MEANS IT NEVER STARTED: no step of the job ran. A review
+            # that had started and was cancelled (a person, the job's time limit) was replaced
+            # by nothing, and its head is this run's to answer for.
+            ran="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+              | jq '[.jobs[] | select(.name == "review") | (.steps // []) | length] | add // 0')"
+            if (( ran == 0 )); then
+              echo "::notice::This review of #$PR_NUMBER was replaced while it waited: the run that replaced it answers for the head."
+              exit 0
+            fi
+            echo "::notice::This review of #$PR_NUMBER was cancelled after it started: checking its head."
           fi
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$RUNNER_TEMP/now.json"
           if ! jq -e --arg repo "$GITHUB_REPOSITORY" '

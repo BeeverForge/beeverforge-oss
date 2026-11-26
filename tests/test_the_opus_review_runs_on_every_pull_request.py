@@ -192,7 +192,8 @@ def test_every_pull_request_of_one_head_gets_a_review(runner):
     assert runner.outputs["pr"] == "10" and runner.outputs["eligible"] == "true"
     started = [call for call in runner.calls if call[:2] == ["workflow", "run"]]
     assert started == [["workflow", "run", "opus-semantic-review.yml", "--repo", REPO,
-                        "-f", "pr=11"]]
+                        "-f", "pr=11", "-f", "started_by_workflow=true"]], \
+        "the workflow's own run: a refusal there is a notice, and it always reviews (#726)"
     listed = [call for call in runner.calls if call[-1].endswith(f"/commits/{HEAD}/pulls")]
     assert len(listed) == 1, "the head's pull requests are asked for once"
 
@@ -313,6 +314,16 @@ def _status(context: str = "opus/semantic-review") -> dict:
     return {"context": context, "state": "failure"}
 
 
+#: This run's jobs, as the last job asks for them (`GITHUB_RUN_ID` is 1 in `Runner`).
+JOBS = f"repos/{REPO}/actions/runs/1/jobs"
+
+
+def _jobs(*, review_steps: int) -> dict:
+    return {"jobs": [{"name": "target", "steps": [{"name": "Resolve"}]},
+                     {"name": "review", "steps": [{"name": f"step {n}"}
+                                                  for n in range(review_steps)]}]}
+
+
 def _started(runner: Runner) -> list[list[str]]:
     return [call for call in runner.calls if call[:2] == ["workflow", "run"]]
 
@@ -336,15 +347,32 @@ def test_at_the_end_of_every_run_a_head_with_no_status_gets_a_review(runner):
 def test_a_review_replaced_while_it_waited_leaves_the_head_to_the_run_that_replaced_it(runner):
     """A run it started would enter the group and replace the review that is waiting there, whose
     own last job would start another: two pushes during one review made four runs and a false
-    "no status after 3 tries" (#723's review). The replaced run asks the API nothing at all."""
+    "no status after 3 tries" (#723's review). REPLACED WHILE WAITING MEANS NO STEP OF IT RAN."""
     runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
-                      f"repos/{REPO}/commits/{HEAD}/statuses": []}
+                      f"repos/{REPO}/commits/{HEAD}/statuses": [],
+                      JOBS: _jobs(review_steps=0)}
 
     ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
                      REVIEW_RESULT="cancelled")
 
-    assert ran.returncode == 0 and runner.calls == []
+    assert ran.returncode == 0 and _started(runner) == []
+    assert [call[1] for call in runner.calls] == [JOBS], "it asks only whether it ever started"
     assert "the run that replaced it answers for the head" in ran.stdout
+
+
+def test_a_review_cancelled_after_it_started_is_answered_for(runner):
+    """Cancelled by a person, or by the job's time limit outside the model's step: nothing
+    replaced it, so reading it as "replaced" left the head with no status and nobody to notice
+    (#726)."""
+    runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
+                      f"repos/{REPO}/commits/{HEAD}/statuses": [],
+                      JOBS: _jobs(review_steps=3)}
+
+    ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
+                     REVIEW_RESULT="cancelled")
+
+    assert ran.returncode == 0, ran.stderr
+    assert len(_started(runner)) == 1 and "cancelled after it started" in ran.stdout
 
 
 def _two_pushes_during_one_review() -> list[str]:
@@ -360,7 +388,8 @@ def test_two_pushes_during_one_review_start_one_extra_run_and_no_alarm(runner):
     started, alarms = [], []
     for name, result, has_status in _two_pushes_during_one_review():
         runner.answers = {f"repos/{REPO}/pulls/9": _pull(9, head=HEAD),
-                          f"repos/{REPO}/commits/{HEAD}/statuses": [_status()] * has_status}
+                          f"repos/{REPO}/commits/{HEAD}/statuses": [_status()] * has_status,
+                          JOBS: _jobs(review_steps=0)}
         ran = runner.run(_step("ensure", "Start a review"), PR_NUMBER="9", ATTEMPT="1",
                          REVIEW_RESULT=result)
         assert ran.returncode == 0, name
@@ -431,11 +460,24 @@ def test_a_run_started_to_fill_a_gap_reviews_only_if_the_gap_is_still_there(
     assert runner.outputs == {"needed": needed}
 
 
-def test_any_other_run_reviews_without_asking(runner):
+def test_a_run_a_person_starts_by_number_reviews_without_asking(runner):
     ran = runner.run(_step("review", "Is this review still needed"), PR_NUMBER="9",
                      HEAD_SHA=HEAD, ONLY_IF_MISSING="false")
 
     assert ran.returncode == 0 and runner.outputs == {"needed": "true"} and runner.calls == []
+
+
+def test_only_a_person_asking_by_number_reviews_a_head_that_has_its_review():
+    """A push that lands as a review ends can bring two runs to the new head, its own and the one
+    the last job starts: whichever comes second finds the status and does nothing (#726). A
+    person's run by number is the way to ask for a second look, so it never asks first."""
+    need = next(step for step in _workflow()["jobs"]["review"]["steps"] if step.get("id") == "need")
+    asked = need["env"]["ONLY_IF_MISSING"]
+    assert asked == "${{ github.event_name != 'workflow_dispatch' || inputs.only_if_missing }}"
+    # …and the run started for ANOTHER pull request of the same head is not one of the skipped:
+    # the two share a commit, so the first to publish would otherwise stand in for the other,
+    # whose base and scope are its own
+    assert "started_by_workflow" not in asked
 
 
 def test_a_review_that_was_not_needed_does_nothing_and_publishes_nothing():
@@ -445,7 +487,8 @@ def test_a_review_that_was_not_needed_does_nothing_and_publishes_nothing():
     assert [step.get("if") for step in steps[1:]] == ["steps.need.outputs.needed == 'true'"] * 4
     assert "needs.review.outputs.needed != 'false'" in jobs["publish"]["if"]
     target = json.dumps(jobs["target"])
-    assert "github.event_name == 'workflow_dispatch' && !inputs.only_if_missing" in target, \
+    assert ("github.event_name == 'workflow_dispatch' && !inputs.only_if_missing "
+            "&& !inputs.started_by_workflow") in target, \
         "a run the workflow started is not somebody asking: its refusal is a notice"
 
 
