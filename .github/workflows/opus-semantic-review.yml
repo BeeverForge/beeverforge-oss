@@ -23,12 +23,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: opus-semantic-review-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || inputs.pr }}
-  # A `ci` re-run starts no review (`target`), so it must not cancel the one that is running:
-  # it waits its turn in the group and then skips.
-  cancel-in-progress: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.run_attempt == 1 }}
-
 env:
   REVIEW_MARKER: "<!-- beeverforge-opus-semantic-review -->"
   # The factory's GitHub App files the issues its pull requests close. A login ending in `[bot]`
@@ -48,6 +42,7 @@ jobs:
         github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: read
       pull-requests: read
     outputs:
@@ -75,10 +70,21 @@ jobs:
             exit 0
           }
           pr="$ASKED"
-          if [[ -z "$pr" && -n "$RUN_HEAD_SHA" ]]; then
-            pr="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
+          if [[ -n "$RUN_HEAD_SHA" ]]; then
+            # EVERY OPEN PULL REQUEST THIS HEAD HAS, not only the first: one branch can be open
+            # into `main` and into a release branch. This run reviews one; each other gets a run
+            # of its own, by number, as a person would start it.
+            heads="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RUN_HEAD_SHA/pulls" \
               | jq -r --arg sha "$RUN_HEAD_SHA" \
-                '[.[] | select(.state == "open" and .head.sha == $sha)][0].number // empty')"
+                '.[] | select(.state == "open" and .head.sha == $sha) | .number')"
+            if [[ -z "$pr" ]]; then
+              pr="$(head -n 1 <<< "$heads")"
+            fi
+            while IFS= read -r other; do
+              [[ -n "$other" && "$other" != "$pr" ]] || continue
+              gh workflow run opus-semantic-review.yml --repo "$GITHUB_REPOSITORY" -f pr="$other"
+              echo "::notice::#$other has the same head: a review of its own was started."
+            done <<< "$heads"
           fi
           [[ "$pr" =~ ^[1-9][0-9]*$ ]] || skip "no open pull request number in '${pr:-nothing}'"
           gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" > "$RUNNER_TEMP/pr.json"
@@ -97,6 +103,13 @@ jobs:
   review:
     needs: target
     if: needs.target.outputs.eligible == 'true'
+    # ONE REVIEW PER PULL REQUEST, KEYED BY ITS NUMBER, whatever started the run: a newer push, or
+    # a run by hand, replaces the review that is running. On this job and not on the workflow,
+    # where the number is not known yet, and where a `ci` re-run (which reviews nothing) would
+    # cancel a review it does not replace.
+    concurrency:
+      group: opus-semantic-review-pr-${{ needs.target.outputs.pr }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -430,7 +443,8 @@ jobs:
   publish:
     name: Semantic review
     needs: [target, review]
-    if: ${{ !cancelled() && needs.review.result != 'skipped' }}
+    # A review that was replaced publishes nothing: the one that replaced it will.
+    if: ${{ !cancelled() && needs.review.result != 'skipped' && needs.review.result != 'cancelled' }}
     runs-on: ubuntu-latest
     env:
       PR_NUMBER: ${{ needs.target.outputs.pr }}
