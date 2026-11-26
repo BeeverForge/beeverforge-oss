@@ -823,6 +823,13 @@ class GitHubProjectBoard:
                      "-f", f"field={self._status_field_id}", "-f", f"option={option}"],
                     self.token)
         if p.returncode != 0:
+            # A SPENT BUDGET IS RAISED AS ITSELF (#699, review of #708), as the reads above it
+            # already are: answered False, the tracker wrote the state's label instead and the
+            # move was lost, where the caller's queue would have applied it after the reset
+            limited = rate_limited(p, f"the board move of issue {issue_number} to {name!r} met "
+                                      "the forge's rate limit")
+            if limited is not None:
+                raise limited
             log.error("BEEVERFORGE_BOARD_MOVE_FAILED %s/%s issue=%s -> %r: %s",
                       self.owner, self.number, issue_number, name,
                       (p.stderr or "").strip()[:200])

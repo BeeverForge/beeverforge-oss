@@ -39,15 +39,15 @@ MUTATIONS = [
      "                          token_provider=(None\n"),
 
     ("the job runner's tracker keeps the token it was composed with", FACTORY,
-     "                              token_provider=(stored_token_provider(project, \"tracker\",\n"
-     "                                                                    tracker_found)\n"
-     "                                              if tracker_tok\n"
-     "                                              else deployment_tracker_provider(project))),\n"
-     "        # A TOKEN A ROTATING",
-     "                              token_provider=(None\n"
-     "                                              if tracker_tok\n"
-     "                                              else deployment_tracker_provider(project))),\n"
-     "        # A TOKEN A ROTATING"),
+     "                          token_provider=(stored_token_provider(project, \"tracker\",\n"
+     "                                                                tracker_found)\n"
+     "                                          if tracker_tok\n"
+     "                                          else deployment_tracker_provider(project))),\n"
+     "            card=issue),",
+     "                          token_provider=(None\n"
+     "                                          if tracker_tok\n"
+     "                                          else deployment_tracker_provider(project))),\n"
+     "            card=issue),"),
 
     ("the promotion runner's observer keeps the token it was composed with (#589)", FACTORY,
      "        observer=build_observer(project, token=forge_tok or app_tok,\n"

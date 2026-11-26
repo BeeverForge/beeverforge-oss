@@ -542,6 +542,112 @@ def box_knobs(project) -> dict:
     return knobs
 
 
+QUEUED_TRACKER_EFFECTS = "queued-tracker-effects.json"
+
+
+def _tracker_scope(project) -> str:
+    """The repository (or the tracker's coordinate) a project's tracker writes to: what a queued
+    entry carries so only a tracker of the same repository applies it (#699, review of #708)."""
+    tracker = getattr(project, "tracker", None)
+    return str(getattr(tracker, "repo", "") or getattr(tracker, "project", "") or "")
+
+
+def _home_repo(project) -> str:
+    """The product's own repository — where a card with a bare ref lives (C-18's default).
+
+    Read from the REGISTERED product, because a job's project is the card's view, whose forge is
+    moved to the card's repository (`card_repo._runner_view`); an unregistered project is its own
+    product, and its tracker, which no view moves, names it."""
+    product = None
+    try:
+        from beeverforge.registry import ProjectRegistry
+
+        product = ProjectRegistry().get(project.name)
+    except Exception as exc:  # noqa: BLE001 — a view of an unregistered project is its own product
+        log.debug("the product of %s is not registered (%s) — its tracker names its repository",
+                  project.name, exc)
+    if product is not None:
+        forge = getattr(product, "forge", None)
+        return str(getattr(forge, "repo", None)
+                   or getattr(getattr(product, "tracker", None), "repo", "") or "")
+    return str(getattr(getattr(project, "tracker", None), "repo", "") or "")
+
+
+def _a_newer_move(project):
+    """`superseded(entry)` for a queued tracker write (ADR-0055 D5, "never backwards"): the reason
+    a state, label or assignee entry must not be applied, read off the card's record — a move the
+    door recorded after the entry was queued decided where the card is now (a delivery, a park, a
+    person's stop). A comment is what was said, not where the card is: no move supersedes it.
+
+    THE CARD IS THE ENTRY'S TICKET (review of #708 at 48ff615): bare for a card of the product's
+    own repository, `owner/name#n` for one of another — the key the worker records the card under
+    (`canonical_ref` of the job's ref). Read by the bare number, `acme/web#1` was judged by the
+    record of `acme/api#1`.
+
+    A deployment with no record store has no move to compare (`Unrecordable`): the entry is
+    applied. A record that will not answer RAISES, and the queue drops the entry, logged: a guess
+    that moves a card backwards is worse than a write that never lands."""
+    from datetime import datetime
+
+    from beeverforge.contracts.refs import canonical_ref
+    from beeverforge.lifecycle import record
+
+    def superseded(entry: dict) -> str:
+        if entry.get("kind") == "comment":
+            return ""
+        try:
+            sink = record.keyed_sink()
+        except record.Unrecordable:
+            return ""
+        card = canonical_ref(entry.get("ticket") or entry["ref"])
+        moved = record.read(sink, project.name, card).latest_move
+        if moved is None or not moved.ts:
+            return ""
+        when = datetime.fromisoformat(moved.ts).timestamp()
+        if when > float(entry["queued_at"]):
+            return f"the card moved since it was queued ({moved.event} at {moved.ts})"
+        return ""
+
+    return superseded
+
+
+def deferring_tracker(project, tracker, *, clock=None, card: str = ""):
+    """`tracker`, its writes queued past the forge's rate limit in the project's one queue file,
+    under its tracker's scope and the card record's "never backwards" check (#699). `card` is the
+    ref of the card a job's runner was built for: the job writes its bare id, and the queue keys it
+    by the card's own repository."""
+    import time
+
+    from beeverforge.adapters.tracker.deferred import DeferringTracker
+    from beeverforge.paths import project_log_dir
+
+    if isinstance(tracker, DeferringTracker):
+        return tracker
+    return DeferringTracker(tracker, clock=clock or time.time,
+                            path=project_log_dir(project) / QUEUED_TRACKER_EFFECTS,
+                            scope=_tracker_scope(project), superseded=_a_newer_move(project),
+                            card=card, home=_home_repo(project))
+
+
+def drain_queued_effects(project, *, tracker_for, clock=None) -> int:
+    """Apply what the project's queue holds whose reset has passed, with the project's tracker
+    (`tracker_for(project)`); how many were applied.
+
+    THE WORKER'S DRAIN (review of #708): a job's last comment and its hand-back are queued, the
+    job ends, and a project with no next job applied nothing, ever. The hourly round calls this,
+    so the queue is applied within the hour after the reset whoever runs next. Every card's job
+    writes through the product's tracker, which no view moves (C-18), so one tracker applies
+    every card's entries. An entry of another tracker coordinate (the product's tracker was
+    re-pointed since) is the tracker of that coordinate's to apply, and is left to it."""
+    from beeverforge.adapters.tracker.deferred import read_queue
+    from beeverforge.paths import project_log_dir
+
+    path = project_log_dir(project) / QUEUED_TRACKER_EFFECTS
+    if not read_queue(path):
+        return 0
+    return deferring_tracker(project, tracker_for(project), clock=clock).flush()
+
+
 def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool, events=None,
                  repo_key: str | None = None, change: int = 0):
     """Assemble a JobRunner for one ticket: tracker + forge + agent + sandbox +
@@ -607,16 +713,20 @@ def build_runner(project, issue: str, *, sandbox: str, image: str, review: bool,
     # mints GitHub tokens, and only the shipped Azure and Jira rows knew to refuse it (measured
     # 2026-08-24). Each axis now asks the credential registry for ITS vendor's provider, which
     # is the App minter for the reference vendor and None for a vendor that declares none.
+    # THE JOB'S WRITES SURVIVE THE FORGE'S RATE LIMIT (#699): queued and applied after its reset
     return JobRunner(
         project=project,  # ADR-0027: the gate needs to know whose board this is
         change=change,  # #448 slice 4: which change of the card — it names the branch
         # the REGISTRY decides which provider — the factory composes a runner, it does not pick
         # a vendor (a client on Jira changes one registry value and nothing here)
-        tracker=build_tracker(project, token=tracker_tok,
-                              token_provider=(stored_token_provider(project, "tracker",
-                                                                    tracker_found)
-                                              if tracker_tok
-                                              else deployment_tracker_provider(project))),
+        tracker=deferring_tracker(
+            project,
+            build_tracker(project, token=tracker_tok,
+                          token_provider=(stored_token_provider(project, "tracker",
+                                                                tracker_found)
+                                          if tracker_tok
+                                          else deployment_tracker_provider(project))),
+            card=issue),  # the job writes its card's bare id: the queue keys it by the card
         # A TOKEN A ROTATING STORE ANSWERED IS READ AGAIN BEFORE IT EXPIRES (#236): with a stored
         # token this passed no provider, so the forge pushed for the whole job with the string
         # read here, and a job longer than the hour an installation token lives pushed with an

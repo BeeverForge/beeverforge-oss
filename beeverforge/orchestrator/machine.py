@@ -9,6 +9,7 @@ and repair were layered on in this file.) The orchestrator itself stays determin
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -110,6 +111,21 @@ _VALIDATION_TIMEOUT = 1800
 _E2E_POLL = 15  # seconds between polls of the dispatched e2e run (ADR-0008)
 _E2E_TIMEOUT = 1500  # give up watching the e2e run after ~25min (a stuck run reports, not hangs)
 _E2E_MAX_ERRORS = 5  # consecutive poll failures before we stop and report the REAL error
+
+
+def _draining_queued_effects(run):
+    """Drain the tracker writes a rate limit deferred around a job (#699).
+
+    Applied to `JobRunner.run` after the class, so `run` stays the body that reads the floor."""
+    @functools.wraps(run)
+    def wrapper(self, *args, **kwargs):
+        ticket_ref = str(args[0] if args else kwargs.get("ticket_ref", ""))
+        self._drain_queued_effects()
+        try:
+            return run(self, *args, **kwargs)
+        finally:
+            self._drain_queued_effects(ticket_ref, ended=True)
+    return wrapper
 
 
 def _all_passed(validations: list[ValidationResult]) -> bool:
@@ -1931,6 +1947,38 @@ class JobRunner:
             # watch — exactly as the attempt that opened the pull request set them
             environments=list(self.manifest.environments.keys()),
             post_merge_deploy=self.manifest.post_merge_deploy))
+
+    def _drain_queued_effects(self, ticket_ref: str = "", *, ended: bool = False) -> None:
+        """Apply the tracker writes a rate limit deferred, once their reset has passed (#699).
+
+        Called when a job starts and when it ends (the worker's hourly round drains the rest);
+        best-effort, the delivery never waits on bookkeeping.
+
+        A STOPPED JOB APPLIES NOTHING (`_unless_stopped`, review of #708): its entries stay in the
+        file, and the stop's own move on the card's record supersedes its marks at the next drain.
+        AT THE JOB'S END ITS OWN PROGRESS MARKS ARE DROPPED: the outcome it hands back to the
+        card's door (ADR-0055 D7) is the card's newest state, and a mark applied after it would
+        move the card backwards (D5) — a delivered card marked `validating` again. Whoever drove
+        the runner applies that outcome through the door — the worker, the attended CLI, the
+        panel (`orchestrator/outcomes.py`) — and the door applies it unrecorded where no record
+        store exists, so no path loses the card's last state to this. A queued state that is NOT
+        a progress mark stands for no outcome the job hands back, and is kept."""
+        flush = getattr(self.tracker, "flush", None)
+        if not callable(flush):
+            return
+        try:
+            self._unless_stopped("drain the queued tracker effects")
+        except JobStopped:
+            return
+        try:
+            supersede = getattr(self.tracker, "supersede", None)
+            if ended and ticket_ref and callable(supersede):
+                supersede(ticket_ref, ("state",),
+                          "the job ended, and the outcome it hands back is the card's newest state",
+                          states=frozenset(s.value for s in PROGRESS_MARKS))
+            flush()
+        except Exception as exc:
+            log.warning("could not drain the queued tracker effects (%s)", str(exc)[:160])
 
     def run(
         self, ticket_ref: str, resume_handle: str | None = None, spent_turns: int = 0,
@@ -5242,4 +5290,10 @@ class JobRunner:
 # read each method as it is written.
 for _entry in ("run", "repair_ci", "review_pr"):
     setattr(JobRunner, _entry, hands_back(getattr(JobRunner, _entry)))
+del _entry
+
+# THE QUEUED TRACKER EFFECTS ARE DRAINED AROUND A JOB (#699), applied here and not in a wrapper
+# method so `JobRunner.run` stays the body the floor tests read.
+for _entry in ("run",):
+    setattr(JobRunner, _entry, _draining_queued_effects(getattr(JobRunner, _entry)))
 del _entry
