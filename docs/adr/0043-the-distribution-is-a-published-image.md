@@ -41,6 +41,11 @@ so a second file would be judged by nothing and would drift first.
 | `beeverforge-sandbox` | `docker/sandbox.Dockerfile` | the worker spawns it through the host's Docker socket and **never builds it** |
 | `beeverforge-cli` | `docker/cli.Dockerfile` | `python:3.12-slim` + the wheel, no Node. Runs `preflight` and `init` in seconds *while the worker image downloads behind the interview* |
 
+**Amended (2026-11-17, #590):** from the switch (BeeverForge/beeverforge-panel#20), the compose file
+also names the panel's image, `ghcr.io/beeverforge/beeverforge-panel`. It is a fifth image, published
+by BeeverForge/beeverforge-panel and not by this repository's `release.yml`, and it ships the SBOM and
+the build-provenance attestation this record asks of every image (ADR-0059 D4).
+
 GHCR rather than Docker Hub: public images cost nothing, are not rate-limited for anonymous pulls
 the way Docker Hub is, live beside the source, authenticate with the token the workflow already
 has — and are plain OCI, so moving off it is a tag prefix rather than a migration.
@@ -60,6 +65,11 @@ docker compose --profile build up -d --build  → builds and tags it as that sam
 The tracked file **is** the release asset, verbatim — not generated, not rewritten with a version
 substituted in. `base-image`, `sandbox-image` and `cli` sit behind `profiles: ["build"]` so `up -d`
 does not build a multi-gigabyte box image it could have pulled.
+
+**Amended (2026-11-17, #590):** the panel's image is the one service in this file with no `build:`,
+and it is named by digest (`…/beeverforge-panel:<tag>@sha256:<digest>`), so the release's `SHA256SUMS`
+covers what runs. The image-set guard below names it as the one image published outside `release.yml`
+(ADR-0059 D4).
 
 **3. The tracked default is `main`; every install is pinned.**
 `image: ghcr.io/beeverforge/beeverforge-worker:${BEEVERFORGE_VERSION:-main}`. `main` is
