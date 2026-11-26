@@ -2858,9 +2858,15 @@ def probes_for(project) -> Probes:
         with no board pays nothing: `build_board` returns None before anything is resolved.
         """
         from beeverforge.adapters.board.factory import build_board
-        from beeverforge.credentials import axis_refusal
+        from beeverforge.credentials import axis_refusal, tracker_token_for
 
-        board = build_board(project, token_provider=_board_credential(project))
+        # THE TOKEN IS RESOLVED HERE, AS THE POLLER AND `cli.py` RESOLVE IT (#737): the Jira row
+        # reads a caller's `token=` or its vendor's default variable and never the provider, so a
+        # project whose `token_env` names its credential was read anonymously and reported
+        # unreadable wherever `JIRA_API_TOKEN` was unset. Every probe below passes it the same way.
+        # `tracker_token_for` reads the store and mints nothing; the mint stays in the provider.
+        board = build_board(project, token=tracker_token_for(project),
+                            token_provider=_board_credential(project))
         if board is None:
             return None  # no board configured — a legitimate setup, and the ONLY meaning of None
         # A REFUSED TRACKER CREDENTIAL IS WHY, AND SAID SO (review of #822): the read would fail
@@ -2882,8 +2888,10 @@ def probes_for(project) -> Probes:
         connection — it reads the registry row — so a second construction costs nothing and keeps
         the two probes independent, which is what lets a test exercise either alone."""
         from beeverforge.adapters.board.factory import build_board
+        from beeverforge.credentials import tracker_token_for
 
-        board = build_board(project, token_provider=_board_credential(project))
+        board = build_board(project, token=tracker_token_for(project),
+                            token_provider=_board_credential(project))
         return board.pickup_column() if board is not None else ""
 
     def _intake() -> object:
@@ -2896,11 +2904,14 @@ def probes_for(project) -> Probes:
         from beeverforge.adapters.board.base import intake
         from beeverforge.adapters.board.factory import build_board
         from beeverforge.adapters.tracker.registry import build_tracker
+        from beeverforge.credentials import tracker_token_for
 
-        board = build_board(project, token_provider=_board_credential(project))
+        board = build_board(project, token=tracker_token_for(project),
+                            token_provider=_board_credential(project))
         if board is None or not callable(getattr(board, "intake_column", None)):
             return None
-        born = intake(build_tracker(project, token_provider=_board_credential(project)), board)
+        born = intake(build_tracker(project, token=tracker_token_for(project),
+                                   token_provider=_board_credential(project)), board)
         # A BOARD READ THAT COULD NOT SAY is not an unread one (`Intake.unknown`, #543): it is
         # this check's own FAIL, with the declaration that answers it — never `board_columns`'s.
         if born is not None and born.column is None and not born.unknown:
@@ -2915,8 +2926,10 @@ def probes_for(project) -> Probes:
         port's None as `BoardUnreadable`, and the map otherwise."""
         from beeverforge.adapters.board.base import stage_key, stage_option
         from beeverforge.adapters.board.factory import build_board
+        from beeverforge.credentials import tracker_token_for
 
-        board = build_board(project, token_provider=_board_credential(project))
+        board = build_board(project, token=tracker_token_for(project),
+                            token_provider=_board_credential(project))
         if board is None:
             return None
         names = board.column_names()
@@ -3113,9 +3126,11 @@ def probes_for(project) -> Probes:
         """
         from beeverforge.adapters.tracker.base import BudgetUnreadable
         from beeverforge.adapters.tracker.registry import build_tracker
+        from beeverforge.credentials import tracker_token_for
 
         try:
-            return build_tracker(project, token_provider=_board_credential(project)).budget()
+            return build_tracker(project, token=tracker_token_for(project),
+                                 token_provider=_board_credential(project)).budget()
         except BudgetUnreadable as exc:
             log.info("could not read the API budget for %s (%s)",
                      getattr(project, "name", "?"), str(exc)[:120])
