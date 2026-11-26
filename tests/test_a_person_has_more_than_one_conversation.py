@@ -182,21 +182,132 @@ def test_what_is_owed_in_a_session_is_on_its_owner_s_agenda_and_nobody_else_s():
     assert not agenda.sees(agenda.Viewer(own="acme"), where)
 
 
-def test_a_decision_asked_in_a_session_is_its_owner_s_to_answer_from_any_of_them():
+def test_a_decision_asked_in_a_session_is_answered_there_and_on_its_owner_s_agenda_in_all():
+    """#718: ANSWERED WHERE IT WAS ASKED. This test held that a decision asked in one of Ana's
+    sessions was answered from any of them, and that reading closed, as `answered`, two decisions
+    asked in one session by a message about something else in another: they left her Pending tab
+    and nobody chased them, though nobody had answered them. It is still on her agenda wherever she
+    reads it — and the Pending tab opens the session it was asked in (#717)."""
     from beeverforge.memory.ledger import DECISION, Loop
     from beeverforge.product import agenda, module
 
     scope = module._asked_of("ana", "person:ana~k3f9a2")
     loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
                 context=scope)
-    assert module._answered_by(loop, person="ana", where=("person:ana~zz99",), room="acme")
-    assert module._answered_by(loop, person="ana", where=(ANA,), room="acme")
-    assert not module._answered_by(loop, person="bruno", where=("person:ana~zz99",), room="acme")
+    assert module._answered_by(loop, person="ana", where=("person:ana~k3f9a2", "acme"),
+                               room="acme")
+    assert not module._answered_by(loop, person="ana", where=("person:ana~zz99", "acme"),
+                                   room="acme")
+    assert not module._answered_by(loop, person="ana", where=(ANA, "acme"), room="acme")
+    assert not module._answered_by(loop, person="bruno", where=("person:ana~k3f9a2",),
+                                   room="acme")
     assert not module._answered_by(loop, person="ana", where=("acme",), room="acme")
     # and it is on her panel's agenda, which is keyed by her first conversation's key
     where = agenda.audience(loop, room="acme")
     assert agenda.sees(agenda.Viewer(own=ANA, person="ana"), where)
+    assert agenda.sees(agenda.Viewer(own="person:ana~zz99", person="ana"), where)
     assert not agenda.sees(agenda.Viewer(own=BRUNO, person="bruno"), where)
+
+
+def test_a_decision_asked_in_a_person_s_first_conversation_is_answered_there_alone():
+    """#718: her first conversation is one conversation like her sessions, not all of them."""
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product import module
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context=module._asked_of("ana", ANA))
+    assert module._answered_by(loop, person="ana", where=(ANA, "acme"), room="acme")
+    assert not module._answered_by(loop, person="ana", where=("person:ana~k3f9a2", "acme"),
+                                   room="acme")
+
+
+def test_a_decision_recorded_before_the_session_was_kept_closes_as_it_always_did():
+    """#718: a row that does not say which session keeps the owner's reading — it cannot be
+    narrowed after the fact, and leaving it open for ever is the other silent failure."""
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product import module
+    from beeverforge.product.speaker import sealed
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context={"asked_of": sealed("ana"), "asked_in": sealed(ANA)})
+    assert module._answered_by(loop, person="ana", where=("person:ana~zz99", "acme"),
+                               room="acme")
+    assert module._answered_by(loop, person="ana", where=(ANA, "acme"), room="acme")
+    assert not module._answered_by(loop, person="bruno", where=("person:bruno~zz99",),
+                                   room="acme")
+
+
+def test_the_same_decision_asked_in_two_of_a_person_s_sessions_is_two_scopes():
+    """#718: `record_decisions` deduplicates by scope, so the scope must name the session — or
+    the second session's question would be folded into the first's and answered by it."""
+    from beeverforge.product import module
+
+    assert module._asked_of("ana", "person:ana~k3f9a2") != module._asked_of("ana",
+                                                                           "person:ana~zz99")
+    assert module._asked_of("ana", ANA) != module._asked_of("ana", "person:ana~zz99")
+    # a room has no sessions: the scope it had
+    assert "asked_session" not in module._asked_of("ana", "acme")
+
+
+# ── the Pending tab opens where each item was asked (#717) ──────────────────────────────────────
+
+def _pending_one(loop, *, own=ANA, person="ana", room="acme"):
+    from beeverforge.product import agenda
+
+    [item] = agenda.pending([loop], agenda.Viewer(own=own, person=person), room=room)
+    return item
+
+
+def test_a_decision_asked_in_a_session_opens_that_session():
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product import module
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context=module._asked_of("ana", "person:ana~k3f9a2"))
+    item = _pending_one(loop, own="person:ana~zz99")
+    assert (item.at, item.session) == ("own", "k3f9a2")
+    assert item.as_dict()["at"] == "own" and item.as_dict()["session"] == "k3f9a2"
+
+
+def test_a_decision_asked_in_the_first_conversation_opens_the_first_conversation():
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product import module
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context=module._asked_of("ana", ANA))
+    assert (_pending_one(loop).at, _pending_one(loop).session) == ("own", "")
+
+
+def test_a_decision_asked_in_the_room_opens_the_room():
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product import module
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context=module._asked_of("ana", "acme"))
+    assert (_pending_one(loop).at, _pending_one(loop).session) == ("room", "")
+
+
+def test_an_acceptance_opens_the_conversation_its_delivery_was_announced_in():
+    from beeverforge.memory.ledger import ACCEPTANCE, Loop
+
+    private = Loop(kind=ACCEPTANCE, subject="REQ-0007", owner="product",
+                   ts="2026-09-20T10:00:00+00:00",
+                   context={"conversation": "person:ana~k3f9a2", "requester": "ana"})
+    assert (_pending_one(private).at, _pending_one(private).session) == ("own", "k3f9a2")
+    room = Loop(kind=ACCEPTANCE, subject="REQ-0007", owner="product",
+                ts="2026-09-20T10:00:00+00:00", context={"conversation": "acme"})
+    assert (_pending_one(room).at, _pending_one(room).session) == ("room", "")
+
+
+def test_a_private_decision_recorded_before_the_session_was_kept_opens_nothing_new():
+    """A row that does not say which session: the item says it does not know, and the page keeps
+    what it did — the open conversation's box."""
+    from beeverforge.memory.ledger import DECISION, Loop
+    from beeverforge.product.speaker import sealed
+
+    loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
+                context={"asked_of": sealed("ana"), "asked_in": sealed(ANA)})
+    assert (_pending_one(loop).at, _pending_one(loop).session) == ("", "")
 
 
 def test_the_distillate_of_a_session_is_its_owner_s_reading(monkeypatch):
