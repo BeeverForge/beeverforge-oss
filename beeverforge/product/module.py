@@ -459,6 +459,25 @@ def _the_search_before_the_turn(module, root) -> tuple[dict[str, str], list[str]
     return module._found_before
 
 
+def _the_knowledge_answers(module) -> tuple[dict[str, str], list[str]]:
+    """WHAT A KNOWLEDGE SOURCE ANSWERED TO THIS MESSAGE (ADR-0052 D15): `found/knowledge.md` in the
+    facts pack, or a gap in its manifest when the source could not be asked — and `({}, [])`, with
+    nothing read or asked, when no source is switched on or this pass answers nobody
+    (`product/knowledge_answers.py`).
+
+    ONCE PER MODULE, which is once per turn, as the search before the turn: the role is built again
+    for a draft or a judgement after the answer, and that pack carries the same file — the source
+    is not asked a second time."""
+    from beeverforge.product import knowledge_answers
+
+    if not hasattr(module, "_facts_for"):
+        return {}, []
+    if "_known_before" not in vars(module):
+        module._known_before = knowledge_answers.answers(
+            str(getattr(module, "_question", "") or ""), project=module.project)
+    return module._known_before
+
+
 def _takes(fn, name: str) -> bool:
     """Whether `fn` declares the keyword `name`, by name or through `**kwargs` — read from the
     signature, so a double written before the keyword is called exactly as before."""
@@ -1609,12 +1628,15 @@ class ProductModule:
         # WHAT THE MESSAGE CARRIED (#336): each file's reading beside what the search found, and
         # through the same withholdings; an image is written as itself once the pack stands
         attached, images = _the_attachments(self)
-        found = {**found, **attached}
+        # WHAT A KNOWLEDGE SOURCE ANSWERED TO THIS MESSAGE (ADR-0052 D15), when a deployment
+        # switched one on: one file beside what the engine found, or one gap; off, nothing at all
+        known, known_gaps = _the_knowledge_answers(self)
+        found = {**found, **attached, **known}
         files, gaps = facts.gather(name, self._board_cards(), read=seen_here,
                                    **({"chain": chain} if chain else {}),
                                    **({"found": found} if found else {}), **read_model)
         into = facts.write_facts(Path(root), files=files,
-                                 gaps=[*gaps, *found_gaps, *_the_view_s_gap(self)])
+                                 gaps=[*gaps, *found_gaps, *known_gaps, *_the_view_s_gap(self)])
         for image, data in images if into else ():
             if not facts.add_image(into, image, data):
                 self._attached_listed = [

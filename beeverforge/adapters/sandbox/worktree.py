@@ -722,9 +722,14 @@ _AGENT_CRED_VARS = ("BEEVERFORGE_AGENT_TOKENS",)
 # …and where the deployment's secret files are mounted (#742): a path to the credential directory
 # is reach to every secret in it. What the scrub removes is the pointer, not the reach — the
 # files are on the worker's filesystem, readable by the worker's user, as SECURITY.md says.
+#
+# …and the token BeeverForge Knowledge is asked with (ADR-0052 D15), stripped from the day it
+# exists: the framework asks the service before the role runs and writes the answer as a file, so
+# nothing the agent does needs it, and a workload holding it could read whatever the role it names
+# may read (`adapters/knowledge_source/service.py`).
 _PANEL_SECRET_VARS = ("BEEVERFORGE_PREVIEW_SECRET", "BEEVERFORGE_GATE_SECRET",
                       "BEEVERFORGE_BOARD_TOKEN", "BEEVERFORGE_BOARD_TOKENS",
-                      "BEEVERFORGE_CREDENTIAL_DIR")
+                      "BEEVERFORGE_CREDENTIAL_DIR", "BEEVERFORGE_KNOWLEDGE_TOKEN")
 
 
 def _scrubbed_env(keep: tuple[str, ...] = ()) -> dict[str, str]:

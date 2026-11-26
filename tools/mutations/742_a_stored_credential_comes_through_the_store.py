@@ -161,9 +161,10 @@ MUTATIONS = [
     ("a worktree workload loses a declared name held in a file", WORKTREE,
      "            elif var in kept and found.value:",
      "            elif False:"),
+    # re-pinned 2026-11-22: the knowledge source's token (ADR-0052 D15) joined the list after it
     ("the path to every secret reaches a worktree workload", WORKTREE,
-     '                      "BEEVERFORGE_CREDENTIAL_DIR")',
-     "                      )"),
+     '                      "BEEVERFORGE_CREDENTIAL_DIR", "BEEVERFORGE_KNOWLEDGE_TOKEN")',
+     '                      "BEEVERFORGE_KNOWLEDGE_TOKEN")'),
     # re-pinned 2026-10-19 (#822): a refused name is said apart from an absent one
     ("readiness reports a name the box receives from a file as not set",
      "beeverforge/onboarding/readiness.py",

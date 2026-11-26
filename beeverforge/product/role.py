@@ -1960,6 +1960,9 @@ class ProductRole:
             "each with where it is, its date and how it was read. Open it when the question turns "
             "on anything older than this conversation. A superseded item there is history: it is "
             "listed under what replaced it, and what holds today is what replaced it.",
+            # WHAT A KNOWLEDGE SOURCE ANSWERED (ADR-0052 D15) — said only when a deployment
+            # switched one on, so a prompt with the axis off is the prompt it always was
+            *_knowledge_line(where),
         ]
 
     def _briefing_section(self) -> list[str]:
@@ -2330,6 +2333,22 @@ _VERDICT_TRIM = " \t\"'`*_.,;:!—–-()[]{}"
 
 #: The engine's search before the turn, as the facts pack names it (`index/retrieval.py::BEFORE`).
 _FOUND_BEFORE = "before-the-turn.md"
+
+
+def _knowledge_line(where: str) -> list[str]:
+    """The facts section's line for `found/knowledge.md`, or nothing when no knowledge source is
+    switched on (`adapters/knowledge_source/registry.py`)."""
+    from beeverforge.adapters.knowledge_source import registry
+    from beeverforge.product.knowledge_answers import FILE
+
+    if not registry.switched_on():
+        return []
+    return [f"`{where}/{FILE}`, when the README lists it, is what {registry.display_name()} "
+            "answered to this message, as the role its administrator registered: each sentence "
+            "with the labels of the documents it rests on, and each document's title and where "
+            "it is. Use a sentence of it only with its label, and say where the document is. An "
+            "abstention there means it had nothing it may cite; a line in the README saying it "
+            "could not be asked means unknown, never nothing."]
 
 
 def _continuation(notes: list[str], *, last: bool) -> str:

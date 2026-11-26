@@ -600,6 +600,23 @@ def build_embedder(project=None):
     return AcmeEmbedder()
 
 
+# ── knowledge source ─────────────────────────────────────────────────────────────────────────────
+
+class AcmeKnowledge:
+    """A stranger's source of knowledge: it answers every question with one cited sentence."""
+
+    def ask(self, question):
+        from beeverforge.adapters.knowledge_source.base import Answered, Cited, Said
+
+        return Answered(question=question, sentences=(Said("Acme says so.", ("A1",)),),
+                        citations=(Cited("A1", "acme-1", 1, "Acme notes", None, "internal"),))
+
+
+def build_knowledge_source(project=None):
+    BUILT.append(("knowledge_source", "acme"))
+    return AcmeKnowledge()
+
+
 def make_identity():
     return AcmeIdentity()
 
@@ -756,6 +773,7 @@ ENTRY_POINTS = {
     "credential_store.acme": "build_credential_store",
     "extract.acme": "build_extractor",
     "embed.acme": "build_embedder",
+    "knowledge_source.acme": "build_knowledge_source",
     "preview.acme": "preview_row",
 }
 
