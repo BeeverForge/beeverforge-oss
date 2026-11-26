@@ -1932,7 +1932,32 @@ class JobRunner:
             environments=list(self.manifest.environments.keys()),
             post_merge_deploy=self.manifest.post_merge_deploy))
 
+    def _drain_queued_effects(self) -> None:
+        """Apply the tracker writes a rate limit deferred, once their reset has passed (#699).
+
+        Called when a job starts and when it ends, so a finished job's queue is drained by the
+        next job of the project; best-effort, the delivery never waits on bookkeeping."""
+        flush = getattr(self.tracker, "flush", None)
+        if not callable(flush):
+            return
+        try:
+            flush()
+        except Exception as exc:
+            log.warning("could not drain the queued tracker effects (%s)", str(exc)[:160])
+
     def run(
+        self, ticket_ref: str, resume_handle: str | None = None, spent_turns: int = 0,
+        decision: str = "", another_pass: str = "",
+    ) -> RunResult:
+        """Drive one ticket to a PR, draining the effects a rate limit deferred around it."""
+        self._drain_queued_effects()
+        try:
+            return self._run_ticket(ticket_ref, resume_handle, spent_turns, decision,
+                                    another_pass)
+        finally:
+            self._drain_queued_effects()
+
+    def _run_ticket(
         self, ticket_ref: str, resume_handle: str | None = None, spent_turns: int = 0,
         decision: str = "", another_pass: str = "",
     ) -> RunResult:

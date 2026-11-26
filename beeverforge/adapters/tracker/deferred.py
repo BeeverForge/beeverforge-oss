@@ -17,23 +17,30 @@ THE RULES OF THE QUEUE
     that cannot succeed must not wait forever (guideline 8).
 
 DURABILITY. With a `path` the queue is a JSON file rewritten atomically on every change, so it
-survives a restart of the process; there is no cross-process lock, so two processes sharing one file
-may each apply an entry (use one file per worker). With no path it lives in memory and is lost with
-the process. Nothing drains it on a timer: it is drained by `flush()` and at the start of every
-write, so a queue on an idle process waits for the next write or a `flush()` call.
+survives a restart of the process. Every runner of a project shares that one file, so each operation
+takes an exclusive lock on a sidecar `.lock` file, RELOADS the queue from the file, and only then
+reads or changes it: two trackers on one path never overwrite each other's entries, and an entry one
+of them applied is gone from the file before the other looks. An entry is applied while the lock is
+held, which is what makes "at most once" true across runners. With no path it lives in memory and is
+lost with the process. Nothing drains it on a timer: it is drained by `flush()` and at the start of
+every write; the job runner calls `flush()` when a job starts and when it ends, so an entry whose
+reset had not passed when its job ended is applied by the next job of the project (or the next
+write) after it has, and a project with no further job keeps it in the file until there is one.
 
 The clock is a parameter, so nothing here reads the wall.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +59,39 @@ class DeferringTracker:
         self._clock = clock
         self._path = Path(path) if path else None
         self._lock = threading.RLock()
+        self._depth = 0
         self._queue: list[dict] = self._load()
+
+    @contextmanager
+    def _held(self) -> Iterator[None]:
+        """The queue, exclusively, as the file has it NOW: the lock first, then the reload."""
+        with self._lock:
+            if self._depth or not self._path:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(self._path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            except OSError as exc:
+                log.error("the queue lock for %s could not be taken (%s) — working on this "
+                          "process's copy", self._path, exc)
+                fd = None
+            try:
+                if fd is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    self._queue = self._load()
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+            finally:
+                if fd is not None:
+                    os.close(fd)  # closing releases the lock
 
     # -- everything not overridden (reads, close_ticket, ...) is the inner tracker's --
     def __getattr__(self, name: str) -> Any:
@@ -86,12 +125,12 @@ class DeferringTracker:
     # -- the queue --
     @property
     def pending(self) -> list[dict]:
-        with self._lock:
+        with self._held():
             return [dict(e) for e in self._queue]
 
     def flush(self) -> None:
         """Apply every entry whose reset has passed, oldest first."""
-        with self._lock:
+        with self._held():
             now = self._clock()
             while self._queue and self._queue[0]["reset_at"] <= now:
                 entry = self._queue.pop(0)
@@ -112,7 +151,7 @@ class DeferringTracker:
                 self._recorded(entry)
 
     def _write(self, key: tuple, payload: dict, call: Callable[[], Any]) -> Any:
-        with self._lock:
+        with self._held():
             self.flush()
             if any(e["ref"] == key[1] for e in self._queue):
                 self._enqueue(key, payload, self._queue[0]["reset_at"], "waiting behind")

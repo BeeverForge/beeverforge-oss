@@ -7,6 +7,9 @@ The clock is injected and the tracker is a fake: nothing here waits or touches a
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
+
+import pytest
 
 from beeverforge.adapters.rate_limit import RateLimited
 from beeverforge.adapters.tracker.deferred import DeferringTracker
@@ -177,3 +180,87 @@ def test_other_failures_still_raise_and_reads_pass_through():
     else:
         raise AssertionError("a non-rate-limit failure must propagate")
     assert t.assignees("#1") == ["someone"]
+
+
+# -- review of #708: one file shared by several trackers --
+
+def test_two_trackers_on_one_path_lose_no_entry(tmp_path):
+    forge, clock = _Forge(), _Clock()
+    path = tmp_path / "queue.json"
+    a = DeferringTracker(forge, clock=clock, path=path)
+    b = DeferringTracker(forge, clock=clock, path=path)
+    a.comment("#1", "from a")
+    b.comment("#2", "from b")
+    forge.limited = False
+    clock.now = RESET
+    DeferringTracker(forge, clock=clock, path=path).flush()
+    assert sorted(c[2] for c in forge.applied) == ["from a", "from b"]
+
+
+def test_an_entry_a_live_tracker_applied_is_not_applied_again_by_another(tmp_path):
+    forge, clock = _Forge(), _Clock()
+    path = tmp_path / "queue.json"
+    a = DeferringTracker(forge, clock=clock, path=path)
+    a.comment("#1", "once")
+    b = DeferringTracker(forge, clock=clock, path=path)  # loaded a's entry
+    forge.limited = False
+    clock.now = RESET
+    a.flush()
+    b.flush()
+    assert forge.applied == [("comment", "#1", "once")]
+
+
+# -- review of #708: who drains --
+
+def _built_runner(tmp_path, monkeypatch, forge, issue="#1"):
+    from beeverforge import factory
+    from beeverforge.contracts.project import Project
+
+    monkeypatch.setenv("BEEVERFORGE_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr("beeverforge.adapters.tracker.registry.build_tracker",
+                        lambda *a, **k: forge)
+    monkeypatch.setattr("beeverforge.loader.load_manifest", lambda *a, **k: SimpleNamespace(
+        environments={}, post_merge_deploy=None, base_branch="main", setup=[], validation={}))
+    project = Project(name="someone", repo_path=str(tmp_path))
+    return factory.build_runner(project, issue, sandbox="worktree", image="", review=False)
+
+
+def test_a_runner_from_build_runner_queues_and_drains_when_its_job_ends(tmp_path, monkeypatch):
+    forge, clock = _Forge(), _Clock()
+    runner = _built_runner(tmp_path, monkeypatch, forge)
+    assert isinstance(runner.tracker, DeferringTracker)
+    runner.tracker._clock = clock
+    runner.tracker.comment("#1", "late")
+    assert [e["kind"] for e in runner.tracker.pending] == ["comment"]
+
+    def get_ticket(ref):  # the reset passes while the job runs, and the job then fails
+        forge.limited = False
+        clock.now = RESET
+        raise RuntimeError("no such ticket")
+
+    forge.get_ticket = get_ticket
+    with pytest.raises(RuntimeError):
+        runner.run("#1")
+    assert forge.applied == [("comment", "#1", "late")]
+    assert runner.tracker.pending == []
+
+
+def test_a_later_runner_drains_what_a_finished_job_left_when_it_starts(tmp_path, monkeypatch):
+    forge, clock = _Forge(), _Clock()
+    first = _built_runner(tmp_path, monkeypatch, forge, "#1")
+    first.tracker._clock = clock
+    first.tracker.comment("#1", "left behind")  # the job ends before the reset
+    forge.limited = False
+    clock.now = RESET
+    second = _built_runner(tmp_path, monkeypatch, forge, "#2")
+    second.tracker._clock = clock
+    seen: list = []
+
+    def get_ticket(ref):  # the first thing a job reads: what was applied by now?
+        seen.extend(forge.applied)
+        raise RuntimeError("no such ticket")
+
+    forge.get_ticket = get_ticket
+    with pytest.raises(RuntimeError):
+        second.run("#2")
+    assert seen == [("comment", "#1", "left behind")]
