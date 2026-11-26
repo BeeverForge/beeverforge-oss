@@ -1958,7 +1958,11 @@ class JobRunner:
         file, and the stop's own move on the card's record supersedes its marks at the next drain.
         AT THE JOB'S END ITS OWN PROGRESS MARKS ARE DROPPED: the outcome it hands back to the
         card's door (ADR-0055 D7) is the card's newest state, and a mark applied after it would
-        move the card backwards (D5) — a delivered card marked `validating` again."""
+        move the card backwards (D5) — a delivered card marked `validating` again. Whoever drove
+        the runner applies that outcome through the door — the worker, the attended CLI, the
+        panel (`orchestrator/outcomes.py`) — and the door applies it unrecorded where no record
+        store exists, so no path loses the card's last state to this. A queued state that is NOT
+        a progress mark stands for no outcome the job hands back, and is kept."""
         flush = getattr(self.tracker, "flush", None)
         if not callable(flush):
             return
@@ -1970,7 +1974,8 @@ class JobRunner:
             supersede = getattr(self.tracker, "supersede", None)
             if ended and ticket_ref and callable(supersede):
                 supersede(ticket_ref, ("state",),
-                          "the job ended, and the outcome it hands back is the card's newest state")
+                          "the job ended, and the outcome it hands back is the card's newest state",
+                          states=frozenset(s.value for s in PROGRESS_MARKS))
             flush()
         except Exception as exc:
             log.warning("could not drain the queued tracker effects (%s)", str(exc)[:160])

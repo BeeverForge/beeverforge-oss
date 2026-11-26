@@ -56,8 +56,9 @@ MUTATIONS = [
     # -- the rules of the queue --
     ("a later write for the same key does not replace the earlier entry, so every state is "
      "applied (test_only_the_newest_state_per_ticket_is_applied)", DEFERRED,
-     "        self._queue = [e for e in self._queue if not (self._mine(e) and e[\"key\"] == "
-     "list(key))]\n",
+     "        self._queue = [e for e in self._queue\n"
+     "                       if not (self._mine(e) and e[\"key\"] == list(key) "
+     "and not e.get(\"claimed\"))]\n",
      ""),
 
     ("a write for a ticket with entries waiting goes straight to the forge and overtakes them "
@@ -66,29 +67,29 @@ MUTATIONS = [
      "            if False:\n"),
 
     ("an entry stays in the file while it is applied, so a restart applies it again "
-     "(test_the_queue_survives_a_restart, test_an_entry_is_out_of_the_file_while_it_is_applied)",
+     "(test_an_entry_is_claimed_in_the_file_while_it_is_applied, "
+     "test_an_entry_whose_claim_could_not_be_saved_is_not_applied)",
      DEFERRED,
-     "                self._queue.pop(i)\n"
-     "                self._save()  # claimed in the file before it is applied: at most once\n",
-     "                self._queue.pop(i)\n"),
+     "            if not self._save():  # claimed in the file before it is applied: at most once\n",
+     "            if False:\n"),
 
     ("an apply that is still rate-limited is dropped, not re-queued "
      "(test_still_limited_after_the_reset_keeps_the_entry_for_the_next_reset)", DEFERRED,
-     '                    entry["reset_at"] = exc.reset_at\n'
-     "                    self._queue.insert(i, entry)\n",
-     ""),
+     "                with self._held():\n                    for e in self._queue:\n",
+     "                self._release(entry)\n                with self._held():\n"
+     "                    for e in []:\n"),
 
     ("a limit met again keeps the old reset "
      "(test_a_limit_met_again_moves_the_entry_to_the_new_reset)", DEFERRED,
-     '                    entry["reset_at"] = exc.reset_at\n',
+     '                            e["reset_at"] = exc.reset_at\n',
      ""),
 
     ("an apply that fails for another reason is kept at the head and blocks the queue "
      "(test_an_entry_that_fails_for_another_reason_is_dropped_and_the_next_applied)", DEFERRED,
-     "                              redact(str(exc))[:160])\n                    continue\n",
-     "                              redact(str(exc))[:160])\n"
-     "                    self._queue.insert(i, entry)\n                    self._save()\n"
-     "                    return applied\n"),
+     "            except Exception as exc:  # a retry that cannot succeed is dropped, logged\n"
+     "                self._release(entry)\n",
+     "            except Exception as exc:  # a retry that cannot succeed is dropped, logged\n"
+     "                return applied\n"),
 
     ("whom the state waits on is dropped on replay "
      "(test_a_limit_met_again_keeps_the_order_the_new_reset_and_whom_the_state_waits_on)",
@@ -98,14 +99,13 @@ MUTATIONS = [
 
     # -- second review of #708 --
     ("every tracker applies every repository's entries "
-     "(test_a_queued_entry_is_applied_only_by_a_runner_of_its_own_repository)", DEFERRED,
+     "(test_trackers_of_two_coordinates_on_one_file_apply_only_their_own)", DEFERRED,
      '        return entry.get("scope", "") == self._scope\n',
      "        return True\n"),
 
-    ("the factory gives every view one scope "
-     "(test_a_queued_entry_is_applied_only_by_a_runner_of_its_own_repository)", FACTORY,
-     "                            scope=scope, superseded=_a_newer_move(project, scope))\n",
-     '                            scope="", superseded=_a_newer_move(project, scope))\n'),
+    # RETIRED 2026-11-26: "the factory gives every view one scope" — no view moves the tracker
+    # (C-18), so every card's runner has the product's scope; a card is told apart by its ticket
+    # (the cuts below), and the scope rule is held by `_mine`'s cut above.
 
     ("the queue never asks whether an entry is superseded "
      "(test_a_queued_state_is_not_applied_over_a_move_the_card_record_holds_since)", DEFERRED,
@@ -148,10 +148,9 @@ MUTATIONS = [
      "        applied = drain_queued_effects(project, tracker_for=_tracker_for)\n",
      "        applied = 0\n"),
 
-    ("the hourly drain uses the product's tracker for every repository "
-     "(test_the_hourly_drain_applies_each_repositorys_entries_with_its_own_tracker)", FACTORY,
-     "        if scope != _tracker_scope(project):\n",
-     "        if False:\n"),
+    # RETIRED 2026-11-26: "the hourly drain uses the product's tracker for every repository" —
+    # the drain no longer builds a view per repository: one product tracker applies every card's
+    # entries (test_the_hourly_drain_applies_every_cards_entries).
 
     ("the diagnosis comment is posted on the bare tracker "
      "(test_the_diagnosis_a_rate_limit_refuses_is_queued_for_after_the_reset)", ACTIVITIES,
@@ -188,17 +187,70 @@ MUTATIONS = [
 
     ("one ticket's wait holds every later entry "
      "(test_one_tickets_wait_does_not_hold_another_tickets_due_entry)", DEFERRED,
-     "                    waiting.add(ticket)\n                    i += 1\n"
-     "                    continue\n",
-     "                    return applied\n"),
+     '            if ticket in waiting or entry["reset_at"] > now:\n'
+     "                waiting.add(ticket)\n                continue\n",
+     '            if ticket in waiting or entry["reset_at"] > now:\n'
+     "                return None\n"),
 
     ("a ticket's later entry overtakes one still waiting "
      "(test_a_tickets_later_entry_never_overtakes_one_still_waiting)", DEFERRED,
-     '                if ticket in waiting or entry["reset_at"] > now:\n',
-     '                if entry["reset_at"] > now:\n'),
+     '            if ticket in waiting or entry["reset_at"] > now:\n',
+     '            if entry["reset_at"] > now:\n'),
 
     ("a dunder is forwarded to the wrapped tracker "
      "(test_a_copy_of_the_tracker_does_not_recurse)", DEFERRED,
      '        if name.startswith("__") or name == "_inner":\n',
      "        if False:\n"),
+
+    # -- the semantic review of #708 at 48ff615 --
+    ("a bare ref of the runner's own card is the home repository's ticket "
+     "(test_a_card_of_another_repository_is_its_own_ticket_in_the_queue)", DEFERRED,
+     "            if card_repo and canonical_ref(card_bare) == bare:\n",
+     "            if False:\n"),
+
+    ("build_runner does not tell the queue its card "
+     "(test_a_card_of_another_repository_is_judged_by_its_own_record)", FACTORY,
+     "            card=issue),",
+     '            card=""),'),
+
+    ("the record is read by the bare ref, not the ticket "
+     "(test_a_card_of_another_repository_is_judged_by_its_own_record)", FACTORY,
+     '        card = canonical_ref(entry.get("ticket") or entry["ref"])\n',
+     '        card = canonical_ref(str(entry["ref"]).rsplit("#", 1)[-1])\n'),
+
+    ("a job's end drops another card's marks of the same number "
+     "(test_the_end_of_a_card_of_another_repository_drops_only_its_own_marks)", DEFERRED,
+     "                    and self._ticket_of(e) == ticket\n",
+     ""),
+
+    ("a job's end drops a queued state that is no progress mark "
+     "(test_a_job_that_ends_keeps_a_queued_state_that_is_not_a_progress_mark)", MACHINE,
+     "                          states=frozenset(s.value for s in PROGRESS_MARKS))",
+     "                          states=None)"),
+
+    ("the forge call runs under the queue's lock "
+     "(test_the_queue_lock_is_not_held_across_the_forge_call)", DEFERRED,
+     "            return call()  # the forge call, with the lock released\n",
+     "            with self._held():\n                return call()\n"),
+
+    ("a claimed entry is applied by another tracker too "
+     "(test_an_entry_is_claimed_in_the_file_while_it_is_applied)", DEFERRED,
+     '            if entry.get("claimed"):\n',
+     "            if False:\n"),
+
+    ("a claim its runner left holds its ticket for ever "
+     "(test_a_claim_its_runner_left_is_dropped_never_applied_again)", DEFERRED,
+     '                if now - float(entry.get("claimed_at") or 0) > CLAIM_EXPIRES:\n',
+     "                if False:\n"),
+
+    ("what a failed save could not write is lost at the next reload "
+     "(test_an_entry_a_failed_save_could_not_write_is_kept_and_saved_again)", DEFERRED,
+     "        if self._dirty:\n",
+     "        if False:\n"),
+
+    ("a rate-limited board move answers False, and the label is written instead "
+     "(test_a_rate_limited_board_move_on_the_github_row_is_queued)",
+     "beeverforge/adapters/tracker/github_project.py",
+     "            if limited is not None:\n                raise limited\n",
+     ""),
 ]
