@@ -150,7 +150,7 @@ def test_unrecorded_names_the_entry_and_a_later_line_says_when_it_was_recorded(c
     assert len(unrecorded) == 1 and len(recorded) == 1
     entry = unrecorded[0].split("entry=")[1].split()[0]
     assert f"entry={entry}" in recorded[0]
-    assert str(RESET + 5) in recorded[0] or "at=" in recorded[0]
+    assert f"at={RESET + 5}" in recorded[0]  # when it was recorded, by the injected clock
 
 
 def test_the_queue_survives_a_restart(tmp_path):
@@ -305,48 +305,77 @@ def test_a_later_runner_drains_what_a_finished_job_left_when_it_starts(tmp_path,
 # -- second review of #708 (hcristia): the measured cases, each red on 82c8f06 --
 
 @pytest.fixture(autouse=True)
-def _no_card_record(monkeypatch):
-    """No deployment store here: the card's record is one this module hands in, case by case."""
+def _no_card_record(monkeypatch, tmp_path):
+    """No deployment store and no registered projects here: the card's record is one this module
+    hands in, case by case."""
     from beeverforge.lifecycle import record
 
     def unrecordable():
         raise record.Unrecordable("no store in this test")
 
     monkeypatch.setattr(record, "keyed_sink", unrecordable)
+    monkeypatch.setenv("BEEVERFORGE_REGISTRY", str(tmp_path / "no-registry.json"))
 
 
-def _a_view(tmp_path, monkeypatch, forges, repo, issue="#1"):
-    """`build_runner` for a project whose tracker is on `repo`, its tracker the fake for `repo`:
-    the view a card of another repository of the product runs on keeps the product's `name`."""
+def _a_card_runner(tmp_path, monkeypatch, forge, card="#1"):
+    """`build_runner` for `card` of the product `acme`, whose default repository is `acme/api`,
+    on the view the worker builds for it (`card_repo._runner_view`): a card of another repository
+    of the product keeps the product's tracker, which never moves (C-18)."""
     from beeverforge import factory
     from beeverforge.contracts.project import Project, ProviderRef
+    from beeverforge.runtime.card_repo import _runner_view
 
     monkeypatch.setenv("BEEVERFORGE_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr("beeverforge.adapters.tracker.registry.build_tracker",
-                        lambda project, *a, **k: forges[project.tracker.repo])
+                        lambda *a, **k: forge)
     monkeypatch.setattr("beeverforge.loader.load_manifest", lambda *a, **k: SimpleNamespace(
         environments={}, post_merge_deploy=None, base_branch="main", setup=[], validation={}))
-    project = Project(name="acme", repo_path=str(tmp_path),
-                      tracker=ProviderRef(kind="github", repo=repo))
-    return factory.build_runner(project, issue, sandbox="worktree", image="", review=False)
+    product = Project(name="acme", repo_path=str(tmp_path / "acme" / "api"),
+                      tracker=ProviderRef(kind="github", repo="acme/api"))
+    view, key = _runner_view(product, card)
+    assert view.tracker.repo == "acme/api"  # the shape production builds
+    return factory.build_runner(view, card, sandbox="worktree", image="", review=False,
+                                repo_key=key)
 
 
-def test_a_queued_entry_is_applied_only_by_a_runner_of_its_own_repository(tmp_path, monkeypatch):
-    forges = {"acme/api": _Forge(), "acme/web": _Forge()}
-    clock = _Clock()
-    api = _a_view(tmp_path, monkeypatch, forges, "acme/api")
-    web = _a_view(tmp_path, monkeypatch, forges, "acme/web")
-    api.tracker._clock = web.tracker._clock = clock
-    api.tracker.set_state("#1", JobState.VALIDATING)  # acme/api's #1, limited
-    for forge in forges.values():
-        forge.limited = False
+def test_trackers_of_two_coordinates_on_one_file_apply_only_their_own(tmp_path):
+    forge_a, forge_b, clock = _Forge(), _Forge(), _Clock()
+    path = tmp_path / "queue.json"
+    a = DeferringTracker(forge_a, clock=clock, path=path, scope="acme/api")
+    b = DeferringTracker(forge_b, clock=clock, path=path, scope="acme/other")
+    a.set_state("#1", JobState.VALIDATING)
+    forge_a.limited = forge_b.limited = False
     clock.now = RESET
-    web.tracker.comment("#1", "web's own")  # acme/web's #1: another issue, nothing to wait on
-    assert forges["acme/web"].applied == [("comment", "#1", "web's own")]
-    assert web.tracker.pending == []
-    assert [e["ref"] for e in api.tracker.pending] == ["#1"]  # still waiting for its own runner
-    api.tracker.flush()
-    assert forges["acme/api"].applied == [("state", "#1", JobState.VALIDATING, None)]
+    b.comment("#1", "b's own")
+    assert forge_b.applied == [("comment", "#1", "b's own")]
+    a.flush()
+    assert forge_a.applied == [("state", "#1", JobState.VALIDATING, None)]
+
+
+def test_a_card_of_another_repository_is_its_own_ticket_in_the_queue(tmp_path, monkeypatch):
+    forge, clock = _Forge(), _Clock()
+    web = _a_card_runner(tmp_path, monkeypatch, forge, "acme/web#1")
+    api = _a_card_runner(tmp_path, monkeypatch, forge, "#1")
+    web.tracker._clock = api.tracker._clock = clock
+    web.tracker.set_state("#1", JobState.VALIDATING)  # the job writes its card's bare id
+    forge.limited = False
+    api.tracker.comment("#1", "api's own")  # nothing of acme/api#1 is waiting
+    assert forge.applied == [("comment", "#1", "api's own")]
+    forge.limited = True
+    api.tracker.set_state("#1", JobState.IMPLEMENTING)  # another card's state replaces nothing
+    assert [e["payload"]["state"] for e in api.tracker.pending] == ["validating", "implementing"]
+
+
+def test_the_end_of_a_card_of_another_repository_drops_only_its_own_marks(tmp_path, monkeypatch):
+    forge, clock = _Forge(), _Clock()
+    web = _a_card_runner(tmp_path, monkeypatch, forge, "acme/web#1")
+    api = _a_card_runner(tmp_path, monkeypatch, forge, "#1")
+    web.tracker._clock = api.tracker._clock = clock
+    api.tracker.set_state("#1", JobState.IMPLEMENTING)  # acme/api#1's job, still running
+    forge.get_ticket = lambda ref: (_ for _ in ()).throw(RuntimeError("no such ticket"))
+    with pytest.raises(RuntimeError):
+        web.run("acme/web#1")
+    assert [e["payload"]["state"] for e in api.tracker.pending] == ["implementing"]
 
 
 def _iso(epoch: float) -> str:
@@ -372,36 +401,50 @@ def _a_card_record(monkeypatch, moves: dict[str, list[tuple[str, float]]]):
 
 def test_a_queued_state_is_not_applied_over_a_move_the_card_record_holds_since(
         tmp_path, monkeypatch, caplog):
-    forges = {"acme/api": _Forge()}
+    forge = _Forge()
     clock = _Clock(now=100.0)
-    runner = _a_view(tmp_path, monkeypatch, forges, "acme/api")
+    runner = _a_card_runner(tmp_path, monkeypatch, forge)
     runner.tracker._clock = clock
     runner.tracker.set_state("#1", JobState.VALIDATING)
     runner.tracker.add_label("#1", "beeverforge:working")
     runner.tracker.set_assignees("#1", ["bot"])
     runner.tracker.comment("#1", "what the job said")
     _a_card_record(monkeypatch, {"1": [("delivered", 500.0)]})  # the door wrote DONE after
-    forges["acme/api"].limited = False
+    forge.limited = False
     clock.now = RESET
     with caplog.at_level(logging.INFO):
         runner.tracker.flush()
-    assert forges["acme/api"].applied == [("comment", "#1", "what the job said")]
+    assert forge.applied == [("comment", "#1", "what the job said")]
     assert runner.tracker.pending == []
     assert sum("BEEVERFORGE_QUEUED_EFFECT_SUPERSEDED" in r.getMessage()
                for r in caplog.records) == 3
 
 
+def test_a_card_of_another_repository_is_judged_by_its_own_record(tmp_path, monkeypatch):
+    forge = _Forge()
+    clock = _Clock(now=100.0)
+    web = _a_card_runner(tmp_path, monkeypatch, forge, "acme/web#1")
+    web.tracker._clock = clock
+    web.tracker.set_state("#1", JobState.VALIDATING)
+    # acme/web#1 was delivered after; acme/api#1, card `1`, never moved
+    _a_card_record(monkeypatch, {"acme/web#1": [("delivered", 500.0)]})
+    forge.limited = False
+    clock.now = RESET
+    web.tracker.flush()
+    assert forge.applied == [] and web.tracker.pending == []
+
+
 def test_a_move_recorded_before_the_entry_was_queued_supersedes_nothing(tmp_path, monkeypatch):
-    forges = {"acme/api": _Forge()}
+    forge = _Forge()
     clock = _Clock(now=600.0)
-    runner = _a_view(tmp_path, monkeypatch, forges, "acme/api")
+    runner = _a_card_runner(tmp_path, monkeypatch, forge)
     runner.tracker._clock = clock
     runner.tracker.set_state("#1", JobState.VALIDATING)
     _a_card_record(monkeypatch, {"1": [("picked_up", 500.0)]})
-    forges["acme/api"].limited = False
+    forge.limited = False
     clock.now = RESET
     runner.tracker.flush()
-    assert forges["acme/api"].applied == [("state", "#1", JobState.VALIDATING, None)]
+    assert forge.applied == [("state", "#1", JobState.VALIDATING, None)]
 
 
 def test_a_job_that_ends_drops_its_own_queued_progress_marks(tmp_path, monkeypatch):
@@ -422,6 +465,23 @@ def test_a_job_that_ends_drops_its_own_queued_progress_marks(tmp_path, monkeypat
     # the outcome the job hands back to the card's door is the card's newest state
     assert forge.applied == [("comment", "#1", "late")]
     assert runner.tracker.pending == []
+
+
+def test_a_job_that_ends_keeps_a_queued_state_that_is_not_a_progress_mark(tmp_path, monkeypatch):
+    forge, clock = _Forge(), _Clock()
+    runner = _built_runner(tmp_path, monkeypatch, forge)
+    runner.tracker._clock = clock
+    runner.tracker.set_state("#1", JobState.DONE)  # no outcome the job hands back stands for it
+
+    def get_ticket(ref):
+        forge.limited = False
+        clock.now = RESET
+        raise RuntimeError("no such ticket")
+
+    forge.get_ticket = get_ticket
+    with pytest.raises(RuntimeError):
+        runner.run("#1")
+    assert forge.applied == [("state", "#1", JobState.DONE, None)]
 
 
 def test_a_stopped_job_applies_nothing_it_queued(tmp_path, monkeypatch):
@@ -469,7 +529,7 @@ def test_a_queued_assignee_change_is_applied_when_nobody_changed_them():
     assert forge.applied == [("assignees", "#1", ("bot",)), ("assignees", "#1", ("owner",))]
 
 
-def test_an_entry_is_out_of_the_file_while_it_is_applied(tmp_path):
+def test_an_entry_is_claimed_in_the_file_while_it_is_applied(tmp_path):
     import json
 
     forge, clock, t = _tracker(tmp_path)
@@ -477,57 +537,164 @@ def test_an_entry_is_out_of_the_file_while_it_is_applied(tmp_path):
     seen: list = []
     real = forge.comment
 
-    def comment(ref, body):  # what another runner would read, at the moment of the apply
-        seen.append(json.loads((tmp_path / "queue.json").read_text()))
+    def comment(ref, body):  # what another runner reads and does, at the moment of the apply
+        seen.append([bool(e.get("claimed")) for e in
+                     json.loads((tmp_path / "queue.json").read_text())])
+        if _the_lock_is_free(tmp_path / "queue.json"):  # never wait on a lock the test holds
+            DeferringTracker(forge, clock=clock, path=tmp_path / "queue.json").flush()
         real(ref, body)
 
     forge.comment = comment
     forge.limited = False
     clock.now = RESET
     t.flush()
-    assert seen == [[]] and forge.applied == [("comment", "#1", "once")]
+    assert seen == [[True]] and forge.applied == [("comment", "#1", "once")]
+    assert t.pending == []
 
 
-def test_the_hourly_drain_applies_each_repositorys_entries_with_its_own_tracker(
-        tmp_path, monkeypatch):
+def test_a_claim_its_runner_left_is_dropped_never_applied_again(tmp_path):
+    import json
+
+    forge, clock, t = _tracker(tmp_path)
+    t.comment("#1", "once")
+    path = tmp_path / "queue.json"
+    left = json.loads(path.read_text())
+    left[0].update(claimed="a runner that stopped", claimed_at=RESET)
+    path.write_text(json.dumps(left))
+    forge.limited = False
+    clock.now = RESET + 1
+    t.flush()
+    assert forge.applied == [] and len(t.pending) == 1  # still being applied, for all we know
+    clock.now = RESET + 601
+    t.flush()
+    assert forge.applied == [] and t.pending == []
+
+
+def _the_lock_is_free(path) -> bool:
+    """Whether another runner could take the queue's lock right now (never waits)."""
+    import fcntl
+    import os
+
+    fd = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def test_the_queue_lock_is_not_held_across_the_forge_call(tmp_path):
+    forge, clock, t = _tracker(tmp_path)
+    path = tmp_path / "queue.json"
+    free: list[bool] = []
+    real = forge.comment
+
+    def comment(ref, body):  # the forge call: up to a minute of `gh`, retries included
+        free.append(_the_lock_is_free(path))
+        real(ref, body)
+
+    forge.comment = comment
+    t.comment("#1", "queued")  # limited: queued
+    forge.limited = False
+    clock.now = RESET
+    t.flush()  # the queued entry's apply
+    t.comment("#2", "direct")  # a write that goes straight to the forge
+    assert free == [True, True, True]
+    assert [c[2] for c in forge.applied] == ["queued", "direct"]
+
+
+def test_an_entry_a_failed_save_could_not_write_is_kept_and_saved_again(tmp_path, monkeypatch):
+    from beeverforge.adapters.tracker import deferred
+
+    forge, clock, t = _tracker(tmp_path)
+    real = deferred.os.replace
+    fails = [True]
+
+    def replace(src, dst):
+        if fails and fails.pop():
+            raise OSError("disk full")
+        real(src, dst)
+
+    monkeypatch.setattr(deferred.os, "replace", replace)
+    t.comment("#1", "kept")  # queued; its save fails
+    assert [e["payload"]["body"] for e in t.pending] == ["kept"]  # the next operation keeps it
+    again = DeferringTracker(forge, clock=clock, path=tmp_path / "queue.json")
+    assert [e["payload"]["body"] for e in again.pending] == ["kept"]  # and it reached the file
+
+
+def test_an_entry_whose_claim_could_not_be_saved_is_not_applied(tmp_path, monkeypatch):
+    from beeverforge.adapters.tracker import deferred
+
+    forge, clock, t = _tracker(tmp_path)
+    t.comment("#1", "once")
+    forge.limited = False
+    clock.now = RESET
+    monkeypatch.setattr(deferred.os, "replace",
+                        lambda src, dst: (_ for _ in ()).throw(OSError("disk full")))
+    t.flush()  # the file still holds it: applying now could apply it twice
+    assert forge.applied == []
+    assert [e["payload"]["body"] for e in t.pending] == ["once"]
+
+
+def test_a_rate_limited_board_move_on_the_github_row_is_queued(monkeypatch):
+    import subprocess
+
+    from beeverforge.adapters.tracker import github as row
+    from beeverforge.adapters.tracker import github_project as board_row
+
+    tracker = row.GitHubIssuesTracker("acme/api", board_owner="acme", board_number=1,
+                                      token="t")
+    board = tracker.board
+    monkeypatch.setattr(board, "_ensure_meta", lambda: None)
+    monkeypatch.setattr(board, "_item_id", lambda *a, **k: "item")
+    board._option_ids = {name: f"o-{name}" for name in board._columns.values() if name}
+    board._status_field_id, board._project_id = "field", "project"
+    monkeypatch.setattr(board_row, "_run_gh", lambda argv, token=None, **k:
+                        subprocess.CompletedProcess(argv, 1, "", "was submitted too quickly"))
+    labelled: list = []
+    monkeypatch.setattr(row.time, "sleep", lambda s: None)
+    monkeypatch.setattr(row.subprocess, "run", lambda argv, *a, **k: (
+        labelled.append(argv), subprocess.CompletedProcess(argv, 0, '{"labels": []}', ""))[1])
+    t = DeferringTracker(tracker, clock=_Clock())
+    assert t.set_state("#1", JobState.VALIDATING) is False
+    assert [e["kind"] for e in t.pending] == ["state"]
+    assert labelled == []  # not answered with the label, as if the move had been refused
+
+
+def test_the_hourly_drain_applies_every_cards_entries(tmp_path, monkeypatch):
     from beeverforge import factory
 
-    forges = {"acme/api": _Forge(), "acme/web": _Forge()}
-    api = _a_view(tmp_path, monkeypatch, forges, "acme/api")
-    web = _a_view(tmp_path, monkeypatch, forges, "acme/web", "#7")
+    forge = _Forge()
+    api = _a_card_runner(tmp_path, monkeypatch, forge, "#1")
+    web = _a_card_runner(tmp_path, monkeypatch, forge, "acme/web#1")
     api.tracker._clock = web.tracker._clock = _Clock()
     api.tracker.comment("#1", "for api")
-    web.tracker.comment("#7", "for web")  # both jobs end; no next job comes
-    for forge in forges.values():
-        forge.limited = False
-    seen: list[str] = []
-
-    def tracker_for(view):
-        seen.append(view.tracker.repo)
-        return forges[view.tracker.repo]
-
-    factory.drain_queued_effects(api.project, tracker_for=tracker_for, clock=lambda: RESET - 1)
-    assert forges["acme/api"].applied == forges["acme/web"].applied == []
-    factory.drain_queued_effects(api.project, tracker_for=tracker_for, clock=lambda: RESET)
-    assert forges["acme/api"].applied == [("comment", "#1", "for api")]
-    assert forges["acme/web"].applied == [("comment", "#7", "for web")]
+    web.tracker.comment("#1", "for web")  # both jobs end; no next job comes
+    forge.limited = False
+    factory.drain_queued_effects(api.project, tracker_for=lambda p: forge,
+                                 clock=lambda: RESET - 1)
+    assert forge.applied == []
+    factory.drain_queued_effects(api.project, tracker_for=lambda p: forge, clock=lambda: RESET)
+    assert sorted(c[2] for c in forge.applied) == ["for api", "for web"]
 
 
 def test_the_hourly_round_drains_what_a_finished_job_left(tmp_path, monkeypatch):
     from beeverforge import lifecycle
     from beeverforge.runtime.temporal import activities
 
-    forges = {"acme/api": _Forge()}
-    runner = _a_view(tmp_path, monkeypatch, forges, "acme/api")
+    forge = _Forge()
+    runner = _a_card_runner(tmp_path, monkeypatch, forge)
     runner.tracker._clock = _Clock()
     runner.tracker.comment("#1", "left behind")
-    forges["acme/api"].limited = False
+    forge.limited = False
     monkeypatch.setattr(lifecycle, "observe", lambda project: [])
     monkeypatch.setattr(lifecycle, "converge", lambda project: [])
-    monkeypatch.setattr(activities, "_tracker_for", lambda project: forges[project.tracker.repo])
+    monkeypatch.setattr(activities, "_tracker_for", lambda project: forge)
     monkeypatch.setattr(activities.activity, "logger", logging.getLogger("test.activity"))
     activities._converge_card_transitions(runner.project)
-    assert forges["acme/api"].applied == [("comment", "#1", "left behind")]
+    assert forge.applied == [("comment", "#1", "left behind")]
 
 
 def test_the_diagnosis_a_rate_limit_refuses_is_queued_for_after_the_reset(tmp_path, monkeypatch):
