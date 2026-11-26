@@ -82,7 +82,10 @@ runs), and every call carries the transport pin (`gitpin.argv`).
 
 WHAT THIS DOES NOT COVER. With the local forge the target is a repository on this machine, and git
 starts its receiving side there, under that repository's own config and hooks: that is the local
-forge's reach, tracked with the other host-side calls in #400.
+forge's reach, tracked with the other host-side calls in #400. When this process is root and
+another user owns that repository, the receiving side (and the side that serves the keep's fetch)
+runs as that user, in a short environment that is not the worker's (`gitowner`); its config and
+hooks still apply, as theirs.
 """
 
 from __future__ import annotations
@@ -96,7 +99,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
-from beeverforge import gitpin
+from beeverforge import gitowner, gitpin
 from beeverforge.adapters.sandbox.base import LEASE_REFUSED, PushRefused
 
 #: The box's own door to the host: `(argv, timeout=…, env=…) -> (exit code, output)`.
@@ -135,11 +138,13 @@ def push_from_the_hosts_own_repository(*, git_dir: Path, branch: str, target: st
     Raises RuntimeError starting `push failed:` naming the step that failed, with a remedy; the
     temporary directory is removed either way."""
     with _the_hosts_own_repository(git_dir=git_dir, branch=branch, run=run, redact=redact,
-                                   ambient_env=ambient_env) as (own, env, ref, commit):
+                                   ambient_env=ambient_env) as (own, env, ref, commit), \
+            _received(target) as received:
         # --no-verify beside the hooks override, as main's push had it (#182): a pre-push hook is
         # handed the authenticated URL
         rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", *_force(ref, lease),
-                                   "--no-verify", "--", target, f"{ref}:{ref}"]), env=env)
+                                   "--no-verify", *received, "--", target, f"{ref}:{ref}"]),
+                      env=env)
         if rc != 0:
             if LEASE_REFUSED in out:
                 raise PushRefused(f"push refused: {redact(out)}", branch=branch)
@@ -170,10 +175,11 @@ def keep_the_remote_tip(*, git_dir: Path, branch: str, target: str, run: Runner,
     it holds, which is a git command run in the job's repository; the branch named here is all the
     negotiation needs."""
     with _the_hosts_own_repository(git_dir=git_dir, branch=branch, run=run, redact=redact,
-                                   ambient_env=ambient_env) as (own, env, ref, _):
+                                   ambient_env=ambient_env) as (own, env, ref, _), \
+            gitowner.upload_pack(target) as read, gitowner.receive_pack(target) as received:
         theirs = "refs/beeverforge/remote-tip"
         rc, out = run(gitpin.argv([*_HOOKLESS, "-c", "core.alternateRefsCommand=true", "-C",
-                                   str(own), "fetch", "-q", "--no-tags", "--", target,
+                                   str(own), "fetch", "-q", "--no-tags", *read, "--", target,
                                    f"+{ref}:{theirs}"]), timeout=180, env=env)
         if rc != 0:
             raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
@@ -185,8 +191,8 @@ def keep_the_remote_tip(*, git_dir: Path, branch: str, target: str, run: Runner,
             raise RuntimeError(f"could not read {branch!r} on the remote to keep it: "
                                f"{redact(out).strip()[:300]}")
         kept = f"{branch}-kept-{tip[:12]}"
-        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--no-verify", "--",
-                                   target, f"{tip}:refs/heads/{kept}"]), env=env)
+        rc, out = run(gitpin.argv([*_HOOKLESS, "-C", str(own), "push", "--no-verify", *received,
+                                   "--", target, f"{tip}:refs/heads/{kept}"]), env=env)
         if rc != 0:
             raise RuntimeError(f"could not keep {branch!r} on {kept!r}: "
                                f"{redact(out).strip()[:300]}")
@@ -200,6 +206,17 @@ def _force(ref: str, lease: str | None) -> list[str]:
     if lease is None:
         return ["--force"]
     return [f"--force-with-lease={ref}:{lease}"]
+
+
+@contextmanager
+def _received(target: str) -> Iterator[list[str]]:
+    """What the push adds so a repository on this machine is written as its owner, or nothing
+    (`gitowner`). A refusal is a push that failed, before it starts."""
+    try:
+        with gitowner.receive_pack(target) as option:
+            yield option
+    except gitowner.Refused as exc:
+        raise RuntimeError(f"push failed: {exc}") from exc
 
 
 @contextmanager
