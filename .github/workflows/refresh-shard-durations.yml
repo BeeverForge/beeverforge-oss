@@ -9,13 +9,17 @@
 # command to the one the builder documents, and its reports to the ones ci.yml's unit jobs write.
 #
 # LEAST PRIVILEGE. The job that runs the tree's code reads only: the repository, and the actions
-# artifacts of the CI run it rebuilds from. Only the job that opens the pull request may write,
-# and it runs no code from the tree. No secret but GITHUB_TOKEN; no expression is interpolated
-# into a shell, every value reaches one through `env:`.
+# artifacts of the CI run it rebuilds from. Only the job that hands the table off may write, and only
+# contents: it runs no code from the tree. No job may write pull requests, and no step opens,
+# approves or merges one. No secret but GITHUB_TOKEN; no expression is interpolated into a shell,
+# every value reaches one through `env:`.
 #
-# A PULL REQUEST OPENED WITH GITHUB_TOKEN STARTS NO WORKFLOW, so `ci` does not run on it by itself:
-# a maintainer closes and reopens it (or pushes to it) to get its checks. The repository setting
-# "Allow GitHub Actions to create and approve pull requests" must be on for `gh pr create`.
+# A MAINTAINER OPENS THE PULL REQUEST (#656). When the rebuilt table differs from main's, the
+# hand-off job pushes it to the branch `refresh-shard-durations/<run id>` and writes to the run's
+# summary the link that opens the pull-request form for it, with the title and body to use, and a
+# warning naming the branch marks the run in the Actions list. The run stays green: a changed
+# table is the expected outcome. Open the pull request from that link, then add the label
+# `no-release-note`. It is the maintainer's pull request, so `ci` runs on it like on any other.
 name: refresh-shard-durations
 on:
   workflow_dispatch:
@@ -90,13 +94,12 @@ jobs:
           path: tests/shard_durations.json
           if-no-files-found: error
 
-  pull-request:
+  hand-off:
     needs: rebuild
     if: needs.rebuild.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,21 +109,33 @@ jobs:
           name: shard-durations
           path: ${{ runner.temp }}/shard-durations
       - env:
-          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           cp "$RUNNER_TEMP/shard-durations/shard_durations.json" tests/shard_durations.json
           if git diff --quiet -- tests/shard_durations.json; then
-            echo "main already holds this table: no pull request"
+            echo "main already holds this table: nothing to hand off"
             exit 0
           fi
           branch="refresh-shard-durations/$GITHUB_RUN_ID"
+          title="Refresh the shard duration table from the latest green main run"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git commit -q -m "Refresh the shard duration table from the latest green main run" \
-            -- tests/shard_durations.json
+          git commit -q -m "$title" -- tests/shard_durations.json
           git push origin "$branch"
-          gh pr create --base main --head "$branch" --label no-release-note \
-            --title "Refresh the shard duration table from the latest green main run" \
-            --body "Rebuilt by refresh-shard-durations.yml (run $GITHUB_RUN_ID) with \`python -m tests.shard_durations --max-unlisted 0.1\` on the four unit JUnit reports of the latest green \`main\` run. Opened with GITHUB_TOKEN, so \`ci\` does not start by itself: close and reopen this pull request to run its checks."
+          link="https://github.com/$REPO/compare/main...$branch?expand=1"
+          {
+            echo "## The shard table changed: open its pull request"
+            echo
+            echo "The rebuilt table is pushed to \`$branch\`. [Open the pull request]($link), then add the label \`no-release-note\`."
+            echo
+            echo "**Title**"
+            echo
+            echo "    $title"
+            echo
+            echo "**Body**"
+            echo
+            echo "    Rebuilt by refresh-shard-durations.yml (run $GITHUB_RUN_ID) with \`python -m tests.shard_durations --max-unlisted 0.1\` on the four unit JUnit reports of the latest green \`main\` run."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::the shard table changed: $branch is pushed; open its pull request from the link in this run's summary"

@@ -83,11 +83,12 @@ list still runs in exactly one shard, picked by its path, so a stale table only 
 The workflow `.github/workflows/refresh-shard-durations.yml` rebuilds it: weekly, and on demand
 from the Actions tab (`workflow_dispatch`). It reads the four unit JUnit reports of the latest green
 `main` run (each `unit` job writes one, `TEST_JUNIT`, and uploads it with its test ids), runs
-`python -m tests.shard_durations --max-unlisted 0.1` on them, and opens a pull request when the
-table changed (none when it did not). It fails, naming the files, when more than 10% of the test
-files are still unlisted after its own rebuild. So do not refresh the table by hand in a change
-that adds a test file; the workflow does it. Its pull request is opened with `GITHUB_TOKEN`, which
-starts no workflow: close and reopen it to run `ci`. Locally, from reports you wrote outside the
+`python -m tests.shard_durations --max-unlisted 0.1` on them, and when the table changed pushes it
+to a branch `refresh-shard-durations/<run id>` (nothing when it did not). It fails, naming the
+files, when more than 10% of the test files are still unlisted after its own rebuild. So do not
+refresh the table by hand in a change that adds a test file; the workflow does it. A run that
+pushed a branch is green with a warning naming it: open the pull request from the link in the
+run's summary, which also gives its title and body, then add the label `no-release-note`. Locally, from reports you wrote outside the
 tree: `python -m tests.shard_durations <junit.xml>…`.
 
 **What green looks like.** pytest's last line reads `N passed, M skipped` and some warnings — no
