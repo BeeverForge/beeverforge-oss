@@ -592,35 +592,64 @@ def _asked_of(person: str, conversation: str) -> dict[str, str]:
     reads `context["person"]` to address a reminder in the product's room. What scoping needs is
     to COMPARE a speaker with the person asked, so a digest is all that is kept: nobody's name
     reaches another conversation from here, and no reminder starts naming people it did not."""
-    from beeverforge.product.conversation import owner_of
+    from beeverforge.product.conversation import is_private, owner_of, session_of
+    from beeverforge.product.sessions import FIRST
     from beeverforge.product.speaker import sealed
 
     who = sealed(person)
     if not who:
         return {}
     # A PRIVATE ONE BY ITS OWNER (#335): asked in one of a person's sessions, it is on their agenda
-    # and answered from any of them — the reading it had when a person had one conversation
-    return {"asked_of": who, "asked_in": sealed(owner_of(conversation))}
+    # in every one of them
+    scope = {"asked_of": who, "asked_in": sealed(owner_of(conversation))}
+    # …AND ANSWERED WHERE IT WAS ASKED (#718): which of them, as its session id — `FIRST` for the
+    # person's first conversation. Read as "any of them", a message about something else in one
+    # session closed, as answered, two decisions asked in another that nobody had answered: they
+    # left the Pending tab and the chase stopped (measured on a deployment, 2026-11-26). The id
+    # names nobody — the key it belongs to is the owner's, sealed above, and the server refuses a
+    # session of anybody else's key (`conversation.session_key`) — and it is what the Pending tab
+    # opens (#717, `agenda.Item.session`).
+    if is_private(conversation):
+        scope["asked_session"] = session_of(conversation) or FIRST
+    return scope
 
 
 def _scope_of(loop) -> dict[str, str]:
     ctx = loop.context or {}
     who = str(ctx.get("asked_of") or "")
-    return {"asked_of": who, "asked_in": str(ctx.get("asked_in") or "")} if who else {}
+    if not who:
+        return {}
+    scope = {"asked_of": who, "asked_in": str(ctx.get("asked_in") or "")}
+    session = str(ctx.get("asked_session") or "")
+    if session:
+        scope["asked_session"] = session
+    return scope
 
 
 def _answered_by(loop, *, person: str, where: tuple[str, ...], room: str) -> bool:
     """Whether `person`, speaking in `where` (the conversation, and the room it lives in), is who
     this decision was asked of, there. A loop that records nobody — opened before #266 slice 4 —
-    is answered by a message in its own room, which is the narrowest the old rows allow."""
-    from beeverforge.product.conversation import owner_of
+    is answered by a message in its own room, which is the narrowest the old rows allow.
+
+    THERE IS ONE CONVERSATION (#718): a loop that records which of its owner's conversations it
+    was asked in is answered in that one alone. One recorded before that, which cannot say, keeps
+    the owner's reading — any of their conversations — because leaving it open for ever would be
+    the other silent failure."""
+    from beeverforge.product.conversation import owner_of, session_of
+    from beeverforge.product.sessions import FIRST
     from beeverforge.product.speaker import sealed
 
     scope = _scope_of(loop)
     if not scope:
         return loop.about == room
-    return (scope["asked_of"] == sealed(person)
-            and scope["asked_in"] in {sealed(owner_of(w)) for w in where if w})
+    if scope["asked_of"] != sealed(person):
+        return False
+    session = scope.get("asked_session")
+    if session:
+        # a room in `where` is nobody's owner key, so it never matches `asked_in`
+        return any(sealed(owner_of(w)) == scope["asked_in"]
+                   and (session_of(w) or FIRST) == session for w in where if w)
+    return scope["asked_in"] in {sealed(owner_of(w)) for w in where if w}
 
 
 def _acceptances_here(project, ledger, conversation: str | None) -> list:

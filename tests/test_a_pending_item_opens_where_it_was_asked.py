@@ -70,7 +70,18 @@ const els={"#prodAsk":box,"#pv":{},"#prodAgenda":{innerHTML:""},"#prodAgendaCoun
 function $(q){return els[q]||null}
 function setScope(room){opened.push(room?"room":"mine");_pc.room=room;_pc.session=""}
 function pvOpen(sid){opened.push("session:"+(sid||"first"));_pc.room=false;_pc.session=sid}
+const toggled=[];
+function pvToggle(cls,on){toggled.push([cls,on])}
 """
+
+
+def test_on_a_narrow_screen_the_tab_is_put_away_so_the_conversation_shows():
+    out = _run(_STUBS + f"""
+const acts={{{_action("pvPendingTalk")}}};
+acts.pvPendingTalk({{w:"own",s:"k3f9a2"}});
+console.log(JSON.stringify({{toggled}}));
+""")
+    assert out["toggled"] == [["sideopen", False]]
 
 
 @pytest.mark.parametrize(("at", "session", "opened", "focused"), [

@@ -76,12 +76,18 @@ MUTATIONS = [
 
     ("a decision asked in a session is sealed by the session, so its owner's panel never shows it",
      MODULE,
-     '    return {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
-     '    return {"asked_of": who, "asked_in": sealed(conversation)}'),
+     # re-pinned 2026-11-26 (#718): the scope is built in `scope = {…}` and then given its session
+     '    scope = {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
+     '    scope = {"asked_of": who, "asked_in": sealed(conversation)}'),
 
-    ("a decision is answered only in the exact session it was asked in", MODULE,
-     '            and scope["asked_in"] in {sealed(owner_of(w)) for w in where if w})',
-     '            and scope["asked_in"] in {sealed(w) for w in where if w})'),
+    # RE-AIMED 2026-11-26 (#718): "answered only in the exact session it was asked in" is now the
+    # rule for a decision that records its session (`718_a_decision_is_answered_where_it_was_asked
+    # .py`). What #335 still claims is the reading of a row recorded BEFORE that, which cannot say
+    # which session: its owner's, from any of their conversations.
+    ("a decision recorded before #718 is answered only in the exact session it was asked in",
+     MODULE,
+     '    return scope["asked_in"] in {sealed(owner_of(w)) for w in where if w}',
+     '    return scope["asked_in"] in {sealed(w) for w in where if w}'),
 
     ("a session's frames never reach its owner: the socket compares keys, not owners", CHAT,
      "        return bool(sub.own) and owner_of(conversation) == sub.own\n",

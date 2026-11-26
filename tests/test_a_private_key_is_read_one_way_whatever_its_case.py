@@ -62,13 +62,17 @@ def _on_the_agenda(key: str) -> bool:
 
 
 def _answered(key: str) -> bool:
-    """Whether a decision asked of Bruno in `key` is his to answer from his own conversation."""
+    """Whether a decision asked of Bruno in `key` is his to answer from his own conversation —
+    the one the server mints for him under the same session id, because a decision is answered
+    where it was asked (#718); before that, his first conversation answered it from anywhere."""
     from beeverforge.memory.ledger import DECISION, Loop
     from beeverforge.product import module
+    from beeverforge.product.conversation import session_key, session_of
 
     loop = Loop(kind=DECISION, subject="d", owner="product", ts="2026-09-20T10:00:00+00:00",
                 context=module._asked_of("bruno", key))
-    return module._answered_by(loop, person="bruno", where=(BRUNO,), room="acme")
+    his = session_key(BRUNO, session_of(key)) or BRUNO
+    return module._answered_by(loop, person="bruno", where=(his,), room="acme")
 
 
 def _recalled(key: str, index_dir) -> bool:

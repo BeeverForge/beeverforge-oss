@@ -50,8 +50,9 @@ MUTATIONS = [
 
     ("a decision asked in a case-variant key is the spelled person's to answer",
      "beeverforge/product/module.py",
-     '    return {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
-     '    return {"asked_of": who, "asked_in": sealed(owner_of(conversation).lower())}'),
+     # re-pinned 2026-11-26 (#718): the scope is built in `scope = {…}` and then given its session
+     '    scope = {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
+     '    scope = {"asked_of": who, "asked_in": sealed(owner_of(conversation).lower())}'),
 
     ("recall hands a case-variant key's turns to the person it spells",
      "beeverforge/memory/recall.py",
