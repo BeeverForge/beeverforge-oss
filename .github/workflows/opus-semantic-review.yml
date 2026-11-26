@@ -8,7 +8,9 @@ on:
   workflow_run:
     workflows: [ci]
     types: [requested]
-  # A draft made ready starts no `ci` run (pull requests into `main`, where this file is).
+  # A draft made ready starts no `ci` run. GitHub reads this trigger from the base branch, so it
+  # covers pull requests into `main`; a draft into a release branch made ready is reviewed at
+  # its next push, or by hand.
   pull_request_target:
     types: [ready_for_review]
   # By hand, any open pull request by number: one opened before this file, or a second look.
@@ -23,7 +25,9 @@ permissions: {}
 
 concurrency:
   group: opus-semantic-review-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || inputs.pr }}
-  cancel-in-progress: true
+  # A `ci` re-run starts no review (`target`), so it must not cancel the one that is running:
+  # it waits its turn in the group and then skips.
+  cancel-in-progress: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.run_attempt == 1 }}
 
 env:
   REVIEW_MARKER: "<!-- beeverforge-opus-semantic-review -->"
