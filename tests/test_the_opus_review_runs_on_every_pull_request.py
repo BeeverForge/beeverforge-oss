@@ -360,6 +360,18 @@ def test_a_review_replaced_while_it_waited_leaves_the_head_to_the_run_that_repla
     assert "the run that replaced it answers for the head" in ran.stdout
 
 
+def test_the_last_job_looks_for_the_review_under_the_name_the_api_gives_it():
+    """The API reports a job by its DISPLAY name: its `name:` when it has one, its id otherwise.
+    The last job finds the review by that name; renamed, it would find nothing, read every
+    cancelled review as replaced, and nobody would answer for one cancelled after it started.
+    Nothing else would fail (#727's review)."""
+    import re
+
+    jobs = _workflow()["jobs"]
+    looked_for = re.findall(r'select\(\.name == "([^"]+)"\)', _step("ensure", "Start a review"))
+    assert looked_for == [jobs["review"].get("name", "review")]
+
+
 def test_a_review_cancelled_after_it_started_is_answered_for(runner):
     """Cancelled by a person, or by the job's time limit outside the model's step: nothing
     replaced it, so reading it as "replaced" left the head with no status and nobody to notice

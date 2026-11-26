@@ -115,6 +115,8 @@ MUTATIONS = [
             | jq 'length')\""""),
     ("a gap is chased for ever", REVIEW,
      "(( ATTEMPT >= 5 ))", "(( ATTEMPT >= 500 ))"),
+    ("the review job is renamed, and the last job no longer finds it", REVIEW,
+     "  review:\n    needs: target\n", "  review:\n    name: Opus review\n    needs: target\n"),
     ("a review cancelled after it started is read as replaced, and nobody answers", REVIEW,
      "            if (( ran == 0 )); then\n", "            if (( ran >= 0 )); then\n"),
     ("an event's run reviews a head that already has its review", REVIEW,
