@@ -86,7 +86,8 @@ MUTATIONS = [
      "    if budget is None or budget == NOT_REPORTED:\n"),
     ("the doctor asks one vendor by name again, with the project's tracker credential",
      "beeverforge/doctor.py",
-     "            return build_tracker(project, token_provider=_board_credential(project)).budget()\n",
+     "            return build_tracker(project, token=tracker_token_for(project),\n"
+     "                                 token_provider=_board_credential(project)).budget()\n",
      "            from beeverforge.adapters.tracker.github_project import github_rate\n"
      "            return github_rate(_board_credential(project)())\n"),
     # ── the poller and its announcement ─────────────────────────────────────────────────────────
