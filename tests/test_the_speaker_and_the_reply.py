@@ -405,6 +405,52 @@ def test_one_person_s_message_does_not_close_another_person_s_decision(table, le
     assert closed.outcome == "answered"
 
 
+def _open_decisions(ledger) -> list:
+    return [x for x in waiting(fold(ledger), owner=followup.OWNER) if x.kind == DECISION]
+
+
+def test_a_decision_asked_in_one_of_ana_s_sessions_is_closed_there_and_by_no_other(table, ledger):
+    """#718: the role asks Ana a decision in one of her sessions. Her message in another session,
+    or in her first conversation, about anything else, leaves it open; her message where it was
+    asked closes it. On a deployment, two decisions asked in one session closed as `answered` 39
+    seconds before the role asked two new ones in another — closed by the message that asked."""
+    project = _project()
+    module = _Room(project)
+    talk = _Conversation(project, module)
+    here = "person:ana~k3f9a2"
+    talk.say("organiza o backlog", user=ANA, thread=here, channel="")
+
+    assert [x.context["asked"] for x in _open_decisions(ledger)] == \
+        ["fechar ou não os cards em Review"]
+
+    talk.say("bom dia", user=ANA, thread="person:ana~zz99", channel="")
+    talk.say("bom dia", user=ANA, thread="person:ana", channel="")
+
+    assert len(_open_decisions(ledger)) == 1, "a message in another of her conversations closed it"
+
+    talk.say("pode fechar os de março", user=ANA, thread=here, channel="")
+
+    assert _open_decisions(ledger) == []
+
+
+def test_the_same_decision_asked_in_two_of_ana_s_sessions_is_two_loops_each_closed_there(table,
+                                                                                         ledger):
+    """#718: asked in two of her sessions, the same label is two decisions — the dedup reads the
+    session too — and her answer in one leaves the other's open."""
+    project = _project()
+    module = _Room(project)
+    talk = _Conversation(project, module)
+    talk.say("organiza o backlog", user=ANA, thread="person:ana~k3f9a2", channel="")
+    talk.say("organiza o backlog", user=ANA, thread="person:ana~zz99", channel="")
+
+    assert len(_open_decisions(ledger)) == 2
+
+    talk.say("pode fechar os de março", user=ANA, thread="person:ana~zz99", channel="")
+
+    [still] = _open_decisions(ledger)
+    assert still.context["asked_session"] == "k3f9a2"
+
+
 def test_the_same_decision_asked_of_two_people_is_two_loops_each_closed_by_its_own(table, ledger):
     """Asked of Ana and of Bia, the same label is two decisions: Bia's answer closes hers and
     leaves Ana's open — a close keyed by the ledger's `(kind, subject, about)` alone would have

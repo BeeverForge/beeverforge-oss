@@ -31,6 +31,11 @@ screen, and a digest names nobody:
 AN ITEM NEVER CARRIES A NAME. It says whom the role owes as "you" or "the room", from the viewer's
 side; the loop's `person` (a forge login the sweep addresses a question to) and every sealed id
 stay in the ledger.
+
+AN ITEM SAYS WHICH CONVERSATION IT OPENS (#717): the room, or one of the viewer's own — by its
+session id, `""` for their first conversation — or `""` when its row cannot say (a private
+decision recorded before #718 kept the session). The Pending tab's ↩ opens it. A session id is
+only ever on an item its owner alone may see, and names nobody.
 """
 
 from __future__ import annotations
@@ -57,6 +62,9 @@ OWED, AWAITED = "owed", "awaited"
 
 #: How much of what the role asked an item carries — a line on a panel, not the whole question.
 _WHAT_CHARS = 200
+
+#: Where an item opens (#717): the project's room, or one of the viewer's own conversations.
+ROOM, OWN = "room", "own"
 
 
 @dataclass(frozen=True)
@@ -104,12 +112,17 @@ class Item:
     #: opens when the person picks the item
     card: str = ""
     opens: str = ""
+    #: WHICH CONVERSATION IT OPENS (#717): `ROOM`, `OWN` — one of the viewer's own, `session`
+    #: naming which, `""` for their first — or `""` when the row cannot say
+    at: str = ""
+    session: str = ""
 
     def as_dict(self) -> dict:
         return {"kind": self.kind, "subject": self.subject, "direction": self.direction,
                 "said": self.said, "what": self.what, "since": self.since,
                 "chased": self.chased, "yours": self.yours, "to": self.to,
-                "chip": self.chip, "when": self.when, "card": self.card, "opens": self.opens}
+                "chip": self.chip, "when": self.when, "card": self.card, "opens": self.opens,
+                "at": self.at, "session": self.session}
 
 
 def _sealed(value: str) -> str:
@@ -223,6 +236,7 @@ def items(rows: list[Loop], viewer: Viewer, *, room: str,
         ctx = loop.context or {}
         what = str(ctx.get("asked") or ctx.get("title") or "").strip()[:_WHAT_CHARS]
         card, opens = _answered_at(loop)
+        at, session = _asked_at(loop, room=room)
         out.append(Item(kind=loop.kind, subject=loop.subject, direction=direction, said=said,
                         what=what, since=loop.ts, chased=loop.chased_ts, yours=yours,
                         to="you" if yours else "the room",
@@ -230,7 +244,7 @@ def items(rows: list[Loop], viewer: Viewer, *, room: str,
                         chip=(agenda_chip(direction, yours=yours, language=language)
                               if direction == AWAITED else ""),
                         when=agenda_when(loop.ts, loop.chased_ts, language=language),
-                        card=card, opens=opens))
+                        card=card, opens=opens, at=at, session=session))
     return out
 
 
@@ -269,8 +283,28 @@ def from_the_import(review, viewer: Viewer, *, language: str | None = None) -> l
                         yours=yours, to="you" if yours else "the room",
                         chip=agenda_chip(AWAITED, yours=yours, language=language),
                         when=agenda_when(review.landed_at, language=language),
-                        card="", opens="conversation"))
+                        card="", opens="conversation", at=ROOM))
     return out
+
+
+def _asked_at(loop: Loop, *, room: str) -> tuple[str, str]:
+    """`(where, session)` — which conversation an item opens (#717), read from what `audience`
+    reads: the room, one of the owner's own (its session id, `""` for their first), or `("", "")`
+    when the row cannot say. Only ever on an item `audience` keeps to its owner or the room."""
+    from beeverforge.product.conversation import is_private, session_of
+    from beeverforge.product.sessions import FIRST
+
+    ctx = loop.context or {}
+    where = str(ctx.get("conversation") or "")
+    if where:
+        return (OWN, session_of(where)) if is_private(where) else (ROOM, "")
+    asked_in = str(ctx.get("asked_in") or "")
+    if not asked_in or asked_in == _sealed(room) or loop.about:
+        return ROOM, ""
+    session = str(ctx.get("asked_session") or "")
+    if session:
+        return OWN, "" if session == FIRST else session
+    return "", ""
 
 
 def _answered_at(loop: Loop) -> tuple[str, str]:
@@ -325,5 +359,5 @@ def render(found: list[Item], *, language: str | None = None) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["AWAITED", "IMPORT", "OWED", "Audience", "Item", "Viewer", "audience",
+__all__ = ["AWAITED", "IMPORT", "OWED", "OWN", "ROOM", "Audience", "Item", "Viewer", "audience",
            "from_the_import", "items", "owed_on", "pending", "render", "sees", "visible"]

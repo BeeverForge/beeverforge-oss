@@ -1306,7 +1306,7 @@ const ACTS={
   pvTab:         d=>pvTab(d.t),
   pvCardOpen:    d=>pvCardOpen(d.r),
   pvPendingCard: d=>{pvTab("board");pvCardOpen(d.r)},
-  pvPendingTalk: ()=>{const a=$("#prodAsk");if(a)a.focus()},
+  pvPendingTalk: d=>pvPendingTalk(d.w,d.s),
   pvCardBack:    ()=>pvCardBack(),
   pvSuggest:     d=>pvSuggest(d.q),
   boardOpenCandidate: d=>boardOpenCandidate(Number(d.i)),
@@ -2196,10 +2196,11 @@ function paintAgenda(){
     // #401: the chip and the date as the server wrote them, in the project's language
     const chip=esc(String(i.chip||`${owed?"owed":"awaited"} · ${i.to||""}`));
     // ADR-0055 D11: EACH ITEM OPENS WHERE IT IS ANSWERED — the card it is about, or the
-    // conversation, whose box is this page's own
+    // conversation it was asked in (#717): the room, or which of the person's own, as the server
+    // says (`agenda.Item.at`, `.session`)
     const go=i.opens==="card"&&i.card
       ?`<button class="btn sm ghost" data-act="pvPendingCard" data-r="${esc(String(i.card))}">#${esc(String(i.card))}</button>`
-      :`<button class="btn sm ghost" data-act="pvPendingTalk">${i.card?`#${esc(String(i.card))} · `:""}↩</button>`;
+      :`<button class="btn sm ghost" data-act="pvPendingTalk" data-w="${esc(String(i.at||""))}" data-s="${esc(String(i.session||""))}">${i.card?`#${esc(String(i.card))} · `:""}↩</button>`;
     const when=esc(String(i.when||`since ${String(i.since||"").slice(0,10)||"?"}${i.chased?` · reminded ${String(i.chased).slice(0,10)}`:""}`));
     if($("#pv")){
       // #335: WHAT IT IS ABOUT FIRST — the question or the requirement — and whose move it is under
@@ -3261,6 +3262,19 @@ function pvNewChat(){
 function pvSid(sid){
   const s=String(sid||"");
   return /^[a-z0-9]{4,24}$/.test(s)?s:"";
+}
+//: A PENDING ITEM OPENS THE CONVERSATION IT WAS ASKED IN (#717), and puts the cursor in its box.
+//: It only focused the box of the conversation already open — the right one while a person had
+//: one (#335 gave them several) — so an item asked in another session opened nothing anybody
+//: could see. `at` is the server's: "room", "own" with `sid` naming which ("" is the first), or
+//: "" when its row cannot say, which keeps the open box. The one already open is not reopened:
+//: that clears the thread and resubscribes. On a narrow screen the tab lies over the conversation,
+//: so it is put away: a conversation opened under it is still one nobody can see.
+function pvPendingTalk(at,sid){
+  if(at==="room"){if(!_pc.room)setScope(true)}
+  else if(at==="own"){const s=pvSid(sid);if(_pc.room||String(_pc.session||"")!==s)pvOpen(s)}
+  pvToggle("sideopen",false);
+  const a=$("#prodAsk");if(a)a.focus();
 }
 function pvOpen(sid){
   _pc.room=false;_pc.session=pvSid(sid);

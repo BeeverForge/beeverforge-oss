@@ -166,8 +166,9 @@ MUTATIONS = [
      "                   if x.kind == DECISION}"),
     # RE-PINNED 2026-09-25 (#335): a private conversation is sealed by its owner
     ("whom a decision was asked of is kept by name", MODULE,
-     '    return {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
-     '    return {"asked_of": str(person), "asked_in": sealed(owner_of(conversation))}'),
+     # re-pinned 2026-11-26 (#718): the scope is built in `scope = {…}` and then given its session
+     '    scope = {"asked_of": who, "asked_in": sealed(owner_of(conversation))}',
+     '    scope = {"asked_of": str(person), "asked_in": sealed(owner_of(conversation))}'),
     ("a decision opened before this slice closes on a message anywhere", MODULE,
      "        return loop.about == room", "        return True"),
 
